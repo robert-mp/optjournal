@@ -165,12 +165,23 @@ def render_summary(data: Row) -> str:
 # --------------------------------------------------------------------- orders
 
 
-def orders_data(conn: sqlite3.Connection) -> list[Row]:
+def orders_data(
+    conn: sqlite3.Connection, order_ids: frozenset[str] | None = None
+) -> list[Row]:
+    """Option orders with their legs, optionally restricted to a set of ids.
+
+    Filtered in Python rather than in SQL: `option_orders` is a view that
+    aggregates fills, and the caller's id set comes from episode membership,
+    which no column on the view carries. The order count here is small enough
+    that the difference is not measurable.
+    """
     orders = conn.execute(
         "SELECT * FROM option_orders ORDER BY first_fill_at DESC"
     ).fetchall()
     out: list[Row] = []
     for o in orders:
+        if order_ids is not None and str(o["ib_order_id"]) not in order_ids:
+            continue
         legs = conn.execute(
             "SELECT * FROM option_legs WHERE ib_order_id = ? ORDER BY expiry, strike",
             (o["ib_order_id"],),

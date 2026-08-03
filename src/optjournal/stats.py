@@ -33,16 +33,21 @@ from typing import Any
 from optjournal.history import build_history
 
 __all__ = [
+    "ALL_TRADES",
     "Cohort",
     "DayPnl",
     "MonthStats",
+    "TradeScope",
     "annual_stats",
     "available_months",
     "available_years",
     "cohort_data",
     "daily_series",
     "month_stats",
+    "monthly_stats",
     "odte_cohorts",
+    "odte_scope",
+    "scope_for",
 ]
 
 
@@ -195,20 +200,180 @@ class MonthStats:
         return self.options_friction_base + self.account_friction_base
 
 
-def available_months(conn: sqlite3.Connection, asset_category: str | None = "OPT") -> list[str]:
-    """Months with at least one trade, newest first."""
+@dataclass(frozen=True)
+class TradeScope:
+    """A subset of the journal, identified by the fills that belong to it.
+
+    The Trade Types control is a scope selector, and a scope has to be defined
+    at fill level because that is what every summation here iterates over. Both
+    id sets `None` means "everything", which is the default and costs nothing.
+
+    Membership is by fill, not by predicate re-evaluation, so the scope agrees
+    with the cohort it came from by construction. In particular the 0DTE scope
+    is *not* "every fill whose trade date equals its expiry": that would also
+    catch the expiry-day close of a position held for a month, which is not
+    0DTE trading. It is the fills of the round trips classified as 0DTE.
+    """
+
+    key: str
+    label: str
+    trade_ids: frozenset[str] | None = None
+    order_ids: frozenset[str] | None = None
+
+    @property
+    def is_everything(self) -> bool:
+        return self.trade_ids is None
+
+    def has_trade(self, trade_id: Any) -> bool:
+        return self.trade_ids is None or str(trade_id or "") in self.trade_ids
+
+    def has_order(self, order_id: Any) -> bool:
+        return self.order_ids is None or str(order_id or "") in self.order_ids
+
+    def has_episode(self, episode: Any) -> bool:
+        """In scope when any of the episode's own fills is.
+
+        Any rather than all: a scope built from whole episodes contains all of
+        their fills, so the two agree -- and a partial overlap should surface
+        the episode rather than silently drop it.
+        """
+        if self.trade_ids is None:
+            return True
+        return any(str(t) in self.trade_ids for t in episode.trade_ids)
+
+
+#: The default: no filtering at all, and no id sets to build or carry.
+ALL_TRADES = TradeScope(key="all", label="Options")
+
+
+def odte_scope(
+    conn: sqlite3.Connection,
+    *,
+    asset_category: str | None = "OPT",
+    base_currency: str = "EUR",
+    report: Any = None,
+) -> TradeScope:
+    """The 0DTE round trips, as a fill-level scope.
+
+    Includes open episodes as well as closed ones. An open 0DTE position is odd
+    but reachable -- a statement cut on expiry day, before the contract died --
+    and a scope that filters the journal should not hide a position the
+    Positions tab would still show. `odte_cohorts` stays closed-only because
+    comparing outcomes needs outcomes.
+    """
+    if report is None:
+        report = build_history(
+            conn, asset_category=asset_category, base_currency=base_currency
+        )
+    trade_ids = {str(t) for e in report.episodes if e.is_odte is True for t in e.trade_ids}
+    # Orders are aggregated in a view keyed by ib_order_id, so filtering them
+    # needs the order ids those fills belong to rather than the fills.
+    order_ids = {
+        str(row["ib_order_id"])
+        for row in conn.execute(
+            "SELECT trade_id, ib_order_id FROM trades WHERE ib_order_id IS NOT NULL"
+        )
+        if str(row["trade_id"]) in trade_ids
+    }
+    return TradeScope(
+        key="odte",
+        label="0DTE",
+        trade_ids=frozenset(trade_ids),
+        order_ids=frozenset(order_ids),
+    )
+
+
+#: Selectable scopes, by the key the UI and the `?type=` parameter use.
+SCOPE_BUILDERS = {"all": None, "odte": odte_scope}
+
+
+def scope_for(
+    conn: sqlite3.Connection,
+    key: str | None,
+    *,
+    asset_category: str | None = "OPT",
+    report: Any = None,
+) -> TradeScope:
+    """Resolve a scope key, falling back to everything for anything unknown.
+
+    Tolerant on purpose: the key arrives from a query parameter, and an
+    unrecognised one should show the whole journal rather than fail.
+    """
+    builder = SCOPE_BUILDERS.get((key or "all").lower())
+    if builder is None:
+        return ALL_TRADES
+    return builder(conn, asset_category=asset_category, report=report)
+
+
+def available_months(
+    conn: sqlite3.Connection,
+    asset_category: str | None = "OPT",
+    scope: TradeScope = ALL_TRADES,
+) -> list[str]:
+    """Months with at least one trade in scope, newest first.
+
+    Scoped, so the month dropdown cannot offer a month that the active filter
+    has emptied -- picking one would show a blank dashboard and look broken.
+    """
     where, params = ("WHERE asset_category = ?", (asset_category,)) if asset_category else ("", ())
-    rows = conn.execute(f"SELECT DISTINCT trade_date FROM trades {where}", params).fetchall()
-    months = {m for m in (_month_of(r["trade_date"]) for r in rows) if m}
+    rows = conn.execute(
+        f"SELECT DISTINCT trade_date, trade_id FROM trades {where}", params
+    ).fetchall()
+    months = {
+        m
+        for m in (
+            _month_of(r["trade_date"]) for r in rows if scope.has_trade(r["trade_id"])
+        )
+        if m
+    }
     return sorted(months, reverse=True)
 
 
-def available_years(conn: sqlite3.Connection, asset_category: str | None = "OPT") -> list[str]:
-    """Years with at least one trade, newest first."""
+def available_years(
+    conn: sqlite3.Connection,
+    asset_category: str | None = "OPT",
+    scope: TradeScope = ALL_TRADES,
+) -> list[str]:
+    """Years with at least one trade in scope, newest first."""
     where, params = ("WHERE asset_category = ?", (asset_category,)) if asset_category else ("", ())
-    rows = conn.execute(f"SELECT DISTINCT trade_date FROM trades {where}", params).fetchall()
-    years = {d[:4] for d in (_day_of(r["trade_date"]) for r in rows) if d}
+    rows = conn.execute(
+        f"SELECT DISTINCT trade_date, trade_id FROM trades {where}", params
+    ).fetchall()
+    years = {
+        d[:4]
+        for d in (
+            _day_of(r["trade_date"]) for r in rows if scope.has_trade(r["trade_id"])
+        )
+        if d
+    }
     return sorted(years, reverse=True)
+
+
+def _period_stats(
+    conn: sqlite3.Connection,
+    periods: list[str],
+    *,
+    asset_category: str | None,
+    base_currency: str,
+    scope: TradeScope,
+) -> list[MonthStats]:
+    """`month_stats` over several periods, sharing one episode history pass.
+
+    The Annual tab asks for every month, every year and an all-time row at
+    once. Each `month_stats` call otherwise rebuilds the whole episode history,
+    so a thirteen-month archive did that fifteen times per page load for
+    identical results.
+    """
+    report = build_history(
+        conn, asset_category=asset_category, base_currency=base_currency
+    )
+    return [
+        month_stats(
+            conn, period, asset_category=asset_category,
+            base_currency=base_currency, scope=scope, report=report,
+        )
+        for period in periods
+    ]
 
 
 def annual_stats(
@@ -216,6 +381,7 @@ def annual_stats(
     *,
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
+    scope: TradeScope = ALL_TRADES,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar year, newest first.
 
@@ -225,12 +391,29 @@ def annual_stats(
     still gets a row: "traded, decided nothing" is a real outcome and hiding
     it would make the years stop accounting for all the activity.
     """
-    return [
-        month_stats(
-            conn, year, asset_category=asset_category, base_currency=base_currency
-        )
-        for year in available_years(conn, asset_category)
-    ]
+    return _period_stats(
+        conn, available_years(conn, asset_category, scope),
+        asset_category=asset_category, base_currency=base_currency, scope=scope,
+    )
+
+
+def monthly_stats(
+    conn: sqlite3.Connection,
+    *,
+    asset_category: str | None = "OPT",
+    base_currency: str = "EUR",
+    scope: TradeScope = ALL_TRADES,
+) -> list[MonthStats]:
+    """One `MonthStats` per calendar month, newest first.
+
+    The same rows the month selector produces one at a time, so the Annual
+    tab's breakdown and the Dashboard agree for any month the reader checks --
+    they are the same call with the same period string.
+    """
+    return _period_stats(
+        conn, available_months(conn, asset_category, scope),
+        asset_category=asset_category, base_currency=base_currency, scope=scope,
+    )
 
 
 @dataclass(slots=True)
@@ -280,6 +463,7 @@ def odte_cohorts(
     *,
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
+    report: Any = None,
 ) -> tuple[Cohort, Cohort, int]:
     """0DTE round trips against everything else, plus the unclassifiable count.
 
@@ -292,7 +476,10 @@ def odte_cohorts(
     into "not 0DTE": a stock has no DTE, and claiming it was not a 0DTE trade
     is a different statement from admitting the question does not apply.
     """
-    report = build_history(conn, asset_category=asset_category, base_currency=base_currency)
+    if report is None:
+        report = build_history(
+            conn, asset_category=asset_category, base_currency=base_currency
+        )
     odte = [e for e in report.closed if e.is_odte is True]
     rest = [e for e in report.closed if e.is_odte is False]
     unknown = sum(1 for e in report.closed if e.is_odte is None)
@@ -315,7 +502,10 @@ def cohort_data(c: Cohort) -> dict[str, Any]:
 
 
 def daily_series(
-    conn: sqlite3.Connection, period: str | None = None, asset_category: str | None = "OPT"
+    conn: sqlite3.Connection,
+    period: str | None = None,
+    asset_category: str | None = "OPT",
+    scope: TradeScope = ALL_TRADES,
 ) -> list[DayPnl]:
     """Realised P&L and fill count per calendar day, ascending.
 
@@ -329,10 +519,12 @@ def daily_series(
 
     buckets: dict[str, DayPnl] = {}
     for row in conn.execute(
-        f"SELECT trade_date, fifo_pnl_realized_base FROM trades {where}", params
+        f"SELECT trade_date, trade_id, fifo_pnl_realized_base FROM trades {where}", params
     ):
         day = _day_of(row["trade_date"])
         if day is None or not _in_period(row["trade_date"], period):
+            continue
+        if not scope.has_trade(row["trade_id"]):
             continue
         bucket = buckets.setdefault(day, DayPnl(day=day))
         bucket.trades += 1
@@ -346,12 +538,19 @@ def month_stats(
     *,
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
+    scope: TradeScope = ALL_TRADES,
+    report: Any = None,
 ) -> MonthStats:
     """Statistics for one period, or for everything when `period` is None.
 
     `period` is a month ("2025-03") or a whole year ("2025"). Both widths run
     through the identical summations, which is what makes the Annual tab's
     figures reconcile with the monthly ones instead of being a second opinion.
+
+    `scope` restricts every trade-derived figure to a subset of fills. `report`
+    lets a caller building many periods reuse one `build_history` pass -- the
+    Annual tab asks for a dozen months, two years and an all-time row on every
+    page load, and rebuilding the episode history for each was the whole cost.
     """
     stats = MonthStats(
         month=period or "ALL",
@@ -367,10 +566,12 @@ def month_stats(
 
     orders: set[str] = set()
     for row in conn.execute(
-        f"SELECT trade_date, ib_order_id, fifo_pnl_realized_base, ib_commission_base"
-        f" FROM trades {where}", params
+        f"SELECT trade_date, trade_id, ib_order_id, fifo_pnl_realized_base,"
+        f" ib_commission_base FROM trades {where}", params
     ):
         if not _in_period(row["trade_date"], period):
+            continue
+        if not scope.has_trade(row["trade_id"]):
             continue
         stats.total_trades += 1
         if row["ib_order_id"]:
@@ -381,6 +582,9 @@ def month_stats(
 
     # Fees are account-level CashTransaction rows, never trade-linked -- verified
     # against real data, where none of the 65 fee rows carries a conid or tradeID.
+    # Deliberately NOT scoped: there is nothing to filter them on, and pro-rating
+    # them into a fill subset would be inventing an attribution. Under an active
+    # scope they stay the account's figure, which is what the pill already says.
     for row in conn.execute(
         "SELECT date_time, amount_base, type FROM cash_transactions"
         " WHERE UPPER(type) LIKE '%FEES%'"
@@ -389,21 +593,27 @@ def month_stats(
             continue
         stats.fees_base += row["amount_base"] or 0.0
 
-    report = build_history(conn, asset_category=asset_category, base_currency=base_currency)
+    if report is None:
+        report = build_history(
+            conn, asset_category=asset_category, base_currency=base_currency
+        )
     # Attributed by close date, matching the monthly convention: an episode
     # opened in December and closed in January is a January outcome, and so a
     # 2026 one. Attributing by entry instead would make the annual rows stop
     # summing to the monthly ones.
-    closed = [e for e in report.closed if _in_period(e.closed_at, period)]
+    closed = [
+        e for e in report.closed
+        if _in_period(e.closed_at, period) and scope.has_episode(e)
+    ]
     stats.closed_episodes = len(closed)
-    stats.open_episodes = len(report.open)
+    stats.open_episodes = sum(1 for e in report.open if scope.has_episode(e))
     wins = [e.realized_pnl_base for e in closed if e.realized_pnl_base > 0]
     losses = [e.realized_pnl_base for e in closed if e.realized_pnl_base < 0]
     stats.wins, stats.losses = len(wins), len(losses)
     stats.avg_win_base = sum(wins) / len(wins) if wins else None
     stats.avg_loss_base = sum(losses) / len(losses) if losses else None
 
-    stats.days = daily_series(conn, period, asset_category)
+    stats.days = daily_series(conn, period, asset_category, scope)
     return stats
 
 

@@ -59,7 +59,9 @@ from optjournal.stats import (
     available_months,
     cohort_data,
     month_stats,
+    monthly_stats,
     odte_cohorts,
+    scope_for,
     stats_data,
 )
 
@@ -123,17 +125,29 @@ def build_state(
     query_id: str | None,
     asset_category: str = "OPT",
     month: str | None = None,
+    trade_type: str | None = None,
 ) -> dict[str, Any]:
     """Everything the page renders, in one JSON-safe payload.
 
     Opens its own connection: sqlite3 objects cannot cross threads and the
     server is threaded, so a shared handle would fail intermittently under the
     one condition nobody tests for.
+
+    `trade_type` selects a fill-level scope for the three views that carry the
+    filter bar -- Dashboard, Calendar and Trades. It deliberately reaches no
+    further: Positions, Costs, Annual and 0DTE render no filter bar, so
+    narrowing them would move numbers on a tab that shows nothing capable of
+    explaining why. The invariant is that a tab's figures change only in
+    response to a control that tab displays.
     """
     conn = connect(db_path)
     try:
         migrate(conn)
-        months = available_months(conn, asset_category)
+        # One history pass, reused by the scope, the cohorts and every period
+        # row below. Rebuilding it per call was the cost of the Annual tab.
+        report = build_history(conn, asset_category=asset_category)
+        scope = scope_for(conn, trade_type, asset_category=asset_category, report=report)
+        months = available_months(conn, asset_category, scope)
         selected = month if month in months else None
         state: dict[str, Any] = {
             "version": __version__,
@@ -143,29 +157,53 @@ def build_state(
             "archive": str(archive_dir),
             "months": months,
             "selected_month": selected,
+            "trade_type": scope.key,
+            "trade_type_label": scope.label,
             "stats": stats_data(
-                month_stats(conn, selected, asset_category=asset_category)
+                month_stats(conn, selected, asset_category=asset_category,
+                            scope=scope, report=report)
             ),
             "all_time": stats_data(
-                month_stats(conn, None, asset_category=asset_category)
+                month_stats(conn, None, asset_category=asset_category,
+                            scope=scope, report=report)
             ),
             "positions": positions_data(conn),
-            "orders": orders_data(conn),
-            "history": history_data(build_history(conn, asset_category=asset_category)),
+            "orders": orders_data(conn, scope.order_ids),
+            "history": history_data(report),
             "statements": statements_data(archive_dir, conn),
         }
-        # Both are all-time by construction and ignore the month selector: a
-        # year-by-year table filtered to one month would have a single row, and
-        # a 0DTE cohort of one month's trades is too small to compare against
-        # anything. The selector stays wired to `stats` alone.
+        # Annual is all-time by construction and ignores both filters. The month
+        # selector because a year-by-year table filtered to one month would have
+        # a single row -- and the trade-type scope because this tab renders no
+        # filter bar. A tab whose numbers move with a control it does not display
+        # gives the reader nothing to explain the change with, which is the same
+        # failure as a total that silently spans a wider scope than its label.
         state["annual"] = [
             stats_data(s) for s in annual_stats(conn, asset_category=asset_category)
         ]
-        odte, rest, unknown_dte = odte_cohorts(conn, asset_category=asset_category)
+        state["monthly"] = [
+            stats_data(s) for s in monthly_stats(conn, asset_category=asset_category)
+        ]
+        # The Annual table's total row. Deliberately not `all_time`, which is the
+        # Dashboard's figure and therefore scoped: under an active filter the
+        # year rows stayed whole while that total shrank, so the table stopped
+        # adding up -- destroying the one reconciliation it exists to show.
+        state["annual_total"] = stats_data(
+            month_stats(conn, None, asset_category=asset_category, report=report)
+        )
+        # Cohorts are the whole book by definition -- they exist to compare the
+        # 0DTE subset against everything else, so scoping them to 0DTE would
+        # leave nothing on the other side of the comparison.
+        odte, rest, unknown_dte = odte_cohorts(
+            conn, asset_category=asset_category, report=report
+        )
         state["odte"] = {
             "cohort": cohort_data(odte),
             "rest": cohort_data(rest),
             "unknown_dte": unknown_dte,
+            # Whether the filter is offerable at all, derived rather than
+            # asserted in the page.
+            "selectable": odte.episodes > 0,
         }
         base_ccy = str(state["stats"].get("base_currency") or "")
         state["fx"] = {"base": base_ccy, "quotes": _fx_quotes(conn, base_ccy)}
@@ -282,6 +320,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     archive_dir=self.archive_dir,
                     query_id=self.query_id,
                     month=(params.get("month") or [None])[0],
+                    trade_type=(params.get("type") or [None])[0],
                 ))
             except sqlite3.OperationalError as exc:
                 self._json(500, {"error": f"database not readable: {exc}"})

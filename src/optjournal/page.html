@@ -174,7 +174,7 @@ td.n,th.n{text-align:right}
 
 <script>
 const $=s=>document.querySelector(s);
-const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null};
+const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null};
 
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -297,13 +297,16 @@ function filters(){
       <select id="month">${opts.join('')}</select></div>
     <div class="center"><div class="flabel">Trade Types</div>
       <div class="seg">
-        <button class="on">Options</button>
+        <button data-type="" class="${S.type?'':'on'}"
+          title="Every ${esc(S.state.asset_category)} trade in the journal."
+          >Options</button>
         <button disabled title="Filtered out at ingest; re-run with --assets ALL">Equities</button>
-        <button disabled title="${esc(odteFilterNote())}">0DTE</button>
+        <button data-type="odte" class="${S.type==='odte'?'on':''}"
+          ${odteSelectable()?'':'disabled'} title="${esc(odteFilterNote())}">0DTE</button>
       </div></div>
     <div><div class="flabel">Select Account</div>
       <select disabled><option>${esc(accountLabel())}</option></select></div>
-  </div>`;
+  </div>${scopeNote()}`;
 }
 function accountLabel(){
   const stm=(S.state.statements||[])[0];
@@ -311,14 +314,30 @@ function accountLabel(){
 }
 /* Derived, not asserted. This read "No 0DTE trades in this account" as a
    hardcoded string -- the same defect as the tab's own disabled reason, which
-   claimed the same thing while the data said otherwise. The button stays
-   disabled because this segmented control filters nothing; the 0DTE tab is
-   where the cohort actually lives. */
+   claimed the same thing while the data said otherwise. */
+function odteSelectable(){
+  const od=S.state.odte;
+  return !!(od&&od.selectable);
+}
+/* Rendered by `filters()`, so it appears on exactly the tabs that carry the
+   control -- Dashboard, Calendar and Trades. A filter that silently changes
+   every number is the same failure as a total that silently spans a wider
+   scope than its label, and fees genuinely do not narrow, so naming which
+   figures moved is the honest version. */
+function scopeNote(){
+  if(!S.type) return '';
+  return `<div class="note"><b>${esc(S.state.trade_type_label)} only.</b> Fills,
+    orders, P&amp;L, commission, win rate and the daily series are restricted to this
+    subset, and the month list offers only months it covers. Account-level fees are
+    unchanged — nothing attributes them to a trade. Positions, Costs and the Annual
+    and 0DTE tabs are unaffected.</div>`;
+}
 function odteFilterNote(){
   const od=S.state.odte;
-  return od&&od.cohort.episodes
-    ? `${od.cohort.episodes} 0DTE round trip(s) — see the 0DTE tab. `
-      +`This filter is not wired up.`
+  return odteSelectable()
+    ? `Restrict this view to the ${od.cohort.episodes} round trip(s) opened on `
+      +`their own expiry date. Account-level fees are not filtered — nothing `
+      +`attributes them to a trade.`
     : 'Nothing in the archive was opened on its own expiry date.';
 }
 
@@ -358,6 +377,8 @@ function dashboard(){
       account-level and carry no asset category. ${esc(ccyNote())} Realised P&L is
       IBKR's own figure and is already net of opening and closing commission.</div></div>
       <div class="pills">
+        ${S.type?`<span class="pill" title="Every trade-derived figure below is
+          restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
         <span class="pill">open <b>${s.open_episodes}</b></span>
         <span class="pill" title="Commission on ${esc(s.asset_category)} trades.
           Commission carries an asset category, so this figure is genuinely
@@ -627,13 +648,15 @@ function costs(){
 
 /* ------------------------------------------------ annual */
 function annual(){
-  const yrs=S.state.annual||[], tot=S.state.all_time||{};
+  const yrs=S.state.annual||[], tot=S.state.annual_total||{};
   if(!yrs.length) return `<div class="card"><div class="empty">no trades to summarise</div></div>`;
   /* Every row is a stats payload of the same shape the Dashboard reads, built
      by the same summations over a year-wide period rather than a parallel
-     aggregation. The total row deliberately shows all_time -- an independently
-     computed figure -- so if the years ever stop accounting for everything the
-     discrepancy is on screen rather than hidden behind agreement. */
+     aggregation. The total row is `annual_total`, computed independently of the
+     years -- so if they ever stop accounting for everything the discrepancy is
+     on screen. Not `all_time`: that one follows the Trade Types filter, which
+     this tab does not show, and using it made the total shrink below the sum
+     of its own rows whenever the filter was on. */
   let best=yrs[0];
   yrs.forEach(s=>{if(s.net_pnl_base>best.net_pnl_base)best=s;});
   const row=(s,klass)=>`<tr class="${klass||''}">
@@ -672,7 +695,45 @@ function annual(){
       trips, which is why they differ: an order filled in two parts is two fills but
       one outcome. Win rate is computed over closed round trips only, so a year that
       traded without closing anything shows a row with no rate rather than 0%.</div>
+    ${monthlyTable()}
   </div>`;
+}
+
+function monthlyTable(){
+  /* The same rows the month selector produces one at a time -- one call, one
+     period string -- so a reader who picks March on the Dashboard sees the
+     figures printed here. Deliberately does not repeat the year totals: they
+     are in the table directly above, which is what makes the month rows
+     checkable against them. */
+  const mons=S.state.monthly||[];
+  if(mons.length<2) return '';
+  let year=null; const out=[];
+  mons.forEach(s=>{
+    const y=String(s.month).slice(0,4);
+    if(y!==year){year=y;
+      out.push(`<tr class="grp"><td class="mono dim" colspan="10">${esc(y)}</td></tr>`);}
+    out.push(`<tr>
+      <td class="mono">${esc(monthLabel(s.month))}</td>
+      <td class="n mono">${s.total_trades}</td>
+      <td class="n mono">${s.orders}</td>
+      <td class="n mono">${s.closed_episodes}</td>
+      <td class="n mono pos">${s.wins}</td>
+      <td class="n mono neg">${s.losses}</td>
+      <td class="n mono">${pct(s.win_rate)}</td>
+      <td class="n mono ${cls(s.net_pnl_base)}">${cash(s.net_pnl_base)}</td>
+      <td class="n mono">${cash(Math.abs(s.commissions_base))}</td>
+      <td class="n mono"><span class="pos">${s.green_days}</span>/<span
+        class="neg">${s.red_days}</span></td></tr>`);
+  });
+  return `<h2 style="font-size:15px;margin-top:20px">Month by month</h2>
+    <div class="note">Grouped under the year each month belongs to, so the rows
+      above them can be checked by adding these up. A month with fills but nothing
+      closed shows no win rate rather than 0%.</div>
+    <table><thead><tr><th>month</th><th class="n">fills</th><th class="n">orders</th>
+      <th class="n">closed</th><th class="n">W</th><th class="n">L</th>
+      <th class="n">win rate</th><th class="n">net P&amp;L</th>
+      <th class="n">commission</th><th class="n">green/red</th></tr></thead>
+      <tbody>${out.join('')}</tbody></table>`;
 }
 
 /* ------------------------------------------------ 0DTE */
@@ -793,6 +854,11 @@ function draw(){
     `<div class="card"><div class="empty">nothing here yet</div></div>`);
   const sel=$('#month');
   if(sel) sel.onchange=()=>{S.month=sel.value||null;load();};
+  /* Server-side like the month filter, so the aggregations are recomputed
+     rather than the page trying to re-sum a filtered subset of totals. */
+  document.querySelectorAll('.seg button[data-type]').forEach(b=>
+    b.onclick=()=>{const t=b.dataset.type||null;
+      if(t===S.type)return; S.type=t; load();});
   const st=S.state;
   $('#foot').textContent=`optjournal ${st.version} · ${st.db} · loopback only, no authentication`;
   const b=$('#sync'), rem=st.sync.cooldown_remaining_s;
@@ -810,11 +876,22 @@ function note(text,kind){
 }
 
 async function load(){
-  const q=S.month?`?month=${encodeURIComponent(S.month)}`:'';
-  const r=await fetch('/api/state'+q);
+  /* Not `q` -- that name is the FX quote everywhere else in this page, and one
+     name for two shapes is what makes the payload guard unable to check either. */
+  const qs=new URLSearchParams();
+  if(S.month) qs.set('month',S.month);
+  if(S.type) qs.set('type',S.type);
+  const r=await fetch('/api/state'+(qs.toString()?'?'+qs:''));
   if(!r.ok){note('Could not read state: HTTP '+r.status,'bad');return;}
   S.state=await r.json();
   if(S.month===null && S.state.selected_month) S.month=S.state.selected_month;
+  /* A scope change can empty the selected month, and the server answers with
+     selected_month null rather than inventing one. Drop the stale selection so
+     the dropdown does not show a month the filter has removed. */
+  if(S.month && !S.state.months.includes(S.month)) S.month=S.state.selected_month;
+  /* Server-resolved, so an unrecognised type falls back to everything here too
+     instead of leaving the button set out of step with the numbers. */
+  S.type=S.state.trade_type==='all'?null:S.state.trade_type;
   draw();
 }
 

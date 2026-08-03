@@ -32,11 +32,16 @@ from optjournal.flex import load
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_OPTIONS, ingest_file
 from optjournal.stats import (
+    ALL_TRADES,
+    _day_of,
     _in_period,
     annual_stats,
     available_months,
     month_stats,
+    monthly_stats,
     odte_cohorts,
+    odte_scope,
+    scope_for,
 )
 
 MULTIPLIER = Decimal("100")
@@ -307,3 +312,174 @@ def test_period_filter_matches_both_widths_and_both_date_forms():
     assert _in_period("20250314", None)
     assert not _in_period(None, "2025")
     assert not _in_period("garbage", "2025")
+
+
+# ------------------------------------------------------------------- scoping
+
+
+def test_odte_scope_is_episode_membership_not_a_fill_predicate(conn):
+    """The trap: "every fill whose trade date equals its expiry" is wider.
+
+    An expiry-day close of a position held for weeks satisfies that predicate
+    without being 0DTE trading at all. The demo has exactly such a fill -- an
+    expiry and an assignment both settle on the expiry date -- so the two
+    definitions give different answers here and the scope must take the
+    narrower one.
+    """
+    scope = odte_scope(conn)
+    same_day_fills = {
+        str(r["trade_id"])
+        for r in conn.execute("SELECT trade_id, trade_date, expiry FROM trades")
+        if _day_of(r["trade_date"]) == _day_of(r["expiry"])
+    }
+    assert same_day_fills > set(scope.trade_ids), (
+        "precondition: the fill-level predicate must be strictly wider here, "
+        "otherwise this test proves nothing"
+    )
+    # Every fill the scope claims is one of a 0DTE round trip's own fills.
+    odte_eps = [e for e in build_history(conn, asset_category="OPT").episodes
+                if e.is_odte is True]
+    assert set(scope.trade_ids) == {str(t) for e in odte_eps for t in e.trade_ids}
+
+
+def test_scope_narrows_every_trade_derived_figure(conn):
+    """A filter that moved only some of the numbers would be worse than none."""
+    everything = month_stats(conn, None)
+    only = month_stats(conn, None, scope=odte_scope(conn))
+    assert 0 < only.total_trades < everything.total_trades
+    assert 0 < only.closed_episodes < everything.closed_episodes
+    assert only.orders < everything.orders
+    assert abs(only.net_pnl_base) < abs(everything.net_pnl_base)
+    assert abs(only.commissions_base) < abs(everything.commissions_base)
+    assert len(only.days) < len(everything.days)
+
+
+def test_scope_leaves_account_level_fees_alone(conn):
+    """Fees carry no trade linkage, so narrowing them would invent one."""
+    everything = month_stats(conn, None)
+    only = month_stats(conn, None, scope=odte_scope(conn))
+    assert only.fees_base == everything.fees_base
+
+
+def test_scope_hides_months_it_has_emptied(conn):
+    """Offering a month the filter emptied would look like a broken dashboard."""
+    all_months = available_months(conn)
+    odte_months = available_months(conn, "OPT", odte_scope(conn))
+    assert odte_months, "the demo has a 0DTE trade, so at least one month remains"
+    assert set(odte_months) < set(all_months)
+    for month in odte_months:
+        assert month_stats(conn, month, scope=odte_scope(conn)).total_trades > 0
+
+
+def test_the_default_scope_changes_nothing(conn):
+    """ALL_TRADES must be a true no-op, not a filter that happens to pass all."""
+    plain = month_stats(conn, None)
+    explicit = month_stats(conn, None, scope=ALL_TRADES)
+    assert (plain.total_trades, plain.net_pnl_base, plain.closed_episodes) == (
+        explicit.total_trades, explicit.net_pnl_base, explicit.closed_episodes
+    )
+    assert ALL_TRADES.trade_ids is None, "no id set to build when nothing is filtered"
+    assert available_months(conn) == available_months(conn, "OPT", ALL_TRADES)
+
+
+def test_an_unknown_scope_key_shows_everything(conn):
+    """The key arrives from a query parameter, so it must fail open, not error."""
+    for key in (None, "", "all", "nonsense", "ODTE"):
+        scope = scope_for(conn, key)
+        expected_odte = key is not None and key.lower() == "odte"
+        assert (scope.key == "odte") is expected_odte, key
+
+
+# --------------------------------------------------------- monthly breakdown
+
+
+def test_the_months_account_for_everything(conn):
+    """Same reconciliation as the years, one granularity down."""
+    months = monthly_stats(conn)
+    everything = month_stats(conn, None)
+    assert len(months) == 13, "the demo spans thirteen months"
+    assert sum(m.total_trades for m in months) == everything.total_trades
+    assert sum(m.closed_episodes for m in months) == everything.closed_episodes
+    assert sum(m.net_pnl_base for m in months) == pytest.approx(
+        everything.net_pnl_base, abs=1e-9
+    )
+
+
+def test_the_months_under_each_year_sum_to_that_year(conn):
+    """What the Annual tab's grouping invites the reader to check by eye."""
+    years = {y.month: y for y in annual_stats(conn)}
+    by_year: dict[str, list] = {}
+    for m in monthly_stats(conn):
+        by_year.setdefault(str(m.month)[:4], []).append(m)
+
+    assert set(by_year) == set(years), "every month must sit under a listed year"
+    for year, months in by_year.items():
+        assert sum(m.total_trades for m in months) == years[year].total_trades, year
+        assert sum(m.closed_episodes for m in months) == years[year].closed_episodes
+        assert sum(m.net_pnl_base for m in months) == pytest.approx(
+            years[year].net_pnl_base, abs=1e-9
+        ), year
+
+
+def test_a_monthly_row_equals_what_the_month_selector_produces(conn):
+    """The breakdown and the Dashboard must not be two opinions of one month."""
+    for row in monthly_stats(conn):
+        picked = month_stats(conn, row.month)
+        assert row.total_trades == picked.total_trades, row.month
+        assert row.net_pnl_base == pytest.approx(picked.net_pnl_base, abs=1e-9)
+        assert row.closed_episodes == picked.closed_episodes
+        assert row.win_rate == picked.win_rate
+
+
+def test_months_are_newest_first(conn):
+    months = [m.month for m in monthly_stats(conn)]
+    assert months == sorted(months, reverse=True)
+
+
+def test_the_scope_reaches_the_payload_end_to_end(demo, tmp_path):
+    """The wiring, on data that actually has a 0DTE round trip.
+
+    The equivalent test over the real archive can only skip -- there is no 0DTE
+    trade there to filter to -- so the parameter-to-aggregation path is proven
+    here or nowhere.
+    """
+    from optjournal.web import build_state
+
+    db = tmp_path / "state.db"
+    conn = connect(db)
+    migrate(conn)
+    ingest_file(conn, demo, assets=ASSET_FILTER_OPTIONS)
+    conn.close()
+
+    kw = dict(db_path=db, archive_dir=demo.parent, query_id=None)
+    everything = build_state(**kw)
+    scoped = build_state(**kw, trade_type="odte")
+
+    assert everything["trade_type"] == "all"
+    assert scoped["trade_type"] == "odte"
+    assert everything["odte"]["selectable"] is True
+
+    assert scoped["stats"]["total_trades"] < everything["stats"]["total_trades"]
+    assert scoped["stats"]["closed_episodes"] == 1
+    assert len(scoped["orders"]) < len(everything["orders"])
+    assert set(scoped["months"]) < set(everything["months"])
+
+    # Tabs with no filter bar must not move: a tab whose numbers change with a
+    # control it does not display leaves the reader nothing to explain it with.
+    assert scoped["annual"] == everything["annual"]
+    assert scoped["monthly"] == everything["monthly"]
+    assert scoped["annual_total"] == everything["annual_total"], (
+        "the Annual table's total row must not follow a filter that tab does "
+        "not show, or it drops below the sum of its own rows"
+    )
+    assert scoped["positions"] == everything["positions"]
+    assert scoped["odte"] == everything["odte"]
+    # And fees have no trade to attach to, so they cannot narrow either.
+    assert scoped["stats"]["fees_base"] == everything["stats"]["fees_base"]
+
+    # The reconciliation the Annual table invites must survive an active filter.
+    assert sum(y["total_trades"] for y in scoped["annual"]) == (
+        scoped["annual_total"]["total_trades"]
+    )
+    # all_time, by contrast, is the Dashboard's own figure and does narrow.
+    assert scoped["all_time"]["total_trades"] < everything["all_time"]["total_trades"]

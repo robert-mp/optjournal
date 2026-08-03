@@ -146,9 +146,11 @@ _NOT_PAYLOAD_BINDINGS = frozenset({
     "Math", "S", "TABS",
     # DOM nodes and the fetch response
     "b", "sel", "m", "r",
+    # the URLSearchParams the state request is built from
+    "qs",
     # local collections; the reads are array methods, not payload keys
-    "arows", "cells", "days", "jrows", "legs", "month", "months", "oc",
-    "odtes", "open", "opts", "orders", "ps", "pts", "rows", "yrs",
+    "arows", "cells", "days", "jrows", "legs", "mons", "month", "months", "oc",
+    "odtes", "open", "opts", "orders", "out", "ps", "pts", "rows", "yrs",
 })
 
 
@@ -547,18 +549,18 @@ def test_restating_positions_reproduces_ibkrs_own_native_figures(state):
 def test_annual_and_odte_are_in_the_payload(state):
     """Both tabs were disabled with hardcoded reasons; now they have data."""
     assert state["annual"], "the Annual tab renders from this"
-    assert set(state["odte"]) == {"cohort", "rest", "unknown_dte"}
+    assert set(state["odte"]) == {"cohort", "rest", "unknown_dte", "selectable"}
     # A cohort in isolation says nothing, so the comparison set must be present.
     assert state["odte"]["rest"]["episodes"] >= 0
 
 
 def test_annual_rows_reconcile_with_the_all_time_row(state):
-    """The Annual table shows all_time as its total row, so they must agree.
+    """The Annual table shows a total row, so it must equal the sum of the years.
 
-    all_time is computed independently of the per-year rows, which is what makes
-    this worth asserting: it is the same check a reader performs by eye.
+    `annual_total` is computed independently of the per-year rows, which is what
+    makes this worth asserting: it is the same check a reader performs by eye.
     """
-    years, everything = state["annual"], state["all_time"]
+    years, everything = state["annual"], state["annual_total"]
     assert sum(y["total_trades"] for y in years) == everything["total_trades"]
     assert sum(y["closed_episodes"] for y in years) == everything["closed_episodes"]
     assert sum(y["net_pnl_base"] for y in years) == pytest.approx(
@@ -642,3 +644,75 @@ def test_demo_refuses_a_query_id(monkeypatch, capsys):
     monkeypatch.setattr(web, "serve", lambda **kw: pytest.fail("must not serve"))
     assert main(["serve", "--demo", "--query-id", "1591754"]) == 2
     assert "Refused" in capsys.readouterr().err
+
+
+# ------------------------------------------- monthly breakdown / trade scope
+
+
+def test_monthly_is_in_the_payload_and_reconciles_with_annual(state):
+    """The Annual tab groups months under years, so the two must agree."""
+    months, years = state["monthly"], state["annual"]
+    assert months, "the Month by month table renders from this"
+    by_year: dict[str, list] = {}
+    for m in months:
+        by_year.setdefault(str(m["month"])[:4], []).append(m)
+    assert set(by_year) == {y["month"] for y in years}
+    for y in years:
+        rows = by_year[y["month"]]
+        assert sum(m["total_trades"] for m in rows) == y["total_trades"]
+        assert sum(m["net_pnl_base"] for m in rows) == pytest.approx(
+            y["net_pnl_base"], abs=1e-9
+        )
+
+
+def test_trade_type_defaults_to_everything(state):
+    assert state["trade_type"] == "all"
+    assert state["trade_type_label"]
+    assert "selectable" in state["odte"], "the page derives the button state from this"
+
+
+def test_trade_type_scope_narrows_the_payload(populated):
+    """Wired end to end: the parameter must reach the aggregations.
+
+    Skips when the archive has no 0DTE round trip to filter to -- the real
+    account does not, which is why the demo suite carries the arithmetic.
+    """
+    kw = dict(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    everything = build_state(**kw)
+    if not everything["odte"]["selectable"]:
+        pytest.skip("no 0DTE round trip in the archive to scope to")
+    scoped = build_state(**kw, trade_type="odte")
+    assert scoped["trade_type"] == "odte"
+    assert scoped["stats"]["total_trades"] < everything["stats"]["total_trades"]
+    assert len(scoped["orders"]) < len(everything["orders"])
+    assert set(scoped["months"]) < set(everything["months"])
+
+
+def test_an_unknown_trade_type_serves_the_whole_journal(populated):
+    """The value comes from a query string, so it must fail open."""
+    kw = dict(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    baseline = build_state(**kw)
+    for bad in ("", "nonsense", "OPTIONS"):
+        state = build_state(**kw, trade_type=bad)
+        assert state["trade_type"] == "all", bad
+        assert state["stats"]["total_trades"] == baseline["stats"]["total_trades"]
+
+
+def test_scope_does_not_reach_the_tabs_without_a_filter_bar(populated):
+    """Positions, Costs, Annual and the cohorts render no filter, so must not narrow.
+
+    A tab whose numbers move with a control it does not display gives the
+    reader no way to explain the change.
+    """
+    kw = dict(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    everything = build_state(**kw)
+    scoped = build_state(**kw, trade_type="odte")
+    assert scoped["positions"] == everything["positions"]
+    assert scoped["costs"] == everything["costs"]
+    assert scoped["annual"] == everything["annual"]
+    assert scoped["monthly"] == everything["monthly"]
+    assert scoped["odte"] == everything["odte"], (
+        "the cohorts compare 0DTE against the rest, so scoping them to 0DTE "
+        "would empty the other side of the comparison"
+    )
+    assert scoped["history"] == everything["history"]
