@@ -34,7 +34,9 @@ _NOT_PAYLOAD = {
     "addEventListener", "background", "catch", "className", "color", "disabled",
     "filter", "isoformat", "join", "json", "length", "map", "ok", "push",
     "querySelector", "replace", "status", "style", "textContent", "then",
-    "title", "toLocaleString",
+    "title", "toLocaleString", "some", "find", "forEach", "concat", "padStart",
+    "split", "slice", "onclick", "onchange", "classList", "dataset", "disabled",
+    "innerHTML", "add", "remove", "getDay", "getDate", "toFixed",
 }
 
 
@@ -76,42 +78,54 @@ def test_state_has_every_panel(state):
 
 
 def test_every_js_property_read_resolves(state):
-    """The regression guard for silently-blank panels."""
+    """The regression guard for silently-blank panels.
+
+    Each JS variable is bound to the payload object it actually holds. The page
+    keeps those names distinct on purpose -- `pos` for a position, `ep` for an
+    episode, `dy` for a calendar day, `pt` for a chart point, `stm` for a
+    statement -- precisely so this mapping is one-to-one and the check means
+    something. Reusing `d` for three different shapes made it unbindable.
+    """
     costs = state["costs"][0]
     history = state["history"]
     episodes = history["open"] or history["closed"]
     orders = state["orders"]
 
     roots: dict[str, dict] = {
-        "s": state,
+        "st": state,
+        "s": state["stats"],
         "c": costs,
         "T": costs["totals"],
         "h": history,
-        "ht": history["totals"],
         # The /api/sync response, which has no fixture -- keys asserted by
         # test_sync_response_shape below.
-        "d": {
+        "res": {
             "kind": None, "ok": None, "message": None, "new_trades": None,
             "new_cash": None, "reused_archive": None, "warnings": None,
         },
+        # Chart points are constructed client-side from stats.days, so their
+        # shape is the page's own contract rather than the API's.
+        "pt": {"x": None, "y": None, "n": None},
     }
+    if state["stats"]["days"]:
+        roots["dy"] = state["stats"]["days"][0]
     if state["positions"]:
-        roots["p"] = state["positions"][0]
+        roots["pos"] = state["positions"][0]
     if orders:
         roots["o"] = orders[0]
         if orders[0].get("legs"):
             roots["l"] = orders[0]["legs"][0]
     if episodes:
-        roots["e"] = episodes[0]
+        roots["ep"] = episodes[0]
     if costs["fx"]:
         roots["f"] = costs["fx"][0]
     if state["statements"]:
-        roots["t"] = state["statements"][0]
+        roots["stm"] = state["statements"][0]
 
     js = _js()
     missing = []
     for var, obj in roots.items():
-        for match in re.finditer(rf"\b{re.escape(var)}\.([a-z_][a-z0-9_]*)\b", js):
+        for match in re.finditer(rf"(?<![\w.]){re.escape(var)}\.([a-z_][a-z0-9_]*)\b", js):
             attr = match.group(1)
             if attr in _NOT_PAYLOAD:
                 continue
@@ -122,6 +136,54 @@ def test_every_js_property_read_resolves(state):
         "the page reads keys the API does not send, so those cells render "
         f"blank rather than failing: {sorted(set(missing))}"
     )
+
+
+def test_stats_panel_keys_present(state):
+    """The dashboard's ten stat cards each need a real key."""
+    s = state["stats"]
+    for key in (
+        "total_trades", "orders", "net_pnl_base", "commissions_base", "fees_base",
+        "wins", "losses", "win_rate", "avg_win_base", "avg_loss_base",
+        "closed_episodes", "open_episodes", "green_days", "red_days", "days",
+        "total_friction_base", "net_liq_base", "gain_pct_of_net_liq",
+    ):
+        assert key in s, f"stats.{key} missing"
+
+
+def test_net_liq_is_unavailable_not_zero(state):
+    """Flex activity statements carry no NAV, so this must be None.
+
+    Reporting 0 would render 'Gain % of Net Liq: 0.0%', which is a wrong
+    answer rather than an absent one.
+    """
+    assert state["stats"]["net_liq_base"] is None
+    assert state["stats"]["gain_pct_of_net_liq"] is None
+
+
+def test_month_filter_narrows_the_payload(populated):
+    from optjournal.stats import available_months
+    from optjournal.db import connect
+
+    conn = connect(populated)
+    months = available_months(conn)
+    conn.close()
+    if not months:
+        pytest.skip("no months with trades")
+
+    scoped = build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None, month=months[0]
+    )
+    assert scoped["selected_month"] == months[0]
+    for day in scoped["stats"]["days"]:
+        assert day["day"].startswith(months[0])
+
+
+def test_unknown_month_falls_back_to_all_time(populated):
+    state = build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None, month="1999-01"
+    )
+    assert state["selected_month"] is None
+    assert state["stats"]["month"] == "ALL"
 
 
 def test_sync_response_shape_matches_what_the_page_reads():
@@ -141,12 +203,25 @@ def test_page_loads_no_external_resources():
 
 
 def test_page_escapes_interpolated_values():
-    """Statement filenames and symbols come from IBKR, so they are untrusted."""
+    """Statement filenames and symbols come from IBKR, so they are untrusted.
+
+    Checks the invariant rather than a literal spelling: every template
+    interpolation mentioning one of these fields must route through esc().
+    An earlier version looked for the exact string `esc(l.symbol)` and broke
+    on `esc(l.underlying_symbol||'')`, which is correct code.
+    """
     js = _js()
     assert "const esc=" in js, "no escaping helper defined"
-    # Every symbol/file interpolation should go through esc().
-    for field in ("p.symbol", "t.file", "l.symbol"):
-        assert f"esc({field})" in js, f"{field} interpolated without esc()"
+
+    untrusted = ("pos.symbol", "stm.file", "l.underlying_symbol", "l.expiry",
+                 "o.underlyings", "o.ib_order_id")
+    unescaped = []
+    for expr in re.finditer(r"\$\{([^{}]*)\}", js):
+        body = expr.group(1)
+        for field in untrusted:
+            if field in body and "esc(" not in body:
+                unescaped.append(f"${{{body.strip()[:60]}}}")
+    assert not unescaped, f"untrusted values interpolated without esc(): {unescaped}"
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.10", "example.com"])
