@@ -1,0 +1,35 @@
+[project]
+name = "optjournal"
+version = "0.1.0"
+description = "Options trading journal backed by IBKR Flex Web Service"
+requires-python = ">=3.12"
+dependencies = [
+    # py_ibkr provides both Flex transport (async statement generation,
+    # reference-code redemption, rate-limit and lockout handling) and
+    # Pydantic-typed parsing. It models 85 of the 86 Trade attributes our
+    # query emits; the only gap is `requestID`, a Flex request artefact
+    # rather than trade data.
+    #
+    # Its models use extra="ignore", so attributes IBKR adds later are
+    # dropped silently rather than raising. tests/test_flex.py guards that.
+    "py-ibkr==0.1.7",
+    "keyring==25.7.0",
+]
+
+[project.scripts]
+optjournal = "optjournal.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/optjournal"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

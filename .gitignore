@@ -1,0 +1,35 @@
+# Virtualenv and caches -- rebuildable from uv.lock.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Archived IBKR statements. DELIBERATELY NOT VERSIONED.
+#
+# These are raw Activity Statements and they contain the account number, the
+# account holder's legal name, every position, every fill and every cash
+# balance for the period. Committing them writes that into git history
+# permanently: adding the directory later is one command, removing it from
+# history is not, and history rewriting is off the table.
+#
+# The tradeoff is real and worth knowing. The test suite uses these as its
+# oracle -- 10 tests are parametrized per archived statement and several more
+# skip without them -- so a fresh clone has a weaker suite until `optjournal
+# fetch` repopulates this directory. Statements also cost requests against
+# IBKR's lockout budget, so treat raw/ as data to back up, not to regenerate
+# casually.
+#
+# To version them anyway:  git add -f raw/
+raw/
+
+# Fetch-state sidecar: local request-budget bookkeeping, not shared state.
+.fetch-state.json
+
+# Derived database. Rebuildable at any time with `optjournal ingest`, and a
+# WAL-mode SQLite file is a poor fit for git regardless -- binary, no useful
+# diff, and two volatile sidecars.
+journal.db
+journal.db-shm
+journal.db-wal

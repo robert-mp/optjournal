@@ -1,0 +1,347 @@
+"""Fold archived Flex statements into the journal database.
+
+Ingest is idempotent by construction. Statements overlap -- a 30-day and a
+365-day query both contain the same fills, verified against real data -- so
+trades and cash transactions are inserted with first-write-wins on IBKR's
+own identifiers, and `first_seen_at` records when the journal first saw a
+row rather than when it was last re-presented.
+
+By default only options are stored (`ASSET_FILTER_OPTIONS`). The raw XML
+stays in the archive, so widening the filter later is a re-ingest from disk
+and costs no IBKR request.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import sqlite3
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from optjournal.flex import load
+from optjournal.sections import raw_sections
+
+__all__ = [
+    "ASSET_FILTER_ALL",
+    "ASSET_FILTER_OPTIONS",
+    "IngestResult",
+    "ingest_file",
+]
+
+log = logging.getLogger(__name__)
+
+ASSET_FILTER_OPTIONS = ("OPT",)
+ASSET_FILTER_ALL: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class IngestResult:
+    source_file: str
+    already_ingested: bool = False
+    #: Set when this file was skipped because another already-ingested file
+    #: holds byte-identical content. Distinct from `already_ingested` alone,
+    #: which also covers re-ingesting the same filename.
+    duplicate_of: str | None = None
+    trades_inserted: int = 0
+    trades_skipped_existing: int = 0
+    trades_filtered_out: int = 0
+    cash_inserted: int = 0
+    cash_skipped_existing: int = 0
+    positions_written: int = 0
+    securities_written: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _f(value: Any) -> float | None:
+    """Coerce to float, tolerating None and blank strings."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _i(value: Any) -> int | None:
+    """Coerce to int. Option quantities are integral; anything else is a bug."""
+    f = _f(value)
+    return None if f is None else int(round(f))
+
+
+def _s(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
+
+
+def _enum_value(value: Any) -> str | None:
+    """py_ibkr yields Enum members; store the wire value, not 'Class.NAME'."""
+    if value is None:
+        return None
+    return _s(getattr(value, "value", value))
+
+
+def _notes(value: Any) -> str | None:
+    """Trade notes arrive as a list of Code enums. Store them wire-form."""
+    if not value:
+        return None
+    if isinstance(value, (list, tuple)):
+        return ";".join(str(getattr(c, "value", c)) for c in value)
+    return _s(getattr(value, "value", value))
+
+
+def _matches_filter(asset_category: str | None, wanted: Iterable[str]) -> bool:
+    allowed = tuple(wanted)
+    if not allowed:
+        return True
+    return (asset_category or "").upper() in allowed
+
+
+def ingest_file(
+    conn: sqlite3.Connection,
+    path: Path,
+    *,
+    assets: Iterable[str] = ASSET_FILTER_OPTIONS,
+    reingest: bool = False,
+) -> IngestResult:
+    """Ingest one archived statement. Safe to call repeatedly."""
+    path = Path(path)
+    raw_bytes = path.read_bytes()
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    result = IngestResult(source_file=path.name)
+
+    if not reingest:
+        existing = conn.execute(
+            "SELECT sha256 FROM statements WHERE source_file = ?", (path.name,)
+        ).fetchone()
+        if existing and existing["sha256"] == digest:
+            result.already_ingested = True
+            return result
+
+        # Same bytes under a different name. `flex._archive` dedupes at write
+        # time, so `fetch` cannot produce this -- but a direct `ingest`, a
+        # copied file, or a restore from backup can, and each one would
+        # otherwise add a redundant provenance row claiming to be a distinct
+        # statement. The row data itself is protected by the primary keys;
+        # this protects `statements` as an audit trail.
+        twin = conn.execute(
+            "SELECT source_file FROM statements WHERE sha256 = ? AND source_file != ?"
+            " ORDER BY ingested_at LIMIT 1",
+            (digest, path.name),
+        ).fetchone()
+        if twin:
+            result.already_ingested = True
+            result.duplicate_of = str(twin["source_file"])
+            result.warnings.append(
+                f"{path.name} is byte-identical to already-ingested "
+                f"{result.duplicate_of}; skipped. Delete it or run "
+                f"`optjournal prune`."
+            )
+            return result
+
+    resp = load(path)
+    sections = raw_sections(path)
+    asset_filter = ",".join(assets) or "ALL"
+
+    for stmt in resp.FlexStatements:
+        conn.execute(
+            "INSERT INTO statements (source_file, sha256, account_id, from_date,"
+            " to_date, when_generated, base_currency, asset_filter, ingested_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(source_file) DO UPDATE SET"
+            " sha256=excluded.sha256, ingested_at=excluded.ingested_at,"
+            " asset_filter=excluded.asset_filter",
+            (
+                path.name,
+                digest,
+                _s(stmt.accountId),
+                _s(stmt.fromDate),
+                _s(stmt.toDate),
+                _s(stmt.whenGenerated),
+                _base_currency(sections),
+                asset_filter,
+                _now(),
+            ),
+        )
+
+        _ingest_trades(conn, stmt, path.name, assets, result)
+        _ingest_cash(conn, stmt, path.name, result)
+
+    _ingest_positions(conn, sections, path.name, assets, result)
+    _ingest_securities(conn, sections, assets, result)
+
+    conn.commit()
+    return result
+
+
+def _base_currency(sections: dict[str, list[dict[str, str]]]) -> str:
+    rows = sections.get("AccountInformation") or []
+    return (rows[0].get("currency") if rows else None) or "EUR"
+
+
+def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult) -> None:
+    for t in stmt.Trades or ():
+        cat = _enum_value(t.assetCategory)
+        if not _matches_filter(cat, assets):
+            result.trades_filtered_out += 1
+            continue
+
+        qty = _i(t.quantity)
+        if qty is None:
+            result.warnings.append(f"trade {t.tradeID}: unparseable quantity")
+            continue
+        raw_qty = _f(t.quantity)
+        if raw_qty is not None and abs(raw_qty - qty) > 1e-9:
+            result.warnings.append(
+                f"trade {t.tradeID}: non-integral quantity {raw_qty} truncated"
+            )
+
+        rate = _f(t.fxRateToBase) or 1.0
+        proceeds = _f(t.proceeds)
+        commission = _f(t.ibCommission)
+        realized = _f(t.fifoPnlRealized)
+
+        cur = conn.execute(
+            "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
+            " account_id, trade_date, date_time, asset_category, symbol, conid,"
+            " underlying_symbol, underlying_conid, put_call, strike, expiry,"
+            " multiplier, buy_sell, open_close, notes, level_of_detail, quantity,"
+            " trade_price, currency, fx_rate_to_base, proceeds, proceeds_base,"
+            " ib_commission, ib_commission_base, taxes, fifo_pnl_realized,"
+            " fifo_pnl_realized_base, mtm_pnl, raw, source_file, first_seen_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(trade_id) DO NOTHING",
+            (
+                _s(t.tradeID), _s(t.ibExecID), _s(t.transactionID), _s(t.ibOrderID),
+                _s(stmt.accountId), _s(t.tradeDate), _s(t.dateTime), cat,
+                _s(t.symbol), _s(t.conid), _s(t.underlyingSymbol),
+                _s(t.underlyingConid), _enum_value(t.putCall), _f(t.strike),
+                _s(t.expiry), _f(t.multiplier), _enum_value(t.buySell),
+                _enum_value(t.openCloseIndicator), _notes(t.notes),
+                _enum_value(t.levelOfDetail), qty, _f(t.tradePrice),
+                _s(t.currency), rate, proceeds,
+                None if proceeds is None else proceeds * rate,
+                commission,
+                None if commission is None else commission * rate,
+                _f(t.taxes), realized,
+                None if realized is None else realized * rate,
+                _f(t.mtmPnl),
+                json.dumps(_model_dump(t), default=str, sort_keys=True),
+                source_file, _now(),
+            ),
+        )
+        if cur.rowcount:
+            result.trades_inserted += 1
+        else:
+            result.trades_skipped_existing += 1
+
+
+def _ingest_cash(conn, stmt, source_file: str, result: IngestResult) -> None:
+    for c in stmt.CashTransactions or ():
+        rate = _f(c.fxRateToBase) or 1.0
+        amount = _f(c.amount) or 0.0
+        cur = conn.execute(
+            "INSERT INTO cash_transactions (transaction_id, account_id, date_time,"
+            " settle_date, type, description, symbol, conid, amount, currency,"
+            " fx_rate_to_base, amount_base, raw, source_file, first_seen_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(transaction_id) DO NOTHING",
+            (
+                _s(c.transactionID), _s(stmt.accountId), _s(c.dateTime),
+                _s(getattr(c, "settleDate", None)), _enum_value(c.type),
+                _s(c.description), _s(c.symbol), _s(c.conid), amount,
+                _s(c.currency), rate, amount * rate,
+                json.dumps(_model_dump(c), default=str, sort_keys=True),
+                source_file, _now(),
+            ),
+        )
+        if cur.rowcount:
+            result.cash_inserted += 1
+        else:
+            result.cash_skipped_existing += 1
+
+
+def _ingest_positions(conn, sections, source_file: str, assets, result) -> None:
+    for row in sections.get("OpenPositions") or ():
+        cat = (row.get("assetCategory") or "").upper()
+        if not _matches_filter(cat, assets):
+            continue
+        rate = _f(row.get("fxRateToBase")) or 1.0
+        value = _f(row.get("positionValue"))
+        conn.execute(
+            "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
+            " asset_category, underlying_symbol, put_call, strike, expiry, multiplier,"
+            " position, mark_price, position_value, position_value_base,"
+            " cost_basis_money, cost_basis_price, fifo_pnl_unrealized, side,"
+            " open_date_time, currency, fx_rate_to_base, raw, source_file, ingested_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(report_date, conid) DO UPDATE SET"
+            " position=excluded.position, mark_price=excluded.mark_price,"
+            " position_value=excluded.position_value,"
+            " position_value_base=excluded.position_value_base,"
+            " fifo_pnl_unrealized=excluded.fifo_pnl_unrealized,"
+            " raw=excluded.raw, source_file=excluded.source_file,"
+            " ingested_at=excluded.ingested_at",
+            (
+                _s(row.get("reportDate")), _s(row.get("conid")),
+                _s(row.get("accountId")), _s(row.get("symbol")), cat,
+                _s(row.get("underlyingSymbol")), _s(row.get("putCall")),
+                _f(row.get("strike")), _s(row.get("expiry")),
+                _f(row.get("multiplier")), _i(row.get("position")),
+                _f(row.get("markPrice")), value,
+                None if value is None else value * rate,
+                _f(row.get("costBasisMoney")), _f(row.get("costBasisPrice")),
+                _f(row.get("fifoPnlUnrealized")), _s(row.get("side")),
+                _s(row.get("openDateTime")), _s(row.get("currency")) or "EUR",
+                rate, json.dumps(row, sort_keys=True), source_file, _now(),
+            ),
+        )
+        result.positions_written += 1
+
+
+def _ingest_securities(conn, sections, assets, result) -> None:
+    for row in sections.get("SecuritiesInfo") or ():
+        cat = (row.get("assetCategory") or "").upper()
+        if not _matches_filter(cat, assets):
+            continue
+        conn.execute(
+            "INSERT INTO securities (conid, symbol, description, asset_category,"
+            " sub_category, currency, multiplier, strike, expiry, put_call,"
+            " underlying_conid, underlying_symbol, isin, listing_exchange, raw,"
+            " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(conid) DO UPDATE SET"
+            " symbol=excluded.symbol, description=excluded.description,"
+            " raw=excluded.raw, updated_at=excluded.updated_at",
+            (
+                _s(row.get("conid")), _s(row.get("symbol")),
+                _s(row.get("description")), cat, _s(row.get("subCategory")),
+                _s(row.get("currency")), _f(row.get("multiplier")),
+                _f(row.get("strike")), _s(row.get("expiry")),
+                _s(row.get("putCall")), _s(row.get("underlyingConid")),
+                _s(row.get("underlyingSymbol")), _s(row.get("isin")),
+                _s(row.get("listingExchange")), json.dumps(row, sort_keys=True),
+                _now(),
+            ),
+        )
+        result.securities_written += 1
+
+
+def _model_dump(model: Any) -> dict[str, Any]:
+    """Best-effort dict of a pydantic model, for the `raw` column."""
+    for attr in ("model_dump", "dict"):
+        fn = getattr(model, attr, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001 - raw column is best-effort
+                break
+    return {}
