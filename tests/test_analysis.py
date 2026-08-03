@@ -17,6 +17,7 @@ from optjournal.analysis import (
     format_report,
 )
 from optjournal.flex import load
+from optjournal.render import costs_data
 
 RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
 ZERO = Decimal("0")
@@ -210,3 +211,70 @@ def test_caveat_reports_autofx_share():
 def test_caveat_when_no_autofx():
     r = analyse(_stmt([_conv("EUR.USD", "-10000", commission="-2")]))
     assert "No conversion carries the AutoFX flag" in r.fx_caveat
+
+
+# --- JSON serialisation ------------------------------------------------------
+#
+# `dataclasses.asdict()` serialises fields only, so every computed total was
+# silently missing from `costs --json`: consumers got the raw components and
+# none of the answers. These pin the contract so the trap cannot return.
+
+
+def _real_report():
+    paths = sorted(RAW_DIR.glob("activity-*.xml"))
+    if not paths:
+        pytest.skip("needs an archived statement")
+    return analyse(load(paths[-1]).FlexStatements[0])
+
+
+def test_costs_data_includes_every_computed_total():
+    data = costs_data(_real_report())
+    for key in (
+        "commission_base", "fees_base", "taxes_base", "autofx_notional_base",
+        "autofx_spread_base", "stated_friction_base", "friction_base",
+        "fx_notional_base", "fx_commission_base",
+    ):
+        assert key in data["totals"], f"totals.{key} missing"
+
+
+def test_costs_data_totals_are_self_consistent():
+    report = _real_report()
+    t = costs_data(report)["totals"]
+    assert t["friction_base"] == pytest.approx(
+        t["stated_friction_base"] + t["autofx_spread_base"]
+    )
+    assert t["stated_friction_base"] == pytest.approx(
+        t["commission_base"] + t["fees_base"] + t["taxes_base"]
+    )
+    assert t["friction_base"] == pytest.approx(float(report.total_friction_base))
+
+
+def test_costs_data_money_is_numeric_not_string():
+    """Decimal + json.dumps(default=str) silently emits money as strings."""
+    import json
+    data = costs_data(_real_report())
+    assert isinstance(data["totals"]["friction_base"], float)
+    assert isinstance(data["fx"][0]["notional_base"], float)
+    round_tripped = json.loads(json.dumps(data))
+    assert isinstance(round_tripped["totals"]["friction_base"], (int, float))
+
+
+def test_costs_data_includes_per_pair_properties():
+    """autofx_spread_base and commission_bps are properties, so asdict drops them."""
+    data = costs_data(_real_report())
+    assert data["fx"], "expected at least one FX pair"
+    for pair in data["fx"]:
+        assert "autofx_spread_base" in pair
+        assert "commission_bps" in pair
+
+
+def test_costs_data_autofx_spread_sums_to_total():
+    data = costs_data(_real_report())
+    assert sum(p["autofx_spread_base"] for p in data["fx"]) == pytest.approx(
+        data["totals"]["autofx_spread_base"]
+    )
+
+
+def test_costs_data_is_json_serialisable():
+    import json
+    json.dumps(costs_data(_real_report()), default=str)

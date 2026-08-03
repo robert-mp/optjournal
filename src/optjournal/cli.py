@@ -29,6 +29,7 @@ from optjournal.flex import FetchCooldown, TokenMissing, fetch, load
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal.render import (
+    costs_data,
     history_data,
     newest_statement,
     orders_data,
@@ -66,6 +67,7 @@ examples:
   optjournal positions                     current option book
   optjournal history                       closed-position P&L, round trip by round trip
   optjournal costs --json                  cost report as JSON
+  optjournal serve --query-id 1591754      local web UI with a Sync now button
 
 path arguments default to the most recently archived statement.
 exit codes: 0 ok, 1 error, 2 config, 3 no data, 4 throttled by IBKR.
@@ -206,7 +208,7 @@ def cmd_costs(args) -> int:
         return _no_statements(args)
     reports = [analyse(s) for s in load(path).FlexStatements]
     _emit(
-        [dataclasses.asdict(r) for r in reports],
+        [costs_data(r) for r in reports],
         "\n\n".join(format_report(r) for r in reports),
         args.json,
     )
@@ -277,6 +279,33 @@ def cmd_history(args) -> int:
     data = history_data(report)
     _emit(data, render_history(data), args.json)
     return EXIT_OK if report.episodes else EXIT_NO_DATA
+
+
+def cmd_serve(args) -> int:
+    """Run the local web UI. Blocks until interrupted."""
+    from optjournal.web import serve
+
+    assets = (
+        ASSET_FILTER_ALL
+        if args.assets.strip().upper() == "ALL"
+        else tuple(a.strip().upper() for a in args.assets.split(",") if a.strip())
+    )
+    try:
+        serve(
+            db_path=args.db,
+            archive_dir=args.archive,
+            query_id=args.query_id,
+            assets=assets,
+            host=args.host,
+            port=args.port,
+        )
+    except ValueError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    except OSError as exc:
+        print(f"\nCould not bind {args.host}:{args.port}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 def cmd_sync(args) -> int:
@@ -477,6 +506,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true",
                    help="bypass the local per-query fetch cooldown")
     p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("serve", parents=[common, archive, database],
+                       help="local web UI (loopback only, no auth)")
+    p.add_argument("--query-id", dest="query_id",
+                   help="Flex Query ID; without it the Sync button is disabled")
+    p.add_argument("--port", type=int, default=8765, help="default: 8765")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="loopback addresses only (default: 127.0.0.1)")
+    p.add_argument("--assets", default="OPT", metavar="LIST",
+                   help="asset categories a UI sync stores (default: OPT)")
+    p.set_defaults(func=cmd_serve)
 
     return ap
 

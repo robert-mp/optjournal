@@ -12,10 +12,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from optjournal.analysis import CostReport
 from optjournal.history import HistoryReport
 from optjournal.sections import raw_sections
 
 __all__ = [
+    "costs_data",
     "history_data",
     "orders_data",
     "positions_data",
@@ -260,6 +262,104 @@ def _day(value: Any, placeholder: str = "-") -> str:
 # -------------------------------------------------------------------- history
 
 
+def _num(value: Any) -> float | None:
+    """Coerce a money/rate value to float for JSON.
+
+    `analysis` computes in Decimal because py_ibkr parses money that way, but
+    Decimal is not JSON-serialisable and `json.dumps(default=str)` silently
+    turns it into a *string* -- so consumers received "42.728611289" where a
+    number was expected. The schema already stores money as REAL, so float is
+    the right wire type; this makes the JSON match that decision.
+    """
+    if value is None:
+        return None
+    return float(value)
+
+
+def _iso(value: Any) -> str | None:
+    """Render a date-like value as an ISO string for JSON.
+
+    py_ibkr parses statement periods into `datetime.date`, which json.dumps
+    rejects. Coercing here rather than leaning on the caller's `default=str`
+    means the payload is self-contained JSON regardless of how it is dumped.
+    """
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def costs_data(report: CostReport) -> Row:
+    """Cost report as a JSON-safe structure.
+
+    Hand-built rather than `dataclasses.asdict(report)`, which was the previous
+    approach and silently wrong: asdict serialises *fields* only, so every
+    computed total -- friction, commission, fees, the AutoFX estimate -- was
+    absent from `costs --json`, leaving consumers a payload of raw components
+    and no answers. The same trap applies per pair, where `autofx_spread_base`
+    and `commission_bps` are properties.
+    """
+    return {
+        "base_currency": report.base_currency,
+        "from_date": _iso(report.from_date),
+        "to_date": _iso(report.to_date),
+        "fx_caveat": report.fx_caveat,
+        "fx": [
+            {
+                "symbol": p.symbol,
+                "conversions": p.conversions,
+                "notional_base": _num(p.notional_base),
+                "commission_base": _num(p.commission_base),
+                "commission_bps": _num(p.commission_bps),
+                "autofx_conversions": p.autofx_conversions,
+                "autofx_notional_base": _num(p.autofx_notional_base),
+                "autofx_spread_base": _num(p.autofx_spread_base),
+            }
+            for p in report.fx
+        ],
+        "commissions": [
+            {
+                "asset_category": g.asset_category,
+                "fills": g.fills,
+                "quantity": g.quantity,
+                "commission_base": _num(g.commission_base),
+                "taxes_base": _num(g.taxes_base),
+                "per_unit_base": _num(g.per_unit_base),
+            }
+            for g in report.commissions
+        ],
+        "fees": [
+            {
+                "name": c.name,
+                "count": c.count,
+                "total_base": _num(c.total_base),
+                "examples": list(c.examples),
+            }
+            for c in report.fees
+        ],
+        "withholding": [
+            {
+                "symbol": w.symbol,
+                "currency": w.currency,
+                "gross_base": _num(w.gross_base),
+                "withheld_base": _num(w.withheld_base),
+                "effective_rate": _num(w.effective_rate),
+            }
+            for w in report.withholding
+        ],
+        "totals": {
+            "commission_base": _num(report.total_commission_base),
+            "fees_base": _num(report.total_fees_base),
+            "taxes_base": _num(report.total_taxes_base),
+            "autofx_notional_base": _num(report.total_autofx_notional_base),
+            "autofx_spread_base": _num(report.total_autofx_spread_base),
+            "stated_friction_base": _num(report.total_stated_friction_base),
+            "friction_base": _num(report.total_friction_base),
+            "fx_notional_base": _num(report.total_fx_notional_base),
+            "fx_commission_base": _num(report.total_fx_commission_base),
+        },
+    }
+
+
 def history_data(report: HistoryReport) -> Row:
     """Closed-position history as a JSON-safe structure."""
     def one(e) -> Row:
@@ -301,8 +401,8 @@ def history_data(report: HistoryReport) -> Row:
         "totals": {
             "closed_episodes": len(report.closed),
             "open_episodes": len(report.open),
-            "realized_base": report.total_realized_base,
-            "commission_base": report.total_commission_base,
+            "realized_base": _num(report.total_realized_base),
+            "commission_base": _num(report.total_commission_base),
             "wins": report.wins,
             "losses": report.losses,
             "win_rate": report.win_rate,

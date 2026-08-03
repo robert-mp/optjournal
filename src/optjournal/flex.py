@@ -39,7 +39,9 @@ __all__ = [
     "FetchResult",
     "TokenMissing",
     "archive_digest",
+    "cooldown_remaining",
     "fetch",
+    "last_fetch",
     "load",
     "read_token",
 ]
@@ -212,6 +214,28 @@ def _check_cooldown(archive_dir: Path, query_id: str, cooldown_s: int) -> None:
             last_fetch=last,
             retry_after_s=int((timedelta(seconds=cooldown_s) - elapsed).total_seconds()),
         )
+
+
+def cooldown_remaining(
+    archive_dir: Path, query_id: str, cooldown_s: int = FETCH_COOLDOWN_S
+) -> int:
+    """Seconds until `query_id` may be fetched again; 0 when allowed now.
+
+    The non-raising counterpart to `_check_cooldown`, for callers that want to
+    show or reason about the guard rather than be stopped by it -- a UI needs
+    to grey out a button and say why, not catch an exception to find out.
+    """
+    try:
+        _check_cooldown(archive_dir, query_id, cooldown_s)
+    except FetchCooldown as exc:
+        return max(0, exc.retry_after_s)
+    return 0
+
+
+def last_fetch(archive_dir: Path, query_id: str) -> str | None:
+    """ISO timestamp of the last fetch of `query_id`, or None if never."""
+    entry = _read_state(archive_dir).get(str(query_id)) or {}
+    return entry.get("last_fetch")
 
 
 def _record_fetch(archive_dir: Path, query_id: str, digest: str, path: Path) -> None:
