@@ -844,8 +844,43 @@ function cog(){
   </div>`;
 }
 
+/* ------------------------------------------------ view state in the URL
+
+   The filter, the month and the tab live in the hash so a reload lands on the
+   view you left, and so a link carries it. Persisting only the trade filter
+   would have been worse than persisting nothing: reload would restore the 0DTE
+   scope while silently dropping the month and jumping to the Dashboard, a
+   combination that was never on screen.
+
+   `replaceState`, not `location.hash = ...`: assigning pushes a history entry
+   per click, so toggling a filter a few times buries the page under back-button
+   history. Nothing here is a navigation. */
+const HASH_TABS=()=>TABS.filter(t=>!t[2]).map(t=>t[0]);
+function applyHash(){
+  /* Not `h` -- that is the history payload everywhere else in this page, and
+     one name for two shapes is what blinds the payload guard to both. */
+  const hs=new URLSearchParams(String(location.hash||'').replace(/^#/,''));
+  const tab=hs.get('tab');
+  /* Validated against the enabled tabs rather than trusted: an unknown or
+     disabled id would otherwise render "nothing here yet" from a URL. */
+  if(tab&&HASH_TABS().includes(tab)) S.tab=tab;
+  S.type=hs.get('type')||null;
+  S.month=hs.get('month')||null;
+}
+function syncHash(){
+  const hs=new URLSearchParams();
+  /* Defaults are omitted so the common case has a clean URL, and so a stale
+     key cannot outlive the state it described. */
+  if(S.tab&&S.tab!=='dashboard') hs.set('tab',S.tab);
+  if(S.type) hs.set('type',S.type);
+  if(S.month) hs.set('month',S.month);
+  const next=hs.toString()?'#'+hs:'';
+  if(next!==(location.hash||'')) history.replaceState(null,'',location.pathname+next);
+}
+
 /* ------------------------------------------------ shell */
 function draw(){
+  syncHash();
   renderTabs();
   renderCcy();
   const views={dashboard,calendar,trades,positions,costs,annual,odte};
@@ -914,5 +949,19 @@ $('#sync').onclick=async()=>{
   await load();
 };
 
+/* An edited or externally set hash is honoured, so the URL is the source of
+   truth rather than a write-only echo of it. `replaceState` does not fire
+   hashchange, so `syncHash` cannot feed this back into a loop.
+
+   Reloads only when the server-side keys moved: the tab is drawn from state
+   already in hand, and refetching for it would spend a request to render the
+   same payload. */
+window.onhashchange=()=>{
+  const was=[S.type,S.month].join('|');
+  applyHash();
+  if([S.type,S.month].join('|')!==was) load(); else draw();
+};
+
+applyHash();
 load();
 </script></body></html>

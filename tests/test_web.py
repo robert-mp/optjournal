@@ -146,8 +146,10 @@ _NOT_PAYLOAD_BINDINGS = frozenset({
     "Math", "S", "TABS",
     # DOM nodes and the fetch response
     "b", "sel", "m", "r",
-    # the URLSearchParams the state request is built from
-    "qs",
+    # browser globals the view-state-in-the-hash code reads
+    "location", "window",
+    # the URLSearchParams the state request and the hash are built from
+    "qs", "hs",
     # local collections; the reads are array methods, not payload keys
     "arows", "cells", "days", "jrows", "legs", "mons", "month", "months", "oc",
     "odtes", "open", "opts", "orders", "out", "ps", "pts", "rows", "yrs",
@@ -716,3 +718,58 @@ def test_scope_does_not_reach_the_tabs_without_a_filter_bar(populated):
         "would empty the other side of the comparison"
     )
     assert scoped["history"] == everything["history"]
+
+
+# --------------------------------------------------------- view state in URL
+
+
+def test_hash_is_written_with_replace_state_not_by_assignment():
+    """Assigning location.hash pushes a history entry per click.
+
+    Toggling a filter a few times would then bury the page under back-button
+    history for changes that are not navigations.
+    """
+    js = _code_only(_js())
+    assert "history.replaceState" in js
+    assert not re.search(r"location\.hash\s*=", js), (
+        "assigning location.hash pushes history; use replaceState"
+    )
+    assert "pushState" not in js
+
+
+def test_hash_carries_every_piece_of_view_state():
+    """Persisting only the filter restores a view that was never on screen.
+
+    Reload would come back with the 0DTE scope applied but the month dropped
+    and the tab reset to Dashboard.
+    """
+    js = _code_only(_js())
+    for key in ("'tab'", "'type'", "'month'"):
+        assert f"hs.set({key}," in js, f"{key} is not written to the hash"
+        assert f"hs.get({key})" in js, f"{key} is not read back from the hash"
+
+
+def test_hash_is_applied_before_the_first_load():
+    """Applied after loading would fetch the default view and then discard it."""
+    js = _code_only(_js())
+    assert re.search(r"applyHash\(\);\s*load\(\);", js), (
+        "applyHash must run before the initial load"
+    )
+
+
+def test_a_tab_from_the_hash_is_validated_against_the_enabled_tabs():
+    """An unknown or disabled id in the URL must not render an empty tab."""
+    js = _code_only(_js())
+    assert "HASH_TABS().includes(tab)" in js
+    # Built from TABS with the disabled ones filtered out, so it cannot drift
+    # from the tab bar as tabs are added or gated.
+    assert re.search(r"HASH_TABS\s*=\s*\(\)\s*=>\s*TABS\.filter", js)
+
+
+def test_hashchange_only_refetches_when_the_server_side_keys_moved():
+    """The tab is drawn from state in hand; refetching for it wastes a request."""
+    js = _code_only(_js())
+    handler = js.split("onhashchange")[1]
+    assert "load()" in handler and "draw()" in handler, (
+        "the handler must choose between refetching and redrawing"
+    )

@@ -330,22 +330,16 @@ def available_months(
 
 
 def available_years(
-    conn: sqlite3.Connection,
-    asset_category: str | None = "OPT",
-    scope: TradeScope = ALL_TRADES,
+    conn: sqlite3.Connection, asset_category: str | None = "OPT"
 ) -> list[str]:
-    """Years with at least one trade in scope, newest first."""
+    """Years with at least one trade, newest first.
+
+    Unscoped, unlike `available_months`: the only caller is the Annual tab,
+    which shows no filter bar and so must not narrow. See `build_state`.
+    """
     where, params = ("WHERE asset_category = ?", (asset_category,)) if asset_category else ("", ())
-    rows = conn.execute(
-        f"SELECT DISTINCT trade_date, trade_id FROM trades {where}", params
-    ).fetchall()
-    years = {
-        d[:4]
-        for d in (
-            _day_of(r["trade_date"]) for r in rows if scope.has_trade(r["trade_id"])
-        )
-        if d
-    }
+    rows = conn.execute(f"SELECT DISTINCT trade_date FROM trades {where}", params).fetchall()
+    years = {d[:4] for d in (_day_of(r["trade_date"]) for r in rows) if d}
     return sorted(years, reverse=True)
 
 
@@ -355,7 +349,6 @@ def _period_stats(
     *,
     asset_category: str | None,
     base_currency: str,
-    scope: TradeScope,
 ) -> list[MonthStats]:
     """`month_stats` over several periods, sharing one episode history pass.
 
@@ -370,7 +363,7 @@ def _period_stats(
     return [
         month_stats(
             conn, period, asset_category=asset_category,
-            base_currency=base_currency, scope=scope, report=report,
+            base_currency=base_currency, report=report,
         )
         for period in periods
     ]
@@ -381,7 +374,6 @@ def annual_stats(
     *,
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
-    scope: TradeScope = ALL_TRADES,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar year, newest first.
 
@@ -390,10 +382,15 @@ def annual_stats(
     monthly and annual views together. A year with fills but nothing closed
     still gets a row: "traded, decided nothing" is a real outcome and hiding
     it would make the years stop accounting for all the activity.
+
+    Takes no `TradeScope`, unlike `month_stats`. The Annual tab renders no
+    filter bar, and a tab whose numbers move with a control it does not display
+    leaves the reader nothing to explain the change with. A scope parameter here
+    would be an unused hook inviting exactly that.
     """
     return _period_stats(
-        conn, available_years(conn, asset_category, scope),
-        asset_category=asset_category, base_currency=base_currency, scope=scope,
+        conn, available_years(conn, asset_category),
+        asset_category=asset_category, base_currency=base_currency,
     )
 
 
@@ -402,17 +399,19 @@ def monthly_stats(
     *,
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
-    scope: TradeScope = ALL_TRADES,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar month, newest first.
 
     The same rows the month selector produces one at a time, so the Annual
     tab's breakdown and the Dashboard agree for any month the reader checks --
     they are the same call with the same period string.
+
+    Unscoped for the same reason as `annual_stats`: it feeds the Annual tab,
+    which carries no filter.
     """
     return _period_stats(
-        conn, available_months(conn, asset_category, scope),
-        asset_category=asset_category, base_currency=base_currency, scope=scope,
+        conn, available_months(conn, asset_category),
+        asset_category=asset_category, base_currency=base_currency,
     )
 
 
