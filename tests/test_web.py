@@ -121,6 +121,14 @@ def test_every_js_property_read_resolves(state):
         roots["f"] = costs["fx"][0]
     if state["statements"]:
         roots["stm"] = state["statements"][0]
+    # The currency toggle's own bindings. Registering them here is what puts
+    # the new code inside the guard's reach -- an unregistered binding is
+    # invisible to it, which is how `p.fifo_pnl_unrealized` shipped blank.
+    fx = state.get("fx") or {}
+    roots["fx"] = fx
+    if fx.get("quotes"):
+        roots["q"] = fx["quotes"][0]
+        roots["qo"] = fx["quotes"][0]
 
     js = _js()
     missing = []
@@ -267,3 +275,86 @@ def test_build_state_survives_an_empty_database(tmp_path):
     assert state["positions"] == []
     assert state["costs"] == []
     json.dumps(state)
+
+
+def test_fx_offers_the_base_and_at_least_one_quote(state):
+    """The toggle needs a base and something to switch to.
+
+    Quotes are whatever the snapshot holds, not a hardcoded list: an options-only
+    journal yields USD alone, while ingesting every asset class also surfaces the
+    KRW and SEK positions. Pinning this to exactly ["USD"] would encode the
+    narrower ingest as if it were the only one.
+    """
+    fx = state["fx"]
+    assert fx["base"] == state["stats"]["base_currency"]
+    assert fx["base"]
+    codes = [q["code"] for q in fx["quotes"]]
+    assert "USD" in codes
+    assert len(codes) == len(set(codes)), "a currency must not be offered twice"
+
+
+def test_fx_never_quotes_the_base_currency(state):
+    """Offering EUR->EUR would imply a conversion that does not happen."""
+    fx = state["fx"]
+    assert fx["base"] not in [q["code"] for q in fx["quotes"]]
+
+
+def _usd_quote(state) -> dict:
+    """The USD quote, selected by code -- index 0 is not guaranteed to be USD."""
+    for quote in state["fx"]["quotes"]:
+        if quote["code"] == "USD":
+            return quote
+    pytest.skip("needs a USD rate in the snapshot")
+
+
+def test_fx_quote_inverts_the_stored_rate(state, populated):
+    """`fx_rate_to_base` is native->base, so a base->native quote must invert it.
+
+    Getting this backwards is silent: 0.867 and 1.153 are both plausible-looking
+    EUR/USD rates, and the page would render totals 33% adrift with no error.
+    """
+    conn = sqlite3.connect(populated)
+    stored = conn.execute(
+        "SELECT fx_rate_to_base FROM position_snapshots WHERE currency = 'USD'"
+        " ORDER BY report_date DESC LIMIT 1"
+    ).fetchone()[0]
+    conn.close()
+    quote = _usd_quote(state)
+    assert quote["per_base"] == pytest.approx(1.0 / stored, rel=1e-12)
+    assert quote["per_base"] > 1.0 > stored
+
+
+def test_fx_quote_carries_its_provenance(state):
+    """A rate with no date or source is not auditable, so it must not ship bare."""
+    quote = _usd_quote(state)
+    assert quote["as_of"]
+    assert quote["source"]
+
+
+def test_fx_has_no_quotes_without_a_snapshot(tmp_path):
+    """No dated rate means no toggle -- the page must not invent one."""
+    db = tmp_path / "empty.db"
+    conn = connect(db)
+    migrate(conn)
+    conn.close()
+    state = build_state(db_path=db, archive_dir=tmp_path, query_id=None)
+    assert state["fx"]["quotes"] == []
+
+
+def test_restating_positions_reproduces_ibkrs_own_native_figures(state):
+    """The strongest available check that the rate is applied the right way up.
+
+    Position values were converted by IBKR at this very snapshot's rate, so
+    restating the base figures back into the native currency must reproduce the
+    native figures exactly. It holds only because both sides share one rate and
+    one date -- the cost report spans a year of conversions at many rates, so
+    there the restatement is genuinely an approximation, which is why the page
+    labels it rather than presenting it as IBKR's own.
+    """
+    usd = [p for p in state["positions"] if p["currency"] == "USD"]
+    if not usd:
+        pytest.skip("needs a USD position")
+    per_base = _usd_quote(state)["per_base"]
+    restated = sum(p["position_value_base"] for p in usd) * per_base
+    native = sum(p["position_value"] for p in usd)
+    assert restated == pytest.approx(native, rel=1e-9)

@@ -74,6 +74,41 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _fx_quotes(conn, base: str) -> list[dict[str, Any]]:
+    """Alternative display currencies, with the rate converting base into each.
+
+    A quote here is a *presentation* rate, not a reconciliation. Every `*_base`
+    figure in this payload was converted by IBKR at its own trade or snapshot
+    date, so no single rate reproduces them all -- on this account the
+    order-implied USD rate (0.87952, trade date) and the snapshot rate (0.86732)
+    differ by 1.4%. Displaying totals in a non-base currency therefore restates
+    them at one stated rate, and the page labels it that way rather than letting
+    the numbers look like IBKR's own.
+
+    The newest position snapshot is the only dated FX rate the statement gives
+    us. With no snapshot there are no quotes, and the page hides the toggle
+    rather than inventing a rate.
+    """
+    rows = conn.execute(
+        "SELECT currency, fx_rate_to_base, report_date FROM position_snapshots"
+        " WHERE fx_rate_to_base IS NOT NULL AND fx_rate_to_base > 0"
+        " ORDER BY report_date DESC"
+    ).fetchall()
+    quotes: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = str(row["currency"] or "").upper()
+        if not code or code == base.upper() or code in quotes:
+            continue
+        quotes[code] = {
+            "code": code,
+            # Stored rate is native -> base, so invert for base -> native.
+            "per_base": 1.0 / float(row["fx_rate_to_base"]),
+            "as_of": str(row["report_date"] or ""),
+            "source": "position snapshot",
+        }
+    return list(quotes.values())
+
+
 def build_state(
     *,
     db_path: Path,
@@ -112,6 +147,8 @@ def build_state(
             "history": history_data(build_history(conn, asset_category=asset_category)),
             "statements": statements_data(archive_dir, conn),
         }
+        base_ccy = str(state["stats"].get("base_currency") or "")
+        state["fx"] = {"base": base_ccy, "quotes": _fx_quotes(conn, base_ccy)}
     finally:
         conn.close()
 
