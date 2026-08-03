@@ -8,12 +8,16 @@ happened in March, and what happened on the 14th.
 Two deliberate choices about what gets counted, because the obvious approach
 is wrong in both cases:
 
-* **Realised P&L comes from `fifo_pnl_realized_base`, summed per day.** IBKR
-  computes it per fill and it is already net of both opening and closing
-  commission -- verified arithmetically in `history`. Deriving daily P&L by
-  reconstructing episodes and then apportioning them across days would be
-  more machinery for a worse answer, because an episode spanning three days
-  has no principled daily split.
+* **Options P&L counts only fully closed round trips, attributed to the day
+  the position closed.** Summing IBKR's per-fill `fifo_pnl_realized_base` --
+  the previous rule, still used for other asset categories -- has two leaks
+  for options: a *partial* close books realised P&L while the position is
+  still open (sell 2, buy back 1: IBKR realises the 1-lot immediately), and
+  a close spanning two days scatters one outcome across both. Episode-based
+  P&L makes the money follow the same rule as the win/loss counts: nothing
+  counts until the position is flat, and the whole outcome lands on the
+  close date. Premium collected on an open short is therefore never P&L --
+  it is a liability until the position closes.
 
 * **Win/loss counts come from episodes, not fills.** A round trip closed by
   two partial fills is one outcome, not two, so counting fills would inflate
@@ -21,6 +25,11 @@ is wrong in both cases:
   that is what "how many executions" means; the win/loss block counts
   episodes because that is what "did it work" means. The dashboard labels
   which is which rather than blurring them.
+
+Other asset categories keep the per-fill sum: IBKR's per-fill realised P&L
+is the correct realisation rule for share lots (each lot sold is realised,
+full stop), and "closed" for an open-ended stock holding is not the crisp
+event it is for an options round trip.
 """
 
 from __future__ import annotations
@@ -35,6 +44,8 @@ __all__ = [
     "ALL_TRADES",
     "Cohort",
     "DayPnl",
+    "EQUITY_CATEGORY",
+    "EQUITY_TRADES",
     "MonthStats",
     "TradeScope",
     "annual_stats",
@@ -130,10 +141,19 @@ class MonthStats:
     avg_win_base: float | None = None
     avg_loss_base: float | None = None
 
-    #: Not derivable from an Activity statement: it carries no Net Asset Value.
-    #: Enabling the "Equity Summary in Base" section on the Flex query template
-    #: would supply it. None means "unavailable", not "zero".
+    #: Net premium sitting in *currently open* episodes: positive when short
+    #: premium was collected, negative for long debits. Point-in-time like
+    #: `open_episodes`, not a period figure. Reported so the money excluded
+    #: from Net P&L is visible somewhere honest -- collected premium is a
+    #: liability until the position closes, not profit.
+    open_premium_base: float = 0.0
+
+    #: Net Asset Value at the period's end, from the newest equity summary on
+    #: or before it. None when the Flex query template does not have the
+    #: "Equity Summary in Base" section enabled -- unavailable, not zero.
     net_liq_base: float | None = None
+    #: The summary date the figure came from, so a stale NAV is labelled.
+    net_liq_date: str | None = None
 
     days: list[DayPnl] = field(default_factory=list)
 
@@ -242,6 +262,14 @@ class TradeScope:
 
 #: The default: no filtering at all, and no id sets to build or carry.
 ALL_TRADES = TradeScope(key="all", label="Options")
+
+#: The Equities selection. Not a fill subset like the 0DTE scope but a switch
+#: to a different asset category -- stocks are not a kind of options trade --
+#: so its id sets stay None ("everything") and `build_state` swaps the
+#: category the summations run over instead. It lives here so the UI, the
+#: `?type=` parameter and the payload share one key/label vocabulary.
+EQUITY_TRADES = TradeScope(key="equities", label="Equities")
+EQUITY_CATEGORY = "STK"
 
 
 def odte_scope(
@@ -498,16 +526,29 @@ def cohort_data(c: Cohort) -> dict[str, Any]:
     }
 
 
+#: The category whose P&L is episode-based. Exactly "OPT": for anything else
+#: -- including the mixed `asset_category=None` -- the per-fill rule stands,
+#: which is what "preserve existing behaviour for other asset types" means.
+_EPISODE_PNL_CATEGORY = "OPT"
+
+
 def daily_series(
     conn: sqlite3.Connection,
     period: str | None = None,
     asset_category: str | None = "OPT",
     scope: TradeScope = ALL_TRADES,
+    report: Any = None,
 ) -> list[DayPnl]:
     """Realised P&L and fill count per calendar day, ascending.
 
-    `period` is a year or a month; see `_in_period`.
+    `period` is a year or a month; see `_in_period`. Fill counts always land
+    on the fill's own day -- they measure activity. Where the *money* lands
+    depends on the category: options P&L is attributed to the day the round
+    trip closed (see the module docstring), so a day with only opening or
+    partial-close fills shows activity and no P&L. Other categories keep
+    IBKR's per-fill realisation on the fill's day.
     """
+    episode_pnl = asset_category == _EPISODE_PNL_CATEGORY
     clauses, params = [], []
     if asset_category:
         clauses.append("asset_category = ?")
@@ -525,8 +566,49 @@ def daily_series(
             continue
         bucket = buckets.setdefault(day, DayPnl(day=day))
         bucket.trades += 1
-        bucket.realized_base += row["fifo_pnl_realized_base"] or 0.0
+        if not episode_pnl:
+            bucket.realized_base += row["fifo_pnl_realized_base"] or 0.0
+
+    if episode_pnl:
+        if report is None:
+            report = build_history(conn, asset_category=asset_category)
+        for ep in report.closed:
+            day = _day_of(ep.closed_at)
+            if day is None or not _in_period(ep.closed_at, period):
+                continue
+            if not scope.has_episode(ep):
+                continue
+            bucket = buckets.setdefault(day, DayPnl(day=day))
+            bucket.realized_base += ep.realized_pnl_base
     return [buckets[k] for k in sorted(buckets)]
+
+
+def _net_liq_for(
+    conn: sqlite3.Connection, period: str | None
+) -> tuple[float | None, str | None]:
+    """NAV at a period's end: the newest equity summary on or before it.
+
+    "On or before" rather than "inside": a month with trades but no summary
+    row (the section was enabled later, or the archive starts mid-history)
+    still gets the latest known NAV rather than pretending none exists. The
+    date rides along so the display can say how stale the figure is.
+
+    Comparing normalised day strings works because both sides are ISO-ordered;
+    the period end key is the period prefix plus '\uffff', which sorts after
+    every day inside it and before the next period.
+    """
+    rows = conn.execute(
+        "SELECT report_date, total_base FROM equity_summaries"
+        " ORDER BY report_date"
+    ).fetchall()
+    end_key = (period + "\uffff") if period else "\uffff"
+    best: tuple[float | None, str | None] = (None, None)
+    for row in rows:
+        day = _day_of(row["report_date"])
+        if day is None or day > end_key:
+            continue
+        best = (row["total_base"], day)
+    return best
 
 
 def month_stats(
@@ -561,6 +643,7 @@ def month_stats(
         params.append(asset_category)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
+    episode_pnl = asset_category == _EPISODE_PNL_CATEGORY
     orders: set[str] = set()
     for row in conn.execute(
         f"SELECT trade_date, trade_id, ib_order_id, fifo_pnl_realized_base,"
@@ -573,7 +656,10 @@ def month_stats(
         stats.total_trades += 1
         if row["ib_order_id"]:
             orders.add(str(row["ib_order_id"]))
-        stats.net_pnl_base += row["fifo_pnl_realized_base"] or 0.0
+        if not episode_pnl:
+            # Per-fill realisation: the rule for share lots, where each lot
+            # sold is realised and "fully closed" is not a crisp event.
+            stats.net_pnl_base += row["fifo_pnl_realized_base"] or 0.0
         stats.commissions_base += row["ib_commission_base"] or 0.0
     stats.orders = len(orders)
 
@@ -604,13 +690,23 @@ def month_stats(
     ]
     stats.closed_episodes = len(closed)
     stats.open_episodes = sum(1 for e in report.open if scope.has_episode(e))
+    if episode_pnl:
+        # The whole outcome of a fully closed round trip, landing on its close
+        # date. An open episode contributes nothing -- including any realised
+        # P&L IBKR booked on a *partial* close, and any premium collected on
+        # the opening sale. Those count on the day the position goes flat.
+        stats.net_pnl_base = sum(e.realized_pnl_base for e in closed)
+    stats.open_premium_base = sum(
+        e.proceeds_base for e in report.open if scope.has_episode(e)
+    )
     wins = [e.realized_pnl_base for e in closed if e.realized_pnl_base > 0]
     losses = [e.realized_pnl_base for e in closed if e.realized_pnl_base < 0]
     stats.wins, stats.losses = len(wins), len(losses)
     stats.avg_win_base = sum(wins) / len(wins) if wins else None
     stats.avg_loss_base = sum(losses) / len(losses) if losses else None
+    stats.net_liq_base, stats.net_liq_date = _net_liq_for(conn, period)
 
-    stats.days = daily_series(conn, period, asset_category, scope)
+    stats.days = daily_series(conn, period, asset_category, scope, report=report)
     return stats
 
 
@@ -632,7 +728,9 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "win_rate": stats.win_rate,
         "avg_win_base": stats.avg_win_base,
         "avg_loss_base": stats.avg_loss_base,
+        "open_premium_base": stats.open_premium_base,
         "net_liq_base": stats.net_liq_base,
+        "net_liq_date": stats.net_liq_date,
         "gain_pct_of_net_liq": stats.gain_pct_of_net_liq,
         "options_friction_base": stats.options_friction_base,
         "account_friction_base": stats.account_friction_base,

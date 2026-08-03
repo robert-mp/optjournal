@@ -30,7 +30,7 @@ from optjournal.demo import (
 )
 from optjournal.flex import load
 from optjournal.history import build_history
-from optjournal.ingest import ASSET_FILTER_OPTIONS, ingest_file
+from optjournal.ingest import ingest_file
 from optjournal.stats import (
     ALL_TRADES,
     _day_of,
@@ -56,7 +56,8 @@ def demo(tmp_path) -> Path:
 def conn(demo, tmp_path):
     db = connect(tmp_path / "demo.db")
     migrate(db)
-    ingest_file(db, demo, assets=ASSET_FILTER_OPTIONS)
+    # The production default: everything stored, categories scoped per query.
+    ingest_file(db, demo)
     yield db
     db.close()
 
@@ -86,9 +87,13 @@ def test_trade_arithmetic_is_self_consistent(demo):
     """The generator is under test too: these identities are IBKR's own."""
     for t in load(demo).FlexStatements[0].Trades or ():
         qty, price = Decimal(t.quantity), Decimal(str(t.tradePrice))
-        assert Decimal(str(t.tradeMoney)) == qty * price * MULTIPLIER, t.symbol
+        # The multiplier comes off the row, not from a constant: options carry
+        # 100, stock carries 1, and using one for the other is exactly the
+        # arithmetic slip this identity exists to catch.
+        mult = Decimal(str(t.multiplier))
+        assert Decimal(str(t.tradeMoney)) == qty * price * mult, t.symbol
         # proceeds is the cash effect, so it is signed opposite to the position.
-        assert Decimal(str(t.proceeds)) == -qty * price * MULTIPLIER, t.symbol
+        assert Decimal(str(t.proceeds)) == -qty * price * mult, t.symbol
         assert (Decimal(str(t.netCash))
                 == Decimal(str(t.proceeds)) + Decimal(str(t.ibCommission))), t.symbol
         assert (t.buySell.value if hasattr(t.buySell, "value") else t.buySell) == (
@@ -120,7 +125,7 @@ def test_refuses_to_touch_the_real_archive_or_database(tmp_path):
 
 def test_ingests_cleanly(conn, demo):
     """No warnings, and a second pass inserts nothing."""
-    again = ingest_file(conn, demo, assets=ASSET_FILTER_OPTIONS, reingest=True)
+    again = ingest_file(conn, demo, reingest=True)
     assert again.warnings == []
     assert again.trades_inserted == 0, "re-ingest must be idempotent"
     assert again.trades_skipped_existing > 0
@@ -182,11 +187,16 @@ def test_has_a_zero_day_round_trip(conn):
 
 
 def test_leaves_positions_open_including_one_without_fills(conn):
-    """Both open-position paths: reconstructed from fills, and snapshot-only."""
+    """All three open-position paths: reconstructed from fills, snapshot-only,
+    and partially closed -- the one whose booked P&L must stay out of the
+    totals until the position is flat."""
     open_eps = build_history(conn).open
-    assert len(open_eps) == 2
+    assert len(open_eps) == 3
     assert any(e.snapshot_only for e in open_eps), "no snapshot-only position"
     assert any(not e.snapshot_only for e in open_eps), "no fill-derived position"
+    assert any(
+        e.close_fills and e.net_qty != 0 for e in open_eps
+    ), "no partially closed position"
 
 
 # ----------------------------------------------------------------- annual/0DTE
@@ -397,7 +407,7 @@ def test_the_months_account_for_everything(conn):
     """Same reconciliation as the years, one granularity down."""
     months = monthly_stats(conn)
     everything = month_stats(conn, None)
-    assert len(months) == 13, "the demo spans thirteen months"
+    assert len(months) == 14, "the demo spans fourteen months with option fills"
     assert sum(m.total_trades for m in months) == everything.total_trades
     assert sum(m.closed_episodes for m in months) == everything.closed_episodes
     assert sum(m.net_pnl_base for m in months) == pytest.approx(
@@ -448,7 +458,7 @@ def test_the_scope_reaches_the_payload_end_to_end(demo, tmp_path):
     db = tmp_path / "state.db"
     conn = connect(db)
     migrate(conn)
-    ingest_file(conn, demo, assets=ASSET_FILTER_OPTIONS)
+    ingest_file(conn, demo)
     conn.close()
 
     kw = dict(db_path=db, archive_dir=demo.parent, query_id=None)
@@ -483,3 +493,144 @@ def test_the_scope_reaches_the_payload_end_to_end(demo, tmp_path):
     )
     # all_time, by contrast, is the Dashboard's own figure and does narrow.
     assert scoped["all_time"]["total_trades"] < everything["all_time"]["total_trades"]
+
+
+# ------------------------------------------------- closed-trades-only P&L
+
+
+def test_a_partial_close_contributes_nothing_until_the_position_is_flat(conn):
+    """The case that separates episode P&L from summing per-fill realisation.
+
+    The demo sells 3 puts and buys back 1: IBKR books realised P&L on that
+    fill immediately, but the position is not flat, so a "fully closed trades
+    only" Net P&L must exclude it. The strictness assertion first proves the
+    data really contains the disagreement -- without it, this test would pass
+    on any archive where every close is total, i.e. on data that cannot tell
+    the two rules apart.
+    """
+    booked = conn.execute(
+        "SELECT SUM(COALESCE(fifo_pnl_realized_base, 0)) AS s FROM trades"
+        " WHERE asset_category = 'OPT'"
+    ).fetchone()["s"]
+    stats = month_stats(conn, None)
+    assert booked > stats.net_pnl_base, (
+        "precondition: a partial close must have booked per-fill P&L that the"
+        " episode rule excludes"
+    )
+    report = build_history(conn)
+    assert stats.net_pnl_base == pytest.approx(
+        sum(e.realized_pnl_base for e in report.closed)
+    ), "Net P&L must equal the sum of fully closed round trips, nothing else"
+
+    partial_month = month_stats(conn, "2026-02")
+    assert partial_month.total_trades == 1, "the buyback fill is activity"
+    assert partial_month.net_pnl_base == 0, (
+        "the month holding only the partial close realises nothing"
+    )
+
+
+def test_the_whole_outcome_lands_on_the_day_the_round_trip_closed(conn):
+    """Attribution: money follows the close date, activity stays on fill days."""
+    from optjournal.stats import daily_series
+
+    days = {d.day: d for d in daily_series(conn)}
+    # The partial-close day shows the fill and no money.
+    partial = days["2026-02-11"]
+    assert partial.trades == 1 and partial.realized_base == 0
+    # The 0DTE round trip opened and closed on 2026-01-16; the whole outcome
+    # sits on that day and equals the episode's own figure.
+    report = build_history(conn)
+    zero_dte = next(e for e in report.closed if e.is_odte)
+    assert days["2026-01-16"].realized_base == pytest.approx(
+        zero_dte.realized_pnl_base
+    )
+    # And nothing realised sits on any day without a close.
+    close_days = {_day_of(e.closed_at) for e in report.closed}
+    for day, bucket in days.items():
+        if day not in close_days:
+            assert bucket.realized_base == 0, day
+
+
+def test_stock_pnl_keeps_ibkrs_per_fill_realisation(conn):
+    """"Preserve existing P&L behaviour for all other asset types" -- pinned.
+
+    Each share lot sold is realised when it is sold, so the stock figure is
+    the plain sum of per-fill realisation, attributed to the sale's own month
+    -- even though a stock episode may never be "closed" in the options sense.
+    """
+    booked = conn.execute(
+        "SELECT SUM(COALESCE(fifo_pnl_realized_base, 0)) AS s FROM trades"
+        " WHERE asset_category = 'STK'"
+    ).fetchone()["s"]
+    stats = month_stats(conn, None, asset_category="STK")
+    assert stats.net_pnl_base == pytest.approx(booked)
+    assert stats.net_pnl_base > 0, "the scripted stock round trip is a win"
+    sale_month = month_stats(conn, "2025-09", asset_category="STK")
+    assert sale_month.net_pnl_base == pytest.approx(booked), (
+        "stock realisation lands in the month the lot was sold"
+    )
+
+
+# ------------------------------------------------------------- net liquidity
+
+
+def test_equity_summaries_are_ingested_with_the_long_short_fallback(conn):
+    """One NAV row per month end, and the split-field fallback is exercised.
+
+    The demo deliberately emits `stockLong`/`stockShort` instead of a single
+    `stock` attribute, so a regression in the combined-field fallback shows
+    up here as a NULL stock component through the real pipeline.
+    """
+    rows = conn.execute(
+        "SELECT * FROM equity_summaries ORDER BY report_date"
+    ).fetchall()
+    assert len(rows) == 14, "one row per month of the demo period"
+    for row in rows:
+        assert row["stock_base"] is not None, "long/short fallback failed"
+        assert row["total_base"] == pytest.approx(
+            row["cash_base"] + row["stock_base"] + row["options_base"]
+        ), "NAV components must sum to the total they were generated from"
+
+
+def test_gain_pct_of_net_liq_uses_the_nav_at_the_periods_end(conn):
+    everything = month_stats(conn, None)
+    assert everything.net_liq_base is not None
+    assert everything.net_liq_date == "2026-02-27", "TO_DATE caps the last row"
+    assert everything.gain_pct_of_net_liq == pytest.approx(
+        everything.net_pnl_base / everything.net_liq_base * 100.0
+    )
+    # A month period reads its own month-end NAV, not the latest overall.
+    october = month_stats(conn, "2025-10")
+    assert october.net_liq_date == "2025-10-31"
+    # A NAV-less database yields None, not zero -- unavailable is not broke.
+    bare = connect(Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent
+                   / "bare.db")
+    migrate(bare)
+    assert month_stats(bare, None).net_liq_base is None
+    bare.close()
+
+
+# ------------------------------------------------------------------ equities
+
+
+def test_the_equities_selection_switches_category_and_reaches_no_further(conn,
+                                                                  demo, tmp_path):
+    """`type=equities` swaps the category for the filter-bar views only."""
+    from optjournal.web import build_state
+
+    kw = dict(db_path=tmp_path / "demo.db", archive_dir=demo.parent,
+              query_id=None)
+    plain = build_state(**kw)
+    stk = build_state(trade_type="equities", **kw)
+
+    assert stk["trade_type"] == "equities"
+    assert stk["stats"]["asset_category"] == "STK"
+    assert stk["stats"]["total_trades"] == 3
+    assert all(o["asset_category"] == "STK" for o in stk["orders"])
+    assert set(stk["months"]) == {"2025-04", "2025-09", "2025-11"}
+    # Pinned to the journal's home category: no filter bar on these tabs.
+    for key in ("annual", "annual_total", "monthly", "odte", "positions",
+                "history"):
+        assert stk[key] == plain[key], f"{key} must not follow the control"
+    # Offerability is derived from the data, not asserted in markup.
+    assert plain["asset_counts"]["STK"] == 3

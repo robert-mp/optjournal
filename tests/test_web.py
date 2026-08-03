@@ -787,3 +787,25 @@ def test_hashchange_only_refetches_when_the_server_side_keys_moved():
     assert "load()" in handler and "draw()" in handler, (
         "the handler must choose between refetching and redrawing"
     )
+
+
+def test_serves_path_defaults_do_not_poison_other_subcommands():
+    """serve's None-path defaults must stay on serve.
+
+    Overriding the shared parent parsers' defaults with set_defaults mutates
+    the shared action objects, so `serve` setting archive=None reached every
+    subcommand built from the same parents: `optjournal ingest` -- and the
+    nightly cron's `sync` -- crashed on `None.glob(...)`. Found by running
+    the command, not by the suite, which never parses these subcommands
+    without explicit paths. Now it does.
+    """
+    from optjournal.cli import build_parser
+
+    ap = build_parser()
+    assert ap.parse_args(["ingest"]).archive == DEFAULT_ARCHIVE
+    assert ap.parse_args(["ingest"]).db == DEFAULT_DB
+    assert ap.parse_args(["sync", "0"]).archive == DEFAULT_ARCHIVE
+    assert ap.parse_args(["statements"]).db == DEFAULT_DB
+    # And serve keeps its deliberate None, which is what --demo relies on.
+    assert ap.parse_args(["serve"]).archive is None
+    assert ap.parse_args(["serve"]).db is None

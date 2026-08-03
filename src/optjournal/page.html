@@ -300,7 +300,9 @@ function filters(){
         <button data-type="" class="${S.type?'':'on'}"
           title="Every ${esc(S.state.asset_category)} trade in the journal."
           >Options</button>
-        <button disabled title="Filtered out at ingest; re-run with --assets ALL">Equities</button>
+        <button data-type="equities" class="${S.type==='equities'?'on':''}"
+          ${equitiesSelectable()?'':'disabled'} title="${esc(equitiesNote())}"
+          >Equities</button>
         <button data-type="odte" class="${S.type==='odte'?'on':''}"
           ${odteSelectable()?'':'disabled'} title="${esc(odteFilterNote())}">0DTE</button>
       </div></div>
@@ -319,13 +321,36 @@ function odteSelectable(){
   const od=S.state.odte;
   return !!(od&&od.selectable);
 }
+/* Equities is offerable exactly when the database holds stock fills --
+   derived from the per-category counts, not asserted in markup. The old
+   button was hardcoded disabled with a tooltip blaming the ingest filter,
+   which stopped being true the day ingest started storing everything. */
+function equitiesSelectable(){
+  return !!((S.state.asset_counts||{}).STK);
+}
+function equitiesNote(){
+  const n=(S.state.asset_counts||{}).STK;
+  return n
+    ? `Show the ${n} stock fill(s) instead of options. Stocks are a different `
+      +`asset category, not a subset — Dashboard, Calendar and Trades switch to `
+      +`STK; other tabs stay on options.`
+    : 'No stock trades in the journal. If some exist in the archive, run '
+      +'`optjournal ingest` to fold them in.';
+}
 /* Rendered by `filters()`, so it appears on exactly the tabs that carry the
    control -- Dashboard, Calendar and Trades. A filter that silently changes
    every number is the same failure as a total that silently spans a wider
    scope than its label, and fees genuinely do not narrow, so naming which
-   figures moved is the honest version. */
+   figures moved is the honest version. Equities gets its own wording: it is
+   a category switch, not a subset of the options journal. */
 function scopeNote(){
   if(!S.type) return '';
+  if(S.type==='equities')
+    return `<div class="note"><b>Equities.</b> Dashboard, Calendar and Trades now
+      show STK activity — a different asset category, not a subset of the options
+      journal. Stock P&amp;L uses IBKR's per-fill realisation: each lot sold is
+      realised when it is sold. Account-level fees are unchanged, and Positions,
+      Costs, Annual and 0DTE stay on options.</div>`;
   return `<div class="note"><b>${esc(S.state.trade_type_label)} only.</b> Fills,
     orders, P&amp;L, commission, win rate and the daily series are restricted to this
     subset, and the month list offers only months it covers. Account-level fees are
@@ -350,10 +375,18 @@ function statCard(k,v,note,klass){
 function dashboard(){
   const st=S.state, s=st.stats;
   const label=monthLabel(s.month);
+  const opt=s.asset_category==='OPT';
+  /* Options P&L counts fully closed round trips only, landing on the close
+     date; premium on an open short is a liability, not profit. Stock P&L is
+     IBKR's per-fill realisation. The note under the card says which rule the
+     number obeys rather than letting two definitions share one label. */
+  const pnlNote=opt?'closed round trips only, net of commission'
+               :'realised per fill, net of commission';
+  const nl=s.net_liq_base;
   const cards=[
     statCard('Total Trades', s.total_trades,
       s.orders?`${s.orders} order(s)`:''),
-    statCard('Net P&L', cash(s.net_pnl_base), 'realised, net of commission',
+    statCard('Net P&L', cash(s.net_pnl_base), pnlNote,
       cls(s.net_pnl_base)+' '+(String(cash(s.net_pnl_base)).length>10?'sm':'')),
     statCard('Commissions', cash(s.commissions_base), 'stated by IBKR',
       'sm '+cls(s.commissions_base)),
@@ -367,19 +400,31 @@ function dashboard(){
       cls(s.avg_win_base)),
     statCard('Avg Loss', cash(s.avg_loss_base), 'per closed round trip',
       cls(s.avg_loss_base)),
-    statCard('Gain % of Net Liq', '—', 'needs Equity Summary section', 'dim2'),
+    nl!=null
+      ? statCard('Gain % of Net Liq', pct(s.gain_pct_of_net_liq,2),
+          `NAV ${cash(nl)} · ${s.net_liq_date||''}`, cls(s.gain_pct_of_net_liq))
+      : statCard('Gain % of Net Liq', '—',
+          'enable Equity Summary on the Flex query', 'dim2'),
   ].join('');
 
   return `${filters()}
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Statistics</h2>
       <div class="sub">${esc(s.asset_category)} trades and commission; fees are
-      account-level and carry no asset category. ${esc(ccyNote())} Realised P&L is
-      IBKR's own figure and is already net of opening and closing commission.</div></div>
+      account-level and carry no asset category. ${esc(ccyNote())} ${opt?`Options
+      P&L counts fully closed round trips only, on the day they closed — an open
+      or partially closed position contributes nothing until it is flat.`:`Stock
+      P&L is IBKR's per-fill realisation, net of commission.`}</div></div>
       <div class="pills">
         ${S.type?`<span class="pill" title="Every trade-derived figure below is
           restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
         <span class="pill">open <b>${s.open_episodes}</b></span>
+        ${opt&&s.open_premium_base?`<span class="pill" title="Net premium sitting in
+          positions that are still open — collected on shorts, paid on longs. Not
+          in Net P&L: premium is a liability until the position closes, and it
+          lands there, in full, on the day it does."
+          >open premium <b class="${cls(s.open_premium_base)}">${
+          cash(s.open_premium_base)}</b></span>`:''}
         <span class="pill" title="Commission on ${esc(s.asset_category)} trades.
           Commission carries an asset category, so this figure is genuinely
           scoped to this journal."
@@ -393,10 +438,12 @@ function dashboard(){
           >account fees <b>${cash(s.account_friction_base)}</b></span>
       </div></div>
     <div class="stats">${cards}</div>
-    ${s.closed_episodes===0?`<div class="note">No round trip has closed yet, so
-      Net P&L, Win Rate, Avg Win and Avg Loss have nothing to measure — they are
-      empty rather than zero. The two open positions are under
-      <b>Positions</b>.</div>`:''}
+    ${s.closed_episodes===0?`<div class="note">No round trip has fully closed yet,
+      so Net P&L, Win Rate, Avg Win and Avg Loss have nothing to measure — they are
+      empty rather than zero. ${s.open_premium_base?`The ${cash(s.open_premium_base)}
+      net premium in the ${s.open_episodes} open position(s) is not profit until
+      they close.`:`The ${s.open_episodes} open position(s) are under
+      <b>Positions</b>.`}</div>`:''}
   </div>
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Performance</h2>
@@ -468,8 +515,9 @@ function calendar(){
   return `${filters()}
   <div class="card">
     <div class="crow"><div><h2>${esc(monthLabel(month))}</h2>
-      <div class="sub">Daily realised P&L from closed trades. A day with fills but
-      no realised P&L shows a dash — an opening trade realises nothing.</div></div>
+      <div class="sub">Daily realised P&L. An options outcome lands, whole, on the
+      day the round trip closed — so a day with only opening or partial-close
+      fills shows the activity and a dash, not money.</div></div>
       <div class="pills">
         <span class="pill">Month P/L <b class="${cls(total)}">${cash(total)}</b></span>
         <span class="pill">Green days <b>${s.green_days}</b></span>
@@ -837,10 +885,11 @@ function cog(){
         <td class="${stm.ingested?'pos':'dim2'}">${stm.ingested?'yes':'no'}</td>
         <td class="dim">${esc(stm.asset_filter||'-')}</td></tr>`).join('')}
     </tbody></table>
-    <div class="note"><b>Not available from a Flex Activity Statement:</b>
-      <i>Gain % of Net Liq</i> needs the Equity Summary section enabled on the query
-      template, and <i>Trade Replay</i> needs intraday underlying prices, implied
-      volatility and greeks — none of which a statement carries.</div>
+    <div class="note"><b>Needs the Flex query template:</b>
+      <i>Gain % of Net Liq</i> reads the Equity Summary section — enable it on the
+      query and sync, and the figure fills in from the next statement. <i>Trade
+      Replay</i> needs intraday underlying prices, implied volatility and greeks —
+      none of which a statement carries.</div>
   </div>`;
 }
 

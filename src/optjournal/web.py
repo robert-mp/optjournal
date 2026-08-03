@@ -46,7 +46,7 @@ from optjournal.flex import (
     load,
 )
 from optjournal.history import build_history
-from optjournal.ingest import ASSET_FILTER_OPTIONS, ingest_file
+from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
 from optjournal.serialize import (
     costs_data,
     history_data,
@@ -56,6 +56,8 @@ from optjournal.serialize import (
     statements_data,
 )
 from optjournal.stats import (
+    EQUITY_CATEGORY,
+    EQUITY_TRADES,
     annual_stats,
     available_months,
     cohort_data,
@@ -134,24 +136,45 @@ def build_state(
     server is threaded, so a shared handle would fail intermittently under the
     one condition nobody tests for.
 
-    `trade_type` selects a fill-level scope for the three views that carry the
-    filter bar -- Dashboard, Calendar and Trades. It deliberately reaches no
-    further: Positions, Costs, Annual and 0DTE render no filter bar, so
-    narrowing them would move numbers on a tab that shows nothing capable of
-    explaining why. The invariant is that a tab's figures change only in
-    response to a control that tab displays.
+    `trade_type` drives the Trade Types control for the three views that carry
+    the filter bar -- Dashboard, Calendar and Trades. Two kinds of selection
+    hide behind one control: "odte" is a fill-level *scope* within options,
+    while "equities" switches the *category* the summations run over, because
+    stocks are not a subset of options trades. Either way it deliberately
+    reaches no further: Positions, Costs, Annual and 0DTE render no filter
+    bar, so they stay pinned to the journal's home category. The invariant is
+    that a tab's figures change only in response to a control that tab
+    displays.
     """
     with open_journal(db_path) as conn:
-        # One history pass, reused by the scope, the cohorts and every period
-        # row below. Rebuilding it per call was the cost of the Annual tab.
+        # One history pass over the home category, reused by the scope, the
+        # cohorts and every period row below.
         report = build_history(conn, asset_category=asset_category)
-        scope = scope_for(conn, trade_type, asset_category=asset_category, report=report)
-        months = available_months(conn, asset_category, scope)
+        if (trade_type or "").lower() == EQUITY_TRADES.key:
+            view_category = EQUITY_CATEGORY
+            view_report = build_history(conn, asset_category=view_category)
+            scope = EQUITY_TRADES
+        else:
+            view_category = asset_category
+            view_report = report
+            scope = scope_for(conn, trade_type, asset_category=view_category,
+                              report=view_report)
+        months = available_months(conn, view_category, scope)
         selected = month if month in months else None
+        # Fill counts per category, so the page can derive which Trade Types
+        # buttons are offerable instead of asserting it in markup.
+        asset_counts = {
+            str(r["asset_category"]): r["n"]
+            for r in conn.execute(
+                "SELECT asset_category, COUNT(*) AS n FROM trades"
+                " GROUP BY asset_category"
+            )
+        }
         state: dict[str, Any] = {
             "version": __version__,
             "generated_at": _now(),
             "asset_category": asset_category,
+            "asset_counts": asset_counts,
             "db": str(db_path),
             "archive": str(archive_dir),
             "months": months,
@@ -159,15 +182,15 @@ def build_state(
             "trade_type": scope.key,
             "trade_type_label": scope.label,
             "stats": stats_data(
-                month_stats(conn, selected, asset_category=asset_category,
-                            scope=scope, report=report)
+                month_stats(conn, selected, asset_category=view_category,
+                            scope=scope, report=view_report)
             ),
             "all_time": stats_data(
-                month_stats(conn, None, asset_category=asset_category,
-                            scope=scope, report=report)
+                month_stats(conn, None, asset_category=view_category,
+                            scope=scope, report=view_report)
             ),
             "positions": positions_data(conn),
-            "orders": orders_data(conn, scope.order_ids),
+            "orders": orders_data(conn, scope.order_ids, view_category),
             "history": history_data(report),
             "statements": statements_data(archive_dir, conn),
         }
@@ -376,7 +399,7 @@ def serve(
     db_path: Path,
     archive_dir: Path,
     query_id: str | None = None,
-    assets: tuple[str, ...] = ASSET_FILTER_OPTIONS,
+    assets: tuple[str, ...] = DEFAULT_ASSET_FILTER,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> None:

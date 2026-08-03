@@ -47,7 +47,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `config.py` | filesystem defaults (`raw/`, `journal.db`, `demo/`) |
 | `flex.py` | IBKR Flex fetch: token, retries, lockout budget, cooldown |
 | `archive.py` | statement store: content-hash dedupe, prune |
-| `ingest.py` | statement → SQLite, asset filter, idempotent upserts |
+| `ingest.py` | statement → SQLite, idempotent upserts (stores every asset category; scoping is query-time) |
 | `db.py` | connection, schema migration, `open_journal()` |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
 | `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts |
@@ -71,11 +71,21 @@ Layering rules (import direction only goes down this list):
    opens its own connections (the two `*_data(conn)` readers are the
    deliberate exception: they wrap single SELECTs over views).
 
-Two invariants worth knowing before changing the UI:
+Three invariants worth knowing before changing the UI:
 
 * **A tab's numbers change only in response to a control that tab
-  displays.** The trade-type filter narrows Dashboard/Calendar/Trades
-  (which render the filter bar) and nothing else.
+  displays.** The Trade Types control drives Dashboard/Calendar/Trades
+  (which render the filter bar) and nothing else. "0DTE" is a fill-level
+  scope within options; "Equities" switches the asset category those three
+  tabs run over. Positions, Costs, Annual and 0DTE stay pinned to options.
+* **Options P&L counts fully closed round trips only, attributed to the
+  close date.** A partial close (sold 3, bought back 1) contributes
+  nothing until the position is flat, and premium collected on an open
+  short is a liability, not profit — it is shown separately as "open
+  premium". Other asset categories keep IBKR's per-fill realisation.
+  `Gain % of Net Liq` divides that P&L by the NAV from the statement's
+  Equity Summary section (enable it on the Flex query template; the demo
+  carries synthetic NAV rows).
 * **The payload is guarded in both directions.** `tests/test_web.py`
   asserts every key the page reads is sent, and every payload binding the
   page uses is registered. A typo'd key fails a test instead of rendering

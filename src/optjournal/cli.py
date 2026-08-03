@@ -33,7 +33,7 @@ from optjournal.config import (
 from optjournal.db import connect, migrate, open_journal
 from optjournal.flex import FetchCooldown, TokenMissing, fetch, load
 from optjournal.history import build_history
-from optjournal.ingest import ASSET_FILTER_ALL, ASSET_FILTER_OPTIONS, ingest_file
+from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal.render import (
     render_history,
     render_orders,
@@ -66,7 +66,7 @@ examples:
   optjournal sync 1591754                  fetch + ingest + report what is new
   optjournal statements                    what is archived, and ingested
   optjournal ingest                        fold all archived statements into the DB
-  optjournal ingest --assets ALL           keep stock and FX too (re-reads archive)
+  optjournal ingest --assets OPT           options only (narrower than the default)
   optjournal orders                        option orders, partial fills collapsed
   optjournal positions                     current option book
   optjournal history                       closed-position P&L, round trip by round trip
@@ -236,8 +236,7 @@ def cmd_demo(args) -> int:
     out, db = args.out, args.db
     path = write_demo_statement(out, db)
     with open_journal(db) as conn:
-        result = ingest_file(conn, path, assets=ASSET_FILTER_OPTIONS,
-                             reingest=True)
+        result = ingest_file(conn, path, reingest=True)
 
     payload = {
         "query_name": QUERY_NAME, "statement": str(path), "db": str(db),
@@ -246,8 +245,9 @@ def cmd_demo(args) -> int:
     }
     lines = [
         f"wrote {path.name}  ({path.stat().st_size:,} bytes)",
-        f"  {result.trades_inserted} option fills, {result.cash_inserted} cash rows,"
-        f" {result.positions_written} open positions",
+        f"  {result.trades_inserted} fills, {result.cash_inserted} cash rows,"
+        f" {result.positions_written} open positions,"
+        f" {result.equity_summaries_written} NAV rows",
         f"  database: {db}",
         "",
         "synthetic data -- closed round trips, a vertical spread, a roll, an",
@@ -534,8 +534,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ingest", parents=[common, archive, database],
                        help="fold archived statements into the database")
     p.add_argument("paths", type=Path, nargs="*", help="defaults to all archived")
-    p.add_argument("--assets", default="OPT", metavar="LIST",
-                   help="asset categories to store, or ALL (default: OPT)")
+    p.add_argument("--assets", default="ALL", metavar="LIST",
+                   help="asset categories to store, or ALL (default: ALL)")
     p.add_argument("--reingest", action="store_true",
                    help="re-process files already ingested")
     p.set_defaults(func=cmd_ingest)
@@ -570,28 +570,36 @@ def build_parser() -> argparse.ArgumentParser:
                    help="YYYYMMDD or YYYY-MM-DD period override")
     p.add_argument("--to", dest="to_date", metavar="DATE",
                    help="YYYYMMDD or YYYY-MM-DD period override")
-    p.add_argument("--assets", default="OPT", metavar="LIST",
-                   help="asset categories to store, or ALL (default: OPT)")
+    p.add_argument("--assets", default="ALL", metavar="LIST",
+                   help="asset categories to store, or ALL (default: ALL)")
     p.add_argument("--force", action="store_true",
                    help="bypass the local per-query fetch cooldown")
     p.set_defaults(func=cmd_sync)
 
-    p = sub.add_parser("serve", parents=[common, archive, database],
+    p = sub.add_parser("serve", parents=[common],
                        help="local web UI (loopback only, no auth)")
     p.add_argument("--query-id", dest="query_id",
                    help="Flex Query ID; without it the Sync button is disabled")
     p.add_argument("--port", type=int, default=8765, help="default: 8765")
     p.add_argument("--host", default="127.0.0.1",
                    help="loopback addresses only (default: 127.0.0.1)")
-    p.add_argument("--assets", default="OPT", metavar="LIST",
-                   help="asset categories a UI sync stores (default: OPT)")
+    p.add_argument("--assets", default="ALL", metavar="LIST",
+                   help="asset categories a UI sync stores (default: ALL)")
     p.add_argument("--demo", action="store_true",
                    help=f"serve the synthetic data from `optjournal demo`"
                         f" ({DEFAULT_DEMO_DB})")
-    # Override the shared parents' defaults for this subcommand only, so None
-    # means "not given" and --demo can supply the paths without having to guess
-    # whether a path equal to the default was typed deliberately.
-    p.set_defaults(func=cmd_serve, db=None, archive=None)
+    # serve declares its OWN path arguments, defaulting to None, instead of
+    # inheriting the shared `archive`/`database` parents and overriding their
+    # defaults. argparse's set_defaults mutates the *shared action objects*,
+    # so the override leaked into every other subcommand -- `optjournal
+    # ingest` and the nightly `sync` crashed on archive=None. None here means
+    # "not given", which is what lets --demo supply the paths without
+    # guessing whether a path equal to the default was typed deliberately.
+    p.add_argument("--archive", type=Path, default=None,
+                   help=f"raw statement archive (default: {DEFAULT_ARCHIVE})")
+    p.add_argument("--db", type=Path, default=None,
+                   help=f"journal database (default: {DEFAULT_DB})")
+    p.set_defaults(func=cmd_serve)
 
     return ap
 

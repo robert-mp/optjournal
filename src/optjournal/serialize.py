@@ -102,25 +102,32 @@ def summary_data(resp, path: Path | None = None) -> Row:
     return data
 
 def orders_data(
-    conn: sqlite3.Connection, order_ids: frozenset[str] | None = None
+    conn: sqlite3.Connection,
+    order_ids: frozenset[str] | None = None,
+    asset_category: str = "OPT",
 ) -> list[Row]:
-    """Option orders with their legs, optionally restricted to a set of ids.
+    """Orders of one asset category with their legs, optionally restricted
+    to a set of order ids.
 
-    Filtered in Python rather than in SQL: `option_orders` is a view that
-    aggregates fills, and the caller's id set comes from episode membership,
-    which no column on the view carries. The order count here is small enough
-    that the difference is not measurable.
+    Reads the category-generic `trade_orders`/`trade_legs` views with a
+    parameter rather than the OPT-only wrappers, because the Trades tab now
+    follows the Trade Types control and stocks are a different category, not
+    a subset of options. Id filtering stays in Python: the id set comes from
+    episode membership, which no view column carries.
     """
     orders = conn.execute(
-        "SELECT * FROM option_orders ORDER BY first_fill_at DESC"
+        "SELECT * FROM trade_orders WHERE asset_category = ?"
+        " ORDER BY first_fill_at DESC",
+        (asset_category,),
     ).fetchall()
     out: list[Row] = []
     for o in orders:
         if order_ids is not None and str(o["ib_order_id"]) not in order_ids:
             continue
         legs = conn.execute(
-            "SELECT * FROM option_legs WHERE ib_order_id = ? ORDER BY expiry, strike",
-            (o["ib_order_id"],),
+            "SELECT * FROM trade_legs WHERE ib_order_id = ?"
+            " AND asset_category = ? ORDER BY expiry, strike",
+            (o["ib_order_id"], asset_category),
         ).fetchall()
         row = dict(o)
         row["legs"] = [dict(lg) for lg in legs]

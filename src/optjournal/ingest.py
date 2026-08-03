@@ -6,9 +6,14 @@ trades and cash transactions are inserted with first-write-wins on IBKR's
 own identifiers, and `first_seen_at` records when the journal first saw a
 row rather than when it was last re-presented.
 
-By default only options are stored (`ASSET_FILTER_OPTIONS`). The raw XML
-stays in the archive, so widening the filter later is a re-ingest from disk
-and costs no IBKR request.
+Everything is stored by default (`ASSET_FILTER_ALL`). The filter existed
+because the journal began options-only, but filtering at ingest made the
+database disagree with the archive it came from: the Equities view read
+empty not because nothing traded but because ingest had dropped the rows.
+Category scoping is a query-time concern -- every consumer already filters
+on `asset_category` -- and storage is not: a row dropped here costs a
+re-ingest to recover, a row stored costs nothing. The raw XML stays in the
+archive either way, so narrowing later is free too.
 """
 
 from __future__ import annotations
@@ -37,6 +42,10 @@ log = logging.getLogger(__name__)
 
 ASSET_FILTER_OPTIONS = ("OPT",)
 ASSET_FILTER_ALL: tuple[str, ...] = ()
+#: What `assets=` means when the caller does not say: everything. A narrower
+#: default here is what made the cron and the Sync button quietly re-narrow a
+#: database that had been widened by hand.
+DEFAULT_ASSET_FILTER = ASSET_FILTER_ALL
 
 
 @dataclass(slots=True)
@@ -54,6 +63,7 @@ class IngestResult:
     cash_skipped_existing: int = 0
     positions_written: int = 0
     securities_written: int = 0
+    equity_summaries_written: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -71,10 +81,21 @@ def _f(value: Any) -> float | None:
         return None
 
 
-def _i(value: Any) -> int | None:
-    """Coerce to int. Option quantities are integral; anything else is a bug."""
+def _qty(value: Any) -> int | float | None:
+    """Coerce a quantity, keeping integers exact and fractions lossless.
+
+    Options quantities are always integral and are stored as ints, which is
+    what keeps the episode flat-test exact. Stock and currency quantities are
+    legitimately fractional -- dividend reinvestment buys 1.79 shares, and a
+    full SIVE sale was 413.22 of them -- so those keep their value rather
+    than being truncated to a different position size. SQLite's INTEGER
+    affinity stores a non-integral value as REAL, losslessly.
+    """
     f = _f(value)
-    return None if f is None else int(round(f))
+    if f is None:
+        return None
+    i = int(round(f))
+    return i if abs(f - i) < 1e-9 else f
 
 
 def _s(value: Any) -> str | None:
@@ -111,7 +132,7 @@ def ingest_file(
     conn: sqlite3.Connection,
     path: Path,
     *,
-    assets: Iterable[str] = ASSET_FILTER_OPTIONS,
+    assets: Iterable[str] = DEFAULT_ASSET_FILTER,
     reingest: bool = False,
 ) -> IngestResult:
     """Ingest one archived statement. Safe to call repeatedly."""
@@ -179,6 +200,7 @@ def ingest_file(
 
     _ingest_positions(conn, sections, path.name, assets, result)
     _ingest_securities(conn, sections, assets, result)
+    _ingest_equity_summaries(conn, sections, path.name, result)
 
     conn.commit()
     return result
@@ -196,15 +218,10 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult) -
             result.trades_filtered_out += 1
             continue
 
-        qty = _i(t.quantity)
+        qty = _qty(t.quantity)
         if qty is None:
             result.warnings.append(f"trade {t.tradeID}: unparseable quantity")
             continue
-        raw_qty = _f(t.quantity)
-        if raw_qty is not None and abs(raw_qty - qty) > 1e-9:
-            result.warnings.append(
-                f"trade {t.tradeID}: non-integral quantity {raw_qty} truncated"
-            )
 
         rate = _f(t.fxRateToBase) or 1.0
         proceeds = _f(t.proceeds)
@@ -297,7 +314,7 @@ def _ingest_positions(conn, sections, source_file: str, assets, result) -> None:
                 _s(row.get("accountId")), _s(row.get("symbol")), cat,
                 _s(row.get("underlyingSymbol")), _s(row.get("putCall")),
                 _f(row.get("strike")), _s(row.get("expiry")),
-                _f(row.get("multiplier")), _i(row.get("position")),
+                _f(row.get("multiplier")), _qty(row.get("position")),
                 _f(row.get("markPrice")), value,
                 None if value is None else value * rate,
                 _f(row.get("costBasisMoney")), _f(row.get("costBasisPrice")),
@@ -334,6 +351,57 @@ def _ingest_securities(conn, sections, assets, result) -> None:
             ),
         )
         result.securities_written += 1
+
+
+def _ingest_equity_summaries(conn, sections, source_file: str, result) -> None:
+    """Daily Net Asset Value rows, from the EquitySummaryInBase section.
+
+    Only present when the Flex query template has the "Equity Summary in Base"
+    section enabled; absent sections simply yield nothing here. NAV is the one
+    figure the trade ledger cannot reconstruct -- deriving cash needs a
+    starting balance no Activity statement carries -- so this is reported
+    data, not derived.
+
+    Field access is tolerant of IBKR's shape: some deployments emit a single
+    `cash`/`stock`/`options` figure, others split them into `*Long`/`*Short`
+    pairs. Both are accepted; `total` is required, because a NAV row without
+    a NAV is noise.
+    """
+    def combined(row: dict[str, str], name: str) -> float | None:
+        whole = _f(row.get(name))
+        if whole is not None:
+            return whole
+        long_, short = _f(row.get(f"{name}Long")), _f(row.get(f"{name}Short"))
+        if long_ is None and short is None:
+            return None
+        return (long_ or 0.0) + (short or 0.0)
+
+    base = _base_currency(sections)
+    for row in sections.get("EquitySummaryInBase") or ():
+        day = _s(row.get("reportDate"))
+        total = combined(row, "total")
+        if not day or total is None:
+            result.warnings.append(
+                f"equity summary row skipped: reportDate={day!r} total missing"
+            )
+            continue
+        conn.execute(
+            "INSERT INTO equity_summaries (report_date, account_id, currency,"
+            " cash_base, stock_base, options_base, total_base, raw,"
+            " source_file, ingested_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(report_date) DO UPDATE SET"
+            " cash_base=excluded.cash_base, stock_base=excluded.stock_base,"
+            " options_base=excluded.options_base, total_base=excluded.total_base,"
+            " raw=excluded.raw, source_file=excluded.source_file,"
+            " ingested_at=excluded.ingested_at",
+            (
+                day, _s(row.get("accountId")) or "", base,
+                combined(row, "cash"), combined(row, "stock"),
+                combined(row, "options"), total,
+                json.dumps(row, sort_keys=True), source_file, _now(),
+            ),
+        )
+        result.equity_summaries_written += 1
 
 
 def _model_dump(model: Any) -> dict[str, Any]:

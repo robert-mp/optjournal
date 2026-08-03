@@ -16,9 +16,11 @@ Three properties of IBKR's data drive the design:
   must never be subtracted from realized P&L again -- it is reported here for
   visibility only, and `net_of_commission` records that fact.
 
-* Quantities are INTEGER in the schema specifically so the flat test is
-  `== 0` rather than an epsilon comparison. That is what makes episode
-  boundaries exact.
+* Option quantities are integral, so their flat test is exact. Stock lots
+  are legitimately fractional (dividend reinvestment buys 1.79 shares), so
+  the flat test is `_flat`: exact zero for integer quantities, a dust
+  epsilon for fractional ones -- a residual under a millionth of a share is
+  a rounding artefact, not a position.
 
 * A position opened before the earliest statement has no opening fill on
   record, so its episode can never balance to zero from trades alone. Those
@@ -59,6 +61,15 @@ DISPOSITION_BY_CODE: dict[str, str] = {
 
 STATUS_OPEN = "OPEN"
 STATUS_CLOSED = "CLOSED"
+
+#: Residual quantity small enough to call flat. Options quantities are ints,
+#: so for them this is exactness by another name; fractional stock lots can
+#: leave float dust that is not a position.
+_FLAT_EPS = 1e-6
+
+
+def _flat(qty: int | float) -> bool:
+    return qty == 0 if isinstance(qty, int) else abs(qty) < _FLAT_EPS
 
 #: Ordering of dispositions when a multi-fill close carries several codes.
 #: Assignment and exercise are more specific outcomes than expiry.
@@ -122,9 +133,9 @@ class Episode:
 
     open_fills: int = 0
     close_fills: int = 0
-    opened_qty: int = 0
-    closed_qty: int = 0
-    net_qty: int = 0
+    opened_qty: float = 0    #: int in practice for options; stock can fract
+    closed_qty: float = 0
+    net_qty: float = 0
 
     #: IBKR's realized P&L, already net of opening and closing commission.
     realized_pnl: float = 0.0
@@ -185,9 +196,10 @@ class Episode:
         return opened.date() == expires.date()
 
     @property
-    def contracts(self) -> int:
+    def contracts(self) -> int | float:
         """Position size at its largest, in contracts or shares."""
-        return max(abs(self.opened_qty), abs(self.closed_qty))
+        size = max(abs(self.opened_qty), abs(self.closed_qty))
+        return int(size) if float(size).is_integer() else size
 
     @property
     def return_on_commission(self) -> float | None:
@@ -260,7 +272,7 @@ def _new_episode(row: Any) -> Episode:
 
 def _absorb(ep: Episode, row: Any) -> None:
     """Fold one fill into an episode."""
-    qty = int(row["quantity"] or 0)
+    qty = row["quantity"] or 0
     closing = (row["open_close"] or "").upper() == "C"
 
     if closing:
@@ -302,7 +314,7 @@ def _finalise(ep: Episode, still_held: bool) -> None:
         ep.status = STATUS_OPEN if still_held else (disposition or STATUS_CLOSED)
         return
 
-    if ep.net_qty == 0 and ep.close_fills:
+    if _flat(ep.net_qty) and ep.close_fills:
         ep.status = disposition or STATUS_CLOSED
     else:
         ep.status = STATUS_OPEN
@@ -361,7 +373,7 @@ def _from_snapshot(row: dict[str, Any]) -> Episode:
     ep.entry_outside_window = True
     ep.snapshot_only = True
     ep.opened_at = row.get("open_date_time") or None
-    ep.net_qty = int(row.get("position") or 0)
+    ep.net_qty = row.get("position") or 0
     ep.opened_qty = ep.net_qty
     ep.cost_basis = row.get("cost_basis_money")
     ep.unrealized = row.get("fifo_pnl_unrealized")
@@ -438,7 +450,7 @@ def build_history(
 
         _absorb(current, row)
 
-        if not current.entry_outside_window and current.net_qty == 0:
+        if not current.entry_outside_window and _flat(current.net_qty):
             flush()
 
     flush()

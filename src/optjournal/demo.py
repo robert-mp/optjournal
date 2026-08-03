@@ -73,14 +73,17 @@ class Leg:
     """One contract's worth of a single order."""
 
     underlying: str
-    expiry: date
+    expiry: date | None
     put_call: str
-    strike: Decimal
+    strike: Decimal | None
     quantity: int          #: signed; negative is short
     price: Decimal
     open_close: str        #: "O" or "C"
     realized: Decimal = Decimal("0")
     notes: str = ""
+    #: "OPT" or "STK". A stock leg has no expiry, put/call or strike, trades
+    #: at multiplier 1, and is its own underlying.
+    asset: str = "OPT"
     #: Split this leg across several fills. Exercises the per-order commission
     #: minimum being charged once and adjusted across fills, which is the case
     #: that produced a commission *credit* in the real data.
@@ -102,12 +105,13 @@ class Position:
     """A row of the closing OpenPositions snapshot."""
 
     underlying: str
-    expiry: date
+    expiry: date | None
     put_call: str
-    strike: Decimal
+    strike: Decimal | None
     quantity: int
     mark: Decimal
     cost_basis: Decimal
+    asset: str = "OPT"
     #: True for a contract with no opening fill anywhere in the period, the
     #: case that forced `position_snapshots` to be an independent source.
     snapshot_only: bool = False
@@ -242,13 +246,49 @@ def _script() -> tuple[list[Order], list[Position], list[Cash]]:
             fills=(-1, -1, -1, -1, -1)),
     ]))
 
-    # 9. Still open at period end. The second has no opening fill in the
-    #    period at all, so its basis exists only in the snapshot.
+    # 9. A PARTIAL close, still open at period end. Sold 3, bought back 1 --
+    #    IBKR realises the 1-lot immediately, but the position is not flat, so
+    #    a "closed trades only" P&L must show none of it. This is the case
+    #    that separates episode-based P&L from summing per-fill realisation:
+    #    every other scripted round trip closes fully, so without this one the
+    #    two rules agree everywhere and the distinction is untested.
+    exp = d(2026, 4, 17)
+    orders.append(Order(d(2026, 1, 8), label="partial: sold 3", legs=[
+        Leg("SPY", exp, "P", Decimal("590"), -3, Decimal("7.20"), "O"),
+    ]))
+    orders.append(Order(d(2026, 2, 11), label="partial: bought back 1 of 3",
+                        legs=[
+        Leg("SPY", exp, "P", Decimal("590"), 1, Decimal("3.10"), "C",
+            realized=Decimal("408.62")),
+    ]))
+
+    # 10. A stock round trip and a stock buy-and-hold, so the Equities view
+    #     has both an outcome and an open position. Stock P&L stays on IBKR's
+    #     per-fill realisation rule -- these pin that it survives the options
+    #     fix untouched.
+    orders.append(Order(d(2025, 4, 8), label="stock: bought 20", legs=[
+        Leg("NVDA", None, "", None, 20, Decimal("94.30"), "O", asset="STK"),
+    ]))
+    orders.append(Order(d(2025, 9, 16), label="stock: sold 20", legs=[
+        Leg("NVDA", None, "", None, -20, Decimal("176.50"), "C",
+            realized=Decimal("1641.20"), asset="STK"),
+    ]))
+    orders.append(Order(d(2025, 11, 4), label="stock: buy and hold", legs=[
+        Leg("SPY", None, "", None, 6, Decimal("571.40"), "O", asset="STK"),
+    ]))
+
+    # Still open at period end. The second has no opening fill in the
+    # period at all, so its basis exists only in the snapshot.
+    exp = d(2026, 3, 20)
     positions = [
         Position("NVDA", exp, "P", Decimal("140"), -5, Decimal("3.80"),
                  Decimal("-2521.75")),
         Position("SPY", d(2026, 6, 18), "C", Decimal("640"), 2, Decimal("11.40"),
                  Decimal("3980.00"), snapshot_only=True),
+        Position("SPY", d(2026, 4, 17), "P", Decimal("590"), -2, Decimal("4.05"),
+                 Decimal("-1436.72")),
+        Position("SPY", None, "", None, 6, Decimal("612.80"),
+                 Decimal("3428.40"), asset="STK"),
     ]
 
     cash: list[Cash] = []
@@ -333,26 +373,37 @@ def _trade_elements(orders: list[Order]) -> list[dict[str, str]]:
         order_id = str(1_100_000_000 + order_no * 137)
         rate = fx_for(order.day)
         for leg in order.legs:
-            sym = _occ(leg.underlying, leg.expiry, leg.put_call, leg.strike)
+            stock = leg.asset == "STK"
+            sym = leg.underlying if stock else _occ(
+                leg.underlying, leg.expiry, leg.put_call, leg.strike
+            )
+            mult = Decimal("1") if stock else MULTIPLIER
             splits = leg.fills or (leg.quantity,)
             comms = commission_for(leg.quantity, leg.fills)
             for i, (qty, comm) in enumerate(zip(splits, comms, strict=True)):
                 seq += 1
-                proceeds = -Decimal(qty) * leg.price * MULTIPLIER
-                money = Decimal(qty) * leg.price * MULTIPLIER
+                proceeds = -Decimal(qty) * leg.price * mult
+                money = Decimal(qty) * leg.price * mult
                 # Realized is reported once per leg, on the last fill, and is
                 # already net of commission -- asserted by the history tests.
                 realized = leg.realized if i == len(splits) - 1 else Decimal("0")
                 a = dict(_TRADE_TEMPLATE)
                 a.update(
                     symbol=sym,
-                    description=(f"{leg.underlying} {leg.expiry:%d%b%y} "
+                    description=(sym if stock else
+                                 f"{leg.underlying} {leg.expiry:%d%b%y} "
                                  f"{_q(leg.strike)} {leg.put_call}").upper(),
-                    conid=_conid(sym), subCategory=leg.put_call,
-                    underlyingSymbol=leg.underlying,
-                    underlyingConid=_UNDERLYING_CONID[leg.underlying],
-                    strike=_q(leg.strike), expiry=f"{leg.expiry:%Y%m%d}",
-                    putCall=leg.put_call,
+                    conid=_conid(sym),
+                    assetCategory=leg.asset,
+                    subCategory="COMMON" if stock else leg.put_call,
+                    multiplier=_q(mult),
+                    listingExchange="NASDAQ" if stock else "CBOE",
+                    underlyingSymbol="" if stock else leg.underlying,
+                    underlyingConid="" if stock
+                        else _UNDERLYING_CONID[leg.underlying],
+                    strike="" if stock else _q(leg.strike),
+                    expiry="" if stock else f"{leg.expiry:%Y%m%d}",
+                    putCall="" if stock else leg.put_call,
                     reportDate=f"{order.day:%Y%m%d}", tradeDate=f"{order.day:%Y%m%d}",
                     dateTime=f"{order.day:%Y%m%d};{order.time}",
                     orderTime=f"{order.day:%Y%m%d};{order.time}",
@@ -380,26 +431,35 @@ def _position_elements(positions: list[Position]) -> list[dict[str, str]]:
     rate = fx_for(TO_DATE)
     out = []
     for p in positions:
-        sym = _occ(p.underlying, p.expiry, p.put_call, p.strike)
-        value = Decimal(p.quantity) * p.mark * MULTIPLIER
+        stock = p.asset == "STK"
+        sym = p.underlying if stock else _occ(
+            p.underlying, p.expiry, p.put_call, p.strike
+        )
+        mult = Decimal("1") if stock else MULTIPLIER
+        value = Decimal(p.quantity) * p.mark * mult
         out.append({
             "accountId": DEMO_ACCOUNT, "acctAlias": "", "currency": "USD",
-            "fxRateToBase": _q(rate), "assetCategory": "OPT",
-            "subCategory": p.put_call, "symbol": sym,
-            "description": f"{p.underlying} {p.expiry:%d%b%y} {_q(p.strike)} "
-                           f"{p.put_call}".upper(),
+            "fxRateToBase": _q(rate), "assetCategory": p.asset,
+            "subCategory": "COMMON" if stock else p.put_call, "symbol": sym,
+            "description": (sym if stock else
+                            f"{p.underlying} {p.expiry:%d%b%y} {_q(p.strike)} "
+                            f"{p.put_call}").upper(),
             "conid": _conid(sym), "securityID": "", "securityIDType": "",
-            "cusip": "", "isin": "", "figi": "", "listingExchange": "CBOE",
-            "underlyingConid": _UNDERLYING_CONID[p.underlying],
-            "underlyingSymbol": p.underlying, "underlyingSecurityID": "",
-            "underlyingListingExchange": "NASDAQ", "issuer": "",
-            "multiplier": "100", "strike": _q(p.strike),
-            "expiry": f"{p.expiry:%Y%m%d}", "putCall": p.put_call,
+            "cusip": "", "isin": "", "figi": "",
+            "listingExchange": "NASDAQ" if stock else "CBOE",
+            "underlyingConid": "" if stock else _UNDERLYING_CONID[p.underlying],
+            "underlyingSymbol": "" if stock else p.underlying,
+            "underlyingSecurityID": "",
+            "underlyingListingExchange": "" if stock else "NASDAQ", "issuer": "",
+            "multiplier": _q(mult),
+            "strike": "" if stock else _q(p.strike),
+            "expiry": "" if stock else f"{p.expiry:%Y%m%d}",
+            "putCall": "" if stock else p.put_call,
             "reportDate": f"{TO_DATE:%Y%m%d}", "position": _q(p.quantity),
             "markPrice": _q(p.mark), "positionValue": _q(value),
-            "openPrice": _q(p.cost_basis / Decimal(p.quantity) / MULTIPLIER),
+            "openPrice": _q(p.cost_basis / Decimal(p.quantity) / mult),
             "costBasisPrice": _q(abs(p.cost_basis / Decimal(p.quantity)
-                                     / MULTIPLIER)),
+                                     / mult)),
             "costBasisMoney": _q(p.cost_basis),
             "percentOfNAV": "", "fifoPnlUnrealized": _q(value - p.cost_basis),
             "side": "Short" if p.quantity < 0 else "Long",
@@ -480,6 +540,8 @@ def build_demo_statement() -> str:
                   dateOpened=f"{FROM_DATE:%Y%m%d}")
 
     for tag, container, rows in (
+        ("EquitySummaryByReportDateInBase", "EquitySummaryInBase",
+         _equity_summary_elements()),
         ("OpenPosition", "OpenPositions", pos),
         ("Trade", "Trades", trades),
         ("CashTransaction", "CashTransactions", _cash_elements(cash)),
@@ -493,6 +555,59 @@ def build_demo_statement() -> str:
 
     ET.indent(root, space=" ")
     return ET.tostring(root, encoding="unicode", xml_declaration=True) + "\n"
+
+
+#: Month-end Net Asset Value, in base currency, for the EquitySummaryInBase
+#: section: (cash, stock, options). Total is their sum by construction, which
+#: is asserted in tests -- so a bug in emission or parsing surfaces as a
+#: broken identity rather than a quietly wrong percentage.
+_NAV: dict[tuple[int, int], tuple[str, str, str]] = {
+    (2025, 1): ("38400.00", "1780.20", "1214.60"),
+    (2025, 2): ("39655.10", "1800.00", "-380.00"),
+    (2025, 3): ("38720.45", "1855.10", "890.30"),
+    (2025, 4): ("38210.80", "1902.40", "310.00"),
+    (2025, 5): ("38830.15", "1940.00", "605.10"),
+    (2025, 6): ("39480.20", "1988.60", "-120.40"),
+    (2025, 7): ("39760.65", "2011.90", "290.75"),
+    (2025, 8): ("40095.30", "2064.20", "150.00"),
+    (2025, 9): ("41530.85", "310.40", "-980.20"),
+    (2025, 10): ("42410.10", "324.75", "410.60"),
+    (2025, 11): ("42980.55", "3510.20", "-830.45"),
+    (2025, 12): ("44205.40", "3595.85", "220.10"),
+    (2026, 1): ("44880.25", "3640.10", "1105.30"),
+    (2026, 2): ("45310.70", "3705.55", "940.85"),
+}
+
+
+def _month_end(year: int, month: int) -> date:
+    nxt = date(year + (month == 12), month % 12 + 1, 1)
+    return min(nxt - timedelta(days=1), TO_DATE)
+
+
+def _equity_summary_elements() -> list[dict[str, str]]:
+    """One NAV row per month end, base currency.
+
+    The stock figure is deliberately emitted as a `stockLong`/`stockShort`
+    split rather than a single `stock` attribute: IBKR emits both shapes,
+    and the split is the one the ingest fallback exists for -- so the demo
+    exercises it through the real pipeline instead of a fixture.
+    """
+    out = []
+    for (year, month), (cash_v, stock_v, options_v) in sorted(_NAV.items()):
+        day = _month_end(year, month)
+        cash_d, stock_d, options_d = (
+            Decimal(cash_v), Decimal(stock_v), Decimal(options_v)
+        )
+        short = min(stock_d, Decimal("0"))
+        out.append({
+            "accountId": DEMO_ACCOUNT, "acctAlias": "", "currency": BASE_CURRENCY,
+            "reportDate": f"{day:%Y%m%d}",
+            "cash": _q(cash_d),
+            "stockLong": _q(stock_d - short), "stockShort": _q(short),
+            "options": _q(options_d),
+            "total": _q(cash_d + stock_d + options_d),
+        })
+    return out
 
 
 def assert_not_real(archive_dir: Path, db_path: Path | None = None) -> None:

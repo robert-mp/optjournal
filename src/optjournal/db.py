@@ -7,10 +7,12 @@ Design notes, and the reasoning behind the non-obvious choices:
   7-decimal commission, so representation error is around 1e-12. Exactness
   costs more in query ergonomics than it buys.
 
-* Contract quantities are INTEGER. Not for magnitude but for exactness on
-  zero: deciding whether an option position is closed means checking that
-  fills net to zero, and float makes that unreliable. Verified safe --
-  option quantities are always integral (stock is not; it can be fractional).
+* Contract quantities are declared INTEGER for the common case: option
+  quantities are always integral, and integers make the episode flat-test
+  exact. Stock lots are legitimately fractional (dividend reinvestment buys
+  1.79 shares), and SQLite's INTEGER *affinity* stores those losslessly as
+  REAL in the same column -- so nothing is truncated; history applies a dust
+  epsilon to fractional quantities instead (see history._flat).
 
 * Every table keeps a `raw` JSON column holding the full source attribute
   dict. py_ibkr's models use extra="ignore" and do not model four of the
@@ -36,7 +38,7 @@ from pathlib import Path
 
 __all__ = ["SCHEMA_VERSION", "connect", "migrate", "open_journal"]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -146,6 +148,24 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
   PRIMARY KEY (report_date, conid)
 );
 
+-- Daily Net Asset Value, from the EquitySummaryInBase statement section.
+-- The one figure a trade ledger cannot reconstruct: cash balances need a
+-- starting balance no Activity statement carries, so NAV must be reported,
+-- not derived. Replace-on-date like position_snapshots: re-fetching a day
+-- corrects rather than duplicates.
+CREATE TABLE IF NOT EXISTS equity_summaries (
+  report_date   TEXT PRIMARY KEY,
+  account_id    TEXT NOT NULL,
+  currency      TEXT NOT NULL,
+  cash_base     REAL,
+  stock_base    REAL,
+  options_base  REAL,
+  total_base    REAL NOT NULL,
+  raw           TEXT NOT NULL,
+  source_file   TEXT NOT NULL REFERENCES statements(source_file),
+  ingested_at   TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS securities (
   conid              TEXT PRIMARY KEY,
   symbol             TEXT NOT NULL,
@@ -166,12 +186,14 @@ CREATE TABLE IF NOT EXISTS securities (
 );
 
 -- One row per (order, leg). Collapses partial fills, which IBKR marks with
--- note code 'P' and which share an ib_order_id.
-CREATE VIEW IF NOT EXISTS option_legs AS
+-- note code 'P' and which share an ib_order_id. Covers every asset category:
+-- the consumer scopes by asset_category, the view does not pre-decide.
+CREATE VIEW IF NOT EXISTS trade_legs AS
 SELECT
   ib_order_id,
   conid,
   account_id,
+  asset_category,
   symbol,
   underlying_symbol,
   put_call,
@@ -193,15 +215,17 @@ SELECT
   SUM(fifo_pnl_realized)                              AS realized_pnl,
   SUM(fifo_pnl_realized_base)                          AS realized_pnl_base
 FROM trades
-WHERE asset_category = 'OPT'
 GROUP BY ib_order_id, conid;
 
 -- One row per order. A multi-leg order is a strategy: leg_count > 1 means
 -- a spread, straddle, condor and so on, submitted as a single order.
-CREATE VIEW IF NOT EXISTS option_orders AS
+CREATE VIEW IF NOT EXISTS trade_orders AS
 SELECT
   ib_order_id,
   account_id,
+  -- An order never mixes categories (verified: IBKR order ids are per
+  -- instrument), so MIN is selection, not aggregation.
+  MIN(asset_category)            AS asset_category,
   COUNT(*)                       AS leg_count,
   SUM(fills)                     AS fills,
   MIN(first_fill_at)             AS first_fill_at,
@@ -214,8 +238,16 @@ SELECT
   SUM(commission_base)           AS commission_base,
   SUM(realized_pnl)              AS realized_pnl,
   SUM(realized_pnl_base)         AS realized_pnl_base
-FROM option_legs
+FROM trade_legs
 GROUP BY ib_order_id;
+
+-- OPT-scoped wrappers, kept for their names: "option orders" is the journal's
+-- home view and half the codebase says so.
+CREATE VIEW IF NOT EXISTS option_legs AS
+SELECT * FROM trade_legs WHERE asset_category = 'OPT';
+
+CREATE VIEW IF NOT EXISTS option_orders AS
+SELECT * FROM trade_orders WHERE asset_category = 'OPT';
 
 -- Current option book, from the most recent snapshot only.
 CREATE VIEW IF NOT EXISTS current_option_positions AS
@@ -238,8 +270,19 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+#: Views are code, not data: their definitions belong to this file, not to
+#: whichever version of it first created the database. Dropped and recreated
+#: on every migrate, because CREATE VIEW IF NOT EXISTS would silently leave an
+#: existing database on the old definition forever -- which is how the
+#: OPT-only order views survived into a journal that stores every category.
+_VIEWS = ("trade_legs", "trade_orders", "option_legs", "option_orders",
+          "current_option_positions")
+
+
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply the schema. Returns the resulting schema version."""
+    for view in _VIEWS:
+        conn.execute(f"DROP VIEW IF EXISTS {view}")
     conn.executescript(_SCHEMA)
     row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
     current = row["v"] if row and row["v"] is not None else 0

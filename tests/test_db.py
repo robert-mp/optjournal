@@ -45,8 +45,25 @@ def test_pragmas_applied(conn):
 
 
 @pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
-def test_ingest_filters_to_options_by_default(conn):
+def test_ingest_keeps_everything_by_default(conn):
+    """Storage is unfiltered; category scoping happens at query time.
+
+    The old OPT-only default made the database disagree with its own archive:
+    the Equities view read empty because ingest had dropped the rows, and any
+    later sync silently re-narrowed a database that had been widened by hand.
+    """
     r = ingest_file(conn, STATEMENTS[-1])
+    assert r.trades_filtered_out == 0
+    cats = {
+        row["asset_category"]
+        for row in conn.execute("SELECT DISTINCT asset_category FROM trades")
+    }
+    assert len(cats) > 1, "the real archive holds stock and FX besides options"
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
+def test_ingest_can_still_narrow_to_options(conn):
+    r = ingest_file(conn, STATEMENTS[-1], assets=("OPT",))
     assert r.trades_filtered_out > 0, "expected stock and FX trades to be filtered"
     cats = {
         row["asset_category"]
@@ -284,3 +301,68 @@ def test_distinct_statements_are_not_treated_as_duplicates(conn):
         assert result.duplicate_of is None
     rows = conn.execute("SELECT COUNT(*) AS n FROM statements").fetchone()["n"]
     assert rows == 2
+
+
+def test_migrate_refreshes_stale_view_definitions(tmp_path):
+    """Views are code: a definition change must reach existing databases.
+
+    CREATE VIEW IF NOT EXISTS never updates, so a database created before a
+    view changed would keep the old SQL forever -- exactly how the OPT-only
+    order views would have survived into a journal that stores every
+    category. Simulated here by planting a garbage definition and asserting
+    migrate replaces it.
+    """
+    conn = connect(tmp_path / "v.db")
+    migrate(conn)
+    conn.execute("DROP VIEW trade_legs")
+    conn.execute("CREATE VIEW trade_legs AS SELECT 1 AS stale")
+    migrate(conn)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(trade_legs)")}
+    assert "stale" not in cols and "asset_category" in cols
+    conn.close()
+
+
+def test_fractional_stock_quantities_survive_ingest(tmp_path):
+    """413.22 shares must not become 413.
+
+    The int coercion predates storing stocks: option quantities are always
+    integral, stock lots are not -- a dividend reinvestment buys 1.79 shares
+    and the real SIVE sale was 413.22. SQLite's INTEGER affinity keeps the
+    fraction losslessly; truncating it changed the position size.
+    """
+    import json
+
+    from optjournal.ingest import _qty
+
+    assert _qty("3") == 3 and isinstance(_qty("3"), int)
+    assert _qty("-2.0") == -2 and isinstance(_qty("-2.0"), int)
+    assert _qty("413.22") == 413.22
+    assert _qty("1.79") == 1.79
+    assert _qty("") is None
+
+    conn = connect(tmp_path / "frac.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
+        " to_date, base_currency, asset_filter, ingested_at)"
+        " VALUES ('t.xml', 'x', 'U0', '2025', '2025', 'EUR', 'ALL', 'now')"
+    )
+    for tid, qty, oc in (("t1", 413.22, "O"), ("t2", -413.22, "C")):
+        conn.execute(
+            "INSERT INTO trades (trade_id, ib_exec_id, transaction_id,"
+            " account_id, trade_date, asset_category, symbol, conid, quantity,"
+            " currency, fx_rate_to_base, open_close, raw, source_file,"
+            " first_seen_at) VALUES (?,?,?, 'U0', '2025-05-05', 'STK', 'SIVE',"
+            " '1', ?, 'SEK', 0.09, ?, ?, 't.xml', 'now')",
+            (tid, tid, tid, qty, oc, json.dumps({})),
+        )
+    row = conn.execute("SELECT quantity FROM trades WHERE trade_id='t1'").fetchone()
+    assert row["quantity"] == 413.22, "INTEGER affinity must keep the fraction"
+
+    # And the episode over the pair is flat -- closed, not stuck open on dust.
+    from optjournal.history import build_history
+
+    report = build_history(conn, asset_category="STK")
+    assert len(report.episodes) == 1
+    assert report.episodes[0].is_closed
+    conn.close()
