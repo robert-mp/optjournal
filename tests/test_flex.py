@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from py_ibkr import Trade
 
+from optjournal import flex
 from optjournal.flex import load
 from optjournal.sections import MODELLED_SECTIONS, raw_sections, section_tags
 
@@ -133,3 +134,55 @@ def test_shim_exposes_unmodelled_sections(statement: Path):
     for tag, rows in sections.items():
         for row in rows:
             assert row, f"{tag}: empty attribute dict"
+
+
+# --- retry budget -------------------------------------------------------------
+#
+# The polling ceiling is not a free parameter: callers size their timeouts from
+# it. A cron script had FETCH_TIMEOUT_S=240 against a real worst case of 2,100s,
+# on a stale comment claiming 84s, so a routine slow statement generation became
+# a raw traceback and a spent request with no cooldown recorded. These pin the
+# arithmetic and, more importantly, fail if MAX_RETRIES grows past what a daily
+# cron can wait for.
+
+
+def test_poll_worst_case_matches_backoff_arithmetic():
+    """Recomputed independently of the module's own expression."""
+    per_stage = sum(
+        min(flex.RETRY_INTERVAL * (2**i), flex.MAX_RETRY_INTERVAL)
+        for i in range(flex.MAX_RETRIES)
+    )
+    assert flex.POLL_WORST_CASE_S == 2 * per_stage, (
+        "worst case must cover both py_ibkr poll stages (SendRequest and "
+        "GetStatement), each of which gets the full retry budget"
+    )
+
+
+def test_poll_worst_case_is_hand_computable():
+    """MAX_RETRIES=4 -> [30, 60, 120, 120] = 330s/stage -> 660s."""
+    assert flex.MAX_RETRIES == 4
+    assert flex.POLL_WORST_CASE_S == 660
+
+
+def test_retry_budget_stays_within_a_daily_cron_window():
+    """The guard that makes the timeout fix durable.
+
+    `~/.meshclaw/crons/optjournal_sync.py` sets a subprocess timeout above
+    POLL_WORST_CASE_S, and its cron registration sets a timeout above that.
+    Raising MAX_RETRIES silently invalidates both. Fail here instead, where the
+    message can say so, rather than at 07:00 in a sandboxed subprocess.
+    """
+    assert flex.POLL_WORST_CASE_S <= 720, (
+        f"POLL_WORST_CASE_S is {flex.POLL_WORST_CASE_S}s. Raise "
+        f"FETCH_TIMEOUT_S in optjournal_sync.py above it, and the cron's own "
+        f"timeout above that, or lower MAX_RETRIES."
+    )
+
+
+def test_backoff_is_capped_not_unbounded():
+    waits = [
+        min(flex.RETRY_INTERVAL * (2**i), flex.MAX_RETRY_INTERVAL)
+        for i in range(flex.MAX_RETRIES)
+    ]
+    assert max(waits) == flex.MAX_RETRY_INTERVAL
+    assert waits == sorted(waits), "backoff must be monotonically non-decreasing"

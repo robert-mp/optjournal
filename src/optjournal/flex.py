@@ -34,6 +34,7 @@ from py_ibkr.flex.parser import parse_xml_file
 
 __all__ = [
     "FETCH_COOLDOWN_S",
+    "POLL_WORST_CASE_S",
     "FetchCooldown",
     "FetchResult",
     "TokenMissing",
@@ -90,12 +91,37 @@ class FetchCooldown(RuntimeError):
             f"retry in {retry_after_s}s or pass force=True"
         )
 
-#: Deliberately conservative. IBKR locks out clients that poll too hard,
-#: and an Activity statement only changes once per day, so there is nothing
-#: to gain from being aggressive.
-MAX_RETRIES = 10
+#: Retry budget for Flex statement generation.
+#:
+#: py_ibkr backs off as ``min(RETRY_INTERVAL * 2**i, MAX_RETRY_INTERVAL)`` and
+#: applies the budget to *each* of its two stages independently (SendRequest,
+#: which retries while another statement is generating, and GetStatement,
+#: which retries while the statement is not ready). So the worst case is
+#: twice the per-stage sum:
+#:
+#:     MAX_RETRIES=4  ->  [30, 60, 120, 120] = 330s/stage  ->  660s (11 min)
+#:
+#: Four is chosen so that ceiling fits inside a daily cron's timeout. It was
+#: 10, which is 1,050s per stage and 35 minutes end to end -- far longer than
+#: any caller was willing to wait, and long enough that the cron's own
+#: subprocess timeout fired first and turned a routine slow generation into a
+#: raw traceback. Patience beyond a few minutes buys nothing here: an
+#: Activity statement is regenerated once a day, so a statement that is not
+#: ready in five minutes will still be there at the next scheduled run.
+#:
+#: Keep any caller-side timeout above 660s, and the cron timeout above that,
+#: so the caller's own handler runs before anything kills the process.
+MAX_RETRIES = 4
 RETRY_INTERVAL = 30
 MAX_RETRY_INTERVAL = 120
+
+#: Worst-case wall time of `fetch`'s polling, derived from the constants
+#: above. Exported so callers can size their timeouts from the real number
+#: rather than guessing -- guessing is what produced the 240s-vs-2100s
+#: mismatch this replaces.
+POLL_WORST_CASE_S = 2 * sum(
+    min(RETRY_INTERVAL * (2**i), MAX_RETRY_INTERVAL) for i in range(MAX_RETRIES)
+)
 
 
 class TokenMissing(RuntimeError):
