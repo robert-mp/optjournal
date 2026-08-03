@@ -326,7 +326,7 @@ function dashboard(){
       cls(s.net_pnl_base)+' '+(String(cash(s.net_pnl_base)).length>10?'sm':'')),
     statCard('Commissions', cash(s.commissions_base), 'stated by IBKR',
       'sm '+cls(s.commissions_base)),
-    statCard('Fees', cash(s.fees_base), 'market data and custody',
+    statCard('Fees', cash(s.fees_base), 'account-level: market data, custody',
       'sm '+cls(s.fees_base)),
     statCard('Winning Trades', s.wins, 'closed round trips', s.wins?'pos':''),
     statCard('Losing Trades', s.losses, 'closed round trips', s.losses?'neg':''),
@@ -342,14 +342,22 @@ function dashboard(){
   return `${filters()}
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Statistics</h2>
-      <div class="sub">Options only. ${esc(ccyNote())} Realised P&L is IBKR's own
-      figure and is already net of opening and closing commission.</div></div>
+      <div class="sub">${esc(s.asset_category)} trades and commission; fees are
+      account-level and carry no asset category. ${esc(ccyNote())} Realised P&L is
+      IBKR's own figure and is already net of opening and closing commission.</div></div>
       <div class="pills">
         <span class="pill">open <b>${s.open_episodes}</b></span>
-        <span class="pill" title="Options only. The Costs tab totals every asset
-          class, so its figure is larger — most of this account's friction is
-          stock commission, which this journal filters out."
-          >friction (options) <b>${cash(s.total_friction_base)}</b></span>
+        <span class="pill" title="Commission on ${esc(s.asset_category)} trades.
+          Commission carries an asset category, so this figure is genuinely
+          scoped to this journal."
+          >${esc(s.asset_category)} <b>${cash(s.options_friction_base)}</b></span>
+        <span class="pill dim" title="Fees carry no asset category at all — they
+          are market-data and custody charges levied on the account — so they
+          cannot be attributed to ${esc(s.asset_category)}. This is not the whole
+          account: this panel reads the ${esc(s.asset_category)}-filtered database
+          and cannot see commission on other instruments. The Costs tab reads the
+          raw statement and shows the full account figure."
+          >account fees <b>${cash(s.account_friction_base)}</b></span>
       </div></div>
     <div class="stats">${cards}</div>
     ${s.closed_episodes===0?`<div class="note">No round trip has closed yet, so
@@ -504,11 +512,7 @@ function positions(){
      where cost_basis is set exclusively for snapshot-only ones -- so the short
      put, which has fills on record, rendered a dash even though the snapshot
      held -1569.907847. The history lookup stays as a fallback for a snapshot
-     row that lacks the column.
-
-     Note: the binding guard below scans this script as text, comments
-     included, so a dotted expression written in prose here reads as a real
-     property access and trips it. */
+     row that lacks the column. */
   const basis={}; open.forEach(ep=>{if(ep.cost_basis!=null)basis[ep.conid]=ep.cost_basis;});
   let val=0; ps.forEach(pos=>val+=(pos.position_value_base||0));
   return `<div class="card">

@@ -121,8 +121,45 @@ class MonthStats:
         return self.net_pnl_base / self.net_liq_base * 100.0
 
     @property
+    def options_friction_base(self) -> float:
+        """Friction attributable to `asset_category`.
+
+        Commission is charged per trade, so it carries an assetCategory and
+        the ingest filter genuinely applies to it. This is the only friction
+        figure on this panel that is scoped to the journalled instruments.
+        """
+        return abs(self.commissions_base)
+
+    @property
+    def account_friction_base(self) -> float:
+        """Friction that cannot be attributed to `asset_category`.
+
+        Fee rows carry no assetCategory at all -- market-data subscriptions
+        and custody charges are levied on the account, not on a trade -- so
+        ingest deliberately does not filter them and they cannot be
+        apportioned to options without inventing the split. The AutoFX markup
+        has the same problem: IBKR never ties a conversion back to the trade
+        that caused it.
+
+        Narrower than `CostReport.account_friction_base` despite the matching
+        name: this panel reads the `asset_category`-filtered database, so it
+        cannot see commission on other instruments at all, while the cost
+        report reads the raw statement and includes it. Do not present the two
+        under the same label -- they differ by the whole of stock commission.
+        """
+        return abs(self.fees_base) + abs(self.autofx_base)
+
+    @property
     def total_friction_base(self) -> float:
-        return abs(self.commissions_base) + abs(self.fees_base) + abs(self.autofx_base)
+        """Both scopes together.
+
+        Presenting this single figure under a panel headed "options" was
+        wrong: it labelled account-level fees as this journal's cost, which
+        is the same defect the cost report carried. Read
+        `options_friction_base` and `account_friction_base` instead wherever
+        the scope is being claimed.
+        """
+        return self.options_friction_base + self.account_friction_base
 
 
 def available_months(conn: sqlite3.Connection, asset_category: str | None = "OPT") -> list[str]:
@@ -238,6 +275,8 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "avg_loss_base": stats.avg_loss_base,
         "net_liq_base": stats.net_liq_base,
         "gain_pct_of_net_liq": stats.gain_pct_of_net_liq,
+        "options_friction_base": stats.options_friction_base,
+        "account_friction_base": stats.account_friction_base,
         "total_friction_base": stats.total_friction_base,
         "green_days": stats.green_days,
         "red_days": stats.red_days,

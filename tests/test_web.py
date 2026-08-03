@@ -64,6 +64,55 @@ def _js() -> str:
     return page_html().split("<script>")[1].split("</script>")[0]
 
 
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+#: The `(?<!:)` keeps `://` in a URL from being mistaken for a comment start.
+#: A protocol-relative `"//host"` would still be stripped, which is acceptable
+#: here: `test_page_loads_no_external_resources` asserts the page has none.
+_LINE_COMMENT = re.compile(r"(?<!:)//[^\n]*")
+
+
+def _code_only(js: str) -> str:
+    """The script with comments removed, so prose is not scanned as code.
+
+    The guards below look for `ident.attr`. A comment that mentions a dotted
+    expression in passing -- "this used to read from history.open" -- is
+    indistinguishable from a real property access, and tripped the
+    classification guard with a binding that exists nowhere in the code. A
+    comment is not code, so it must not be scanned.
+
+    Stripping is regex-based rather than a real tokenizer, which is sound for
+    this file: it uses block comments exclusively, they are balanced, and it
+    contains no `://` and no comment markers inside string literals. The
+    helper is tested directly rather than trusted.
+    """
+    return _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", js))
+
+
+def test_code_only_strips_comments_and_keeps_code():
+    js = """
+    /* prose mentioning history.open and pos.bogus_key */
+    const a = real.value;
+    // a line comment about foo.bar
+    const u = "https://example.com/x";
+    """
+    out = _code_only(js)
+    assert "history.open" not in out
+    assert "pos.bogus_key" not in out
+    assert "foo.bar" not in out, "line comments must be stripped too"
+    assert "real.value" in out, "real code must survive"
+    assert "https://example.com/x" in out, "a URL is not a line comment"
+
+
+def test_page_comments_are_balanced():
+    """The regex stripper assumes balanced block comments; assert that holds.
+
+    Deliberately reads the raw script: counting markers after stripping them
+    would compare 0 to 0 and pass no matter what the file contained.
+    """
+    js = _js()
+    assert js.count("/*") == js.count("*/"), "unbalanced block comments in page.html"
+
+
 def test_state_is_pure_json(state):
     """No default=str crutch: the payload must serialise on its own.
 
@@ -161,7 +210,7 @@ def test_every_js_property_read_resolves(state):
     what guard two exists for.
     """
     roots = _roots(state)
-    js = _js()
+    js = _code_only(_js())
     missing = []
     for var, obj in roots.items():
         for match in re.finditer(rf"(?<![\w.]){re.escape(var)}\.([a-z_][a-z0-9_]*)\b", js):
@@ -192,7 +241,7 @@ def test_every_binding_is_classified(state):
     declared not to be (`_NOT_PAYLOAD_BINDINGS`). Introducing a name becomes a
     deliberate decision instead of a silent omission.
     """
-    used = {m.group(1) for m in _PROPERTY_READ.finditer(_js())}
+    used = {m.group(1) for m in _PROPERTY_READ.finditer(_code_only(_js()))}
     unclassified = used - (set(_roots(state)) | _NOT_PAYLOAD_BINDINGS)
 
     assert not unclassified, (
@@ -277,7 +326,7 @@ def test_page_escapes_interpolated_values():
     An earlier version looked for the exact string `esc(l.symbol)` and broke
     on `esc(l.underlying_symbol||'')`, which is correct code.
     """
-    js = _js()
+    js = _code_only(_js())
     assert "const esc=" in js, "no escaping helper defined"
 
     untrusted = ("pos.symbol", "stm.file", "l.underlying_symbol", "l.expiry",
@@ -296,6 +345,28 @@ def test_serve_refuses_non_loopback(host, tmp_path):
     """The page has no auth and exposes an entire account. Loopback or nothing."""
     with pytest.raises(ValueError, match="Loopback only"):
         serve(db_path=tmp_path / "x.db", archive_dir=tmp_path, host=host)
+
+
+def test_dashboard_friction_is_split_by_scope(state):
+    """The panel is headed by an asset category, so it must not blend scopes.
+
+    It presented one `total_friction_base` pill labelled "friction (options)"
+    that was options commission plus account-level fees -- the same defect the
+    cost report carried. Fees carry no assetCategory, so ingest does not filter
+    them and they cannot be attributed to options.
+    """
+    s = state["stats"]
+    assert s["options_friction_base"] == abs(s["commissions_base"])
+    assert s["account_friction_base"] == abs(s["fees_base"]) + abs(s["autofx_base"])
+    # The split reapportions; it must not change or drop anything.
+    assert (
+        s["options_friction_base"] + s["account_friction_base"]
+        == s["total_friction_base"]
+    )
+    # Guards the actual bug: the attributable figure must exclude fees.
+    assert s["options_friction_base"] != s["total_friction_base"], (
+        "fees are being counted as options friction again"
+    )
 
 
 def test_every_position_carries_a_cost_basis(state):
