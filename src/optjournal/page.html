@@ -538,8 +538,14 @@ function costs(){
   /* Two blocks, not one. T.commission_base spans the whole IBKR account, so
      showing it as "Commission" under a journal scoped to options presented
      stock cost as this journal's. journal_* is the attributable figure. */
-  const jrows=[[scope+' commission',T.journal_commission_base,'stated']];
-  if(T.journal_taxes_base) jrows.push([scope+' taxes',T.journal_taxes_base,'stated']);
+  const jrows=[[scope+' commission',cash(T.journal_commission_base),'stated']];
+  if(T.journal_taxes_base) jrows.push([scope+' taxes',cash(T.journal_taxes_base),'stated']);
+  /* Per contract, not a repeat of the total. With commission as the only
+     component, a "journal friction" card would restate the figure beside
+     itself; the per-unit rate is the one that predicts cost at volume. */
+  if(T.journal_per_unit_base!=null)
+    jrows.push(['Per contract',cash(T.journal_per_unit_base,4),'charged per unit, not per euro']);
+  else jrows.push(['Journal friction',cash(T.journal_friction_base),'stated only']);
   const arows=[['Commission, other instruments',T.other_commission_base,'stated'],
                ['Fees',T.fees_base,'no asset attribution'],
                ['AutoFX rate markup',T.autofx_spread_base,'estimated @ 3 bps']];
@@ -553,9 +559,8 @@ function costs(){
         cash(T.friction_base)}</b></span></div>
     </div>
     <h2 style="font-size:15px;margin-top:4px">${esc(scope)} — attributable to this journal</h2>
-    <div class="stats" style="grid-template-columns:repeat(4,1fr)">
-      ${jrows.map(r=>statCard(r[0],cash(r[1]),r[2],'sm')).join('')}
-      ${statCard('Journal friction',cash(T.journal_friction_base),'stated only','sm')}
+    <div class="stats" style="grid-template-columns:repeat(${jrows.length},1fr)">
+      ${jrows.map(r=>statCard(r[0],r[1],r[2],'sm')).join('')}
     </div>
     <h2 style="font-size:15px;margin-top:16px">Account-level — all instruments, context only</h2>
     <div class="note">These cannot be attributed to ${esc(scope)}: commission on other

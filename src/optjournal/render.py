@@ -364,6 +364,7 @@ def costs_data(report: CostReport) -> Row:
             "journal_commission_base": _num(report.journal_commission_base),
             "journal_taxes_base": _num(report.journal_taxes_base),
             "journal_friction_base": _num(report.journal_friction_base),
+            "journal_per_unit_base": _num(report.journal_per_unit_base),
             "other_commission_base": _num(report.other_commission_base),
             "other_taxes_base": _num(report.other_taxes_base),
             "account_friction_base": _num(report.account_friction_base),

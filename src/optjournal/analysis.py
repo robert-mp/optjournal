@@ -280,6 +280,19 @@ class CostReport:
         return self.journal_commission_base + self.journal_taxes_base
 
     @property
+    def journal_per_unit_base(self) -> Decimal | None:
+        """Commission per contract across the journal's scope.
+
+        The forward-looking figure: options commission is charged per contract
+        with no reference to money at risk, so this is the only number in the
+        report that predicts cost at higher volume.
+        """
+        qty = sum(g.quantity for g in self.journal_commissions)
+        if not qty:
+            return None
+        return self.journal_commission_base / Decimal(qty)
+
+    @property
     def other_commission_base(self) -> Decimal:
         return sum((g.commission_base for g in self.other_commissions), ZERO)
 
