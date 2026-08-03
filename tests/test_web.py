@@ -77,14 +77,33 @@ def test_state_has_every_panel(state):
         assert key in state, f"panel data {key!r} missing"
 
 
-def test_every_js_property_read_resolves(state):
-    """The regression guard for silently-blank panels.
+#: Matches `ident.attr` where `ident` is not itself part of a property access,
+#: so `S.state.positions` yields only `S.state`.
+_PROPERTY_READ = re.compile(r"(?<![\w.$])([A-Za-z_$][\w$]*)\.([a-z_][a-z0-9_]*)\b")
 
-    Each JS variable is bound to the payload object it actually holds. The page
-    keeps those names distinct on purpose -- `pos` for a position, `ep` for an
-    episode, `dy` for a calendar day, `pt` for a chart point, `stm` for a
-    statement -- precisely so this mapping is one-to-one and the check means
-    something. Reusing `d` for three different shapes made it unbindable.
+#: Bindings that carry a dot but hold no API payload: page globals, DOM nodes,
+#: fetch responses, and local collections whose reads are array methods.
+#: Explicit by design -- see test_every_binding_is_classified.
+_NOT_PAYLOAD_BINDINGS = frozenset({
+    # page globals and builtins
+    "Math", "S", "TABS",
+    # DOM nodes and the fetch response
+    "b", "sel", "m", "r",
+    # local collections; the reads are array methods, not payload keys
+    "cells", "days", "legs", "month", "months", "open", "opts", "orders",
+    "ps", "pts", "rows",
+})
+
+
+def _roots(state: dict) -> dict[str, dict]:
+    """Every JS binding that holds an API payload object, mapped to that object.
+
+    One name per shape, deliberately: `pos` for a position, `ep` for an episode,
+    `dy` for a calendar day, `pt` for a chart point, `stm` for a statement.
+    Reusing `d` for three different shapes once made this unbindable.
+
+    Shared by both guards below. Registering a binding here is what brings it
+    inside their reach, so this is the single place a new binding is declared.
     """
     costs = state["costs"][0]
     history = state["history"]
@@ -117,19 +136,30 @@ def test_every_js_property_read_resolves(state):
             roots["l"] = orders[0]["legs"][0]
     if episodes:
         roots["ep"] = episodes[0]
+        # `x` is the find-predicate binding over the same episode shape. It went
+        # unregistered until guard two started demanding every binding be
+        # classified, which means `x.conid` was never actually checked.
+        roots["x"] = episodes[0]
     if costs["fx"]:
         roots["f"] = costs["fx"][0]
     if state["statements"]:
         roots["stm"] = state["statements"][0]
-    # The currency toggle's own bindings. Registering them here is what puts
-    # the new code inside the guard's reach -- an unregistered binding is
-    # invisible to it, which is how `p.fifo_pnl_unrealized` shipped blank.
     fx = state.get("fx") or {}
     roots["fx"] = fx
     if fx.get("quotes"):
         roots["q"] = fx["quotes"][0]
         roots["qo"] = fx["quotes"][0]
+    return roots
 
+
+def test_every_js_property_read_resolves(state):
+    """Guard one: a read on a registered binding must resolve against the payload.
+
+    Catches a wrong KEY on a known binding -- `o.symbol` when the field is
+    really `underlyings`. Blind to a binding it does not know about, which is
+    what guard two exists for.
+    """
+    roots = _roots(state)
     js = _js()
     missing = []
     for var, obj in roots.items():
@@ -143,6 +173,33 @@ def test_every_js_property_read_resolves(state):
     assert not missing, (
         "the page reads keys the API does not send, so those cells render "
         f"blank rather than failing: {sorted(set(missing))}"
+    )
+
+
+def test_every_binding_is_classified(state):
+    """Guard two: every binding read in the page must be classified somewhere.
+
+    This is the complement of guard one, and it closes the hole that let a blank
+    Positions panel ship. Guard one only inspects bindings listed in `_roots`,
+    so when a map binding was renamed `p` -> `pos`, the registered key moved and
+    the single straggler `p.fifo_pnl_unrealized` fell outside everything that
+    looks. Reading a property of an undefined variable throws, and a throw
+    inside a template callback renders the whole table blank -- so the failure
+    surfaced as an empty tab, not as a red test.
+
+    A binding must therefore be either a payload object (`_roots`) or explicitly
+    declared not to be (`_NOT_PAYLOAD_BINDINGS`). Introducing a name becomes a
+    deliberate decision instead of a silent omission.
+    """
+    used = {m.group(1) for m in _PROPERTY_READ.finditer(_js())}
+    unclassified = used - (set(_roots(state)) | _NOT_PAYLOAD_BINDINGS)
+
+    assert not unclassified, (
+        "these bindings are read in the page but classified nowhere, so guard "
+        "one cannot see them and a stale rename or typo in any of them would "
+        f"render blank instead of failing a test: {sorted(unclassified)}. Add "
+        "each to _roots (holds a payload object) or to _NOT_PAYLOAD_BINDINGS "
+        "(DOM node, builtin, or local collection)."
     )
 
 
