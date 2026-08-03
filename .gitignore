@@ -33,3 +33,7 @@ raw/
 journal.db
 journal.db-shm
 journal.db-wal
+
+# Synthetic data from `optjournal demo`. Regenerated deterministically, and
+# kept out of raw/ so a fake statement can never be mistaken for a real one.
+demo/

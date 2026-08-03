@@ -27,7 +27,7 @@ from optjournal.compat import unknown_codes
 from optjournal.db import connect, migrate
 from optjournal.flex import FetchCooldown, TokenMissing, fetch, load
 from optjournal.history import build_history
-from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
+from optjournal.ingest import ASSET_FILTER_ALL, ASSET_FILTER_OPTIONS, ingest_file
 from optjournal.render import (
     costs_data,
     history_data,
@@ -46,6 +46,10 @@ from optjournal.render import (
 _ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_ARCHIVE = _ROOT / "raw"
 DEFAULT_DB = _ROOT / "journal.db"
+#: Synthetic data lives beside the real archive, never inside it. `raw/` is
+#: the provenance root and its statements cost IBKR requests to replace.
+DEFAULT_DEMO_DIR = _ROOT / "demo"
+DEFAULT_DEMO_DB = _ROOT / "demo" / "journal.db"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -212,6 +216,47 @@ def cmd_costs(args) -> int:
         "\n\n".join(format_report(r) for r in reports),
         args.json,
     )
+    return EXIT_OK
+
+
+def cmd_demo(args) -> int:
+    """Generate a synthetic statement and ingest it into a scratch database.
+
+    Kept away from `raw/` and `journal.db` by `assert_not_real`: the archive is
+    the provenance root for every report and a statement costs an IBKR request
+    to replace, so a fake one landing there would be indistinguishable from a
+    real one afterwards.
+    """
+    from optjournal.demo import QUERY_NAME, write_demo_statement
+
+    out, db = args.out, args.db
+    path = write_demo_statement(out, db)
+    conn = connect(db)
+    migrate(conn)
+    try:
+        result = ingest_file(conn, path, assets=ASSET_FILTER_OPTIONS,
+                             reingest=True)
+    finally:
+        conn.close()
+
+    payload = {
+        "query_name": QUERY_NAME, "statement": str(path), "db": str(db),
+        "trades": result.trades_inserted, "cash": result.cash_inserted,
+        "positions": result.positions_written,
+    }
+    lines = [
+        f"wrote {path.name}  ({path.stat().st_size:,} bytes)",
+        f"  {result.trades_inserted} option fills, {result.cash_inserted} cash rows,"
+        f" {result.positions_written} open positions",
+        f"  database: {db}",
+        "",
+        "synthetic data -- closed round trips, a vertical spread, a roll, an",
+        "expiry, an assignment, a 0DTE trade and a credited multi-fill order.",
+        "",
+        "  optjournal serve --db "
+        f"{db} --archive {out} --port 8792",
+    ]
+    _emit(payload, "\n".join(lines), args.json)
     return EXIT_OK
 
 
@@ -479,6 +524,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="re-process files already ingested")
     p.set_defaults(func=cmd_ingest)
 
+    p = sub.add_parser("demo", parents=[common],
+                       help="generate synthetic data in a scratch archive and DB")
+    p.add_argument("--out", type=Path, default=DEFAULT_DEMO_DIR,
+                   help=f"archive directory (default: {DEFAULT_DEMO_DIR})")
+    p.add_argument("--db", type=Path, default=DEFAULT_DEMO_DB,
+                   help=f"database (default: {DEFAULT_DEMO_DB})")
+    p.set_defaults(func=cmd_demo)
+
     p = sub.add_parser("orders", parents=[common, database],
                        help="option orders with partial fills collapsed")
     p.set_defaults(func=cmd_orders)
@@ -557,6 +610,12 @@ def main(argv: list[str] | None = None) -> int:
             f"\nFlex request failed: {type(exc).__name__}: {exc}", file=sys.stderr
         )
         return EXIT_ERROR
+    except ValueError as exc:
+        # Refusals: a non-loopback serve host, or demo data aimed at the real
+        # archive or database. The caller gave a bad argument, not a broken
+        # environment, so this is a config exit rather than an error.
+        print(f"\nRefused: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
     except sqlite3.OperationalError as exc:
         print(f"\nDatabase error: {exc}", file=sys.stderr)
         return EXIT_ERROR

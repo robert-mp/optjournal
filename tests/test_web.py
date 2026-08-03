@@ -140,8 +140,8 @@ _NOT_PAYLOAD_BINDINGS = frozenset({
     # DOM nodes and the fetch response
     "b", "sel", "m", "r",
     # local collections; the reads are array methods, not payload keys
-    "arows", "cells", "days", "jrows", "legs", "month", "months", "open",
-    "opts", "orders", "ps", "pts", "rows",
+    "arows", "cells", "days", "jrows", "legs", "month", "months", "oc",
+    "open", "opts", "orders", "ps", "pts", "rows",
 })
 
 
