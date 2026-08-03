@@ -499,6 +499,16 @@ function trades(){
 function positions(){
   const ps=S.state.positions||[], h=S.state.history||{};
   const open=(h.open||[]);
+  /* Cost basis comes from the snapshot row itself, which carries it for every
+     position. This used to read only from the history payload's open episodes,
+     where cost_basis is set exclusively for snapshot-only ones -- so the short
+     put, which has fills on record, rendered a dash even though the snapshot
+     held -1569.907847. The history lookup stays as a fallback for a snapshot
+     row that lacks the column.
+
+     Note: the binding guard below scans this script as text, comments
+     included, so a dotted expression written in prose here reads as a real
+     property access and trips it. */
   const basis={}; open.forEach(ep=>{if(ep.cost_basis!=null)basis[ep.conid]=ep.cost_basis;});
   let val=0; ps.forEach(pos=>val+=(pos.position_value_base||0));
   return `<div class="card">
@@ -516,7 +526,8 @@ function positions(){
         <td class="n mono ${cls(pos.position)}">${pos.position}</td>
         <td class="n mono">${money(pos.mark_price,pos.currency)}</td>
         <td class="n mono">${cash(pos.position_value_base)}</td>
-        <td class="n mono">${natCash(basis[pos.conid],pos.fx_rate_to_base)}</td>
+        <td class="n mono">${natCash(pos.cost_basis_money!=null?pos.cost_basis_money
+          :basis[pos.conid],pos.fx_rate_to_base)}</td>
         <td class="n mono ${cls(pos.fifo_pnl_unrealized)}">${
           natCash(pos.fifo_pnl_unrealized,pos.fx_rate_to_base)}</td>
         <td class="dim">${esc(pos.currency)}</td>

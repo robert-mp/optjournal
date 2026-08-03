@@ -254,7 +254,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         path, _, query = self.path.partition("?")
         params = urllib.parse.parse_qs(query)
         if path in ("/", "/index.html"):
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            self._send(200, page_html().encode(), "text/html; charset=utf-8")
         elif path == "/api/state":
             try:
                 self._json(200, build_state(
@@ -313,6 +313,12 @@ def serve(
             f"exposes an entire brokerage account. Loopback only."
         )
 
+    # Read once here and discard. The page is now read per request, so without
+    # this a missing or unreadable page.html would not surface until someone
+    # loaded the browser and got a 500. Failing at startup keeps the fast
+    # signal the old import-time read gave us.
+    page_html()
+
     _Handler.db_path = db_path
     _Handler.archive_dir = archive_dir
     _Handler.query_id = query_id
@@ -336,5 +342,22 @@ def serve(
 
 #: The page is a separate file so it can be edited with HTML/CSS tooling and
 #: diffed sensibly, rather than living as a multi-hundred-line string literal.
-#: Read once at import: it is ~20KB and never changes at runtime.
-PAGE = (Path(__file__).resolve().parent / "page.html").read_text(encoding="utf-8")
+PAGE_PATH = Path(__file__).resolve().parent / "page.html"
+
+
+def page_html() -> str:
+    """The page markup, read fresh on every call.
+
+    Deliberately not cached at import, which is what it used to do. The stale
+    copy cost real time: a server left running from an earlier session kept
+    serving a pre-edit page, three restart attempts silently failed to bind
+    the port and so appeared to change nothing, and a screenshot taken to
+    verify a UI change showed the old layout -- which would have been reported
+    as the change not working rather than as a stale process.
+
+    Re-reading is ~40KB from the page cache on a loopback-only, single-user
+    tool where the page is fetched once per load. That is orders of magnitude
+    cheaper than the failure mode it removes, and it means editing the file is
+    enough: reload the browser and the edit is there.
+    """
+    return PAGE_PATH.read_text(encoding="utf-8")

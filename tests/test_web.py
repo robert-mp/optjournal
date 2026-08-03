@@ -24,7 +24,8 @@ import pytest
 
 from optjournal.db import connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
-from optjournal.web import PAGE, build_state, serve
+from optjournal import web
+from optjournal.web import build_state, page_html, serve
 
 RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
 STATEMENTS = sorted(RAW_DIR.glob("activity-*.xml"))
@@ -60,7 +61,7 @@ def state(populated) -> dict:
 
 
 def _js() -> str:
-    return PAGE.split("<script>")[1].split("</script>")[0]
+    return page_html().split("<script>")[1].split("</script>")[0]
 
 
 def test_state_is_pure_json(state):
@@ -263,8 +264,9 @@ def test_sync_response_shape_matches_what_the_page_reads():
 
 def test_page_loads_no_external_resources():
     """Offline by construction, and the CSP header assumes it."""
-    assert not re.search(r'(src|href)="https?://', PAGE)
-    assert "cdn." not in PAGE
+    page = page_html()
+    assert not re.search(r'(src|href)="https?://', page)
+    assert "cdn." not in page
 
 
 def test_page_escapes_interpolated_values():
@@ -296,11 +298,48 @@ def test_serve_refuses_non_loopback(host, tmp_path):
         serve(db_path=tmp_path / "x.db", archive_dir=tmp_path, host=host)
 
 
+def test_every_position_carries_a_cost_basis(state):
+    """The book table shows a cost basis per row, so every row must have one.
+
+    It used to read this only from `history.open`, where `cost_basis` is set
+    exclusively for snapshot-only episodes. The short put has fills on record,
+    so its episode carried None and the cell rendered a dash -- while
+    position_snapshots held -1569.907847 all along. A negative basis is
+    correct for a short: it is premium received, not money paid.
+    """
+    for pos in state["positions"]:
+        assert pos.get("cost_basis_money") is not None, pos["symbol"]
+
+
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "127.0.0.2"])
 def test_loopback_addresses_accepted(host):
     from optjournal.web import _is_loopback
 
     assert _is_loopback(host)
+
+
+def test_page_is_reread_per_call(tmp_path, monkeypatch):
+    """An edit to page.html must show on reload, with no server restart.
+
+    This used to be cached at import, and the stale copy was actively
+    misleading: a server left running from an earlier session served a
+    pre-edit page, so a screenshot taken to verify a UI change showed the old
+    layout and looked like the change had failed.
+    """
+    page = tmp_path / "page.html"
+    page.write_text("<html>first</html>", encoding="utf-8")
+    monkeypatch.setattr(web, "PAGE_PATH", page)
+    assert "first" in page_html()
+
+    page.write_text("<html>second</html>", encoding="utf-8")
+    assert "second" in page_html(), "edit not picked up -- the page is cached again"
+
+
+def test_serve_fails_fast_when_the_page_is_missing(tmp_path, monkeypatch):
+    """Reading per request must not defer a missing page to a browser 500."""
+    monkeypatch.setattr(web, "PAGE_PATH", tmp_path / "absent.html")
+    with pytest.raises(FileNotFoundError):
+        serve(db_path=tmp_path / "x.db", archive_dir=tmp_path, host="127.0.0.1")
 
 
 def test_sync_panel_reports_cooldown(state):
