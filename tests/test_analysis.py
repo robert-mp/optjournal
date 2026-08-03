@@ -278,3 +278,120 @@ def test_costs_data_autofx_spread_sums_to_total():
 def test_costs_data_is_json_serialisable():
     import json
     json.dumps(costs_data(_real_report()), default=str)
+
+
+# ---------------------------------------------------------------- sign handling
+#
+# IBKR states commission as negative-is-a-charge, and on a split order it
+# charges the per-order minimum against one fill then credits part of it back
+# on another. Taking abs() per fill inverted those credits, so a credit of c
+# was booked as +c instead of -c and the total came out 2c too high.
+
+
+def _fill(asset, commission, qty="1", rate="1", taxes="0"):
+    return SimpleNamespace(
+        assetCategory=SimpleNamespace(value=asset),
+        symbol="TSLA",
+        proceeds=Decimal("-1000"),
+        ibCommission=Decimal(commission),
+        taxes=Decimal(taxes),
+        fxRateToBase=Decimal(rate),
+        quantity=Decimal(qty),
+        notes=[],
+    )
+
+
+def test_commission_credit_is_netted_not_added():
+    """The real defect: order 1096738670's two fills must net, not accumulate.
+
+    Charged -0.3481 on the 2-share fill and credited +0.0088 on the 8-share
+    fill; IBKR shows the order as having paid 0.3393. The old per-fill abs()
+    reported 0.3569 -- 0.0176 too high, exactly twice the credit.
+    """
+    r = analyse(_stmt([
+        _fill("STK", "-0.3481", qty="2"),
+        _fill("STK", "0.0088", qty="8"),
+    ]))
+    stk = r.commissions[0]
+    assert stk.commission_base == Decimal("0.3393")
+    assert stk.credit_fills == 1
+    # The figure the bug produced, asserted so a regression is unambiguous.
+    assert stk.commission_base != Decimal("0.3569")
+
+
+def test_a_net_credit_category_reports_negative_cost():
+    """A category that was net credited is a negative cost, not a positive one."""
+    r = analyse(_stmt([_fill("STK", "0.50"), _fill("STK", "-0.20")]))
+    assert r.commissions[0].commission_base == Decimal("-0.30")
+    assert r.commissions[0].credit_fills == 1
+
+
+def test_taxes_use_the_same_sign_convention():
+    r = analyse(_stmt([_fill("OPT", "-1.00", taxes="-0.25")]))
+    assert r.commissions[0].taxes_base == Decimal("0.25")
+
+
+def test_credit_netting_holds_on_the_real_statement(statement):
+    """Signed accumulation must equal the magnitude of the signed sum."""
+    signed = sum(
+        (t.ibCommission or ZERO) * (t.fxRateToBase or Decimal("1"))
+        for t in statement.Trades or ()
+    )
+    assert analyse(statement).total_commission_base == -signed
+
+
+# --------------------------------------------------------------- journal scope
+#
+# `analyse` reads the raw statement, which covers the whole IBKR account, while
+# ingest filters the database to options. Without an explicit scope the report
+# presented account-wide commission under a journal scoped to options: 93% of
+# the "commission" figure was stock the journal deliberately excludes.
+
+
+def test_journal_scope_separates_attributable_from_account_level():
+    r = analyse(_stmt([
+        _fill("OPT", "-2.00", qty="3"),
+        _fill("STK", "-25.00", qty="100"),
+    ]))
+    assert r.journal_asset == "OPT"
+    assert r.journal_commission_base == Decimal("2.00")
+    assert r.journal_friction_base == Decimal("2.00")
+    assert r.other_commission_base == Decimal("25.00")
+    # The account total is unchanged -- the split reapportions, never drops.
+    assert r.total_commission_base == Decimal("27.00")
+
+
+def test_the_two_blocks_sum_to_the_account_total(statement):
+    """No cost may fall between the journal block and the account block."""
+    r = analyse(statement)
+    assert r.journal_friction_base + r.account_friction_base == r.total_friction_base
+
+
+def test_journal_scope_is_configurable():
+    """Rescoping moves costs between blocks without changing the total."""
+    trades = [_fill("OPT", "-2.00", qty="3"), _fill("STK", "-25.00", qty="100")]
+    stk = analyse(_stmt(trades), journal_asset="STK")
+    assert stk.journal_commission_base == Decimal("25.00")
+    assert stk.other_commission_base == Decimal("2.00")
+    assert stk.total_friction_base == analyse(_stmt(trades)).total_friction_base
+
+
+def test_journal_block_is_reported_even_with_no_matching_trades():
+    """A statement with no option fills must say so, not print an empty block."""
+    r = analyse(_stmt([_fill("STK", "-25.00", qty="100")]))
+    assert r.journal_commissions == []
+    assert r.journal_friction_base == ZERO
+    assert f"no {r.journal_asset} trades" in format_report(r)
+
+
+def test_json_exposes_both_scopes(statement):
+    """A consumer must be able to read the journal figure, not just the account."""
+    t = costs_data(analyse(statement))["totals"]
+    for key in (
+        "journal_commission_base", "journal_friction_base",
+        "other_commission_base", "account_friction_base", "credit_fills",
+    ):
+        assert key in t, key
+    assert t["journal_friction_base"] + t["account_friction_base"] == pytest.approx(
+        t["friction_base"]
+    )

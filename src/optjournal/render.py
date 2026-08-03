@@ -346,6 +346,7 @@ def costs_data(report: CostReport) -> Row:
             }
             for w in report.withholding
         ],
+        "journal_asset": report.journal_asset,
         "totals": {
             "commission_base": _num(report.total_commission_base),
             "fees_base": _num(report.total_fees_base),
@@ -356,6 +357,17 @@ def costs_data(report: CostReport) -> Row:
             "friction_base": _num(report.total_friction_base),
             "fx_notional_base": _num(report.total_fx_notional_base),
             "fx_commission_base": _num(report.total_fx_commission_base),
+            # Scope split. `commission_base` above spans the whole account, so
+            # a consumer that wants this journal's cost must read the journal_*
+            # keys -- presenting the account figure as the journal's was the
+            # defect this split exists to remove.
+            "journal_commission_base": _num(report.journal_commission_base),
+            "journal_taxes_base": _num(report.journal_taxes_base),
+            "journal_friction_base": _num(report.journal_friction_base),
+            "other_commission_base": _num(report.other_commission_base),
+            "other_taxes_base": _num(report.other_taxes_base),
+            "account_friction_base": _num(report.account_friction_base),
+            "credit_fills": sum(g.credit_fills for g in report.commissions),
         },
     }
 

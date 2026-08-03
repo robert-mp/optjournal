@@ -534,19 +534,36 @@ function costs(){
   const c=(S.state.costs||[])[0];
   if(!c) return `<div class="card"><div class="empty">no statement to analyse</div></div>`;
   const T=c.totals;
-  const rows=[['Commission',T.commission_base,'stated'],
-              ['Fees',T.fees_base,'stated'],
-              ['AutoFX rate markup',T.autofx_spread_base,'estimated @ 3 bps']];
-  if(T.taxes_base) rows.splice(2,0,['Taxes',T.taxes_base,'stated']);
+  const scope=c.journal_asset||'OPT';
+  /* Two blocks, not one. T.commission_base spans the whole IBKR account, so
+     showing it as "Commission" under a journal scoped to options presented
+     stock cost as this journal's. journal_* is the attributable figure. */
+  const jrows=[[scope+' commission',T.journal_commission_base,'stated']];
+  if(T.journal_taxes_base) jrows.push([scope+' taxes',T.journal_taxes_base,'stated']);
+  const arows=[['Commission, other instruments',T.other_commission_base,'stated'],
+               ['Fees',T.fees_base,'no asset attribution'],
+               ['AutoFX rate markup',T.autofx_spread_base,'estimated @ 3 bps']];
+  if(T.other_taxes_base) arows.splice(1,0,['Taxes, other',T.other_taxes_base,'stated']);
   return `<div class="card">
     <div class="crow"><div><h2>Cost &amp; friction</h2>
       <div class="sub">${esc(c.from_date)} → ${esc(c.to_date)} ·
         ${esc(S.state.costs_source||'')}</div></div>
-      <div class="pills"><span class="pill">total <b>${cash(T.friction_base)}</b></span></div>
+      <div class="pills"><span class="pill">${esc(scope)} <b>${
+        cash(T.journal_friction_base)}</b></span><span class="pill dim">account <b>${
+        cash(T.friction_base)}</b></span></div>
     </div>
+    <h2 style="font-size:15px;margin-top:4px">${esc(scope)} — attributable to this journal</h2>
     <div class="stats" style="grid-template-columns:repeat(4,1fr)">
-      ${rows.map(r=>statCard(r[0],cash(r[1]),r[2],'sm')).join('')}
-      ${statCard('Total', cash(T.friction_base),
+      ${jrows.map(r=>statCard(r[0],cash(r[1]),r[2],'sm')).join('')}
+      ${statCard('Journal friction',cash(T.journal_friction_base),'stated only','sm')}
+    </div>
+    <h2 style="font-size:15px;margin-top:16px">Account-level — all instruments, context only</h2>
+    <div class="note">These cannot be attributed to ${esc(scope)}: commission on other
+      instruments belongs to those instruments, fees carry no asset category at all,
+      and AutoFX markup is not tied to the trade that caused the conversion.</div>
+    <div class="stats" style="grid-template-columns:repeat(4,1fr)">
+      ${arows.map(r=>statCard(r[0],cash(r[1]),r[2],'sm')).join('')}
+      ${statCard('Account total', cash(T.friction_base),
         `${cash(T.stated_friction_base)} stated + ${cash(T.autofx_spread_base)} est.`,'sm')}
     </div>
     <div class="card" style="margin-top:16px;background:var(--bg2)">

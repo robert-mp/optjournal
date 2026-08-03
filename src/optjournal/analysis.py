@@ -62,6 +62,12 @@ ZERO = Decimal("0")
 #: rather than something computed from reference rates.
 AUTOFX_MARKUP_BPS = Decimal("3")
 
+#: Asset category this journal is scoped to. Ingest filters to it, so the
+#: database holds only these trades -- but `analyse` reads the raw statement,
+#: which holds the whole account. Without an explicit scope the cost report
+#: silently blended stock commission into a figure labelled as this journal's.
+DEFAULT_JOURNAL_ASSET = "OPT"
+
 #: IBKR trade-note code marking a conversion as executed by the auto currency
 #: conversion service. py_ibkr models this as `Code.AUTOFX`; the wire value is
 #: compared directly so an ad-hoc member minted by `compat` still matches.
@@ -116,9 +122,15 @@ class FxPair:
     symbol: str
     conversions: int = 0
     notional_base: Decimal = ZERO
-    commission_base: Decimal = ZERO
+    #: Signed, like CommissionGroup.commission_signed: negative is a charge.
+    commission_signed: Decimal = ZERO
     autofx_conversions: int = 0
     autofx_notional_base: Decimal = ZERO
+
+    @property
+    def commission_base(self) -> Decimal:
+        """Cost as a positive number. See `CommissionGroup.commission_base`."""
+        return -self.commission_signed
 
     @property
     def commission_bps(self) -> Decimal | None:
@@ -152,8 +164,36 @@ class CommissionGroup:
     asset_category: str
     fills: int = 0
     quantity: int = 0
-    commission_base: Decimal = ZERO
-    taxes_base: Decimal = ZERO
+    #: Accumulated in IBKR's own sign convention: negative is a charge,
+    #: positive a credit. Kept signed on purpose -- see `commission_base`.
+    commission_signed: Decimal = ZERO
+    taxes_signed: Decimal = ZERO
+    #: Fills carrying a positive (credit) commission. Surfaced because a
+    #: nonzero count is the fingerprint of a per-order minimum adjustment,
+    #: and it is the case the old per-fill abs() silently inverted.
+    credit_fills: int = 0
+
+    @property
+    def commission_base(self) -> Decimal:
+        """Cost as a positive number, with credits netted off.
+
+        The sign is flipped once, here, rather than per fill. Applying abs()
+        to each fill turned IBKR's commission *credits* into extra charges:
+        when an order splits into several fills, IBKR charges the per-order
+        minimum against one fill and credits part of it back on another, so a
+        credit of c was counted as +c instead of -c and the group came out 2c
+        too high. Verified against order 1096738670 (TSLA, 2026-03-09): fills
+        of -0.3481 and +0.0088 USD net to the -0.3393 the order actually paid.
+
+        Negative output is meaningful, not a bug: it means the category was a
+        net credit over the period.
+        """
+        return -self.commission_signed
+
+    @property
+    def taxes_base(self) -> Decimal:
+        """Taxes as a positive cost. Same sign handling as `commission_base`."""
+        return -self.taxes_signed
 
     @property
     def per_unit_base(self) -> Decimal | None:
@@ -209,7 +249,63 @@ class CostReport:
     fees: list[FeeCategory]
     withholding: list[WithholdingLine]
     fx_caveat: str
+    #: Asset category this journal covers. Costs on it are attributable to the
+    #: journal; everything else is account-level context.
+    journal_asset: str = DEFAULT_JOURNAL_ASSET
 
+    @property
+    def journal_commissions(self) -> list[CommissionGroup]:
+        return [g for g in self.commissions if g.asset_category == self.journal_asset]
+
+    @property
+    def other_commissions(self) -> list[CommissionGroup]:
+        return [g for g in self.commissions if g.asset_category != self.journal_asset]
+
+    @property
+    def journal_commission_base(self) -> Decimal:
+        return sum((g.commission_base for g in self.journal_commissions), ZERO)
+
+    @property
+    def journal_taxes_base(self) -> Decimal:
+        return sum((g.taxes_base for g in self.journal_commissions), ZERO)
+
+    @property
+    def journal_friction_base(self) -> Decimal:
+        """Cost attributable to the instruments this journal actually covers.
+
+        Only per-trade charges qualify, because only they carry an
+        assetCategory. This is the number to read when asking what the
+        journalled book costs to run.
+        """
+        return self.journal_commission_base + self.journal_taxes_base
+
+    @property
+    def other_commission_base(self) -> Decimal:
+        return sum((g.commission_base for g in self.other_commissions), ZERO)
+
+    @property
+    def other_taxes_base(self) -> Decimal:
+        return sum((g.taxes_base for g in self.other_commissions), ZERO)
+
+    @property
+    def account_friction_base(self) -> Decimal:
+        """Cost the journal's scope cannot claim, and why it cannot.
+
+        Three components, none of them attributable to `journal_asset`:
+        commission on other instruments belongs to those instruments; fees
+        carry no assetCategory at all (market-data subscriptions and custody
+        charges are levied on the account, and in this data none of the fee
+        rows carries a conid or tradeID); and the AutoFX markup arises from
+        currency conversion, which IBKR never ties back to the trade that
+        caused it. Splitting any of the three into an options share would mean
+        inventing the split, so they are reported whole and kept separate.
+        """
+        return (
+            self.other_commission_base
+            + self.other_taxes_base
+            + self.total_fees_base
+            + self.total_autofx_spread_base
+        )
     @property
     def total_fees_base(self) -> Decimal:
         return sum((c.total_base for c in self.fees), ZERO)
@@ -266,8 +362,18 @@ class CostReport:
         return sum((p.commission_base for p in self.fx), ZERO)
 
 
-def analyse(statement, base_currency: str = "EUR") -> CostReport:
-    """Build a CostReport from one py_ibkr FlexStatement."""
+def analyse(
+    statement,
+    base_currency: str = "EUR",
+    journal_asset: str = DEFAULT_JOURNAL_ASSET,
+) -> CostReport:
+    """Build a CostReport from one py_ibkr FlexStatement.
+
+    `journal_asset` is the asset category this journal is scoped to. It does
+    not filter anything -- every category is still measured -- but it decides
+    which costs the report presents as attributable to the journal and which
+    as account-level context.
+    """
     pairs: dict[str, FxPair] = {}
     groups: dict[str, CommissionGroup] = {}
 
@@ -276,8 +382,14 @@ def analyse(statement, base_currency: str = "EUR") -> CostReport:
         rate = t.fxRateToBase
         g = groups.setdefault(cat, CommissionGroup(asset_category=cat))
         g.fills += 1
-        g.commission_base += abs(_to_base(t.ibCommission, rate))
-        g.taxes_base += abs(_to_base(t.taxes, rate))
+        # Signed, not abs(): a fill can carry a commission *credit* when IBKR
+        # adjusts a per-order minimum across a split order, and abs() would
+        # book that credit as a further charge.
+        commission = _to_base(t.ibCommission, rate)
+        g.commission_signed += commission
+        g.taxes_signed += _to_base(t.taxes, rate)
+        if commission > ZERO:
+            g.credit_fills += 1
         # Quantity is only a meaningful denominator for contracts and shares.
         # A per-unit figure on a currency conversion would be commission per
         # euro, which is not a rate anyone charges or reads.
@@ -290,9 +402,10 @@ def analyse(statement, base_currency: str = "EUR") -> CostReport:
         p = pairs.setdefault(sym, FxPair(symbol=sym))
         p.conversions += 1
         # proceeds is signed by direction; magnitude is the converted value.
+        # abs() is correct here -- turnover accumulates regardless of side.
         notional = abs(_to_base(t.proceeds, rate))
         p.notional_base += notional
-        p.commission_base += abs(_to_base(t.ibCommission, rate))
+        p.commission_signed += commission
         if _is_autofx(t):
             p.autofx_conversions += 1
             p.autofx_notional_base += notional
@@ -359,6 +472,7 @@ def analyse(statement, base_currency: str = "EUR") -> CostReport:
         fees=sorted(fees.values(), key=lambda c: -c.total_base),
         withholding=lines,
         fx_caveat=caveat,
+        journal_asset=journal_asset,
     )
 
 
@@ -425,18 +539,53 @@ def format_report(report: CostReport) -> str:
             f"{w.withheld_base:>11,.2f}{rate:>10}"
         )
 
-    out.append(f"\nTotal friction ({cur})")
-    out.append(f"  {'commission':<20}{report.total_commission_base:>12,.2f}  stated")
-    out.append(f"  {'fees':<20}{report.total_fees_base:>12,.2f}  stated")
-    if report.total_taxes_base:
-        out.append(f"  {'taxes':<20}{report.total_taxes_base:>12,.2f}  stated")
+    scope = report.journal_asset
+    out.append(f"\n{scope} -- attributable to this journal ({cur})")
+    if report.journal_commissions:
+        for g in report.journal_commissions:
+            per = (
+                f"  {g.per_unit_base:,.4f} per unit"
+                if g.per_unit_base is not None
+                else ""
+            )
+            out.append(
+                f"  {'commission':<24}{g.commission_base:>12,.4f}  stated"
+                f"   {g.fills} fill(s){per}"
+            )
+        if report.journal_taxes_base:
+            out.append(f"  {'taxes':<24}{report.journal_taxes_base:>12,.4f}  stated")
+        out.append(f"  {'journal friction':<24}{report.journal_friction_base:>12,.4f}")
+    else:
+        out.append(f"  no {scope} trades in this statement")
+
+    out.append(f"\nAccount-level -- all instruments, context only ({cur})")
+    others = ", ".join(g.asset_category for g in report.other_commissions)
+    if report.other_commissions:
+        out.append(
+            f"  {'commission, other':<24}{report.other_commission_base:>12,.4f}"
+            f"  stated   {others}"
+        )
+    if report.other_taxes_base:
+        out.append(f"  {'taxes, other':<24}{report.other_taxes_base:>12,.4f}  stated")
     out.append(
-        f"  {'AutoFX markup':<20}{report.total_autofx_spread_base:>12,.2f}"
+        f"  {'fees':<24}{report.total_fees_base:>12,.4f}"
+        f"  stated   no asset attribution"
+    )
+    out.append(
+        f"  {'AutoFX markup':<24}{report.total_autofx_spread_base:>12,.4f}"
         f"  estimated @ {AUTOFX_MARKUP_BPS} bps"
     )
-    out.append(f"  {'TOTAL':<20}{report.total_friction_base:>12,.2f}")
+    out.append(f"  {'account friction':<24}{report.account_friction_base:>12,.4f}")
+
+    out.append(f"\n  {'account total':<24}{report.total_friction_base:>12,.4f}")
     out.append(
-        f"  of which stated {report.total_stated_friction_base:,.2f}, "
-        f"estimated {report.total_autofx_spread_base:,.2f}."
+        f"  of which stated {report.total_stated_friction_base:,.4f}, "
+        f"estimated {report.total_autofx_spread_base:,.4f}."
     )
+    credits = sum(g.credit_fills for g in report.commissions)
+    if credits:
+        out.append(
+            f"  note: {credits} fill(s) carried a commission credit, netted off "
+            f"rather than added."
+        )
     return "\n".join(out)
