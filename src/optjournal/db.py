@@ -31,9 +31,10 @@ Design notes, and the reasoning behind the non-obvious choices:
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
-__all__ = ["SCHEMA_VERSION", "connect", "migrate"]
+__all__ = ["SCHEMA_VERSION", "connect", "migrate", "open_journal"]
 
 SCHEMA_VERSION = 1
 
@@ -250,3 +251,25 @@ def migrate(conn: sqlite3.Connection) -> int:
         )
     conn.commit()
     return SCHEMA_VERSION
+
+
+@contextmanager
+def open_journal(path: Path):
+    """A migrated connection, closed on exit.
+
+    Every entry point repeated the same three lines -- connect, migrate,
+    close-in-finally -- and two of them had, at different times, forgotten
+    one of the three. The pattern is policy (a journal connection is always
+    migrated before use), so it lives here rather than being re-derived at
+    each call site.
+
+    Yields a connection rather than caching one: sqlite3 objects cannot
+    cross threads, and the web server is threaded, so per-use connections
+    are the correctness requirement, not an inefficiency.
+    """
+    conn = connect(path)
+    try:
+        migrate(conn)
+        yield conn
+    finally:
+        conn.close()

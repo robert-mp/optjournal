@@ -25,7 +25,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import keyring
@@ -67,10 +67,6 @@ FETCH_COOLDOWN_S = 900
 #: rather than in the database, so `fetch` stays usable with no DB present
 #: and the guard survives a database rebuild.
 STATE_FILE = ".fetch-state.json"
-
-
-class TokenMissing(RuntimeError):
-    """No usable Flex token in the OS keyring."""
 
 
 class FetchCooldown(RuntimeError):
@@ -206,8 +202,8 @@ def _check_cooldown(archive_dir: Path, query_id: str, cooldown_s: int) -> None:
     except ValueError:
         return
     if last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)
-    elapsed = datetime.now(timezone.utc) - last
+        last = last.replace(tzinfo=UTC)
+    elapsed = datetime.now(UTC) - last
     if elapsed < timedelta(seconds=cooldown_s):
         raise FetchCooldown(
             query_id=str(query_id),
@@ -241,7 +237,7 @@ def last_fetch(archive_dir: Path, query_id: str) -> str | None:
 def _record_fetch(archive_dir: Path, query_id: str, digest: str, path: Path) -> None:
     state = _read_state(archive_dir)
     state[str(query_id)] = {
-        "last_fetch": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "last_fetch": datetime.now(UTC).isoformat(timespec="seconds"),
         "sha256": digest,
         "archive": path.name,
     }
@@ -288,7 +284,7 @@ def _archive(raw: bytes, archive_dir: Path) -> tuple[Path, Path | None]:
         return existing, existing
 
     archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     dest = archive_dir / f"activity-{stamp}.xml"
     dest.write_bytes(raw)
     return dest, None

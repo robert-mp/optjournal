@@ -17,10 +17,11 @@ import hashlib
 import json
 import logging
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from optjournal.flex import load
 from optjournal.sections import raw_sections
@@ -57,7 +58,7 @@ class IngestResult:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _f(value: Any) -> float | None:

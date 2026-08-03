@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date
 from typing import Any
 
 from optjournal.history import build_history
@@ -122,7 +121,6 @@ class MonthStats:
     net_pnl_base: float = 0.0      #: realised, already net of commission
     commissions_base: float = 0.0
     fees_base: float = 0.0
-    autofx_base: float = 0.0
 
     #: Episode-derived, so a two-fill close counts once.
     closed_episodes: int = 0
@@ -185,7 +183,7 @@ class MonthStats:
         report reads the raw statement and includes it. Do not present the two
         under the same label -- they differ by the whole of stock commission.
         """
-        return abs(self.fees_base) + abs(self.autofx_base)
+        return abs(self.fees_base)
 
     @property
     def total_friction_base(self) -> float:
@@ -627,7 +625,6 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "net_pnl_base": stats.net_pnl_base,
         "commissions_base": stats.commissions_base,
         "fees_base": stats.fees_base,
-        "autofx_base": stats.autofx_base,
         "closed_episodes": stats.closed_episodes,
         "open_episodes": stats.open_episodes,
         "wins": stats.wins,

@@ -50,7 +50,7 @@ def install_code_fallback() -> None:
 
         # Code mixes in str, so the member must be constructed via
         # str.__new__; object.__new__ raises "not safe" for mixin enums.
-        if issubclass(cls, str):
+        if issubclass(cls, str):  # noqa: SIM108 - the else carries a coverage pragma a ternary cannot
             member = str.__new__(cls, value)
         else:  # pragma: no cover - defensive, Code is str-based today
             member = object.__new__(cls)

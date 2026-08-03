@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -336,7 +336,7 @@ def _trade_elements(orders: list[Order]) -> list[dict[str, str]]:
             sym = _occ(leg.underlying, leg.expiry, leg.put_call, leg.strike)
             splits = leg.fills or (leg.quantity,)
             comms = commission_for(leg.quantity, leg.fills)
-            for i, (qty, comm) in enumerate(zip(splits, comms)):
+            for i, (qty, comm) in enumerate(zip(splits, comms, strict=True)):
                 seq += 1
                 proceeds = -Decimal(qty) * leg.price * MULTIPLIER
                 money = Decimal(qty) * leg.price * MULTIPLIER
@@ -397,7 +397,7 @@ def _position_elements(positions: list[Position]) -> list[dict[str, str]]:
             "expiry": f"{p.expiry:%Y%m%d}", "putCall": p.put_call,
             "reportDate": f"{TO_DATE:%Y%m%d}", "position": _q(p.quantity),
             "markPrice": _q(p.mark), "positionValue": _q(value),
-            "openPrice": _q((p.cost_basis / Decimal(p.quantity) / MULTIPLIER)),
+            "openPrice": _q(p.cost_basis / Decimal(p.quantity) / MULTIPLIER),
             "costBasisPrice": _q(abs(p.cost_basis / Decimal(p.quantity)
                                      / MULTIPLIER)),
             "costBasisMoney": _q(p.cost_basis),

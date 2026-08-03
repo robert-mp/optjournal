@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-
-from types import SimpleNamespace
 
 from optjournal.analysis import (
     AUTOFX_MARKUP_BPS,
@@ -17,7 +16,7 @@ from optjournal.analysis import (
     format_report,
 )
 from optjournal.flex import load
-from optjournal.render import costs_data
+from optjournal.serialize import costs_data
 
 RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
 ZERO = Decimal("0")
@@ -135,7 +134,7 @@ def _stmt(trades):
 
 def test_autofx_markup_is_three_bps():
     """Published rate for IBKR Ireland: 0.03% == 3 bps."""
-    assert AUTOFX_MARKUP_BPS == Decimal("3")
+    assert Decimal("3") == AUTOFX_MARKUP_BPS
 
 
 def test_markup_applied_to_flagged_conversion():

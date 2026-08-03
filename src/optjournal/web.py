@@ -19,7 +19,6 @@ simpler than five and the panels can never disagree with each other.
 
 from __future__ import annotations
 
-import dataclasses
 import http.server
 import ipaddress
 import json
@@ -28,13 +27,15 @@ import socket
 import sqlite3
 import threading
 import urllib.parse
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from optjournal import __version__
 from optjournal.analysis import analyse
-from optjournal.db import connect, migrate
+from optjournal.db import open_journal
 from optjournal.flex import (
     FETCH_COOLDOWN_S,
     FetchCooldown,
@@ -46,7 +47,7 @@ from optjournal.flex import (
 )
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_OPTIONS, ingest_file
-from optjournal.render import (
+from optjournal.serialize import (
     costs_data,
     history_data,
     newest_statement,
@@ -80,7 +81,7 @@ def _is_loopback(host: str) -> bool:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _fx_quotes(conn, base: str) -> list[dict[str, Any]]:
@@ -140,9 +141,7 @@ def build_state(
     explaining why. The invariant is that a tab's figures change only in
     response to a control that tab displays.
     """
-    conn = connect(db_path)
-    try:
-        migrate(conn)
+    with open_journal(db_path) as conn:
         # One history pass, reused by the scope, the cohorts and every period
         # row below. Rebuilding it per call was the cost of the Annual tab.
         report = build_history(conn, asset_category=asset_category)
@@ -207,8 +206,6 @@ def build_state(
         }
         base_ccy = str(state["stats"].get("base_currency") or "")
         state["fx"] = {"base": base_ccy, "quotes": _fx_quotes(conn, base_ccy)}
-    finally:
-        conn.close()
 
     newest = newest_statement(archive_dir)
     if newest is not None:
@@ -254,9 +251,7 @@ def _do_sync(
     except TokenMissing as exc:
         return {"ok": False, "kind": "config", "message": str(exc)}
 
-    conn = connect(db_path)
-    try:
-        migrate(conn)
+    with open_journal(db_path) as conn:
         ingested = ingest_file(conn, result.raw_path, assets=assets)
         new_trades = conn.execute(
             "SELECT COUNT(*) AS n FROM trades WHERE first_seen_at >= ?", (started,)
@@ -265,8 +260,6 @@ def _do_sync(
             "SELECT COUNT(*) AS n FROM cash_transactions WHERE first_seen_at >= ?",
             (started,),
         ).fetchone()["n"]
-    finally:
-        conn.close()
 
     return {
         "ok": True,
@@ -281,15 +274,37 @@ def _do_sync(
     }
 
 
-class _Handler(http.server.BaseHTTPRequestHandler):
-    server_version = f"optjournal/{__version__}"
-    # Config injected by serve(); class attributes keep the handler picklable
-    # and avoid a closure-over-mutable-state bug.
+@dataclass(frozen=True)
+class ServeConfig:
+    """Everything a request handler needs, bound at serve() time.
+
+    Injected per instance rather than written onto the handler class. Class
+    attributes are process-global mutable state: two serve() calls in one
+    process (which the test suite performs routinely) would silently
+    reconfigure each other's handlers, and nothing marks the writes as the
+    dependency wiring they are. A frozen dataclass makes the configuration
+    explicit, immutable, and local to one server.
+    """
+
     db_path: Path
     archive_dir: Path
     query_id: str | None
     assets: tuple[str, ...]
-    _sync_lock = threading.Lock()
+    #: Serialised because two concurrent syncs would each spend an IBKR
+    #: request and race on the same archive directory. Lives on the config --
+    #: one lock per server -- not on the handler class, where it would be one
+    #: lock per process.
+    sync_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    server_version = f"optjournal/{__version__}"
+
+    def __init__(self, cfg: ServeConfig, *args: Any, **kwargs: Any) -> None:
+        # Assigned before super().__init__, which handles the request inside
+        # the constructor -- stdlib quirk, not a style choice.
+        self.cfg = cfg
+        super().__init__(*args, **kwargs)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         log.debug("%s - %s", self.address_string(), fmt % args)
@@ -316,9 +331,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/state":
             try:
                 self._json(200, build_state(
-                    db_path=self.db_path,
-                    archive_dir=self.archive_dir,
-                    query_id=self.query_id,
+                    db_path=self.cfg.db_path,
+                    archive_dir=self.cfg.archive_dir,
+                    query_id=self.cfg.query_id,
                     month=(params.get("month") or [None])[0],
                     trade_type=(params.get("type") or [None])[0],
                 ))
@@ -332,7 +347,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path != "/api/sync":
             self._json(404, {"error": "not found"})
             return
-        if not self.query_id:
+        if not self.cfg.query_id:
             self._json(400, {
                 "ok": False, "kind": "config",
                 "message": "No Flex query ID configured. Start with "
@@ -341,19 +356,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         # Serialised: two concurrent syncs would each spend a request and race
         # on the same archive directory.
-        if not self._sync_lock.acquire(blocking=False):
+        if not self.cfg.sync_lock.acquire(blocking=False):
             self._json(409, {"ok": False, "kind": "busy",
                              "message": "A sync is already running."})
             return
         try:
             self._json(200, _do_sync(
-                db_path=self.db_path,
-                archive_dir=self.archive_dir,
-                query_id=self.query_id,
-                assets=self.assets,
+                db_path=self.cfg.db_path,
+                archive_dir=self.cfg.archive_dir,
+                query_id=self.cfg.query_id,
+                assets=self.cfg.assets,
             ))
         finally:
-            self._sync_lock.release()
+            self.cfg.sync_lock.release()
 
 
 def serve(
@@ -378,16 +393,21 @@ def serve(
     # signal the old import-time read gave us.
     page_html()
 
-    _Handler.db_path = db_path
-    _Handler.archive_dir = archive_dir
-    _Handler.query_id = query_id
-    _Handler.assets = tuple(assets)
+    cfg = ServeConfig(
+        db_path=db_path,
+        archive_dir=archive_dir,
+        query_id=query_id,
+        assets=tuple(assets),
+    )
 
     class _Server(http.server.ThreadingHTTPServer):
         daemon_threads = True
         address_family = socket.AF_INET
 
-    with _Server((host, port), _Handler) as httpd:
+    # ThreadingHTTPServer instantiates its handler class per request; partial
+    # prepends the config, which is the stdlib-sanctioned way to inject
+    # dependencies into a BaseHTTPRequestHandler.
+    with _Server((host, port), partial(_Handler, cfg)) as httpd:
         actual = httpd.socket.getsockname()[1]
         print(f"optjournal UI on http://{host}:{actual}")
         print("  loopback only, no authentication -- do not expose this port")

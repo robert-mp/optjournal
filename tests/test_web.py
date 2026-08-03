@@ -22,16 +22,16 @@ from pathlib import Path
 
 import pytest
 
-from optjournal.cli import (
+from optjournal import web
+from optjournal.cli import main
+from optjournal.config import (
     DEFAULT_ARCHIVE,
     DEFAULT_DB,
     DEFAULT_DEMO_DB,
     DEFAULT_DEMO_DIR,
-    main,
 )
 from optjournal.db import connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
-from optjournal import web
 from optjournal.web import build_state, page_html, serve
 
 RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
@@ -43,7 +43,7 @@ _NOT_PAYLOAD = {
     "filter", "isoformat", "join", "json", "length", "map", "ok", "push",
     "querySelector", "replace", "status", "style", "textContent", "then",
     "title", "toLocaleString", "some", "find", "forEach", "concat", "padStart",
-    "split", "slice", "onclick", "onchange", "classList", "dataset", "disabled",
+    "split", "slice", "onclick", "onchange", "classList", "dataset",
     "innerHTML", "add", "remove", "getDay", "getDate", "toFixed",
 }
 
@@ -294,8 +294,8 @@ def test_net_liq_is_unavailable_not_zero(state):
 
 
 def test_month_filter_narrows_the_payload(populated):
-    from optjournal.stats import available_months
     from optjournal.db import connect
+    from optjournal.stats import available_months
 
     conn = connect(populated)
     months = available_months(conn)
@@ -321,9 +321,9 @@ def test_unknown_month_falls_back_to_all_time(populated):
 
 def test_sync_response_shape_matches_what_the_page_reads():
     """Pin the /api/sync contract, which has no fixture to check against."""
-    from optjournal.web import _do_sync  # noqa: PLC0415 - private by design
-
     import inspect
+
+    from optjournal.web import _do_sync  # noqa: PLC0415 - private by design
     src = inspect.getsource(_do_sync)
     for key in ("new_trades", "new_cash", "reused_archive", "warnings", "kind", "ok"):
         assert f'"{key}"' in src, f"/api/sync no longer returns {key!r}"
@@ -375,7 +375,7 @@ def test_dashboard_friction_is_split_by_scope(state):
     """
     s = state["stats"]
     assert s["options_friction_base"] == abs(s["commissions_base"])
-    assert s["account_friction_base"] == abs(s["fees_base"]) + abs(s["autofx_base"])
+    assert s["account_friction_base"] == abs(s["fees_base"])
     # The split reapportions; it must not change or drop anything.
     assert (
         s["options_friction_base"] + s["account_friction_base"]

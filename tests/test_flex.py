@@ -161,7 +161,7 @@ def test_poll_worst_case_matches_backoff_arithmetic():
         min(flex.RETRY_INTERVAL * (2**i), flex.MAX_RETRY_INTERVAL)
         for i in range(flex.MAX_RETRIES)
     )
-    assert flex.POLL_WORST_CASE_S == 2 * per_stage, (
+    assert 2 * per_stage == flex.POLL_WORST_CASE_S, (
         "worst case must cover both py_ibkr poll stages (SendRequest and "
         "GetStatement), each of which gets the full retry budget"
     )

@@ -26,7 +26,6 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Iterable
 
 __all__ = [
     "AUTOFX_MARKUP_BPS",
@@ -84,10 +83,10 @@ def _is_autofx(trade) -> bool:
     unflagged, and would carry a real `ibCommission` instead -- so applying
     the markup to everything would double-count it.
     """
-    for note in trade.notes or ():
-        if str(getattr(note, "value", note)) == AUTOFX_CODE:
-            return True
-    return False
+    return any(
+        str(getattr(note, "value", note)) == AUTOFX_CODE
+        for note in trade.notes or ()
+    )
 
 #: Fee description patterns, most specific first. IBKR fee descriptions are
 #: free text, so this is heuristic by necessity; `OTHER` is the honest

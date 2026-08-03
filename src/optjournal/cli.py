@@ -14,7 +14,7 @@ import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,32 +24,32 @@ from optjournal import __version__
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import prune_archive
 from optjournal.compat import unknown_codes
-from optjournal.db import connect, migrate
+from optjournal.config import (
+    DEFAULT_ARCHIVE,
+    DEFAULT_DB,
+    DEFAULT_DEMO_DB,
+    DEFAULT_DEMO_DIR,
+)
+from optjournal.db import connect, migrate, open_journal
 from optjournal.flex import FetchCooldown, TokenMissing, fetch, load
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_ALL, ASSET_FILTER_OPTIONS, ingest_file
 from optjournal.render import (
-    costs_data,
-    history_data,
-    newest_statement,
-    orders_data,
-    positions_data,
     render_history,
     render_orders,
     render_positions,
     render_statements,
     render_summary,
+)
+from optjournal.serialize import (
+    costs_data,
+    history_data,
+    newest_statement,
+    orders_data,
+    positions_data,
     statements_data,
     summary_data,
 )
-
-_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_ARCHIVE = _ROOT / "raw"
-DEFAULT_DB = _ROOT / "journal.db"
-#: Synthetic data lives beside the real archive, never inside it. `raw/` is
-#: the provenance root and its statements cost IBKR requests to replace.
-DEFAULT_DEMO_DIR = _ROOT / "demo"
-DEFAULT_DEMO_DB = _ROOT / "demo" / "journal.db"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -95,6 +95,8 @@ def _resolve_path(args) -> Path | None:
 
 
 def _open_db(args) -> sqlite3.Connection:
+    """A migrated connection the caller owns. Prefer `open_journal` for new
+    code; this exists for commands whose connection outlives one block."""
     conn = connect(args.db)
     migrate(conn)
     return conn
@@ -233,13 +235,9 @@ def cmd_demo(args) -> int:
 
     out, db = args.out, args.db
     path = write_demo_statement(out, db)
-    conn = connect(db)
-    migrate(conn)
-    try:
+    with open_journal(db) as conn:
         result = ingest_file(conn, path, assets=ASSET_FILTER_OPTIONS,
                              reingest=True)
-    finally:
-        conn.close()
 
     payload = {
         "query_name": QUERY_NAME, "statement": str(path), "db": str(db),
@@ -387,7 +385,7 @@ def cmd_sync(args) -> int:
         )
         return EXIT_CONFIG
 
-    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    started = datetime.now(UTC).isoformat(timespec="seconds")
     assets = (
         ASSET_FILTER_ALL
         if args.assets.strip().upper() == "ALL"

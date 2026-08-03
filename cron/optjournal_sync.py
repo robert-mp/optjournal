@@ -123,7 +123,7 @@ def verify_timeouts() -> None:
     worst_case = _poll_worst_case()
     if worst_case is None:
         return
-    if FETCH_TIMEOUT_S <= worst_case:
+    if worst_case >= FETCH_TIMEOUT_S:
         raise RuntimeError(
             f"FETCH_TIMEOUT_S ({FETCH_TIMEOUT_S}s) must exceed "
             f"flex.POLL_WORST_CASE_S ({worst_case}s), or a routine slow "

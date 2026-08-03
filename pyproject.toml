@@ -22,6 +22,7 @@ optjournal = "optjournal.cli:main"
 [dependency-groups]
 dev = [
     "pytest==8.4.2",
+    "ruff>=0.16.1",
 ]
 
 [build-system]
@@ -33,3 +34,25 @@ packages = ["src/optjournal"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I import order, B bugbear (real bug patterns),
+# UP outdated idioms, SIM simplifications. N (naming) is deliberately absent:
+# the code mirrors IBKR's camelCase attribute names at the parsing boundary,
+# and renaming them would put a translation layer between the statement and
+# the reader for zero safety.
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
+ignore = [
+    # One-letter and short names are idiomatic in this codebase's tight
+    # numeric code; ruff has no rule for that, but E741 (ambiguous l/I/O)
+    # does fire on the order-leg binding `l` mirrored from the page JS.
+    "E741",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests re-import private helpers on purpose; that is what they test.
+"tests/*" = ["SIM117"]
