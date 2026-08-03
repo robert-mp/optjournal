@@ -250,7 +250,7 @@ function renderTabs(){
     `<button class="tab${S.tab===id?' on':''}" data-tab="${id}"
       ${disabled?`disabled title="${esc(disabled)}"`:''}>${esc(label)}</button>`).join('');
   document.querySelectorAll('.tab[data-tab]').forEach(b=>
-    b.onclick=()=>{S.tab=b.dataset.tab;draw();});
+    b.onclick=()=>{S.tab=b.dataset.tab;draw(true);});
 }
 
 /* ------------------------------------------------ display-currency toggle */
@@ -862,25 +862,43 @@ function applyHash(){
   const hs=new URLSearchParams(String(location.hash||'').replace(/^#/,''));
   const tab=hs.get('tab');
   /* Validated against the enabled tabs rather than trusted: an unknown or
-     disabled id would otherwise render "nothing here yet" from a URL. */
-  if(tab&&HASH_TABS().includes(tab)) S.tab=tab;
+     disabled id would otherwise render "nothing here yet" from a URL. An
+     ABSENT key must reset to the default, not leave the current tab standing:
+     the back button lands on entries whose hash has no tab key, and keeping
+     the old tab made syncHash rewrite it into the entry just navigated to. */
+  S.tab=(tab&&HASH_TABS().includes(tab))?tab:'dashboard';
   S.type=hs.get('type')||null;
   S.month=hs.get('month')||null;
+  S.ccy=(hs.get('ccy')||'').toUpperCase()||null;
 }
-function syncHash(){
+function syncHash(push){
   const hs=new URLSearchParams();
   /* Defaults are omitted so the common case has a clean URL, and so a stale
-     key cannot outlive the state it described. */
+     key cannot outlive the state it described. The display currency's default
+     is the account base, so only a restatement is worth recording. */
   if(S.tab&&S.tab!=='dashboard') hs.set('tab',S.tab);
   if(S.type) hs.set('type',S.type);
   if(S.month) hs.set('month',S.month);
+  if(S.ccy&&S.ccy!==BASE()) hs.set('ccy',S.ccy);
   const next=hs.toString()?'#'+hs:'';
-  if(next!==(location.hash||'')) history.replaceState(null,'',location.pathname+next);
+  if(next===(location.hash||'')) return;
+  /* A tab jump is a navigation, so it pushes and the back button walks tabs.
+     Everything else -- filter, month, currency -- mutates the current entry:
+     those are adjustments to the view you are on, and pushing them would bury
+     the tab trail under one entry per click. Clicking the current tab is a
+     no-op by the guard above, so it cannot mint duplicate entries. */
+  if(push) history.pushState(null,'',location.pathname+next);
+  else history.replaceState(null,'',location.pathname+next);
 }
 
 /* ------------------------------------------------ shell */
-function draw(){
-  syncHash();
+function draw(push){
+  /* A currency the account has no quote for falls back to base on display
+     (DISP does that); clearing it makes the hash heal to match. Healed here
+     rather than in load() because a hash edit is a same-document navigation
+     -- load() never runs for it, only the hashchange -> draw path does. */
+  if(S.ccy&&S.state&&S.ccy!==BASE()&&!QUOTES().some(qo=>qo.code===S.ccy)) S.ccy=null;
+  syncHash(push);
   renderTabs();
   renderCcy();
   const views={dashboard,calendar,trades,positions,costs,annual,odte};

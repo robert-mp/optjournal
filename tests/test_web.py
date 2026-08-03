@@ -723,18 +723,25 @@ def test_scope_does_not_reach_the_tabs_without_a_filter_bar(populated):
 # --------------------------------------------------------- view state in URL
 
 
-def test_hash_is_written_with_replace_state_not_by_assignment():
-    """Assigning location.hash pushes a history entry per click.
+def test_history_discipline_push_for_tabs_replace_for_the_rest():
+    """Tab jumps are navigations; filter, month and currency changes are not.
 
-    Toggling a filter a few times would then bury the page under back-button
-    history for changes that are not navigations.
+    So the tab click is the one path allowed to push -- that is what makes the
+    back button walk tabs -- while everything else mutates the current entry.
+    Assigning location.hash would push indiscriminately, one entry per click.
     """
     js = _code_only(_js())
     assert "history.replaceState" in js
+    assert "history.pushState" in js
     assert not re.search(r"location\.hash\s*=", js), (
-        "assigning location.hash pushes history; use replaceState"
+        "assigning location.hash pushes history for every change"
     )
-    assert "pushState" not in js
+    # The push flag flows tab-click -> draw(true) -> syncHash(push); no other
+    # caller passes it, so only tab jumps can mint history entries.
+    assert "draw(true)" in js
+    assert js.count("draw(true)") == 1, "only the tab click may push"
+    assert re.search(r"function syncHash\(push\)", js)
+    assert re.search(r"function draw\(push\)", js)
 
 
 def test_hash_carries_every_piece_of_view_state():
@@ -744,7 +751,7 @@ def test_hash_carries_every_piece_of_view_state():
     and the tab reset to Dashboard.
     """
     js = _code_only(_js())
-    for key in ("'tab'", "'type'", "'month'"):
+    for key in ("'tab'", "'type'", "'month'", "'ccy'"):
         assert f"hs.set({key}," in js, f"{key} is not written to the hash"
         assert f"hs.get({key})" in js, f"{key} is not read back from the hash"
 
@@ -758,9 +765,16 @@ def test_hash_is_applied_before_the_first_load():
 
 
 def test_a_tab_from_the_hash_is_validated_against_the_enabled_tabs():
-    """An unknown or disabled id in the URL must not render an empty tab."""
+    """An unknown or disabled id in the URL must not render an empty tab.
+
+    And an ABSENT key must reset to the default rather than leave the current
+    tab standing: the back button lands on entries whose hash has no tab key,
+    and keeping the old tab made syncHash rewrite it into the entry just
+    navigated to -- the back button appeared to do nothing.
+    """
     js = _code_only(_js())
     assert "HASH_TABS().includes(tab)" in js
+    assert re.search(r"S\.tab=\(tab&&HASH_TABS\(\)\.includes\(tab\)\)\?tab:'dashboard'", js)
     # Built from TABS with the disabled ones filtered out, so it cannot drift
     # from the tab bar as tabs are added or gated.
     assert re.search(r"HASH_TABS\s*=\s*\(\)\s*=>\s*TABS\.filter", js)
