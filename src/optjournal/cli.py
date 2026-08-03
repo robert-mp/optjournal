@@ -72,6 +72,8 @@ examples:
   optjournal history                       closed-position P&L, round trip by round trip
   optjournal costs --json                  cost report as JSON
   optjournal serve --query-id 1591754      local web UI with a Sync now button
+  optjournal demo                          synthetic data in a scratch archive and DB
+  optjournal serve --demo                  serve that synthetic data instead
 
 path arguments default to the most recently archived statement.
 exit codes: 0 ok, 1 error, 2 config, 3 no data, 4 throttled by IBKR.
@@ -253,8 +255,9 @@ def cmd_demo(args) -> int:
         "synthetic data -- closed round trips, a vertical spread, a roll, an",
         "expiry, an assignment, a 0DTE trade and a credited multi-fill order.",
         "",
-        "  optjournal serve --db "
-        f"{db} --archive {out} --port 8792",
+        "  optjournal serve --demo --port 8792"
+        + ("" if (out, db) == (DEFAULT_DEMO_DIR, DEFAULT_DEMO_DB)
+           else f"  # or: --db {db} --archive {out}"),
     ]
     _emit(payload, "\n".join(lines), args.json)
     return EXIT_OK
@@ -335,10 +338,25 @@ def cmd_serve(args) -> int:
         if args.assets.strip().upper() == "ALL"
         else tuple(a.strip().upper() for a in args.assets.split(",") if a.strip())
     )
+    # --db and --archive default to None on this subcommand, so an explicit path
+    # always wins over --demo rather than being silently redirected.
+    db = args.db or (DEFAULT_DEMO_DB if args.demo else DEFAULT_DB)
+    archive_dir = args.archive or (DEFAULT_DEMO_DIR if args.demo else DEFAULT_ARCHIVE)
+    if args.demo and args.query_id:
+        # Sync writes the fetched statement into the served archive and ingests
+        # it into the served database. Pointed at the demo pair, one click would
+        # spend an IBKR request to put real trades in the same tables as
+        # synthetic ones -- after which no figure in the journal means anything,
+        # and the archive holds a real statement in a gitignored directory.
+        raise ValueError(
+            "--demo cannot be combined with --query-id: a sync would fetch real"
+            " trades into the synthetic database. Serve the demo without a query"
+            " id, or serve the real journal without --demo."
+        )
     try:
         serve(
-            db_path=args.db,
-            archive_dir=args.archive,
+            db_path=db,
+            archive_dir=archive_dir,
             query_id=args.query_id,
             assets=assets,
             host=args.host,
@@ -569,7 +587,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="loopback addresses only (default: 127.0.0.1)")
     p.add_argument("--assets", default="OPT", metavar="LIST",
                    help="asset categories a UI sync stores (default: OPT)")
-    p.set_defaults(func=cmd_serve)
+    p.add_argument("--demo", action="store_true",
+                   help=f"serve the synthetic data from `optjournal demo`"
+                        f" ({DEFAULT_DEMO_DB})")
+    # Override the shared parents' defaults for this subcommand only, so None
+    # means "not given" and --demo can supply the paths without having to guess
+    # whether a path equal to the default was typed deliberately.
+    p.set_defaults(func=cmd_serve, db=None, archive=None)
 
     return ap
 

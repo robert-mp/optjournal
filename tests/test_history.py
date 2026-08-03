@@ -18,6 +18,7 @@ import pytest
 from optjournal.db import connect, migrate
 from optjournal.history import (
     NON_POSITION_CATEGORIES,
+    Episode,
     build_history,
     disposition_of,
     split_notes,
@@ -398,3 +399,62 @@ def test_prewindow_close_absent_from_snapshot_is_closed(conn):
     assert len(report.episodes) == 1
     assert report.episodes[0].is_closed
     assert report.total_realized_base == 50.0
+
+
+# ------------------------------------------------------------------------ 0DTE
+
+
+def _ep(*, opened, closed=None, expiry) -> Episode:
+    """A bare episode carrying only the dates `is_odte` reads."""
+    return Episode(
+        conid="1", symbol="X", asset_category="OPT", currency="USD",
+        opened_at=opened, closed_at=closed, expiry=expiry,
+    )
+
+
+def test_odte_is_not_the_same_question_as_a_zero_day_holding_period():
+    """The distinction the demo data cannot make, so it is pinned here.
+
+    Every closed episode in the synthetic statement agrees under either
+    definition -- its one same-day round trip is also its one same-day expiry --
+    so a `holding_days == 0` implementation would pass every other test in the
+    suite while being wrong about what 0DTE means.
+    """
+    # Opened and closed within one session, but the contract had 45 days left.
+    day_trade = _ep(opened="2026-01-16 10:02:00", closed="2026-01-16 15:44:00",
+                    expiry="2026-03-02")
+    assert day_trade.holding_days == 0, "precondition: this is a same-day trade"
+    assert day_trade.is_odte is False, "a 45-DTE day trade is not a 0DTE trade"
+
+    # Opened on expiry day and held to the bell: 0DTE, same holding period.
+    odte = _ep(opened="2026-01-16 10:02:00", closed="2026-01-16 15:44:00",
+               expiry="2026-01-16")
+    assert odte.holding_days == 0
+    assert odte.is_odte is True
+
+    # Opened on expiry day is enough on its own -- the close date is irrelevant,
+    # since a contract cannot outlive its expiry.
+    assert _ep(opened="2026-01-16 10:02:00", expiry="2026-01-16").is_odte is True
+
+
+def test_odte_survives_the_forms_the_two_dates_actually_arrive_in():
+    """A string comparison would be False on every genuine 0DTE trade.
+
+    `opened_at` carries a time of day and `expiry` does not, and expiry reaches
+    the database in IBKR's compact form -- verified against the stored column,
+    which holds `20250221` while `date_time` holds `2025-01-14 14:30:05`. So
+    `opened_at == expiry` is not merely fragile, it never matches.
+    """
+    compact = _ep(opened="2026-01-16 10:02:00", expiry="20260116")
+    assert compact.opened_at != compact.expiry, "precondition: raw forms differ"
+    assert compact.is_odte is True
+
+    assert _ep(opened="20260116;100200", expiry="2026-01-16").is_odte is True
+    assert _ep(opened="2026-01-16", expiry="2026-01-17").is_odte is False
+
+
+def test_odte_is_unknown_rather_than_false_without_an_expiry():
+    """A stock has no DTE, which is a different claim from "not 0DTE"."""
+    assert _ep(opened="2026-01-16 10:02:00", expiry=None).is_odte is None
+    assert _ep(opened=None, expiry="2026-01-16").is_odte is None
+    assert _ep(opened="not a date", expiry="2026-01-16").is_odte is None

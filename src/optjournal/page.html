@@ -242,8 +242,8 @@ const TABS=[
   ['trades','Trades',null],
   ['positions','Positions',null],
   ['costs','Costs',null],
-  ['annual','Annual','Needs more than one year of statements'],
-  ['odte','ODTE','No 0DTE trades in this account'],
+  ['annual','Annual',null],
+  ['odte','0DTE',null],
 ];
 function renderTabs(){
   $('#tabs').innerHTML=TABS.map(([id,label,disabled])=>
@@ -299,7 +299,7 @@ function filters(){
       <div class="seg">
         <button class="on">Options</button>
         <button disabled title="Filtered out at ingest; re-run with --assets ALL">Equities</button>
-        <button disabled title="No 0DTE trades in this account">ODTE</button>
+        <button disabled title="${esc(odteFilterNote())}">0DTE</button>
       </div></div>
     <div><div class="flabel">Select Account</div>
       <select disabled><option>${esc(accountLabel())}</option></select></div>
@@ -308,6 +308,18 @@ function filters(){
 function accountLabel(){
   const stm=(S.state.statements||[])[0];
   return stm? 'Single account' : 'No statements';
+}
+/* Derived, not asserted. This read "No 0DTE trades in this account" as a
+   hardcoded string -- the same defect as the tab's own disabled reason, which
+   claimed the same thing while the data said otherwise. The button stays
+   disabled because this segmented control filters nothing; the 0DTE tab is
+   where the cohort actually lives. */
+function odteFilterNote(){
+  const od=S.state.odte;
+  return od&&od.cohort.episodes
+    ? `${od.cohort.episodes} 0DTE round trip(s) — see the 0DTE tab. `
+      +`This filter is not wired up.`
+    : 'Nothing in the archive was opened on its own expiry date.';
 }
 
 /* ------------------------------------------------ dashboard */
@@ -613,6 +625,133 @@ function costs(){
   </div>`;
 }
 
+/* ------------------------------------------------ annual */
+function annual(){
+  const yrs=S.state.annual||[], tot=S.state.all_time||{};
+  if(!yrs.length) return `<div class="card"><div class="empty">no trades to summarise</div></div>`;
+  /* Every row is a stats payload of the same shape the Dashboard reads, built
+     by the same summations over a year-wide period rather than a parallel
+     aggregation. The total row deliberately shows all_time -- an independently
+     computed figure -- so if the years ever stop accounting for everything the
+     discrepancy is on screen rather than hidden behind agreement. */
+  let best=yrs[0];
+  yrs.forEach(s=>{if(s.net_pnl_base>best.net_pnl_base)best=s;});
+  const row=(s,klass)=>`<tr class="${klass||''}">
+    <td class="mono">${esc(s.month==='ALL'?'all time':s.month)}</td>
+    <td class="n mono">${s.total_trades}</td>
+    <td class="n mono">${s.orders}</td>
+    <td class="n mono">${s.closed_episodes}</td>
+    <td class="n mono pos">${s.wins}</td>
+    <td class="n mono neg">${s.losses}</td>
+    <td class="n mono">${pct(s.win_rate)}</td>
+    <td class="n mono ${cls(s.net_pnl_base)}">${cash(s.net_pnl_base)}</td>
+    <td class="n mono">${s.avg_win_base==null?'—':cash(s.avg_win_base)}</td>
+    <td class="n mono">${s.avg_loss_base==null?'—':cash(s.avg_loss_base)}</td>
+    <td class="n mono">${cash(Math.abs(s.commissions_base))}</td>
+    <td class="n mono"><span class="pos">${s.green_days}</span>/<span
+      class="neg">${s.red_days}</span></td></tr>`;
+  return `<div class="card">
+    <div class="crow"><div><h2>Year by year</h2>
+      <div class="sub">${esc(ccyNote())} A round trip counts in the year it
+      <b>closed</b>, the same rule the month selector uses — so a position opened in
+      December and closed in January is a January outcome.</div></div>
+      <div class="pills">
+        <span class="pill">years <b>${yrs.length}</b></span>
+        ${yrs.length>1?`<span class="pill">best <b>${esc(best.month)}</b>
+          <b class="${cls(best.net_pnl_base)}">${cash(best.net_pnl_base)}</b></span>`:''}
+      </div></div>
+    <table><thead><tr><th>year</th><th class="n">fills</th><th class="n">orders</th>
+      <th class="n">closed</th><th class="n">W</th><th class="n">L</th>
+      <th class="n">win rate</th><th class="n">net P&amp;L</th><th class="n">avg win</th>
+      <th class="n">avg loss</th><th class="n">commission</th>
+      <th class="n">green/red</th></tr></thead><tbody>
+      ${yrs.map(s=>row(s)).join('')}
+      ${row(tot,'grp')}
+    </tbody></table>
+    <div class="note"><b>fills</b> counts executions and <b>closed</b> counts round
+      trips, which is why they differ: an order filled in two parts is two fills but
+      one outcome. Win rate is computed over closed round trips only, so a year that
+      traded without closing anything shows a row with no rate rather than 0%.</div>
+  </div>`;
+}
+
+/* ------------------------------------------------ 0DTE */
+function odte(){
+  const od=S.state.odte, h=S.state.history||{};
+  if(!od) return `<div class="card"><div class="empty">no data</div></div>`;
+  const odtes=(h.closed||[]).filter(x=>x.is_odte===true);
+  /* Classified server-side: 0DTE means the contract expired on the day it was
+     opened, which is not the same question as holding_days === 0. A 45-day
+     option opened and closed in one afternoon is a day trade at 45 DTE. The
+     two coincide often enough that deriving this from the holding period would
+     look right on most data and be wrong on exactly the trades that matter. */
+  const block=(co,klass)=>`<div class="card" style="background:var(--bg2);flex:1">
+    <h2 style="font-size:15px">${esc(co.label)}</h2>
+    <div class="stats" style="grid-template-columns:repeat(4,1fr)">
+      ${statCard('Round trips',co.episodes,`${co.contracts} contracts`,'sm')}
+      ${statCard('Win rate',pct(co.win_rate),`${co.wins}W / ${co.losses}L`,'sm')}
+      ${statCard('Net P&L',cash(co.net_pnl_base),'realised, net of commission',
+        'sm '+cls(co.net_pnl_base))}
+      ${statCard('Avg per trip',co.avg_pnl_base==null?'—':cash(co.avg_pnl_base),
+        'wins and losses together','sm '+cls(co.avg_pnl_base))}
+    </div></div>`;
+  const closedTotal=od.cohort.episodes+od.rest.episodes+od.unknown_dte;
+  /* A cohort of one against a cohort of eight will always show a difference in
+     win rate, and it means nothing. Flagged rather than hidden, because the
+     numbers are real and worth showing -- what is not real is the comparison.
+     Ten is a judgement call, stated as such on screen: a defensible threshold
+     would need a significance test this tool has no business claiming to run. */
+  const thin=Math.min(od.cohort.episodes,od.rest.episodes)<10;
+  /* Two different empty states, because they are different facts. With nothing
+     closed at all there is no cohort to compare and the two all-zero blocks are
+     noise; with closed trips but no same-day expiries among them, the count is
+     the informative part. Saying "nothing was opened on its expiry date" in the
+     first case implies a search that found nothing, when nothing was searched. */
+  if(!closedTotal) return `<div class="card">
+    <div class="crow"><div><h2>Zero days to expiration</h2>
+      <div class="sub">Contracts opened on their own expiry date.</div></div></div>
+    <div class="empty">no closed round trips yet, so there is no cohort to compare</div>
+    <div class="note">A 0DTE trade is one opened on the day its contract expires —
+      not simply one opened and closed the same day, which is a day trade at whatever
+      the contract's remaining life happens to be. This tab fills in once a round trip
+      opened on an expiry date has closed.</div>
+  </div>`;
+  return `<div class="card">
+    <div class="crow"><div><h2>Zero days to expiration</h2>
+      <div class="sub">Contracts opened on their own expiry date. ${esc(ccyNote())}</div></div>
+      <div class="pills"><span class="pill">0DTE <b>${od.cohort.episodes}</b></span>
+        <span class="pill dim">rest of book <b>${od.rest.episodes}</b></span></div></div>
+    <div class="note">A high 0DTE win rate means nothing on its own, so the rest of
+      the book is shown beside it. <b>Avg per trip</b> is the figure that decides
+      whether the cohort is worth trading: a better win rate with a worse average is
+      a losing strategy.</div>
+    ${thin?`<div class="note"><b>Too few round trips to conclude anything.</b>
+      ${od.cohort.episodes} 0DTE against ${od.rest.episodes} other — a difference in
+      win rate across samples this small is noise, not evidence. The threshold is a
+      rule of thumb, not a significance test.</div>`:''}
+    <div style="display:flex;gap:12px;align-items:stretch">
+      ${block(od.cohort)}${block(od.rest)}
+    </div>
+    ${odtes.length?`<h2 style="font-size:15px;margin-top:16px">0DTE round trips</h2>
+    <table><thead><tr><th>contract</th><th>opened</th><th>closed</th>
+      <th class="n">qty</th><th class="n">realised</th><th class="n">commission</th>
+      <th>how</th></tr></thead><tbody>
+      ${odtes.map(ep=>`<tr><td class="mono">${esc(ep.symbol)}</td>
+        <td class="dim mono">${esc(String(ep.opened_at||'').slice(0,16))}</td>
+        <td class="dim mono">${esc(String(ep.closed_at||'').slice(0,16))}</td>
+        <td class="n mono">${ep.contracts}</td>
+        <td class="n mono ${cls(ep.realized_pnl_base)}">${cash(ep.realized_pnl_base)}</td>
+        <td class="n mono">${cash(Math.abs(ep.commission_base))}</td>
+        <td class="dim2">${esc(ep.status)}</td></tr>`).join('')}
+    </tbody></table>`
+    :`<div class="empty" style="margin-top:16px">none of the ${closedTotal} closed
+      round trips was opened on its own expiry date</div>`}
+    ${od.unknown_dte?`<div class="note">${od.unknown_dte} closed round trip(s) carry no
+      expiry, so their DTE is unknown rather than non-zero. They are excluded from both
+      columns above.</div>`:''}
+  </div>`;
+}
+
 /* ------------------------------------------------ cog panel */
 function cog(){
   const st=S.state;
@@ -648,7 +787,7 @@ function cog(){
 function draw(){
   renderTabs();
   renderCcy();
-  const views={dashboard,calendar,trades,positions,costs};
+  const views={dashboard,calendar,trades,positions,costs,annual,odte};
   const v=views[S.tab];
   $('#body').innerHTML=(S.showCog?cog():'')+(v?v():
     `<div class="card"><div class="empty">nothing here yet</div></div>`);

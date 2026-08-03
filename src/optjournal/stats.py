@@ -32,7 +32,40 @@ from typing import Any
 
 from optjournal.history import build_history
 
-__all__ = ["DayPnl", "MonthStats", "available_months", "daily_series", "month_stats"]
+__all__ = [
+    "Cohort",
+    "DayPnl",
+    "MonthStats",
+    "annual_stats",
+    "available_months",
+    "available_years",
+    "cohort_data",
+    "daily_series",
+    "month_stats",
+    "odte_cohorts",
+]
+
+
+def _in_period(value: str | None, period: str | None) -> bool:
+    """Whether a stored date falls inside `period`, which may be a year.
+
+    `period` is matched as a prefix of the normalised ISO day, so "2025-03"
+    selects a month and "2025" a year with one predicate. That is what lets
+    `month_stats` serve the Annual tab unchanged: the year figures come from
+    the same summations, over the same columns, with the same episode-versus-
+    fill distinctions as the monthly ones, so the two reconcile by
+    construction rather than by two implementations agreeing.
+
+    Prefix-matching the *normalised* day matters -- the raw column mixes ISO
+    `2025-01-14 14:30:05` with IBKR's compact `20250114`, and the compact form
+    would not match an ISO prefix.
+
+    An empty period means "everything", so this returns True.
+    """
+    if not period:
+        return True
+    day = _day_of(value)
+    return day is not None and day.startswith(period)
 
 
 def _month_of(value: str | None) -> str | None:
@@ -75,7 +108,7 @@ class DayPnl:
 
 @dataclass(slots=True)
 class MonthStats:
-    month: str            #: "YYYY-MM", or "ALL"
+    month: str            #: "YYYY-MM", "YYYY" for an annual row, or "ALL"
     base_currency: str = "EUR"
     asset_category: str = "OPT"
 
@@ -170,10 +203,124 @@ def available_months(conn: sqlite3.Connection, asset_category: str | None = "OPT
     return sorted(months, reverse=True)
 
 
+def available_years(conn: sqlite3.Connection, asset_category: str | None = "OPT") -> list[str]:
+    """Years with at least one trade, newest first."""
+    where, params = ("WHERE asset_category = ?", (asset_category,)) if asset_category else ("", ())
+    rows = conn.execute(f"SELECT DISTINCT trade_date FROM trades {where}", params).fetchall()
+    years = {d[:4] for d in (_day_of(r["trade_date"]) for r in rows) if d}
+    return sorted(years, reverse=True)
+
+
+def annual_stats(
+    conn: sqlite3.Connection,
+    *,
+    asset_category: str | None = "OPT",
+    base_currency: str = "EUR",
+) -> list[MonthStats]:
+    """One `MonthStats` per calendar year, newest first.
+
+    Each year is `month_stats` over a year-wide period rather than a separate
+    aggregation, so a change to how P&L or win rate is counted lands on the
+    monthly and annual views together. A year with fills but nothing closed
+    still gets a row: "traded, decided nothing" is a real outcome and hiding
+    it would make the years stop accounting for all the activity.
+    """
+    return [
+        month_stats(
+            conn, year, asset_category=asset_category, base_currency=base_currency
+        )
+        for year in available_years(conn, asset_category)
+    ]
+
+
+@dataclass(slots=True)
+class Cohort:
+    """Outcome summary for a subset of closed episodes."""
+
+    label: str
+    episodes: int = 0
+    wins: int = 0
+    losses: int = 0
+    net_pnl_base: float = 0.0
+    commission_base: float = 0.0
+    contracts: int = 0
+
+    @property
+    def win_rate(self) -> float | None:
+        decided = self.wins + self.losses
+        return None if not decided else self.wins / decided * 100.0
+
+    @property
+    def avg_pnl_base(self) -> float | None:
+        """Mean outcome per round trip, wins and losses together.
+
+        The figure that answers "is this cohort worth trading": a high win
+        rate with a worse average is a losing strategy, and the two numbers
+        only mean something side by side.
+        """
+        return None if not self.episodes else self.net_pnl_base / self.episodes
+
+
+def _cohort(label: str, episodes: list[Any]) -> Cohort:
+    c = Cohort(label=label)
+    for e in episodes:
+        c.episodes += 1
+        c.net_pnl_base += e.realized_pnl_base
+        c.commission_base += abs(e.commission_base)
+        c.contracts += e.contracts
+        if e.realized_pnl_base > 0:
+            c.wins += 1
+        elif e.realized_pnl_base < 0:
+            c.losses += 1
+    return c
+
+
+def odte_cohorts(
+    conn: sqlite3.Connection,
+    *,
+    asset_category: str | None = "OPT",
+    base_currency: str = "EUR",
+) -> tuple[Cohort, Cohort, int]:
+    """0DTE round trips against everything else, plus the unclassifiable count.
+
+    Returned as a pair because a 0DTE win rate in isolation says nothing --
+    the question is always whether same-day expiries did better or worse than
+    the rest of the book, and that needs both sides on screen.
+
+    The third value counts closed episodes whose DTE cannot be determined,
+    which is anything without an expiry. Reported rather than silently folded
+    into "not 0DTE": a stock has no DTE, and claiming it was not a 0DTE trade
+    is a different statement from admitting the question does not apply.
+    """
+    report = build_history(conn, asset_category=asset_category, base_currency=base_currency)
+    odte = [e for e in report.closed if e.is_odte is True]
+    rest = [e for e in report.closed if e.is_odte is False]
+    unknown = sum(1 for e in report.closed if e.is_odte is None)
+    return _cohort("0DTE", odte), _cohort("Everything else", rest), unknown
+
+
+def cohort_data(c: Cohort) -> dict[str, Any]:
+    """JSON-safe view, including the computed properties `asdict` would drop."""
+    return {
+        "label": c.label,
+        "episodes": c.episodes,
+        "wins": c.wins,
+        "losses": c.losses,
+        "win_rate": c.win_rate,
+        "net_pnl_base": c.net_pnl_base,
+        "avg_pnl_base": c.avg_pnl_base,
+        "commission_base": c.commission_base,
+        "contracts": c.contracts,
+    }
+
+
 def daily_series(
-    conn: sqlite3.Connection, month: str | None = None, asset_category: str | None = "OPT"
+    conn: sqlite3.Connection, period: str | None = None, asset_category: str | None = "OPT"
 ) -> list[DayPnl]:
-    """Realised P&L and fill count per calendar day, ascending."""
+    """Realised P&L and fill count per calendar day, ascending.
+
+    `period` is a year or a month; see `_in_period`.
+    """
     clauses, params = [], []
     if asset_category:
         clauses.append("asset_category = ?")
@@ -185,7 +332,7 @@ def daily_series(
         f"SELECT trade_date, fifo_pnl_realized_base FROM trades {where}", params
     ):
         day = _day_of(row["trade_date"])
-        if day is None or (month and not day.startswith(month)):
+        if day is None or not _in_period(row["trade_date"], period):
             continue
         bucket = buckets.setdefault(day, DayPnl(day=day))
         bucket.trades += 1
@@ -195,14 +342,19 @@ def daily_series(
 
 def month_stats(
     conn: sqlite3.Connection,
-    month: str | None = None,
+    period: str | None = None,
     *,
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
 ) -> MonthStats:
-    """Statistics for one month, or for everything when `month` is None."""
+    """Statistics for one period, or for everything when `period` is None.
+
+    `period` is a month ("2025-03") or a whole year ("2025"). Both widths run
+    through the identical summations, which is what makes the Annual tab's
+    figures reconcile with the monthly ones instead of being a second opinion.
+    """
     stats = MonthStats(
-        month=month or "ALL",
+        month=period or "ALL",
         base_currency=base_currency,
         asset_category=asset_category or "ALL",
     )
@@ -218,7 +370,7 @@ def month_stats(
         f"SELECT trade_date, ib_order_id, fifo_pnl_realized_base, ib_commission_base"
         f" FROM trades {where}", params
     ):
-        if month and _month_of(row["trade_date"]) != month:
+        if not _in_period(row["trade_date"], period):
             continue
         stats.total_trades += 1
         if row["ib_order_id"]:
@@ -233,15 +385,16 @@ def month_stats(
         "SELECT date_time, amount_base, type FROM cash_transactions"
         " WHERE UPPER(type) LIKE '%FEES%'"
     ):
-        if month and _month_of(row["date_time"]) != month:
+        if not _in_period(row["date_time"], period):
             continue
         stats.fees_base += row["amount_base"] or 0.0
 
     report = build_history(conn, asset_category=asset_category, base_currency=base_currency)
-    closed = [
-        e for e in report.closed
-        if not month or (_month_of(e.closed_at) == month)
-    ]
+    # Attributed by close date, matching the monthly convention: an episode
+    # opened in December and closed in January is a January outcome, and so a
+    # 2026 one. Attributing by entry instead would make the annual rows stop
+    # summing to the monthly ones.
+    closed = [e for e in report.closed if _in_period(e.closed_at, period)]
     stats.closed_episodes = len(closed)
     stats.open_episodes = len(report.open)
     wins = [e.realized_pnl_base for e in closed if e.realized_pnl_base > 0]
@@ -250,7 +403,7 @@ def month_stats(
     stats.avg_win_base = sum(wins) / len(wins) if wins else None
     stats.avg_loss_base = sum(losses) / len(losses) if losses else None
 
-    stats.days = daily_series(conn, month, asset_category)
+    stats.days = daily_series(conn, period, asset_category)
     return stats
 
 

@@ -391,6 +391,10 @@ def history_data(report: HistoryReport) -> Row:
             "opened_at": e.opened_at,
             "closed_at": e.closed_at,
             "holding_days": e.holding_days,
+            # Classified here rather than in the page: the comparison needs
+            # date parsing (opened_at carries a time, expiry does not) and is
+            # not the same question as holding_days == 0. See Episode.is_odte.
+            "is_odte": e.is_odte,
             "contracts": e.contracts,
             "open_fills": e.open_fills,
             "close_fills": e.close_fills,

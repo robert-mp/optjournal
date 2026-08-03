@@ -54,7 +54,14 @@ from optjournal.render import (
     positions_data,
     statements_data,
 )
-from optjournal.stats import available_months, month_stats, stats_data
+from optjournal.stats import (
+    annual_stats,
+    available_months,
+    cohort_data,
+    month_stats,
+    odte_cohorts,
+    stats_data,
+)
 
 __all__ = ["build_state", "serve"]
 
@@ -146,6 +153,19 @@ def build_state(
             "orders": orders_data(conn),
             "history": history_data(build_history(conn, asset_category=asset_category)),
             "statements": statements_data(archive_dir, conn),
+        }
+        # Both are all-time by construction and ignore the month selector: a
+        # year-by-year table filtered to one month would have a single row, and
+        # a 0DTE cohort of one month's trades is too small to compare against
+        # anything. The selector stays wired to `stats` alone.
+        state["annual"] = [
+            stats_data(s) for s in annual_stats(conn, asset_category=asset_category)
+        ]
+        odte, rest, unknown_dte = odte_cohorts(conn, asset_category=asset_category)
+        state["odte"] = {
+            "cohort": cohort_data(odte),
+            "rest": cohort_data(rest),
+            "unknown_dte": unknown_dte,
         }
         base_ccy = str(state["stats"].get("base_currency") or "")
         state["fx"] = {"base": base_ccy, "quotes": _fx_quotes(conn, base_ccy)}

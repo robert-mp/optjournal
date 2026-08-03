@@ -156,6 +156,35 @@ class Episode:
         return (end.date() - start.date()).days
 
     @property
+    def is_odte(self) -> bool | None:
+        """Whether the contract had zero days to expiration when it was opened.
+
+        Deliberately *not* `holding_days == 0`. That is a day trade, which is a
+        different thing: a 45-day option bought and sold in one afternoon is a
+        day trade at 45 DTE, and a 0DTE contract held from the open to the bell
+        is 0DTE with a holding period of zero -- the two coincide often enough
+        to be mistaken for one definition. What makes 0DTE its own category is
+        the expiry, not the holding period: gamma and time decay behave unlike
+        anything else on the day a contract dies, which is the whole reason to
+        look at these trades separately.
+
+        Compares parsed dates, not strings. `opened_at` carries a time of day
+        while `expiry` does not, so `opened_at == expiry` is False even on a
+        genuine 0DTE trade; and expiry reaches the database in IBKR's compact
+        `YYYYMMDD` form, so the two are not even the same shape. Both sides go
+        through `_parse_dt`, which normalises either form.
+
+        None when the contract has no expiry -- a stock has no DTE, and that is
+        unknowable rather than false.
+        """
+        if not self.expiry:
+            return None
+        opened, expires = _parse_dt(self.opened_at), _parse_dt(self.expiry)
+        if opened is None or expires is None:
+            return None
+        return opened.date() == expires.date()
+
+    @property
     def contracts(self) -> int:
         """Position size at its largest, in contracts or shares."""
         return max(abs(self.opened_qty), abs(self.closed_qty))

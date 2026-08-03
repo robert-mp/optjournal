@@ -22,6 +22,13 @@ from pathlib import Path
 
 import pytest
 
+from optjournal.cli import (
+    DEFAULT_ARCHIVE,
+    DEFAULT_DB,
+    DEFAULT_DEMO_DB,
+    DEFAULT_DEMO_DIR,
+    main,
+)
 from optjournal.db import connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal import web
@@ -141,7 +148,7 @@ _NOT_PAYLOAD_BINDINGS = frozenset({
     "b", "sel", "m", "r",
     # local collections; the reads are array methods, not payload keys
     "arows", "cells", "days", "jrows", "legs", "month", "months", "oc",
-    "open", "opts", "orders", "ps", "pts", "rows",
+    "odtes", "open", "opts", "orders", "ps", "pts", "rows", "yrs",
 })
 
 
@@ -175,6 +182,13 @@ def _roots(state: dict) -> dict[str, dict]:
         # Chart points are constructed client-side from stats.days, so their
         # shape is the page's own contract rather than the API's.
         "pt": {"x": None, "y": None, "n": None},
+        "od": state["odte"],
+        "co": state["odte"]["cohort"],
+        # An annual row is the same stats shape as `s`, so the Annual view maps
+        # over them as `s` and this only registers the running best-year
+        # binding. Two names for one shape is fine -- `ep` and `x` already are;
+        # what breaks the guard is one name for two shapes.
+        "best": state["annual"][0],
     }
     if state["stats"]["days"]:
         roots["dy"] = state["stats"]["days"][0]
@@ -525,3 +539,106 @@ def test_restating_positions_reproduces_ibkrs_own_native_figures(state):
     restated = sum(p["position_value_base"] for p in usd) * per_base
     native = sum(p["position_value"] for p in usd)
     assert restated == pytest.approx(native, rel=1e-9)
+
+
+# --------------------------------------------------------- annual / 0DTE tabs
+
+
+def test_annual_and_odte_are_in_the_payload(state):
+    """Both tabs were disabled with hardcoded reasons; now they have data."""
+    assert state["annual"], "the Annual tab renders from this"
+    assert set(state["odte"]) == {"cohort", "rest", "unknown_dte"}
+    # A cohort in isolation says nothing, so the comparison set must be present.
+    assert state["odte"]["rest"]["episodes"] >= 0
+
+
+def test_annual_rows_reconcile_with_the_all_time_row(state):
+    """The Annual table shows all_time as its total row, so they must agree.
+
+    all_time is computed independently of the per-year rows, which is what makes
+    this worth asserting: it is the same check a reader performs by eye.
+    """
+    years, everything = state["annual"], state["all_time"]
+    assert sum(y["total_trades"] for y in years) == everything["total_trades"]
+    assert sum(y["closed_episodes"] for y in years) == everything["closed_episodes"]
+    assert sum(y["net_pnl_base"] for y in years) == pytest.approx(
+        everything["net_pnl_base"], abs=1e-9
+    )
+
+
+def test_every_episode_carries_an_odte_verdict(state):
+    """The 0DTE tab filters on this flag, so it cannot be absent."""
+    for ep in state["history"]["closed"] + state["history"]["open"]:
+        assert "is_odte" in ep, ep["symbol"]
+        assert ep["is_odte"] in (True, False, None)
+
+
+def test_annual_and_odte_ignore_the_month_selector(populated):
+    """Both are all-time by construction.
+
+    A year-by-year table filtered to one month has a single row, and a 0DTE
+    cohort of one month's trades is too small to compare against anything. The
+    month selector stays wired to `stats` alone.
+    """
+    kw = dict(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    unfiltered = build_state(**kw)
+    month = unfiltered["months"][0]
+    filtered = build_state(**kw, month=month)
+    assert filtered["selected_month"] == month, "precondition: the filter applied"
+    assert filtered["stats"]["month"] == month
+    assert filtered["annual"] == unfiltered["annual"]
+    assert filtered["odte"] == unfiltered["odte"]
+
+
+# ------------------------------------------------------------- serve --demo
+
+
+def _serve_kwargs(monkeypatch, argv: list[str]) -> dict:
+    """Run `main` against a stubbed `serve`, returning the kwargs it received."""
+    captured: dict = {}
+    monkeypatch.setattr(web, "serve", lambda **kw: captured.update(kw))
+    assert main(argv) == 0
+    return captured
+
+
+def test_demo_flag_redirects_both_paths(monkeypatch):
+    """One flag, because pointing only --db at the demo is a silent mismatch.
+
+    The archive is where the cost report is read from, so a demo database served
+    beside the real archive would show synthetic trades against real costs.
+    """
+    kw = _serve_kwargs(monkeypatch, ["serve", "--demo"])
+    assert kw["db_path"] == DEFAULT_DEMO_DB
+    assert kw["archive_dir"] == DEFAULT_DEMO_DIR
+
+
+def test_without_demo_the_real_paths_are_served(monkeypatch):
+    kw = _serve_kwargs(monkeypatch, ["serve"])
+    assert kw["db_path"] == DEFAULT_DB
+    assert kw["archive_dir"] == DEFAULT_ARCHIVE
+
+
+def test_an_explicit_path_wins_over_demo(monkeypatch, tmp_path):
+    """--db and --archive default to None here so this is decidable at all.
+
+    With the shared parents' defaults left in place, an explicit path equal to
+    the default is indistinguishable from an absent one, and --demo would have
+    had to overwrite it.
+    """
+    kw = _serve_kwargs(
+        monkeypatch, ["serve", "--demo", "--db", str(tmp_path / "mine.db")]
+    )
+    assert kw["db_path"] == tmp_path / "mine.db"
+    assert kw["archive_dir"] == DEFAULT_DEMO_DIR, "only --db was overridden"
+
+
+def test_demo_refuses_a_query_id(monkeypatch, capsys):
+    """A sync would put real trades in the synthetic database.
+
+    Sync writes into the archive and database being served, so one click on a
+    demo server with a query id spends an IBKR request to mix real fills with
+    generated ones -- after which no figure in the journal means anything.
+    """
+    monkeypatch.setattr(web, "serve", lambda **kw: pytest.fail("must not serve"))
+    assert main(["serve", "--demo", "--query-id", "1591754"]) == 2
+    assert "Refused" in capsys.readouterr().err

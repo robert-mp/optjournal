@@ -31,7 +31,13 @@ from optjournal.demo import (
 from optjournal.flex import load
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_OPTIONS, ingest_file
-from optjournal.stats import available_months, month_stats
+from optjournal.stats import (
+    _in_period,
+    annual_stats,
+    available_months,
+    month_stats,
+    odte_cohorts,
+)
 
 MULTIPLIER = Decimal("100")
 
@@ -123,7 +129,7 @@ def test_spans_more_than_one_calendar_year(conn):
 
 def test_has_closed_round_trips_with_wins_and_losses(conn):
     """The real account has none, so these metrics were permanently empty."""
-    s = month_stats(conn, month=None)
+    s = month_stats(conn, period=None)
     assert s.wins and s.losses, "need both sides for Win Rate to mean anything"
     assert s.avg_win_base is not None and s.avg_loss_base is not None
     assert s.avg_win_base > 0 > s.avg_loss_base
@@ -176,3 +182,128 @@ def test_leaves_positions_open_including_one_without_fills(conn):
     assert len(open_eps) == 2
     assert any(e.snapshot_only for e in open_eps), "no snapshot-only position"
     assert any(not e.snapshot_only for e in open_eps), "no fill-derived position"
+
+
+# ----------------------------------------------------------------- annual/0DTE
+
+
+def test_the_years_account_for_everything(conn):
+    """Per-year figures must sum to the all-time ones they sit beside.
+
+    The Annual tab shows an all-time total row, so any figure that failed to
+    reconcile would be visible on screen. Guarded here because the two are
+    computed over different period widths and a filter that dropped or
+    double-counted a boundary date would still look plausible per year.
+    """
+    years = annual_stats(conn)
+    everything = month_stats(conn, None)
+    assert len(years) == 2, "the demo spans two calendar years"
+
+    assert sum(y.total_trades for y in years) == everything.total_trades
+    assert sum(y.closed_episodes for y in years) == everything.closed_episodes
+    assert sum(y.wins for y in years) == everything.wins
+    assert sum(y.losses for y in years) == everything.losses
+    assert sum(y.net_pnl_base for y in years) == pytest.approx(
+        everything.net_pnl_base, abs=1e-9
+    )
+    assert sum(y.commissions_base for y in years) == pytest.approx(
+        everything.commissions_base, abs=1e-9
+    )
+    # Every trading day belongs to exactly one year.
+    assert sum(len(y.days) for y in years) == len(everything.days)
+
+
+def test_years_are_newest_first_and_span_only_traded_years(conn):
+    years = [y.month for y in annual_stats(conn)]
+    assert years == sorted(years, reverse=True)
+    assert years == ["2026", "2025"]
+
+
+def test_a_year_crossing_round_trip_counts_in_the_year_it_closed(conn):
+    """The attribution rule, which the generated data cannot exercise.
+
+    Every synthetic episode opens and closes inside one calendar year, so
+    attributing by entry instead of exit would pass every other assertion here.
+    A December-to-January round trip is the case that separates them, and the
+    convention has to match the month selector's -- otherwise the annual rows
+    stop summing to the monthly ones.
+    """
+    template = conn.execute(
+        "SELECT * FROM trades WHERE open_close = 'O' LIMIT 1"
+    ).fetchone()
+    columns = list(template.keys())
+
+    def clone(**overrides) -> None:
+        row = dict(template)
+        row.update(overrides)
+        conn.execute(
+            f"INSERT INTO trades ({','.join(columns)})"
+            f" VALUES ({','.join('?' for _ in columns)})",
+            [row[c] for c in columns],
+        )
+
+    before = {y.month: y for y in annual_stats(conn)}
+    common = dict(conid="999000001", symbol="XCROSS 260130C00100000",
+                  expiry="20260130", notes=None)
+    clone(trade_id="X-OPEN", ib_exec_id="X-EXEC-1", transaction_id="X-TXN-1",
+          ib_order_id="X-ORD-1", quantity=-1,
+          trade_date="2025-12-22", date_time="2025-12-22 14:30:05",
+          open_close="O", fifo_pnl_realized=0.0, fifo_pnl_realized_base=0.0,
+          **common)
+    clone(trade_id="X-CLOSE", ib_exec_id="X-EXEC-2", transaction_id="X-TXN-2",
+          ib_order_id="X-ORD-2", quantity=1,
+          trade_date="2026-01-05", date_time="2026-01-05 14:30:05",
+          open_close="C", fifo_pnl_realized=100.0, fifo_pnl_realized_base=90.0,
+          **common)
+    conn.commit()
+
+    after = {y.month: y for y in annual_stats(conn)}
+    assert after["2026"].closed_episodes == before["2026"].closed_episodes + 1, (
+        "a round trip closed in January must count as a January-year outcome"
+    )
+    assert after["2025"].closed_episodes == before["2025"].closed_episodes, (
+        "counting it in the entry year would double it across the two rows"
+    )
+    # The realised P&L follows the closing fill's own trade date, so the two
+    # measures agree about which year the money landed in.
+    assert after["2026"].net_pnl_base == pytest.approx(
+        before["2026"].net_pnl_base + 90.0, abs=1e-9
+    )
+    # And the reconciliation still holds with a boundary-crossing episode.
+    everything = month_stats(conn, None)
+    assert sum(y.closed_episodes for y in after.values()) == everything.closed_episodes
+
+
+def test_odte_cohorts_partition_every_closed_round_trip(conn):
+    """Nothing may be counted twice or fall between the two columns."""
+    odte, rest, unknown = odte_cohorts(conn)
+    closed = len(build_history(conn, asset_category="OPT").closed)
+    assert odte.episodes + rest.episodes + unknown == closed
+    assert unknown == 0, "every option in the demo carries an expiry"
+
+
+def test_the_demo_has_exactly_one_odte_round_trip(conn):
+    """The path that was unreachable: the ODTE tab had no trade to show."""
+    odte, rest, _ = odte_cohorts(conn)
+    assert odte.episodes == 1
+    assert rest.episodes > 1, "a cohort of one needs something to compare against"
+    assert odte.win_rate is not None
+    assert odte.avg_pnl_base == pytest.approx(odte.net_pnl_base, abs=1e-9), (
+        "one round trip, so the average is the total"
+    )
+
+
+def test_period_filter_matches_both_widths_and_both_date_forms():
+    """`_in_period` is what lets one summation serve months and years."""
+    assert _in_period("2025-03-14 10:00:00", "2025")
+    assert _in_period("2025-03-14 10:00:00", "2025-03")
+    assert not _in_period("2025-03-14", "2025-04")
+    assert not _in_period("2026-01-05", "2025")
+    # IBKR's compact form must not be prefix-matched raw: "20250314" does not
+    # start with "2025-03", so the value has to be normalised first.
+    assert _in_period("20250314", "2025-03")
+    assert _in_period("20250314", "2025")
+    # No period means everything; an unparseable date belongs to no period.
+    assert _in_period("20250314", None)
+    assert not _in_period(None, "2025")
+    assert not _in_period("garbage", "2025")
