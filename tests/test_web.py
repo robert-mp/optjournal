@@ -152,9 +152,9 @@ _NOT_PAYLOAD_BINDINGS = frozenset({
     # the URLSearchParams the state request and the hash are built from
     "qs", "hs",
     # local collections; the reads are array methods, not payload keys
-    "cells", "days", "groups", "jrows", "legs", "mons", "month", "months",
-    "morders", "oc", "odtes", "olegs", "open", "opts", "orders", "out", "ps",
-    "pts", "range", "rows", "yrs",
+    "cells", "days", "buckets", "evs", "glegs", "groups", "jrows", "lcs",
+    "legs", "mons", "month", "months", "morders", "oc", "odtes", "olegs",
+    "open", "opts", "orders", "out", "ps", "pts", "range", "rows", "yrs",
 })
 
 
@@ -201,6 +201,12 @@ def _roots(state: dict) -> dict[str, dict]:
     # uses, so it stays registered under `o` below.
     if state["strategies"]:
         roots["g"] = state["strategies"][0]
+    # A position lifecycle; its `events` are strategy-group shaped and render
+    # as `g`. The Positions tab's bucket is a page-side construct pairing a
+    # lifecycle with its snapshot rows, like `pt` is for chart points.
+    if state["lifecycles"]:
+        roots["lc"] = state["lifecycles"][0]
+    roots["bkt"] = {"lc": None, "rows": None}
     if state["stats"]["days"]:
         roots["dy"] = state["stats"]["days"][0]
     if state["positions"]:
@@ -463,6 +469,43 @@ def test_trades_view_renders_strategy_groups():
     js = _js()
     assert "S.state.strategies" in js
     assert "g.orders" in js and "g.label" in js and "g.order_ids" in js
+
+
+def test_trades_view_renders_lifecycles_and_positions_group_by_them():
+    """The Trades tab is one card per position lifecycle (open->close is one
+    position, not two trades); the Positions tab buckets snapshot rows by the
+    open lifecycle that owns their conids."""
+    js = _js()
+    assert "S.state.lifecycles" in js
+    assert "lc.events" in js and "lc.status" in js and "lc.conids" in js
+
+
+def test_a_lifecycle_spans_open_and_close_and_matches_the_dashboard(populated):
+    """The real naked put: opened July, bought back August -- ONE closed
+    lifecycle whose P&L equals the episode accounting the Dashboard uses."""
+    conn = connect(populated)
+    try:
+        report = build_history(conn, asset_category="OPT")
+    finally:
+        conn.close()
+    spanning = [e for e in report.closed
+                if e.opened_at and e.closed_at
+                and e.opened_at[:7] != e.closed_at[:7]]
+    if not spanning:
+        pytest.skip("archive has no closed round trip spanning two months")
+    st = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    ep = spanning[0]
+    owning = [lc for lc in st["lifecycles"] if str(ep.conid) in lc["conids"]]
+    assert len(owning) == 1, "exactly one lifecycle owns the contract"
+    lc = owning[0]
+    assert lc["status"] == "closed"
+    assert len(lc["events"]) >= 2, "the open and the close are both present"
+    assert lc["opened_at"][:10] == ep.opened_at[:10]
+    assert lc["closed_at"][:10] == ep.closed_at[:10]
+    assert lc["realized_pnl_base"] == pytest.approx(ep.realized_pnl_base)
+    # An open lifecycle keeps the Dashboard's rule: nothing until flat.
+    for open_lc in (x for x in st["lifecycles"] if x["status"] == "open"):
+        assert open_lc["realized_pnl_base"] is None
 
 
 def test_dashboard_headline_counts_closed_round_trips_for_options():

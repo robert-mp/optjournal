@@ -636,44 +636,52 @@ function groupLabel(legs){
   return closing?'CLOSING':'OPENING';
 }
 function trades(){
-  /* One card per STRATEGY, not per IBKR order: the first real strangle in
-     this account arrived as two orders (call and put) filled in the same
-     second, each with its own order id -- order-per-card showed it as two
-     unrelated positions. The server groups same-underlying orders placed
-     within seconds (see strategies.py) and names the shape; every member
-     order stays visible beneath with its own legs, so nothing about the
-     order-level truth is hidden by the grouping. A group of one order
-     renders exactly as the old order card did. */
-  const groups=S.state.strategies||[];
-  if(!groups.length) return `${filters()}<div class="card"><div class="empty">no option orders</div></div>`;
-  return filters()+groups.map(g=>{
-    const morders=g.orders||[];
-    const legs=morders.flatMap(o=>o.legs||[]);
+  /* One card per POSITION LIFECYCLE: a short put opened in July and bought
+     back in August is one position with two events, not two unrelated
+     trades. The linkage is the episode layer's, not a display heuristic --
+     the open and the close share a FIFO episode keyed by conid, so the
+     grouping can never join two different contracts or split one. Below the
+     lifecycle, each EVENT (the strategy-grouped orders from strategies.py)
+     stays fully visible with its legs, so the order-level truth is intact.
+     Realised P&L and commission are episode-sourced and appear only once
+     the lifecycle is closed -- the same rule the Dashboard follows. */
+  const lcs=S.state.lifecycles||[];
+  if(!lcs.length) return `${filters()}<div class="card"><div class="empty">no option orders</div></div>`;
+  return filters()+lcs.map(lc=>{
+    const evs=lc.events||[];
+    const legs=evs.flatMap(g=>(g.orders||[]).flatMap(o=>o.legs||[]));
     const nat=legs[0]?legs[0].currency:'';
-    const ids=(g.order_ids||[]).join(', ');
+    const openLc=lc.status==='open';
+    const when=openLc?`opened ${esc((lc.opened_at||'').slice(0,10))} · still open`
+      :`${esc((lc.opened_at||'').slice(0,10))} → ${esc((lc.closed_at||'').slice(0,10))}`;
     return `<div class="card">
-      <div class="crow"><div><h2>${esc(g.underlying||'?')}
-        <span class="dim" style="font-size:14px;font-weight:500">${esc(g.label)}</span></h2>
-        <div class="sub mono">order${morders.length>1?'s':''} ${esc(ids)} ·
-          ${esc((g.first_fill_at||'').slice(0,16))} · ${g.fills} fill(s)</div></div>
+      <div class="crow"><div><h2>${esc(lc.underlying||'?')}
+        <span class="dim" style="font-size:14px;font-weight:500">${esc(lc.label)}</span>
+        <span class="pill" style="margin-left:8px;font-size:11px"
+          >${openLc?'OPEN':'CLOSED'}</span></h2>
+        <div class="sub mono">${when} · ${lc.fills} fill(s) · ${evs.length} event(s)</div></div>
       </div>
       <div class="stats" style="grid-template-columns:repeat(3,1fr)">
-        ${statCard('Proceeds', cash(g.proceeds_base),
+        ${statCard('Proceeds', cash(lc.proceeds_base),
           nat&&nat!==DISP()?`${money(legs.reduce((a,l)=>a+(l.proceeds||0),0),nat)} as filled`:'',
-          'sm '+cls(g.proceeds_base))}
-        ${statCard('Comms & Fees', cash(g.commission_base),
-          morders.length>1?'all legs':'per order',
-          'sm '+cls(g.commission_base))}
-        ${statCard('Realised P&L', cash(g.realized_pnl_base), 'net of commission',
-          'sm '+cls(g.realized_pnl_base))}
+          'sm '+cls(lc.proceeds_base))}
+        ${statCard('Comms & Fees',
+          lc.commission_base!=null?cash(lc.commission_base):'—',
+          openLc?'lands with the outcome, on close':'all legs, whole lifecycle',
+          'sm '+cls(lc.commission_base))}
+        ${statCard('Realised P&L',
+          lc.realized_pnl_base!=null?cash(lc.realized_pnl_base):'—',
+          openLc?'nothing counts until the position is flat':'net of commission',
+          'sm '+cls(lc.realized_pnl_base))}
       </div>
-      ${morders.map(o=>{
-        const olegs=o.legs||[];
+      ${evs.map(g=>{
+        const glegs=(g.orders||[]).flatMap(o=>o.legs||[]);
         return `<div class="grp">
-        <div class="gh"><span class="gl">${esc((o.first_fill_at||'').slice(0,10))} — ${
-          groupLabel(olegs)}${morders.length>1?` <span class="dim2 mono">order ${esc(o.ib_order_id)}</span>`:''}</span>
-          <span class="mono ${cls(o.proceeds_base)}">${cash(o.proceeds_base)}</span></div>
-        ${olegs.map(l=>`<div class="leg">
+        <div class="gh"><span class="gl">${esc((g.first_fill_at||'').slice(0,10))} — ${
+          esc(g.label)} <span class="dim2 mono">order${(g.order_ids||[]).length>1?'s':''} ${
+          esc((g.order_ids||[]).join(', '))}</span></span>
+          <span class="mono ${cls(g.proceeds_base)}">${cash(g.proceeds_base)}</span></div>
+        ${glegs.map(l=>`<div class="leg">
           <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
           <span class="mono">${esc(l.underlying_symbol||'')}
             <b>${l.strike!=null?num(l.strike,0):''}${esc(l.put_call||'')}</b>
@@ -703,28 +711,53 @@ function positions(){
      row that lacks the column. */
   const basis={}; open.forEach(ep=>{if(ep.cost_basis!=null)basis[ep.conid]=ep.cost_basis;});
   let val=0; ps.forEach(pos=>val+=(pos.position_value_base||0));
+  /* Snapshot rows grouped by the LIFECYCLE that opened them, via conid --
+     the same episode-exact linkage the Trades tab uses, so the strangle is
+     one position with two contract rows beneath it. Rows no open lifecycle
+     claims (snapshot-only contracts from before the archive) group under
+     their own heading rather than being forced into a strategy story the
+     data cannot back. */
+  const lcByConid={};
+  (S.state.lifecycles||[]).forEach(lc=>{
+    if(lc.status==='open') (lc.conids||[]).forEach(cid=>lcByConid[cid]=lc);});
+  const buckets=[]; const seen={};
+  ps.forEach(pos=>{
+    const lc=lcByConid[String(pos.conid)];
+    const key=lc?'lc:'+lc.conids.join(','):'solo:'+pos.conid;
+    if(!seen[key]){seen[key]={lc,rows:[]};buckets.push(seen[key]);}
+    seen[key].rows.push(pos);
+  });
+  const row=pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
+    return `<tr><td class="mono">${esc(pos.symbol)}</td>
+    <td class="n mono ${cls(pos.position)}">${pos.position}</td>
+    <td class="n mono">${money(pos.mark_price,pos.currency)}</td>
+    <td class="n mono">${cash(pos.position_value_base)}</td>
+    <td class="n mono">${natCash(pos.cost_basis_money!=null?pos.cost_basis_money
+      :basis[pos.conid],pos.fx_rate_to_base)}</td>
+    <td class="n mono ${cls(pos.fifo_pnl_unrealized)}">${
+      natCash(pos.fifo_pnl_unrealized,pos.fx_rate_to_base)}</td>
+    <td class="dim">${esc(pos.currency)}</td>
+    <td class="dim2">${ep.snapshot_only?'snapshot only':ep.entry_outside_window?'partial':'complete'}</td>
+  </tr>`;};
+  const grpRow=bkt=>{
+    /* Not `b` -- that name is the DOM button binding elsewhere in this page,
+       and one name for two shapes blinds the payload guard to both. */
+    const label=bkt.lc?`${bkt.lc.underlying||''} — ${bkt.lc.label}, opened ${
+      String(bkt.lc.opened_at||'').slice(0,10)}`:'Ungrouped — no opening fills in the archive';
+    let uv=0; bkt.rows.forEach(pos=>uv+=(pos.position_value_base||0));
+    return `<tr class="grp"><td colspan="7" class="dim">${esc(label)}</td>
+      <td class="n mono ${cls(uv)}">${cash(uv)}</td></tr>${bkt.rows.map(row).join('')}`;};
   return `<div class="card">
     <div class="crow"><div><h2>Option book</h2>
       <div class="sub">From the ${esc((ps[0]&&ps[0].report_date)||'latest')} position
       snapshot — the only cost-basis source for anything opened before the archive
-      starts.</div></div>
+      starts. Grouped by the strategy each position was opened as.</div></div>
       <div class="pills"><span class="pill">book value
         <b class="${cls(val)}">${cash(val)}</b></span></div></div>
     ${ps.length?`<table><thead><tr><th>contract</th><th class="n">qty</th>
       <th class="n">mark</th><th class="n">value</th><th class="n">cost basis</th>
       <th class="n">unrealised</th><th>price ccy</th><th>record</th></tr></thead><tbody>
-      ${ps.map(pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
-        return `<tr><td class="mono">${esc(pos.symbol)}</td>
-        <td class="n mono ${cls(pos.position)}">${pos.position}</td>
-        <td class="n mono">${money(pos.mark_price,pos.currency)}</td>
-        <td class="n mono">${cash(pos.position_value_base)}</td>
-        <td class="n mono">${natCash(pos.cost_basis_money!=null?pos.cost_basis_money
-          :basis[pos.conid],pos.fx_rate_to_base)}</td>
-        <td class="n mono ${cls(pos.fifo_pnl_unrealized)}">${
-          natCash(pos.fifo_pnl_unrealized,pos.fx_rate_to_base)}</td>
-        <td class="dim">${esc(pos.currency)}</td>
-        <td class="dim2">${ep.snapshot_only?'snapshot only':ep.entry_outside_window?'partial':'complete'}</td>
-      </tr>`}).join('')}</tbody></table>`:'<div class="empty">no open options</div>'}
+      ${buckets.map(grpRow).join('')}</tbody></table>`:'<div class="empty">no open options</div>'}
     ${open.some(ep=>ep.snapshot_only)?`<div class="note">A position marked
       <b>snapshot only</b> was opened before the earliest archived statement, so no
       opening fill exists anywhere and its entry price and holding period are

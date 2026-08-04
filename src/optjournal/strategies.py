@@ -137,3 +137,94 @@ def strategy_groups(orders: list[Row]) -> list[Row]:
         })
     out.sort(key=lambda g: g["first_fill_at"], reverse=True)
     return out
+
+
+def position_groups(
+    orders: list[Row],
+    *,
+    episodes: list[Any],
+    trade_to_order: dict[str, str],
+) -> list[Row]:
+    """Strategy events linked into position lifecycles, newest first.
+
+    An opened-then-closed single leg is one position, not two trades -- and
+    the accounting layer already knows it: `history.py` FIFO-matches fills
+    into per-conid episodes, so the open and the close share an episode. The
+    linkage here is exact, not heuristic: episode.trade_ids -> the fills'
+    ib_order_id (via `trade_to_order`) -> the strategy event that order
+    belongs to. Events sharing any episode are one lifecycle.
+
+    Two deliberate consequences:
+
+    * A re-opened contract later is a NEW episode, so it starts a new
+      lifecycle rather than reviving the old card.
+    * A roll event (mixed open/close legs) shares an episode with the old
+      lifecycle AND opens a new episode -- the union links the whole chain
+      into one campaign card. That is the intended reading of a roll: one
+      continuing decision, with each episode's P&L still landing in its own
+      close month underneath.
+
+    Events whose orders map to no episode (nothing but snapshots, or an
+    unmatched category) stay as singleton lifecycles.
+    """
+    events = strategy_groups(orders)
+
+    order_to_eps: dict[str, set[int]] = {}
+    for idx, ep in enumerate(episodes):
+        for tid in getattr(ep, "trade_ids", ()) or ():
+            oid = trade_to_order.get(str(tid))
+            if oid is not None:
+                order_to_eps.setdefault(oid, set()).add(idx)
+
+    def event_eps(event: Row) -> set[int]:
+        eps: set[int] = set()
+        for oid in event.get("order_ids", ()):
+            eps |= order_to_eps.get(str(oid), set())
+        return eps
+
+    # Union events sharing episodes. Tiny n, so the quadratic sweep is
+    # clearer than a union-find and costs nothing.
+    clusters: list[tuple[set[int], list[Row]]] = []
+    for event in events:
+        eps = event_eps(event)
+        merged: tuple[set[int], list[Row]] | None = None
+        for cluster in clusters:
+            if eps and cluster[0] & eps:
+                cluster[0].update(eps)
+                cluster[1].append(event)
+                merged = cluster
+                break
+        if merged is None:
+            clusters.append((set(eps), [event]))
+
+    out: list[Row] = []
+    for ep_idxs, members in clusters:
+        members.sort(key=lambda e: str(e.get("first_fill_at") or ""))
+        opening = members[0]
+        eps = [episodes[i] for i in sorted(ep_idxs)]
+        closed = bool(eps) and all(e.is_closed for e in eps)
+        out.append({
+            "underlying": opening.get("underlying"),
+            # The shape it was OPENED as names the position; later events
+            # (closes, rolls) are its history, not its identity.
+            "label": opening.get("label"),
+            "status": "closed" if closed else "open",
+            "opened_at": opening.get("first_fill_at"),
+            "closed_at": max((str(e.closed_at) for e in eps if e.closed_at),
+                             default=None) if closed else None,
+            "conids": sorted({str(e.conid) for e in eps}),
+            "episodes": len(eps),
+            "fills": sum(e.get("fills") or 0 for e in members),
+            "proceeds_base": sum(e.get("proceeds_base") or 0.0 for e in members),
+            # Episode-sourced, so it equals the Dashboard's accounting exactly
+            # -- populated only when the lifecycle is closed, same rule.
+            "realized_pnl_base": (
+                sum(e.realized_pnl_base for e in eps) if closed else None
+            ),
+            "commission_base": (
+                sum(e.commission_base for e in eps) if closed else None
+            ),
+            "events": members,
+        })
+    out.sort(key=lambda p: str(p["opened_at"] or ""), reverse=True)
+    return out

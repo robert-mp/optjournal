@@ -8,7 +8,12 @@ two unrelated positions.
 
 from __future__ import annotations
 
-from optjournal.strategies import WINDOW_S, classify, strategy_groups
+from optjournal.strategies import (
+    WINDOW_S,
+    classify,
+    position_groups,
+    strategy_groups,
+)
 
 
 def _leg(**kw):
@@ -112,3 +117,86 @@ def test_window_constant_is_seconds_and_modest():
     """The window is the heuristic's whole risk surface; pin its scale so a
     casual edit to minutes does not silently merge unrelated trades."""
     assert 1 <= WINDOW_S <= 300
+
+
+# ---------------------------------------------------------------- lifecycles
+
+
+class _Ep:
+    """Just enough Episode surface for position_groups."""
+
+    def __init__(self, conid, trade_ids, *, closed=False, closed_at=None,
+                 pnl=0.0, comm=0.0):
+        self.conid = conid
+        self.trade_ids = trade_ids
+        self.is_closed = closed
+        self.closed_at = closed_at
+        self.realized_pnl_base = pnl
+        self.commission_base = comm
+
+
+def test_open_and_close_events_link_into_one_closed_lifecycle():
+    """The naked-put case: sold in July, bought back in August -- one
+    position across its lifecycle, linked by the shared episode, with the
+    episode's own P&L (already net of commission) on the card."""
+    opening = _order("10", "2026-07-24 10:35:01",
+                     [_leg(underlying_symbol="TSLA", strike=270.0)])
+    closing = _order("11", "2026-08-03 09:55:23",
+                     [_leg(underlying_symbol="TSLA", strike=270.0,
+                           buy_sell="BUY", open_close="C")])
+    ep = _Ep("C1", ["t1", "t2"], closed=True,
+             closed_at="2026-08-03 09:55:23", pnl=684.59, comm=-3.62)
+    lifecycles = position_groups(
+        [opening, closing], episodes=[ep],
+        trade_to_order={"t1": "10", "t2": "11"},
+    )
+    assert len(lifecycles) == 1
+    lc = lifecycles[0]
+    assert lc["status"] == "closed"
+    assert lc["label"] == "Single leg", "named by the shape it was OPENED as"
+    assert (lc["opened_at"], lc["closed_at"]) == (
+        "2026-07-24 10:35:01", "2026-08-03 09:55:23")
+    assert lc["realized_pnl_base"] == 684.59, "episode-sourced, not fill-summed"
+    assert len(lc["events"]) == 2, "both events stay visible beneath"
+
+
+def test_an_open_lifecycle_reports_no_realised_pnl():
+    """Same rule as the Dashboard: nothing counts until the position is flat."""
+    opening = _order("10", "2026-08-03 11:11:19", [_leg()])
+    ep = _Ep("C1", ["t1"], closed=False)
+    (lc,) = position_groups([opening], episodes=[ep],
+                            trade_to_order={"t1": "10"})
+    assert lc["status"] == "open"
+    assert lc["realized_pnl_base"] is None
+    assert lc["commission_base"] is None
+
+
+def test_unrelated_contracts_never_share_a_lifecycle():
+    a = _order("10", "2026-07-24 10:35:01", [_leg(underlying_symbol="TSLA")])
+    b = _order("11", "2026-08-03 11:11:19", [_leg(underlying_symbol="META")])
+    eps = [_Ep("C1", ["t1"]), _Ep("C2", ["t2"])]
+    got = position_groups([a, b], episodes=eps,
+                          trade_to_order={"t1": "10", "t2": "11"})
+    assert len(got) == 2
+
+
+def test_a_roll_event_chains_lifecycles_into_one_campaign():
+    """A roll closes episode A and opens episode B in one event; sharing an
+    episode with each side links the whole chain into one card."""
+    opening = _order("10", "2026-07-24 10:00:00", [_leg()])
+    roll = _order("11", "2026-08-20 10:00:00", [
+        _leg(buy_sell="BUY", open_close="C"),
+        _leg(expiry="20261016", open_close="O"),
+    ])
+    eps = [
+        _Ep("C1", ["t1", "t2"], closed=True, closed_at="2026-08-20 10:00:00",
+            pnl=100.0),
+        _Ep("C2", ["t3"], closed=False),
+    ]
+    got = position_groups([opening, roll], episodes=eps,
+                          trade_to_order={"t1": "10", "t2": "11", "t3": "11"})
+    assert len(got) == 1, "the campaign is one lifecycle"
+    lc = got[0]
+    assert lc["status"] == "open", "the rolled-into leg is still open"
+    assert lc["realized_pnl_base"] is None, "campaign not decided yet"
+    assert {e["label"] for e in lc["events"]} == {"Single leg", "Roll"}

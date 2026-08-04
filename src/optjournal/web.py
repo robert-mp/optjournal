@@ -67,7 +67,7 @@ from optjournal.stats import (
     scope_for,
     stats_data,
 )
-from optjournal.strategies import strategy_groups
+from optjournal.strategies import position_groups, strategy_groups
 
 __all__ = ["build_state", "serve"]
 
@@ -250,6 +250,20 @@ def build_state(
             # as -- a strangle sold as two same-second orders is one group.
             "strategies": strategy_groups(
                 orders_data(conn, scope.order_ids, view_category)
+            ),
+            # ... and further linked into position lifecycles: the open and
+            # the close of one position share an episode, so they are one
+            # card. Exact linkage via episode trade ids, not a time window.
+            "lifecycles": position_groups(
+                orders_data(conn, scope.order_ids, view_category),
+                episodes=[*view_report.closed, *view_report.open],
+                trade_to_order={
+                    str(r["trade_id"]): str(r["ib_order_id"])
+                    for r in conn.execute(
+                        "SELECT trade_id, ib_order_id FROM trades"
+                        " WHERE ib_order_id IS NOT NULL"
+                    )
+                },
             ),
             "history": history_data(report),
             "statements": statements_data(archive_dir, conn),
