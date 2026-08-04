@@ -68,7 +68,24 @@ def classify(legs: list[Row]) -> str:
     closing = oc == {"C"}
     suffix = " close" if closing else ""
     if len(legs) == 1:
-        return "Single leg"
+        # Named from the leg itself, like every other shape here -- IBKR
+        # sends no strategy field to read (verified against the raw
+        # statements: origOrderID/origTradeID/relatedTradeID/
+        # volatilityOrderLink are all empty on option trades, and no
+        # combo/strategy vocabulary exists anywhere in a statement).
+        # Direction is the POSITION'S, not the fill's: a BUY that closes
+        # closes a short, so the buyback of a short put reads "Short put
+        # close", never "Long put". A leg without a right (a stock leg in
+        # the equities view) or without an open/close marker keeps the old
+        # generic label rather than guessing a direction.
+        leg = legs[0]
+        right = {"P": "put", "C": "call"}.get(str(leg.get("put_call") or "").upper())
+        side = str(leg.get("buy_sell") or "").upper()
+        oc_leg = str(leg.get("open_close") or "").upper()
+        if right is None or side not in ("BUY", "SELL") or oc_leg not in ("O", "C"):
+            return "Single leg"
+        opened_long = (side == "BUY") == (oc_leg == "O")
+        return f"{'Long' if opened_long else 'Short'} {right}{suffix}"
 
     rights = {str(leg.get("put_call") or "").upper() for leg in legs}
     strikes = {leg.get("strike") for leg in legs}

@@ -78,7 +78,7 @@ def test_same_time_different_underlyings_stay_separate():
 def test_a_group_of_one_is_exactly_its_order():
     o = _order("1", "2026-08-03 11:11:19", [_leg()])
     (g,) = strategy_groups([o])
-    assert g["label"] == "Single leg"
+    assert g["label"] == "Short put"
     assert g["orders"] == [o]
     assert (g["proceeds_base"], g["commission_base"]) == (
         o["proceeds_base"], o["commission_base"],
@@ -153,7 +153,7 @@ def test_open_and_close_events_link_into_one_closed_lifecycle():
     assert len(lifecycles) == 1
     lc = lifecycles[0]
     assert lc["status"] == "closed"
-    assert lc["label"] == "Single leg", "named by the shape it was OPENED as"
+    assert lc["label"] == "Short put", "named by the shape it was OPENED as"
     assert (lc["opened_at"], lc["closed_at"]) == (
         "2026-07-24 10:35:01", "2026-08-03 09:55:23")
     assert lc["realized_pnl_base"] == 684.59, "episode-sourced, not fill-summed"
@@ -199,7 +199,7 @@ def test_a_roll_event_chains_lifecycles_into_one_campaign():
     lc = got[0]
     assert lc["status"] == "open", "the rolled-into leg is still open"
     assert lc["realized_pnl_base"] is None, "campaign not decided yet"
-    assert {e["label"] for e in lc["events"]} == {"Single leg", "Roll"}
+    assert {e["label"] for e in lc["events"]} == {"Short put", "Roll"}
 
 
 def test_grouping_layers_do_not_mutate_the_orders_they_receive():
@@ -225,3 +225,26 @@ def test_grouping_layers_do_not_mutate_the_orders_they_receive():
     )
 
     assert orders == before, "a grouping layer mutated its input"
+
+
+def test_single_legs_are_named_by_right_and_position_direction():
+    """A sold put is a "Short put", not a generic "Single leg" -- and the
+    direction is the POSITION'S: buying back a put CLOSES a short, so the
+    buyback reads "Short put close", never "Long put". A leg the naming
+    cannot be honest about (a stock leg with no right, or a missing
+    open/close marker) keeps the generic label rather than guessing.
+    """
+    cases = [
+        (dict(buy_sell="SELL", open_close="O", put_call="P"), "Short put"),
+        (dict(buy_sell="BUY", open_close="O", put_call="C"), "Long call"),
+        (dict(buy_sell="BUY", open_close="O", put_call="P"), "Long put"),
+        (dict(buy_sell="SELL", open_close="O", put_call="C"), "Short call"),
+        # closes: the fill's side inverts to name the position it closes
+        (dict(buy_sell="BUY", open_close="C", put_call="P"), "Short put close"),
+        (dict(buy_sell="SELL", open_close="C", put_call="C"), "Long call close"),
+        # honest fallbacks
+        (dict(buy_sell="SELL", open_close="O", put_call=None), "Single leg"),
+        (dict(buy_sell="SELL", open_close="", put_call="P"), "Single leg"),
+    ]
+    for kw, expected in cases:
+        assert classify([_leg(**kw)]) == expected, expected
