@@ -1184,3 +1184,22 @@ def test_serves_path_defaults_do_not_poison_other_subcommands():
     # And serve keeps its deliberate None, which is what --demo relies on.
     assert ap.parse_args(["serve"]).archive is None
     assert ap.parse_args(["serve"]).db is None
+
+
+def test_positions_table_shows_the_side_column():
+    """Long/Short straight from IBKR's snapshot `side` field -- explicit,
+    not left to the reader inferring it from a signed quantity."""
+    js = _code_only(_js())
+    assert "<th>side</th>" in js, "side column header missing"
+    assert "pos.side" in js, "side cell not bound to the snapshot field"
+
+
+def test_lifecycle_event_labels_are_contextual_inside_their_card():
+    """Within its own card, an event that merely repeats the card's shape is
+    captioned Opened/Closed; an event carrying new information (a Roll, a
+    different shape) keeps its full name. Presentation only -- g.label is
+    unchanged in the payload, and the calendar drill-down (no card context)
+    still shows the full name."""
+    js = _code_only(_js())
+    assert "g.label===lc.label?'Opened'" in js.replace(" ", "")
+    assert "g.label===lc.label+'close'?'Closed':g.label" in js.replace(" ", "")

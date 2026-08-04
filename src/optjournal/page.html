@@ -1051,9 +1051,19 @@ function trades(){
       </div>
       ${evs.map(g=>{
         const glegs=(g.orders||[]).flatMap(o=>o.legs||[]);
+        /* Inside its own card, an event whose shape merely repeats the
+           card's is noise: a "Short put" lifecycle does not need its events
+           captioned "Short put" and "Short put close" -- those are "Opened"
+           and "Closed" here. An event that carries NEW information (a Roll,
+           a different shape added to a campaign) keeps its full name. Pure
+           presentation: g.label itself is unchanged everywhere else the
+           payload is read (the calendar drill-down has no card context, so
+           it needs the full name). */
+        const evl=g.label===lc.label?'Opened'
+          :g.label===lc.label+' close'?'Closed':g.label;
         return `<div class="grp">
         <div class="gh"><span class="gl">${esc((g.first_fill_at||'').slice(0,10))} — ${
-          esc(g.label)} <span class="dim2 mono">order${(g.order_ids||[]).length>1?'s':''} ${
+          esc(evl)} <span class="dim2 mono">order${(g.order_ids||[]).length>1?'s':''} ${
           esc((g.order_ids||[]).join(', '))}</span></span>
           <span class="mono ${cls(g.proceeds_base)}">${cash(g.proceeds_base)}</span></div>
         ${glegs.map(l=>legRow(l)).join('')}
@@ -1095,6 +1105,7 @@ function positions(){
   });
   const row=pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
     return `<tr><td class="mono">${esc(pos.symbol)}</td>
+    <td class="${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
     <td class="n mono ${cls(pos.position)}">${pos.position}</td>
     <td class="n mono">${money(pos.mark_price,pos.currency)}</td>
     <td class="n mono">${cash(pos.position_value_base)}</td>
@@ -1111,7 +1122,7 @@ function positions(){
     const label=bkt.lc?`${bkt.lc.underlying||''} — ${bkt.lc.label}, opened ${
       String(bkt.lc.opened_at||'').slice(0,10)}`:'Ungrouped — no opening fills in the archive';
     let uv=0; bkt.rows.forEach(pos=>uv+=(pos.position_value_base||0));
-    return `<tr class="grp"><td colspan="7" class="dim">${esc(label)}</td>
+    return `<tr class="grp"><td colspan="8" class="dim">${esc(label)}</td>
       <td class="n mono ${cls(uv)}">${cash(uv)}</td></tr>${bkt.rows.map(row).join('')}`;};
   return `<div class="card">
     <div class="crow"><div><h2>Option book</h2>
@@ -1120,7 +1131,7 @@ function positions(){
       starts. Grouped by the strategy each position was opened as.</div></div>
       <div class="pills"><span class="pill">book value
         <b class="${cls(val)}">${cash(val)}</b></span></div></div>
-    ${ps.length?`<table><thead><tr><th>contract</th><th class="n">qty</th>
+    ${ps.length?`<table><thead><tr><th>contract</th><th>side</th><th class="n">qty</th>
       <th class="n">mark</th><th class="n">value</th><th class="n">cost basis</th>
       <th class="n">unrealised</th><th>price ccy</th><th>record</th></tr></thead><tbody>
       ${buckets.map(grpRow).join('')}</tbody></table>`:'<div class="empty">no open options</div>'}
