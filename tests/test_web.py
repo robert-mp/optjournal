@@ -151,8 +151,8 @@ _NOT_PAYLOAD_BINDINGS = frozenset({
     # the URLSearchParams the state request and the hash are built from
     "qs", "hs",
     # local collections; the reads are array methods, not payload keys
-    "arows", "cells", "days", "jrows", "legs", "mons", "month", "months", "oc",
-    "odtes", "open", "opts", "orders", "out", "ps", "pts", "rows", "yrs",
+    "cells", "days", "jrows", "legs", "mons", "month", "months", "oc",
+    "odtes", "open", "opts", "orders", "out", "ps", "pts", "range", "rows", "yrs",
 })
 
 
@@ -283,14 +283,94 @@ def test_stats_panel_keys_present(state):
         assert key in s, f"stats.{key} missing"
 
 
-def test_net_liq_is_unavailable_not_zero(state):
-    """Flex activity statements carry no NAV, so this must be None.
+def test_net_liq_is_absent_not_zero_without_equity_summaries(tmp_path):
+    """No equity_summaries rows -> None, never 0.
 
-    Reporting 0 would render 'Gain % of Net Liq: 0.0%', which is a wrong
-    answer rather than an absent one.
+    Reporting 0 would render 'Gain % of Net Liq: 0.0%', a wrong answer rather
+    than an absent one. Pinned against an empty database on purpose: the real
+    archive gained EquitySummaryInBase rows on 2026-08-03, so asserting this
+    against ingested statements would pin the archive's contents, not the rule.
     """
+    db = tmp_path / "no-nav.db"
+    conn = connect(db)
+    migrate(conn)
+    conn.close()
+    state = build_state(db_path=db, archive_dir=RAW_DIR, query_id=None)
     assert state["stats"]["net_liq_base"] is None
     assert state["stats"]["gain_pct_of_net_liq"] is None
+
+
+def test_net_liq_populates_once_equity_summaries_exist(state):
+    """The other half of the rule: rows present -> a dated, positive NAV."""
+    if state["stats"]["net_liq_base"] is None:
+        pytest.skip("archive carries no EquitySummaryInBase statement")
+    assert state["stats"]["net_liq_base"] > 0
+    assert state["stats"]["net_liq_date"]
+
+
+def test_month_range_spans_account_life_and_contains_months(state):
+    """`month_range` walks first activity to now; `months` is a subset of it.
+
+    The range is what the calendar chevrons and the dropdown walk. It must be
+    contiguous and newest-first, or prev/next would jump or reverse.
+    """
+    rng, months = state["month_range"], state["months"]
+    assert set(months) <= set(rng)
+    assert rng == sorted(rng, reverse=True)
+    # contiguous: every consecutive pair is exactly one month apart
+    for newer, older in zip(rng, rng[1:], strict=False):
+        y, m = int(newer[:4]), int(newer[5:7])
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+        assert older == f"{y:04d}-{m:02d}", f"gap between {newer} and {older}"
+
+
+def test_a_fill_free_month_is_an_honest_zero_not_all_time(populated):
+    """Selecting an in-range month with no option fills must not silently show
+    the all-time figures -- that was the 'month selector does nothing' bug."""
+    everything = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    empty = [m for m in everything["month_range"] if m not in everything["months"]]
+    if not empty:
+        pytest.skip("every month in range has option fills")
+    chosen = empty[0]
+    st = build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None, month=chosen
+    )
+    assert st["selected_month"] == chosen, "in-range month must be honoured"
+    assert st["stats"]["total_trades"] == 0
+    assert st["stats"]["net_pnl_base"] in (0, 0.0, None)
+
+
+def test_a_month_outside_the_account_life_still_heals_to_all_time(populated):
+    st = build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None, month="1999-01"
+    )
+    assert st["selected_month"] is None
+
+
+def test_fx_quotes_offer_only_option_trade_currencies(populated):
+    """The toggle restates an options journal; SEK/KRW from stock positions are
+    rate-quotable but not information. Codes must be a subset of currencies
+    that appear on OPT trades."""
+    conn = connect(populated)
+    opt_codes = {
+        str(r["currency"]).upper()
+        for r in conn.execute(
+            "SELECT DISTINCT currency FROM trades WHERE asset_category='OPT'"
+        )
+    }
+    snapshot_codes = {
+        str(r["currency"]).upper()
+        for r in conn.execute("SELECT DISTINCT currency FROM position_snapshots")
+    }
+    conn.close()
+    state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    offered = {q["code"] for q in state["fx"]["quotes"]}
+    assert offered <= opt_codes, f"non-option currencies offered: {offered - opt_codes}"
+    if snapshot_codes - opt_codes - {state["fx"]["base"]}:
+        # The restriction is only proven when there was something to exclude.
+        assert offered < snapshot_codes
 
 
 def test_month_filter_narrows_the_payload(populated):
@@ -754,6 +834,28 @@ def test_hash_carries_every_piece_of_view_state():
     for key in ("'tab'", "'type'", "'month'", "'ccy'"):
         assert f"hs.set({key}," in js, f"{key} is not written to the hash"
         assert f"hs.get({key})" in js, f"{key} is not read back from the hash"
+
+
+def test_calendar_chevrons_walk_the_range_through_load():
+    """Prev/next must mutate S.month and go through load(), the same path as
+    the dropdown -- a chevron that only redraws would show a month the server
+    never filtered for, and the two controls could disagree."""
+    js = _js()
+    assert "data-calmonth" in js
+    binding = re.search(
+        r"data-calmonth.*?b\.onclick=\(\)=>\{.*?S\.month=b\.dataset\.calmonth;load\(\);",
+        js, re.S)
+    assert binding, "chevron click must set S.month from the button and call load()"
+
+
+def test_calendar_chevrons_disable_at_the_ends_of_the_range():
+    """At the account's first month and the current month there is nowhere to
+    go; a live button that does nothing reads as broken."""
+    js = _js()
+    assert re.search(r"data-calmonth=\"\$\{prev\|\|''\}\"\s*\$\{prev\?'':'disabled'\}", js)
+    assert re.search(r"data-calmonth=\"\$\{next\|\|''\}\"\s*\$\{next\?'':'disabled'\}", js)
+    # Walks month_range (the browsable range), not the fills-only months list.
+    assert re.search(r"const range=S\.state\.month_range\|\|S\.state\.months", js)
 
 
 def test_hash_is_applied_before_the_first_load():

@@ -50,6 +50,11 @@ html,body{margin:0;background:var(--bg);color:var(--fg);
   font-size:12px;font-weight:600;letter-spacing:.04em;padding:6px 11px;cursor:pointer}
 .ccytog button.on{background:linear-gradient(180deg,#c98a5c,#a86c42);color:#1a1206}
 .ccytog button:disabled{opacity:.4;cursor:not-allowed}
+.calnav{display:inline-flex;gap:4px;margin-left:10px;vertical-align:2px}
+.calnav button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+  border-radius:7px;font:inherit;font-size:14px;line-height:1;padding:3px 9px;cursor:pointer}
+.calnav button:hover:not(:disabled){color:var(--fg)}
+.calnav button:disabled{opacity:.35;cursor:not-allowed}
 /* A restated (non-base) total is not IBKR's own figure, so the toggle says so
    rather than letting the number pass as authoritative. */
 .ccynote{font-size:11px;color:var(--dim2);text-align:right;max-width:210px;
@@ -289,9 +294,15 @@ function ccyNote(){
 
 /* ------------------------------------------------ filter bar */
 function filters(){
-  const st=S.state, months=st.months||[];
+  const st=S.state, months=st.months||[], range=st.month_range||months;
+  /* The dropdown walks the account's whole life (month_range), not just months
+     with fills in scope. With one traded month the old list had one entry, so
+     "selecting different months" was impossible and the control looked broken.
+     Months without fills are offered but say so, and render as honest zeros. */
   const opts=[`<option value="">All time</option>`].concat(
-    months.map(m=>`<option value="${m}"${m===S.month?' selected':''}>${monthLabel(m)}</option>`));
+    range.map(m=>{const has=months.includes(m);
+      return `<option value="${m}"${m===S.month?' selected':''}>${monthLabel(m)}${
+        has?'':' — no fills'}</option>`;}));
   return `<div class="filters">
     <div><div class="flabel">Select Month</div>
       <select id="month">${opts.join('')}</select></div>
@@ -349,20 +360,18 @@ function scopeNote(){
     return `<div class="note"><b>Equities.</b> Dashboard, Calendar and Trades now
       show STK activity — a different asset category, not a subset of the options
       journal. Stock P&amp;L uses IBKR's per-fill realisation: each lot sold is
-      realised when it is sold. Account-level fees are unchanged, and Positions,
-      Costs, Annual and 0DTE stay on options.</div>`;
+      realised when it is sold. Positions, Costs, Annual and 0DTE stay on
+      options.</div>`;
   return `<div class="note"><b>${esc(S.state.trade_type_label)} only.</b> Fills,
     orders, P&amp;L, commission, win rate and the daily series are restricted to this
-    subset, and the month list offers only months it covers. Account-level fees are
-    unchanged — nothing attributes them to a trade. Positions, Costs and the Annual
-    and 0DTE tabs are unaffected.</div>`;
+    subset. Months without fills in it render as zeros rather than disappearing.
+    Positions, Costs and the Annual and 0DTE tabs are unaffected.</div>`;
 }
 function odteFilterNote(){
   const od=S.state.odte;
   return odteSelectable()
     ? `Restrict this view to the ${od.cohort.episodes} round trip(s) opened on `
-      +`their own expiry date. Account-level fees are not filtered — nothing `
-      +`attributes them to a trade.`
+      +`their own expiry date.`
     : 'Nothing in the archive was opened on its own expiry date.';
 }
 
@@ -390,8 +399,9 @@ function dashboard(){
       cls(s.net_pnl_base)+' '+(String(cash(s.net_pnl_base)).length>10?'sm':'')),
     statCard('Commissions', cash(s.commissions_base), 'stated by IBKR',
       'sm '+cls(s.commissions_base)),
-    statCard('Fees', cash(s.fees_base), 'account-level: market data, custody',
-      'sm '+cls(s.fees_base)),
+    /* No account-level Fees card here by request: market-data and custody
+       charges carry no asset category and are not options information. The
+       Costs tab remains the place that itemises them. */
     statCard('Winning Trades', s.wins, 'closed round trips', s.wins?'pos':''),
     statCard('Losing Trades', s.losses, 'closed round trips', s.losses?'neg':''),
     statCard('Win Rate', pct(s.win_rate),
@@ -410,8 +420,9 @@ function dashboard(){
   return `${filters()}
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Statistics</h2>
-      <div class="sub">${esc(s.asset_category)} trades and commission; fees are
-      account-level and carry no asset category. ${esc(ccyNote())} ${opt?`Options
+      <div class="sub">${esc(s.asset_category)} trades and commission only —
+      account-level fees and other instruments live on the Costs tab.
+      ${esc(ccyNote())} ${opt?`Options
       P&L counts fully closed round trips only, on the day they closed — an open
       or partially closed position contributes nothing until it is flat.`:`Stock
       P&L is IBKR's per-fill realisation, net of commission.`}</div></div>
@@ -429,13 +440,6 @@ function dashboard(){
           Commission carries an asset category, so this figure is genuinely
           scoped to this journal."
           >${esc(s.asset_category)} <b>${cash(s.options_friction_base)}</b></span>
-        <span class="pill dim" title="Fees carry no asset category at all — they
-          are market-data and custody charges levied on the account — so they
-          cannot be attributed to ${esc(s.asset_category)}. This is not the whole
-          account: this panel reads the ${esc(s.asset_category)}-filtered database
-          and cannot see commission on other instruments. The Costs tab reads the
-          raw statement and shows the full account figure."
-          >account fees <b>${cash(s.account_friction_base)}</b></span>
       </div></div>
     <div class="stats">${cards}</div>
     ${s.closed_episodes===0?`<div class="note">No round trip has fully closed yet,
@@ -493,7 +497,7 @@ function chart(days){
 /* ------------------------------------------------ calendar */
 function calendar(){
   const s=S.state.stats;
-  const month=s.month!=='ALL'?s.month:(S.state.months||[])[0];
+  const month=s.month!=='ALL'?s.month:(S.state.month_range||S.state.months||[])[0];
   if(!month) return `${filters()}<div class="card"><div class="empty">no months with trades</div></div>`;
   const [Y,M]=month.split('-').map(Number);
   const first=new Date(Y,M-1,1), lead=first.getDay(), len=new Date(Y,M,0).getDate();
@@ -512,9 +516,19 @@ function calendar(){
       <div class="dpl ${dy&&!k?'dim':''}">${dy?(k?cash(dy.realized_base):'—'):'<span class="dim2">—</span>'}</div>
     </div>`);
   }
+  /* Prev/next walk month_range -- the account's life -- not the fills-only
+     list. They mutate S.month through the same load() path as the dropdown, so
+     the two controls cannot disagree. At either end the chevron disables. */
+  const range=S.state.month_range||S.state.months||[];
+  const idx=range.indexOf(month);
+  const prev=idx>=0&&idx<range.length-1?range[idx+1]:null; /* newest-first */
+  const next=idx>0?range[idx-1]:null;
+  const nav=`<span class="calnav">
+    <button data-calmonth="${prev||''}" ${prev?'':'disabled'} title="${prev?monthLabel(prev):'account start'}">‹</button>
+    <button data-calmonth="${next||''}" ${next?'':'disabled'} title="${next?monthLabel(next):'current month'}">›</button></span>`;
   return `${filters()}
   <div class="card">
-    <div class="crow"><div><h2>${esc(monthLabel(month))}</h2>
+    <div class="crow"><div><h2>${esc(monthLabel(month))} ${nav}</h2>
       <div class="sub">Daily realised P&L. An options outcome lands, whole, on the
       day the round trip closed — so a day with only opening or partial-close
       fills shows the activity and a dash, not money.</div></div>
@@ -654,30 +668,19 @@ function costs(){
   if(T.journal_per_unit_base!=null)
     jrows.push(['Per contract',cash(T.journal_per_unit_base,4),'charged per unit, not per euro']);
   else jrows.push(['Journal friction',cash(T.journal_friction_base),'stated only']);
-  const arows=[['Commission, other instruments',T.other_commission_base,'stated'],
-               ['Fees',T.fees_base,'no asset attribution'],
-               ['AutoFX rate markup',T.autofx_spread_base,'estimated @ 3 bps']];
-  if(T.other_taxes_base) arows.splice(1,0,['Taxes, other',T.other_taxes_base,'stated']);
+  /* No account-level block by request: commission on other instruments and
+     account fees are not options information. The FX table below stays — AutoFX
+     markup is a cost of converting to trade at all, not a stock cost. */
   return `<div class="card">
     <div class="crow"><div><h2>Cost &amp; friction</h2>
       <div class="sub">${esc(c.from_date)} → ${esc(c.to_date)} ·
-        ${esc(S.state.costs_source||'')}</div></div>
+        ${esc(S.state.costs_source||'')} · ${esc(scope)}-attributable costs and FX only</div></div>
       <div class="pills"><span class="pill">${esc(scope)} <b>${
-        cash(T.journal_friction_base)}</b></span><span class="pill dim">account <b>${
-        cash(T.friction_base)}</b></span></div>
+        cash(T.journal_friction_base)}</b></span></div>
     </div>
     <h2 style="font-size:15px;margin-top:4px">${esc(scope)} — attributable to this journal</h2>
     <div class="stats" style="grid-template-columns:repeat(${jrows.length},1fr)">
       ${jrows.map(r=>statCard(r[0],r[1],r[2],'sm')).join('')}
-    </div>
-    <h2 style="font-size:15px;margin-top:16px">Account-level — all instruments, context only</h2>
-    <div class="note">These cannot be attributed to ${esc(scope)}: commission on other
-      instruments belongs to those instruments, fees carry no asset category at all,
-      and AutoFX markup is not tied to the trade that caused the conversion.</div>
-    <div class="stats" style="grid-template-columns:repeat(4,1fr)">
-      ${arows.map(r=>statCard(r[0],cash(r[1]),r[2],'sm')).join('')}
-      ${statCard('Account total', cash(T.friction_base),
-        `${cash(T.stated_friction_base)} stated + ${cash(T.autofx_spread_base)} est.`,'sm')}
     </div>
     <div class="card" style="margin-top:16px;background:var(--bg2)">
       <h2 style="font-size:15px">FX conversions</h2>
@@ -956,6 +959,8 @@ function draw(push){
     `<div class="card"><div class="empty">nothing here yet</div></div>`);
   const sel=$('#month');
   if(sel) sel.onchange=()=>{S.month=sel.value||null;load();};
+  document.querySelectorAll('button[data-calmonth]').forEach(b=>
+    b.onclick=()=>{if(b.dataset.calmonth){S.month=b.dataset.calmonth;load();}});
   /* Server-side like the month filter, so the aggregations are recomputed
      rather than the page trying to re-sum a filtered subset of totals. */
   document.querySelectorAll('.seg button[data-type]').forEach(b=>
@@ -987,10 +992,12 @@ async function load(){
   if(!r.ok){note('Could not read state: HTTP '+r.status,'bad');return;}
   S.state=await r.json();
   if(S.month===null && S.state.selected_month) S.month=S.state.selected_month;
-  /* A scope change can empty the selected month, and the server answers with
-     selected_month null rather than inventing one. Drop the stale selection so
-     the dropdown does not show a month the filter has removed. */
-  if(S.month && !S.state.months.includes(S.month)) S.month=S.state.selected_month;
+  /* A month outside the account's lifetime heals away (the server answers with
+     selected_month null rather than inventing one). Months WITH no fills are
+     legitimate now -- validated against month_range, not the fills-only list,
+     or picking one would revert on the very next load. */
+  if(S.month && !((S.state.month_range||S.state.months||[]).includes(S.month)))
+    S.month=S.state.selected_month;
   /* Server-resolved, so an unrecognised type falls back to everything here too
      instead of leaving the button set out of step with the numbers. */
   S.type=S.state.trade_type==='all'?null:S.state.trade_type;
