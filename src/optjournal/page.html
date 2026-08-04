@@ -407,7 +407,16 @@ function dashboard(){
           s.orders?`${s.orders} order(s)`:''),
     statCard('Net P&L', cash(s.net_pnl_base), pnlNote,
       cls(s.net_pnl_base)+' '+(String(cash(s.net_pnl_base)).length>10?'sm':'')),
-    statCard('Commissions', cash(s.commissions_base), 'stated by IBKR',
+    /* Commission rides the same attribution as the P&L it is already inside:
+       for options, the round trip's whole commission lands in its close month.
+       Fill-date commission here showed the same euros twice -- July displayed
+       the opening legs' cost, August's net P&L contained it again. Commission
+       on still-open positions is a sub-note, like open premium: real cash,
+       no outcome yet. */
+    statCard('Commissions', cash(s.commissions_base),
+      opt?`closed round trips${s.open_commission_base?` · ${
+        cash(Math.abs(s.open_commission_base))} on open positions`:''}`
+         :'stated by IBKR',
       'sm '+cls(s.commissions_base)),
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
@@ -446,7 +455,8 @@ function dashboard(){
           lands there, in full, on the day it does."
           >open premium <b class="${cls(s.open_premium_base)}">${
           cash(s.open_premium_base)}</b></span>`:''}
-        <span class="pill" title="Commission on ${esc(s.asset_category)} trades.
+        <span class="pill" title="Commission on ${esc(s.asset_category)} trades${
+          opt?', closed round trips only -- commission on open positions is on the Commissions card':''}.
           Commission carries an asset category, so this figure is genuinely
           scoped to this journal."
           >${esc(s.asset_category)} <b>${cash(s.options_friction_base)}</b></span>

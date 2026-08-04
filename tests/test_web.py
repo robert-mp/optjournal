@@ -388,12 +388,52 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
         sum(e.realized_pnl_base for e in closed_in(open_month))
     ), "the spanning episode's outcome must not leak into the month that opened it"
     assert opened["wins"] + opened["losses"] == opened["closed_episodes"]
+    # Commission rides the same rule: IBKR's episode P&L is already net of
+    # every leg's commission, so fill-date commission showed the same euros
+    # twice -- once in the open month's card, again inside the close month's
+    # net P&L. The open month reports only commission of trades closed in it.
+    assert opened["commissions_base"] == pytest.approx(
+        sum(e.commission_base for e in closed_in(open_month))
+    )
 
     # The close month carries the outcome, spanning episode included.
     assert closed["closed_episodes"] == len(closed_in(close_month)) >= 1
     assert closed["net_pnl_base"] == pytest.approx(
         sum(e.realized_pnl_base for e in closed_in(close_month))
     )
+    # ... and the round trip's WHOLE commission, opening legs included.
+    assert closed["commissions_base"] == pytest.approx(
+        sum(e.commission_base for e in closed_in(close_month))
+    )
+    assert abs(closed["commissions_base"]) > abs(opened["commissions_base"])
+
+
+def test_options_commission_reconciles_and_open_commission_is_separate(populated):
+    """Monthly commissions must sum to the closed-episodes total, with the
+    commission of still-open positions reported separately -- excluded for the
+    same reason open premium is excluded from P&L, visible for the same reason
+    the premium is: real cash, no outcome yet."""
+    conn = connect(populated)
+    try:
+        report = build_history(conn, asset_category="OPT")
+    finally:
+        conn.close()
+    everything = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    monthly_sum = sum(
+        build_state(
+            db_path=populated, archive_dir=RAW_DIR, query_id=None, month=m
+        )["stats"]["commissions_base"]
+        for m in everything["month_range"]
+    )
+    closed_total = sum(e.commission_base for e in report.closed)
+    assert monthly_sum == pytest.approx(closed_total)
+    assert everything["stats"]["commissions_base"] == pytest.approx(closed_total)
+    open_total = sum(e.commission_base for e in report.open)
+    assert everything["stats"]["open_commission_base"] == pytest.approx(open_total)
+    if open_total:  # strictness: real data currently has open META shorts
+        assert everything["stats"]["commissions_base"] != pytest.approx(
+            closed_total + open_total
+        ), "open commission must not be folded into the headline figure"
 
 
 def test_dashboard_headline_counts_closed_round_trips_for_options():

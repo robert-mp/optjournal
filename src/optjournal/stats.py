@@ -130,6 +130,12 @@ class MonthStats:
     total_trades: int = 0          #: fills
     orders: int = 0
     net_pnl_base: float = 0.0      #: realised, already net of commission
+    #: For options, the commission of round trips *closed in the period* --
+    #: the same attribution as the P&L, wins and trade count, because IBKR's
+    #: episode P&L is already net of every leg's commission. Summing by fill
+    #: date (the old rule, still used for other categories) showed the same
+    #: euros twice across months: July displayed the opening legs' commission,
+    #: and August's net P&L contained it again. Signed, like the fill sum was.
     commissions_base: float = 0.0
     fees_base: float = 0.0
 
@@ -147,6 +153,13 @@ class MonthStats:
     #: from Net P&L is visible somewhere honest -- collected premium is a
     #: liability until the position closes, not profit.
     open_premium_base: float = 0.0
+
+    #: Commission already paid on *currently open* episodes. Point-in-time,
+    #: like `open_premium_base`, and excluded from `commissions_base` for the
+    #: same reason the premium is excluded from P&L: it belongs to an outcome
+    #: that has not landed yet. Surfaced so the cash is visible somewhere
+    #: honest rather than vanishing until the close month.
+    open_commission_base: float = 0.0
 
     #: Net Asset Value at the period's end, from the newest equity summary on
     #: or before it. None when the Flex query template does not have the
@@ -659,8 +672,10 @@ def month_stats(
         if not episode_pnl:
             # Per-fill realisation: the rule for share lots, where each lot
             # sold is realised and "fully closed" is not a crisp event.
+            # Commission rides the same basis: on the fill's day, because
+            # that is also where the P&L it nets against is attributed.
             stats.net_pnl_base += row["fifo_pnl_realized_base"] or 0.0
-        stats.commissions_base += row["ib_commission_base"] or 0.0
+            stats.commissions_base += row["ib_commission_base"] or 0.0
     stats.orders = len(orders)
 
     # Fees are account-level CashTransaction rows, never trade-linked -- verified
@@ -696,6 +711,14 @@ def month_stats(
         # P&L IBKR booked on a *partial* close, and any premium collected on
         # the opening sale. Those count on the day the position goes flat.
         stats.net_pnl_base = sum(e.realized_pnl_base for e in closed)
+        # Commission follows the trade, not the fill: the round trip's whole
+        # commission -- opening legs included -- lands in the close period,
+        # because the net P&L above already contains it. A month that merely
+        # opened a position shows no commission, exactly as it shows no trade.
+        stats.commissions_base = sum(e.commission_base for e in closed)
+        stats.open_commission_base = sum(
+            e.commission_base for e in report.open if scope.has_episode(e)
+        )
     stats.open_premium_base = sum(
         e.proceeds_base for e in report.open if scope.has_episode(e)
     )
@@ -729,6 +752,7 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "avg_win_base": stats.avg_win_base,
         "avg_loss_base": stats.avg_loss_base,
         "open_premium_base": stats.open_premium_base,
+        "open_commission_base": stats.open_commission_base,
         "net_liq_base": stats.net_liq_base,
         "net_liq_date": stats.net_liq_date,
         "gain_pct_of_net_liq": stats.gain_pct_of_net_liq,
