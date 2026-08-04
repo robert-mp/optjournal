@@ -392,9 +392,19 @@ function dashboard(){
   const pnlNote=opt?'closed round trips only, net of commission'
                :'realised per fill, net of commission';
   const nl=s.net_liq_base;
+  /* For options, the headline trade count is CLOSED ROUND TRIPS -- the same
+     population every other card on this row measures. Counting fills here
+     made a month claim trades it had no outcome for: open the position in
+     July, close it in August, and July's card said "3 trades" while its P&L,
+     wins and losses all correctly said the outcome was August's. A trade
+     counts in the month it closed, full stop. Fills stay visible in the
+     sub-note as what they are -- activity, not trades. */
   const cards=[
-    statCard('Total Trades', s.total_trades,
-      s.orders?`${s.orders} order(s)`:''),
+    opt
+      ? statCard('Trades', s.closed_episodes,
+          `closed round trips · ${s.total_trades} fill(s), ${s.orders} order(s)`)
+      : statCard('Total Trades', s.total_trades,
+          s.orders?`${s.orders} order(s)`:''),
     statCard('Net P&L', cash(s.net_pnl_base), pnlNote,
       cls(s.net_pnl_base)+' '+(String(cash(s.net_pnl_base)).length>10?'sm':'')),
     statCard('Commissions', cash(s.commissions_base), 'stated by IBKR',

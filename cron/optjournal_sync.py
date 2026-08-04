@@ -36,7 +36,7 @@ Register with (query ID passed via the cron's message field):
         name="optjournal-daily-sync",
         script="~/.meshclaw/crons/optjournal_sync.py:sync",
         message="1591754",
-        cron_expr="0 7 * * 2-6",
+        cron_expr="0 12 * * 2-6",
         timezone="Europe/Dublin",
         timeout=900,
     )
@@ -48,6 +48,21 @@ killer fires first, replacing a clean Report with a raw traceback.
 Tuesday-Saturday is deliberate: an Activity Statement covers the previous
 trading day, so a Monday run would only re-fetch Friday's already-ingested
 data and a Sunday run would find nothing at all.
+
+12:00 Dublin time rather than 07:00, from evidence: 07:00 IST is 02:00 ET,
+before IBKR has generated the previous day's statement -- the 07:00 run
+fetched stale bytes twice (2026-08-03 and -04), missing Monday's fills both
+times. Real statements have been observed generating around 05:00 ET, so
+12:00 IST (07:00 ET) clears that with margin while still landing before the
+US session opens.
+
+After a fetch, any archived statement is committed to the workspace backup
+repo (`git add -f`, because optjournal/.gitignore excludes raw/ and nested
+gitignores override the workspace root's unignore chain). The raw XML is the
+one artifact that cannot be regenerated once IBKR's ~365-day window passes,
+and three statements were silently unversioned before this step existed. A
+routine backup commit stays silent; a backup *failure* Reports, because a
+backup that fails quietly is not a backup.
 """
 
 from __future__ import annotations
@@ -60,6 +75,12 @@ from mesh_claw.cron_script import Report, Skip
 
 PROJECT = Path.home() / ".meshclaw" / "workspace" / "optjournal"
 CLI = PROJECT / ".venv" / "bin" / "optjournal"
+
+#: The workspace repo is the backup home for raw statements; the project repo
+#: deliberately excludes them (they carry the account number and belong in a
+#: backup, not next to source that might grow a remote).
+WORKSPACE = Path.home() / ".meshclaw" / "workspace"
+RAW_DIR = PROJECT / "raw"
 
 #: Mirrors optjournal.cli. Kept explicit so a CLI change that renumbers exit
 #: codes shows up as a wrong branch here rather than as silent misreporting.
@@ -162,6 +183,59 @@ def _describe(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def _git(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(WORKSPACE), *args],
+        capture_output=True, text=True, timeout=60,
+    )
+
+
+def _commit_raw_backup() -> str | None:
+    """Commit any unversioned raw statements to the workspace backup repo.
+
+    Returns a one-line status when a commit was made, None when there was
+    nothing new. Raises RuntimeError when git fails, so the caller can decide
+    how loudly to say so.
+
+    Catch-up semantics, deliberately: every `*.xml` in raw/ is (force-)added
+    on every run, not just today's file, so a run that fetched nothing still
+    sweeps in any statement a previous run archived but failed to commit.
+    Adding an already-tracked, unchanged file is a no-op, which is what makes
+    the unconditional add safe.
+
+    `-f` because optjournal/.gitignore ignores raw/ wholesale and a nested
+    gitignore overrides the workspace root's `!raw/*.xml` unignore chain --
+    that override is exactly how three statements went silently unversioned.
+    Files are enumerated here rather than passed as `raw/`, so `-f` can never
+    drag in non-XML residue like the .fetch-state.json cooldown record.
+
+    The commit pins its pathspec, so anything the user happens to have staged
+    in the workspace repo stays out of this commit.
+    """
+    xmls = sorted(RAW_DIR.glob("*.xml"))
+    if not xmls:
+        return None
+    rel = [str(p.relative_to(WORKSPACE)) for p in xmls]
+
+    add = _git("add", "-f", "--", *rel)
+    if add.returncode != 0:
+        raise RuntimeError(f"git add failed: {(add.stderr or '').strip()[:300]}")
+
+    staged = _git("diff", "--cached", "--quiet", "--", *rel)
+    if staged.returncode == 0:
+        return None  # everything already versioned
+    names = _git("diff", "--cached", "--name-only", "--", *rel).stdout.split()
+
+    commit = _git(
+        "commit",
+        "-m", "chore(optjournal): archive raw statement(s) from daily sync",
+        "--", *rel,
+    )
+    if commit.returncode != 0:
+        raise RuntimeError(f"git commit failed: {(commit.stderr or '').strip()[:300]}")
+    return f"backed up {len(names)} statement(s) to the workspace repo"
+
+
 def sync(ctx) -> None:
     """Fetch yesterday's statement, ingest it, and report only real changes."""
     if not CLI.exists():
@@ -188,8 +262,21 @@ def sync(ctx) -> None:
     if proc.returncode == EXIT_THROTTLED:
         raise Skip()
 
+    # A fetch happened (or at least was attempted and returned), so bytes may
+    # have been archived -- back them up before interpreting the outcome, so
+    # even a sync that errored after archiving leaves the XML versioned.
+    backup_note: str | None = None
+    backup_error: str | None = None
+    try:
+        backup_note = _commit_raw_backup()
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        backup_error = str(exc)
+
     if proc.returncode == EXIT_NO_DATA:
-        # Not a failure: nothing to ingest. Stay silent, same as "nothing new".
+        # Not a failure: nothing to ingest. Stay silent, same as "nothing new"
+        # -- unless the backup broke, which must not fail quietly.
+        if backup_error:
+            raise Report(f"*Raw statement backup failed* — {backup_error}")
         return
 
     if proc.returncode == EXIT_CONFIG:
@@ -210,5 +297,13 @@ def sync(ctx) -> None:
         raise RuntimeError(f"sync produced unparseable JSON: {exc}") from exc
 
     if payload.get("changed"):
-        raise Report(_describe(payload))
-    # Nothing new. Stay silent so the daily cadence does not become noise.
+        text = _describe(payload)
+        if backup_note:
+            text += f"\n{backup_note}"
+        if backup_error:
+            text += f"\n⚠️ raw statement backup failed: {backup_error}"
+        raise Report(text)
+    # Nothing new. A routine backup commit is not worth a notification, but a
+    # backup failure is -- a backup that fails quietly is not a backup.
+    if backup_error:
+        raise Report(f"*Raw statement backup failed* — {backup_error}")

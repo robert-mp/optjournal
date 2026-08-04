@@ -31,6 +31,7 @@ from optjournal.config import (
     DEFAULT_DEMO_DIR,
 )
 from optjournal.db import connect, migrate
+from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal.web import build_state, page_html, serve
 
@@ -347,6 +348,65 @@ def test_a_month_outside_the_account_life_still_heals_to_all_time(populated):
         db_path=populated, archive_dir=RAW_DIR, query_id=None, month="1999-01"
     )
     assert st["selected_month"] is None
+
+
+def test_a_trade_counts_only_in_the_month_it_closed(populated):
+    """A round trip opened in one month and closed in the next belongs -- as a
+    trade, a win/loss and P&L -- to the close month alone. The open month gets
+    fills (activity) but no outcome. Verified against a real spanning episode
+    rather than asserted in the abstract, with an independent recount as the
+    oracle so other episodes in either month cannot mask a leak.
+    """
+    conn = connect(populated)
+    try:
+        report = build_history(conn, asset_category="OPT")
+    finally:
+        conn.close()
+    spanning = [
+        e for e in report.closed
+        if e.opened_at and e.closed_at and e.opened_at[:7] != e.closed_at[:7]
+    ]
+    if not spanning:
+        pytest.skip("archive has no closed round trip spanning two months")
+    ep = spanning[0]
+    open_month, close_month = ep.opened_at[:7], ep.closed_at[:7]
+
+    def closed_in(month: str) -> list:
+        return [e for e in report.closed if (e.closed_at or "")[:7] == month]
+
+    opened = build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None, month=open_month
+    )["stats"]
+    closed = build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None, month=close_month
+    )["stats"]
+
+    # The open month has the fills but only the outcomes that closed IN it.
+    assert opened["total_trades"] > 0, "the opening fills are that month's activity"
+    assert opened["closed_episodes"] == len(closed_in(open_month))
+    assert opened["net_pnl_base"] == pytest.approx(
+        sum(e.realized_pnl_base for e in closed_in(open_month))
+    ), "the spanning episode's outcome must not leak into the month that opened it"
+    assert opened["wins"] + opened["losses"] == opened["closed_episodes"]
+
+    # The close month carries the outcome, spanning episode included.
+    assert closed["closed_episodes"] == len(closed_in(close_month)) >= 1
+    assert closed["net_pnl_base"] == pytest.approx(
+        sum(e.realized_pnl_base for e in closed_in(close_month))
+    )
+
+
+def test_dashboard_headline_counts_closed_round_trips_for_options():
+    """'Total Trades' as a fill count let a month claim trades whose outcome
+    belonged to a later month -- open in July, close in August, and July's card
+    said '3 trades' while its P&L, wins and losses all correctly read zero. For
+    options the headline is closed round trips, the same population every other
+    card on the row measures; fills survive in the sub-note, named as fills."""
+    js = _js()
+    assert "statCard('Trades', s.closed_episodes," in js
+    assert "fill(s), ${s.orders} order(s)" in js, "fills stay visible as activity"
+    # The fill-count headline remains only as the non-options branch.
+    assert js.count("statCard('Total Trades', s.total_trades,") == 1
 
 
 def test_fx_quotes_offer_only_option_trade_currencies(populated):
