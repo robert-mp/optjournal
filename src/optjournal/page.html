@@ -184,6 +184,370 @@ td.n,th.n{text-align:right}
 </div>
 
 <script>
+/* ===================== the payload contract =====================
+   Everything this page reads, declared beside the code that reads it. The
+   suite DERIVES its guards from these blocks (tests/test_web.py) instead of
+   keeping a registry of its own:
+
+     * every typedef below is checked BOTH WAYS against a real /api/state
+       payload -- a required key the API stops sending fails, and a key the
+       API sends but these blocks omit fails, so the contract can neither
+       rot optimistic nor fall behind the server;
+     * every `binding.key` read in this script must be a declared key of
+       the shape that binding is bound to in the tables at the end;
+     * every binding name read with a dot must appear in those tables, and
+       every name in the tables must still exist in the code -- a stale
+       entry fails, so the table cannot outlive the code it describes.
+
+   Types and |null are documentation for the reader (the nullability is
+   real: format a null without guarding and the cell renders junk); key
+   PRESENCE and [optional] brackets are what the suite enforces. A name
+   whose only reads are camelCase methods (x.forEach) is invisible to the
+   read-scanner -- the same blindness the guards have always had -- and
+   needs no declaration.
+
+   Change recipe: a new payload key is one line here plus its serializer;
+   a new binding is one token in the tables below, in the same diff as the
+   code that introduces it. */
+
+/** @typedef {Object} State -- the /api/state payload (web.build_state)
+ * @property {string} version
+ * @property {string} generated_at
+ * @property {string} asset_category -- the journal's home category, OPT
+ * @property {Object} asset_counts -- fills per category; derives offerable Trade Types
+ * @property {string} db
+ * @property {string} archive
+ * @property {Array} months -- months with fills in the current scope
+ * @property {Array} month_range -- every month of the account's life, newest first
+ * @property {string|null} selected_month -- null means the all-time view
+ * @property {string} trade_type
+ * @property {string} trade_type_label
+ * @property {Stats} stats -- the selected period
+ * @property {Stats} all_time
+ * @property {Array} positions -- Position rows, newest snapshot
+ * @property {Array} orders -- Order rows in scope
+ * @property {Array} strategies -- StrategyGroup rows: same orders, grouped
+ * @property {Array} lifecycles -- Lifecycle rows: strategies linked by episode
+ * @property {History} history
+ * @property {Array} statements -- Statement rows, the archive inventory
+ * @property {Array} annual -- Stats per year, ignores both filters
+ * @property {Array} monthly -- Stats per month, ignores both filters
+ * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
+ * @property {OdteBlock} odte
+ * @property {FxBlock} fx
+ * @property {Array} costs -- Costs per statement section, may be empty
+ * @property {string} [costs_source] -- only when an archive statement was readable
+ * @property {string} [costs_error] -- only when reading it failed
+ * @property {Sync} sync
+ */
+
+/** @typedef {Object} Stats -- one period's numbers (stats.month_stats via stats_data)
+ * @property {string} month -- "ALL" or "YYYY-MM" or "YYYY"
+ * @property {string} base_currency
+ * @property {string} asset_category
+ * @property {number} total_trades -- FILLS: how many executions, not outcomes
+ * @property {number} orders
+ * @property {number} net_pnl_base -- options: closed round trips only, net of commission
+ * @property {number} commissions_base -- options: commission of round trips CLOSED here
+ * @property {number} fees_base
+ * @property {number} closed_episodes -- the headline trade count for options
+ * @property {number} open_episodes
+ * @property {number} wins
+ * @property {number} losses
+ * @property {number|null} win_rate -- null until anything closed
+ * @property {number|null} avg_win_base -- null without wins
+ * @property {number|null} avg_loss_base -- null without losses
+ * @property {number} open_premium_base -- excluded from P&L until positions close
+ * @property {number} open_commission_base -- excluded the same way
+ * @property {number|null} net_liq_base -- null until equity summaries exist
+ * @property {string|null} net_liq_date
+ * @property {number|null} gain_pct_of_net_liq
+ * @property {number} options_friction_base
+ * @property {number} account_friction_base
+ * @property {number} total_friction_base
+ * @property {number} green_days
+ * @property {number} red_days
+ * @property {Array} days -- Day rows for the calendar
+ */
+
+/** @typedef {Object} Day -- one calendar cell (stats.DayPnl)
+ * @property {string} day
+ * @property {number} trades
+ * @property {number} realized_base
+ */
+
+/** @typedef {Object} Position -- one open-position snapshot row (serialize.positions_data)
+ * @property {string} report_date
+ * @property {string} conid
+ * @property {string} account_id
+ * @property {string} symbol
+ * @property {string} asset_category
+ * @property {string|null} underlying_symbol -- null on stock rows
+ * @property {string|null} put_call
+ * @property {number|null} strike
+ * @property {string|null} expiry
+ * @property {number} multiplier
+ * @property {number} position
+ * @property {number} mark_price
+ * @property {number} position_value
+ * @property {number} position_value_base
+ * @property {number} cost_basis_money
+ * @property {number} cost_basis_price
+ * @property {number} fifo_pnl_unrealized
+ * @property {string} side
+ * @property {string|null} open_date_time
+ * @property {string} currency
+ * @property {number} fx_rate_to_base
+ * @property {string} raw
+ * @property {string} source_file
+ * @property {string} ingested_at
+ */
+
+/** @typedef {Object} Order -- one IBKR order with its fills folded (serialize.orders_data)
+ * @property {string} ib_order_id
+ * @property {string} account_id
+ * @property {string} asset_category
+ * @property {number} leg_count
+ * @property {number} fills
+ * @property {string} first_fill_at
+ * @property {string} last_fill_at
+ * @property {string} underlyings
+ * @property {string} expiries
+ * @property {number} proceeds
+ * @property {number} proceeds_base
+ * @property {number} commission
+ * @property {number} commission_base
+ * @property {number} realized_pnl
+ * @property {number} realized_pnl_base
+ * @property {Array} legs -- Leg rows
+ */
+
+/** @typedef {Object} Leg -- one contract's fills within an order
+ * @property {string} ib_order_id
+ * @property {string} conid
+ * @property {string} account_id
+ * @property {string} asset_category
+ * @property {string} symbol
+ * @property {string|null} underlying_symbol -- null on stock legs
+ * @property {string|null} put_call
+ * @property {number|null} strike
+ * @property {string|null} expiry
+ * @property {number} multiplier
+ * @property {string} buy_sell
+ * @property {string} open_close
+ * @property {string} currency
+ * @property {number} fills
+ * @property {string} first_fill_at
+ * @property {string} last_fill_at
+ * @property {number} quantity
+ * @property {number} avg_price -- always in the contract's own currency
+ * @property {number} proceeds
+ * @property {number} proceeds_base
+ * @property {number} commission
+ * @property {number} commission_base
+ * @property {number} realized_pnl
+ * @property {number} realized_pnl_base
+ */
+
+/** @typedef {Object} Episode -- one FIFO round trip per conid (serialize.history_data)
+ * @property {string} symbol
+ * @property {string} conid
+ * @property {string|null} underlying_symbol
+ * @property {string|null} put_call
+ * @property {number|null} strike
+ * @property {string|null} expiry
+ * @property {string} status
+ * @property {boolean} entry_outside_window
+ * @property {boolean} snapshot_only
+ * @property {number|null} cost_basis
+ * @property {number|null} unrealized
+ * @property {string|null} opened_at
+ * @property {string|null} closed_at -- null while open
+ * @property {number|null} holding_days
+ * @property {boolean} is_odte
+ * @property {number} contracts
+ * @property {number} open_fills
+ * @property {number} close_fills
+ * @property {number} net_qty
+ * @property {number} realized_pnl
+ * @property {number} realized_pnl_base -- already net of every leg's commission
+ * @property {boolean} realized_is_net_of_commission
+ * @property {number} commission
+ * @property {number} commission_base
+ * @property {string} currency
+ * @property {Array} notes
+ */
+
+/** @typedef {Object} History -- the episode report (serialize.history_data)
+ * @property {string} asset_category
+ * @property {string} base_currency
+ * @property {string|null} snapshot_date
+ * @property {number} partial_record
+ * @property {Array} closed -- Episode rows
+ * @property {Array} open -- Episode rows
+ * @property {Object} totals
+ */
+
+/** @typedef {Object} Costs -- one statement section's cost report (serialize.costs_data)
+ * @property {string} base_currency
+ * @property {string} from_date
+ * @property {string} to_date
+ * @property {string} fx_caveat
+ * @property {Array} fx -- FxRow per conversion pair
+ * @property {Array} commissions
+ * @property {Array} fees
+ * @property {Array} withholding
+ * @property {string} journal_asset
+ * @property {CostsTotals} totals
+ */
+
+/** @typedef {Object} CostsTotals
+ * @property {number} commission_base
+ * @property {number} fees_base
+ * @property {number} taxes_base
+ * @property {number} autofx_notional_base
+ * @property {number} autofx_spread_base
+ * @property {number} stated_friction_base
+ * @property {number} friction_base
+ * @property {number} fx_notional_base
+ * @property {number} fx_commission_base
+ * @property {number} journal_commission_base
+ * @property {number} journal_taxes_base
+ * @property {number} journal_friction_base
+ * @property {number} journal_per_unit_base
+ * @property {number} other_commission_base
+ * @property {number} other_taxes_base
+ * @property {number} account_friction_base
+ * @property {number} credit_fills
+ */
+
+/** @typedef {Object} FxRow -- one currency pair's conversion costs
+ * @property {string} symbol
+ * @property {number} conversions
+ * @property {number} notional_base
+ * @property {number} commission_base
+ * @property {number} commission_bps
+ * @property {number} autofx_conversions
+ * @property {number} autofx_notional_base
+ * @property {number} autofx_spread_base
+ */
+
+/** @typedef {Object} Statement -- one archived statement (serialize.statements_data)
+ * @property {string} file
+ * @property {number} bytes
+ * @property {boolean} ingested
+ * @property {string|null} from_date
+ * @property {string|null} to_date
+ * @property {string|null} asset_filter
+ */
+
+/** @typedef {Object} FxBlock -- presentation rates (stats.fx_quotes)
+ * @property {string} base
+ * @property {Array} quotes -- FxQuote rows; empty hides the currency toggle
+ */
+
+/** @typedef {Object} FxQuote
+ * @property {string} code
+ * @property {number} per_base
+ * @property {string} as_of
+ * @property {string} source
+ */
+
+/** @typedef {Object} OdteBlock -- 0DTE cohort comparison (stats.odte_cohorts)
+ * @property {Cohort} cohort
+ * @property {Cohort} rest
+ * @property {number} unknown_dte
+ * @property {boolean} selectable -- whether the 0DTE filter is offerable at all
+ */
+
+/** @typedef {Object} Cohort
+ * @property {string} label
+ * @property {number} episodes
+ * @property {number} wins
+ * @property {number} losses
+ * @property {number|null} win_rate
+ * @property {number} net_pnl_base
+ * @property {number|null} avg_pnl_base
+ * @property {number} commission_base
+ * @property {number} contracts
+ */
+
+/** @typedef {Object} StrategyGroup -- orders placed as one strategy (strategies.strategy_groups)
+ * @property {string} underlying
+ * @property {string} label -- derived from the combined legs, never assumed
+ * @property {Array} order_ids
+ * @property {string} first_fill_at
+ * @property {number} fills
+ * @property {number} proceeds_base
+ * @property {number} commission_base
+ * @property {number} realized_pnl_base
+ * @property {Array} orders -- the member Order rows, fully visible
+ */
+
+/** @typedef {Object} Lifecycle -- strategy events linked by episode (strategies.position_groups)
+ * @property {string} underlying
+ * @property {string} label -- the shape the position was OPENED as
+ * @property {string} status
+ * @property {string|null} opened_at
+ * @property {string|null} closed_at
+ * @property {Array} conids
+ * @property {number} episodes
+ * @property {number} fills
+ * @property {number} proceeds_base
+ * @property {number|null} realized_pnl_base -- null until the lifecycle is closed
+ * @property {number|null} commission_base -- same rule
+ * @property {Array} events -- StrategyGroup rows
+ */
+
+/** @typedef {Object} Sync -- fetch machinery state (web.build_state)
+ * @property {string|null} query_id
+ * @property {boolean} configured
+ * @property {string|null} last_fetch
+ * @property {number} cooldown_s
+ * @property {number} cooldown_remaining_s
+ */
+
+/** @typedef {Object} SyncResponse -- the /api/sync reply (web._do_sync); no
+ *  /api/state sample exists (building one spends an IBKR request), so its
+ *  keys are pinned against _do_sync's source instead
+ * @property {boolean} ok
+ * @property {string} kind
+ * @property {string} [message]
+ * @property {number} [retry_after_s]
+ * @property {string} [archive]
+ * @property {boolean} [reused_archive]
+ * @property {boolean} [already_ingested]
+ * @property {string} [duplicate_of]
+ * @property {number} [new_trades]
+ * @property {number} [new_cash]
+ * @property {Array} [warnings]
+ */
+
+/** @typedef {Object} ChartPoint -- page-side: built from Stats.days for the sparkline
+ * @property {number} x
+ * @property {number} y
+ * @property {number} n
+ */
+
+/** @typedef {Object} Bucket -- page-side: a Lifecycle paired with its Position rows
+ * @property {Lifecycle|null} lc -- null for the Ungrouped bucket
+ * @property {Array} rows
+ */
+
+/** Which binding holds which shape, and which names are page machinery.
+ *  One name per shape, deliberately: reusing one name for two shapes blinds
+ *  the guard to both. Declared here, in the file being edited, in the same
+ *  diff as the code that introduces the name.
+ * @payload st:State s:Stats best:Stats x:Episode ep:Episode dy:Day
+ * @payload pos:Position o:Order l:Leg h:History c:Costs T:CostsTotals
+ * @payload f:FxRow stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
+ * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle
+ * @payload res:SyncResponse pt:ChartPoint bkt:Bucket
+ * @local Math S TABS b sel m r el location window qs hs
+ * @local cells days buckets evs glegs jrows lcs legs mons month months
+ * @local oc odtes open opts out ps pts range rows yrs
+ */
+
 const $=s=>document.querySelector(s);
 const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
   /* Selected calendar day for the drill-down. View-local: deliberately NOT in
@@ -601,16 +965,8 @@ function dayDetail(by){
   return `<div class="grp" style="margin-top:14px">
     <div class="gh"><span class="gl">${esc(key)} — ${rows.length} fill(s)</span>
       <button class="linkish" data-calday-clear="1">clear</button></div>
-    ${rows.map(({g,o,l})=>`<div class="leg">
-      <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
-      <span class="mono">${esc(l.underlying_symbol||'')}
-        <b>${l.strike!=null?num(l.strike,0):''}${esc(l.put_call||'')}</b>
-        <span class="dim">${esc(l.expiry||'')}</span></span>
-      <span class="dim" style="font-size:11px">${esc(g.label)}</span>
-      <span class="mono dim">×${Math.abs(l.quantity)}</span>
-      <span class="mono">${money(l.avg_price,l.currency)}</span>
-      <span class="mono ${cls(l.proceeds_base)}">${cash(l.proceeds_base)}</span>
-    </div>`).join('')}
+    ${rows.map(({g,l})=>legRow(l,
+      `<span class="dim" style="font-size:11px">${esc(g.label)}</span>`)).join('')}
   </div>`;
 }
 
@@ -622,6 +978,25 @@ function actLabel(l){
   if(bs==='SELL') return oc==='O'?'STO':'STC';
   if(bs==='BUY')  return oc==='O'?'BTO':'BTC';
   return oc||'—';
+}
+function legRow(l,extra=''){
+  /* One fill line, shared by the Trades cards and the calendar drill-down --
+     the same leg must read identically wherever it appears, and this line
+     had already been copied once. `extra` is the one real divergence: the
+     drill-down wedges the strategy label between contract and quantity,
+     because there the leg appears outside its strategy card; the Trades
+     card, already under its strategy header, passes nothing. */
+  return `<div class="leg">
+    <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
+    <span class="mono">${esc(l.underlying_symbol||'')}
+      <b>${l.strike!=null?num(l.strike,0):''}${esc(l.put_call||'')}</b>
+      <span class="dim">${esc(l.expiry||'')}</span></span>
+    ${extra}
+    <span class="mono dim">×${Math.abs(l.quantity)}</span>
+    <span class="mono" title="fill price, always in the contract's own currency"
+      >${money(l.avg_price,l.currency)}</span>
+    <span class="mono ${cls(l.proceeds_base)}">${cash(l.proceeds_base)}</span>
+  </div>`;
 }
 function groupLabel(legs){
   /* Derived from the legs, not assumed. This read 'SPREAD' for anything
@@ -681,16 +1056,7 @@ function trades(){
           esc(g.label)} <span class="dim2 mono">order${(g.order_ids||[]).length>1?'s':''} ${
           esc((g.order_ids||[]).join(', '))}</span></span>
           <span class="mono ${cls(g.proceeds_base)}">${cash(g.proceeds_base)}</span></div>
-        ${glegs.map(l=>`<div class="leg">
-          <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
-          <span class="mono">${esc(l.underlying_symbol||'')}
-            <b>${l.strike!=null?num(l.strike,0):''}${esc(l.put_call||'')}</b>
-            <span class="dim">${esc(l.expiry||'')}</span></span>
-          <span class="mono dim">×${Math.abs(l.quantity)}</span>
-          <span class="mono" title="fill price, always in the contract's own currency"
-            >${money(l.avg_price,l.currency)}</span>
-          <span class="mono ${cls(l.proceeds_base)}">${cash(l.proceeds_base)}</span>
-        </div>`).join('')}
+        ${glegs.map(l=>legRow(l)).join('')}
       </div>`;}).join('')}
       ${legs.length>1?'':`<div class="note">One leg, so this is a single-leg
         position rather than a strategy. Legs placed together on one underlying

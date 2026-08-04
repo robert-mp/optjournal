@@ -86,18 +86,29 @@ Three invariants worth knowing before changing the UI:
   `Gain % of Net Liq` divides that P&L by the NAV from the statement's
   Equity Summary section (enable it on the Flex query template; the demo
   carries synthetic NAV rows).
-* **The payload is guarded in both directions.** `tests/test_web.py`
-  asserts every key the page reads is sent, and every payload binding the
-  page uses is registered. A typo'd key fails a test instead of rendering
-  a blank cell.
+* **The payload contract lives in the page, and the suite derives its
+  guards from it.** `page.html` opens with `@typedef` blocks declaring
+  every shape the page reads and a `@payload`/`@local` table saying which
+  binding holds which shape. `tests/test_web.py` parses those blocks and
+  enforces the chain in every direction: reads must resolve against the
+  typedefs, the typedefs must match a real payload both ways (a required
+  key the API stops sending fails, and a key it sends undeclared fails),
+  and the binding table may be neither incomplete nor stale. A typo'd key
+  fails a test instead of rendering a blank cell.
 
 ## Adding functionality
 
 **A new UI tab**: serializer in `serialize.py` → emit it in
-`web.build_state` → view function in `page.html` + entry in `TABS` +
-register in the `views` dispatch → register its payload binding in
-`tests/test_web.py::_roots` → tests asserting its figures reconcile with
-an existing independent number (see the Annual total-row tests).
+`web.build_state` → declare its shape in `page.html`'s `@typedef` blocks
+and its binding in the `@payload` table (same file, same diff) → add the
+shape's extractor to `tests/test_web.py::_shape_samples` → view function
+in `page.html` + entry in `TABS` + register in the `views` dispatch →
+tests asserting its figures reconcile with an existing independent number
+(see the Annual total-row tests).
+
+**A new payload key on an existing shape**: emit it in the serializer and
+add one `@property` line to the shape's typedef — the drift test holds the
+two together from both sides.
 
 **A new trade-type filter**: build a `TradeScope` (fill membership, not a
 predicate — see `odte_scope` for why) and register it in

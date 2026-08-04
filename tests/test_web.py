@@ -139,148 +139,249 @@ def test_state_has_every_panel(state):
 #: so `S.state.positions` yields only `S.state`.
 _PROPERTY_READ = re.compile(r"(?<![\w.$])([A-Za-z_$][\w$]*)\.([a-z_][a-z0-9_]*)\b")
 
-#: Bindings that carry a dot but hold no API payload: page globals, DOM nodes,
-#: fetch responses, and local collections whose reads are array methods.
-#: Explicit by design -- see test_every_binding_is_classified.
-_NOT_PAYLOAD_BINDINGS = frozenset({
-    # page globals and builtins
-    "Math", "S", "TABS",
-    # DOM nodes and the fetch response
-    "b", "sel", "m", "r", "el",
-    # browser globals the view-state-in-the-hash code reads
-    "location", "window",
-    # the URLSearchParams the state request and the hash are built from
-    "qs", "hs",
-    # local collections; the reads are array methods, not payload keys
-    "cells", "days", "buckets", "evs", "glegs", "groups", "jrows", "lcs",
-    "legs", "mons", "month", "months", "morders", "oc", "odtes", "olegs",
-    "open", "opts", "orders", "out", "ps", "pts", "range", "rows", "yrs",
-})
+# ------------------------------------------------------------ the contract
+#
+# The payload contract lives IN THE PAGE: @typedef blocks and a bindings
+# table at the top of its script declare every shape the page reads and
+# which binding holds which shape. This section PARSES that contract and
+# enforces it, so the suite owns no registry of its own. It used to: an
+# ~80-entry hand-maintained map here taxed every new template variable with
+# a classification edit 500 lines from the code that introduced it -- paid
+# four times in one afternoon -- and still drifted (three entries survived
+# the render functions that used them). Now declaring a binding is one
+# token in page.html, in the same diff as the code, and both a MISSING and
+# a STALE declaration are red tests.
+#
+# The enforcement chain: reads resolve against the typedefs (guard one),
+# the typedefs are held to a real payload in both directions (drift test),
+# and every binding must be classified with none stale (guard two). The
+# contract lives in comments and the reads live in code, which is exactly
+# the line _code_only already draws -- the two scanners cannot confuse one
+# another's territory.
+
+_TYPEDEF = re.compile(r"/\*\*\s*@typedef\s+\{Object\}\s+(\w+)(.*?)\*/", re.S)
+_TYPEDEF_PROP = re.compile(r"@property\s+\{([^}]+)\}\s+(\[)?([a-z_][a-z0-9_]*)")
+_BINDING_ROW = re.compile(r"@(payload|local)\s+([^\n]+)")
 
 
-def _roots(state: dict) -> dict[str, dict]:
-    """Every JS binding that holds an API payload object, mapped to that object.
+def _parse_contract(js: str) -> tuple[dict[str, dict[str, bool]], dict[str, str], set[str]]:
+    """(shapes, bindings, locals) parsed from RAW script text.
 
-    One name per shape, deliberately: `pos` for a position, `ep` for an episode,
-    `dy` for a calendar day, `pt` for a chart point, `stm` for a statement.
-    Reusing `d` for three different shapes once made this unbindable.
+    shapes:   {shape name: {key: is_optional}} -- `[key]` brackets mark keys
+              the API sends only sometimes (costs_source, the sync reply's
+              branch-dependent fields); required keys must always be sent.
+    bindings: {binding name: shape name} from the @payload rows.
+    locals:   names declared page machinery (DOM nodes, builtins, local
+              collections) from the @local rows.
 
-    Shared by both guards below. Registering a binding here is what brings it
-    inside their reach, so this is the single place a new binding is declared.
+    Deliberately parses the raw script, not _code_only's output: the
+    contract lives in comments, which is exactly what _code_only strips.
     """
-    costs = state["costs"][0]
-    history = state["history"]
-    episodes = history["open"] or history["closed"]
+    shapes: dict[str, dict[str, bool]] = {}
+    for block in _TYPEDEF.finditer(js):
+        name, body = block.group(1), block.group(2)
+        shapes[name] = {
+            prop.group(3): prop.group(2) == "["
+            for prop in _TYPEDEF_PROP.finditer(body)
+        }
+    bindings: dict[str, str] = {}
+    locals_: set[str] = set()
+    for row in _BINDING_ROW.finditer(js):
+        kind, tokens = row.group(1), row.group(2).split()
+        if kind == "local":
+            locals_.update(tokens)
+        else:
+            for token in tokens:
+                var, _, shape = token.partition(":")
+                bindings[var] = shape
+    return shapes, bindings, locals_
+
+
+def test_contract_parser_is_correct():
+    """The parser is new load-bearing code, so it is tested directly rather
+    than trusted -- the same policy _code_only gets. A parser that silently
+    dropped keys would not make the guards pass vacuously (the both-ways
+    drift test would report the dropped keys as undeclared), but it would
+    make the failure message point at the wrong culprit."""
+    doc = (
+        "/** @typedef {Object} Thing -- header prose is ignored\n"
+        " * @property {string} name\n"
+        " * @property {number|null} maybe -- nullability is prose, presence is law\n"
+        " * @property {string} [rare] -- optional: not always sent\n"
+        " */\n"
+        "/** the tables\n"
+        " * @payload t:Thing u:Thing\n"
+        " * @local foo bar\n"
+        " * @local baz\n"
+        " */\n"
+    )
+    shapes, bindings, locals_ = _parse_contract(doc)
+    assert shapes == {"Thing": {"name": False, "maybe": False, "rare": True}}
+    assert bindings == {"t": "Thing", "u": "Thing"}
+    assert locals_ == {"foo", "bar", "baz"}
+
+
+#: Shapes with no /api/state sample to check against: two page-side
+#: constructs (chart points and Positions-tab buckets are built by the page,
+#: not sent by the API) and the /api/sync reply (building a real one spends
+#: an IBKR request; it is pinned against _do_sync's source instead, in
+#: test_sync_response_shape_matches_what_the_page_reads).
+_UNSAMPLED = frozenset({"ChartPoint", "Bucket", "SyncResponse"})
+
+
+def _shape_samples(state: dict) -> dict[str, dict]:
+    """One real instance of every sampled shape, from the live payload.
+
+    Keyed per SHAPE, not per binding: this map changes when a new payload
+    panel is born (rare), where the old registry changed on every new
+    template variable (constant). It is the fixture-side anchor of the
+    contract -- the thing that stops the typedefs agreeing with themselves.
+    """
+
+    def first(rows):
+        return rows[0] if rows else None
+
+    costs = first(state["costs"])
     orders = state["orders"]
-
-    roots: dict[str, dict] = {
-        "st": state,
-        "s": state["stats"],
-        "c": costs,
-        "T": costs["totals"],
-        "h": history,
-        # The /api/sync response, which has no fixture -- keys asserted by
-        # test_sync_response_shape below.
-        "res": {
-            "kind": None, "ok": None, "message": None, "new_trades": None,
-            "new_cash": None, "reused_archive": None, "warnings": None,
-        },
-        # Chart points are constructed client-side from stats.days, so their
-        # shape is the page's own contract rather than the API's.
-        "pt": {"x": None, "y": None, "n": None},
-        "od": state["odte"],
-        "co": state["odte"]["cohort"],
-        # An annual row is the same stats shape as `s`, so the Annual view maps
-        # over them as `s` and this only registers the running best-year
-        # binding. Two names for one shape is fine -- `ep` and `x` already are;
-        # what breaks the guard is one name for two shapes.
-        "best": state["annual"][0],
+    history = state["history"]
+    samples = {
+        "State": state,
+        "Stats": state["stats"],
+        "Day": first(state["stats"]["days"]),
+        "Position": first(state["positions"]),
+        "Order": first(orders),
+        "Leg": first(orders[0]["legs"]) if orders else None,
+        "Episode": first(history["closed"] + history["open"]),
+        "History": history,
+        "Costs": costs,
+        "CostsTotals": costs["totals"] if costs else None,
+        "FxRow": first(costs["fx"]) if costs else None,
+        "Statement": first(state["statements"]),
+        "FxBlock": state["fx"],
+        "FxQuote": first(state["fx"]["quotes"]),
+        "OdteBlock": state["odte"],
+        "Cohort": state["odte"]["cohort"],
+        "StrategyGroup": first(state["strategies"]),
+        "Lifecycle": first(state["lifecycles"]),
+        "Sync": state["sync"],
     }
-    # A strategy group and its member order: `g` is the group payload; the
-    # member order is rendered as `o`, the same shape the flat orders list
-    # uses, so it stays registered under `o` below.
-    if state["strategies"]:
-        roots["g"] = state["strategies"][0]
-    # A position lifecycle; its `events` are strategy-group shaped and render
-    # as `g`. The Positions tab's bucket is a page-side construct pairing a
-    # lifecycle with its snapshot rows, like `pt` is for chart points.
-    if state["lifecycles"]:
-        roots["lc"] = state["lifecycles"][0]
-    roots["bkt"] = {"lc": None, "rows": None}
-    if state["stats"]["days"]:
-        roots["dy"] = state["stats"]["days"][0]
-    if state["positions"]:
-        roots["pos"] = state["positions"][0]
-    if orders:
-        roots["o"] = orders[0]
-        if orders[0].get("legs"):
-            roots["l"] = orders[0]["legs"][0]
-    if episodes:
-        roots["ep"] = episodes[0]
-        # `x` is the find-predicate binding over the same episode shape. It went
-        # unregistered until guard two started demanding every binding be
-        # classified, which means `x.conid` was never actually checked.
-        roots["x"] = episodes[0]
-    if costs["fx"]:
-        roots["f"] = costs["fx"][0]
-    if state["statements"]:
-        roots["stm"] = state["statements"][0]
-    fx = state.get("fx") or {}
-    roots["fx"] = fx
-    if fx.get("quotes"):
-        roots["q"] = fx["quotes"][0]
-        roots["qo"] = fx["quotes"][0]
-    return roots
+    missing = sorted(k for k, v in samples.items() if v is None)
+    assert not missing, (
+        f"the fixture no longer produces a sample for {missing} -- the drift "
+        "test would silently stop covering those shapes, so this fails instead"
+    )
+    return samples
 
 
-def test_every_js_property_read_resolves(state):
-    """Guard one: a read on a registered binding must resolve against the payload.
+def test_contract_is_coherent(state):
+    """Meta-guard: a typo anywhere in the contract machinery is itself red.
 
-    Catches a wrong KEY on a known binding -- `o.symbol` when the field is
-    really `underlyings`. Blind to a binding it does not know about, which is
-    what guard two exists for.
+    Every binding must name a declared shape, no name may be both payload
+    and local, the sample map may only name declared shapes, and every
+    declared shape must either have a sample or an explicit exemption --
+    so a new payload shape cannot silently skip the drift test.
     """
-    roots = _roots(state)
+    shapes, bindings, locals_ = _parse_contract(_js())
+    assert shapes and bindings and locals_, "the page lost its contract blocks"
+
+    unknown = sorted(f"{v}:{s}" for v, s in bindings.items() if s not in shapes)
+    assert not unknown, f"bindings bound to undeclared shapes: {unknown}"
+
+    both = sorted(set(bindings) & locals_)
+    assert not both, f"declared both @payload and @local: {both}"
+
+    samples = _shape_samples(state)
+    assert set(samples) <= set(shapes), (
+        f"sample map names undeclared shapes: {sorted(set(samples) - set(shapes))}"
+    )
+    unanchored = sorted(set(shapes) - set(samples) - _UNSAMPLED)
+    assert not unanchored, (
+        f"shapes with neither a payload sample nor an exemption: {unanchored} "
+        "-- add an extractor to _shape_samples or, for a page-side shape, "
+        "an entry in _UNSAMPLED"
+    )
+    assert not _UNSAMPLED & set(samples), "an exempted shape has a sample after all"
+
+
+def test_contract_matches_the_payload_both_ways(state):
+    """The typedefs in page.html are held to a real payload in BOTH
+    directions: a required key the API stopped sending fails (the contract
+    cannot rot optimistic), and a key the API sends that the contract omits
+    fails (the server cannot outrun its documentation). Optional keys --
+    `[bracketed]` in the typedef -- are exempt from the first direction
+    only."""
+    shapes, _, _ = _parse_contract(_js())
+    problems = []
+    for name, sample in _shape_samples(state).items():
+        declared = shapes[name]
+        sent = set(sample)
+        required = {key for key, optional in declared.items() if not optional}
+        problems += [
+            f"{name}.{key}: declared required, not sent -- fix the typedef "
+            "or the serializer" for key in sorted(required - sent)
+        ]
+        problems += [
+            f"{name}.{key}: sent but undeclared -- add one @property line "
+            "to page.html" for key in sorted(sent - set(declared))
+        ]
+    assert not problems, "\n".join(problems)
+
+
+def test_every_js_property_read_resolves():
+    """Guard one: a read on a payload binding must be a key its declared
+    shape carries. Catches a wrong KEY on a known binding -- `o.symbol` when
+    the field is really `underlyings`. The typedef consulted here is itself
+    held to the real payload by test_contract_matches_the_payload_both_ways,
+    so the chain read -> typedef -> payload is closed without this test
+    touching a fixture."""
+    shapes, bindings, _ = _parse_contract(_js())
     js = _code_only(_js())
     missing = []
-    for var, obj in roots.items():
+    for var, shape in bindings.items():
+        declared = shapes.get(shape, {})
         for match in re.finditer(rf"(?<![\w.]){re.escape(var)}\.([a-z_][a-z0-9_]*)\b", js):
             attr = match.group(1)
             if attr in _NOT_PAYLOAD:
                 continue
-            if attr not in obj:
-                missing.append(f"{var}.{attr}")
+            if attr not in declared:
+                missing.append(f"{var}.{attr} (shape {shape})")
 
     assert not missing, (
-        "the page reads keys the API does not send, so those cells render "
-        f"blank rather than failing: {sorted(set(missing))}"
+        "the page reads keys its contract does not declare, so those cells "
+        "render blank rather than failing -- either the read is a typo or "
+        f"the typedef in page.html is missing a line: {sorted(set(missing))}"
     )
 
 
-def test_every_binding_is_classified(state):
-    """Guard two: every binding read in the page must be classified somewhere.
+def test_every_binding_is_classified_and_none_is_stale():
+    """Guard two: every binding read in the page must be declared, and every
+    declaration must still be read.
 
-    This is the complement of guard one, and it closes the hole that let a blank
-    Positions panel ship. Guard one only inspects bindings listed in `_roots`,
-    so when a map binding was renamed `p` -> `pos`, the registered key moved and
-    the single straggler `p.fifo_pnl_unrealized` fell outside everything that
-    looks. Reading a property of an undefined variable throws, and a throw
-    inside a template callback renders the whole table blank -- so the failure
-    surfaced as an empty tab, not as a red test.
-
-    A binding must therefore be either a payload object (`_roots`) or explicitly
-    declared not to be (`_NOT_PAYLOAD_BINDINGS`). Introducing a name becomes a
-    deliberate decision instead of a silent omission.
+    The first direction closes the hole that let a blank Positions panel
+    ship: an unregistered binding is invisible to guard one, so a stale
+    rename renders blank instead of failing. The second direction is new,
+    and earned: when the registry lived in this file, three entries
+    (morders, olegs, orders) survived the render functions that used them
+    by two rewrites -- nothing noticed, because nothing checked. A table
+    that cannot outlive its code stays trustworthy.
     """
+    _, bindings, locals_ = _parse_contract(_js())
     used = {m.group(1) for m in _PROPERTY_READ.finditer(_code_only(_js()))}
-    unclassified = used - (set(_roots(state)) | _NOT_PAYLOAD_BINDINGS)
+    declared = set(bindings) | locals_
 
+    unclassified = sorted(used - declared)
     assert not unclassified, (
-        "these bindings are read in the page but classified nowhere, so guard "
-        "one cannot see them and a stale rename or typo in any of them would "
-        f"render blank instead of failing a test: {sorted(unclassified)}. Add "
-        "each to _roots (holds a payload object) or to _NOT_PAYLOAD_BINDINGS "
-        "(DOM node, builtin, or local collection)."
+        f"read in the page but declared nowhere: {unclassified}. Add each to "
+        "the tables at the top of page.html's script -- `name:Shape` on a "
+        "@payload row if it holds API data, or to a @local row if it is a "
+        "DOM node, builtin, or local collection."
+    )
+
+    stale = sorted(declared - used)
+    assert not stale, (
+        f"declared in page.html's tables but no longer read anywhere: {stale}. "
+        "Remove the token -- a stale entry is exactly how the old registry "
+        "rotted."
     )
 
 
