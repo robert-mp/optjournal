@@ -128,6 +128,12 @@ td.n,th.n{text-align:right}
 .day .top{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
 .day .dnum{font-weight:600}
 .day .dct{font-size:10.5px;color:var(--dim)}
+.day.clk{cursor:pointer}
+.day.clk:hover{border-color:#8a6a4e}
+.day.selected{outline:2px solid #c98a5c;outline-offset:-2px}
+.linkish{background:none;border:none;color:var(--dim);cursor:pointer;
+  font:inherit;font-size:11px;text-decoration:underline;padding:0}
+.linkish:hover{color:var(--fg)}
 .day .dpl{font-family:var(--mono);font-weight:600;font-size:13px}
 .day.g .dct,.day.r .dct{color:rgba(255,255,255,.62)}
 
@@ -179,7 +185,12 @@ td.n,th.n{text-align:right}
 
 <script>
 const $=s=>document.querySelector(s);
-const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null};
+const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
+  /* Selected calendar day for the drill-down. View-local: deliberately NOT in
+     the URL hash -- a day selection is an inspection, not a view state worth
+     a link, and putting it in the hash would grow the hash contract for no
+     navigational gain. Cleared when the month changes underneath it. */
+  calday:null};
 
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -530,7 +541,12 @@ function calendar(){
     const key=`${Y}-${String(M).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
     const dy=by[key];
     const k=!dy?'':dy.realized_base>0?'g':dy.realized_base<0?'r':'';
-    cells.push(`<div class="day ${k}">
+    /* A day with fills is a drill-down target: clicking it lists that day's
+       trades below the calendar. Only days with activity get the handler --
+       an empty day has nothing to show, and making it clickable would
+       promise detail that does not exist. */
+    const sel=S.calday===key?' selected':'';
+    cells.push(`<div class="day ${k}${dy?' clk':''}${sel}"${dy?` data-calday="${key}"`:''}>
       <div class="top"><span class="dnum">${d}</span>
         <span class="dct">${dy?dy.trades+(dy.trades===1?' fill':' fills'):''}</span></div>
       <div class="dpl ${dy&&!k?'dim':''}">${dy?(k?cash(dy.realized_base):'—'):'<span class="dim2">—</span>'}</div>
@@ -560,6 +576,41 @@ function calendar(){
     <div class="cal">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
       .map(d=>`<div class="dow">${d}</div>`).join('')}</div>
     <div class="cal" style="margin-top:2px">${cells.join('')}</div>
+    ${dayDetail(by)}
+  </div>`;
+}
+
+function dayDetail(by){
+  /* The clicked day's trades, from the leg data already in the payload --
+     no extra request. Legs are matched by their own fill date, so this shows
+     the day's ACTIVITY; the day cell's money remains close-attributed P&L,
+     and the two can legitimately differ (an opening day shows fills and a
+     dash). The panel says which day it describes rather than leaving the
+     reader to infer it from the highlight. */
+  const key=S.calday;
+  if(!key) return `<div class="note">Click a day with fills to see its trades.</div>`;
+  if(!by[key]){S.calday=null;return '';} /* heal: selection from another month */
+  const groups=S.state.strategies||[];
+  const rows=[];
+  groups.forEach(g=>(g.orders||[]).forEach(o=>(o.legs||[]).forEach(l=>{
+    if(String(l.first_fill_at||'').slice(0,10)===key)
+      rows.push({g,o,l});
+  })));
+  if(!rows.length) return `<div class="note">No leg detail for ${esc(key)} —
+    fills exist but their orders are outside the current filter.</div>`;
+  return `<div class="grp" style="margin-top:14px">
+    <div class="gh"><span class="gl">${esc(key)} — ${rows.length} fill(s)</span>
+      <button class="linkish" data-calday-clear="1">clear</button></div>
+    ${rows.map(({g,o,l})=>`<div class="leg">
+      <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
+      <span class="mono">${esc(l.underlying_symbol||'')}
+        <b>${l.strike!=null?num(l.strike,0):''}${esc(l.put_call||'')}</b>
+        <span class="dim">${esc(l.expiry||'')}</span></span>
+      <span class="dim" style="font-size:11px">${esc(g.label)}</span>
+      <span class="mono dim">×${Math.abs(l.quantity)}</span>
+      <span class="mono">${money(l.avg_price,l.currency)}</span>
+      <span class="mono ${cls(l.proceeds_base)}">${cash(l.proceeds_base)}</span>
+    </div>`).join('')}
   </div>`;
 }
 
@@ -585,34 +636,44 @@ function groupLabel(legs){
   return closing?'CLOSING':'OPENING';
 }
 function trades(){
-  const orders=S.state.orders||[];
-  if(!orders.length) return `${filters()}<div class="card"><div class="empty">no option orders</div></div>`;
-  return filters()+orders.map(o=>{
-    const legs=o.legs||[];
-    const strat=legs.length>1?`${legs.length}-leg spread`:'Single leg';
-    /* An order carries no currency of its own -- only its legs do. Legs of one
-       order are same-currency by construction, so the first leg settles it. */
+  /* One card per STRATEGY, not per IBKR order: the first real strangle in
+     this account arrived as two orders (call and put) filled in the same
+     second, each with its own order id -- order-per-card showed it as two
+     unrelated positions. The server groups same-underlying orders placed
+     within seconds (see strategies.py) and names the shape; every member
+     order stays visible beneath with its own legs, so nothing about the
+     order-level truth is hidden by the grouping. A group of one order
+     renders exactly as the old order card did. */
+  const groups=S.state.strategies||[];
+  if(!groups.length) return `${filters()}<div class="card"><div class="empty">no option orders</div></div>`;
+  return filters()+groups.map(g=>{
+    const morders=g.orders||[];
+    const legs=morders.flatMap(o=>o.legs||[]);
     const nat=legs[0]?legs[0].currency:'';
+    const ids=(g.order_ids||[]).join(', ');
     return `<div class="card">
-      <div class="crow"><div><h2>${esc(o.underlyings||'?')}
-        <span class="dim" style="font-size:14px;font-weight:500">${esc(strat)}</span></h2>
-        <div class="sub mono">order ${esc(o.ib_order_id)} ·
-          ${esc((o.first_fill_at||'').slice(0,16))} · ${o.fills} fill(s)</div></div>
+      <div class="crow"><div><h2>${esc(g.underlying||'?')}
+        <span class="dim" style="font-size:14px;font-weight:500">${esc(g.label)}</span></h2>
+        <div class="sub mono">order${morders.length>1?'s':''} ${esc(ids)} ·
+          ${esc((g.first_fill_at||'').slice(0,16))} · ${g.fills} fill(s)</div></div>
       </div>
       <div class="stats" style="grid-template-columns:repeat(3,1fr)">
-        ${statCard('Proceeds', cash(o.proceeds_base),
-          nat&&nat!==DISP()?`${money(o.proceeds,nat)} as filled`:'',
-          'sm '+cls(o.proceeds_base))}
-        ${statCard('Comms & Fees', cash(o.commission_base), 'per order',
-          'sm '+cls(o.commission_base))}
-        ${statCard('Realised P&L', cash(o.realized_pnl_base), 'net of commission',
-          'sm '+cls(o.realized_pnl_base))}
+        ${statCard('Proceeds', cash(g.proceeds_base),
+          nat&&nat!==DISP()?`${money(legs.reduce((a,l)=>a+(l.proceeds||0),0),nat)} as filled`:'',
+          'sm '+cls(g.proceeds_base))}
+        ${statCard('Comms & Fees', cash(g.commission_base),
+          morders.length>1?'all legs':'per order',
+          'sm '+cls(g.commission_base))}
+        ${statCard('Realised P&L', cash(g.realized_pnl_base), 'net of commission',
+          'sm '+cls(g.realized_pnl_base))}
       </div>
-      <div class="grp">
+      ${morders.map(o=>{
+        const olegs=o.legs||[];
+        return `<div class="grp">
         <div class="gh"><span class="gl">${esc((o.first_fill_at||'').slice(0,10))} — ${
-          groupLabel(legs)}</span>
+          groupLabel(olegs)}${morders.length>1?` <span class="dim2 mono">order ${esc(o.ib_order_id)}</span>`:''}</span>
           <span class="mono ${cls(o.proceeds_base)}">${cash(o.proceeds_base)}</span></div>
-        ${legs.map(l=>`<div class="leg">
+        ${olegs.map(l=>`<div class="leg">
           <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
           <span class="mono">${esc(l.underlying_symbol||'')}
             <b>${l.strike!=null?num(l.strike,0):''}${esc(l.put_call||'')}</b>
@@ -622,10 +683,10 @@ function trades(){
             >${money(l.avg_price,l.currency)}</span>
           <span class="mono ${cls(l.proceeds_base)}">${cash(l.proceeds_base)}</span>
         </div>`).join('')}
-      </div>
+      </div>`;}).join('')}
       ${legs.length>1?'':`<div class="note">One leg, so this is a single-leg
-        position rather than a strategy. <b>leg_count &gt; 1</b> on one order is
-        what makes a spread, and the view groups for that the day it happens.</div>`}
+        position rather than a strategy. Legs placed together on one underlying
+        group into a named strategy the day it happens.</div>`}
     </div>`;
   }).join('');
 }
@@ -980,7 +1041,16 @@ function draw(push){
   const sel=$('#month');
   if(sel) sel.onchange=()=>{S.month=sel.value||null;load();};
   document.querySelectorAll('button[data-calmonth]').forEach(b=>
-    b.onclick=()=>{if(b.dataset.calmonth){S.month=b.dataset.calmonth;load();}});
+    b.onclick=()=>{if(b.dataset.calmonth){
+      S.calday=null; /* a selection from the old month means nothing in the new */
+      S.month=b.dataset.calmonth;load();}});
+  /* Day drill-down: pure redraw, no request -- the leg data is already in the
+     payload. Clicking the selected day again clears it (toggle). */
+  document.querySelectorAll('[data-calday]').forEach(el=>
+    el.onclick=()=>{const k=el.dataset.calday;
+      S.calday=S.calday===k?null:k;draw();});
+  document.querySelectorAll('[data-calday-clear]').forEach(el=>
+    el.onclick=()=>{S.calday=null;draw();});
   /* Server-side like the month filter, so the aggregations are recomputed
      rather than the page trying to re-sum a filtered subset of totals. */
   document.querySelectorAll('.seg button[data-type]').forEach(b=>

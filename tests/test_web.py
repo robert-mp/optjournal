@@ -146,14 +146,15 @@ _NOT_PAYLOAD_BINDINGS = frozenset({
     # page globals and builtins
     "Math", "S", "TABS",
     # DOM nodes and the fetch response
-    "b", "sel", "m", "r",
+    "b", "sel", "m", "r", "el",
     # browser globals the view-state-in-the-hash code reads
     "location", "window",
     # the URLSearchParams the state request and the hash are built from
     "qs", "hs",
     # local collections; the reads are array methods, not payload keys
-    "cells", "days", "jrows", "legs", "mons", "month", "months", "oc",
-    "odtes", "open", "opts", "orders", "out", "ps", "pts", "range", "rows", "yrs",
+    "cells", "days", "groups", "jrows", "legs", "mons", "month", "months",
+    "morders", "oc", "odtes", "olegs", "open", "opts", "orders", "out", "ps",
+    "pts", "range", "rows", "yrs",
 })
 
 
@@ -195,6 +196,11 @@ def _roots(state: dict) -> dict[str, dict]:
         # what breaks the guard is one name for two shapes.
         "best": state["annual"][0],
     }
+    # A strategy group and its member order: `g` is the group payload; the
+    # member order is rendered as `o`, the same shape the flat orders list
+    # uses, so it stays registered under `o` below.
+    if state["strategies"]:
+        roots["g"] = state["strategies"][0]
     if state["stats"]["days"]:
         roots["dy"] = state["stats"]["days"][0]
     if state["positions"]:
@@ -434,6 +440,29 @@ def test_options_commission_reconciles_and_open_commission_is_separate(populated
         assert everything["stats"]["commissions_base"] != pytest.approx(
             closed_total + open_total
         ), "open commission must not be folded into the headline figure"
+
+
+def test_calendar_day_drilldown_is_wired():
+    """A day with fills is clickable and toggles a detail panel drawn from the
+    strategies payload already in hand -- a redraw, not a refetch."""
+    js = _js()
+    assert "data-calday=" in js, "day cells with activity carry the target"
+    assert "S.calday=S.calday===k?null:k;draw();" in js.replace(" ", "").replace(
+        "\n", ""
+    ) or "S.calday===k?null:k" in js, "clicking the selected day clears it"
+    assert "[data-calday]" in js and "[data-calday-clear]" in js
+    assert "function dayDetail" in js
+    # The drill-down redraws; only month navigation refetches.
+    handler = js.split("[data-calday]")[1].split("forEach")[1][:200]
+    assert "load()" not in handler, "day selection must not spend a request"
+
+
+def test_trades_view_renders_strategy_groups():
+    """One card per strategy, member orders visible beneath -- the strangle
+    sold as two same-second orders is the case order-grouping cannot show."""
+    js = _js()
+    assert "S.state.strategies" in js
+    assert "g.orders" in js and "g.label" in js and "g.order_ids" in js
 
 
 def test_dashboard_headline_counts_closed_round_trips_for_options():

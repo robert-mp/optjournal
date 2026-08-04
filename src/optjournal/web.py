@@ -67,6 +67,7 @@ from optjournal.stats import (
     scope_for,
     stats_data,
 )
+from optjournal.strategies import strategy_groups
 
 __all__ = ["build_state", "serve"]
 
@@ -245,6 +246,11 @@ def build_state(
             ),
             "positions": positions_data(conn),
             "orders": orders_data(conn, scope.order_ids, view_category),
+            # The same orders folded into the strategies they were placed
+            # as -- a strangle sold as two same-second orders is one group.
+            "strategies": strategy_groups(
+                orders_data(conn, scope.order_ids, view_category)
+            ),
             "history": history_data(report),
             "statements": statements_data(archive_dir, conn),
         }
