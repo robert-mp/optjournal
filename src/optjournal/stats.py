@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from optjournal.history import build_history
@@ -53,6 +54,8 @@ __all__ = [
     "available_years",
     "cohort_data",
     "daily_series",
+    "fx_quotes",
+    "month_range",
     "month_stats",
     "monthly_stats",
     "odte_cohorts",
@@ -104,6 +107,86 @@ def _day_of(value: str | None) -> str | None:
     if len(text) >= 8 and text[:8].isdigit():
         return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
     return None
+
+
+def fx_quotes(conn: sqlite3.Connection, base: str) -> list[dict[str, Any]]:
+    """Alternative display currencies, with the rate converting base into each.
+
+    A quote here is a *presentation* rate, not a reconciliation. Every `*_base`
+    figure in this payload was converted by IBKR at its own trade or snapshot
+    date, so no single rate reproduces them all -- on this account the
+    order-implied USD rate (0.87952, trade date) and the snapshot rate (0.86732)
+    differ by 1.4%. Displaying totals in a non-base currency therefore restates
+    them at one stated rate, and the page labels it that way rather than letting
+    the numbers look like IBKR's own.
+
+    The newest position snapshot is the only dated FX rate the statement gives
+    us. With no snapshot there are no quotes, and the page hides the toggle
+    rather than inventing a rate.
+
+    Offered codes are restricted to currencies that appear on *option* trades.
+    The snapshot table carries every currency the account holds anything in --
+    after the equities re-ingest that meant SEK and KRW from stock positions --
+    but this is an options journal, and restating its figures into a currency
+    no option ever traded in is noise, not information. The snapshot remains
+    the *rate* source; option trades define the *set*.
+    """
+    option_codes = {
+        str(r["currency"] or "").upper()
+        for r in conn.execute(
+            "SELECT DISTINCT currency FROM trades WHERE asset_category = 'OPT'"
+        )
+    }
+    rows = conn.execute(
+        "SELECT currency, fx_rate_to_base, report_date FROM position_snapshots"
+        " WHERE fx_rate_to_base IS NOT NULL AND fx_rate_to_base > 0"
+        " ORDER BY report_date DESC"
+    ).fetchall()
+    quotes: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = str(row["currency"] or "").upper()
+        if not code or code == base.upper() or code in quotes:
+            continue
+        if code not in option_codes:
+            continue
+        quotes[code] = {
+            "code": code,
+            # Stored rate is native -> base, so invert for base -> native.
+            "per_base": 1.0 / float(row["fx_rate_to_base"]),
+            "as_of": str(row["report_date"] or ""),
+            "source": "position snapshot",
+        }
+    return list(quotes.values())
+
+
+def month_range(conn: sqlite3.Connection) -> list[str]:
+    """Every calendar month from the account's first activity to today, newest first.
+
+    This is the *browsable* range, deliberately wider than `available_months`
+    (months with fills in the current scope). The calendar walks it month by
+    month, and the dropdown offers all of it: a month you held positions but
+    did not trade is a real month of the account's life, and rendering it as
+    an honest zero beats pretending it does not exist. Derived from any
+    activity at all -- trades or cash rows -- so a fills-free account start
+    still counts.
+    """
+    row = conn.execute(
+        "SELECT MIN(d) FROM (SELECT MIN(trade_date) AS d FROM trades"
+        " UNION ALL SELECT MIN(date_time) FROM cash_transactions)"
+    ).fetchone()
+    first = str(row[0] or "")[:7]
+    if len(first) != 7:
+        return []
+    y, m = int(first[:4]), int(first[5:7])
+    today = date.today()
+    out: list[str] = []
+    while (y, m) <= (today.year, today.month):
+        out.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    out.reverse()
+    return out
 
 
 @dataclass(slots=True)

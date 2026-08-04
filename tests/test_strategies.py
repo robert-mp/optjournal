@@ -200,3 +200,28 @@ def test_a_roll_event_chains_lifecycles_into_one_campaign():
     assert lc["status"] == "open", "the rolled-into leg is still open"
     assert lc["realized_pnl_base"] is None, "campaign not decided yet"
     assert {e["label"] for e in lc["events"]} == {"Single leg", "Roll"}
+
+
+def test_grouping_layers_do_not_mutate_the_orders_they_receive():
+    """build_state now fetches orders_data() ONCE and hands the same list to
+    the flat view, strategy_groups and position_groups. That dedup is only
+    sound while both grouping layers are read-only lenses over their input --
+    if either ever annotated an order dict in place, the three panels would
+    stop being independent views of one truth. This is the invariant the
+    single fetch in web.py cites.
+    """
+    import copy
+
+    put = _order("1", "2026-08-03 11:11:19", [_leg()])
+    call = _order("2", "2026-08-03 11:11:19", [_leg(put_call="C", strike=675.0)])
+    orders = [put, call]
+    before = copy.deepcopy(orders)
+
+    strategy_groups(orders)
+    position_groups(
+        orders,
+        episodes=[_Ep("C1", ["t1"], closed=False)],
+        trade_to_order={"t1": "1"},
+    )
+
+    assert orders == before, "a grouping layer mutated its input"

@@ -28,7 +28,7 @@ import sqlite3
 import threading
 import urllib.parse
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -61,6 +61,8 @@ from optjournal.stats import (
     annual_stats,
     available_months,
     cohort_data,
+    fx_quotes,
+    month_range,
     month_stats,
     monthly_stats,
     odte_cohorts,
@@ -85,86 +87,6 @@ def _is_loopback(host: str) -> bool:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
-
-
-def _fx_quotes(conn, base: str) -> list[dict[str, Any]]:
-    """Alternative display currencies, with the rate converting base into each.
-
-    A quote here is a *presentation* rate, not a reconciliation. Every `*_base`
-    figure in this payload was converted by IBKR at its own trade or snapshot
-    date, so no single rate reproduces them all -- on this account the
-    order-implied USD rate (0.87952, trade date) and the snapshot rate (0.86732)
-    differ by 1.4%. Displaying totals in a non-base currency therefore restates
-    them at one stated rate, and the page labels it that way rather than letting
-    the numbers look like IBKR's own.
-
-    The newest position snapshot is the only dated FX rate the statement gives
-    us. With no snapshot there are no quotes, and the page hides the toggle
-    rather than inventing a rate.
-
-    Offered codes are restricted to currencies that appear on *option* trades.
-    The snapshot table carries every currency the account holds anything in --
-    after the equities re-ingest that meant SEK and KRW from stock positions --
-    but this is an options journal, and restating its figures into a currency
-    no option ever traded in is noise, not information. The snapshot remains
-    the *rate* source; option trades define the *set*.
-    """
-    option_codes = {
-        str(r["currency"] or "").upper()
-        for r in conn.execute(
-            "SELECT DISTINCT currency FROM trades WHERE asset_category = 'OPT'"
-        )
-    }
-    rows = conn.execute(
-        "SELECT currency, fx_rate_to_base, report_date FROM position_snapshots"
-        " WHERE fx_rate_to_base IS NOT NULL AND fx_rate_to_base > 0"
-        " ORDER BY report_date DESC"
-    ).fetchall()
-    quotes: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        code = str(row["currency"] or "").upper()
-        if not code or code == base.upper() or code in quotes:
-            continue
-        if code not in option_codes:
-            continue
-        quotes[code] = {
-            "code": code,
-            # Stored rate is native -> base, so invert for base -> native.
-            "per_base": 1.0 / float(row["fx_rate_to_base"]),
-            "as_of": str(row["report_date"] or ""),
-            "source": "position snapshot",
-        }
-    return list(quotes.values())
-
-
-def _month_range(conn: sqlite3.Connection) -> list[str]:
-    """Every calendar month from the account's first activity to today, newest first.
-
-    This is the *browsable* range, deliberately wider than `available_months`
-    (months with fills in the current scope). The calendar walks it month by
-    month, and the dropdown offers all of it: a month you held positions but
-    did not trade is a real month of the account's life, and rendering it as
-    an honest zero beats pretending it does not exist. Derived from any
-    activity at all -- trades or cash rows -- so a fills-free account start
-    still counts.
-    """
-    row = conn.execute(
-        "SELECT MIN(d) FROM (SELECT MIN(trade_date) AS d FROM trades"
-        " UNION ALL SELECT MIN(date_time) FROM cash_transactions)"
-    ).fetchone()
-    first = str(row[0] or "")[:7]
-    if len(first) != 7:
-        return []
-    y, m = int(first[:4]), int(first[5:7])
-    today = date.today()
-    out: list[str] = []
-    while (y, m) <= (today.year, today.month):
-        out.append(f"{y:04d}-{m:02d}")
-        m += 1
-        if m == 13:
-            y, m = y + 1, 1
-    out.reverse()
-    return out
 
 
 def build_state(
@@ -206,7 +128,7 @@ def build_state(
             scope = scope_for(conn, trade_type, asset_category=view_category,
                               report=view_report)
         months = available_months(conn, view_category, scope)
-        month_range = _month_range(conn)
+        browsable = month_range(conn)
         # Any month in the account's lifetime is selectable, not just months
         # this scope has fills in. The previous rule (`month in months`) made a
         # month with no option fills silently fall back to the all-time view --
@@ -214,7 +136,7 @@ def build_state(
         # the page said why. An empty month now shows an honest zero month.
         # Months outside the account's lifetime still heal to all-time, so a
         # hand-edited `#month=1999-01` cannot render a calendar of nothing.
-        selected = month if month in month_range else None
+        selected = month if month in browsable else None
         # Fill counts per category, so the page can derive which Trade Types
         # buttons are offerable instead of asserting it in markup.
         asset_counts = {
@@ -224,6 +146,11 @@ def build_state(
                 " GROUP BY asset_category"
             )
         }
+        # One fetch, three lenses: `orders`, `strategies` and `lifecycles`
+        # all present the same rows, and neither grouping layer mutates
+        # what it receives (pinned in test_strategies), so fetching per
+        # consumer was three times the queries buying nothing.
+        orders = orders_data(conn, scope.order_ids, view_category)
         state: dict[str, Any] = {
             "version": __version__,
             "generated_at": _now(),
@@ -232,7 +159,7 @@ def build_state(
             "db": str(db_path),
             "archive": str(archive_dir),
             "months": months,
-            "month_range": month_range,
+            "month_range": browsable,
             "selected_month": selected,
             "trade_type": scope.key,
             "trade_type_label": scope.label,
@@ -245,17 +172,15 @@ def build_state(
                             scope=scope, report=view_report)
             ),
             "positions": positions_data(conn),
-            "orders": orders_data(conn, scope.order_ids, view_category),
+            "orders": orders,
             # The same orders folded into the strategies they were placed
             # as -- a strangle sold as two same-second orders is one group.
-            "strategies": strategy_groups(
-                orders_data(conn, scope.order_ids, view_category)
-            ),
+            "strategies": strategy_groups(orders),
             # ... and further linked into position lifecycles: the open and
             # the close of one position share an episode, so they are one
             # card. Exact linkage via episode trade ids, not a time window.
             "lifecycles": position_groups(
-                orders_data(conn, scope.order_ids, view_category),
+                orders,
                 episodes=[*view_report.closed, *view_report.open],
                 trade_to_order={
                     str(r["trade_id"]): str(r["ib_order_id"])
@@ -302,7 +227,7 @@ def build_state(
             "selectable": odte.episodes > 0,
         }
         base_ccy = str(state["stats"].get("base_currency") or "")
-        state["fx"] = {"base": base_ccy, "quotes": _fx_quotes(conn, base_ccy)}
+        state["fx"] = {"base": base_ccy, "quotes": fx_quotes(conn, base_ccy)}
 
     newest = newest_statement(archive_dir)
     if newest is not None:
