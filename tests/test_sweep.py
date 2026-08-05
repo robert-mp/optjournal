@@ -151,16 +151,32 @@ _REPLAY_PAYLOAD = {
             "bar_size": "1h", "points": [[100, 370.0], [200, 340.0], [300, 323.0]],
             "strikes": [{"strike": 270.0, "put_call": "P", "side": "short"}],
             "opened_at": "2026-07-24", "closed_at": "2026-08-03",
+            "opened_ts": 150, "closed_ts": 280, "fills": [150, 280],
+            "band": [[100, 320.0, 420.0], [200, 290.0, 390.0], [300, 275.0, 371.0]],
         },
     },
 }
+_REPLAY_CTL = (
+    '<input id="rscrub" type="range" min="0" max="2" value="2">'
+    '<select id="rspeed"><option value="240">1x</option></select>'
+)
 _REPLAY_OK = (
-    '<div class="replay"><svg><polyline class="pxline" points="1,2 3,4 5,6"/>'
-    '<text class="sklab">270P short</text></svg></div>'
+    '<div class="replay"><svg>'
+    '<defs><clipPath id="rclip"><rect id="rclipr"/></clipPath></defs>'
+    '<polygon class="emband" points="1,2 3,4"/>'
+    '<line class="edge in" x1="3" y1="0" x2="3" y2="9"/>'
+    '<polyline class="pxline" points="1,2 3,4 5,6"/>'
+    '<text class="sklab">270P short</text></svg>' + _REPLAY_CTL + '</div>'
 )
 #: The failure this excludes: an axis frame with no line reads as "this trade
 #: did nothing", which is a claim about the trade rather than about the data.
-_REPLAY_NO_LINE = '<div class="replay"><svg><text class="sklab">270P short</text></svg></div>'
+_REPLAY_NO_LINE = (
+    '<div class="replay"><svg>'
+    '<defs><clipPath id="rclip"><rect id="rclipr"/></clipPath></defs>'
+    '<polygon class="emband" points="1,2 3,4"/>'
+    '<line class="edge in" x1="3" y1="0" x2="3" y2="9"/>'
+    '<text class="sklab">270P short</text></svg>' + _REPLAY_CTL + '</div>'
+)
 
 
 _SIDE_OK = '<td class="side buy">Long</td><td class="side sell">Short</td>'
@@ -344,6 +360,40 @@ def test_replay_heals_a_key_that_names_no_trade():
     lying = page(tab="trades", replay="lc:nosuch@1999-01-01",
                  body=_REPLAY_OK, payload=_REPLAY_PAYLOAD)
     assert sweep.check_replay_renders_from_url(lying).status == FAIL
+
+
+def test_replay_requires_the_band_it_was_given():
+    """The band is the only MODELLED series on the panel, and the only one with
+    no broker figure anywhere else in the journal to contradict it. If it
+    silently stops rendering, nothing but this notices.
+    """
+    no_band = _REPLAY_OK.replace('<polygon class="emband" points="1,2 3,4"/>', '')
+    verdict = sweep.check_replay_renders_from_url(
+        page(tab="trades", replay="lc:C1@2026-07-24", body=no_band,
+             payload=_REPLAY_PAYLOAD))
+    assert verdict.status == FAIL, "a dropped band went unnoticed"
+
+
+def test_replay_requires_the_entry_to_be_marked():
+    """Without it the session of context either side reads as part of the trade,
+    which on a ten-bar trade is most of the picture.
+    """
+    no_edge = _REPLAY_OK.replace('<line class="edge in" x1="3" y1="0" x2="3" y2="9"/>', '')
+    verdict = sweep.check_replay_renders_from_url(
+        page(tab="trades", replay="lc:C1@2026-07-24", body=no_edge,
+             payload=_REPLAY_PAYLOAD))
+    assert verdict.status == FAIL
+
+
+def test_replay_scrubber_must_span_every_bar():
+    """A range that stops short leaves the tail of the series unreachable, which
+    looks like a chart that ends early rather than a control that does.
+    """
+    short = _REPLAY_OK.replace('max="2"', 'max="1"')
+    verdict = sweep.check_replay_renders_from_url(
+        page(tab="trades", replay="lc:C1@2026-07-24", body=short,
+             payload=_REPLAY_PAYLOAD))
+    assert verdict.status == FAIL
 
 
 def test_no_check_reads_the_raw_dom():

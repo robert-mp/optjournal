@@ -171,6 +171,31 @@ td.n,th.n{text-align:right}
 /* Session boundary. Faint on purpose: it restores the day breaks that an
    ordinal axis collapses, without competing with the price line. */
 .sess{stroke:var(--line);stroke-width:1;stroke-dasharray:2 5}
+.edge{stroke:var(--kicker);stroke-width:1;stroke-dasharray:3 3;opacity:.85}
+.edgelab{fill:var(--kicker);font-size:9.5px;letter-spacing:.1em;
+  text-transform:uppercase;font-family:var(--mono)}
+.fill{fill:var(--fg);stroke:var(--bg2);stroke-width:1.4}
+/* One standard deviation of expected move: a faint fill for the region and two
+   thin edges so it reads as a RANGE rather than a wash. Never as firm as the
+   price line, because it is a level the market was pricing rather than one
+   anything traded at, and equal weight would claim equal standing. */
+.emband{fill:var(--leather2);opacity:.17}
+.emedge{fill:none;stroke:var(--leather1);stroke-width:1;opacity:.5;stroke-dasharray:4 4}
+.cross{stroke:var(--dim);stroke-width:1;opacity:.5}
+.rctl{display:flex;align-items:center;gap:12px;margin-top:8px;padding:0 2px}
+.rbtn{font:inherit;font-size:11.5px;font-weight:600;padding:5px 11px;
+  border-radius:8px;cursor:pointer;white-space:nowrap;
+  background:var(--panel2);color:var(--fg);border:1px solid var(--line2)}
+.rbtn:hover{border-color:var(--leather1)}
+.rscrub{flex:1;accent-color:var(--leather1);cursor:pointer;min-width:80px}
+/* width and flex are explicit because the page has a global `select{width:100%}`
+   for the month picker, which as a flex item claimed the whole control row and
+   squeezed the scrubber to a stub. */
+.rspeed{font:inherit;font-size:11.5px;padding:4px 6px;border-radius:8px;
+  width:auto;flex:0 0 auto;
+  background:var(--panel2);color:var(--fg);border:1px solid var(--line2);cursor:pointer}
+.rread{font-size:11.5px;color:var(--dim);white-space:nowrap;min-width:150px;
+  text-align:right}
 .sk{stroke:var(--leather1);stroke-width:1.3}
 .sk.long{stroke-dasharray:5 4}
 .sklab{fill:var(--kicker);font-size:11px;font-family:var(--mono)}
@@ -539,6 +564,12 @@ td.n,th.n{text-align:right}
  * @property {Array} strikes -- Strike rows, one per distinct contract
  * @property {string|null} opened_at -- null for a snapshot-only contract
  * @property {string|null} closed_at -- null while the position is open
+ * @property {number|null} opened_ts -- entry as an epoch, US Eastern (bars.epoch_et)
+ * @property {number|null} closed_ts -- exit as an epoch; null while open
+ * @property {Array} fills -- epochs of each fill, for the dots on the line
+ * @property {Array} band -- [ts, low, high] one-standard-deviation expected move,
+ *   from the implied vol backed out of the option's own closes; EMPTY where no
+ *   vol could be solved, which is honest rather than a narrow range
  */
 
 /** @typedef {Object} Strike -- one contract as a horizontal reference line
@@ -654,7 +685,8 @@ td.n,th.n{text-align:right}
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local oc odtes open opts out ps pts range rows yrs active shown
- * @local sks ys
+ * @local sks ys RGEO up dn
+ * @local play scrub speed
  */
 
 const $=s=>document.querySelector(s);
@@ -1226,6 +1258,14 @@ const rstamp=(ts,size)=>new Date(ts*1000).toLocaleString(undefined,
    'en-CA' because it yields YYYY-MM-DD, so string equality is date equality. */
 const etday=ts=>new Date(ts*1000).toLocaleDateString('en-CA',{timeZone:MKT});
 
+/* Geometry of the panel currently on screen, so the scrubber can move a clip
+   rect and a crosshair without re-rendering the page. Only ONE panel is ever
+   open (S.replay is a single key), so fixed element ids are unambiguous.
+   Everything else on this page redraws wholesale on interaction, which is right
+   for a click and wrong for a continuous drag. */
+let RGEO=null, RTIMER=null;
+function replayStop(){ if(RTIMER){clearInterval(RTIMER);RTIMER=null;} }
+
 function replayChart(rp){
   const pts=(rp.points||[]).filter(p=>p&&isFinite(p[1]));
   if(pts.length<2) return `<div class="empty">no price bars stored for ${
@@ -1237,7 +1277,8 @@ function replayChart(rp){
      level the whole chart exists to compare against, so a far-OTM one clipped
      off-canvas would leave a price line and no answer to "how close did it
      get" -- which is the question the panel is for. */
-  const vals=ys.concat(sks.map(sk=>sk.strike));
+  const vals=ys.concat(sks.map(sk=>sk.strike)).concat(
+    (rp.band||[]).flatMap(b=>[b[1],b[2]]).filter(v=>isFinite(v)));
   const lo0=Math.min(...vals), hi0=Math.max(...vals);
   const gap=(hi0-lo0)*0.07||1, lo=lo0-gap, hi=hi0+gap, vspan=hi-lo;
   /* x is ORDINAL -- bar position, not elapsed time. Measured on this journal's
@@ -1254,14 +1295,27 @@ function replayChart(rp){
      rule marks each session boundary for the same reason. */
   const X=i=>L+(pts.length<2?iw/2:(i*iw)/(pts.length-1));
   const Y=v=>T+ih-((v-lo)*ih)/vspan;
+  /* A wall-clock instant onto the ordinal axis: find the bar interval it falls
+     in and interpolate across it. Nearest-bar rounding would drop a fill onto
+     the hour mark, which on a daily chart moves an entry by half a session. */
+  const at=ts=>{
+    if(ts==null||!isFinite(ts)) return null;
+    if(ts<=pts[0][0]) return {x:X(0),y:Y(pts[0][1])};
+    const last=pts.length-1;
+    if(ts>=pts[last][0]) return {x:X(last),y:Y(pts[last][1])};
+    for(let i=1;i<=last;i++) if(pts[i][0]>=ts){
+      const f=(ts-pts[i-1][0])/((pts[i][0]-pts[i-1][0])||1);
+      return {x:X(i-1)+f*(X(i)-X(i-1)), y:Y(pts[i-1][1]+f*(pts[i][1]-pts[i-1][1]))};
+    }
+    return {x:X(last),y:Y(pts[last][1])};
+  };
   const dp=vspan>40?0:2;
   const yticks=[0,0.25,0.5,0.75,1].map(f=>lo+f*vspan).map(v=>
     `<line class="gr" x1="${L}" y1="${Y(v).toFixed(1)}" x2="${L+iw}" y2="${
       Y(v).toFixed(1)}"/><text class="tk" x="${L-7}" y="${
       (Y(v)+3.5).toFixed(1)}" text-anchor="end">${num(v,dp)}</text>`).join('');
-  /* Ticks land on real bars, not on an even split of the span: sessions are
-     not evenly spaced, so an interpolated label can name a timestamp that has
-     no bar -- a weekend midnight on a daily series. */
+  /* Ticks land on real bars, not on an even split of the span: an interpolated
+     label can name a timestamp that has no bar -- a weekend midnight. */
   const xticks=[0,0.5,1].map(f=>Math.round(f*(pts.length-1))).map((ix,i)=>
     `<text class="tk" x="${X(ix).toFixed(1)}" y="${H-10}" text-anchor="${
       i===0?'start':i===2?'end':'middle'}">${esc(rstamp(pts[ix][0],rp.bar_size))}</text>`
@@ -1278,13 +1332,49 @@ function replayChart(rp){
       x2="${L+iw}" y2="${y}"/><text class="sklab" x="${L+iw+7}" y="${
       (Number(y)+3.5).toFixed(1)}">${strike(sk.strike)}${esc(sk.put_call||'')} ${
       esc(sk.side)}</text>`;}).join('');
+  /* Expected move, one standard deviation to the position's expiry, from the
+     implied vol backed out of the option's OWN closes. Drawn as an envelope
+     because that is what it is: a range the market was pricing, not a forecast
+     the chart endorses. */
+  const band=!(rp.band||[]).length?'':(()=>{
+    const up=rp.band.map(b=>`${at(b[0]).x.toFixed(1)},${Y(b[2]).toFixed(1)}`);
+    const dn=rp.band.map(b=>`${at(b[0]).x.toFixed(1)},${Y(b[1]).toFixed(1)}`);
+    return `<polygon class="emband" points="${up.concat(dn.slice().reverse()).join(' ')}"/>`
+      +`<polyline class="emedge" points="${up.join(' ')}"/>`
+      +`<polyline class="emedge" points="${dn.join(' ')}"/>`;})();
+  /* Entry and exit as labelled rules rather than a shaded span: the band is
+     already a filled region, and a second translucent fill over it went muddy
+     without telling the reader anything the two rules do not. */
+  const inx=at(rp.opened_ts), outx=at(rp.closed_ts);
+  const edge=(m,cls,label)=>!m?'':`<line class="${cls}" x1="${m.x.toFixed(1)}" y1="${
+    T}" x2="${m.x.toFixed(1)}" y2="${T+ih}"/><text class="edgelab" x="${
+    (m.x+4).toFixed(1)}" y="${T+11}">${label}</text>`;
+  const dots=(rp.fills||[]).map(ts=>at(ts)).filter(Boolean).map(m=>
+    `<circle class="fill" cx="${m.x.toFixed(1)}" cy="${m.y.toFixed(1)}" r="3.2"/>`).join('');
+  RGEO={xs:pts.map((p,i)=>X(i)),pts:pts,size:rp.bar_size,dp:dp,top:T,bot:T+ih,left:L};
   return `<svg viewBox="0 0 ${W} ${H}" role="img" preserveAspectRatio="xMidYMid meet"
     ><title>${esc(rp.underlying||'')} ${num(ys[0],dp)} → ${num(ys[ys.length-1],dp)} across ${
       pts.length} ${rp.bar_size==='1h'?'hourly':'daily'} bars</title>
-    ${yticks}${breaks}${strikes}
+    <defs><clipPath id="rclip"><rect id="rclipr" x="0" y="0" width="${W}" height="${H}"/></clipPath></defs>
+    ${band}${yticks}${breaks}${strikes}
     <line class="ax" x1="${L}" y1="${T}" x2="${L}" y2="${T+ih}"/>
     <line class="ax" x1="${L}" y1="${T+ih}" x2="${L+iw}" y2="${T+ih}"/>
-    <polyline class="pxline" points="${line}"/>${xticks}</svg>`;
+    ${edge(inx,'edge in','entry')}${edge(outx,'edge out','exit')}
+    <g clip-path="url(#rclip)"><polyline class="pxline" points="${line}"/>${dots}</g>
+    <line id="rcross" class="cross" x1="${X(pts.length-1).toFixed(1)}" y1="${T}" x2="${
+      X(pts.length-1).toFixed(1)}" y2="${T+ih}"/>
+    ${xticks}</svg>
+  <div class="rctl">
+    <button class="rbtn" data-rplay="1">▶ play</button>
+    <input class="rscrub" id="rscrub" type="range" min="0" max="${pts.length-1}"
+      value="${pts.length-1}" step="1" aria-label="replay position">
+    <select class="rspeed" id="rspeed" aria-label="playback speed">
+      <option value="240">1×</option><option value="120">2×</option>
+      <option value="60">4×</option><option value="24">10×</option>
+    </select>
+    <span class="rread mono" id="rread">${esc(rstamp(pts[pts.length-1][0],rp.bar_size))} · ${
+      num(pts[pts.length-1][1],dp)}</span>
+  </div>`;
 }
 
 /* The scorecard is passed in rather than derived here, because what counts as
@@ -1292,6 +1382,46 @@ function replayChart(rp){
    accounting layer computed, while an open one has only unrealised value from
    the position snapshot. Deciding that inside the chart would put an accounting
    rule in a renderer. */
+/* Scrubber, playback and readout. These mutate the open panel IN PLACE rather
+   than going through draw(): a click is a state change worth re-rendering for,
+   a continuous drag is not, and re-rendering the whole page per scrub tick
+   would rebuild every card to move one rect. */
+function replaySeek(i){
+  if(!RGEO) return;
+  const n=RGEO.pts.length, ix=Math.max(0,Math.min(n-1,i|0));
+  const clip=$('#rclipr'), cross=$('#rcross'), read=$('#rread');
+  /* The clip reveals up to the CURRENT bar, so the future is hidden -- which is
+     the point of a replay: reviewing the decision without the hindsight the
+     finished line would hand you. A half-step of slack keeps the marker at the
+     revealed edge instead of cutting it in half. */
+  if(clip) clip.setAttribute('width', (RGEO.xs[ix]+1.2).toFixed(1));
+  if(cross){cross.setAttribute('x1',RGEO.xs[ix].toFixed(1));
+    cross.setAttribute('x2',RGEO.xs[ix].toFixed(1));}
+  if(read) read.textContent=`${rstamp(RGEO.pts[ix][0],RGEO.size)} · ${
+    num(RGEO.pts[ix][1],RGEO.dp)}`;
+  return ix;
+}
+function bindReplayControls(){
+  const scrub=$('#rscrub'), speed=$('#rspeed'), play=document.querySelector('[data-rplay]');
+  if(!scrub) return;
+  scrub.oninput=()=>{replayStop();if(play)play.textContent='▶ play';
+    replaySeek(Number(scrub.value));};
+  if(play) play.onclick=()=>{
+    if(RTIMER){replayStop();play.textContent='▶ play';return;}
+    /* Restart from the beginning when the cursor is already at the end,
+       otherwise pressing play on a finished replay does nothing visible. */
+    if(Number(scrub.value)>=Number(scrub.max)) scrub.value='0';
+    play.textContent='❚❚ pause';
+    const step=Number((speed&&speed.value)||240);
+    RTIMER=setInterval(()=>{
+      const next=Number(scrub.value)+1;
+      if(next>Number(scrub.max)){replayStop();play.textContent='▶ play';return;}
+      scrub.value=String(next);replaySeek(next);
+    },step);
+  };
+  if(speed) speed.onchange=()=>{ if(RTIMER&&play){play.onclick();play.onclick();} };
+}
+
 function replayPanel(rp,label,valueHtml){
   const bars=rp.bar_size==='1h'?'hourly bars':rp.bar_size==='1d'?'daily bars':'no bars';
   const when=rp.opened_at?`${esc(String(rp.opened_at).slice(0,16))}${
@@ -1813,6 +1943,9 @@ function draw(push){
      its panel is how the old registry rotted. Checked before syncHash so the
      address bar never carries a key the page cannot open. */
   if(S.replay&&S.state&&!((S.state.replays||{})[S.replay])) S.replay=null;
+  /* A running playback drives element ids that this render is about to
+     replace, so it has to die with them. */
+  replayStop();
   syncHash(push);
   renderTabs();
   renderCcy();
@@ -1836,6 +1969,7 @@ function draw(push){
   document.querySelectorAll('[data-replay]').forEach(el=>
     el.onclick=()=>{const k=el.dataset.replay;
       S.replay=S.replay===k?null:k;draw();});
+  bindReplayControls();
   document.querySelectorAll('[data-calday-clear]').forEach(el=>
     el.onclick=()=>{S.calday=null;draw();});
   /* Server-side like the month filter, so the aggregations are recomputed

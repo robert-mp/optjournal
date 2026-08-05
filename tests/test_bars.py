@@ -16,12 +16,17 @@ from optjournal.bars import (
     CONTEXT_BARS,
     HOURLY_LIMIT_DAYS,
     BackfillOutcome,
+    BandContract,
     backfill_bars,
     bars_manifest,
     close_series,
+    epoch_et,
+    et_day,
+    expected_move_band,
     replay_bars,
     upsert_bars,
 )
+from optjournal.blackscholes import bs_price
 from optjournal.db import connect, migrate
 from optjournal.marketdata import Bar, BarFetchError, occ_symbol, parse_chart
 
@@ -364,6 +369,106 @@ def test_a_snapshot_only_window_is_not_trimmed(conn):
     )
     got = replay_bars(conn, "AAA", opened_at=None, closed_at=None)
     assert len(got["points"]) == 30
+
+
+# --------------------------------------------------------------------------
+# clocks
+# --------------------------------------------------------------------------
+
+def test_journal_stamps_are_read_as_us_eastern():
+    """Settled from the data, not assumed: Stockholm fills land 03:19-10:57 and a
+    Korean fill lands 20:03, both of which are inside those exchanges' sessions
+    in ET and outside them in UTC. A wrong zone would put every entry marker four
+    hours off the line it marks.
+    """
+    # 10:35 EDT is 14:35Z in July (UTC-4) and 15:35Z in January (UTC-5).
+    assert epoch_et("2026-07-24 10:35:01") == 1784903701
+    summer = datetime.fromtimestamp(epoch_et("2026-07-24 10:35:00"), UTC)
+    winter = datetime.fromtimestamp(epoch_et("2026-01-15 10:35:00"), UTC)
+    assert (summer.hour, winter.hour) == (14, 15), "DST is not being applied"
+
+
+@pytest.mark.parametrize("stamp", [None, "", "nonsense", "24/07/2026"])
+def test_an_unparseable_stamp_is_none_not_zero(stamp):
+    """Epoch zero is 1970, which would place a marker at the far left of every
+    chart rather than nowhere.
+    """
+    assert epoch_et(stamp) is None
+
+
+def test_two_daily_series_join_on_the_trading_day_not_the_timestamp(conn):
+    """The source does not stamp them alike: an option's daily bar arrives at
+    04:00Z (midnight ET) and its underlying's at 13:30Z (the session open). Same
+    provider, same interval, two conventions -- so an exact-timestamp join finds
+    nothing, silently, and the band just fails to appear.
+    """
+    day = _ts("2026-07-27")
+    assert et_day(day + 4 * 3600) == et_day(day + 13 * 3600 + 1800) == "2026-07-27"
+
+
+def test_the_band_solves_vol_from_the_options_own_closes(conn):
+    """The whole point: the reference implementation applies an INDEX's vol to a
+    single name because the underlying is all it has. We hold the contract's own
+    prices, so the band reports what the market charged for this contract.
+    """
+    spot, strike, vol = 100.0, 90.0, 0.40
+    expiry = "2026-03-20"
+    expiry_ts = _ts("2026-03-20") + 16 * 3600
+    # Stamps built through epoch_et rather than by adding hours to a UTC
+    # midnight, because the source's "midnight ET" is 04:00Z in summer and
+    # 05:00Z in winter. Hand-adding 4h to a JANUARY date lands at 23:00 ET the
+    # previous day, which is a different trading day and so a different join key.
+    days = ["2026-01-05", "2026-01-06"]
+    opt = []
+    for day in days:
+        stamp = epoch_et(f"{day} 00:00:00")
+        years = (expiry_ts - stamp) / (365.0 * 86400)
+        opt.append(_bar(stamp, bs_price(spot, strike, years, vol, "P")))
+    upsert_bars(conn, conid="OPT1", symbol="AAA  260320P00090000", bar_size="1d",
+                source="yahoo", bars=opt)
+    # Underlying dailies stamped at the session open, as the source really does.
+    opens = [epoch_et(f"{day} 09:30:00") for day in days]
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(s, spot) for s in opens])
+
+    points = [(s, spot) for s in opens]
+    band = expected_move_band(
+        conn,
+        [BandContract(conid="OPT1", strike=strike, right="P", expiry=expiry)],
+        points,
+        underlying_conid="U1",
+    )
+    assert len(band) == 2, "no band -- the daily series failed to join"
+    stamp, low, high = band[0]
+    years = (expiry_ts - epoch_et(f"{days[0]} 00:00:00")) / (365.0 * 86400)
+    want = spot * vol * (years ** 0.5)
+    assert (high - low) / 2 == pytest.approx(want, rel=2e-2)
+    assert low < spot < high
+
+
+def test_the_band_is_absent_rather_than_narrow_without_a_vol(conn):
+    """A point before the first solvable close gets NO band. A zero-width
+    envelope would read as "the market expected nothing to happen".
+    """
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(_ts("2026-01-05") + 13 * 3600, 100.0)])
+    band = expected_move_band(
+        conn,
+        [BandContract(conid="OPT1", strike=90.0, right="P", expiry="2026-03-20")],
+        [(_ts("2026-01-05") + 13 * 3600, 100.0)],
+        underlying_conid="U1",
+    )
+    assert band == []
+
+
+def test_the_band_accepts_both_expiry_formats_the_payload_carries(conn):
+    """A leg states 2026-09-04 while a snapshot row keeps IBKR's 20260918.
+    Handling one and rejecting the other produced a band for the LEAP and none
+    for any traded lifecycle.
+    """
+    from optjournal.bars import _expiry_epoch
+    assert _expiry_epoch("20260904") == _expiry_epoch("2026-09-04")
+    assert _expiry_epoch("nonsense") is None
 
 
 def test_backfill_collects_failures_without_abandoning_the_book(conn):

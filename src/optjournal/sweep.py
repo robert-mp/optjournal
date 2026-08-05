@@ -431,6 +431,26 @@ def check_replay_renders_from_url(p: Page) -> Verdict:
         want = f"{strike_row['put_call']} {strike_row['side']}"
         if not any(lab.strip().endswith(want) for lab in labels):
             return bad(f"no strike label reads '{want}': {labels}")
+    # The band is the only modelled series on the panel and the only one with no
+    # broker figure to contradict it, so its absence is invisible everywhere else.
+    if replay.get("band") and 'class="emband"' not in p.markup:
+        return bad(f"payload holds {len(replay['band'])} band rows, none drawn")
+    # An entry inside the window must be marked, or the session of context either
+    # side reads as part of the trade.
+    opened = replay.get("opened_ts")
+    inside = opened and replay["points"][0][0] <= opened <= replay["points"][-1][0]
+    if inside and 'class="edge in"' not in p.markup:
+        return bad("entry falls inside the window but is not marked on the line")
+    # Playback: a scrubber whose range does not span the bars would leave part of
+    # the series unreachable.
+    scrub = re.search(r'id="rscrub"[^>]*max="(\d+)"', p.markup)
+    if not scrub:
+        return bad("no scrubber rendered")
+    if int(scrub.group(1)) != len(replay["points"]) - 1:
+        return bad(f"scrubber max={scrub.group(1)} for "
+                   f"{len(replay['points'])} bars -- part of the series is unreachable")
+    if 'id="rclip"' not in p.markup:
+        return bad("no reveal clip, so scrubbing cannot hide the future")
     return ok()
 
 

@@ -35,7 +35,7 @@ from typing import Any
 
 from optjournal import __version__
 from optjournal.analysis import analyse
-from optjournal.bars import replay_bars
+from optjournal.bars import BandContract, epoch_et, expected_move_band, replay_bars
 from optjournal.db import open_journal
 from optjournal.flex import (
     FETCH_COOLDOWN_S,
@@ -119,6 +119,28 @@ def _strikes_of(legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(seen.values(), key=lambda s: s["strike"])
 
 
+def _band_contracts(rows: list[dict[str, Any]]) -> list[BandContract]:
+    """The legs a vol solve can use: one per distinct contract that has a conid.
+
+    Deduplicated by conid because a closed lifecycle holds each contract twice,
+    and solving the same series of closes twice would weight that leg double in
+    the average.
+    """
+    seen: dict[str, BandContract] = {}
+    for row in rows:
+        conid = str(row.get("conid") or "")
+        strike, expiry = row.get("strike"), row.get("expiry")
+        if not conid or strike is None or not expiry or conid in seen:
+            continue
+        seen[conid] = BandContract(
+            conid=conid,
+            strike=float(strike),
+            right=str(row.get("put_call") or ""),
+            expiry=str(expiry),
+        )
+    return list(seen.values())
+
+
 def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     """Build one replay per trade and point rows at it by key.
 
@@ -168,6 +190,19 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "strikes": _strikes_of(legs),
             "opened_at": opened,
             "closed_at": closed,
+            # Epochs, so the page never parses a timezone. Every journal stamp is
+            # US Eastern (bars.epoch_et carries the evidence) and the chart
+            # labels the same zone, so fills and bars share one timeline.
+            "opened_ts": epoch_et(opened),
+            "closed_ts": epoch_et(closed),
+            "fills": sorted(
+                {ts for ts in (epoch_et(leg.get("first_fill_at")) for leg in legs)
+                 if ts is not None}
+            ),
+            "band": expected_move_band(
+                conn, _band_contracts(legs), bars["points"],
+                underlying_conid=bars["conid"],
+            ),
         }
         lifecycle["replay_key"] = key
 
@@ -203,6 +238,16 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             }]),
             "opened_at": opened,
             "closed_at": None,
+            # A snapshot row has no fills anywhere -- that is what makes it
+            # snapshot-only -- so there is nothing to mark and no entry to mark
+            # it from. Empty rather than guessed.
+            "opened_ts": epoch_et(opened),
+            "closed_ts": None,
+            "fills": [],
+            "band": expected_move_band(
+                conn, _band_contracts([row]), bars["points"],
+                underlying_conid=bars["conid"],
+            ),
         }
 
     state["replays"] = replays

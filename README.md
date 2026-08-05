@@ -54,7 +54,10 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `db.py` | connection, schema migration, `open_journal()` |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
 | `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one. See [The Money model](#the-money-model) |
-| `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts |
+| `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts. **Never reads `blackscholes.py`** — see [Modelled numbers](#modelled-numbers) |
+| `marketdata.py` | price-bar fetch and parse for one contract over one window. A leaf: no DB, no journal shapes |
+| `bars.py` | the journal-shaped half of price bars — which contract over which window (from episodes), the idempotent write, the series a chart reads, and the expected-move band |
+| `blackscholes.py` | option pricing and the implied vol backed out of a market price. A leaf: pure float maths, `math.erf` for the normal CDF, so no numpy or scipy |
 | `analysis.py` | cost/friction report from the raw statement (whole account); a leaf — imports nothing internal |
 | `serialize.py` | the JSON payload the page renders and `--json` emits; wraps `analysis`'s per-currency ledgers into `Money` |
 | `render.py` | human-readable terminal reports |
@@ -64,6 +67,37 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `sweep.py` | the page matrix and its checks; each a pure function of a rendered page |
 | `demo.py` | deterministic synthetic statement; refuses to touch real data |
 | `sections.py`, `compat.py` | shims over py-ibkr's partial statement model |
+
+### Modelled numbers
+
+Every figure the accounting layers report is broker-stated: a fill price, a
+commission IBKR billed, a mark from a position snapshot. `blackscholes.py` breaks
+that rule on purpose, and is quarantined for it.
+
+Its output reaches exactly one place — the expected-move band on a replay panel,
+labelled as expected move — and reaches it through `bars.py`. `stats.py`,
+`analysis.py` and `serialize.py` never import it, so no headline number, no
+calendar day and no annual row can be traced back to a model. The journal's
+credibility rests on that separation: "nothing counts until the position is
+flat" is worth little if a modelled figure can reach the same card.
+
+Two assumptions live in `blackscholes.py` as named constants rather than
+literals, so they are auditable: `RISK_FREE` (0.04) and `DIVIDEND_YIELD` (0.0,
+correct for every underlying this journal has traded options on, and wrong the
+day it holds one that pays).
+
+### Clocks
+
+Every journal timestamp is **US Eastern**, settled from the data rather than
+assumed (`bars.epoch_et` carries the evidence: Stockholm fills land 03:19-10:57
+and a Korean fill at 20:03, both inside those exchanges' sessions in ET and
+outside them in UTC). The chart labels the same zone, so fills and bars share one
+timeline without conversion.
+
+Bars are stored as epoch UTC. Two daily series from the same source are joined on
+the ET trading **day**, not the timestamp, because the source does not stamp them
+alike: an option's daily bar arrives at 04:00Z (midnight ET) while its
+underlying's arrives at 13:30Z (the session open).
 
 Layering rules (import direction only goes down this list):
 

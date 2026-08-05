@@ -41,7 +41,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from optjournal.blackscholes import expected_move, implied_vol
 from optjournal.history import build_history
 from optjournal.marketdata import BAR_SIZES, SOURCE_RANK, Bar, BarFetchError, fetch_bars
 
@@ -50,7 +52,12 @@ __all__ = [
     "BarRequest",
     "backfill_bars",
     "bars_manifest",
+    "MARKET_TZ",
+    "BandContract",
     "close_series",
+    "expected_move_band",
+    "epoch_et",
+    "et_day",
     "replay_bars",
     "upsert_bars",
 ]
@@ -65,6 +72,11 @@ PAD_DAYS = 4
 #: while a months-long position wants daily or the series becomes thousands of
 #: points for no added insight.
 HOURLY_LIMIT_DAYS = 40
+
+#: The clock every journal timestamp is stated in. See epoch_et for the
+#: evidence; it is also the zone the chart labels its x axis in, so fills and
+#: bars land on one timeline without conversion.
+MARKET_TZ = ZoneInfo("America/New_York")
 
 #: Bars of context kept either side of the trade window when CHARTING. Counted
 #: in bars, not calendar days: PAD_DAYS is what gets FETCHED (wide is free and
@@ -141,6 +153,33 @@ class BackfillOutcome:
         return not self.failures
 
 
+def epoch_et(stamp: str | None) -> int | None:
+    """Epoch seconds from a journal timestamp, read as US EASTERN time.
+
+    Settled from the data rather than assumed, because a wrong zone would put
+    every entry marker four hours off the line it marks. Fills carry the local
+    time of ONE clock, and three markets agree on which: Nasdaq Stockholm fills
+    land 03:19-10:57 (its 09:00-17:30 CET session is 03:00-11:30 ET), a Korean
+    fill lands 20:03 (KRX opens 20:00 ET), and every US option fill lands
+    09:55-11:24 inside the 09:30-16:00 session. Under UTC, Stockholm's 03:19 and
+    Korea's 20:03 are both outside any session those exchanges run.
+
+    ZoneInfo rather than a fixed offset because the account has held positions
+    across a DST boundary -- the LEAP spans two -- and EDT is UTC-4 while EST is
+    UTC-5.
+    """
+    if not stamp:
+        return None
+    text = str(stamp).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            naive = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return int(naive.replace(tzinfo=MARKET_TZ).timestamp())
+    return None
+
+
 def _epoch(stamp: str | None) -> int | None:
     """Epoch seconds from a journal timestamp, or None when unparseable.
 
@@ -209,6 +248,20 @@ def bars_manifest(
 
     def add(conid: str, symbol: str, start: int, end: int, kind: str) -> None:
         size = _bar_size_for(start, end, kind=kind)
+        _emit(conid, symbol, start, end, kind, size)
+        # An hourly underlying window ALSO needs its daily series, because the
+        # expected-move band solves implied vol by pairing an option's daily
+        # close with the underlying's daily close for the same session. Without
+        # this, a short trade got hourly underlying bars and no daily ones, so
+        # there was nothing to pair and the band silently never appeared -- it
+        # worked only for TSLA, whose LEAP happened to force a daily request on
+        # the same conid. One extra request per underlying per window.
+        if kind == "underlying" and size == "1h":
+            _emit(conid, symbol, start, end, kind, "1d")
+
+    def _emit(
+        conid: str, symbol: str, start: int, end: int, kind: str, size: str
+    ) -> None:
         request = BarRequest(
             conid=str(conid), symbol=str(symbol), bar_size=size,
             start=start, end=end, kind=kind,
@@ -359,6 +412,149 @@ def close_series(
         args,
     ).fetchall()
     return [(int(r["ts"]), float(r["close"])) for r in rows]
+
+
+@dataclass(frozen=True, slots=True)
+class BandContract:
+    """One leg, reduced to what a vol solve needs and nothing else."""
+
+    conid: str
+    strike: float
+    right: str
+    expiry: str
+
+
+def _expiry_epoch(expiry: str | None) -> int | None:
+    """Epoch of an option's expiry, at the 16:00 ET close of its expiry date.
+
+    Both formats the payload actually carries are accepted: a leg states an
+    expiry as ``2026-09-04`` while a position snapshot row keeps IBKR's raw
+    ``20260918``. Handling one and rejecting the other silently produced a band
+    for the snapshot-only LEAP and none for any traded lifecycle.
+    """
+    text = str(expiry or "").strip()
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            day = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return int(day.replace(hour=16, tzinfo=MARKET_TZ).timestamp())
+    return None
+
+
+def et_day(stamp: int) -> str:
+    """The ET calendar date a bar belongs to, as YYYY-MM-DD.
+
+    The join key between two daily series, because the SOURCE does not stamp them
+    alike: an option's daily bar arrives at 04:00Z (midnight ET) while its
+    underlying's arrives at 13:30Z (the session open). Same provider, same
+    interval, two conventions -- so matching on the raw timestamp finds nothing,
+    silently, and the band simply fails to appear. The trading day is what both
+    actually mean.
+    """
+    return datetime.fromtimestamp(stamp, MARKET_TZ).strftime("%Y-%m-%d")
+
+
+def _spot_at(points: list[tuple[int, float]], ts: int) -> float | None:
+    """Underlying price at ``ts``, interpolated across the bar it falls in.
+
+    Used to place a value on the chart's own grid, NOT to pair with an option
+    price -- see expected_move_band for why that pairing has to be daily-to-daily.
+    """
+    if not points or ts < points[0][0] or ts > points[-1][0]:
+        return None
+    for index in range(1, len(points)):
+        if points[index][0] >= ts:
+            prev_ts, prev_px = points[index - 1]
+            next_ts, next_px = points[index]
+            width = (next_ts - prev_ts) or 1
+            return prev_px + ((ts - prev_ts) / width) * (next_px - prev_px)
+    return points[-1][1]
+
+
+def expected_move_band(
+    conn: sqlite3.Connection,
+    contracts: list[BandContract],
+    points: list[tuple[int, float]],
+    *,
+    underlying_conid: str | None,
+) -> list[list[float]]:
+    """A one-standard-deviation envelope, per underlying bar.
+
+    The vol comes from the option's OWN closes rather than from a volatility
+    index. The reference implementation labels its band "IV ref: VIX" -- S&P 500
+    implied vol applied to a gold ETF -- because the underlying is all it has;
+    we hold the contract's prices, so we can ask what the market charged for
+    THIS contract. Averaged across legs, because expected move is a property of
+    the underlying and a strangle's two legs are two observations of it.
+
+    The vol solve pairs an option's DAILY close with the underlying's DAILY
+    close for the same session, matched on the ET trading DAY (see et_day). Both come from one
+    source with one stamping convention (midnight ET), so the pair is
+    simultaneous by construction. Pairing against the CHART series instead looks
+    equivalent and is not: a chart may be hourly, and an option's daily stamp
+    then falls in the overnight gap between two hourly bars, so interpolating
+    there prices the option against a spot the market never showed and books the
+    discrepancy as volatility.
+
+    Vol is held forward from the last observation rather than interpolated
+    toward the next: an interpolated vol asserts a value between two closes that
+    nothing was priced at, and holding forward says only "this is the last thing
+    the market told us". Points before the first solvable close get NO band, so
+    a gap reads as absent information rather than as a narrow range.
+
+    The horizon is the NEAREST expiry among the legs, which is the one that
+    dominates the risk. That is also what makes the envelope narrow as a trade
+    ages and step outward when a roll pushes expiry further out.
+    """
+    if not points or not contracts or not underlying_conid:
+        return []
+    low, high = points[0][0], points[-1][0]
+    daily = {
+        et_day(stamp): close
+        for stamp, close in close_series(conn, str(underlying_conid), bar_size="1d")
+    }
+    observed: dict[int, list[float]] = {}
+    expiries: list[int] = []
+    for contract in contracts:
+        expiry = _expiry_epoch(contract.expiry)
+        if expiry is None:
+            continue
+        expiries.append(expiry)
+        # A day of slack either side because the join is BY DAY and the source
+        # stamps the two series differently: an option's bar for the same session
+        # lands at 04:00Z, hours BEFORE a chart window that starts at the 13:30Z
+        # open, so clipping to the exact window drops the first day's vol.
+        closes = close_series(
+            conn, contract.conid, bar_size="1d",
+            start=low - 86400, end=high + 86400,
+        )
+        for stamp, close in closes:
+            spot = daily.get(et_day(stamp))
+            if spot is None:
+                continue
+            years = (expiry - stamp) / (365.0 * 86400)
+            vol = implied_vol(close, spot, contract.strike, years, contract.right)
+            if vol is not None:
+                observed.setdefault(stamp, []).append(vol)
+    if not observed or not expiries:
+        return []
+    series = sorted((stamp, sum(v) / len(v)) for stamp, v in observed.items())
+    horizon = min(expiries)
+    band: list[list[float]] = []
+    current: float | None = None
+    cursor = 0
+    for stamp, spot in points:
+        while cursor < len(series) and series[cursor][0] <= stamp:
+            current = series[cursor][1]
+            cursor += 1
+        if current is None:
+            continue
+        move = expected_move(spot, current, (horizon - stamp) / (365.0 * 86400))
+        if move is None:
+            continue
+        band.append([stamp, round(spot - move, 4), round(spot + move, 4)])
+    return band
 
 
 def _trim_to_context(
