@@ -20,8 +20,8 @@ uv run optjournal serve --demo        # browse it
 ```
 
 `optjournal --help` lists the rest: `fetch`, `ingest`, `orders`,
-`positions`, `history`, `costs`, `statements`, `prune`. Every reporting
-command takes `--json`.
+`positions`, `history`, `costs`, `statements`, `prune`, `sweep`. Every
+reporting command takes `--json`.
 
 ## Architecture
 
@@ -37,6 +37,8 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
                      serialize.py (JSON payload contract; wraps analysis's
                                    per-currency ledgers into Money)
                      render.py    (terminal reports)
+                          ▲
+                     money.py (Money: held by every layer above, depends on none)
                                       │
                             ┌─────────┴─────────┐
                             ▼                   ▼
@@ -51,13 +53,15 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `ingest.py` | statement → SQLite, idempotent upserts (stores every asset category; scoping is query-time) |
 | `db.py` | connection, schema migration, `open_journal()` |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
-| `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one |
+| `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one. See [The Money model](#the-money-model) |
 | `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts |
 | `analysis.py` | cost/friction report from the raw statement (whole account); a leaf — imports nothing internal |
 | `serialize.py` | the JSON payload the page renders and `--json` emits; wraps `analysis`'s per-currency ledgers into `Money` |
 | `render.py` | human-readable terminal reports |
 | `web.py` | loopback HTTP server; `ServeConfig` injected per server |
 | `page.html` | the entire frontend: no build step, no external resources |
+| `browser.py` | headless browser discovery and the DOM dump, in three views: raw, markup (scripts stripped), text |
+| `sweep.py` | the page matrix and its checks; each a pure function of a rendered page |
 | `demo.py` | deterministic synthetic statement; refuses to touch real data |
 | `sections.py`, `compat.py` | shims over py-ibkr's partial statement model |
 
@@ -95,17 +99,16 @@ Four invariants worth knowing before changing the UI:
   is already looking at that currency.** IBKR bills commission per trade
   in the instrument's currency (and, on FX conversions, in the account
   base) and debits it there — no euros move for a dollar commission. So
-  `*_base` figures are an accounting translation, converted per row at
+  `base` figures are an accounting translation, converted per row at
   IBKR's own rate for that row's date, and restating a sum of them into a
   display currency sends each charge on a round trip through two different
-  rates. Where one currency accounts for a whole figure, the payload also
-  carries it `_native` with its `_ccy`, and the page prefers that: the
-  card says "as charged" rather than "restated". Where a figure spans
-  currencies — this account's stock trades span four — the native value is
-  withheld as `null`, because an exact-looking number covering part of a
-  total is worse than an honest approximation of all of it. `friction`
-  never carries a native figure at all: it includes the estimated AutoFX
-  markup, which IBKR never billed as a line item in any currency.
+  rates. Where one currency accounts for a whole figure the payload also
+  carries `native` and its `ccy`, and the page prefers that: the card says
+  "as charged" rather than "restated". Where a figure spans currencies —
+  this account's stock trades span four — `native` is `null`, because an
+  exact-looking number covering part of a total is worse than an honest
+  approximation of all of it. See **The Money model** below for the shape
+  and where each figure gets one.
 
 * **A tab's numbers change only in response to a control that tab
   displays.** The Trade Types control drives Dashboard/Calendar/Trades
@@ -130,6 +133,133 @@ Four invariants worth knowing before changing the UI:
   and the binding table may be neither incomplete nor stale. A typo'd key
   fails a test instead of rendering a blank cell.
 
+## The Money model
+
+Every cash figure has two readings, and conflating them was the largest
+source of wrong numbers in this journal's history — a `$22.44` overstatement
+on a single option premium, found only after the type made the two readings
+impossible to separate.
+
+* **base** — the accounting translation. Each contributing row converted at
+  IBKR's own rate for *its own date*, then summed. Always available, always
+  addable across currencies, and never exactly what left the account.
+* **native** — the amount as charged, in the currency it was charged in.
+  Exact, but unaddable: USD, SEK and KRW commission cannot share a number.
+  Offered only when one currency accounts for the whole figure.
+
+`Money` (in `money.py`, a leaf so any layer may hold one) carries both as one
+frozen value. It replaced three parallel fields per figure — `x_base`,
+`x_native`, `x_native_ccy` — plus a five-line ledger accumulation at each
+producer and a two-call unpack at each consumer. The spelling was not merely
+verbose; it let the halves drift. `options_friction` took its amount from
+`abs(commissions_native)` and its currency label from `commissions_native_ccy`,
+a field on a *different figure*, and a figure could be left half-assigned with
+nothing to complain. Both are now unrepresentable: the constructor refuses a
+half-set figure, and `abs()` carries the currency along.
+
+### On the wire
+
+Real values from this account, at their actual payload paths:
+
+```json
+costs[].totals.journal_commission  { "base": 6.071888, "native": 6.965211, "ccy": "USD" }
+costs[].totals.other_commission    { "base": 3.338990, "native": null,     "ccy": null   }
+costs[].totals.friction_base       10.736560
+```
+
+`journal_commission` answers because this journal's option trades are all USD.
+`other_commission` withholds because the account's stock trades span four
+currencies, so no single one can speak for the total. `friction_base` is a bare
+float, because it contains the AutoFX markup estimate.
+
+`native` and `ccy` are always both present or both `null` — never one of the
+two. **The shape itself carries meaning**: a nested object says "an as-charged
+figure could exist here"; a flat `_base` float says it cannot. The sweep
+asserts that directly, in both directions.
+
+### Six constructors, six provenances
+
+Each names where the figure came from, rather than being six ways to do one
+thing. Choosing one is the decision; the gate is not re-litigated per call
+site.
+
+| constructor | for |
+|---|---|
+| `Money(base, native, ccy)` | both readings already known |
+| `Money.restated(base)` | no native can exist *even in principle* |
+| `Money.gated(base, by_ccy)` | a base plus a per-currency ledger to judge |
+| `Money.charged(rows)` | `(base, native, ccy)` rows: accumulate and gate in one pass |
+| `Money.at_rate(native, rate, ccy)` | one row's amount, base derived from that row's own rate |
+| `Money.from_rows(rows, field)` | fill rows following this project's `field` / `field_base` / `currency` shape |
+
+`restated` is deliberately distinct from a `gated` figure that happened to
+withhold: `friction` includes the estimated AutoFX markup, which IBKR never
+billed as a line item in any currency, so it is `restated` **by nature**. A
+test asserts it never gains a native, so nobody later "fixes" the gap by
+inventing precision.
+
+`at_rate` replaced `natCash(v, rate)` in the page, which multiplied to base and
+then applied the display rate — two hops, so a USD value shown in USD had
+round-tripped through EUR at two different rates. That was lossless on current
+data only by coincidence (the display rate is the positions snapshot's own rate
+inverted, so the hops cancel), and would drift the moment positions span report
+dates.
+
+### Every level aggregates the leaves, never the level below
+
+`leg → order → strategy group → position lifecycle` each derive their figures
+from the **same leaf fill rows** via `Money.from_rows`. The base is identical
+either way, since sums are associative — but the gate is not:
+
+> An order spanning currencies has `native: null`. A group summing that order
+> cannot distinguish a native *withheld for being mixed* from one that *never
+> existed*, so it would gate as though that order contributed nothing.
+
+Asked at each level against the union of those legs' currencies, it answers
+correctly everywhere. `trade_legs` carries a `currency`; `trade_orders`
+deliberately carries none, because an order can span them — that asymmetry is
+why the leaf is the only honest source.
+
+Which decides how each row is shaped, and the rule reads oddly until you see
+the reason:
+
+* **Derived rows** (order, strategy group, lifecycle) **replace** their six
+  flat keys with three `Money` objects. Nothing aggregates from them.
+* **Leaf rows** (`trade_legs`, position snapshots) **keep** the raw triple and
+  gain a nested `money` key beside it, because every level above re-aggregates
+  exactly those keys.
+
+Writing a leaf's Money over its flat native breaks the aggregation one level
+up — it happened twice during the conversion, once caught by inspection and
+once by the suite, which is what turned this from a preference into a rule.
+
+### What stays a flat float, and why
+
+Not everything can be `Money`. These have no native in the data, and no amount
+of work creates one:
+
+| figure | why |
+|---|---|
+| `net_liq_base` | IBKR's section is `EquitySummaryByReportDate`**`InBase`** — base at source |
+| `autofx_spread_base` | basis points on a converted notional; never billed |
+| `friction_base`, `account_friction_base` | contain the AutoFX estimate above |
+| `notional_base` | a cross-pair notional, so no single currency |
+| `per_base` | an FX **rate**, not an amount |
+| `win_rate`, `gain_pct_of_net_liq` | unitless |
+| `journal_taxes_base` | convertible, but needs a journal-scoped merge in `analysis.py` first — the per-group `taxes_native_by_ccy` exists and nothing aggregates it |
+
+Everything else is `Money`. When adding a figure, the question is not "should
+this be Money" but "which constructor names where it came from".
+
+### One entry point in the page
+
+`chargeOf(native, ccy, base)` is the rule; `moneyOf(mo)` applies it to a
+Money-shaped payload key. There is no second path — `legProceedsOf` and
+`natCash` were both absorbed, and a test asserts they cannot come back.
+Figures that share a sentence must share a basis, so the rule is applied per
+*block*, not per figure: "as charged · $6.97" beside a €6.07 pill is a
+contradiction, not a rounding difference.
+
 ## Adding functionality
 
 **A new UI tab**: serializer in `serialize.py` → emit it in
@@ -143,6 +273,22 @@ tests asserting its figures reconcile with an existing independent number
 **A new payload key on an existing shape**: emit it in the serializer and
 add one `@property` line to the shape's typedef — the drift test holds the
 two together from both sides.
+
+**A new cash figure**: return a `Money` from the constructor that names its
+provenance (see [the table](#six-constructors-six-provenances)), declare it
+`{Money}` in the typedef, and read it in the page with `moneyOf`. Never add a
+`_base`/`_native`/`_native_ccy` triple: that spelling is what let an amount and
+its currency drift apart. If the figure genuinely cannot have an as-charged
+form, `Money.restated` says so explicitly — and a flat `_base` float is
+reserved for the cases in [what stays a flat
+float](#what-stays-a-flat-float-and-why).
+
+**A new sweep check**: a function taking a `Page` and returning `ok()`,
+`bad(reason)` or `skip(why)`, added to `sweep.CHECKS` — plus a pair of
+fragments in `tests/test_sweep.py::CASES`, one satisfying it and one violating
+it. The violation must FAIL, and a test refuses any check that joins `CHECKS`
+without that pair. Read `p.markup` for structure, `p.text` for prose; an AST
+test forbids reading `p.dom`, which contains the page's own JS.
 
 **A new trade-type filter**: build a `TradeScope` (fill membership, not a
 predicate — see `odte_scope` for why) and register it in
@@ -169,14 +315,33 @@ so `--json` comes for free.
 ## Development
 
 ```bash
-uv run pytest -q            # 212 tests; the raw/ statements are fixtures
+uv run pytest -q            # 399 tests; the raw/ statements are fixtures
 uv run ruff check src tests cron
+uv run optjournal sweep     # every page in a real browser (~2 min)
 ```
 
-The suite covers three layers: unit tests over domain arithmetic (with the
+The suite covers four layers: unit tests over domain arithmetic (with the
 generator itself under test — see `test_demo.py`), payload-contract guards
-binding `page.html` to `build_state`, and static checks over the page's
-JavaScript (history discipline, hash round-tripping). UI changes should
-additionally be eyeballed against `serve --demo`, which exercises paths
-the real account cannot reach (closed round trips, spreads, rolls,
-expiries, a 0DTE trade, a commission credit).
+binding `page.html` to `build_state`, static checks over the page's JavaScript
+(history discipline, hash round-tripping), and one executed render in a real
+browser engine (`test_rendered.py`).
+
+`optjournal sweep` goes further than the suite can afford to: it renders **every
+page both journals can show** — each tab, the currency toggle, the asset switch,
+the calendar drill-downs — and applies every check to every page. It is a
+separate command rather than a test because it launches a browser per page, so
+it costs a minute or two where the suite costs ten seconds.
+
+Its checks are in the suite even though it is not. Each is a pure function of a
+rendered page, so `tests/test_sweep.py` feeds every one a fragment that violates
+it and asserts it **fails** — and treats a skip as a failure of the check
+itself, because that is the silent mode: a precondition that stopped matching
+the markup reads as "not applicable" forever. Three checks were caught that way
+on the first run, including two that could never have failed. A green sweep is
+worth something only because the checks have been shown to go red.
+
+Both journals are swept because they cover different ground: the real one is the
+only source of true rates and mixed currencies, and the demo is the only one
+holding closed round trips, spreads, rolls, expiries, a 0DTE trade and a
+commission credit. Skips are reported separately from passes, so a check whose
+precondition this data never reaches cannot be mistaken for evidence.
