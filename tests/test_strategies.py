@@ -248,3 +248,27 @@ def test_single_legs_are_named_by_right_and_position_direction():
     ]
     for kw, expected in cases:
         assert classify([_leg(**kw)]) == expected, expected
+
+
+def test_a_right_less_closing_leg_is_still_named_a_close():
+    """A stock leg has no put/call, and the single-leg branch bailed out before
+    applying the closing suffix -- so an equities lifecycle gave its opening
+    AND its closing event the identical label "Single leg". The Trades tab
+    captions an event by comparing its label to the lifecycle's ("X" -> Opened,
+    "X close" -> Closed), so both matched the first case and a share SALE that
+    closed the position was captioned "Opened" while its own chip read STC.
+
+    The direction is what a missing right makes unknowable; whether the order
+    closed is known from open_close alone, so the suffix still applies.
+    """
+    opening = [{"put_call": None, "buy_sell": "BUY", "open_close": "O", "symbol": "SIVE"}]
+    closing = [{"put_call": None, "buy_sell": "SELL", "open_close": "C", "symbol": "SIVE"}]
+    assert classify(opening) == "Single leg"
+    assert classify(closing) == "Single leg close"
+    # The caption rule the page applies, reproduced here so the pin covers the
+    # behaviour the user sees rather than just the string.
+    lifecycle_label = classify(opening)
+    assert classify(closing) == lifecycle_label + " close"
+    # Options keep the direction naming they already had.
+    assert classify([{"put_call": "P", "buy_sell": "SELL", "open_close": "O"}]) == "Short put"
+    assert classify([{"put_call": "P", "buy_sell": "BUY", "open_close": "C"}]) == "Short put close"

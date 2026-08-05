@@ -44,7 +44,21 @@ html,body{margin:0;background:var(--bg);color:var(--fg);
   border-color:#a06840;color:var(--leatherfg);
   box-shadow:0 1px 0 rgba(255,255,255,.16) inset,0 2px 10px rgba(0,0,0,.4)}
 .tab:disabled{color:var(--dim2);cursor:not-allowed;opacity:.55}
-.hdr-actions{margin-left:auto;display:flex;flex-direction:column;gap:9px}
+/* `align-items` must be pinned on BOTH levels, and the reason differs at each.
+   On the column itself, the default `stretch` is opted out of by .icobtn's
+   explicit width -- and a definite cross-size lands the item at the cross-axis
+   START, so the two icon buttons sat hard LEFT while .ccynote beside them was
+   text-align:right. Inside #ccywrap, `stretch` is NOT opted out of: .ccytog has
+   no width, so it inflated to the wrap's width, which .ccynote's max-width had
+   already pushed to 210px -- the rounded border then extended well past $USD
+   with dead space inside it. Right-aligning the wrap makes the toggle
+   shrink-wrap its own buttons, which is the only width that means anything. */
+.hdr-actions{margin-left:auto;display:flex;flex-direction:column;gap:9px;
+  align-items:flex-end}
+#ccywrap{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+/* The two icons are one control group, so they share a row rather than
+   stacking -- stacked, they read as two unrelated affordances. */
+.hdr-icons{display:flex;gap:9px}
 .ccytog{display:flex;gap:0;border:1px solid var(--line);border-radius:9px;overflow:hidden}
 .ccytog button{background:transparent;border:0;color:var(--dim);font:inherit;
   font-size:12px;font-weight:600;letter-spacing:.04em;padding:6px 11px;cursor:pointer}
@@ -146,10 +160,24 @@ td.n,th.n{text-align:right}
 .leg{display:grid;grid-template-columns:52px 1fr auto auto auto;gap:12px;
   align-items:center;padding:8px 13px;font-size:13px;
   border-bottom:1px solid rgba(255,255,255,.035)}
+/* The calendar drill-down wedges a strategy label in as a SIXTH child (legRow's
+   `extra`), and a sixth child in a five-column grid wraps: the proceeds figure
+   dropped to a second row and left-aligned under the 52px action column, so the
+   money no longer sat beside the price it belonged to. The variant declares its
+   own column count rather than the base grid carrying an always-empty sixth
+   track, which would add a stray 12px gap to every Trades row. */
+.leg.ctx{grid-template-columns:52px 1fr auto auto auto auto}
 .leg:last-child{border-bottom:0}
 .act{font-family:var(--mono);font-size:11px;font-weight:700;text-align:center;
   padding:3px 0;border-radius:5px;background:#241a12;border:1px solid var(--line2);
   color:var(--kicker)}
+/* The Positions side cell wants the buy/sell HUE without the chip's box, and
+   the only buy/sell rules were compound (.act.buy / .act.sell) -- so a bare
+   <td class="sell"> matched nothing and Long/Short both rendered default white,
+   silently losing the colour coding the markup was asking for. Scoped to .side
+   rather than defining bare .buy/.sell, which would leak onto anything. */
+.side.buy{color:#8fd6b4}
+.side.sell{color:#f0a9b5}
 .act.buy{color:#8fd6b4;border-color:#2c6a48;background:#16281f}
 .act.sell{color:#f0a9b5;border-color:#7c2f2b;background:#2a1618}
 
@@ -173,8 +201,10 @@ td.n,th.n{text-align:right}
     </div>
     <div class="hdr-actions">
       <div id="ccywrap"></div>
-      <button class="icobtn" id="sync" title="Sync from IBKR">⟳</button>
-      <button class="icobtn" id="cog" title="Journal details">⚙</button>
+      <div class="hdr-icons">
+        <button class="icobtn" id="sync" title="Sync from IBKR">⟳</button>
+        <button class="icobtn" id="cog" title="Journal details">⚙</button>
+      </div>
     </div>
   </div>
 
@@ -545,7 +575,7 @@ td.n,th.n{text-align:right}
  * @payload res:SyncResponse pt:ChartPoint bkt:Bucket
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
- * @local oc odtes open opts out ps pts range rows yrs
+ * @local oc odtes open opts out ps pts range rows yrs active shown
  */
 
 const $=s=>document.querySelector(s);
@@ -788,11 +818,17 @@ function dashboard(){
        the opening legs' cost, August's net P&L contained it again. Commission
        on still-open positions is a sub-note, like open premium: real cash,
        no outcome yet. */
-    statCard('Commissions', cash(s.commissions_base),
+    /* `Math.abs`, matching the Annual and Month tables. The same all-time
+       figure read "−€26.25" here and "€26.25" there, so a reader checking one
+       against the other had to know which sign convention each surface chose.
+       Commission is a cost by definition and the label says so, so the
+       magnitude is the honest form -- and the red `cls()` tint went with the
+       sign, because colouring a figure by a sign no longer shown is noise. */
+    statCard('Commissions', cash(Math.abs(s.commissions_base)),
       opt?`closed round trips${s.open_commission_base?` · ${
         cash(Math.abs(s.open_commission_base))} on open positions`:''}`
          :'stated by IBKR',
-      'sm '+cls(s.commissions_base)),
+      'sm'),
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
@@ -857,7 +893,9 @@ function dashboard(){
 /* ------------------------------------------------ chart (inline SVG) */
 function chart(days){
   if(!days||!days.length) return `<div class="empty">no fills in this period</div>`;
-  const W=1000,H=230,PL=54,PR=14,PT=14,PB=26;
+  /* PL leaves room for a tick label that now carries a currency symbol as well
+     as digits; at 54px "€4,138" collided with the plot area. */
+  const W=1000,H=230,PL=68,PR=14,PT=14,PB=26;
   let run=0; const pts=days.map(dy=>({x:dy.day,y:(run+=dy.realized_base),n:dy.trades}));
   const ys=pts.map(pt=>pt.y).concat([0]);
   let lo=Math.min(...ys), hi=Math.max(...ys);
@@ -869,9 +907,16 @@ function chart(days){
   const area=pts.length>1
     ? `${line}L${sx(pts.length-1).toFixed(1)},${sy(0).toFixed(1)}L${sx(0).toFixed(1)},${sy(0).toFixed(1)}Z`
     : '';
+  /* `cash`, not `num`: the tick VALUES are base-currency (they come from
+     realized_base), so labelling them raw left the axis in EUR while the
+     headline, the cards and every dot tooltip on the same chart restated to
+     USD -- the axis was the one figure on the page that ignored the toggle,
+     and it carried no symbol to admit which currency it meant. The plotted
+     shape is unaffected either way: conv() is a uniform scale factor, so it
+     cancels out of sy()'s normalisation. */
   const ticks=[hi,(hi+lo)/2,lo].map(v=>
     `<line class="grid" x1="${PL}" y1="${sy(v).toFixed(1)}" x2="${W-PR}" y2="${sy(v).toFixed(1)}"/>
-     <text class="axis" x="${PL-7}" y="${(sy(v)+3).toFixed(1)}" text-anchor="end">${num(v,0)}</text>`).join('');
+     <text class="axis" x="${PL-7}" y="${(sy(v)+3).toFixed(1)}" text-anchor="end">${cash(v,0)}</text>`).join('');
   const zero=(lo<0&&hi>0)?`<line class="grid" style="stroke:rgba(255,255,255,.14)"
      x1="${PL}" y1="${sy(0).toFixed(1)}" x2="${W-PR}" y2="${sy(0).toFixed(1)}"/>`:'';
   const dots=pts.map((pt,i)=>`<circle cx="${sx(i).toFixed(1)}" cy="${sy(pt.y).toFixed(1)}" r="3.5"
@@ -892,12 +937,30 @@ function chart(days){
 /* ------------------------------------------------ calendar */
 function calendar(){
   const s=S.state.stats;
-  const month=s.month!=='ALL'?s.month:(S.state.month_range||S.state.months||[])[0];
+  const by={}; (s.days||[]).forEach(dy=>by[dy.day]=dy);
+  /* Under "All time" the payload's days span the whole account, but a grid can
+     only draw one month -- and this fell back to month_range[0], the newest
+     month of the account's LIFE. On the demo journal, whose activity ends in
+     February, that drew a blank August beside pills reading "Green days 7":
+     every one of those days was unreachable from the view claiming them. The
+     newest month that actually HAS a day is the one worth landing on. */
+  const active=(s.days||[]).map(dy=>dy.day.slice(0,7)).sort();
+  const month=s.month!=='ALL'?s.month
+    :(active[active.length-1]||(S.state.month_range||S.state.months||[])[0]);
   if(!month) return `${filters()}<div class="card"><div class="empty">no months with trades</div></div>`;
   const [Y,M]=month.split('-').map(Number);
   const first=new Date(Y,M-1,1), lead=first.getDay(), len=new Date(Y,M,0).getDate();
-  const by={}; (s.days||[]).forEach(dy=>by[dy.day]=dy);
-  let total=0; (s.days||[]).forEach(dy=>total+=dy.realized_base);
+  /* Derived from the days actually ON the grid, not from the payload's
+     period-wide totals. Those describe the whole selected period, so under
+     "All time" a one-month grid sat next to an account-lifetime P&L and green
+     and red day counts it could not account for. Deriving locally keeps this
+     tab's own invariant -- its numbers move only with a control it displays --
+     and for a specific month it reproduces s.green_days/s.red_days exactly,
+     because the grid then holds every day the period has. */
+  const shown=(s.days||[]).filter(dy=>dy.day.slice(0,7)===month);
+  let total=0; shown.forEach(dy=>total+=dy.realized_base);
+  const greenDays=shown.filter(dy=>dy.realized_base>0).length;
+  const redDays=shown.filter(dy=>dy.realized_base<0).length;
 
   const cells=[];
   for(let i=0;i<lead;i++) cells.push(`<div class="day void"></div>`);
@@ -934,9 +997,13 @@ function calendar(){
       fills shows the activity and a dash, not money.</div></div>
       <div class="pills">
         <span class="pill">Month P/L <b class="${cls(total)}">${cash(total)}</b></span>
-        <span class="pill">Green days <b>${s.green_days}</b></span>
-        <span class="pill">Red days <b>${s.red_days}</b></span>
+        <span class="pill">Green days <b>${greenDays}</b></span>
+        <span class="pill">Red days <b>${redDays}</b></span>
       </div></div>
+    ${s.month==='ALL'&&active.length?`<div class="note">Showing <b>${esc(monthLabel(month))}</b>,
+      the most recent month with activity. The pills describe this month; the
+      account-wide figures are on <b>Dashboard</b> and <b>Annual</b>. Use the
+      chevrons or the month selector to walk the rest.</div>`:''}
     <div class="cal">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
       .map(d=>`<div class="dow">${d}</div>`).join('')}</div>
     <div class="cal" style="margin-top:2px">${cells.join('')}</div>
@@ -986,7 +1053,7 @@ function legRow(l,extra=''){
      drill-down wedges the strategy label between contract and quantity,
      because there the leg appears outside its strategy card; the Trades
      card, already under its strategy header, passes nothing. */
-  return `<div class="leg">
+  return `<div class="leg${extra?' ctx':''}">
     <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
     <span class="mono">${esc(l.underlying_symbol||'')}
       <b>${l.strike!=null?num(l.strike,0):''}${esc(l.put_call||'')}</b>
@@ -1105,7 +1172,7 @@ function positions(){
   });
   const row=pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
     return `<tr><td class="mono">${esc(pos.symbol)}</td>
-    <td class="${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
+    <td class="side ${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
     <td class="n mono ${cls(pos.position)}">${pos.position}</td>
     <td class="n mono">${money(pos.mark_price,pos.currency)}</td>
     <td class="n mono">${cash(pos.position_value_base)}</td>
@@ -1122,8 +1189,15 @@ function positions(){
     const label=bkt.lc?`${bkt.lc.underlying||''} — ${bkt.lc.label}, opened ${
       String(bkt.lc.opened_at||'').slice(0,10)}`:'Ungrouped — no opening fills in the archive';
     let uv=0; bkt.rows.forEach(pos=>uv+=(pos.position_value_base||0));
-    return `<tr class="grp"><td colspan="8" class="dim">${esc(label)}</td>
-      <td class="n mono ${cls(uv)}">${cash(uv)}</td></tr>${bkt.rows.map(row).join('')}`;};
+    /* The subtotal sums `value`, so it sits in the `value` column. It used to
+       ride a colspan=8 label and land in column 9 -- under `record` -- four
+       columns adrift of the figures it totals, which is exactly the "total in
+       a column that is not its own" failure this table is meant to make
+       checkable. Label spans contract..mark, the subtotal takes value, and a
+       trailing span covers cost basis..record. */
+    return `<tr class="grp"><td colspan="4" class="dim">${esc(label)}</td>
+      <td class="n mono ${cls(uv)}">${cash(uv)}</td>
+      <td colspan="4"></td></tr>${bkt.rows.map(row).join('')}`;};
   return `<div class="card">
     <div class="crow"><div><h2>Option book</h2>
       <div class="sub">From the ${esc((ps[0]&&ps[0].report_date)||'latest')} position

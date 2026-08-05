@@ -83,7 +83,17 @@ def classify(legs: list[Row]) -> str:
         side = str(leg.get("buy_sell") or "").upper()
         oc_leg = str(leg.get("open_close") or "").upper()
         if right is None or side not in ("BUY", "SELL") or oc_leg not in ("O", "C"):
-            return "Single leg"
+            # The suffix still applies. Dropping it here was a real defect
+            # rather than a cosmetic one: a stock leg never has a right, so
+            # every equities lifecycle gave its opening AND its closing event
+            # the identical label "Single leg", and the Trades tab decides an
+            # event's caption by comparing the event label to the lifecycle's
+            # ("X" -> Opened, "X close" -> Closed). Both matched the first
+            # case, so a share SALE that closed the position was captioned
+            # "Opened" while its own action chip beside it read STC. The
+            # direction is what cannot be guessed without a right; whether
+            # the order closed is known from open_close alone.
+            return f"Single leg{suffix}"
         opened_long = (side == "BUY") == (oc_leg == "O")
         return f"{'Long' if opened_long else 'Short'} {right}{suffix}"
 

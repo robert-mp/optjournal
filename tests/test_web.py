@@ -1203,3 +1203,132 @@ def test_lifecycle_event_labels_are_contextual_inside_their_card():
     js = _code_only(_js())
     assert "g.label===lc.label?'Opened'" in js.replace(" ", "")
     assert "g.label===lc.label+'close'?'Closed':g.label" in js.replace(" ", "")
+
+
+# ---------------------------------------------------------------- UI defect pins
+#
+# Eight rendering defects, each pinned by the narrowest assertion that would
+# have failed before its fix. Four were invisible to the existing suite because
+# they lived in CSS, which nothing here had ever read -- hence _css().
+
+
+def _css() -> str:
+    return page_html().split("<style>")[1].split("</style>")[0]
+
+
+def _fn(name: str) -> str:
+    """One render function's source, so a pin cannot be satisfied elsewhere."""
+    js = _code_only(_js())
+    start = js.index(f"function {name}(")
+    nxt = js.find("\nfunction ", start + 1)
+    return js[start : nxt if nxt != -1 else len(js)]
+
+
+def test_header_cluster_right_aligns_and_groups_its_icons():
+    """`align-items` is pinned at BOTH levels, for two different reasons.
+
+    On .hdr-actions the default `stretch` was opted out of by .icobtn's
+    explicit width, and a definite cross-size lands an item at the cross-axis
+    start -- so the sync and cog buttons sat hard left of the right-aligned
+    note above them. Inside #ccywrap `stretch` was NOT opted out of: .ccytog
+    has no width, so it inflated to the wrap's width, itself widened to 210px
+    by .ccynote's max-width, leaving the rounded border extending past the
+    active button with dead space inside it.
+    """
+    css = _css().replace(" ", "").replace("\n", "")
+    assert "align-items:flex-end" in css.split(".hdr-actions{")[1].split("}")[0]
+    assert "align-items:flex-end" in css.split("#ccywrap{")[1].split("}")[0], \
+        "the currency toggle will stretch to the note's width again"
+    assert ".hdr-icons{display:flex" in css
+    # Both icons in the row wrapper, or they stack again.
+    head = page_html().split("</style>")[1]
+    icons = head.split('class="hdr-icons"')[1].split("</div>")[0]
+    assert 'id="sync"' in icons and 'id="cog"' in icons
+
+
+def test_the_drilldown_leg_row_gets_a_sixth_grid_column():
+    """legRow emits six children when `extra` is passed (the calendar
+    drill-down wedges a strategy label in), and .leg declares five columns --
+    so the sixth child, the proceeds figure, wrapped onto a second row and
+    left-aligned under the 52px action column, away from the price it belongs
+    beside. The variant carries the extra track so Trades rows keep exactly
+    five and gain no stray gap.
+    """
+    css = _css().replace(" ", "").replace("\n", "")
+    base = css.split(".leg{")[1].split("}")[0]
+    assert base.count("auto") == 3, "base .leg should stay a five-column grid"
+    ctx = css.split(".leg.ctx{")[1].split("}")[0]
+    assert ctx.count("auto") == 4, "the drill-down variant needs a sixth track"
+    # Compared against the space-stripped source, so the class literal's own
+    # leading space is gone here too.
+    assert '"leg${extra?\'ctx\':\'\'}"' in _fn("legRow").replace(" ", ""), \
+        "legRow must tag the six-child variant or the CSS never applies"
+
+
+def test_the_positions_side_cell_has_a_colour_rule_that_matches():
+    """The only buy/sell rules were compound (.act.buy / .act.sell), so the
+    bare <td class="sell"> the table emitted matched nothing and Long/Short
+    both rendered default white -- colour coding the markup asked for and
+    never got. Scoped to .side so the hue cannot leak onto other elements.
+    """
+    css = _css().replace(" ", "").replace("\n", "")
+    assert ".side.buy{color:" in css and ".side.sell{color:" in css
+    assert 'class="side${String(pos.side)' in _fn("positions").replace(" ", "")
+
+
+def test_position_group_subtotal_sits_under_the_value_column():
+    """The subtotal sums position_value_base, so it belongs in `value` -- the
+    fifth of nine columns. It used to ride a colspan=8 label into column 9,
+    under `record`, four columns from the figures it totals.
+    """
+    body = _fn("positions").replace(" ", "").replace("\n", "")
+    headers = re.findall(r"<th[^>]*>(.*?)</th>", _fn("positions"))
+    assert len(headers) == 9, f"column count changed: {headers}"
+    assert headers.index("value") == 4, "value is no longer the fifth column"
+    grp = body.split('<trclass="grp">')[1].split("</tr>")[0]
+    assert grp.count('colspan="4"') == 2, "label and trailing spans must be 4+4"
+    assert 'colspan="8"' not in grp
+
+
+def test_the_chart_axis_follows_the_display_currency():
+    """Tick values come from realized_base, so labelling them with num() left
+    the axis in the base currency while the headline, the cards and every dot
+    tooltip on the same chart restated -- the one figure on the page that
+    ignored the toggle, and it carried no symbol to admit which currency it
+    meant.
+    """
+    chart = _fn("chart").replace(" ", "")
+    assert "text-anchor=\"end\">${cash(v,0)}" in chart, "axis ticks not restated"
+    assert "${num(v,0)}" not in chart
+
+
+def test_dashboard_commission_reads_the_same_as_the_tables():
+    """The same all-time figure read "-EUR26.25" on the Dashboard card and
+    "EUR26.25" in the Annual and Month tables, so cross-checking one against
+    the other required knowing each surface's sign convention. Commission is a
+    cost and the label says so, so the magnitude is the honest form -- and the
+    sign-driven tint goes with the sign.
+    """
+    card = _fn("dashboard").replace(" ", "").replace("\n", "")
+    assert "statCard('Commissions',cash(Math.abs(s.commissions_base))" in card
+    assert "cls(s.commissions_base)" not in card, \
+        "colouring by a sign that is no longer displayed"
+
+
+def test_the_calendar_pills_describe_the_month_on_the_grid():
+    """Under "All time" the payload's days span the account while the grid can
+    draw only one month, so the pills described a scope the grid could not
+    account for -- on the demo journal, a blank August beside "Green days 7".
+    The grid now lands on the newest month that HAS a day, and the pills are
+    derived from the days actually on it, which for a specific month
+    reproduces green_days/red_days exactly.
+    """
+    cal = _fn("calendar")
+    assert "s.green_days" not in cal and "s.red_days" not in cal, \
+        "pills read the period-wide counts again"
+    flat = cal.replace(" ", "").replace("\n", "")
+    assert "shown.filter(dy=>dy.realized_base>0).length" in flat
+    assert "shown.filter(dy=>dy.realized_base<0).length" in flat
+    # The fallback is the newest ACTIVE month, not the newest month of the
+    # account's life -- month_range[0] is only the last resort.
+    assert "active[active.length-1]" in flat
