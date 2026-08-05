@@ -292,6 +292,8 @@ td.n,th.n{text-align:right}
  * @property {number|null} avg_loss_base -- null without losses
  * @property {number} open_premium_base -- excluded from P&L until positions close
  * @property {number} open_commission_base -- excluded the same way
+ * @property {number|null} open_commission_native -- as charged, null when mixed
+ * @property {string|null} open_commission_native_ccy -- the currency charged
  * @property {number|null} net_liq_base -- null until equity summaries exist
  * @property {string|null} net_liq_date
  * @property {number|null} gain_pct_of_net_liq
@@ -658,11 +660,21 @@ const natCash=(v,rate,d)=>
 
    One helper, used by the Dashboard card and both tables, because the same
    figure reading differently on two tabs is the defect this replaced. */
+/* One rule, applied to every commission figure: show the charge when the
+   reader is already in the currency it was charged in, else the restatement.
+   Factored rather than repeated because the headline card and the
+   open-positions figure beside it sit in the SAME sentence -- "as charged ·
+   $2.83 on open positions" is a contradiction if only one of them is. */
+const isNativeCharge=(nat,ccy)=>nat!=null&&ccy===DISP();
+const chargeOf=(nat,ccy,base)=>isNativeCharge(nat,ccy)
+  ? money(Math.abs(nat),ccy) : cash(Math.abs(base));
 const commissionIsNative=s=>
-  s.commissions_native!=null&&s.commissions_native_ccy===DISP();
-const commissionOf=s=>commissionIsNative(s)
-  ? money(Math.abs(s.commissions_native),s.commissions_native_ccy)
-  : cash(Math.abs(s.commissions_base));
+  isNativeCharge(s.commissions_native,s.commissions_native_ccy);
+const commissionOf=s=>
+  chargeOf(s.commissions_native,s.commissions_native_ccy,s.commissions_base);
+const openCommissionOf=s=>
+  chargeOf(s.open_commission_native,s.open_commission_native_ccy,
+           s.open_commission_base);
 /* Which basis the figure on screen actually uses -- three states, not two.
    "restated" is a claim, and it is false when the reader is looking at the
    base currency: that figure is IBKR's own conversion, unrestated, and saying
@@ -858,7 +870,7 @@ function dashboard(){
     statCard('Commissions', commissionOf(s),
       commissionBasis(s)
       +(opt?` · closed round trips${s.open_commission_base?` · ${
-        cash(Math.abs(s.open_commission_base))} on open positions`:''}`
+        openCommissionOf(s)} on open positions`:''}`
          :' · stated by IBKR'),
       'sm'),
     /* No account-level Fees card here by request: market-data and custody

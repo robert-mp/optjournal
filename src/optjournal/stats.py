@@ -261,6 +261,13 @@ class MonthStats:
     #: honest rather than vanishing until the close month.
     open_commission_base: float = 0.0
 
+    #: The open-position commission as charged, same single-currency rule as
+    #: `commissions_native`. Separate from it because the populations differ:
+    #: one is closed round trips, the other still-open ones, and a scope can
+    #: easily be single-currency in one and mixed in the other.
+    open_commission_native: float | None = None
+    open_commission_native_ccy: str | None = None
+
     #: Net Asset Value at the period's end, from the newest equity summary on
     #: or before it. None when the Flex query template does not have the
     #: "Equity Summary in Base" section enabled -- unavailable, not zero.
@@ -856,6 +863,13 @@ def month_stats(
         stats.open_commission_base = sum(
             e.commission_base for e in report.open if scope.has_episode(e)
         )
+        open_by_ccy: dict[str, float] = {}
+        for e in report.open:
+            if scope.has_episode(e) and e.commission:
+                open_by_ccy[e.currency] = open_by_ccy.get(e.currency, 0.0) + e.commission
+        stats.open_commission_native, stats.open_commission_native_ccy = _one_currency(
+            open_by_ccy
+        )
     stats.open_premium_base = sum(
         e.proceeds_base for e in report.open if scope.has_episode(e)
     )
@@ -892,6 +906,8 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "avg_loss_base": stats.avg_loss_base,
         "open_premium_base": stats.open_premium_base,
         "open_commission_base": stats.open_commission_base,
+        "open_commission_native": stats.open_commission_native,
+        "open_commission_native_ccy": stats.open_commission_native_ccy,
         "net_liq_base": stats.net_liq_base,
         "net_liq_date": stats.net_liq_date,
         "gain_pct_of_net_liq": stats.gain_pct_of_net_liq,

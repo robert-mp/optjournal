@@ -1313,8 +1313,8 @@ def test_dashboard_commission_reads_the_same_as_the_tables():
     which passed only while the three call sites happened to be spelled alike.
     """
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
-    assert "constcommissionOf=s=>commissionIsNative(s)" in js, \
-        "the shared commission helper is gone"
+    assert "constchargeOf=(nat,ccy,base)=>isNativeCharge(nat,ccy)" in js, \
+        "the shared charge helper is gone"
     for fn in ("dashboard", "annual", "monthlyTable"):
         body = _fn(fn).replace(" ", "").replace("\n", "")
         assert "commissionOf(s)" in body, f"{fn} does not use the shared helper"
@@ -1322,7 +1322,6 @@ def test_dashboard_commission_reads_the_same_as_the_tables():
             f"{fn} bypasses the helper and can drift from the others"
     # Magnitude, not sign: the tint went with the sign it no longer shows.
     assert "cls(s.commissions_base)" not in _fn("dashboard").replace(" ", "")
-    assert "Math.abs(s.commissions_native)" in _code_only(_js()).replace(" ", "")
 
 
 def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
@@ -1339,13 +1338,22 @@ def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
     """
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
     # The gate is currency identity, not merely presence of a native figure.
-    assert "s.commissions_native!=null&&s.commissions_native_ccy===DISP()" in js
-    # money(), not cash(): a native amount must NOT be passed through conv().
-    helper = _code_only(_js())
-    helper = helper[helper.index("const commissionOf") :][:260].replace(" ", "")
-    assert "money(Math.abs(s.commissions_native),s.commissions_native_ccy)" in helper
-    assert "cash(s.commissions_native" not in helper, \
-        "converting an already-native amount reintroduces the round trip"
+    assert "constisNativeCharge=(nat,ccy)=>nat!=null&&ccy===DISP()" in js
+    # money(), not cash(): a native amount must NOT be passed through conv(),
+    # which would reintroduce the round trip the native figure exists to avoid.
+    assert "money(Math.abs(nat),ccy):cash(Math.abs(base))" in js
+    assert "cash(Math.abs(nat)" not in js
+
+    # BOTH commission figures route through the one rule. They share a sentence
+    # on the card -- "as charged - $2.83 on open positions" -- so one being a
+    # restatement while the other is a charge would be a contradiction in a
+    # single line of prose.
+    assert "constcommissionOf=s=>chargeOf(s.commissions_native," in js
+    assert "constopenCommissionOf=s=>chargeOf(s.open_commission_native," in js
+    card = _fn("dashboard").replace(" ", "").replace("\n", "")
+    assert "openCommissionOf(s)" in card
+    assert "cash(Math.abs(s.open_commission_base))" not in card, \
+        "the open-positions figure bypasses the shared rule"
 
 
 def test_the_calendar_pills_describe_the_month_on_the_grid():
