@@ -27,7 +27,7 @@ from typing import Any
 
 from optjournal.analysis import CostReport
 from optjournal.history import HistoryReport
-from optjournal.money import Money
+from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
 
 Row = dict[str, Any]
@@ -102,6 +102,26 @@ def summary_data(resp, path: Path | None = None) -> Row:
         }
     return data
 
+def _replace_with_money(row: Row, monies: dict[str, Row]) -> None:
+    """Swap a DERIVED row's flat money triples for one `Money` each, in place.
+
+    Only for rows nothing aggregates from. An order, a strategy group and a
+    lifecycle are each derived, and every level derives from the leaf legs
+    directly, so their flat triples have no remaining reader: six keys become
+    three.
+
+    A leg instead keeps its raw triple and gains its Money under `money` --
+    the same split a position snapshot gets, for the same reason. The triple is
+    the leaf datum every level above re-aggregates; the Money is one reading of
+    it. They cannot be collapsed: a Money whose native is withheld for spanning
+    currencies is indistinguishable from one that never had a native, so
+    re-gating on it would silently drop a contributor.
+    """
+    for field, money in monies.items():
+        row.pop(f"{field}_base", None)
+        row[field] = money
+
+
 def orders_data(
     conn: sqlite3.Connection,
     order_ids: frozenset[str] | None = None,
@@ -131,7 +151,22 @@ def orders_data(
             (o["ib_order_id"], asset_category),
         ).fetchall()
         row = dict(o)
-        row["legs"] = [dict(lg) for lg in legs]
+        leg_rows = [dict(lg) for lg in legs]
+        # Computed from the raw view columns BEFORE any are replaced -- the
+        # order's figures aggregate the legs' natives, so overwriting a leg's
+        # `proceeds` with its Money first would leave the order summing dicts.
+        order_money = {f: Money.from_rows(leg_rows, f).payload()
+                       for f in FILL_MONEY_FIELDS}
+        for lg in leg_rows:
+            # A single leg is single-currency by construction, so the gate has
+            # nothing to decide -- but one code path from fill to lifecycle is
+            # worth more than the shortcut.
+            # Added under `money`, not replacing: strategy_groups and the
+            # lifecycle both re-aggregate these same legs from the flat triple.
+            lg["money"] = {f: Money.from_rows([lg], f).payload()
+                           for f in FILL_MONEY_FIELDS}
+        row["legs"] = leg_rows
+        _replace_with_money(row, order_money)
         out.append(row)
     return out
 
@@ -342,11 +377,19 @@ def history_data(report: HistoryReport) -> Row:
             "open_fills": e.open_fills,
             "close_fills": e.close_fills,
             "net_qty": e.net_qty,
-            "realized_pnl": e.realized_pnl,
-            "realized_pnl_base": e.realized_pnl_base,
+            # Both readings are known for one episode, and an episode is
+            # single-currency by construction, so the plain constructor applies
+            # -- there is no gate to ask.
+            "realized_pnl": Money(
+                base=e.realized_pnl_base, native=e.realized_pnl,
+                currency=e.currency).payload(),
             "realized_is_net_of_commission": e.net_of_commission,
-            "commission": e.commission,
-            "commission_base": e.commission_base,
+            "commission": Money(
+                base=e.commission_base, native=e.commission,
+                currency=e.currency).payload(),
+            "proceeds": Money(
+                base=e.proceeds_base, native=e.proceeds,
+                currency=e.currency).payload(),
             "currency": e.currency,
             "notes": e.notes,
         }

@@ -24,8 +24,15 @@ layer may hold one without acquiring a dependency direction.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
+
+#: The money figures every fill row in this journal carries -- each with a
+#: `_base` twin and a shared `currency`. Named here, beside the type that reads
+#: them, so a leg, an order, a strategy group and a lifecycle cannot disagree
+#: about which figures exist.
+FILL_MONEY_FIELDS = ("proceeds", "commission", "realized_pnl")
 
 
 def one_currency(by_ccy: dict[str, float]) -> tuple[float | None, str | None]:
@@ -131,6 +138,33 @@ class Money:
         amount = float(native)
         base = amount if rate is None else amount * float(rate)
         return cls(base=base, native=amount, currency=currency)
+
+    @classmethod
+    def from_rows(cls, rows: Iterable[Mapping[str, Any]], field: str) -> Money:
+        """One figure aggregated from fill rows following this project's shape.
+
+        A fill row -- a `trade_legs` view row, an order, an episode-backed
+        event -- carries every money figure three ways: `field` is the native
+        amount, `field_base` the translation, and `currency` the one it was
+        billed in. This walks that convention so the extraction is written
+        once instead of at each aggregation site.
+
+        Every level above a leg (order, strategy group, position lifecycle)
+        derives its figures from the SAME leaf rows rather than summing the
+        level below. The base is identical either way because sums are
+        associative -- but the gate is not: asked at each level against the
+        union of those legs' currencies it answers correctly everywhere, where
+        re-gating an already-gated total cannot tell a native withheld for
+        being mixed from one that was never there.
+
+        `trade_legs` carries a currency; `trade_orders` deliberately carries
+        none, because an order can span them. That asymmetry is why the leaf is
+        the only honest source.
+        """
+        return cls.charged(
+            (row.get(f"{field}_base"), row.get(field), row.get("currency"))
+            for row in rows
+        )
 
     @property
     def is_exact(self) -> bool:

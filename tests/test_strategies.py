@@ -8,6 +8,8 @@ two unrelated positions.
 
 from __future__ import annotations
 
+import pytest
+
 from optjournal.strategies import (
     WINDOW_S,
     classify,
@@ -25,7 +27,17 @@ def _leg(**kw):
         "buy_sell": "SELL",
         "open_close": "O",
         "quantity": -1,
+        # The trade_legs view carries every money figure three ways -- native,
+        # base and the currency it was billed in -- and every level above
+        # re-aggregates from exactly these keys. A double that omitted them
+        # would hide the aggregation it is meant to exercise.
+        "currency": "USD",
+        "proceeds": 115.0,
         "proceeds_base": 100.0,
+        "commission": -0.71,
+        "commission_base": -0.62,
+        "realized_pnl": 0.0,
+        "realized_pnl_base": 0.0,
     }
     leg.update(kw)
     return leg
@@ -57,7 +69,9 @@ def test_same_second_orders_on_one_underlying_group_as_a_strangle():
     assert g["label"] == "Strangle"
     assert sorted(g["order_ids"]) == ["1", "2"]
     assert len(g["orders"]) == 2, "member orders stay visible beneath the group"
-    assert g["proceeds_base"] == put["proceeds_base"] + call["proceeds_base"]
+    assert g["proceeds"]["base"] == pytest.approx(
+        put["proceeds_base"] + call["proceeds_base"]
+    )
 
 
 def test_orders_outside_the_window_stay_separate():
@@ -80,9 +94,13 @@ def test_a_group_of_one_is_exactly_its_order():
     (g,) = strategy_groups([o])
     assert g["label"] == "Short put"
     assert g["orders"] == [o]
-    assert (g["proceeds_base"], g["commission_base"]) == (
-        o["proceeds_base"], o["commission_base"],
-    )
+    # `_order` is a hand-built row, not one `orders_data` produced, so it has
+    # no Money -- the group's figures come from the LEGS either way, which is
+    # exactly the property under test.
+    (leg,) = o["legs"]
+    assert g["proceeds"]["base"] == pytest.approx(leg["proceeds_base"])
+    assert g["proceeds"]["native"] == pytest.approx(leg["proceeds"])
+    assert g["commission"]["base"] == pytest.approx(leg["commission_base"])
 
 
 def test_classification_is_derived_from_the_combined_legs():
@@ -133,6 +151,11 @@ class _Ep:
         self.closed_at = closed_at
         self.realized_pnl_base = pnl
         self.commission_base = comm
+        # Real episodes carry the native amount and the currency it settled in;
+        # the lifecycle gates on them, so the double must too.
+        self.realized_pnl = pnl
+        self.commission = comm
+        self.currency = "USD"
 
 
 def test_open_and_close_events_link_into_one_closed_lifecycle():
@@ -156,7 +179,7 @@ def test_open_and_close_events_link_into_one_closed_lifecycle():
     assert lc["label"] == "Short put", "named by the shape it was OPENED as"
     assert (lc["opened_at"], lc["closed_at"]) == (
         "2026-07-24 10:35:01", "2026-08-03 09:55:23")
-    assert lc["realized_pnl_base"] == 684.59, "episode-sourced, not fill-summed"
+    assert lc["realized_pnl"]["base"] == 684.59, "episode-sourced, not fill-summed"
     assert len(lc["events"]) == 2, "both events stay visible beneath"
 
 
@@ -167,8 +190,8 @@ def test_an_open_lifecycle_reports_no_realised_pnl():
     (lc,) = position_groups([opening], episodes=[ep],
                             trade_to_order={"t1": "10"})
     assert lc["status"] == "open"
-    assert lc["realized_pnl_base"] is None
-    assert lc["commission_base"] is None
+    assert lc["realized_pnl"] is None
+    assert lc["commission"] is None
 
 
 def test_unrelated_contracts_never_share_a_lifecycle():
@@ -198,7 +221,7 @@ def test_a_roll_event_chains_lifecycles_into_one_campaign():
     assert len(got) == 1, "the campaign is one lifecycle"
     lc = got[0]
     assert lc["status"] == "open", "the rolled-into leg is still open"
-    assert lc["realized_pnl_base"] is None, "campaign not decided yet"
+    assert lc["realized_pnl"] is None, "campaign not decided yet"
     assert {e["label"] for e in lc["events"]} == {"Short put", "Roll"}
 
 
@@ -272,3 +295,37 @@ def test_a_right_less_closing_leg_is_still_named_a_close():
     # Options keep the direction naming they already had.
     assert classify([{"put_call": "P", "buy_sell": "SELL", "open_close": "O"}]) == "Short put"
     assert classify([{"put_call": "P", "buy_sell": "BUY", "open_close": "C"}]) == "Short put close"
+
+
+def test_every_level_aggregates_the_leaf_rows_not_the_level_below():
+    """Leg, order, strategy group and lifecycle all derive from the same fill
+    rows, and each asks the gate against the union of THOSE legs' currencies.
+
+    Summing the level below would give an identical base -- sums are
+    associative -- but it cannot gate correctly. An order spanning currencies
+    has `native: null`, and a group summing that order could not tell a native
+    withheld for being mixed from one that was never there, so it would gate as
+    though that order had contributed nothing.
+    """
+    usd = _leg(proceeds=100.0, proceeds_base=90.0, currency="USD")
+    sek = _leg(proceeds=1000.0, proceeds_base=95.0, currency="SEK",
+               put_call="C", strike=675.0)
+    (mixed,) = strategy_groups([_order("1", "2026-08-03 11:11:19", [usd, sek])])
+
+    # The base is complete regardless -- it is the addable reading.
+    assert mixed["proceeds"]["base"] == pytest.approx(185.0)
+    # ...and the exact figure is withheld, because no single currency accounts
+    # for it. An exact-looking 100.0 covering half a total would be worse.
+    assert mixed["proceeds"]["native"] is None
+    assert mixed["proceeds"]["ccy"] is None
+
+    # A single-currency group answers, through the very same code path.
+    (uniform,) = strategy_groups([
+        _order("2", "2026-08-03 11:11:19",
+               [_leg(proceeds=100.0, proceeds_base=90.0, currency="USD"),
+                _leg(proceeds=40.0, proceeds_base=36.0, currency="USD",
+                     put_call="C", strike=675.0)])
+    ])
+    assert uniform["proceeds"]["native"] == pytest.approx(140.0)
+    assert uniform["proceeds"]["ccy"] == "USD"
+    assert uniform["proceeds"]["base"] == pytest.approx(126.0)

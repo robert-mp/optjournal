@@ -254,6 +254,7 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         "Position": first(state["positions"]),
         "Order": first(orders),
         "Leg": first(orders[0]["legs"]) if orders else None,
+        "LegMoney": first(orders[0]["legs"])["money"] if orders else None,
         "Episode": first(history["closed"] + history["open"]),
         "History": history,
         "Costs": costs,
@@ -606,10 +607,10 @@ def test_a_lifecycle_spans_open_and_close_and_matches_the_dashboard(populated):
     assert len(lc["events"]) >= 2, "the open and the close are both present"
     assert lc["opened_at"][:10] == ep.opened_at[:10]
     assert lc["closed_at"][:10] == ep.closed_at[:10]
-    assert lc["realized_pnl_base"] == pytest.approx(ep.realized_pnl_base)
+    assert lc["realized_pnl"]["base"] == pytest.approx(ep.realized_pnl_base)
     # An open lifecycle keeps the Dashboard's rule: nothing until flat.
     for open_lc in (x for x in st["lifecycles"] if x["status"] == "open"):
-        assert open_lc["realized_pnl_base"] is None
+        assert open_lc["realized_pnl"] is None
 
 
 def test_dashboard_headline_counts_closed_round_trips_for_options():
@@ -1500,11 +1501,14 @@ def test_proceeds_and_friction_follow_the_same_charge_rule_as_commission():
     # reaches chargeOf directly rather than through moneyOf. Both paths are the
     # SAME rule -- moneyOf delegates to chargeOf -- which is the property that
     # stops a change reaching one figure and missing another.
-    assert "legProceedsOf=l=>chargeOf(l.proceeds,l.currency,l.proceeds_base)" in js
+    # There is now exactly ONE entry point. `legProceedsOf` existed only because
+    # a leg carried its triple flat; the leaf now carries a Money too, so every
+    # display site in the page goes through `moneyOf`.
+    assert "legProceedsOf" not in js, "the second entry point is back"
     assert "constmoneyOf=mo=>mo==null?cash(null):chargeOf(" in js, \
         "moneyOf no longer delegates to the shared rule"
     card = _fn("dashboard").replace(" ", "").replace("\n", "")
     assert "moneyOf(s.open_premium)" in card and "moneyOf(s.options_friction)" in card
     assert "cash(s.open_premium.base)}</b>" not in card, "pill bypasses the rule"
     assert "cash(s.options_friction.base)" not in card, "pill bypasses the rule"
-    assert "legProceedsOf(l)" in _fn("legRow").replace(" ", "")
+    assert "moneyOf(l.money.proceeds)" in _fn("legRow").replace(" ", "")

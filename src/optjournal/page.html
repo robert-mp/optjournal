@@ -347,12 +347,9 @@ td.n,th.n{text-align:right}
  * @property {string} last_fill_at
  * @property {string} underlyings
  * @property {string} expiries
- * @property {number} proceeds
- * @property {number} proceeds_base
- * @property {number} commission
- * @property {number} commission_base
- * @property {number} realized_pnl
- * @property {number} realized_pnl_base
+ * @property {Money} proceeds
+ * @property {Money} commission
+ * @property {Money} realized_pnl
  * @property {Array} legs -- Leg rows
  */
 
@@ -375,12 +372,15 @@ td.n,th.n{text-align:right}
  * @property {string} last_fill_at
  * @property {number} quantity
  * @property {number} avg_price -- always in the contract's own currency
+ * Raw leaf columns. Kept because every level above re-aggregates them; read
+ * `money` to DISPLAY a figure, so the as-charged rule applies.
  * @property {number} proceeds
  * @property {number} proceeds_base
  * @property {number} commission
  * @property {number} commission_base
  * @property {number} realized_pnl
  * @property {number} realized_pnl_base
+ * @property {LegMoney} money
  */
 
 /** @typedef {Object} Episode -- one FIFO round trip per conid (serialize.history_data)
@@ -403,11 +403,10 @@ td.n,th.n{text-align:right}
  * @property {number} open_fills
  * @property {number} close_fills
  * @property {number} net_qty
- * @property {number} realized_pnl
- * @property {number} realized_pnl_base -- already net of every leg's commission
+ * @property {Money} realized_pnl -- already net of every leg's commission
  * @property {boolean} realized_is_net_of_commission
- * @property {number} commission
- * @property {number} commission_base
+ * @property {Money} commission
+ * @property {Money} proceeds
  * @property {string} currency
  * @property {Array} notes
  */
@@ -433,6 +432,12 @@ td.n,th.n{text-align:right}
  * @property {Array} withholding
  * @property {string} journal_asset
  * @property {CostsTotals} totals
+ */
+
+/** @typedef {Object} LegMoney -- a leaf row's figures, interpreted
+ * @property {Money} proceeds
+ * @property {Money} commission
+ * @property {Money} realized_pnl
  */
 
 /** @typedef {Object} Money -- an amount and the currency it was charged in
@@ -531,9 +536,9 @@ td.n,th.n{text-align:right}
  * @property {Array} order_ids
  * @property {string} first_fill_at
  * @property {number} fills
- * @property {number} proceeds_base
- * @property {number} commission_base
- * @property {number} realized_pnl_base
+ * @property {Money} proceeds
+ * @property {Money} commission
+ * @property {Money} realized_pnl
  * @property {Array} orders -- the member Order rows, fully visible
  */
 
@@ -546,9 +551,9 @@ td.n,th.n{text-align:right}
  * @property {Array} conids
  * @property {number} episodes
  * @property {number} fills
- * @property {number} proceeds_base
- * @property {number|null} realized_pnl_base -- null until the lifecycle is closed
- * @property {number|null} commission_base -- same rule
+ * @property {Money} proceeds
+ * @property {Money|null} realized_pnl -- null until the lifecycle is closed
+ * @property {Money|null} commission -- same rule
  * @property {Array} events -- StrategyGroup rows
  */
 
@@ -690,10 +695,6 @@ const chargeOf=(nat,ccy,base)=>isNativeCharge(nat,ccy)
 const moneyOf=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);
 /** @param {Money|null} mo */
 const isNative=mo=>mo!=null&&isNativeCharge(mo.native,mo.ccy);
-/* A leg carries the same triple flat rather than as a Money -- legs and
-   episodes are the one payload shape still spelling it out -- so it reaches
-   the rule directly. */
-const legProceedsOf=l=>chargeOf(l.proceeds,l.currency,l.proceeds_base);
 /* Which basis the figure on screen actually uses -- three states, not two.
    "restated" is a claim, and it is false when the reader is looking at the
    base currency: that figure is IBKR's own conversion, unrestated, and saying
@@ -1133,7 +1134,7 @@ function legRow(l,extra=''){
     <span class="mono dim">×${Math.abs(l.quantity)}</span>
     <span class="mono" title="fill price, always in the contract's own currency"
       >${money(l.avg_price,l.currency)}</span>
-    <span class="mono ${cls(l.proceeds_base)}">${legProceedsOf(l)}</span>
+    <span class="mono ${cls(l.money.proceeds.base)}">${moneyOf(l.money.proceeds)}</span>
   </div>`;
 }
 function groupLabel(legs){
@@ -1175,17 +1176,17 @@ function trades(){
         <div class="sub mono">${when} · ${lc.fills} fill(s) · ${evs.length} event(s)</div></div>
       </div>
       <div class="stats" style="grid-template-columns:repeat(3,1fr)">
-        ${statCard('Proceeds', cash(lc.proceeds_base),
+        ${statCard('Proceeds', moneyOf(lc.proceeds),
           nat&&nat!==DISP()?`${money(legs.reduce((a,l)=>a+(l.proceeds||0),0),nat)} as filled`:'',
-          'sm '+cls(lc.proceeds_base))}
+          'sm '+cls(lc.proceeds.base))}
         ${statCard('Comms & Fees',
-          lc.commission_base!=null?cash(lc.commission_base):'—',
+          lc.commission!=null?moneyOf(lc.commission):'—',
           openLc?'lands with the outcome, on close':'all legs, whole lifecycle',
-          'sm '+cls(lc.commission_base))}
+          'sm '+cls(lc.commission?.base))}
         ${statCard('Realised P&L',
-          lc.realized_pnl_base!=null?cash(lc.realized_pnl_base):'—',
+          lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—',
           openLc?'nothing counts until the position is flat':'net of commission',
-          'sm '+cls(lc.realized_pnl_base))}
+          'sm '+cls(lc.realized_pnl?.base))}
       </div>
       ${evs.map(g=>{
         const glegs=(g.orders||[]).flatMap(o=>o.legs||[]);
@@ -1203,7 +1204,7 @@ function trades(){
         <div class="gh"><span class="gl">${esc((g.first_fill_at||'').slice(0,10))} — ${
           esc(evl)} <span class="dim2 mono">order${(g.order_ids||[]).length>1?'s':''} ${
           esc((g.order_ids||[]).join(', '))}</span></span>
-          <span class="mono ${cls(g.proceeds_base)}">${cash(g.proceeds_base)}</span></div>
+          <span class="mono ${cls(g.proceeds.base)}">${moneyOf(g.proceeds)}</span></div>
         ${glegs.map(l=>legRow(l)).join('')}
       </div>`;}).join('')}
       ${legs.length>1?'':`<div class="note">One leg, so this is a single-leg
@@ -1495,8 +1496,8 @@ function odte(){
         <td class="dim mono">${esc(String(ep.opened_at||'').slice(0,16))}</td>
         <td class="dim mono">${esc(String(ep.closed_at||'').slice(0,16))}</td>
         <td class="n mono">${ep.contracts}</td>
-        <td class="n mono ${cls(ep.realized_pnl_base)}">${cash(ep.realized_pnl_base)}</td>
-        <td class="n mono">${cash(Math.abs(ep.commission_base))}</td>
+        <td class="n mono ${cls(ep.realized_pnl.base)}">${moneyOf(ep.realized_pnl)}</td>
+        <td class="n mono">${moneyOf(ep.commission)}</td>
         <td class="dim2">${esc(ep.status)}</td></tr>`).join('')}
     </tbody></table>`
     :`<div class="empty" style="margin-top:16px">none of the ${closedTotal} closed

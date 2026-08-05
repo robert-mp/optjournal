@@ -28,6 +28,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from optjournal.money import FILL_MONEY_FIELDS, Money
+
 Row = dict[str, Any]
 
 #: Orders on the same underlying with first fills inside this window are one
@@ -167,9 +169,13 @@ def strategy_groups(orders: list[Row]) -> list[Row]:
             "order_ids": [str(o.get("ib_order_id")) for o in members],
             "first_fill_at": min(str(o.get("first_fill_at") or "") for o in members),
             "fills": sum(o.get("fills") or 0 for o in members),
-            "proceeds_base": sum(o.get("proceeds_base") or 0.0 for o in members),
-            "commission_base": sum(o.get("commission_base") or 0.0 for o in members),
-            "realized_pnl_base": sum(o.get("realized_pnl_base") or 0.0 for o in members),
+            # Aggregated from `legs` -- the leaf fill rows already in hand --
+            # rather than by summing the orders' own figures. The base is the
+            # same either way, but the gate must be asked against the union of
+            # THESE legs' currencies: a group whose legs span currencies has no
+            # exact figure, and re-gating an already-gated order total cannot
+            # tell a withheld native from an absent one.
+            **{f: Money.from_rows(legs, f).payload() for f in FILL_MONEY_FIELDS},
             "orders": members,
         })
     out.sort(key=lambda g: g["first_fill_at"], reverse=True)
@@ -252,14 +258,25 @@ def position_groups(
             "conids": sorted({str(e.conid) for e in eps}),
             "episodes": len(eps),
             "fills": sum(e.get("fills") or 0 for e in members),
-            "proceeds_base": sum(e.get("proceeds_base") or 0.0 for e in members),
-            # Episode-sourced, so it equals the Dashboard's accounting exactly
-            # -- populated only when the lifecycle is closed, same rule.
-            "realized_pnl_base": (
-                sum(e.realized_pnl_base for e in eps) if closed else None
+            # Down to the same leaf rows again, through every event's orders.
+            "proceeds": Money.from_rows(
+                (lg for ev in members for o in ev.get("orders", ())
+                 for lg in o.get("legs", ())),
+                "proceeds",
+            ).payload(),
+            # Episode-sourced, so these equal the Dashboard's accounting
+            # exactly -- populated only when the lifecycle is closed, same
+            # rule. Episodes carry the native and the currency, so the figure
+            # is exact wherever one currency closed the whole position.
+            "realized_pnl": (
+                Money.charged(
+                    (e.realized_pnl_base, e.realized_pnl, e.currency) for e in eps
+                ).payload() if closed else None
             ),
-            "commission_base": (
-                sum(e.commission_base for e in eps) if closed else None
+            "commission": (
+                Money.charged(
+                    (e.commission_base, e.commission, e.currency) for e in eps
+                ).payload() if closed else None
             ),
             "events": members,
         })
