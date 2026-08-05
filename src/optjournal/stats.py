@@ -40,6 +40,7 @@ from datetime import date
 from typing import Any
 
 from optjournal.history import build_history
+from optjournal.money import Money
 
 __all__ = [
     "ALL_TRADES",
@@ -219,24 +220,16 @@ class MonthStats:
     #: date (the old rule, still used for other categories) showed the same
     #: euros twice across months: July displayed the opening legs' commission,
     #: and August's net P&L contained it again. Signed, like the fill sum was.
-    commissions_base: float = 0.0
-
-    #: Commission as CHARGED, in the currency it was charged in -- set only
-    #: when every contributing row shares one currency, and None otherwise.
     #:
-    #: `commissions_base` is an accounting translation: each row converted at
-    #: IBKR's own rate for ITS OWN date. Displaying that sum in a non-base
-    #: currency multiplies it by a single later snapshot rate, so a USD charge
-    #: makes a round trip -- USD to EUR at trade date, EUR to USD at snapshot --
+    #: `.base` is an accounting translation: each row converted at IBKR's own
+    #: rate for ITS OWN date. Displaying that sum in a non-base currency
+    #: multiplies it by a single later snapshot rate, so a USD charge makes a
+    #: round trip -- USD to EUR at trade date, EUR to USD at snapshot --
     #: through two different rates, and does not come back. On this account
     #: that read $7.0021 for commission IBKR actually billed as $6.9652.
-    #:
-    #: The native figure is exact but cannot be summed across currencies, so it
-    #: is offered only where one currency accounts for all of it. A mixed scope
-    #: (this account's stock trades span USD, SEK, EUR and KRW) gets None, and
-    #: the display falls back to the restatement it has always shown.
-    commissions_native: float | None = None
-    commissions_native_ccy: str | None = None
+    #: `.native` is that exact figure, present only where one currency
+    #: accounts for all of it; see `Money`.
+    commissions: Money = Money.restated(0.0)
     fees_base: float = 0.0
 
     #: Episode-derived, so a two-fill close counts once.
@@ -251,26 +244,21 @@ class MonthStats:
     #: premium was collected, negative for long debits. Point-in-time like
     #: `open_episodes`, not a period figure. Reported so the money excluded
     #: from Net P&L is visible somewhere honest -- collected premium is a
-    #: liability until the position closes, not profit.
-    open_premium_base: float = 0.0
-
-    #: Open premium as received or paid, same single-currency rule.
-    open_premium_native: float | None = None
-    open_premium_native_ccy: str | None = None
+    #: liability until the position closes, not profit. Premium is cash in the
+    #: contract's own currency, so it takes the same native treatment as
+    #: commission.
+    open_premium: Money = Money.restated(0.0)
 
     #: Commission already paid on *currently open* episodes. Point-in-time,
-    #: like `open_premium_base`, and excluded from `commissions_base` for the
-    #: same reason the premium is excluded from P&L: it belongs to an outcome
-    #: that has not landed yet. Surfaced so the cash is visible somewhere
-    #: honest rather than vanishing until the close month.
-    open_commission_base: float = 0.0
-
-    #: The open-position commission as charged, same single-currency rule as
-    #: `commissions_native`. Separate from it because the populations differ:
+    #: like `open_premium`, and excluded from `commissions` for the same reason
+    #: the premium is excluded from P&L: it belongs to an outcome that has not
+    #: landed yet. Surfaced so the cash is visible somewhere honest rather than
+    #: vanishing until the close month.
+    #:
+    #: A separate figure from `commissions` because the populations differ:
     #: one is closed round trips, the other still-open ones, and a scope can
     #: easily be single-currency in one and mixed in the other.
-    open_commission_native: float | None = None
-    open_commission_native_ccy: str | None = None
+    open_commission: Money = Money.restated(0.0)
 
     #: Net Asset Value at the period's end, from the newest equity summary on
     #: or before it. None when the Flex query template does not have the
@@ -301,26 +289,21 @@ class MonthStats:
         return self.net_pnl_base / self.net_liq_base * 100.0
 
     @property
-    def options_friction_base(self) -> float:
-        """Friction attributable to `asset_category`.
+    def options_friction(self) -> Money:
+        """Friction attributable to `asset_category`, base and as-charged.
 
         Commission is charged per trade, so it carries an assetCategory and
         the ingest filter genuinely applies to it. This is the only friction
         figure on this panel that is scoped to the journalled instruments.
-        """
-        return abs(self.commissions_base)
 
-    @property
-    def options_friction_native(self) -> float | None:
-        """The same friction as charged, or None when the scope is mixed.
-
-        Derived from `commissions_native` rather than tracked separately: they
-        are the same money, and computing the magnitude twice is how the two
-        drift apart.
+        Derived from `commissions` rather than tracked separately: they are the
+        same money, and computing the magnitude twice is how the two drift
+        apart. Taking `abs` of a `Money` carries the currency along, so the
+        as-charged figure cannot end up labelled with another figure's
+        currency -- which is what the two separate properties this replaces
+        had to do, reading `commissions_native_ccy` for their own label.
         """
-        if self.commissions_native is None:
-            return None
-        return abs(self.commissions_native)
+        return abs(self.commissions)
 
     @property
     def account_friction_base(self) -> float:
@@ -348,10 +331,14 @@ class MonthStats:
         Presenting this single figure under a panel headed "options" was
         wrong: it labelled account-level fees as this journal's cost, which
         is the same defect the cost report carried. Read
-        `options_friction_base` and `account_friction_base` instead wherever
+        `options_friction` and `account_friction_base` instead wherever
         the scope is being claimed.
+
+        Base only, and not a `Money`: it merges a per-trade charge with
+        account-level fees, so no single currency can speak for the sum even
+        when the commission half is uniform.
         """
-        return self.options_friction_base + self.account_friction_base
+        return self.options_friction.base + self.account_friction_base
 
 
 @dataclass(frozen=True)
@@ -747,32 +734,6 @@ def _net_liq_for(
     return best
 
 
-def one_currency(by_ccy: dict[str, float]) -> tuple[float | None, str | None]:
-    """The total and its currency, when exactly one currency accounts for it.
-
-    Public because three surfaces need the same judgement -- commission and
-    premium here, and the cost report's per-currency breakdown, which is built
-    in analysis.py (a leaf module, which deliberately does not interpret it)
-    and gated in serialize.py. A rule applied in three places must be written
-    once or the three drift.
-
-    A native figure is exact but unaddable: USD, SEK and KRW commission cannot
-    share a number. So it is offered only when the scope is single-currency,
-    and withheld -- (None, None) -- the moment a second currency appears, which
-    is the display's signal to fall back to the base restatement rather than
-    show an exact-looking figure that silently dropped part of the total.
-
-    Currencies with no commission are ignored rather than counted: a scope of
-    USD option trades plus a zero-commission EUR conversion row is still
-    honestly a USD commission figure.
-    """
-    live = {ccy: amount for ccy, amount in by_ccy.items() if amount}
-    if len(live) != 1:
-        return None, None
-    ccy, amount = next(iter(live.items()))
-    return amount, ccy
-
-
 def month_stats(
     conn: sqlite3.Connection,
     period: str | None = None,
@@ -807,8 +768,11 @@ def month_stats(
 
     episode_pnl = asset_category == _EPISODE_PNL_CATEGORY
     orders: set[str] = set()
-    #: Native commission per currency, so `commissions_native` can be offered
-    #: when -- and only when -- one currency accounts for all of it.
+    #: Base total and the per-currency native ledger, accumulated together so
+    #: the figure can be gated once at the end. Local rather than accumulated
+    #: onto `stats` because a `Money` is frozen: an amount cannot be advanced
+    #: without its currency, which is the property that keeps the two in step.
+    fill_commission_base = 0.0
     native: dict[str, float] = {}
     for row in conn.execute(
         f"SELECT trade_date, trade_id, ib_order_id, fifo_pnl_realized_base,"
@@ -827,14 +791,14 @@ def month_stats(
             # Commission rides the same basis: on the fill's day, because
             # that is also where the P&L it nets against is attributed.
             stats.net_pnl_base += row["fifo_pnl_realized_base"] or 0.0
-            stats.commissions_base += row["ib_commission_base"] or 0.0
+            fill_commission_base += row["ib_commission_base"] or 0.0
             if row["ib_commission"]:
                 native[row["currency"]] = (
                     native.get(row["currency"], 0.0) + row["ib_commission"]
                 )
     stats.orders = len(orders)
     if not episode_pnl:
-        stats.commissions_native, stats.commissions_native_ccy = one_currency(native)
+        stats.commissions = Money.gated(fill_commission_base, native)
 
     # Fees are account-level CashTransaction rows, never trade-linked -- verified
     # against real data, where none of the 65 fee rows carries a conid or tradeID.
@@ -873,37 +837,24 @@ def month_stats(
         # commission -- opening legs included -- lands in the close period,
         # because the net P&L above already contains it. A month that merely
         # opened a position shows no commission, exactly as it shows no trade.
-        stats.commissions_base = sum(e.commission_base for e in closed)
-        # Episodes carry both the native amount and the currency it was charged
-        # in, so the exact figure needs no extra query -- only the check that
-        # one currency speaks for the whole round-trip set.
-        by_ccy: dict[str, float] = {}
-        for e in closed:
-            if e.commission:
-                by_ccy[e.currency] = by_ccy.get(e.currency, 0.0) + e.commission
-        stats.commissions_native, stats.commissions_native_ccy = one_currency(by_ccy)
-        stats.open_commission_base = sum(
-            e.commission_base for e in report.open if scope.has_episode(e)
+        #
+        # Episodes carry the base amount, the native amount AND the currency it
+        # was charged in, so the exact figure needs no extra query -- only the
+        # check that one currency speaks for the whole round-trip set, which is
+        # what `Money.charged` does in the same pass as the sum.
+        stats.commissions = Money.charged(
+            (e.commission_base, e.commission, e.currency) for e in closed
         )
-        open_by_ccy: dict[str, float] = {}
-        for e in report.open:
-            if scope.has_episode(e) and e.commission:
-                open_by_ccy[e.currency] = open_by_ccy.get(e.currency, 0.0) + e.commission
-        stats.open_commission_native, stats.open_commission_native_ccy = one_currency(
-            open_by_ccy
+        stats.open_commission = Money.charged(
+            (e.commission_base, e.commission, e.currency)
+            for e in report.open if scope.has_episode(e)
         )
-    stats.open_premium_base = sum(
-        e.proceeds_base for e in report.open if scope.has_episode(e)
-    )
     # Premium is cash received or paid in the contract's own currency, so it
     # takes the same treatment as commission: exact when one currency accounts
     # for the whole figure, withheld when they are mixed.
-    premium_by_ccy: dict[str, float] = {}
-    for e in report.open:
-        if scope.has_episode(e) and e.proceeds:
-            premium_by_ccy[e.currency] = premium_by_ccy.get(e.currency, 0.0) + e.proceeds
-    stats.open_premium_native, stats.open_premium_native_ccy = one_currency(
-        premium_by_ccy
+    stats.open_premium = Money.charged(
+        (e.proceeds_base, e.proceeds, e.currency)
+        for e in report.open if scope.has_episode(e)
     )
     wins = [e.realized_pnl_base for e in closed if e.realized_pnl_base > 0]
     losses = [e.realized_pnl_base for e in closed if e.realized_pnl_base < 0]
@@ -925,9 +876,13 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "total_trades": stats.total_trades,
         "orders": stats.orders,
         "net_pnl_base": stats.net_pnl_base,
-        "commissions_base": stats.commissions_base,
-        "commissions_native": stats.commissions_native,
-        "commissions_native_ccy": stats.commissions_native_ccy,
+        # A `Money` figure serialises as one nested object rather than three
+        # parallel keys. The page reads `.base`, `.native` and `.ccy` off it
+        # through a single helper, so a new gated figure costs no new display
+        # branch. Figures that stay flat floats -- net_pnl, avg_win, net_liq,
+        # the friction rollups -- are the ones for which no as-charged amount
+        # can exist, and the shape says so.
+        "commissions": stats.commissions.payload(),
         "fees_base": stats.fees_base,
         "closed_episodes": stats.closed_episodes,
         "open_episodes": stats.open_episodes,
@@ -936,19 +891,12 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "win_rate": stats.win_rate,
         "avg_win_base": stats.avg_win_base,
         "avg_loss_base": stats.avg_loss_base,
-        "open_premium_base": stats.open_premium_base,
-        "open_premium_native": stats.open_premium_native,
-        "open_premium_native_ccy": stats.open_premium_native_ccy,
-        "open_commission_base": stats.open_commission_base,
-        "open_commission_native": stats.open_commission_native,
-        "open_commission_native_ccy": stats.open_commission_native_ccy,
+        "open_premium": stats.open_premium.payload(),
+        "open_commission": stats.open_commission.payload(),
         "net_liq_base": stats.net_liq_base,
         "net_liq_date": stats.net_liq_date,
         "gain_pct_of_net_liq": stats.gain_pct_of_net_liq,
-        "options_friction_base": stats.options_friction_base,
-        "options_friction_native": stats.options_friction_native,
-        # Friction is commission, so it names the same currency.
-        "options_friction_native_ccy": stats.commissions_native_ccy,
+        "options_friction": stats.options_friction.payload(),
         "account_friction_base": stats.account_friction_base,
         "total_friction_base": stats.total_friction_base,
         "green_days": stats.green_days,

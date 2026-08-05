@@ -27,8 +27,8 @@ from typing import Any
 
 from optjournal.analysis import CostReport
 from optjournal.history import HistoryReport
+from optjournal.money import Money
 from optjournal.sections import raw_sections
-from optjournal.stats import one_currency
 
 Row = dict[str, Any]
 
@@ -141,30 +141,38 @@ def positions_data(conn: sqlite3.Connection) -> list[Row]:
     ).fetchall()
     return [dict(r) for r in rows]
 
-def _gate(ledger: dict) -> tuple[float | None, str | None]:
-    """Apply the single-currency gate to a per-currency ledger."""
-    return one_currency({c: float(v) for c, v in ledger.items()})
-
-
-def _journal_native(report: CostReport) -> tuple[float | None, str | None]:
-    """The journal's commission as charged, gated to a single currency.
+def _money(base: Any, ledger: dict) -> Money:
+    """A cost figure: the base total, plus the as-charged amount where one exists.
 
     analysis.py carries the per-currency breakdown and deliberately does not
-    judge it -- it imports nothing and must stay that way. The gate lives once,
-    in stats, and is applied here, where both are already in hand.
+    judge it -- it imports nothing internal and must stay that way. The gate
+    lives once, in `Money`, and is applied here, where the base total and the
+    ledger are both already in hand.
+
+    Returning one `Money` rather than a `(amount, currency)` tuple is what
+    removed the duplication this block used to carry: reaching each half of a
+    tuple through subscripting meant `_gate` was called twice per payload key,
+    and the `journal_friction` case spelled its whole dict comprehension twice.
     """
-    return one_currency(
-        {c: float(v) for c, v in report.journal_native_by_ccy.items()}
-    )
+    return Money.gated(_num(base) or 0.0, {c: float(v) for c, v in ledger.items()})
 
 
-def _journal_per_unit_native(report: CostReport) -> float | None:
-    """Commission per contract as charged, or None when the gate withholds."""
-    amount, _ccy = _journal_native(report)
-    if amount is None:
-        return None
+def _journal_commission(report: CostReport) -> Money:
+    """Commission for the journalled asset only, base and as-charged."""
+    return _money(report.journal_commission_base, report.journal_native_by_ccy)
+
+
+def _journal_per_unit(report: CostReport) -> Row | None:
+    """Commission per contract, or None when the scope has no quantity.
+
+    Both halves come from one `Money.per`, so the base and as-charged figures
+    are guaranteed to share a denominator. Previously the base came from
+    `report.journal_per_unit_base` and the native was divided separately here,
+    which is two divisions that had to agree by inspection.
+    """
     qty = sum(g.quantity for g in report.journal_commissions)
-    return amount / qty if qty else None
+    per = _journal_commission(report).per(qty)
+    return None if per is None else per.payload()
 
 
 def costs_data(report: CostReport) -> Row:
@@ -227,61 +235,52 @@ def costs_data(report: CostReport) -> Row:
         ],
         "journal_asset": report.journal_asset,
         "totals": {
-            "commission_base": _num(report.total_commission_base),
-            "commission_native": _gate(report.total_native_by_ccy)[0],
-            "commission_native_ccy": _gate(report.total_native_by_ccy)[1],
-            "fees_base": _num(report.total_fees_base),
-            "fees_native": _gate(report.total_fees_native_by_ccy)[0],
-            "fees_native_ccy": _gate(report.total_fees_native_by_ccy)[1],
-            "taxes_base": _num(report.total_taxes_base),
-            "taxes_native": _gate(report.total_taxes_native_by_ccy)[0],
-            "taxes_native_ccy": _gate(report.total_taxes_native_by_ccy)[1],
+            # Each gated figure is one `Money` -- one gate call, one key, and
+            # the amount inseparable from the currency it was charged in.
+            "commission": _money(
+                report.total_commission_base, report.total_native_by_ccy).payload(),
+            "fees": _money(
+                report.total_fees_base, report.total_fees_native_by_ccy).payload(),
+            "taxes": _money(
+                report.total_taxes_base, report.total_taxes_native_by_ccy).payload(),
             "autofx_notional_base": _num(report.total_autofx_notional_base),
             "autofx_spread_base": _num(report.total_autofx_spread_base),
-            "stated_friction_base": _num(report.total_stated_friction_base),
-            "stated_friction_native": _gate(report.total_stated_friction_native_by_ccy)[0],
-            "stated_friction_native_ccy": _gate(report.total_stated_friction_native_by_ccy)[1],
+            "stated_friction": _money(
+                report.total_stated_friction_base,
+                report.total_stated_friction_native_by_ccy).payload(),
             "friction_base": _num(report.total_friction_base),
             "fx_notional_base": _num(report.total_fx_notional_base),
-            "fx_commission_base": _num(report.total_fx_commission_base),
-            "fx_commission_native": _gate(report.total_fx_commission_native_by_ccy)[0],
-            "fx_commission_native_ccy": _gate(report.total_fx_commission_native_by_ccy)[1],
-            # Scope split. `commission_base` above spans the whole account, so
+            "fx_commission": _money(
+                report.total_fx_commission_base,
+                report.total_fx_commission_native_by_ccy).payload(),
+            # Scope split. `commission` above spans the whole account, so
             # a consumer that wants this journal's cost must read the journal_*
             # keys -- presenting the account figure as the journal's was the
             # defect this split exists to remove.
-            "journal_commission_base": _num(report.journal_commission_base),
-            "journal_commission_native": _journal_native(report)[0],
-            "journal_commission_native_ccy": _journal_native(report)[1],
+            "journal_commission": _journal_commission(report).payload(),
             "journal_taxes_base": _num(report.journal_taxes_base),
-            "journal_friction_base": _num(report.journal_friction_base),
-            "journal_friction_native": one_currency(
-                {c: float(v) for c, v in report.journal_friction_native_by_ccy.items()}
-            )[0],
-            "journal_friction_native_ccy": one_currency(
-                {c: float(v) for c, v in report.journal_friction_native_by_ccy.items()}
-            )[1],
-            "journal_per_unit_base": _num(report.journal_per_unit_base),
+            "journal_friction": _money(
+                report.journal_friction_base,
+                report.journal_friction_native_by_ccy).payload(),
             # Divided by the same quantity the base figure uses, so the two
-            # differ only in the currency of the numerator. Deriving it in the
-            # page from a restated total would have put "as charged" beside a
-            # per-unit figure that was not.
-            "journal_per_unit_native": _journal_per_unit_native(report),
+            # halves differ only in the currency of the numerator. `Money.per`
+            # divides both at once, so an as-charged numerator can never end up
+            # over a restated denominator.
+            "journal_per_unit": _journal_per_unit(report),
             # Account-level figures take the same gate. On a multi-currency
             # account it almost always withholds -- these deliberately span
             # asset categories -- but "withheld because the scope is mixed" is
             # a different statement from "never considered", and only one of
             # them survives a currency becoming uniform later.
             #
-            # account_friction and total_friction are ABSENT on purpose: both
-            # include the estimated AutoFX markup, which was never billed as a
-            # line item in any currency, so no as-charged figure exists.
-            "other_commission_base": _num(report.other_commission_base),
-            "other_commission_native": _gate(report.other_native_by_ccy)[0],
-            "other_commission_native_ccy": _gate(report.other_native_by_ccy)[1],
-            "other_taxes_base": _num(report.other_taxes_base),
-            "other_taxes_native": _gate(report.other_taxes_native_by_ccy)[0],
-            "other_taxes_native_ccy": _gate(report.other_taxes_native_by_ccy)[1],
+            # account_friction and friction are flat base-only floats on
+            # purpose: both include the estimated AutoFX markup, which was never
+            # billed as a line item in any currency, so no as-charged figure
+            # exists and the shape should not imply one could.
+            "other_commission": _money(
+                report.other_commission_base, report.other_native_by_ccy).payload(),
+            "other_taxes": _money(
+                report.other_taxes_base, report.other_taxes_native_by_ccy).payload(),
             "account_friction_base": _num(report.account_friction_base),
             "credit_fills": sum(g.credit_fills for g in report.commissions),
         },

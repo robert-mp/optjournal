@@ -247,6 +247,9 @@ def _shape_samples(state: dict) -> dict[str, dict]:
     samples = {
         "State": state,
         "Stats": state["stats"],
+        # Anchors the nested money shape to a real figure, so the Money
+        # typedef cannot drift from what the serializer actually sends.
+        "Money": state["stats"]["commissions"],
         "Day": first(state["stats"]["days"]),
         "Position": first(state["positions"]),
         "Order": first(orders),
@@ -389,7 +392,7 @@ def test_stats_panel_keys_present(state):
     """The dashboard's ten stat cards each need a real key."""
     s = state["stats"]
     for key in (
-        "total_trades", "orders", "net_pnl_base", "commissions_base", "fees_base",
+        "total_trades", "orders", "net_pnl_base", "commissions", "fees_base",
         "wins", "losses", "win_rate", "avg_win_base", "avg_loss_base",
         "closed_episodes", "open_episodes", "green_days", "red_days", "days",
         "total_friction_base", "net_liq_base", "gain_pct_of_net_liq",
@@ -505,7 +508,7 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
     # every leg's commission, so fill-date commission showed the same euros
     # twice -- once in the open month's card, again inside the close month's
     # net P&L. The open month reports only commission of trades closed in it.
-    assert opened["commissions_base"] == pytest.approx(
+    assert opened["commissions"]["base"] == pytest.approx(
         sum(e.commission_base for e in closed_in(open_month))
     )
 
@@ -515,10 +518,10 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
         sum(e.realized_pnl_base for e in closed_in(close_month))
     )
     # ... and the round trip's WHOLE commission, opening legs included.
-    assert closed["commissions_base"] == pytest.approx(
+    assert closed["commissions"]["base"] == pytest.approx(
         sum(e.commission_base for e in closed_in(close_month))
     )
-    assert abs(closed["commissions_base"]) > abs(opened["commissions_base"])
+    assert abs(closed["commissions"]["base"]) > abs(opened["commissions"]["base"])
 
 
 def test_options_commission_reconciles_and_open_commission_is_separate(populated):
@@ -535,16 +538,16 @@ def test_options_commission_reconciles_and_open_commission_is_separate(populated
     monthly_sum = sum(
         build_state(
             db_path=populated, archive_dir=RAW_DIR, query_id=None, month=m
-        )["stats"]["commissions_base"]
+        )["stats"]["commissions"]["base"]
         for m in everything["month_range"]
     )
     closed_total = sum(e.commission_base for e in report.closed)
     assert monthly_sum == pytest.approx(closed_total)
-    assert everything["stats"]["commissions_base"] == pytest.approx(closed_total)
+    assert everything["stats"]["commissions"]["base"] == pytest.approx(closed_total)
     open_total = sum(e.commission_base for e in report.open)
-    assert everything["stats"]["open_commission_base"] == pytest.approx(open_total)
+    assert everything["stats"]["open_commission"]["base"] == pytest.approx(open_total)
     if open_total:  # strictness: real data currently has open META shorts
-        assert everything["stats"]["commissions_base"] != pytest.approx(
+        assert everything["stats"]["commissions"]["base"] != pytest.approx(
             closed_total + open_total
         ), "open commission must not be folded into the headline figure"
 
@@ -727,15 +730,15 @@ def test_dashboard_friction_is_split_by_scope(state):
     them and they cannot be attributed to options.
     """
     s = state["stats"]
-    assert s["options_friction_base"] == abs(s["commissions_base"])
+    assert s["options_friction"]["base"] == abs(s["commissions"]["base"])
     assert s["account_friction_base"] == abs(s["fees_base"])
     # The split reapportions; it must not change or drop anything.
     assert (
-        s["options_friction_base"] + s["account_friction_base"]
+        s["options_friction"]["base"] + s["account_friction_base"]
         == s["total_friction_base"]
     )
     # Guards the actual bug: the attributable figure must exclude fees.
-    assert s["options_friction_base"] != s["total_friction_base"], (
+    assert s["options_friction"]["base"] != s["total_friction_base"], (
         "fees are being counted as options friction again"
     )
 
@@ -1339,11 +1342,12 @@ def test_dashboard_commission_reads_the_same_as_the_tables():
         "the shared charge helper is gone"
     for fn in ("dashboard", "annual", "monthlyTable"):
         body = _fn(fn).replace(" ", "").replace("\n", "")
-        assert "commissionOf(s)" in body, f"{fn} does not use the shared helper"
-        assert "cash(Math.abs(s.commissions_base))" not in body, \
+        assert "moneyOf(s.commissions)" in body, \
+            f"{fn} does not use the shared helper"
+        assert "cash(Math.abs(s.commissions.base))" not in body, \
             f"{fn} bypasses the helper and can drift from the others"
     # Magnitude, not sign: the tint went with the sign it no longer shows.
-    assert "cls(s.commissions_base)" not in _fn("dashboard").replace(" ", "")
+    assert "cls(s.commissions.base)" not in _fn("dashboard").replace(" ", "")
 
 
 def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
@@ -1370,11 +1374,13 @@ def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
     # on the card -- "as charged - $2.83 on open positions" -- so one being a
     # restatement while the other is a charge would be a contradiction in a
     # single line of prose.
-    assert "constcommissionOf=s=>chargeOf(s.commissions_native," in js
-    assert "constopenCommissionOf=s=>chargeOf(s.open_commission_native," in js
+    # One entry point now, not a wrapper per figure: `moneyOf` applies the rule
+    # to any Money-shaped key, so a new gated figure needs no new helper and
+    # cannot arrive with a subtly different rule of its own.
+    assert "constmoneyOf=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);" in js
     card = _fn("dashboard").replace(" ", "").replace("\n", "")
-    assert "openCommissionOf(s)" in card
-    assert "cash(Math.abs(s.open_commission_base))" not in card, \
+    assert "moneyOf(s.commissions)" in card and "moneyOf(s.open_commission)" in card
+    assert "cash(Math.abs(s.open_commission.base))" not in card, \
         "the open-positions figure bypasses the shared rule"
 
 
@@ -1428,12 +1434,15 @@ def test_proceeds_and_friction_follow_the_same_charge_rule_as_commission():
     to the rule cannot reach one figure and miss another.
     """
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
-    for helper in ("openPremiumOf=s=>chargeOf(s.open_premium_native,",
-                   "frictionOf=s=>chargeOf(s.options_friction_native,",
-                   "legProceedsOf=l=>chargeOf(l.proceeds,l.currency,l.proceeds_base)"):
-        assert helper in js, f"missing {helper}"
+    # A leg is the one payload shape still carrying the triple flat, so it
+    # reaches chargeOf directly rather than through moneyOf. Both paths are the
+    # SAME rule -- moneyOf delegates to chargeOf -- which is the property that
+    # stops a change reaching one figure and missing another.
+    assert "legProceedsOf=l=>chargeOf(l.proceeds,l.currency,l.proceeds_base)" in js
+    assert "constmoneyOf=mo=>mo==null?cash(null):chargeOf(" in js, \
+        "moneyOf no longer delegates to the shared rule"
     card = _fn("dashboard").replace(" ", "").replace("\n", "")
-    assert "openPremiumOf(s)" in card and "frictionOf(s)" in card
-    assert "cash(s.open_premium_base)}</b>" not in card, "pill bypasses the rule"
-    assert "cash(s.options_friction_base)" not in card, "pill bypasses the rule"
+    assert "moneyOf(s.open_premium)" in card and "moneyOf(s.options_friction)" in card
+    assert "cash(s.open_premium.base)}</b>" not in card, "pill bypasses the rule"
+    assert "cash(s.options_friction.base)" not in card, "pill bypasses the rule"
     assert "legProceedsOf(l)" in _fn("legRow").replace(" ", "")

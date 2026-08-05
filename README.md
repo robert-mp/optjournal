@@ -34,9 +34,8 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
                   (episodes)   (periods, scopes)  (cost report)
                        └──────────────┼───────────────┘
                                       ▼
-                     serialize.py (JSON payload contract; applies
-                                   stats.one_currency() to analysis's
-                                   per-currency ledgers)
+                     serialize.py (JSON payload contract; wraps analysis's
+                                   per-currency ledgers into Money)
                      render.py    (terminal reports)
                                       │
                             ┌─────────┴─────────┐
@@ -52,9 +51,10 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `ingest.py` | statement → SQLite, idempotent upserts (stores every asset category; scoping is query-time) |
 | `db.py` | connection, schema migration, `open_journal()` |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
-| `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts, `one_currency()` |
+| `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one |
+| `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts |
 | `analysis.py` | cost/friction report from the raw statement (whole account); a leaf — imports nothing internal |
-| `serialize.py` | the JSON payload the page renders and `--json` emits; applies `one_currency()` to `analysis`'s per-currency ledgers |
+| `serialize.py` | the JSON payload the page renders and `--json` emits; wraps `analysis`'s per-currency ledgers into `Money` |
 | `render.py` | human-readable terminal reports |
 | `web.py` | loopback HTTP server; `ServeConfig` injected per server |
 | `page.html` | the entire frontend: no build step, no external resources |
@@ -76,10 +76,18 @@ Layering rules (import direction only goes down this list):
    several of them composes. `analysis.py` accumulates commission, taxes
    and fees keyed by the currency they were *billed* in, and deliberately
    does not decide whether one currency can speak for a total — that
-   judgement is `stats.one_currency()`, and `serialize.py` applies it,
-   because it is the only module that already imports both. The
-   alternative was `analysis` importing `stats`, which would point an
-   import upward and cost this module its leaf status for one function.
+   judgement is `Money.gated()`, and `serialize.py` applies it when it
+   builds the payload. `analysis` could now import `money.py` directly
+   (it is a leaf, so it costs no dependency direction), and the split is
+   kept anyway: a report that measures cost has nothing to say about how
+   a reader's display currency should be chosen.
+5. A quantity and its unit travel together. `Money` carries an amount,
+   the currency it was charged in and the base translation as one frozen
+   value, because the three-field spelling it replaced (`x_base`,
+   `x_native`, `x_native_ccy`) let them drift: `options_friction` took
+   its amount from one figure and its currency label from another, and a
+   figure could be left half-assigned with nothing to complain. Add a new
+   gated figure by returning a `Money`, never by adding a field triple.
 
 Four invariants worth knowing before changing the UI:
 

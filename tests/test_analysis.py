@@ -230,9 +230,9 @@ def _real_report():
 def test_costs_data_includes_every_computed_total():
     data = costs_data(_real_report())
     for key in (
-        "commission_base", "fees_base", "taxes_base", "autofx_notional_base",
-        "autofx_spread_base", "stated_friction_base", "friction_base",
-        "fx_notional_base", "fx_commission_base",
+        "commission", "fees", "taxes", "autofx_notional_base",
+        "autofx_spread_base", "stated_friction", "friction_base",
+        "fx_notional_base", "fx_commission",
     ):
         assert key in data["totals"], f"totals.{key} missing"
 
@@ -241,10 +241,10 @@ def test_costs_data_totals_are_self_consistent():
     report = _real_report()
     t = costs_data(report)["totals"]
     assert t["friction_base"] == pytest.approx(
-        t["stated_friction_base"] + t["autofx_spread_base"]
+        t["stated_friction"]["base"] + t["autofx_spread_base"]
     )
-    assert t["stated_friction_base"] == pytest.approx(
-        t["commission_base"] + t["fees_base"] + t["taxes_base"]
+    assert t["stated_friction"]["base"] == pytest.approx(
+        t["commission"]["base"] + t["fees"]["base"] + t["taxes"]["base"]
     )
     assert t["friction_base"] == pytest.approx(float(report.total_friction_base))
 
@@ -401,11 +401,11 @@ def test_json_exposes_both_scopes(statement):
     """A consumer must be able to read the journal figure, not just the account."""
     t = costs_data(analyse(statement))["totals"]
     for key in (
-        "journal_commission_base", "journal_friction_base",
-        "other_commission_base", "account_friction_base", "credit_fills",
+        "journal_commission", "journal_friction",
+        "other_commission", "account_friction_base", "credit_fills",
     ):
         assert key in t, key
-    assert t["journal_friction_base"] + t["account_friction_base"] == pytest.approx(
+    assert t["journal_friction"]["base"] + t["account_friction_base"] == pytest.approx(
         t["friction_base"]
     )
 
@@ -420,7 +420,7 @@ def test_native_commission_is_offered_only_for_a_single_currency_scope():
     signal to fall back to the base restatement, which is approximate but
     complete.
     """
-    from optjournal.stats import one_currency
+    from optjournal.money import one_currency
 
     assert one_currency({"USD": -6.97}) == (-6.97, "USD")
     assert one_currency({"USD": -4.46, "SEK": -208.41}) == (None, None)
@@ -453,17 +453,17 @@ def test_native_commission_is_exact_where_the_restatement_was_not(tmp_path):
 
     st = web.build_state(db_path=tmp_path / "demo.db", archive_dir=statement.parent,
                          query_id=None)["stats"]
-    if st["commissions_native"] is None:
+    if st["commissions"]["native"] is None:
         return  # demo scope is multi-currency; the gate is pinned above
     billed = sqlite3.connect(tmp_path / "demo.db").execute(
         "SELECT SUM(ib_commission) FROM trades WHERE asset_category='OPT'"
-        " AND currency = ?", (st["commissions_native_ccy"],)
+        " AND currency = ?", (st["commissions"]["ccy"],)
     ).fetchone()[0]
     # Native is a subset of billed (closed round trips only), never larger.
-    assert abs(st["commissions_native"]) <= abs(billed) + 1e-9
+    assert abs(st["commissions"]["native"]) <= abs(billed) + 1e-9
     # And it is a genuinely different number from the base figure, which is
     # what makes the display distinction worth drawing.
-    assert st["commissions_native"] != st["commissions_base"]
+    assert st["commissions"]["native"] != st["commissions"]["base"]
 
 
 def test_cost_analysis_converts_commission_at_a_rate_that_applies_to_it():
@@ -524,11 +524,11 @@ def test_a_mixed_currency_journal_scope_serves_no_native_cost_figure():
     number that is both exact and complete, so it serves None and the display
     falls back to the base restatement.
     """
-    from optjournal.serialize import _journal_native
+    from optjournal.serialize import _journal_commission
 
     one = analyse(_stmt([_fill("OPT", "-2.00", qty="3")]))
-    amount, ccy = _journal_native(one)
-    assert ccy is not None and amount == float(one.journal_commission_base)
+    charged = _journal_commission(one)
+    assert charged.is_exact and charged.native == float(one.journal_commission_base)
 
     # Two billing currencies in the journal scope -> withheld. Built explicitly
     # rather than by extending _fill: that helper is shared by a dozen tests
@@ -540,7 +540,8 @@ def test_a_mixed_currency_journal_scope_serves_no_native_cost_figure():
     sek.ibCommissionCurrency = "SEK"
     mixed = analyse(_stmt([usd, sek]))
     assert len(mixed.journal_native_by_ccy) == 2, "the fake did not span currencies"
-    assert _journal_native(mixed) == (None, None)
+    withheld = _journal_commission(mixed)
+    assert not withheld.is_exact and (withheld.native, withheld.currency) == (None, None)
 
 
 def test_friction_has_no_as_charged_figure_because_part_of_it_is_estimated():
@@ -572,20 +573,22 @@ def test_the_account_level_gate_withholds_on_a_mixed_scope_but_is_applied():
     asset categories, so on a multi-currency account the gate almost always
     withholds; the point is that it is asked.
     """
-    from optjournal.serialize import _gate
+    from optjournal.serialize import _money
 
     usd = _fill("STK", "-25.00", qty="100")
     usd.ibCommissionCurrency = "USD"
     mixed = analyse(_stmt([_fill("OPT", "-2.00", qty="3"), usd]))
     # Journal scope is single-currency, so it answers.
-    assert _gate(mixed.journal_native_by_ccy)[1] is not None
+    assert _money(mixed.journal_commission_base, mixed.journal_native_by_ccy).is_exact
     # One non-journal currency: the account-level ledger answers too.
-    assert _gate(mixed.other_native_by_ccy) == (25.0, "USD")
+    other = _money(mixed.other_commission_base, mixed.other_native_by_ccy)
+    assert (other.native, other.currency) == (25.0, "USD")
 
     sek = _fill("STK", "-9.00", qty="5")
     sek.ibCommissionCurrency = "SEK"
     spanning = analyse(_stmt([_fill("OPT", "-2.00", qty="3"), usd, sek]))
-    assert _gate(spanning.other_native_by_ccy) == (None, None)
+    withheld = _money(spanning.other_commission_base, spanning.other_native_by_ccy)
+    assert (withheld.native, withheld.currency) == (None, None)
 
 
 def test_analysis_stays_a_leaf_module():

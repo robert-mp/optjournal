@@ -278,10 +278,7 @@ td.n,th.n{text-align:right}
  * @property {number} total_trades -- FILLS: how many executions, not outcomes
  * @property {number} orders
  * @property {number} net_pnl_base -- options: closed round trips only, net of commission
- * @property {number} commissions_base -- options: commission of round trips CLOSED here
- * @property {number|null} commissions_native -- commission AS CHARGED, null when the
- *   scope spans more than one currency and no single figure can be exact
- * @property {string|null} commissions_native_ccy -- the currency it was charged in
+ * @property {Money} commissions -- options: commission of round trips CLOSED here
  * @property {number} fees_base
  * @property {number} closed_episodes -- the headline trade count for options
  * @property {number} open_episodes
@@ -290,18 +287,12 @@ td.n,th.n{text-align:right}
  * @property {number|null} win_rate -- null until anything closed
  * @property {number|null} avg_win_base -- null without wins
  * @property {number|null} avg_loss_base -- null without losses
- * @property {number} open_premium_base -- excluded from P&L until positions close
- * @property {number|null} open_premium_native -- as received, null when mixed
- * @property {string|null} open_premium_native_ccy
- * @property {number|null} options_friction_native -- as charged, null when mixed
- * @property {string|null} options_friction_native_ccy
- * @property {number} open_commission_base -- excluded the same way
- * @property {number|null} open_commission_native -- as charged, null when mixed
- * @property {string|null} open_commission_native_ccy -- the currency charged
+ * @property {Money} open_premium -- excluded from P&L until positions close
+ * @property {Money} open_commission -- excluded the same way
  * @property {number|null} net_liq_base -- null until equity summaries exist
  * @property {string|null} net_liq_date
  * @property {number|null} gain_pct_of_net_liq
- * @property {number} options_friction_base
+ * @property {Money} options_friction -- magnitude of commissions, currency carried
  * @property {number} account_friction_base
  * @property {number} total_friction_base
  * @property {number} green_days
@@ -440,42 +431,42 @@ td.n,th.n{text-align:right}
  * @property {CostsTotals} totals
  */
 
+/** @typedef {Object} Money -- an amount and the currency it was charged in
+ * Two readings of one figure. `base` is the accounting translation: every
+ * contributing row converted at IBKR's own rate for ITS OWN date, then summed
+ * -- always available, always addable, never exactly what left the account.
+ * `native` is the amount as charged: exact, but unaddable across currencies,
+ * so it is withheld (null) the moment a second currency contributes. The page
+ * prefers `native` when the reader is already looking at that currency, which
+ * is the whole of `moneyOf`.
+ * @property {number} base
+ * @property {number|null} native -- null when no single currency accounts for it
+ * @property {string|null} ccy -- null exactly when `native` is null
+ */
+
 /** @typedef {Object} CostsTotals
- * @property {number} commission_base
- * @property {number} fees_base
- * @property {number} taxes_base
+ * Account-wide unless prefixed `journal_`, which narrows to the journalled
+ * asset. Reading an account figure under a journal heading was the defect the
+ * split exists to prevent.
+ * @property {Money} commission
+ * @property {Money} fees
+ * @property {Money} taxes
  * @property {number} autofx_notional_base
  * @property {number} autofx_spread_base
- * @property {number} stated_friction_base
- * @property {number} friction_base
+ * @property {Money} stated_friction -- commission+taxes+fees, all real charges
+ * @property {number} friction_base -- stated_friction PLUS the AutoFX estimate, so
+ *   base-only by nature: the markup was never billed as a line item in any currency
  * @property {number} fx_notional_base
- * @property {number} fx_commission_base
- * @property {number} journal_commission_base
- * @property {number|null} journal_commission_native -- as charged, null when mixed
- * @property {number|null} other_commission_native -- as charged, null when the scope is mixed
- * @property {string|null} other_commission_native_ccy
- * @property {number|null} other_taxes_native
- * @property {string|null} other_taxes_native_ccy
- * @property {number|null} commission_native -- account-wide, as charged
- * @property {string|null} commission_native_ccy
- * @property {number|null} fees_native
- * @property {string|null} fees_native_ccy
- * @property {number|null} taxes_native
- * @property {string|null} taxes_native_ccy
- * @property {number|null} stated_friction_native -- commission+taxes+fees; friction has NO native (estimate)
- * @property {string|null} stated_friction_native_ccy
- * @property {number|null} fx_commission_native
- * @property {string|null} fx_commission_native_ccy
- * @property {string|null} journal_commission_native_ccy
+ * @property {Money} fx_commission
+ * @property {Money} journal_commission
  * @property {number} journal_taxes_base
- * @property {number} journal_friction_base
- * @property {number|null} journal_friction_native -- commission + taxes, as charged
- * @property {string|null} journal_friction_native_ccy
- * @property {number} journal_per_unit_base
- * @property {number|null} journal_per_unit_native -- as charged, same divisor
- * @property {number} other_commission_base
- * @property {number} other_taxes_base
- * @property {number} account_friction_base
+ * @property {Money} journal_friction -- commission + taxes
+ * @property {Money|null} journal_per_unit -- per contract; null without quantity.
+ *   Both halves share a divisor, so an as-charged numerator never sits over a
+ *   restated denominator
+ * @property {Money} other_commission -- non-journal asset categories
+ * @property {Money} other_taxes
+ * @property {number} account_friction_base -- includes the AutoFX estimate, so base only
  * @property {number} credit_fills
  */
 
@@ -599,6 +590,7 @@ td.n,th.n{text-align:right}
  * @payload st:State s:Stats best:Stats x:Episode ep:Episode dy:Day
  * @payload pos:Position o:Order l:Leg h:History c:Costs T:CostsTotals
  * @payload f:FxRow stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
+ * @payload mo:Money
  * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle
  * @payload res:SyncResponse pt:ChartPoint bkt:Bucket
  * @local Math S TABS b sel m r el location window qs hs
@@ -683,34 +675,31 @@ const natCash=(v,rate,d)=>
 
    One helper, used by the Dashboard card and both tables, because the same
    figure reading differently on two tabs is the defect this replaced. */
-/* One rule, applied to every commission figure: show the charge when the
-   reader is already in the currency it was charged in, else the restatement.
-   Factored rather than repeated because the headline card and the
-   open-positions figure beside it sit in the SAME sentence -- "as charged ·
-   $2.83 on open positions" is a contradiction if only one of them is. */
+/* One rule for every as-charged figure: show the charge when the reader is
+   already in the currency it was charged in, else the restatement. Written
+   once because figures that share a sentence must share a basis -- "as charged
+   · $2.83 on open positions" is a contradiction if only one of them is.
+
+   `chargeOf` is the rule; `moneyOf` applies it to a Money-shaped payload key.
+   Four near-identical wrappers (commissionOf, openCommissionOf, openPremiumOf,
+   frictionOf) existed only to bind three flat field names each, and vanished
+   when the payload started sending one nested object per figure. */
 const isNativeCharge=(nat,ccy)=>nat!=null&&ccy===DISP();
 const chargeOf=(nat,ccy,base)=>isNativeCharge(nat,ccy)
   ? money(Math.abs(nat),ccy) : cash(Math.abs(base));
-const commissionIsNative=s=>
-  isNativeCharge(s.commissions_native,s.commissions_native_ccy);
-const commissionOf=s=>
-  chargeOf(s.commissions_native,s.commissions_native_ccy,s.commissions_base);
-const openCommissionOf=s=>
-  chargeOf(s.open_commission_native,s.open_commission_native_ccy,
-           s.open_commission_base);
-const openPremiumOf=s=>
-  chargeOf(s.open_premium_native,s.open_premium_native_ccy,s.open_premium_base);
-const frictionOf=s=>
-  chargeOf(s.options_friction_native,s.options_friction_native_ccy,
-           s.options_friction_base);
-/* A leg already carries its own native proceeds and the currency it filled
-   in, so the same rule applies with no payload addition. */
+/** @param {Money|null} mo */
+const moneyOf=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);
+/** @param {Money|null} mo */
+const isNative=mo=>mo!=null&&isNativeCharge(mo.native,mo.ccy);
+/* A leg carries the same triple flat rather than as a Money -- legs and
+   episodes are the one payload shape still spelling it out -- so it reaches
+   the rule directly. */
 const legProceedsOf=l=>chargeOf(l.proceeds,l.currency,l.proceeds_base);
 /* Which basis the figure on screen actually uses -- three states, not two.
    "restated" is a claim, and it is false when the reader is looking at the
    base currency: that figure is IBKR's own conversion, unrestated, and saying
    otherwise undersells it. */
-const commissionBasis=s=>commissionIsNative(s)?'as charged'
+const basisOf=m=>isNative(m)?'as charged'
   :DISP()===BASE()?`IBKR's figure in ${BASE()}`:`restated from ${BASE()}`;
 
 const cls=v=>v==null||Number(v)===0?'':Number(v)>0?'pos':'neg';
@@ -906,10 +895,10 @@ function dashboard(){
        Commission is a cost by definition and the label says so, so the
        magnitude is the honest form -- and the red `cls()` tint went with the
        sign, because colouring a figure by a sign no longer shown is noise. */
-    statCard('Commissions', commissionOf(s),
-      commissionBasis(s)
-      +(opt?` · closed round trips${s.open_commission_base?` · ${
-        openCommissionOf(s)} on open positions`:''}`
+    statCard('Commissions', moneyOf(s.commissions),
+      basisOf(s.commissions)
+      +(opt?` · closed round trips${s.open_commission.base?` · ${
+        moneyOf(s.open_commission)} on open positions`:''}`
          :' · stated by IBKR'),
       'sm'),
     /* No account-level Fees card here by request: market-data and custody
@@ -943,22 +932,22 @@ function dashboard(){
         ${S.type?`<span class="pill" title="Every trade-derived figure below is
           restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
         <span class="pill">open <b>${s.open_episodes}</b></span>
-        ${opt&&s.open_premium_base?`<span class="pill" title="Net premium sitting in
+        ${opt&&s.open_premium.base?`<span class="pill" title="Net premium sitting in
           positions that are still open — collected on shorts, paid on longs. Not
           in Net P&L: premium is a liability until the position closes, and it
           lands there, in full, on the day it does."
-          >open premium <b class="${cls(s.open_premium_base)}">${
-          openPremiumOf(s)}</b></span>`:''}
+          >open premium <b class="${cls(s.open_premium.base)}">${
+          moneyOf(s.open_premium)}</b></span>`:''}
         <span class="pill" title="Commission on ${esc(s.asset_category)} trades${
           opt?', closed round trips only -- commission on open positions is on the Commissions card':''}.
           Commission carries an asset category, so this figure is genuinely
           scoped to this journal."
-          >${esc(s.asset_category)} <b>${frictionOf(s)}</b></span>
+          >${esc(s.asset_category)} <b>${moneyOf(s.options_friction)}</b></span>
       </div></div>
     <div class="stats">${cards}</div>
     ${s.closed_episodes===0?`<div class="note">No round trip has fully closed yet,
       so Net P&L, Win Rate, Avg Win and Avg Loss have nothing to measure — they are
-      empty rather than zero. ${s.open_premium_base?`The ${cash(s.open_premium_base)}
+      empty rather than zero. ${s.open_premium.base?`The ${cash(s.open_premium.base)}
       net premium in the ${s.open_episodes} open position(s) is not profit until
       they close.`:`The ${s.open_episodes} open position(s) are under
       <b>Positions</b>.`}</div>`:''}
@@ -1311,22 +1300,21 @@ function costs(){
   /* Same as-charged rule the Dashboard uses: the figure IBKR billed, when the
      reader is already in that currency. Costs is where this matters most --
      the tab exists to answer what trading actually cost. */
-  const jnat=isNativeCharge(T.journal_commission_native,T.journal_commission_native_ccy);
-  const jrows=[[scope+' commission',
-    chargeOf(T.journal_commission_native,T.journal_commission_native_ccy,
-             T.journal_commission_base),
-    jnat?'as charged':'stated']];
+  const jrows=[[scope+' commission', moneyOf(T.journal_commission),
+    isNative(T.journal_commission)?'as charged':'stated']];
   if(T.journal_taxes_base) jrows.push([scope+' taxes',cash(T.journal_taxes_base),'stated']);
   /* Per contract, not a repeat of the total. With commission as the only
      component, a "journal friction" card would restate the figure beside
      itself; the per-unit rate is the one that predicts cost at volume. */
-  if(T.journal_per_unit_base!=null)
+  /* One Money, so the per-unit figure cannot be as-charged over a restated
+     divisor -- serialize divides both halves by the same quantity. */
+  if(T.journal_per_unit!=null)
     jrows.push(['Per contract',
-      jnat&&T.journal_per_unit_native!=null
-        ? money(T.journal_per_unit_native,T.journal_commission_native_ccy,4)
-        : cash(T.journal_per_unit_base,4),
+      isNative(T.journal_per_unit)
+        ? money(T.journal_per_unit.native,T.journal_per_unit.ccy,4)
+        : cash(T.journal_per_unit.base,4),
       'charged per unit, not per euro']);
-  else jrows.push(['Journal friction',cash(T.journal_friction_base),'stated only']);
+  else jrows.push(['Journal friction',moneyOf(T.journal_friction),'stated only']);
   /* No account-level block by request: commission on other instruments and
      account fees are not options information. The FX table below stays — AutoFX
      markup is a cost of converting to trade at all, not a stock cost. */
@@ -1335,8 +1323,7 @@ function costs(){
       <div class="sub">${esc(c.from_date)} → ${esc(c.to_date)} ·
         ${esc(S.state.costs_source||'')} · ${esc(scope)}-attributable costs and FX only</div></div>
       <div class="pills"><span class="pill">${esc(scope)} <b>${
-        chargeOf(T.journal_friction_native,T.journal_friction_native_ccy,
-                 T.journal_friction_base)}</b></span></div>
+        moneyOf(T.journal_friction)}</b></span></div>
     </div>
     <h2 style="font-size:15px;margin-top:4px">${esc(scope)} — attributable to this journal</h2>
     <div class="stats" style="grid-template-columns:repeat(${jrows.length},1fr)">
@@ -1381,7 +1368,7 @@ function annual(){
     <td class="n mono ${cls(s.net_pnl_base)}">${cash(s.net_pnl_base)}</td>
     <td class="n mono">${s.avg_win_base==null?'—':cash(s.avg_win_base)}</td>
     <td class="n mono">${s.avg_loss_base==null?'—':cash(s.avg_loss_base)}</td>
-    <td class="n mono">${commissionOf(s)}</td>
+    <td class="n mono">${moneyOf(s.commissions)}</td>
     <td class="n mono"><span class="pos">${s.green_days}</span>/<span
       class="neg">${s.red_days}</span></td></tr>`;
   return `<div class="card">
@@ -1432,7 +1419,7 @@ function monthlyTable(){
       <td class="n mono neg">${s.losses}</td>
       <td class="n mono">${pct(s.win_rate)}</td>
       <td class="n mono ${cls(s.net_pnl_base)}">${cash(s.net_pnl_base)}</td>
-      <td class="n mono">${commissionOf(s)}</td>
+      <td class="n mono">${moneyOf(s.commissions)}</td>
       <td class="n mono"><span class="pos">${s.green_days}</span>/<span
         class="neg">${s.red_days}</span></td></tr>`);
   });

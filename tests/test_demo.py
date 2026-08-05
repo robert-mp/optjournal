@@ -221,8 +221,8 @@ def test_the_years_account_for_everything(conn):
     assert sum(y.net_pnl_base for y in years) == pytest.approx(
         everything.net_pnl_base, abs=1e-9
     )
-    assert sum(y.commissions_base for y in years) == pytest.approx(
-        everything.commissions_base, abs=1e-9
+    assert sum(y.commissions.base for y in years) == pytest.approx(
+        everything.commissions.base, abs=1e-9
     )
     # Every trading day belongs to exactly one year.
     assert sum(len(y.days) for y in years) == len(everything.days)
@@ -360,7 +360,7 @@ def test_scope_narrows_every_trade_derived_figure(conn):
     assert 0 < only.closed_episodes < everything.closed_episodes
     assert only.orders < everything.orders
     assert abs(only.net_pnl_base) < abs(everything.net_pnl_base)
-    assert abs(only.commissions_base) < abs(everything.commissions_base)
+    assert abs(only.commissions.base) < abs(everything.commissions.base)
     assert len(only.days) < len(everything.days)
 
 
