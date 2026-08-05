@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 import pytest
 
 from optjournal.bars import (
+    CONTEXT_BARS,
     HOURLY_LIMIT_DAYS,
     BackfillOutcome,
     backfill_bars,
@@ -306,6 +307,63 @@ def test_replay_of_a_snapshot_only_contract_draws_every_bar_held(conn):
 def test_replay_of_an_unknown_symbol_is_empty_not_invented(conn):
     got = replay_bars(conn, "NOPE", opened_at="2026-01-05", closed_at="2026-01-12")
     assert got == {"conid": None, "bar_size": None, "points": []}
+
+
+def test_context_is_counted_in_bars_not_calendar_days(conn):
+    """Four calendar days rendered 45-58% of every chart as padding, and on a
+    ten-bar trade the lead-in was larger than the trade. It also varied with the
+    weekday: Thursday plus four days is two sessions, Monday plus four is four.
+    """
+    _option_trade(conn, conid="OPT1", symbol="AAA  260201P00100000",
+                  underlying="AAA", ucid="U1", date="2026-01-12", trade_id="o1")
+    # 40 daily bars straddling a trade that ran 2026-01-12 .. 2026-01-16.
+    bars = [_bar(_ts("2026-01-01") + n * DAY, 100.0 + n) for n in range(40)]
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d",
+                source="yahoo", bars=bars)
+    got = replay_bars(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
+    kept = [ts for ts, _ in got["points"]]
+    before = [ts for ts in kept if ts < _ts("2026-01-12")]
+    after = [ts for ts in kept if ts > _ts("2026-01-16") + DAY - 1]
+    assert len(before) == CONTEXT_BARS["1d"], f"{len(before)} bars of lead-in"
+    assert len(after) == CONTEXT_BARS["1d"], f"{len(after)} bars of run-out"
+
+
+def test_the_closing_session_belongs_to_the_trade(conn):
+    """A journal stamp truncates to its date, so a closing day's epoch is that
+    day's MIDNIGHT and every bar of the session sorts after it. Harmless while
+    the window was padded by whole days; it cut the closing session out of the
+    trade the moment the trim got precise.
+    """
+    _option_trade(conn, conid="OPT1", symbol="AAA  260201P00100000",
+                  underlying="AAA", ucid="U1", date="2026-01-12", trade_id="o1")
+    # Three bars DURING the closing session, hours after midnight.
+    close_day = _ts("2026-01-16")
+    bars = [_bar(_ts("2026-01-12") + 14 * 3600, 100.0),
+            _bar(close_day + 14 * 3600, 101.0),
+            _bar(close_day + 15 * 3600, 102.0),
+            _bar(close_day + 16 * 3600, 103.0)]
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d",
+                source="yahoo", bars=bars)
+    got = replay_bars(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
+    inside = [ts for ts, _ in got["points"]
+              if _ts("2026-01-12") <= ts <= close_day + DAY - 1]
+    assert len(inside) == 4, "the closing session's bars were treated as context"
+
+
+def test_a_snapshot_only_window_is_not_trimmed(conn):
+    """Nothing to be context FOR: with no entry date, everything held is the
+    answer rather than a slice around a window that does not exist.
+    """
+    bars = [_bar(_ts("2025-02-03") + n * DAY, 10.0 + n) for n in range(30)]
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d",
+                source="yahoo", bars=bars)
+    conn.execute(
+        "INSERT INTO securities (conid, symbol, underlying_symbol, underlying_conid,"
+        " raw, updated_at) "
+        "VALUES ('OPTY', 'AAA  270101C00700000', 'AAA', 'U1', '{}', 'now')"
+    )
+    got = replay_bars(conn, "AAA", opened_at=None, closed_at=None)
+    assert len(got["points"]) == 30
 
 
 def test_backfill_collects_failures_without_abandoning_the_book(conn):

@@ -66,6 +66,16 @@ PAD_DAYS = 4
 #: points for no added insight.
 HOURLY_LIMIT_DAYS = 40
 
+#: Bars of context kept either side of the trade window when CHARTING. Counted
+#: in bars, not calendar days: PAD_DAYS is what gets FETCHED (wide is free and
+#: already stored), but four calendar days rendered 45-58% of every chart as
+#: padding -- on a ten-bar GOOG trade the lead-in was larger than the trade. It
+#: also varied with the weekday, since Thursday plus four days is two sessions
+#: while Monday plus four is four. One session of hourly context answers "what
+#: was it doing just before I entered"; a daily chart gets a few sessions,
+#: because at that grid one bar either side is invisible.
+CONTEXT_BARS = {"1h": 7, "1d": 3}
+
 #: How far back to look for a contract whose opening fill predates the archive.
 #: The source truncates to whatever it actually holds -- a 2025-01-01 request
 #: for the LEAP returned bars from 2025-02-03, the contract's listing date --
@@ -326,9 +336,11 @@ def close_series(
     across a LEAP; selecting both and ordering by ts would splice three years of
     daily onto two weeks of hourly and draw the join as a price move.
 
-    Timestamps are carried, unlike the row miniature this replaces: a chart with
-    a real time axis cannot infer x from position in the list, because sessions
-    are not evenly spaced (weekends, holidays, and a half-length 15:30 bar).
+    Timestamps are carried, unlike the row miniature this replaces, but for the
+    LABELS rather than for x: the chart plots bar position, because sessions are
+    not evenly spaced and a linear time axis spends most of its width on hours
+    the market was shut. Which bar a tick names still has to be true, and that
+    needs the stamp.
 
     Null closes are dropped. A quiet strike genuinely has no print, and the
     window is clipped inclusively so a caller asking for a trade's span gets
@@ -347,6 +359,23 @@ def close_series(
         args,
     ).fetchall()
     return [(int(r["ts"]), float(r["close"])) for r in rows]
+
+
+def _trim_to_context(
+    points: list[tuple[int, float]], start: int, end: int, bar_size: str
+) -> list[tuple[int, float]]:
+    """The trade window plus a bounded number of bars either side.
+
+    Trimming by BAR COUNT rather than by clock is what keeps two charts
+    comparable: a window measured in calendar days lands on a different number
+    of sessions depending on which weekday the trade opened, and once the x axis
+    is ordinal a calendar-day pad has no consistent width at all.
+    """
+    keep = CONTEXT_BARS.get(bar_size, 3)
+    before = [p for p in points if p[0] < start]
+    inside = [p for p in points if start <= p[0] <= end]
+    after = [p for p in points if p[0] > end]
+    return before[-keep:] + inside + after[:keep]
 
 
 def replay_bars(
@@ -377,7 +406,12 @@ def replay_bars(
         return empty
     moment = now or datetime.now(UTC)
     start = _epoch(opened_at)
-    end = _epoch(closed_at) or int(moment.timestamp())
+    # A journal stamp truncates to its date, so a closing day's epoch is that
+    # day's MIDNIGHT -- every bar of the session the trade closed in sorts after
+    # it. Harmless while the window was padded by whole days; it would have cut
+    # the closing session out of the trade the moment the trim got precise.
+    closed = _epoch(closed_at)
+    end = (closed + 86400 - 1) if closed is not None else int(moment.timestamp())
     if start is None:
         # No opening fill anywhere (a snapshot-only contract such as the LEAP).
         # Its window is unknown, so draw every bar held rather than inventing an
@@ -389,5 +423,9 @@ def replay_bars(
     for size in (preferred, "1d" if preferred == "1h" else "1h"):
         points = close_series(conn, conid, bar_size=size, start=lo, end=hi)
         if points:
+            # An unknown window (snapshot-only) has nothing to be context FOR,
+            # so everything held is the answer rather than a trimmed slice.
+            if start:
+                points = _trim_to_context(points, start, end, size)
             return {"conid": conid, "bar_size": size, "points": points}
     return {"conid": conid, "bar_size": preferred, "points": []}

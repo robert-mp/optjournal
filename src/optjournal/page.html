@@ -168,6 +168,9 @@ td.n,th.n{text-align:right}
    palette: green/red means signed money everywhere else on this page, and
    reusing it for "which way round the contract is" would make the two
    meanings compete. */
+/* Session boundary. Faint on purpose: it restores the day breaks that an
+   ordinal axis collapses, without competing with the price line. */
+.sess{stroke:var(--line);stroke-width:1;stroke-dasharray:2 5}
 .sk{stroke:var(--leather1);stroke-width:1.3}
 .sk.long{stroke-dasharray:5 4}
 .sklab{fill:var(--kicker);font-size:11px;font-family:var(--mono)}
@@ -1219,6 +1222,9 @@ const MKT='America/New_York';
 const rstamp=(ts,size)=>new Date(ts*1000).toLocaleString(undefined,
   size==='1h'?{timeZone:MKT,month:'short',day:'numeric',hour:'numeric'}
              :{timeZone:MKT,year:'2-digit',month:'short',day:'numeric'});
+/* The bar's calendar day at the exchange, for finding session boundaries.
+   'en-CA' because it yields YYYY-MM-DD, so string equality is date equality. */
+const etday=ts=>new Date(ts*1000).toLocaleDateString('en-CA',{timeZone:MKT});
 
 function replayChart(rp){
   const pts=(rp.points||[]).filter(p=>p&&isFinite(p[1]));
@@ -1226,7 +1232,7 @@ function replayChart(rp){
     esc(rp.underlying||'this underlying')} yet — run <code>optjournal bars</code></div>`;
   const sks=(rp.strikes||[]).filter(sk=>sk&&isFinite(sk.strike));
   const W=920,H=270,L=52,R=76,T=12,B=30, iw=W-L-R, ih=H-T-B;
-  const ys=pts.map(p=>p[1]), xs=pts.map(p=>p[0]);
+  const ys=pts.map(p=>p[1]);
   /* The y domain spans the strikes as well as the price path. A strike is the
      level the whole chart exists to compare against, so a far-OTM one clipped
      off-canvas would leave a price line and no answer to "how close did it
@@ -1234,8 +1240,20 @@ function replayChart(rp){
   const vals=ys.concat(sks.map(sk=>sk.strike));
   const lo0=Math.min(...vals), hi0=Math.max(...vals);
   const gap=(hi0-lo0)*0.07||1, lo=lo0-gap, hi=hi0+gap, vspan=hi-lo;
-  const t0=Math.min(...xs), t1=Math.max(...xs), tspan=(t1-t0)||1;
-  const X=t=>L+((t-t0)*iw)/tspan, Y=v=>T+ih-((v-lo)*ih)/vspan;
+  /* x is ORDINAL -- bar position, not elapsed time. Measured on this journal's
+     own TSLA trade, a linear time axis spent 80.9% of its width on hours the
+     market was shut, and all five of its largest visual moves were overnight or
+     weekend gaps rather than anything that happened while trading. Those gaps
+     drew as long diagonals across dead space, which is what read as "jumpy".
+
+     Collapsing closed time is also the more honest rendering, not merely the
+     tidier one: a straight line across an 18-hour gap asserts a path the price
+     took while no price existed. Adjacent bars are adjacent here, the gap stays
+     visible as a step, and no interval is claimed. Every tick label carries its
+     real date, so the compression is legible rather than hidden -- and a faint
+     rule marks each session boundary for the same reason. */
+  const X=i=>L+(pts.length<2?iw/2:(i*iw)/(pts.length-1));
+  const Y=v=>T+ih-((v-lo)*ih)/vspan;
   const dp=vspan>40?0:2;
   const yticks=[0,0.25,0.5,0.75,1].map(f=>lo+f*vspan).map(v=>
     `<line class="gr" x1="${L}" y1="${Y(v).toFixed(1)}" x2="${L+iw}" y2="${
@@ -1244,11 +1262,17 @@ function replayChart(rp){
   /* Ticks land on real bars, not on an even split of the span: sessions are
      not evenly spaced, so an interpolated label can name a timestamp that has
      no bar -- a weekend midnight on a daily series. */
-  const xticks=[0,0.5,1].map(f=>pts[Math.round(f*(pts.length-1))]).map((pt,i)=>
-    `<text class="tk" x="${X(pt[0]).toFixed(1)}" y="${H-10}" text-anchor="${
-      i===0?'start':i===2?'end':'middle'}">${esc(rstamp(pt[0],rp.bar_size))}</text>`
+  const xticks=[0,0.5,1].map(f=>Math.round(f*(pts.length-1))).map((ix,i)=>
+    `<text class="tk" x="${X(ix).toFixed(1)}" y="${H-10}" text-anchor="${
+      i===0?'start':i===2?'end':'middle'}">${esc(rstamp(pts[ix][0],rp.bar_size))}</text>`
   ).join('');
-  const line=pts.map(p=>`${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(' ');
+  /* Only for hourly: on a daily series every bar IS a session, so a rule per
+     bar would be a picket fence rather than information. */
+  const breaks=rp.bar_size!=='1h'?'':pts.map((p,i)=>
+    i&&etday(p[0])!==etday(pts[i-1][0])
+      ?`<line class="sess" x1="${((X(i-1)+X(i))/2).toFixed(1)}" y1="${T}" x2="${
+        ((X(i-1)+X(i))/2).toFixed(1)}" y2="${T+ih}"/>`:'').join('');
+  const line=pts.map((p,i)=>`${X(i).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(' ');
   const strikes=sks.map(sk=>{const y=Y(sk.strike).toFixed(1);
     return `<line class="${sk.side==='long'?'sk long':'sk'}" x1="${L}" y1="${y}"
       x2="${L+iw}" y2="${y}"/><text class="sklab" x="${L+iw+7}" y="${
@@ -1257,7 +1281,7 @@ function replayChart(rp){
   return `<svg viewBox="0 0 ${W} ${H}" role="img" preserveAspectRatio="xMidYMid meet"
     ><title>${esc(rp.underlying||'')} ${num(ys[0],dp)} → ${num(ys[ys.length-1],dp)} across ${
       pts.length} ${rp.bar_size==='1h'?'hourly':'daily'} bars</title>
-    ${yticks}${strikes}
+    ${yticks}${breaks}${strikes}
     <line class="ax" x1="${L}" y1="${T}" x2="${L}" y2="${T+ih}"/>
     <line class="ax" x1="${L}" y1="${T+ih}" x2="${L+iw}" y2="${T+ih}"/>
     <polyline class="pxline" points="${line}"/>${xticks}</svg>`;

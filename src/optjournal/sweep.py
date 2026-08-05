@@ -408,9 +408,22 @@ def check_replay_renders_from_url(p: Page) -> Verdict:
         return ok()
     if 'class="pxline"' not in p.markup:
         return bad("panel rendered but the underlying price line is absent")
-    drawn = len(re.findall(r'class="pxline" points="([^"]*)"', p.markup)[0].split())
-    if drawn != len(replay["points"]):
-        return bad(f"{drawn} points drawn, payload holds {len(replay['points'])}")
+    drawn = re.findall(r'class="pxline" points="([^"]*)"', p.markup)[0].split()
+    if len(drawn) != len(replay["points"]):
+        return bad(f"{len(drawn)} points drawn, payload holds {len(replay['points'])}")
+    # x is ordinal, so every bar occupies the same width. A linear time axis
+    # would space them by elapsed seconds, which on this journal's own data put
+    # 80.9% of the width on hours the market was shut and drew every overnight
+    # gap as a long diagonal. Uneven steps here mean that regressed.
+    steps = [round(float(b.split(",")[0]) - float(a.split(",")[0]), 1)
+             for a, b in zip(drawn, drawn[1:], strict=False)]  # pairwise: b is 1 shorter
+    # Bounded by SPREAD, not by distinct count: coordinates are rounded to one
+    # decimal, so an even axis still yields two neighbouring values (12.7 and
+    # 12.8). A count-based bound of two therefore admitted exactly the shape it
+    # was meant to catch -- one short step and one long overnight one.
+    if steps and max(steps) - min(steps) > 0.5:
+        return bad(f"x steps span {min(steps)}..{max(steps)} -- the axis is "
+                   "spacing bars by elapsed time, not by position")
     labels = re.findall(r'class="sklab"[^>]*>([^<]+)<', p.markup)
     if len(labels) != len(replay["strikes"]):
         return bad(f"{len(labels)} strike labels, payload holds {len(replay['strikes'])}")
