@@ -312,12 +312,18 @@ def _backfill_commission_currency(conn: sqlite3.Connection) -> int:
     `raw` can actually supply it. After one pass that set is empty and this costs
     a single indexless count on a table of a few hundred rows; it can never loop.
 
+    Self-terminating in practice: after one pass the only rows still matching are
+    those whose `raw` carries the key with an empty value, which no statement
+    observed does -- and those cost a parse per open, never a write. The narrower
+    alternative (only rows with non-zero commission) left a repaired journal
+    disagreeing with a fresh ingest of the same archive on 127 zero-commission
+    rows, which makes "rebuild from the archive and compare" useless as a check.
+
     Returns the number of rows filled, so a caller can log or test it.
     """
     pending = conn.execute(
         "SELECT trade_id, raw FROM trades"
         " WHERE ib_commission_currency IS NULL"
-        "   AND ib_commission IS NOT NULL AND ib_commission <> 0"
         "   AND raw LIKE '%ibCommissionCurrency%'"
     ).fetchall()
     filled = 0

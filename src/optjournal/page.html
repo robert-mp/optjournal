@@ -451,9 +451,14 @@ td.n,th.n{text-align:right}
  * @property {number} fx_notional_base
  * @property {number} fx_commission_base
  * @property {number} journal_commission_base
+ * @property {number|null} journal_commission_native -- as charged, null when mixed
+ * @property {string|null} journal_commission_native_ccy
  * @property {number} journal_taxes_base
  * @property {number} journal_friction_base
+ * @property {number|null} journal_friction_native -- commission + taxes, as charged
+ * @property {string|null} journal_friction_native_ccy
  * @property {number} journal_per_unit_base
+ * @property {number|null} journal_per_unit_native -- as charged, same divisor
  * @property {number} other_commission_base
  * @property {number} other_taxes_base
  * @property {number} account_friction_base
@@ -1289,13 +1294,24 @@ function costs(){
   /* Two blocks, not one. T.commission_base spans the whole IBKR account, so
      showing it as "Commission" under a journal scoped to options presented
      stock cost as this journal's. journal_* is the attributable figure. */
-  const jrows=[[scope+' commission',cash(T.journal_commission_base),'stated']];
+  /* Same as-charged rule the Dashboard uses: the figure IBKR billed, when the
+     reader is already in that currency. Costs is where this matters most --
+     the tab exists to answer what trading actually cost. */
+  const jnat=isNativeCharge(T.journal_commission_native,T.journal_commission_native_ccy);
+  const jrows=[[scope+' commission',
+    chargeOf(T.journal_commission_native,T.journal_commission_native_ccy,
+             T.journal_commission_base),
+    jnat?'as charged':'stated']];
   if(T.journal_taxes_base) jrows.push([scope+' taxes',cash(T.journal_taxes_base),'stated']);
   /* Per contract, not a repeat of the total. With commission as the only
      component, a "journal friction" card would restate the figure beside
      itself; the per-unit rate is the one that predicts cost at volume. */
   if(T.journal_per_unit_base!=null)
-    jrows.push(['Per contract',cash(T.journal_per_unit_base,4),'charged per unit, not per euro']);
+    jrows.push(['Per contract',
+      jnat&&T.journal_per_unit_native!=null
+        ? money(T.journal_per_unit_native,T.journal_commission_native_ccy,4)
+        : cash(T.journal_per_unit_base,4),
+      'charged per unit, not per euro']);
   else jrows.push(['Journal friction',cash(T.journal_friction_base),'stated only']);
   /* No account-level block by request: commission on other instruments and
      account fees are not options information. The FX table below stays — AutoFX
@@ -1305,7 +1321,8 @@ function costs(){
       <div class="sub">${esc(c.from_date)} → ${esc(c.to_date)} ·
         ${esc(S.state.costs_source||'')} · ${esc(scope)}-attributable costs and FX only</div></div>
       <div class="pills"><span class="pill">${esc(scope)} <b>${
-        cash(T.journal_friction_base)}</b></span></div>
+        chargeOf(T.journal_friction_native,T.journal_friction_native_ccy,
+                 T.journal_friction_base)}</b></span></div>
     </div>
     <h2 style="font-size:15px;margin-top:4px">${esc(scope)} — attributable to this journal</h2>
     <div class="stats" style="grid-template-columns:repeat(${jrows.length},1fr)">

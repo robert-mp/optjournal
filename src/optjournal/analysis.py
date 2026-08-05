@@ -191,6 +191,16 @@ class CommissionGroup:
     asset_category: str
     fills: int = 0
     quantity: int = 0
+    #: Commission AS CHARGED, keyed by the currency IBKR billed it in. A group
+    #: can span currencies (this account's stock trades span four), and those
+    #: amounts cannot be added -- so the breakdown is carried and the decision
+    #: about whether one currency can speak for the whole figure is left to the
+    #: layer that composes the payload. This module stays a leaf: it produces
+    #: the raw material and imports nothing to interpret it.
+    native_by_ccy: dict[str, Decimal] = field(default_factory=dict)
+    #: Taxes as charged, keyed the same way. Friction is commission + taxes, so
+    #: a friction figure can only be exact when BOTH are, in one currency.
+    taxes_native_by_ccy: dict[str, Decimal] = field(default_factory=dict)
     #: Accumulated in IBKR's own sign convention: negative is a charge,
     #: positive a credit. Kept signed on purpose -- see `commission_base`.
     commission_signed: Decimal = ZERO
@@ -291,6 +301,34 @@ class CostReport:
     @property
     def journal_commission_base(self) -> Decimal:
         return sum((g.commission_base for g in self.journal_commissions), ZERO)
+
+    @property
+    def journal_native_by_ccy(self) -> dict[str, Decimal]:
+        """Journal commission as charged, per billing currency.
+
+        Magnitudes, matching `commission_base`'s sign convention: the whole
+        report presents cost as positive, and a breakdown that disagreed with
+        the total it decomposes would be worse than no breakdown.
+        """
+        out: dict[str, Decimal] = {}
+        for g in self.journal_commissions:
+            for ccy, amount in g.native_by_ccy.items():
+                out[ccy] = out.get(ccy, ZERO) - amount
+        return out
+
+    @property
+    def journal_friction_native_by_ccy(self) -> dict[str, Decimal]:
+        """Friction as charged, per currency: commission plus taxes.
+
+        Merged rather than gated separately, so a scope whose commission is USD
+        and whose taxes are SEK produces two entries and is correctly refused a
+        single exact figure.
+        """
+        out = dict(self.journal_native_by_ccy)
+        for g in self.journal_commissions:
+            for ccy, amount in g.taxes_native_by_ccy.items():
+                out[ccy] = out.get(ccy, ZERO) - amount
+        return out
 
     @property
     def journal_taxes_base(self) -> Decimal:
@@ -437,6 +475,15 @@ def analyse(
         )
         g.commission_signed += commission
         g.taxes_signed += _to_base(t.taxes, rate)
+        if t.ibCommission:
+            billed = (str(getattr(t, "ibCommissionCurrency", None) or "")
+                      or str(getattr(t, "currency", None) or "") or base_currency)
+            g.native_by_ccy[billed] = g.native_by_ccy.get(billed, ZERO) + t.ibCommission
+        if t.taxes:
+            # Taxes carry no currency field of their own, so the instrument's
+            # is the only interpretation the statement supports.
+            tc = str(getattr(t, "currency", None) or "") or base_currency
+            g.taxes_native_by_ccy[tc] = g.taxes_native_by_ccy.get(tc, ZERO) + t.taxes
         if commission > ZERO:
             g.credit_fills += 1
         # Quantity is only a meaningful denominator for contracts and shares.

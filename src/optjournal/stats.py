@@ -747,8 +747,14 @@ def _net_liq_for(
     return best
 
 
-def _one_currency(by_ccy: dict[str, float]) -> tuple[float | None, str | None]:
+def one_currency(by_ccy: dict[str, float]) -> tuple[float | None, str | None]:
     """The total and its currency, when exactly one currency accounts for it.
+
+    Public because three surfaces need the same judgement -- commission and
+    premium here, and the cost report's per-currency breakdown, which is built
+    in analysis.py (a leaf module, which deliberately does not interpret it)
+    and gated in serialize.py. A rule applied in three places must be written
+    once or the three drift.
 
     A native figure is exact but unaddable: USD, SEK and KRW commission cannot
     share a number. So it is offered only when the scope is single-currency,
@@ -828,7 +834,7 @@ def month_stats(
                 )
     stats.orders = len(orders)
     if not episode_pnl:
-        stats.commissions_native, stats.commissions_native_ccy = _one_currency(native)
+        stats.commissions_native, stats.commissions_native_ccy = one_currency(native)
 
     # Fees are account-level CashTransaction rows, never trade-linked -- verified
     # against real data, where none of the 65 fee rows carries a conid or tradeID.
@@ -875,7 +881,7 @@ def month_stats(
         for e in closed:
             if e.commission:
                 by_ccy[e.currency] = by_ccy.get(e.currency, 0.0) + e.commission
-        stats.commissions_native, stats.commissions_native_ccy = _one_currency(by_ccy)
+        stats.commissions_native, stats.commissions_native_ccy = one_currency(by_ccy)
         stats.open_commission_base = sum(
             e.commission_base for e in report.open if scope.has_episode(e)
         )
@@ -883,7 +889,7 @@ def month_stats(
         for e in report.open:
             if scope.has_episode(e) and e.commission:
                 open_by_ccy[e.currency] = open_by_ccy.get(e.currency, 0.0) + e.commission
-        stats.open_commission_native, stats.open_commission_native_ccy = _one_currency(
+        stats.open_commission_native, stats.open_commission_native_ccy = one_currency(
             open_by_ccy
         )
     stats.open_premium_base = sum(
@@ -896,7 +902,7 @@ def month_stats(
     for e in report.open:
         if scope.has_episode(e) and e.proceeds:
             premium_by_ccy[e.currency] = premium_by_ccy.get(e.currency, 0.0) + e.proceeds
-    stats.open_premium_native, stats.open_premium_native_ccy = _one_currency(
+    stats.open_premium_native, stats.open_premium_native_ccy = one_currency(
         premium_by_ccy
     )
     wins = [e.realized_pnl_base for e in closed if e.realized_pnl_base > 0]

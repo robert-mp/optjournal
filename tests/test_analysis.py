@@ -420,16 +420,16 @@ def test_native_commission_is_offered_only_for_a_single_currency_scope():
     signal to fall back to the base restatement, which is approximate but
     complete.
     """
-    from optjournal.stats import _one_currency
+    from optjournal.stats import one_currency
 
-    assert _one_currency({"USD": -6.97}) == (-6.97, "USD")
-    assert _one_currency({"USD": -4.46, "SEK": -208.41}) == (None, None)
-    assert _one_currency({}) == (None, None)
+    assert one_currency({"USD": -6.97}) == (-6.97, "USD")
+    assert one_currency({"USD": -4.46, "SEK": -208.41}) == (None, None)
+    assert one_currency({}) == (None, None)
     # A zero-commission currency is not a second currency: a scope of USD
     # option trades plus a free EUR conversion row is still a USD figure.
-    assert _one_currency({"USD": -6.97, "EUR": 0.0}) == (-6.97, "USD")
+    assert one_currency({"USD": -6.97, "EUR": 0.0}) == (-6.97, "USD")
     # ...and a scope with no commission at all names no currency.
-    assert _one_currency({"EUR": 0.0}) == (None, None)
+    assert one_currency({"EUR": 0.0}) == (None, None)
 
 
 def test_native_commission_is_exact_where_the_restatement_was_not(tmp_path):
@@ -495,3 +495,49 @@ def test_cost_analysis_converts_commission_at_a_rate_that_applies_to_it():
         Decimal("-1.5"), Decimal("0.090897"), "GBP", "SEK", "EUR"
     ) == Decimal("-1.5")
     assert _commission_to_base(None, Decimal("1"), "EUR", "EUR", "EUR") == ZERO
+
+
+def test_the_cost_report_carries_native_commission_per_billing_currency():
+    """analysis.py stays a leaf: it accumulates the breakdown and imports nothing
+    to interpret it. The single-currency judgement lives once, in stats, and is
+    applied by serialize -- the layer that already holds both.
+
+    Magnitudes, matching commission_base's convention: the report presents cost
+    as positive, and a breakdown that disagreed in sign with the total it
+    decomposes would be worse than no breakdown at all.
+    """
+    r = analyse(_stmt([
+        _fill("OPT", "-2.00", qty="3"),
+        _fill("STK", "-25.00", qty="100"),
+    ]))
+    assert r.journal_asset == "OPT"
+    nat = r.journal_native_by_ccy
+    assert nat, "no per-currency breakdown produced"
+    assert sum(nat.values()) == r.journal_commission_base, \
+        "the breakdown does not reconcile with the total it decomposes"
+    assert all(v > 0 for v in nat.values()), "cost must be presented positive"
+
+
+def test_a_mixed_currency_journal_scope_serves_no_native_cost_figure():
+    """The gate is what keeps an exact-looking figure from silently covering
+    only part of a total. A journal scope spanning currencies has no single
+    number that is both exact and complete, so it serves None and the display
+    falls back to the base restatement.
+    """
+    from optjournal.serialize import _journal_native
+
+    one = analyse(_stmt([_fill("OPT", "-2.00", qty="3")]))
+    amount, ccy = _journal_native(one)
+    assert ccy is not None and amount == float(one.journal_commission_base)
+
+    # Two billing currencies in the journal scope -> withheld. Built explicitly
+    # rather than by extending _fill: that helper is shared by a dozen tests
+    # that have nothing to say about currency, and its silence is what proves
+    # the fallback path works in the case above.
+    usd = _fill("OPT", "-2.00", qty="3")
+    usd.ibCommissionCurrency = "USD"
+    sek = _fill("OPT", "-3.00", qty="1")
+    sek.ibCommissionCurrency = "SEK"
+    mixed = analyse(_stmt([usd, sek]))
+    assert len(mixed.journal_native_by_ccy) == 2, "the fake did not span currencies"
+    assert _journal_native(mixed) == (None, None)

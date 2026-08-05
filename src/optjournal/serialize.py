@@ -28,6 +28,7 @@ from typing import Any
 from optjournal.analysis import CostReport
 from optjournal.history import HistoryReport
 from optjournal.sections import raw_sections
+from optjournal.stats import one_currency
 
 Row = dict[str, Any]
 
@@ -140,6 +141,27 @@ def positions_data(conn: sqlite3.Connection) -> list[Row]:
     ).fetchall()
     return [dict(r) for r in rows]
 
+def _journal_native(report: CostReport) -> tuple[float | None, str | None]:
+    """The journal's commission as charged, gated to a single currency.
+
+    analysis.py carries the per-currency breakdown and deliberately does not
+    judge it -- it imports nothing and must stay that way. The gate lives once,
+    in stats, and is applied here, where both are already in hand.
+    """
+    return one_currency(
+        {c: float(v) for c, v in report.journal_native_by_ccy.items()}
+    )
+
+
+def _journal_per_unit_native(report: CostReport) -> float | None:
+    """Commission per contract as charged, or None when the gate withholds."""
+    amount, _ccy = _journal_native(report)
+    if amount is None:
+        return None
+    qty = sum(g.quantity for g in report.journal_commissions)
+    return amount / qty if qty else None
+
+
 def costs_data(report: CostReport) -> Row:
     """Cost report as a JSON-safe structure.
 
@@ -214,9 +236,22 @@ def costs_data(report: CostReport) -> Row:
             # keys -- presenting the account figure as the journal's was the
             # defect this split exists to remove.
             "journal_commission_base": _num(report.journal_commission_base),
+            "journal_commission_native": _journal_native(report)[0],
+            "journal_commission_native_ccy": _journal_native(report)[1],
             "journal_taxes_base": _num(report.journal_taxes_base),
             "journal_friction_base": _num(report.journal_friction_base),
+            "journal_friction_native": one_currency(
+                {c: float(v) for c, v in report.journal_friction_native_by_ccy.items()}
+            )[0],
+            "journal_friction_native_ccy": one_currency(
+                {c: float(v) for c, v in report.journal_friction_native_by_ccy.items()}
+            )[1],
             "journal_per_unit_base": _num(report.journal_per_unit_base),
+            # Divided by the same quantity the base figure uses, so the two
+            # differ only in the currency of the numerator. Deriving it in the
+            # page from a restated total would have put "as charged" beside a
+            # per-unit figure that was not.
+            "journal_per_unit_native": _journal_per_unit_native(report),
             "other_commission_base": _num(report.other_commission_base),
             "other_taxes_base": _num(report.other_taxes_base),
             "account_friction_base": _num(report.account_friction_base),
