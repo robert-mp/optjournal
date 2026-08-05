@@ -111,18 +111,35 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
 @media(max-width:1180px){.stats{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}
   .filters{grid-template-columns:1fr}}
-.stat{padding:13px 15px;border-radius:11px;background:var(--bg2);border:1px solid var(--line)}
+.stat{padding:13px 15px;border-radius:11px;background:var(--bg2);
+  border:1px solid var(--line);position:relative}
 .stat .k{font-size:11.5px;color:var(--dim);margin-bottom:7px}
-/* Marks a card that carries a tooltip. Dotted underline plus a help cursor is
-   the long-standing convention for "there is more here on hover", and without
-   it the note would be information the page holds and never offers. */
-.stat[title]{cursor:help}
+/* Instant, styled tooltip. NOT a `title` attribute: a native tooltip waits one
+   to two seconds, is easily missed and does not exist on touch, so hiding
+   always-visible text behind one deletes it in practice. Absolute so revealing
+   it cannot change a card's height and nudge the grid. */
+.tip{position:absolute;left:10px;top:calc(100% - 3px);z-index:40;
+  width:max-content;max-width:230px;padding:7px 10px;border-radius:8px;
+  text-align:left;font-size:11px;line-height:1.55;font-weight:400;
+  /* Explicit, not inherited: the heading's trigger is a monospace glyph, so an
+     inherited family rendered the same tooltip in two different typefaces
+     depending on which element opened it. */
+  font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  color:var(--dim);background:var(--panel2);border:1px solid var(--line2);
+  box-shadow:0 8px 22px rgba(0,0,0,.55);
+  opacity:0;visibility:hidden;transition:opacity .12s ease;pointer-events:none}
+/* `focus-within` as well as `focus`, so the card reveals whether the focus
+   landed on it or on something inside it. */
+.tipped{cursor:help}
+.tipped:hover>.tip,.tipped:focus>.tip,.tipped:focus-within>.tip{
+  opacity:1;visibility:visible}
+.tipped:focus{outline:1px solid var(--leather1);outline-offset:1px}
 /* A heading states its section's rule on hover. A dotted underline is the right
    affordance under an 11px label and the wrong one under a 19px bold heading --
    at that weight a 1px dotted line reads as a rendering artefact rather than an
    invitation, so the heading gets an explicit glyph instead. */
 .info{display:inline-flex;align-items:center;justify-content:center;
-  width:15px;height:15px;margin-left:7px;border-radius:999px;cursor:help;
+  position:relative;width:15px;height:15px;margin-left:7px;border-radius:999px;
   background:var(--panel2);border:1px solid var(--line2);
   font-size:10px;font-weight:700;font-family:var(--mono);color:var(--dim);
   vertical-align:middle}
@@ -1058,13 +1075,21 @@ function odteFilterNote(){
    ("closed round trips") repeated across five cards is noise that crowds the
    figures without telling a reader anything new the fifth time.
 
-   The dotted underline on the label is what keeps this honest. A tooltip nobody
-   knows to look for is deleted information, so a card with more to say says so;
-   a card with nothing extra gets no underline and no cursor change. */
+   The note is a real ELEMENT, not a `title` attribute. A native tooltip needs
+   one to two seconds of stationary hover, is trivially missed, and does not
+   exist on a touch device -- so putting always-visible text behind one deletes
+   it in practice, which is exactly what happened on the first attempt. A hidden
+   element appears instantly, is styled, stays in the DOM for a screen reader,
+   and is markup a test can assert on.
+
+   `tabindex` because a tooltip reachable only by mouse is still hidden from
+   anyone driving the page from the keyboard. The dotted underline on the label
+   is what advertises that there is anything to reach at all. */
 function statCard(k,v,note,klass){
-  return `<div class="stat"${note?` title="${esc(note)}"`:''}>
+  return `<div class="stat${note?' tipped':''}"${note?' tabindex="0"':''}>
     <div class="k${note?' hint':''}">${esc(k)}</div>
-    <div class="v ${klass||''}">${v}</div></div>`;
+    <div class="v ${klass||''}">${v}</div>
+    ${note?`<div class="tip">${esc(note)}</div>`:''}</div>`;
 }
 function dashboard(){
   const st=S.state, s=st.stats;
@@ -1114,7 +1139,11 @@ function dashboard(){
       +(opt?` · closed round trips${s.open_commission.base?` · ${
         moneyOf(s.open_commission)} on open positions`:''}`
          :' · stated by IBKR'),
-      'sm neg'),
+      /* Same length rule as Net P&L above, not an unconditional `sm`. Fixed at
+         19px this was the only card on the dashboard permanently smaller than
+         its neighbours, which read as a different typeface rather than as a
+         deliberate size -- and the tint made it obvious. */
+      'neg '+(String(moneyOf(s.commissions)).length>10?'sm':'')),
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
@@ -1135,11 +1164,11 @@ function dashboard(){
 
   return `${filters()}
   <div class="card">
-    <div class="crow"><div><h2>${esc(label)} Statistics<span class="info"
-      title="${opt?`Options P&L counts fully closed round trips only, on the day
-      they closed — an open or partially closed position contributes nothing
-      until it is flat.`:`Stock P&L is IBKR's per-fill realisation, net of
-      commission.`}">i</span></h2>
+    <div class="crow"><div><h2>${esc(label)} Statistics<span class="info tipped"
+      tabindex="0"><span class="tip">${opt?`Options P&amp;L counts fully closed
+      round trips only, on the day they closed — an open or partially closed
+      position contributes nothing until it is flat.`:`Stock P&amp;L is IBKR's
+      per-fill realisation, net of commission.`}</span>i</span></h2>
       <div class="sub">${esc(s.asset_category)} trades and commission only —
       account-level fees and other instruments live on the Costs tab.
       ${esc(ccyNote())}</div></div>

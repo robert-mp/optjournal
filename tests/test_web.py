@@ -1713,31 +1713,61 @@ def test_an_event_without_a_timestamp_is_dropped():
     assert web._annotations(lifecycle, []) == []
 
 
-def test_a_stat_cards_note_is_a_tooltip_not_a_visible_line():
-    """The dashboard carried nine stat cards each with a grey line under the
-    figure, and the same six words ("closed round trips") appeared on five of
-    them. Moving the note to a tooltip is what makes the row readable; the
-    dotted-underline hint is what stops it becoming information the page holds
-    and never offers.
+def test_a_stat_cards_note_is_a_hoverable_element_not_a_title_attribute():
+    """Two failures this excludes, and the second was shipped.
+
+    A visible grey line under every figure is the clutter this removed -- the
+    same six words ("closed round trips") appeared on five cards.
+
+    But the first fix used a `title` attribute, and a native tooltip waits one
+    to two seconds, is trivially missed and does not exist on a touch device --
+    so the note was reported as simply gone. A real element appears instantly,
+    stays in the DOM for a screen reader, and is markup this test can read.
     """
     card = _fn("statCard").replace(" ", "").replace("\n", "")
-    assert 'title="${esc(note)}"' in card, "the note no longer reaches a tooltip"
+    assert '<divclass="tip">${esc(note)}</div>' in card, (
+        "the note no longer reaches a hoverable element"
+    )
+    assert 'title=' not in card, (
+        "back to a native title tooltip, which is the mechanism that failed to "
+        "surface the note at all"
+    )
+    assert "class=\"stat${note?'tipped':''}\"" in card, "no tooltip trigger class"
+    assert 'tabindex="0"' in card, (
+        "not focusable, so the note is reachable by mouse only"
+    )
     assert "class=\"k${note?'hint':''}\"" in card, (
         "no hint class, so a card with a tooltip looks identical to one without"
     )
-    assert '<divclass="n">' not in card, (
-        "the note is rendered as a visible line again -- that is the clutter "
-        "this removed, and it now duplicates the tooltip"
+
+
+def test_a_tooltip_is_hidden_until_hovered_or_focused():
+    """The note lives in the DOM, so if the reveal rules ever go it renders as a
+    visible block on every card -- worse than the clutter it replaced.
+    """
+    css = _css().replace(" ", "").replace("\n", "")
+    assert "visibility:hidden" in css and ".tip{" in css, "the tip is not hidden"
+    for trigger in (".tipped:hover>.tip", ".tipped:focus>.tip",
+                    ".tipped:focus-within>.tip"):
+        assert trigger.replace(" ", "") in css, f"no reveal on {trigger}"
+    assert ".tip{position:absolute" in css, (
+        "a static tip would change the card's height when shown and shift the grid"
     )
 
 
-def test_commission_is_tinted_as_a_cost():
-    """It is displayed as a magnitude, so there is no sign to colour by -- and
-    an untinted figure among green ones reads as unfinished rather than neutral.
-    Commission is never a gain, so the tint is unconditional.
+def test_commission_is_tinted_as_a_cost_and_sized_like_its_neighbours():
+    """Two separate defects on one card. It is displayed as a magnitude, so an
+    untinted figure among green ones reads as unfinished rather than neutral --
+    commission is never a gain, so the tint is unconditional. The SIZE is not:
+    an unconditional `sm` made it the only card permanently smaller than its
+    neighbours, which reads as a different typeface. Long figures shrink, by the
+    same length rule Net P&L uses.
     """
     dash = _fn("dashboard").replace(" ", "").replace("\n", "")
-    assert "'smneg'" in dash, "the Commissions card lost its cost tint"
+    assert "'neg'+(String(moneyOf(s.commissions)).length>10?'sm':'')" in dash, (
+        "the Commissions card lost its cost tint or its conditional sizing"
+    )
+    assert "'smneg'" not in dash, "back to an unconditional small size"
 
 
 def test_the_open_pill_counts_positions_not_contracts():
