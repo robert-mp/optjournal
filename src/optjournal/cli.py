@@ -14,13 +14,14 @@ import logging
 import os
 import sqlite3
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 
-from optjournal import __version__
+from optjournal import __version__, browser
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import prune_archive
 from optjournal.compat import unknown_codes
@@ -327,6 +328,60 @@ def cmd_history(args) -> int:
     return EXIT_OK if report.episodes else EXIT_NO_DATA
 
 
+def cmd_sweep(args) -> int:
+    """Render every page both journals can show and assert what each must hold.
+
+    Deliberately not part of `pytest`: it launches a browser once per page, so
+    it costs a minute or two where the suite costs ten seconds. The checks
+    themselves ARE in the suite -- `tests/test_sweep.py` feeds each one a
+    broken fragment and asserts it fails -- so what runs here is trusted
+    machinery over real data rather than unvalidated assertions.
+
+    Both journals by default, because they cover different ground: the real one
+    is the only source of true rates and mixed currencies, and the demo is the
+    only one holding closed round trips, rolls, spreads and a commission
+    credit.
+    """
+    from optjournal import sweep as sweep_mod
+
+    if not browser.browsers():
+        print(
+            "\nNo Chrome/Chromium found. The sweep needs a browser engine to"
+            " render the page; `pytest` covers everything that does not.",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    journals: list[tuple[str, Path, Path, str | None]] = []
+    if not args.demo_only:
+        journals.append(("real", args.db or DEFAULT_DB,
+                         args.archive or DEFAULT_ARCHIVE, args.query_id))
+    if not args.real_only:
+        journals.append(("demo", DEFAULT_DEMO_DB, DEFAULT_DEMO_DIR, None))
+
+    results = []
+    with tempfile.TemporaryDirectory(prefix="optj-sweep-") as tmp:
+        for name, db, archive_dir, query_id in journals:
+            if not Path(db).exists():
+                print(f"skipping {name}: no journal at {db}", file=sys.stderr)
+                continue
+            results.append(sweep_mod.sweep_journal(
+                name=name, db_path=Path(db), archive_dir=Path(archive_dir),
+                profile=Path(tmp) / f"profile-{name}", query_id=query_id,
+            ))
+
+    if not results:
+        return _no_statements(args) if hasattr(args, "archive") else EXIT_NO_DATA
+
+    payload = [
+        {"journal": journal, "page": label,
+         "checks": {n: {"status": v.status, "detail": v.detail} for n, v in checks}}
+        for r in results for journal, label, checks in r.pages
+    ]
+    _emit(payload, sweep_mod.format_report(results), args.json)
+    return EXIT_ERROR if any(r.failures for r in results) else EXIT_OK
+
+
 def cmd_serve(args) -> int:
     """Run the local web UI. Blocks until interrupted."""
     from optjournal.web import serve
@@ -600,6 +655,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", type=Path, default=None,
                    help=f"journal database (default: {DEFAULT_DB})")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("sweep", parents=[common],
+                       help="render every page in a browser and check it")
+    p.add_argument("--query-id", dest="query_id", default=None,
+                   help="Flex Query ID, so the Sync button renders as it does live")
+    p.add_argument("--real-only", action="store_true", help="skip the demo journal")
+    p.add_argument("--demo-only", action="store_true", help="skip the real journal")
+    # Same None-default reasoning as `serve`: an explicit path must win, and
+    # set_defaults on a shared parent would leak into every other subcommand.
+    p.add_argument("--archive", type=Path, default=None,
+                   help=f"raw statement archive (default: {DEFAULT_ARCHIVE})")
+    p.add_argument("--db", type=Path, default=None,
+                   help=f"journal database (default: {DEFAULT_DB})")
+    p.set_defaults(func=cmd_sweep)
 
     return ap
 

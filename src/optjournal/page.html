@@ -1017,7 +1017,15 @@ function calendar(){
      every one of those days was unreachable from the view claiming them. The
      newest month that actually HAS a day is the one worth landing on. */
   const active=(s.days||[]).map(dy=>dy.day.slice(0,7)).sort();
-  const month=s.month!=='ALL'?s.month
+  /* A calday names the month to show, and outranks the month the dropdown
+     would otherwise pick. Without this a link to #calday=2026-07-24 rendered
+     AUGUST's grid with a panel captioned "2026-07-24 — 1 fill" beneath it and
+     no cell highlighted: detail for a day that was not on screen. The day is
+     the more specific instruction, and it only reaches here having survived
+     draw()'s guard -- which proves it is in `s.days`, so the month it names is
+     inside the period and its grid cannot come back empty. */
+  const month=S.calday?S.calday.slice(0,7)
+    :s.month!=='ALL'?s.month
     :(active[active.length-1]||(S.state.month_range||S.state.months||[])[0]);
   if(!month) return `${filters()}<div class="card"><div class="empty">no months with trades</div></div>`;
   const [Y,M]=month.split('-').map(Number);

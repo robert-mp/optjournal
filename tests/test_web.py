@@ -1135,6 +1135,28 @@ def test_a_calday_the_payload_cannot_show_heals_out_of_the_hash():
         "a calday change must not trigger a refetch"
 
 
+def test_the_grid_shows_the_month_the_calday_names():
+    """A calday from the URL outranks the month the dropdown would pick.
+
+    The bug: #calday=2026-07-24 rendered AUGUST's grid with a panel captioned
+    "2026-07-24 -- 1 fill" beneath it and no cell highlighted, because the month
+    came from the dropdown while the panel came from the hash. Detail for a day
+    that is not on screen.
+
+    Safe precisely because draw() heals a calday the payload cannot show BEFORE
+    the calendar runs (see the test above): anything reaching here is in
+    `s.days`, so the month it names is inside the period and its grid cannot
+    come back empty.
+
+    Found by `optjournal sweep`, which asserts exactly one selected cell -- a
+    state that was unreachable, and so uncheckable, until calday joined the
+    hash.
+    """
+    js = _fn("calendar").replace(" ", "").replace("\n", "")
+    assert "constmonth=S.calday?S.calday.slice(0,7)" in js, \
+        "the calendar grid does not follow the calday from the URL"
+
+
 def test_calendar_chevrons_walk_the_range_through_load():
     """Prev/next must mutate S.month and go through load(), the same path as
     the dropdown -- a chevron that only redraws would show a month the server
