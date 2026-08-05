@@ -14,8 +14,10 @@ import {
   deltaDomain,
   domainOf,
   frameAt,
+  indexOfTs,
   markAt,
   plotGeometry,
+  reachedEvents,
   sessionBreaks,
   strikeSpan,
 } from "../../src/optjournal/static/replay.js";
@@ -221,4 +223,39 @@ test("band edges pair upper with lower at the same x", () => {
   assert.equal(lower.length, 2);
   assert.equal(upper[0][0], lower[0][0], "the two edges drifted apart in x");
   assert.ok(upper[0][1] < lower[0][1], "the upper edge is not above the lower");
+});
+
+test("an event maps to the bar that contains it, not the nearest one", () => {
+  // A fill at 1900 sits inside the bar stamped 1000 (which spans 1000-2000).
+  // Nearest-bar rounding would call it bar 1 and place it after later bars.
+  assert.equal(indexOfTs(PRICE, 1900), 0);
+  assert.equal(indexOfTs(PRICE, 2000), 1, "a fill exactly on a bar is that bar");
+  assert.equal(indexOfTs(PRICE, 500), 0, "before the first bar clamps to it");
+  assert.equal(indexOfTs(PRICE, 99999), 2, "after the last bar clamps to it");
+});
+
+test("an event is reached only once the replay passes it", () => {
+  const events = [{ ts: 1500 }, { ts: 2500 }];
+  assert.deepEqual(reachedEvents(events, 1000), [], "an event leaked early");
+  assert.deepEqual(reachedEvents(events, 2000), [1500]);
+  assert.deepEqual(reachedEvents(events, 3000), [1500, 2500]);
+});
+
+test("a reached card and its fill dot agree at every frame", () => {
+  /* The property that matters, not just the arithmetic: cards are revealed by
+     timestamp while dots are clipped by pixel width, so the two could disagree
+     and have the panel contradict itself mid-scrub. */
+  const geo = geometry();
+  const fillTs = 1900;
+  for (let i = 0; i < PRICE.length; i++) {
+    const frame = frameAt({ points: PRICE, marks: [], xs: geo.xs }, i);
+    const carded = reachedEvents([{ ts: fillTs }], frame.ts).length > 0;
+    const dotted = geo.at(fillTs).x <= frame.revealWidth;
+    assert.equal(carded, dotted, `card and dot disagree at bar ${i}`);
+  }
+});
+
+test("an event with no timestamp is never reached", () => {
+  // A malformed event must not render as having happened at the epoch.
+  assert.deepEqual(reachedEvents([{ ts: null }, {}], 9999), []);
 });

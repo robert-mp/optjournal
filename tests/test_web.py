@@ -263,6 +263,9 @@ def _shape_samples(state: dict) -> dict[str, dict]:
     # A replay whose contract has strikes -- an empty strikes list would leave
     # the Strike shape unanchored and quietly exempt it from the contract.
     striped = first([r for r in replays if r["strikes"]])
+    # Likewise for events: a snapshot-only replay has none, so sampling the
+    # first replay would anchor Annotation to nothing and exempt it.
+    evented = first([r for r in replays if r["events"]])
     samples = {
         "State": state,
         "Stats": state["stats"],
@@ -288,6 +291,7 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         "Lifecycle": first(state["lifecycles"]),
         "Replay": striped,
         "Strike": first(striped["strikes"]) if striped else None,
+        "Annotation": first(evented["events"]) if evented else None,
         "Sync": state["sync"],
     }
     missing = sorted(k for k, v in samples.items() if v is None)
@@ -1617,3 +1621,93 @@ def test_proceeds_and_friction_follow_the_same_charge_rule_as_commission():
     assert "cash(s.open_premium.base)}</b>" not in card, "pill bypasses the rule"
     assert "cash(s.options_friction.base)" not in card, "pill bypasses the rule"
     assert "moneyOf(l.money.proceeds)" in _fn("legRow").replace(" ", "")
+
+
+# --------------------------------------------------------------------------
+# event annotations
+# --------------------------------------------------------------------------
+
+def _event(label, *legs, at="2026-07-24 10:35:01", **money):
+    """One lifecycle event in the shape strategies.py actually emits."""
+    return {
+        "label": label,
+        "first_fill_at": at,
+        "orders": [{"legs": list(legs)}],
+        "proceeds": money.get("proceeds"),
+        "commission": money.get("commission"),
+        "realized_pnl": money.get("realized_pnl"),
+    }
+
+
+def _leg(strike, right, side, oc, qty, price):
+    return {
+        "strike": strike, "put_call": right, "buy_sell": side,
+        "open_close": oc, "quantity": qty, "avg_price": price,
+    }
+
+
+def test_an_events_kind_comes_from_its_legs_not_its_label():
+    """The label is prose meant for a human ("Short put close"), so matching on
+    it would break the moment classify() rewords. A ROLL is the case that
+    matters: it closes and opens in one act, so neither marker alone describes
+    it, and colouring it as an open or a close would misreport which.
+    """
+    lifecycle = {"events": [
+        _event("Short put", _leg(270, "P", "SELL", "O", -3, 5.24)),
+        _event("Short put close", _leg(270, "P", "BUY", "C", 3, 2.60),
+               at="2026-08-03 09:55:23"),
+        _event("Roll", _leg(420, "C", "BUY", "C", 1, 1.10),
+               _leg(410, "C", "SELL", "O", -1, 2.30), at="2026-08-10 11:00:00"),
+    ]}
+    kinds = [row["kind"] for row in web._annotations(lifecycle, [])]
+    assert kinds == ["open", "close", "roll"]
+
+
+def test_an_opening_event_reports_no_realised_pnl():
+    """The episode layer reports 0.0 on an opening event, and a card reading
+    "realised $0.00" beside an opening credit invites the reader to conclude the
+    trade made nothing rather than that it has not finished.
+    """
+    zero = {"base": 0.0, "native": None, "ccy": None}
+    lifecycle = {"events": [
+        _event("Short put", _leg(270, "P", "SELL", "O", -3, 5.24),
+               realized_pnl=zero),
+    ]}
+    assert web._annotations(lifecycle, [])[0]["realized"] is None
+
+    closed = {"events": [
+        _event("Short put close", _leg(270, "P", "BUY", "C", 3, 2.60),
+               realized_pnl={"base": 684.59, "native": 787.86, "ccy": "USD"}),
+    ]}
+    got = web._annotations(closed, [])[0]["realized"]
+    assert got is not None and got["native"] == 787.86, (
+        "the control: a CLOSING event must keep its realised figure"
+    )
+
+
+def test_annotations_carry_the_delta_an_event_changed():
+    """What a roll is judged by. The opening event reports None -> x because
+    there was no position to have a delta.
+    """
+    lifecycle = {"events": [
+        _event("Short put", _leg(270, "P", "SELL", "O", -3, 5.24)),
+        _event("Short put close", _leg(270, "P", "BUY", "C", 3, 2.60),
+               at="2026-08-03 09:55:23"),
+    ]}
+    open_ts = web.epoch_et("2026-07-24 10:35:01")
+    close_ts = web.epoch_et("2026-08-03 09:55:23")
+    marks = [[open_ts, 0.0, 0.52], [close_ts - 3600, 700.0, 0.32],
+             [close_ts, 792.0, 0.0]]
+    rows = web._annotations(lifecycle, marks)
+    assert (rows[0]["delta_before"], rows[0]["delta_after"]) == (None, 0.52)
+    assert (rows[1]["delta_before"], rows[1]["delta_after"]) == (0.32, 0.0)
+
+
+def test_an_event_without_a_timestamp_is_dropped():
+    """It could not be placed on the timeline, and defaulting it to the epoch
+    would put it at the far left of every chart as if it happened first.
+    """
+    lifecycle = {"events": [
+        _event("Short put", _leg(270, "P", "SELL", "O", -3, 5.24), at=None),
+    ]}
+    assert web._annotations(lifecycle, []) == []

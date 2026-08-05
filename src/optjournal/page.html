@@ -199,10 +199,34 @@ td.n,th.n{text-align:right}
 .rauto{font-size:11px;color:var(--dim2);white-space:nowrap;cursor:pointer;
   display:flex;align-items:center;gap:4px}
 .rkey{font-size:10.5px;color:var(--dim);margin-top:8px;display:flex;
-  flex-wrap:wrap;gap:2px;align-items:baseline}
-.lg{font-weight:700;margin-right:3px}
+  flex-wrap:wrap;gap:2px;align-items:baseline}.lg{font-weight:700;margin-right:3px}
 .lg.put{color:#d98f8f} .lg.call{color:#7fbf9a}
 .lg.px{color:var(--fg)} .lg.dl{color:var(--dim)}
+/* Event annotation cards. One per DECISION, laid out along the timeline below
+   the chart. They reveal as the replay reaches them rather than all at once:
+   seeing the buyback card while scrubbing the day you opened would tell you the
+   outcome before the chart does, which is the same reason the price line is
+   clipped. Hidden by visibility rather than display so the strip keeps its
+   height and the panel does not jump as cards appear. */
+.evs{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.evc{flex:1 1 210px;min-width:200px;max-width:340px;padding:8px 10px;
+  border-radius:9px;background:var(--panel2);border:1px solid var(--line2);
+  cursor:pointer;visibility:hidden;opacity:0;transition:opacity .18s ease}
+.evc.on{visibility:visible;opacity:1}
+.evc:hover{border-color:var(--leather1)}
+.evc.now{border-color:var(--leather1);background:var(--panel)}
+.evh{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
+.evk{font-size:9px;letter-spacing:.09em;text-transform:uppercase;font-weight:700;
+  padding:1px 5px;border-radius:5px;font-family:var(--mono)}
+.evk.open{background:rgba(127,191,154,.16);color:#7fbf9a}
+.evk.close{background:rgba(217,143,143,.16);color:#d98f8f}
+/* A roll is neither: it closes and opens in one act, and colouring it as either
+   half would misreport which. Neutral, and the only kind that gets its own hue. */
+.evk.roll{background:rgba(191,164,111,.18);color:var(--leather1)}
+.evt{font-size:11.5px;font-weight:600}
+.evw{font-size:10px;color:var(--dim2)}
+.evl{font-size:10.5px;color:var(--dim);margin-top:4px;line-height:1.5}
+.evm{font-size:10.5px;color:var(--dim2);margin-top:3px;line-height:1.5}
 .lg.em{color:var(--leather1)}
 /* Two independent readings of one line: HUE says put or call, DASH says short or
    long. Deliberately not the pos/neg palette -- green/red means signed money
@@ -297,7 +321,8 @@ td.n,th.n{text-align:right}
      these functions being global. -->
 <script type="module">
 import {
-  MIN_POINTS, bandEdges, clampIndex, deltaDomain, domainOf, frameAt, markAt,
+  MIN_POINTS, bandEdges, clampIndex, deltaDomain, domainOf, frameAt, indexOfTs,
+  markAt, reachedEvents,
   plotGeometry, sessionBreaks, strikeSpan,
 } from '/static/replay.js';
 
@@ -606,6 +631,25 @@ import {
  * @property {Array} band -- [ts, low, high] one-standard-deviation expected move,
  *   from the implied vol backed out of the option's own closes; EMPTY where no
  *   vol could be solved, which is honest rather than a narrow range
+ * @property {Array} events -- Annotation rows, one per lifecycle event, oldest
+ *   first; empty for a snapshot-only contract, which has no fills to annotate
+ */
+
+/** @typedef {Object} Annotation -- one decision on the timeline (web._annotations)
+ * @property {number} ts -- the event's first fill, as an epoch (US Eastern)
+ * @property {string} at -- the same instant as "YYYY-MM-DD HH:MM", for display
+ * @property {string|null} label -- the strategy name from strategies.classify
+ * @property {string} kind -- "open", "close" or "roll", from the legs' open/close
+ *   markers rather than parsed out of the prose label
+ * @property {Array} legs -- {strike, put_call, buy_sell, open_close, quantity,
+ *   avg_price} per leg; enough for one line each and nothing more
+ * @property {Money|null} cash -- proceeds: positive is a credit taken in
+ * @property {Money|null} commission
+ * @property {Money|null} realized -- null on an opening event, where the
+ *   episode layer's 0.0 would read as "this trade made nothing"
+ * @property {number|null} delta_before -- effective delta before the event; null
+ *   when no position existed, which is not the same as delta-neutral
+ * @property {number|null} delta_after
  */
 
 /** @typedef {Object} Strike -- one contract as a horizontal reference line
@@ -721,11 +765,12 @@ import {
  * @payload mo:Money
  * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle
  * @payload res:SyncResponse pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
+ * @payload e:Annotation
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local oc odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks mks dd sp spot
- * @local play scrub speed loop
+ * @local play scrub speed loop ev reached
  */
 
 const $=s=>document.querySelector(s);
@@ -1382,7 +1427,8 @@ function replayChart(rp){
     (m.x+4).toFixed(1)}" y="${T+11}">${label}</text>`;
   const dots=(rp.fills||[]).map(ts=>geo.at(ts)).filter(Boolean).map(m=>
     `<circle class="fill" cx="${m.x.toFixed(1)}" cy="${m.y.toFixed(1)}" r="3.2"/>`).join('');
-  RGEO={points:pts,marks:rp.band?rp.marks||[]:[],xs:geo.xs,size:rp.bar_size,dp:dp};
+  RGEO={points:pts,marks:rp.band?rp.marks||[]:[],xs:geo.xs,size:rp.bar_size,dp:dp,
+    events:(rp.events||[]).filter(e=>e&&isFinite(e.ts))};
   const opening=frameAt(RGEO,pts.length-1);
   /* The legend states the encoding rather than making the reader infer it: a
      dashed line means two different things on this chart (a long strike, and the
@@ -1405,11 +1451,12 @@ function replayChart(rp){
       num(pts[pts.length-1][1],dp)} across ${pts.length} ${
       rp.bar_size==='1h'?'hourly':'daily'} bars</title>
     <defs><clipPath id="rclip"><rect id="rclipr" x="0" y="0" width="${W}" height="${H}"/></clipPath></defs>
-    ${band}${yticks}${dax}${breaks}${strikes}
+    ${yticks}${dax}${breaks}
     <line class="ax" x1="${L}" y1="${T}" x2="${L}" y2="${T+ih}"/>
     <line class="ax" x1="${L}" y1="${T+ih}" x2="${L+iw}" y2="${T+ih}"/>
-    ${edge(geo.at(rp.opened_ts),'edge in','entry')}${edge(geo.at(rp.closed_ts),'edge out','exit')}
-    <g clip-path="url(#rclip)">${dline?`<polyline class="dline" points="${
+    <g clip-path="url(#rclip)">${band}${strikes}${
+      edge(geo.at(rp.opened_ts),'edge in','entry')}${
+      edge(geo.at(rp.closed_ts),'edge out','exit')}${dline?`<polyline class="dline" points="${
       dline}"/>`:''}<polyline class="pxline" points="${line}"/>${dots}</g>
     <line id="rcross" class="cross" x1="${geo.xs[pts.length-1].toFixed(1)}" y1="${T}" x2="${
       geo.xs[pts.length-1].toFixed(1)}" y2="${T+ih}"/>
@@ -1426,7 +1473,44 @@ function replayChart(rp){
     </select>
     <label class="rauto"><input type="checkbox" id="rloop"> loop</label>
     <span class="rread mono" id="rread">${replayReadout(opening,rp.bar_size,dp)}</span>
-  </div>`;
+  </div>${replayEvents(rp,pts)}`;
+}
+
+/* One card per decision on the timeline. Rendered once and toggled by class as
+   the replay reaches each one -- rebuilding the strip on every scrub tick would
+   discard the DOM 240 times a second during playback to change one attribute.
+
+   Each card seeks to its own event, which makes the strip a table of contents
+   for the trade: click "Short put close" to jump the chart to the buyback. */
+function replayEvents(rp,pts){
+  const evs=(rp.events||[]).filter(e=>e&&isFinite(e.ts));
+  if(!evs.length) return '';
+  return `<div class="evs">${evs.map(e=>{
+    const legs=(e.legs||[]).map(l=>
+      `<div><span class="${actClass(l.buy_sell)}">${esc(actLabel(l))}</span> ${
+        num(l.quantity,0)} × ${strike(l.strike)}${esc(l.put_call||'')} @ ${
+        num(l.avg_price,2)}</div>`).join('');
+    /* Credit or debit named rather than shown as a signed number: "−$780" is
+       ambiguous about whether the trade received or paid, and which one it was
+       is the first thing you want off a closing card. */
+    const flow=!e.cash?'':`${Number(e.cash.native)<0?'debit':'credit'} ${
+      moneyOf(e.cash)}`;
+    /* Δ before → after: for an opening event `before` is null because there was
+       no position, and printing 0.00 there would read as "we were neutral". */
+    const dl=e.delta_after==null?'':`Δ ${
+      e.delta_before==null?'':num(e.delta_before,2)+' → '}${num(e.delta_after,2)}`;
+    const bits=[flow,
+      e.commission?`comm ${moneyOf(e.commission)}`:'',
+      e.realized?`realised <b class="${cls(e.realized.native)}">${
+        moneyOf(e.realized)}</b>`:'',
+      dl].filter(Boolean).join('<span class="dim2"> · </span>');
+    return `<div class="evc" data-rts="${e.ts}" data-rseek="${
+      indexOfTs(pts,e.ts)}" role="button" tabindex="0"
+      title="jump the replay here"><div class="evh"><span class="evk ${
+      esc(e.kind)}">${esc(e.kind)}</span><span class="evt">${
+      esc(e.label||'')}</span><span class="evw mono">${esc(e.at||'')}</span></div>
+      <div class="evl mono">${legs}</div><div class="evm">${bits}</div></div>`;
+  }).join('')}</div>`;
 }
 
 /* The scrubbed bar in words. Shared by the initial render and every seek, so the
@@ -1459,11 +1543,27 @@ function replaySeek(i){
   if(cross){cross.setAttribute('x1',fr.x.toFixed(1));
     cross.setAttribute('x2',fr.x.toFixed(1));}
   if(read) read.innerHTML=replayReadout(fr,RGEO.size,RGEO.dp);
+  /* Which cards the replay has reached is reachedEvents' decision, in the tested
+     module -- it is the half that has to agree with the clip on the fill dots.
+     `now` marks the most recent one, so during playback the strip reads as a
+     cursor moving through the trade rather than as a set that only grows. */
+  const reached=reachedEvents(RGEO.events||[],fr.ts);
+  const latest=reached.length?reached[reached.length-1]:null;
+  document.querySelectorAll('.evc').forEach(el=>{
+    const ts=Number(el.dataset.rts);
+    el.classList.toggle('on',reached.includes(ts));
+    el.classList.toggle('now',ts===latest);
+  });
   return fr.index;
 }
 function bindReplayControls(){
   const scrub=$('#rscrub'), speed=$('#rspeed'), play=document.querySelector('[data-rplay]');
   if(!scrub) return;
+  /* Sync once on open. The cards render hidden and are revealed by replaySeek, so
+     without this the strip would stay blank until the first interaction even
+     though the scrubber already sits at the end with everything reached. One
+     source of truth for "what is revealed at frame i" rather than two. */
+  replaySeek(Number(scrub.value));
   scrub.oninput=()=>{replayStop();if(play)play.textContent='▶ play';
     replaySeek(Number(scrub.value));};
   if(play) play.onclick=()=>{
@@ -1487,11 +1587,17 @@ function bindReplayControls(){
     },step);
   };
   if(speed) speed.onchange=()=>{ if(RTIMER&&play){play.onclick();play.onclick();} };
-  /* Jump to either end. Stops playback first: leaving a timer running would have
-     it march away from the position just asked for. */
-  document.querySelectorAll('[data-rseek]').forEach(el=>
-    el.onclick=()=>{replayStop();if(play)play.textContent='▶ play';
-      scrub.value=el.dataset.rseek;replaySeek(Number(scrub.value));});
+  /* Jump to either end, or to an event. Stops playback first: leaving a timer
+     running would have it march away from the position just asked for. The
+     annotation cards carry data-rseek too, which makes the strip a table of
+     contents -- and since they are role=button, Enter and Space have to work. */
+  document.querySelectorAll('[data-rseek]').forEach(el=>{
+    const seek=()=>{replayStop();if(play)play.textContent='▶ play';
+      scrub.value=el.dataset.rseek;replaySeek(Number(scrub.value));};
+    el.onclick=seek;
+    if(el.getAttribute('role')==='button')
+      el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();seek();}};
+  });
 }
 
 function replayPanel(rp,label,valueHtml){
@@ -1507,9 +1613,11 @@ function replayPanel(rp,label,valueHtml){
   <div class="note">The line is the UNDERLYING's price, not the option's — it is
     what the strikes are read against. Each strike spans only the period it was
     held; hue says put or call, and a dashed one was bought rather than sold.
-    Expected move and eff Δ are modelled from the vol implied by the option's own
-    closes, so they are estimates: the card above states the figure the broker
-    billed.</div></div>`;
+    Everything that states a fact about the trade is hidden ahead of the
+    scrubber, so a replay cannot show you its own outcome. Expected move and
+    eff Δ are modelled from the vol implied by the option's own closes AND by
+    your fills, so they are estimates: the card above states the figure the
+    broker billed.</div></div>`;
 }
 
 function trades(){

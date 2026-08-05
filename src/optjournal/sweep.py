@@ -519,6 +519,27 @@ def check_replay_renders_from_url(p: Page) -> Verdict:
         return bad(f"{len(replay['marks'])} marks held, no eff-delta series drawn")
     if 'class="rkey"' not in p.markup:
         return bad("no legend, so the hue and dash encodings are unexplained")
+    # Event annotation cards: one per decision, each seeking to its own bar.
+    events = replay.get("events") or []
+    cards = re.findall(r'class="evc[^"]*" data-rts="(\d+)" data-rseek="(\d+)"', p.markup)
+    if len(cards) != len(events):
+        return bad(f"{len(cards)} annotation cards for {len(events)} events")
+    for (raw_ts, raw_seek), event in zip(cards, events, strict=False):
+        if int(raw_ts) != event["ts"]:
+            return bad(f"card timestamp {raw_ts} does not match event {event['ts']}")
+        # A card seeks to the bar CONTAINING its event. Landing past the event
+        # would jump the chart to a frame where the card is not yet revealed.
+        seek = int(raw_seek)
+        if not 0 <= seek < len(replay["points"]):
+            return bad(f"card seeks to bar {seek}, outside {len(replay['points'])} bars")
+        if replay["points"][seek][0] > event["ts"]:
+            return bad(f"card for {event['at']} seeks past its own event")
+    # Revealed on open. The strip renders hidden and bindReplayControls syncs it,
+    # so a missing sync leaves every card invisible with the scrubber at the end.
+    if events and p.markup.count('class="evc on') != len(events):
+        return bad(f"{p.markup.count('class=\"evc on')} of {len(events)} cards "
+                   "revealed with the scrubber at the last bar -- the open sync "
+                   "did not run, so the strip stays blank until an interaction")
     return ok()
 
 

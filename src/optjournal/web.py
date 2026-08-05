@@ -27,7 +27,7 @@ import socket
 import sqlite3
 import threading
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -38,6 +38,7 @@ from optjournal.analysis import analyse
 from optjournal.bars import (
     BandContract,
     ReplayLeg,
+    delta_around,
     epoch_et,
     expected_move_band,
     modelled_marks,
@@ -147,20 +148,29 @@ def _band_contracts(rows: list[dict[str, Any]]) -> list[BandContract]:
 
     Deduplicated by conid because a closed lifecycle holds each contract twice,
     and solving the same series of closes twice would weight that leg double in
-    the average.
+    the average. The fills of BOTH rows still count as vol anchors though -- an
+    opening and a closing fill are two separate observations of the same
+    contract, so they accumulate onto the one entry rather than replacing it.
     """
     seen: dict[str, BandContract] = {}
     for row in rows:
         conid = str(row.get("conid") or "")
         strike, expiry = row.get("strike"), row.get("expiry")
-        if not conid or strike is None or not expiry or conid in seen:
+        if not conid or strike is None or not expiry:
             continue
-        seen[conid] = BandContract(
-            conid=conid,
-            strike=float(strike),
-            right=str(row.get("put_call") or ""),
-            expiry=str(expiry),
-        )
+        stamp, price = epoch_et(row.get("first_fill_at")), row.get("avg_price")
+        anchor = () if stamp is None or price is None else ((stamp, float(price)),)
+        existing = seen.get(conid)
+        if existing is None:
+            seen[conid] = BandContract(
+                conid=conid,
+                strike=float(strike),
+                right=str(row.get("put_call") or ""),
+                expiry=str(expiry),
+                anchors=anchor,
+            )
+        elif anchor:
+            seen[conid] = replace(existing, anchors=existing.anchors + anchor)
     return list(seen.values())
 
 
@@ -204,6 +214,74 @@ def _replay_legs(rows: list[dict[str, Any]]) -> list[ReplayLeg]:
     ]
 
 
+def _annotations(
+    lifecycle: dict[str, Any], marks: list[list[float]]
+) -> list[dict[str, Any]]:
+    """One card per EVENT on the timeline: what was done, what it cost, what it changed.
+
+    An event, not a fill. A four-leg iron condor opened in one order is one
+    decision and belongs on one card; splitting it per fill would turn a single
+    act into four annotations that each look like a separate trade. The grouping
+    is strategies.py's, already computed -- which is also how a roll arrives
+    labelled as one: an order with both opening and closing legs classifies as
+    "Roll" there, so the card needs no detection of its own and cannot disagree
+    with the event caption shown elsewhere on the same page.
+
+    ``kind`` is derived from the legs' open/close markers rather than parsed out
+    of the label, because the label is prose meant for a human ("Short put
+    close") and matching on it would break the moment classify() rewords.
+
+    Delta before and after come from the modelled marks, so a roll states the
+    exposure it removed. An OPENING event reports ``None -> x``: there was no
+    position to have a delta.
+    """
+    out: list[dict[str, Any]] = []
+    for event in lifecycle.get("events") or []:
+        stamp = epoch_et(event.get("first_fill_at"))
+        if stamp is None:
+            continue
+        legs = [
+            leg
+            for order in (event.get("orders") or [])
+            for leg in (order.get("legs") or [])
+        ]
+        markers = {str(leg.get("open_close") or "").upper() for leg in legs}
+        kind = (
+            "roll" if len(markers) > 1
+            else "close" if markers == {"C"}
+            else "open"
+        )
+        before, after = delta_around(marks, stamp)
+        out.append({
+            "ts": stamp,
+            "at": str(event.get("first_fill_at") or "")[:16],
+            "label": event.get("label"),
+            "kind": kind,
+            # Only what a card shows. Passing the whole leg would ship account
+            # ids and both currencies' worth of every figure into a tooltip.
+            "legs": [
+                {
+                    "strike": leg.get("strike"),
+                    "put_call": leg.get("put_call"),
+                    "buy_sell": leg.get("buy_sell"),
+                    "open_close": leg.get("open_close"),
+                    "quantity": leg.get("quantity"),
+                    "avg_price": leg.get("avg_price"),
+                }
+                for leg in legs
+            ],
+            "cash": event.get("proceeds"),
+            "commission": event.get("commission"),
+            # Realised P&L is meaningless on an opening event -- the episode layer
+            # reports 0.0 there, and a card reading "realised $0.00" beside an
+            # opening credit invites the reader to think the trade made nothing.
+            "realized": event.get("realized_pnl") if kind != "open" else None,
+            "delta_before": before,
+            "delta_after": after,
+        })
+    return sorted(out, key=lambda row: row["ts"])
+
+
 def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     """Build one replay per trade and point rows at it by key.
 
@@ -244,6 +322,10 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             conn, str(lifecycle.get("underlying") or ""),
             opened_at=opened, closed_at=closed,
         )
+        marks = modelled_marks(
+            conn, _replay_legs(legs), bars["points"],
+            underlying_conid=bars["conid"],
+        )
         replays[key] = {
             "key": key,
             "underlying": lifecycle.get("underlying"),
@@ -266,10 +348,8 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 conn, _band_contracts(legs), bars["points"],
                 underlying_conid=bars["conid"],
             ),
-            "marks": modelled_marks(
-                conn, _replay_legs(legs), bars["points"],
-                underlying_conid=bars["conid"],
-            ),
+            "marks": marks,
+            "events": _annotations(lifecycle, marks),
         }
         lifecycle["replay_key"] = key
 
@@ -334,6 +414,9 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 )],
                 bars["points"], underlying_conid=bars["conid"],
             ),
+            # No fills means no events to annotate. Explicitly empty rather than
+            # absent, so the page reads one shape for every replay.
+            "events": [],
         }
 
     state["replays"] = replays

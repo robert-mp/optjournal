@@ -61,6 +61,7 @@ __all__ = [
     "BandContract",
     "close_series",
     "ReplayLeg",
+    "delta_around",
     "expected_move_band",
     "modelled_marks",
     "epoch_et",
@@ -446,6 +447,11 @@ class BandContract:
     strike: float
     right: str
     expiry: str
+    #: (epoch, price per unit) from the trade's OWN fills. A fill is an option
+    #: price the market actually charged, so it is a vol observation in exactly
+    #: the way a daily close is -- and the only one available for a session the
+    #: price source has no history for. See _vol_series.
+    anchors: tuple[tuple[int, float], ...] = ()
 
 
 def _expiry_epoch(expiry: str | None) -> int | None:
@@ -550,9 +556,53 @@ def _vol_series(
             vol = implied_vol(close, spot, contract.strike, years, contract.right)
             if vol is not None:
                 found.append((stamp, vol))
+        found.extend(_anchor_vols(contract, points, expiry))
         if found:
             out[contract.conid] = sorted(found)
     return out
+
+
+def _anchor_vols(
+    contract: BandContract, points: list[tuple[int, float]], expiry: int
+) -> list[tuple[int, float]]:
+    """Implied vol from the trade's own fills.
+
+    This exists because a price source's history can start AFTER a trade did.
+    Measured on this journal: the TSLA 270P was sold on 2026-07-24, and the
+    source's first bar for that contract is 2026-07-27 -- so the band, the
+    effective delta and the modelled P&L were all absent across the entry
+    session, which is the one part of a replay a reader most wants. Asking the
+    source for an earlier window returns nothing; the data does not exist. The
+    fill does: the market charged 5.24 for that contract at 10:35, which is an
+    option price as real as any close.
+
+    Spot comes from _spot_at -- interpolated WITHIN the bar the fill falls in --
+    and this is the one place that pairing is correct, where pairing a daily
+    close that way is not. A daily option bar is stamped 04:00Z, which on an
+    hourly chart lands in the overnight gap, so interpolating there prices the
+    option against a spot the market never showed. A fill carries a genuine
+    intraday instant that the hourly series brackets, so the interpolation is
+    between two prices that really did surround it.
+
+    Only fills inside the chart window are used, since a spot outside it cannot
+    be read; anything the solve rejects (a price below intrinsic, a fill after
+    expiry) is dropped rather than defaulted, so a gap stays a gap.
+    """
+    if not points:
+        return []
+    low, high = points[0][0], points[-1][0]
+    found: list[tuple[int, float]] = []
+    for stamp, price in contract.anchors:
+        if stamp < low or stamp > high:
+            continue
+        spot = _spot_at(points, stamp)
+        if spot is None:
+            continue
+        years = (expiry - stamp) / (365.0 * 86400)
+        vol = implied_vol(price, spot, contract.strike, years, contract.right)
+        if vol is not None:
+            found.append((stamp, vol))
+    return found
 
 
 def _held_forward(series: list[tuple[int, float]], stamp: int) -> float | None:
@@ -654,8 +704,13 @@ def modelled_marks(
     fraction -- the scale the reference chart uses.
     """
     contracts = [
-        BandContract(conid=leg.conid, strike=leg.strike, right=leg.right,
-                     expiry=leg.expiry)
+        BandContract(
+            conid=leg.conid, strike=leg.strike, right=leg.right, expiry=leg.expiry,
+            # The fills, so a session the price source has no history for still
+            # prices from what the market charged us. A snapshot-only leg is
+            # seeded from a cost basis with no timestamp, so it cannot anchor.
+            anchors=tuple((stamp, price) for stamp, _qty, price in leg.fills),
+        )
         for leg in legs
     ]
     vols = _vol_series(conn, contracts, points, underlying_conid)
@@ -694,6 +749,32 @@ def modelled_marks(
             continue
         marks.append([stamp, round(cash + value, 2), round(delta, 4)])
     return marks
+
+
+def delta_around(marks: list[list[float]], stamp: int) -> tuple[float | None, float | None]:
+    """Effective delta immediately before and after an event, as ``(before, after)``.
+
+    The pair a roll is judged by: the reference implementation this feature
+    imitates puts "Eff Delta 17 -> 10" on its roll card, because the number that
+    matters about a roll is how much exposure it removed.
+
+    ``before`` is the last mark STRICTLY before the event and ``after`` the first
+    at or after it, so an opening fill correctly reports ``None -> 0.56``: there
+    was no position to have a delta, and inventing 0.0 there would read as
+    "we were delta-neutral" rather than "we were not in the trade".
+
+    Either side may be None at a window edge, or when no bar in the window had a
+    solvable vol.
+    """
+    before: float | None = None
+    after: float | None = None
+    for row in marks:
+        if row[0] < stamp:
+            before = row[2]
+        else:
+            after = row[2]
+            break
+    return before, after
 
 
 def _trim_to_context(

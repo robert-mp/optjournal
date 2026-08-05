@@ -190,3 +190,36 @@ export function bandEdges(band, geometry) {
   }
   return { upper, lower };
 }
+
+/** The bar an instant belongs to: the last bar at or before it.
+ *
+ * The bar CONTAINING the event, not the nearest one. A fill at 10:35 belongs to
+ * the 10:30 bar because that bar spans 10:30-11:30; rounding to the nearest
+ * would attribute it to 11:30, which on a daily chart moves an event a whole
+ * session and puts it after bars that were actually later than it.
+ */
+export function indexOfTs(points, ts) {
+  if (!points.length || ts == null || !Number.isFinite(ts)) return 0;
+  let found = 0;
+  for (let i = 0; i < points.length; i++) {
+    if (points[i][0] > ts) break;
+    found = i;
+  }
+  return found;
+}
+
+/** Which event annotations the replay has reached, by timestamp.
+ *
+ * `ts <= frame` rather than a pixel comparison, but chosen to agree with one:
+ * the fill dots are clipped by the reveal edge, so a card appearing while its
+ * dot is still hidden (or the reverse) would have the panel contradict itself
+ * mid-scrub. An event inside a bar is reached at the FOLLOWING bar, which is
+ * where its interpolated x actually falls.
+ *
+ * Returns the timestamps rather than the objects, so the caller can toggle
+ * existing DOM by key instead of re-rendering cards on every scrub tick.
+ */
+export function reachedEvents(events, ts) {
+  return events.filter((e) => e && Number.isFinite(e.ts) && e.ts <= ts)
+    .map((e) => e.ts);
+}

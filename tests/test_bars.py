@@ -8,6 +8,7 @@ offline and deterministic.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -20,6 +21,7 @@ from optjournal.bars import (
     backfill_bars,
     bars_manifest,
     close_series,
+    delta_around,
     epoch_et,
     et_day,
     expected_move_band,
@@ -459,6 +461,54 @@ def test_the_band_is_absent_rather_than_narrow_without_a_vol(conn):
         underlying_conid="U1",
     )
     assert band == []
+
+
+def test_a_fill_anchors_vol_where_the_source_has_no_history(conn):
+    """The defect this closes, measured on the real journal: the TSLA 270P was
+    sold on 2026-07-24 and the price source's first bar for that contract is
+    2026-07-27, so the band, the delta and the P&L were all absent across the
+    entry session -- the part of a replay a reader most wants. Asking the source
+    for an earlier window returns nothing; the data does not exist. The fill does.
+    """
+    spot, strike, vol = 100.0, 90.0, 0.40
+    expiry, expiry_ts = "2026-03-20", _ts("2026-03-20") + 16 * 3600
+    # An hourly chart over one session, with NO option bar anywhere.
+    opens = [epoch_et("2026-01-05 09:30:00") + i * 3600 for i in range(4)]
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1h", source="yahoo",
+                bars=[_bar(s, spot) for s in opens])
+    points = [(s, spot) for s in opens]
+    contract = BandContract(conid="OPT1", strike=strike, right="P", expiry=expiry)
+
+    assert expected_move_band(conn, [contract], points, underlying_conid="U1") == [], (
+        "the control: with no option price at all there is nothing to solve"
+    )
+
+    # The same contract, priced by a fill in the second bar.
+    fill_at = opens[1]
+    years = (expiry_ts - fill_at) / (365.0 * 86400)
+    priced = replace(
+        contract, anchors=((fill_at, bs_price(spot, strike, years, vol, "P")),)
+    )
+    band = expected_move_band(conn, [priced], points, underlying_conid="U1")
+    assert [row[0] for row in band] == opens[1:], (
+        "the band should start AT the fill and not before it -- a vol held "
+        "backwards would price a position that did not exist yet"
+    )
+    stamp, low, high = band[0]
+    assert (high - low) / 2 == pytest.approx(spot * vol * (years ** 0.5), rel=2e-2)
+
+
+def test_delta_around_reports_none_before_a_position_existed(conn):
+    """An opening event has no delta "before". Reporting 0.0 there would read as
+    "we were delta-neutral" rather than "we were not in the trade" -- and for a
+    roll, whose whole point is the exposure it removed, the pair is the number.
+    """
+    marks = [[100, 0.0, 0.60], [200, 5.0, 0.40], [300, 9.0, 0.0]]
+    assert delta_around(marks, 100) == (None, 0.60), "an event on the first bar"
+    assert delta_around(marks, 250) == (0.40, 0.0), "a roll mid-series"
+    assert delta_around(marks, 50) == (None, 0.60), "before every mark"
+    assert delta_around(marks, 9999) == (0.0, None), "after every mark"
+    assert delta_around([], 100) == (None, None)
 
 
 def test_the_band_accepts_both_expiry_formats_the_payload_carries(conn):

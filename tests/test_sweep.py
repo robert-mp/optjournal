@@ -156,6 +156,14 @@ _REPLAY_PAYLOAD = {
             "opened_ts": 150, "closed_ts": 280, "fills": [150, 280],
             "band": [[100, 320.0, 420.0], [200, 290.0, 390.0], [300, 275.0, 371.0]],
             "marks": [[100, 100.0, 0.4], [200, 250.0, 0.3], [300, 792.0, 0.0]],
+            "events": [
+                {"ts": 150, "at": "2026-07-24 10:35", "label": "Short put",
+                 "kind": "open", "legs": [], "cash": None, "commission": None,
+                 "realized": None, "delta_before": None, "delta_after": 0.4},
+                {"ts": 280, "at": "2026-08-03 09:55", "label": "Short put close",
+                 "kind": "close", "legs": [], "cash": None, "commission": None,
+                 "realized": None, "delta_before": 0.3, "delta_after": 0.0},
+            ],
         },
     },
 }
@@ -179,12 +187,25 @@ _REPLAY_OK = (
     '<g clip-path="url(#rclip)">'
     '<polyline class="dline" points="1,2 3,4"/>'
     '<polyline class="pxline" points="1,2 3,4 5,6"/></g>'
-    '</svg>' + _REPLAY_CTL + '</div>'
+    '</svg>' + _REPLAY_CTL
+    + '<div class="evs">'
+      '<div class="evc on" data-rts="150" data-rseek="0">opened</div>'
+      '<div class="evc on now" data-rts="280" data-rseek="1">closed</div>'
+      '</div></div>'
 )
 #: The failure this excludes: an axis frame with no line reads as "this trade
 #: did nothing", which is a claim about the trade rather than about the data.
 _REPLAY_NO_LINE = _REPLAY_OK.replace(
     '<polyline class="pxline" points="1,2 3,4 5,6"/>', '')
+#: The cards render but none is revealed -- the open sync did not run, so the
+#: strip sits blank until the reader happens to touch the scrubber.
+_REPLAY_CARDS_HIDDEN = _REPLAY_OK.replace('class="evc on now"', 'class="evc"').replace(
+    'class="evc on"', 'class="evc"')
+#: A card seeking PAST its own event: clicking it would jump the chart to a frame
+#: where the card it was clicked from is not yet revealed.
+_REPLAY_CARD_MISSEEKS = _REPLAY_OK.replace(
+    '<div class="evc on" data-rts="150" data-rseek="0">',
+    '<div class="evc on" data-rts="150" data-rseek="2">')
 
 
 _SIDE_OK = '<td class="side buy">Long</td><td class="side sell">Short</td>'
@@ -304,6 +325,18 @@ CASES: list[tuple[str, sweep.Check, Page, Page]] = [
      page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_OK,
           payload=_REPLAY_PAYLOAD),
      page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_NO_LINE,
+          payload=_REPLAY_PAYLOAD)),
+    ("replay reveals its annotation cards on open",
+     sweep.check_replay_renders_from_url,
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_OK,
+          payload=_REPLAY_PAYLOAD),
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_CARDS_HIDDEN,
+          payload=_REPLAY_PAYLOAD)),
+    ("an annotation card seeks to its own bar",
+     sweep.check_replay_renders_from_url,
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_OK,
+          payload=_REPLAY_PAYLOAD),
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_CARD_MISSEEKS,
           payload=_REPLAY_PAYLOAD)),
     ("drill-down legs carry ctx",
      sweep.check_drilldown_legs_have_context,

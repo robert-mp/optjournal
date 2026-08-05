@@ -74,12 +74,21 @@ Every figure the accounting layers report is broker-stated: a fill price, a
 commission IBKR billed, a mark from a position snapshot. `blackscholes.py` breaks
 that rule on purpose, and is quarantined for it.
 
-Its output reaches exactly one place — the expected-move band on a replay panel,
-labelled as expected move — and reaches it through `bars.py`. `stats.py`,
+Its output reaches the replay panel and nowhere else, through `bars.py`: the
+expected-move band, the per-bar P&L on the scorecard, and the effective-delta
+series — each labelled as modelled, on a panel whose caption says so. `stats.py`,
 `analysis.py` and `serialize.py` never import it, so no headline number, no
 calendar day and no annual row can be traced back to a model. The journal's
 credibility rests on that separation: "nothing counts until the position is
 flat" is worth little if a modelled figure can reach the same card.
+
+The vol it solves against is the contract's own — its daily closes, plus **your
+own fills**, which are option prices the market really charged. Fills matter
+because a price source's history can begin after a trade did: this journal's TSLA
+270P was sold on 2026-07-24 and the source's first bar for it is 2026-07-27, so
+without the fill the band, the delta and the P&L were all absent across the entry
+session. The fill-derived vol came out at 49.3% against 50.0% for the next daily
+close, so it agrees with the source rather than distorting it.
 
 Two assumptions live in `blackscholes.py` as named constants rather than
 literals, so they are auditable: `RISK_FREE` (0.04) and `DIVIDEND_YIELD` (0.0,
