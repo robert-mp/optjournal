@@ -1325,17 +1325,28 @@ def test_the_positions_side_cell_has_a_colour_rule_that_matches():
 
 
 def test_position_group_subtotal_sits_under_the_value_column():
-    """The subtotal sums position_value_base, so it belongs in `value` -- the
-    fifth of nine columns. It used to ride a colspan=8 label into column 9,
-    under `record`, four columns from the figures it totals.
+    """The subtotal sums position_value_base, so it belongs in `value`. It used
+    to ride a colspan=8 label into the last column, under `record`, four columns
+    from the figures it totals.
+
+    The arithmetic is DERIVED from the header row rather than hardcoded. The
+    hardcoded form failed merely because a column was added (the `trend`
+    miniature), which says nothing about whether the subtotal still lines up --
+    the thing actually worth guarding. Now it fails only when the alignment
+    genuinely breaks.
     """
     body = _fn("positions").replace(" ", "").replace("\n", "")
     headers = re.findall(r"<th[^>]*>(.*?)</th>", _fn("positions"))
-    assert len(headers) == 9, f"column count changed: {headers}"
-    assert headers.index("value") == 4, "value is no longer the fifth column"
+    total = len(headers)
+    value_at = next(i for i, h in enumerate(headers) if h.strip() == "value")
     grp = body.split('<trclass="grp">')[1].split("</tr>")[0]
-    assert grp.count('colspan="4"') == 2, "label and trailing spans must be 4+4"
-    assert 'colspan="8"' not in grp
+    assert f'colspan="{value_at}"' in grp, (
+        f"the label span must cover the {value_at} column(s) that precede `value`"
+    )
+    assert f'colspan="{total - value_at - 1}"' in grp, (
+        "the trailing span must cover every column after `value`"
+    )
+    assert f'colspan="{total}"' not in grp, "the label must not span the whole row"
 
 
 def test_the_chart_axis_follows_the_display_currency():

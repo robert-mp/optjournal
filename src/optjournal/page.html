@@ -145,6 +145,8 @@ td.n,th.n{text-align:right}
 .day.clk{cursor:pointer}
 .day.clk:hover{border-color:#8a6a4e}
 .day.selected{outline:2px solid #c98a5c;outline-offset:-2px}
+.spark{vertical-align:middle;display:inline-block;overflow:visible}
+.sparkcell{width:1%;white-space:nowrap;padding-right:10px}
 .linkish{background:none;border:none;color:var(--dim);cursor:pointer;
   font:inherit;font-size:11px;text-decoration:underline;padding:0}
 .linkish:hover{color:var(--fg)}
@@ -322,6 +324,8 @@ td.n,th.n{text-align:right}
  * @property {number} mark_price
  * @property {number} position_value
  * @property {number} position_value_base -- raw column; read `value` instead
+ * @property {Array} spark -- decimated daily closes, oldest first (bars.spark_series);
+ *   empty when no bars have been backfilled for this contract yet
  * @property {number} cost_basis_money -- raw column; read `cost_basis` instead
  * @property {number} cost_basis_price
  * @property {number} fifo_pnl_unrealized -- raw column; read `unrealized` instead
@@ -555,6 +559,9 @@ td.n,th.n{text-align:right}
  * @property {Money|null} realized_pnl -- null until the lifecycle is closed
  * @property {Money|null} commission -- same rule
  * @property {Array} events -- StrategyGroup rows
+ * @property {Array} spark -- decimated daily closes; EMPTY for a multi-leg
+ *   lifecycle, because one line cannot honestly stand for two legs whose
+ *   summed value we cannot align (web.build_state says why)
  */
 
 /** @typedef {Object} Sync -- fetch machinery state (web.build_state)
@@ -605,6 +612,7 @@ td.n,th.n{text-align:right}
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local oc odtes open opts out ps pts range rows yrs active shown
+ * @local vs
  */
 
 const $=s=>document.querySelector(s);
@@ -1157,6 +1165,40 @@ function groupLabel(legs){
   if(legs.length>1) return oc.length>1?'ROLL':(closing?'SPREAD CLOSE':'SPREAD');
   return closing?'CLOSING':'OPENING';
 }
+function sparkline(v,opts){
+  /* A row miniature: one polyline, no axes, no labels, no library. Explicitly
+     NOT the replay chart -- that one needs a y-axis, because reading a strike
+     line against a price scale is its whole purpose, and a 100px table cell
+     has no room for one.
+
+     An absent series renders an em dash rather than a flat line, so "no bars
+     yet" and "did not move" stay distinguishable. Two points is the minimum
+     that can express a direction; one point is a dot that reads as a trend it
+     does not have.
+
+     Values arrive already decimated and null-free from bars.spark_series --
+     min/max preserving, with the true first and last pinned, so the endpoints
+     mean what the eye reads them to mean. */
+  const vs=(v||[]).filter(n=>typeof n==='number'&&isFinite(n));
+  if(vs.length<2) return '<span class="dim2">—</span>';
+  const w=(opts&&opts.w)||100, h=(opts&&opts.h)||24, pad=2.5;
+  const lo=Math.min(...vs), hi=Math.max(...vs), span=(hi-lo)||1;
+  const pts=vs.map((n,i)=>{
+    const px=pad+(i*(w-2*pad))/(vs.length-1);
+    const py=h-pad-((n-lo)*(h-2*pad))/span;
+    return px.toFixed(1)+','+py.toFixed(1);
+  }).join(' ');
+  /* Direction over the whole series, through the same cls() the page uses for
+     signed money, so it lands in the pos/neg palette and green/red means one
+     thing everywhere. `stroke="currentColor"` is what picks it up: .pos/.neg
+     set `color`, not `stroke`. */
+  return `<svg class="spark ${cls(vs[vs.length-1]-vs[0])}" viewBox="0 0 ${w} ${h}"
+    width="${w}" height="${h}" preserveAspectRatio="none" role="img"
+    ><title>${vs[0].toFixed(2)} → ${vs[vs.length-1].toFixed(2)} (${
+      vs.length} daily closes)</title
+    ><polyline points="${pts}" fill="none" stroke="currentColor"
+      stroke-width="1.25" stroke-linejoin="round"/></svg>`;
+}
 function trades(){
   /* One card per POSITION LIFECYCLE: a short put opened in July and bought
      back in August is one position with two events, not two unrelated
@@ -1182,6 +1224,9 @@ function trades(){
         <span class="pill" style="margin-left:8px;font-size:11px"
           >${openLc?'OPEN':'CLOSED'}</span></h2>
         <div class="sub mono">${when} · ${lc.fills} fill(s) · ${evs.length} event(s)</div></div>
+        ${(lc.spark||[]).length?`<div style="text-align:right">
+          <div class="dim2" style="font-size:10.5px">daily close</div>
+          ${sparkline(lc.spark,{w:150,h:32})}</div>`:''}
       </div>
       <div class="stats" style="grid-template-columns:repeat(3,1fr)">
         ${statCard('Proceeds', moneyOf(lc.proceeds),
@@ -1251,6 +1296,7 @@ function positions(){
   });
   const row=pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
     return `<tr><td class="mono">${esc(pos.symbol)}</td>
+    <td class="sparkcell">${sparkline(pos.spark)}</td>
     <td class="side ${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
     <td class="n mono ${cls(pos.position)}">${pos.position}</td>
     <td class="n mono">${money(pos.mark_price,pos.currency)}</td>
@@ -1271,8 +1317,13 @@ function positions(){
        columns adrift of the figures it totals, which is exactly the "total in
        a column that is not its own" failure this table is meant to make
        checkable. Label spans contract..mark, the subtotal takes value, and a
-       trailing span covers cost basis..record. */
-    return `<tr class="grp"><td colspan="4" class="dim">${esc(label)}</td>
+       trailing span covers cost basis..record.
+
+       The label span is 5, not 4: the `trend` miniature added a column between
+       contract and side, and a colspan left at 4 would slide the subtotal one
+       column left into `mark` -- reintroducing the exact defect this comment
+       records fixing. Pinned by a test for that reason. */
+    return `<tr class="grp"><td colspan="5" class="dim">${esc(label)}</td>
       <td class="n mono ${cls(uv)}">${cash(uv)}</td>
       <td colspan="4"></td></tr>${bkt.rows.map(row).join('')}`;};
   return `<div class="card">
@@ -1282,7 +1333,7 @@ function positions(){
       starts. Grouped by the strategy each position was opened as.</div></div>
       <div class="pills"><span class="pill">book value
         <b class="${cls(val)}">${cash(val)}</b></span></div></div>
-    ${ps.length?`<table><thead><tr><th>contract</th><th>side</th><th class="n">qty</th>
+    ${ps.length?`<table><thead><tr><th>contract</th><th>trend</th><th>side</th><th class="n">qty</th>
       <th class="n">mark</th><th class="n">value</th><th class="n">cost basis</th>
       <th class="n">unrealised</th><th>price ccy</th><th>record</th></tr></thead><tbody>
       ${buckets.map(grpRow).join('')}</tbody></table>`:'<div class="empty">no open options</div>'}

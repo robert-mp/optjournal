@@ -39,7 +39,7 @@ from pathlib import Path
 
 __all__ = ["SCHEMA_VERSION", "connect", "migrate", "open_journal"]
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Columns added to existing tables after their CREATE statement shipped.
 #: `executescript(_SCHEMA)` uses CREATE TABLE IF NOT EXISTS, which is a no-op on
@@ -201,6 +201,36 @@ CREATE TABLE IF NOT EXISTS securities (
   listing_exchange   TEXT,
   raw                TEXT NOT NULL,
   updated_at         TEXT NOT NULL
+);
+
+-- Historical OHLCV, for underlyings and option contracts alike. One table
+-- rather than two because the shape is identical and every reader wants both
+-- series on one time axis; which is which is already answerable by joining
+-- `conid` against trades/securities, so a discriminator column would only
+-- duplicate what the journal knows.
+--
+-- Bars are immutable once a session closes, so this is a cache that only ever
+-- grows: `ts` is the bar's OPEN in epoch seconds UTC, and the primary key
+-- makes a re-fetch idempotent. `source` records provenance so a later,
+-- better-trusted fetch can upgrade a row in place (see marketdata.SOURCE_RANK)
+-- without a migration and without re-fetching what is already good.
+--
+-- Prices are nullable on purpose. A quiet option strike has no print on
+-- roughly one session in five, and writing 0.0 there would render the
+-- position's value collapsing to nothing.
+CREATE TABLE IF NOT EXISTS price_bars (
+  conid       TEXT    NOT NULL,
+  symbol      TEXT    NOT NULL,
+  bar_size    TEXT    NOT NULL,
+  ts          INTEGER NOT NULL,
+  open        REAL,
+  high        REAL,
+  low         REAL,
+  close       REAL,
+  volume      INTEGER,
+  source      TEXT    NOT NULL,
+  fetched_at  TEXT    NOT NULL,
+  PRIMARY KEY (conid, bar_size, ts)
 );
 
 -- One row per (order, leg). Collapses partial fills, which IBKR marks with

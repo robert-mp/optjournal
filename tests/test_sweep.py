@@ -124,10 +124,23 @@ _CALENDAR_LIES = (
     '<span class="pill">Red days <b>2</b></span></div>'
 )
 
-_POS_OK = '<tr class="grp"><td colspan="4" class="dim">x</td><td></td><td colspan="4"></td></tr>'
-#: The original: a colspan=8 label put the subtotal in column 9, under
+#: The check derives the expected spans from the header row, so the fixture has
+#: to carry one. Ten columns with `value` sixth means 5 before and 4 after.
+_POS_HEAD = (
+    "<tr><th>contract</th><th>trend</th><th>side</th><th>qty</th><th>mark</th>"
+    "<th>value</th><th>cost basis</th><th>unrealised</th><th>price ccy</th>"
+    "<th>record</th></tr>"
+)
+_POS_OK = (
+    _POS_HEAD
+    + '<tr class="grp"><td colspan="5" class="dim">x</td><td></td>'
+      '<td colspan="4"></td></tr>'
+)
+#: The original: a colspan=8 label put the subtotal in the last column, under
 #: `record` -- four columns left of the value it totalled.
-_POS_WRONG_COLUMN = '<tr class="grp"><td colspan="8" class="dim">x</td><td></td></tr>'
+_POS_WRONG_COLUMN = (
+    _POS_HEAD + '<tr class="grp"><td colspan="8" class="dim">x</td><td></td></tr>'
+)
 
 _SIDE_OK = '<td class="side buy">Long</td><td class="side sell">Short</td>'
 #: `side` alone has no hue; the column renders as unstyled text.

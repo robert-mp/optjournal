@@ -24,6 +24,7 @@ from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 from optjournal import __version__, browser
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import prune_archive
+from optjournal.bars import backfill_bars, bars_manifest
 from optjournal.compat import unknown_codes
 from optjournal.config import (
     DEFAULT_ARCHIVE,
@@ -328,6 +329,45 @@ def cmd_history(args) -> int:
     return EXIT_OK if report.episodes else EXIT_NO_DATA
 
 
+def cmd_bars(args) -> int:
+    """Fetch the price bars this journal's own positions imply.
+
+    Idempotent by construction, so running it again is cheap: bars for a closed
+    session never change, and the upsert makes a repeat a no-op. `--dry-run`
+    prints the derived windows without spending a request, which is the way to
+    see what a run would ask for before it asks.
+    """
+    conn = _open_db(args)
+
+    def day(epoch: int) -> str:
+        return datetime.fromtimestamp(epoch, UTC).date().isoformat()
+
+    if args.dry_run:
+        requests = bars_manifest(conn)
+        data = [dataclasses.asdict(r) for r in requests]
+        lines = [f"{len(requests)} window(s) derived, nothing fetched"]
+        lines += [
+            f"  {r.kind:<10} {r.symbol:<20} {r.bar_size}  "
+            f"{day(r.start)} -> {day(r.end)}"
+            for r in requests
+        ]
+        _emit(data, "\n".join(lines), args.json)
+        return EXIT_OK if requests else EXIT_NO_DATA
+
+    outcome = backfill_bars(conn)
+    data = dataclasses.asdict(outcome)
+    lines = [
+        f"{outcome.written} bar(s) stored across {outcome.requested} window(s)"
+        + (f", {outcome.skipped} with no bars at that granularity"
+           if outcome.skipped else "")
+    ]
+    lines += [f"  FAILED: {failure}" for failure in outcome.failures]
+    _emit(data, "\n".join(lines), args.json)
+    if outcome.failures:
+        return EXIT_ERROR
+    return EXIT_OK if outcome.written else EXIT_NO_DATA
+
+
 def cmd_sweep(args) -> int:
     """Render every page both journals can show and assert what each must hold.
 
@@ -616,6 +656,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--assets", default="OPT", metavar="LIST",
                    help="asset category to report, or ALL (default: OPT)")
     p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("bars", parents=[common, database],
+                       help="backfill price bars for the windows positions imply")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the derived windows without fetching anything")
+    p.set_defaults(func=cmd_bars)
 
     p = sub.add_parser("sync", parents=[common, archive, database],
                        help="fetch, ingest and report new activity (for cron)")

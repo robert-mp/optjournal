@@ -285,16 +285,30 @@ def check_positions_subtotal_column(p: Page) -> Verdict:
 
     A subtotal in the wrong column is not obviously wrong to look at -- it is a
     plausible number under the wrong heading, which is worse than a blank.
+
+    The expected spans are DERIVED from the rendered header row rather than
+    hardcoded. Hardcoding them meant adding a column (the `trend` miniature)
+    failed this check while the alignment was in fact still correct, which
+    trains a reader to bump the constant instead of reading the assertion.
     """
     if p.tab != "positions":
         return skip("not the positions tab")
     rows = re.findall(r'<tr class="grp">(.*?)</tr>', p.markup, re.S)
     if not rows:
         return skip("no position groups on this page")
+    headers = re.findall(r"<th[^>]*>(.*?)</th>", p.markup)
+    if "value" not in headers:
+        return bad(f"no `value` column in the positions header: {headers}")
+    before = headers.index("value")
+    after = len(headers) - before - 1
+    expected = [str(before), str(after)]
     for row in rows:
         spans = re.findall(r'colspan="(\d+)"', row)
-        if spans != ["4", "4"]:
-            return bad(f"subtotal row has colspans {spans}, expected ['4', '4']")
+        if spans != expected:
+            return bad(
+                f"subtotal row has colspans {spans}, expected {expected} "
+                f"for a {len(headers)}-column table with `value` at {before}"
+            )
     return ok()
 
 

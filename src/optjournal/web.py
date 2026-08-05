@@ -35,6 +35,7 @@ from typing import Any
 
 from optjournal import __version__
 from optjournal.analysis import analyse
+from optjournal.bars import attach_sparks, spark_series
 from optjournal.db import open_journal
 from optjournal.flex import (
     FETCH_COOLDOWN_S,
@@ -235,6 +236,28 @@ def build_state(
         }
         base_ccy = str(state["stats"].get("base_currency") or "")
         state["fx"] = {"base": base_ccy, "quotes": fx_quotes(conn, base_ccy)}
+
+        # Row miniatures, attached to the rows the serializers just produced
+        # rather than to anything the grouping layers received -- those stay
+        # read-only lenses over their input, an invariant the suite pins.
+        #
+        # A position row is exactly one contract, so every row gets a real
+        # series. A LIFECYCLE can span several (a strangle's two legs, a roll
+        # chain), and a single line cannot honestly stand for two legs: the
+        # position's value is their sum, and summing needs timestamp-aligned
+        # series that dropping null closes does not give us. So a multi-contract
+        # lifecycle gets no miniature rather than one leg passed off as the
+        # whole, and the replay chart draws the legs separately where it can.
+        spark_conids = {str(row.get("conid") or "") for row in state["positions"]}
+        for lifecycle in state["lifecycles"]:
+            legs = [str(c) for c in (lifecycle.get("conids") or [])]
+            if len(legs) == 1:
+                spark_conids.add(legs[0])
+        sparks = spark_series(conn, sorted(c for c in spark_conids if c))
+        attach_sparks(state["positions"], sparks)
+        for lifecycle in state["lifecycles"]:
+            legs = [str(c) for c in (lifecycle.get("conids") or [])]
+            lifecycle["spark"] = sparks.get(legs[0], []) if len(legs) == 1 else []
 
     newest = newest_statement(archive_dir)
     if newest is not None:
