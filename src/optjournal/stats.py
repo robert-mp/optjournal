@@ -220,6 +220,23 @@ class MonthStats:
     #: euros twice across months: July displayed the opening legs' commission,
     #: and August's net P&L contained it again. Signed, like the fill sum was.
     commissions_base: float = 0.0
+
+    #: Commission as CHARGED, in the currency it was charged in -- set only
+    #: when every contributing row shares one currency, and None otherwise.
+    #:
+    #: `commissions_base` is an accounting translation: each row converted at
+    #: IBKR's own rate for ITS OWN date. Displaying that sum in a non-base
+    #: currency multiplies it by a single later snapshot rate, so a USD charge
+    #: makes a round trip -- USD to EUR at trade date, EUR to USD at snapshot --
+    #: through two different rates, and does not come back. On this account
+    #: that read $7.0021 for commission IBKR actually billed as $6.9652.
+    #:
+    #: The native figure is exact but cannot be summed across currencies, so it
+    #: is offered only where one currency accounts for all of it. A mixed scope
+    #: (this account's stock trades span USD, SEK, EUR and KRW) gets None, and
+    #: the display falls back to the restatement it has always shown.
+    commissions_native: float | None = None
+    commissions_native_ccy: str | None = None
     fees_base: float = 0.0
 
     #: Episode-derived, so a two-fill close counts once.
@@ -707,6 +724,26 @@ def _net_liq_for(
     return best
 
 
+def _one_currency(by_ccy: dict[str, float]) -> tuple[float | None, str | None]:
+    """The total and its currency, when exactly one currency accounts for it.
+
+    A native figure is exact but unaddable: USD, SEK and KRW commission cannot
+    share a number. So it is offered only when the scope is single-currency,
+    and withheld -- (None, None) -- the moment a second currency appears, which
+    is the display's signal to fall back to the base restatement rather than
+    show an exact-looking figure that silently dropped part of the total.
+
+    Currencies with no commission are ignored rather than counted: a scope of
+    USD option trades plus a zero-commission EUR conversion row is still
+    honestly a USD commission figure.
+    """
+    live = {ccy: amount for ccy, amount in by_ccy.items() if amount}
+    if len(live) != 1:
+        return None, None
+    ccy, amount = next(iter(live.items()))
+    return amount, ccy
+
+
 def month_stats(
     conn: sqlite3.Connection,
     period: str | None = None,
@@ -741,9 +778,12 @@ def month_stats(
 
     episode_pnl = asset_category == _EPISODE_PNL_CATEGORY
     orders: set[str] = set()
+    #: Native commission per currency, so `commissions_native` can be offered
+    #: when -- and only when -- one currency accounts for all of it.
+    native: dict[str, float] = {}
     for row in conn.execute(
         f"SELECT trade_date, trade_id, ib_order_id, fifo_pnl_realized_base,"
-        f" ib_commission_base FROM trades {where}", params
+        f" ib_commission_base, ib_commission, currency FROM trades {where}", params
     ):
         if not _in_period(row["trade_date"], period):
             continue
@@ -759,7 +799,13 @@ def month_stats(
             # that is also where the P&L it nets against is attributed.
             stats.net_pnl_base += row["fifo_pnl_realized_base"] or 0.0
             stats.commissions_base += row["ib_commission_base"] or 0.0
+            if row["ib_commission"]:
+                native[row["currency"]] = (
+                    native.get(row["currency"], 0.0) + row["ib_commission"]
+                )
     stats.orders = len(orders)
+    if not episode_pnl:
+        stats.commissions_native, stats.commissions_native_ccy = _one_currency(native)
 
     # Fees are account-level CashTransaction rows, never trade-linked -- verified
     # against real data, where none of the 65 fee rows carries a conid or tradeID.
@@ -799,6 +845,14 @@ def month_stats(
         # because the net P&L above already contains it. A month that merely
         # opened a position shows no commission, exactly as it shows no trade.
         stats.commissions_base = sum(e.commission_base for e in closed)
+        # Episodes carry both the native amount and the currency it was charged
+        # in, so the exact figure needs no extra query -- only the check that
+        # one currency speaks for the whole round-trip set.
+        by_ccy: dict[str, float] = {}
+        for e in closed:
+            if e.commission:
+                by_ccy[e.currency] = by_ccy.get(e.currency, 0.0) + e.commission
+        stats.commissions_native, stats.commissions_native_ccy = _one_currency(by_ccy)
         stats.open_commission_base = sum(
             e.commission_base for e in report.open if scope.has_episode(e)
         )
@@ -826,6 +880,8 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "orders": stats.orders,
         "net_pnl_base": stats.net_pnl_base,
         "commissions_base": stats.commissions_base,
+        "commissions_native": stats.commissions_native,
+        "commissions_native_ccy": stats.commissions_native_ccy,
         "fees_base": stats.fees_base,
         "closed_episodes": stats.closed_episodes,
         "open_episodes": stats.open_episodes,

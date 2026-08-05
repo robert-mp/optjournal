@@ -279,6 +279,9 @@ td.n,th.n{text-align:right}
  * @property {number} orders
  * @property {number} net_pnl_base -- options: closed round trips only, net of commission
  * @property {number} commissions_base -- options: commission of round trips CLOSED here
+ * @property {number|null} commissions_native -- commission AS CHARGED, null when the
+ *   scope spans more than one currency and no single figure can be exact
+ * @property {string|null} commissions_native_ccy -- the currency it was charged in
  * @property {number} fees_base
  * @property {number} closed_episodes -- the headline trade count for options
  * @property {number} open_episodes
@@ -639,6 +642,34 @@ const cash=(v,d)=>money(conv(v),DISP(),d);
 const natCash=(v,rate,d)=>
   cash(v==null||rate==null?null:Number(v)*Number(rate),d);
 
+/* ---- commission: a charge, not an analytic total ----------------------
+   Commission is billed in one currency and debited in that currency -- IBKR
+   takes dollars for a US option, never euros. `commissions_base` is therefore
+   an accounting translation, and restating it into a display currency sends a
+   USD charge on a round trip through two different rates (its own trade-date
+   rate to EUR at ingest, then one snapshot rate back out), which does not
+   return: $6.9652 billed read $7.0021 on screen.
+
+   So when the reader is already looking at the currency the commission was
+   charged in, show the charge. `commissions_native` is null whenever the scope
+   spans currencies -- this account's stock trades span USD, SEK, EUR and KRW,
+   and those cannot share a number -- and then the restatement is the honest
+   best available, exactly as before.
+
+   One helper, used by the Dashboard card and both tables, because the same
+   figure reading differently on two tabs is the defect this replaced. */
+const commissionIsNative=s=>
+  s.commissions_native!=null&&s.commissions_native_ccy===DISP();
+const commissionOf=s=>commissionIsNative(s)
+  ? money(Math.abs(s.commissions_native),s.commissions_native_ccy)
+  : cash(Math.abs(s.commissions_base));
+/* Which basis the figure on screen actually uses -- three states, not two.
+   "restated" is a claim, and it is false when the reader is looking at the
+   base currency: that figure is IBKR's own conversion, unrestated, and saying
+   otherwise undersells it. */
+const commissionBasis=s=>commissionIsNative(s)?'as charged'
+  :DISP()===BASE()?`IBKR's figure in ${BASE()}`:`restated from ${BASE()}`;
+
 const cls=v=>v==null||Number(v)===0?'':Number(v)>0?'pos':'neg';
 const pct=(v,d=1)=>v==null?'—':num(v,d)+'%';
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -824,10 +855,11 @@ function dashboard(){
        Commission is a cost by definition and the label says so, so the
        magnitude is the honest form -- and the red `cls()` tint went with the
        sign, because colouring a figure by a sign no longer shown is noise. */
-    statCard('Commissions', cash(Math.abs(s.commissions_base)),
-      opt?`closed round trips${s.open_commission_base?` · ${
+    statCard('Commissions', commissionOf(s),
+      commissionBasis(s)
+      +(opt?` · closed round trips${s.open_commission_base?` · ${
         cash(Math.abs(s.open_commission_base))} on open positions`:''}`
-         :'stated by IBKR',
+         :' · stated by IBKR'),
       'sm'),
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
@@ -1286,7 +1318,7 @@ function annual(){
     <td class="n mono ${cls(s.net_pnl_base)}">${cash(s.net_pnl_base)}</td>
     <td class="n mono">${s.avg_win_base==null?'—':cash(s.avg_win_base)}</td>
     <td class="n mono">${s.avg_loss_base==null?'—':cash(s.avg_loss_base)}</td>
-    <td class="n mono">${cash(Math.abs(s.commissions_base))}</td>
+    <td class="n mono">${commissionOf(s)}</td>
     <td class="n mono"><span class="pos">${s.green_days}</span>/<span
       class="neg">${s.red_days}</span></td></tr>`;
   return `<div class="card">
@@ -1337,7 +1369,7 @@ function monthlyTable(){
       <td class="n mono neg">${s.losses}</td>
       <td class="n mono">${pct(s.win_rate)}</td>
       <td class="n mono ${cls(s.net_pnl_base)}">${cash(s.net_pnl_base)}</td>
-      <td class="n mono">${cash(Math.abs(s.commissions_base))}</td>
+      <td class="n mono">${commissionOf(s)}</td>
       <td class="n mono"><span class="pos">${s.green_days}</span>/<span
         class="neg">${s.red_days}</span></td></tr>`);
   });

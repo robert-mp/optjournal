@@ -1305,14 +1305,47 @@ def test_the_chart_axis_follows_the_display_currency():
 def test_dashboard_commission_reads_the_same_as_the_tables():
     """The same all-time figure read "-EUR26.25" on the Dashboard card and
     "EUR26.25" in the Annual and Month tables, so cross-checking one against
-    the other required knowing each surface's sign convention. Commission is a
-    cost and the label says so, so the magnitude is the honest form -- and the
-    sign-driven tint goes with the sign.
+    the other required knowing each surface's sign convention.
+
+    Agreement is now structural rather than coincidental: all three read one
+    helper, so a change to the basis cannot land on one surface only. That is
+    a stronger guarantee than the identical-expression assertion this replaced,
+    which passed only while the three call sites happened to be spelled alike.
     """
-    card = _fn("dashboard").replace(" ", "").replace("\n", "")
-    assert "statCard('Commissions',cash(Math.abs(s.commissions_base))" in card
-    assert "cls(s.commissions_base)" not in card, \
-        "colouring by a sign that is no longer displayed"
+    js = _code_only(_js()).replace(" ", "").replace("\n", "")
+    assert "constcommissionOf=s=>commissionIsNative(s)" in js, \
+        "the shared commission helper is gone"
+    for fn in ("dashboard", "annual", "monthlyTable"):
+        body = _fn(fn).replace(" ", "").replace("\n", "")
+        assert "commissionOf(s)" in body, f"{fn} does not use the shared helper"
+        assert "cash(Math.abs(s.commissions_base))" not in body, \
+            f"{fn} bypasses the helper and can drift from the others"
+    # Magnitude, not sign: the tint went with the sign it no longer shows.
+    assert "cls(s.commissions_base)" not in _fn("dashboard").replace(" ", "")
+    assert "Math.abs(s.commissions_native)" in _code_only(_js()).replace(" ", "")
+
+
+def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
+    """Commission is billed and debited in one currency -- IBKR takes dollars
+    for a US option, never euros. `commissions_base` is an accounting
+    translation, so restating it into a display currency round-trips a USD
+    charge through two different rates (its own trade-date rate to EUR at
+    ingest, one snapshot rate back out) and does not return: $6.9652 billed
+    read $7.0021 on screen.
+
+    The native figure is exact but unaddable, so it is used only when the
+    display currency IS the currency charged; a scope spanning currencies
+    serves null and the display falls back to the restatement.
+    """
+    js = _code_only(_js()).replace(" ", "").replace("\n", "")
+    # The gate is currency identity, not merely presence of a native figure.
+    assert "s.commissions_native!=null&&s.commissions_native_ccy===DISP()" in js
+    # money(), not cash(): a native amount must NOT be passed through conv().
+    helper = _code_only(_js())
+    helper = helper[helper.index("const commissionOf") :][:260].replace(" ", "")
+    assert "money(Math.abs(s.commissions_native),s.commissions_native_ccy)" in helper
+    assert "cash(s.commissions_native" not in helper, \
+        "converting an already-native amount reintroduces the round trip"
 
 
 def test_the_calendar_pills_describe_the_month_on_the_grid():

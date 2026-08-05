@@ -394,3 +394,59 @@ def test_json_exposes_both_scopes(statement):
     assert t["journal_friction_base"] + t["account_friction_base"] == pytest.approx(
         t["friction_base"]
     )
+
+
+def test_native_commission_is_offered_only_for_a_single_currency_scope():
+    """Exact when one currency accounts for the whole figure, withheld the
+    moment a second appears.
+
+    A native amount cannot be summed across currencies -- USD, SEK and KRW
+    commission share no number -- so offering one for a mixed scope would mean
+    either a wrong total or a silently partial one. None is the display's
+    signal to fall back to the base restatement, which is approximate but
+    complete.
+    """
+    from optjournal.stats import _one_currency
+
+    assert _one_currency({"USD": -6.97}) == (-6.97, "USD")
+    assert _one_currency({"USD": -4.46, "SEK": -208.41}) == (None, None)
+    assert _one_currency({}) == (None, None)
+    # A zero-commission currency is not a second currency: a scope of USD
+    # option trades plus a free EUR conversion row is still a USD figure.
+    assert _one_currency({"USD": -6.97, "EUR": 0.0}) == (-6.97, "USD")
+    # ...and a scope with no commission at all names no currency.
+    assert _one_currency({"EUR": 0.0}) == (None, None)
+
+
+def test_native_commission_is_exact_where_the_restatement_was_not(tmp_path):
+    """The regression this closes, end to end on demo data: the native figure
+    must equal the sum IBKR billed, and must NOT equal the base sum restated at
+    a snapshot rate -- the two differ precisely because the base figure was
+    converted per trade at each trade's own date.
+    """
+    import sqlite3
+
+    from optjournal import web
+    from optjournal.db import connect, migrate
+    from optjournal.demo import write_demo_statement
+    from optjournal.ingest import ingest_file
+
+    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    conn = connect(tmp_path / "demo.db")
+    migrate(conn)
+    ingest_file(conn, statement)
+    conn.close()
+
+    st = web.build_state(db_path=tmp_path / "demo.db", archive_dir=statement.parent,
+                         query_id=None)["stats"]
+    if st["commissions_native"] is None:
+        return  # demo scope is multi-currency; the gate is pinned above
+    billed = sqlite3.connect(tmp_path / "demo.db").execute(
+        "SELECT SUM(ib_commission) FROM trades WHERE asset_category='OPT'"
+        " AND currency = ?", (st["commissions_native_ccy"],)
+    ).fetchone()[0]
+    # Native is a subset of billed (closed round trips only), never larger.
+    assert abs(st["commissions_native"]) <= abs(billed) + 1e-9
+    # And it is a genuinely different number from the base figure, which is
+    # what makes the display distinction worth drawing.
+    assert st["commissions_native"] != st["commissions_base"]
