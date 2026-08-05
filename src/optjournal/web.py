@@ -35,7 +35,14 @@ from typing import Any
 
 from optjournal import __version__
 from optjournal.analysis import analyse
-from optjournal.bars import BandContract, epoch_et, expected_move_band, replay_bars
+from optjournal.bars import (
+    BandContract,
+    ReplayLeg,
+    epoch_et,
+    expected_move_band,
+    modelled_marks,
+    replay_bars,
+)
 from optjournal.db import open_journal
 from optjournal.flex import (
     FETCH_COOLDOWN_S,
@@ -141,6 +148,46 @@ def _band_contracts(rows: list[dict[str, Any]]) -> list[BandContract]:
     return list(seen.values())
 
 
+def _replay_legs(rows: list[dict[str, Any]]) -> list[ReplayLeg]:
+    """One ReplayLeg per distinct contract, carrying its whole fill schedule.
+
+    Grouped by conid rather than one leg per fill, because the mark-to-market
+    walks a running position: a contract sold to open and bought to close is ONE
+    leg with two fills, and treating it as two legs would hold both at once and
+    double the position.
+
+    Quantities are signed as the fill states them -- IBKR sends -3 for a sale --
+    so cash flow and position both fall out of the same number without a
+    buy_sell branch.
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        conid = str(row.get("conid") or "")
+        strike, expiry = row.get("strike"), row.get("expiry")
+        if not conid or strike is None or not expiry:
+            continue
+        stamp = epoch_et(row.get("first_fill_at"))
+        quantity, price = row.get("quantity"), row.get("avg_price")
+        entry = grouped.setdefault(conid, {
+            "conid": conid,
+            "strike": float(strike),
+            "right": str(row.get("put_call") or ""),
+            "expiry": str(expiry),
+            "multiplier": float(row.get("multiplier") or 100.0),
+            "fills": [],
+        })
+        if stamp is not None and quantity is not None and price is not None:
+            entry["fills"].append((stamp, float(quantity), float(price)))
+    return [
+        ReplayLeg(
+            conid=entry["conid"], strike=entry["strike"], right=entry["right"],
+            expiry=entry["expiry"], multiplier=entry["multiplier"],
+            fills=tuple(sorted(entry["fills"])),
+        )
+        for entry in grouped.values()
+    ]
+
+
 def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     """Build one replay per trade and point rows at it by key.
 
@@ -203,6 +250,10 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 conn, _band_contracts(legs), bars["points"],
                 underlying_conid=bars["conid"],
             ),
+            "marks": modelled_marks(
+                conn, _replay_legs(legs), bars["points"],
+                underlying_conid=bars["conid"],
+            ),
         }
         lifecycle["replay_key"] = key
 
@@ -247,6 +298,22 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "band": expected_move_band(
                 conn, _band_contracts([row]), bars["points"],
                 underlying_conid=bars["conid"],
+            ),
+            # No fills anywhere -- that is what makes it snapshot-only -- so the
+            # position is seeded from the snapshot's own cost basis and held flat
+            # across the window.
+            "marks": modelled_marks(
+                conn,
+                [ReplayLeg(
+                    conid=str(row.get("conid") or ""),
+                    strike=float(row.get("strike") or 0.0),
+                    right=str(row.get("put_call") or ""),
+                    expiry=str(row.get("expiry") or ""),
+                    multiplier=float(row.get("multiplier") or 100.0),
+                    seed_quantity=float(row.get("position") or 0.0),
+                    seed_price=float(row.get("cost_basis_price") or 0.0),
+                )],
+                bars["points"], underlying_conid=bars["conid"],
             ),
         }
 
@@ -522,6 +589,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(query)
         if path in ("/", "/index.html"):
             self._send(200, page_html().encode(), "text/html; charset=utf-8")
+        elif path.startswith("/static/"):
+            # Same-origin only, and only the files shipped beside the page: the
+            # CSP is `default-src 'self'`, and a path that could escape this
+            # directory would turn a local journal viewer into a file server.
+            name = path[len("/static/"):]
+            asset = (Path(__file__).parent / "static" / name).resolve()
+            root = (Path(__file__).parent / "static").resolve()
+            if name and root in asset.parents and asset.is_file():
+                self._send(200, asset.read_bytes(),
+                           "text/javascript; charset=utf-8")
+            else:
+                self._json(404, {"error": "not found"})
         elif path == "/api/state":
             try:
                 self._json(200, build_state(

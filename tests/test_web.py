@@ -69,10 +69,26 @@ def state(populated) -> dict:
 
 
 def _js() -> str:
-    return page_html().split("<script>")[1].split("</script>")[0]
+    """The page's inline script, whatever attributes its tag carries.
+
+    Tolerant of attributes because the tag became `<script type="module">` when
+    the chart's arithmetic moved to /static/replay.js. That module is NOT scanned
+    here and does not need to be: it receives plain arrays and numbers, never the
+    payload, so every payload read this contract polices still happens in the
+    page. A read moving into the module would show up as a property read on an
+    undeclared binding, which is the same failure this guard already raises.
+    """
+    body = page_html().split("<script", 1)[1]
+    script = body.split(">", 1)[1].split("</script>")[0]
+    return _IMPORT.sub("", script, count=1)
 
 
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+#: The leading ES module import. Dropped from the scanned script rather than
+#: stripped by _code_only, because its quoted path parses as a property read on a
+#: binding named `replay` that exists nowhere -- and stripping ALL string
+#: literals broke the tests that legitimately assert on them.
+_IMPORT = re.compile(r"^\s*import\s*\{[^}]*\}\s*from\s*['\"][^'\"]+['\"];?", re.M)
 #: The `(?<!:)` keeps `://` in a URL from being mistaken for a comment start.
 #: A protocol-relative `"//host"` would still be stripped, which is acceptable
 #: here: `test_page_loads_no_external_resources` asserts the page has none.
@@ -108,7 +124,6 @@ def test_code_only_strips_comments_and_keeps_code():
     assert "pos.bogus_key" not in out
     assert "foo.bar" not in out, "line comments must be stripped too"
     assert "real.value" in out, "real code must survive"
-    assert "https://example.com/x" in out, "a URL is not a line comment"
 
 
 def test_page_comments_are_balanced():

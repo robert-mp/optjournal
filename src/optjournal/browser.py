@@ -81,6 +81,12 @@ def dump_dom(url: str, profile: Path) -> str | None:
                 "--no-first-run", "--no-default-browser-check",
                 f"--user-data-dir={profile}-{i}",
                 f"--virtual-time-budget={_VIRTUAL_TIME_BUDGET_MS}",
+                # Routes page console output to stderr, so an uncaught error can
+                # be asserted on. Worth having: a ReferenceError blanks the whole
+                # view, and 470 passing Python tests did not notice one -- the
+                # payload contract and the unit suite both read source and data,
+                # neither of which knows the browser refused to run it.
+                "--enable-logging=stderr", "--v=0",
                 "--dump-dom", url,
             ]
             try:
@@ -90,8 +96,48 @@ def dump_dom(url: str, profile: Path) -> str | None:
             except (subprocess.TimeoutExpired, OSError):
                 continue
             if proc.returncode == 0 and "<html" in proc.stdout.lower():
+                _LAST_CONSOLE.clear()
+                _LAST_CONSOLE.extend(console_errors(proc.stderr))
                 return proc.stdout
     return None
+
+
+#: Console errors from the most recent successful dump_dom. Module state rather
+#: than a return value so every existing caller keeps working unchanged; the
+#: sweep reads it immediately after its own dump, which is single-threaded.
+_LAST_CONSOLE: list[str] = []
+
+
+def last_console_errors() -> list[str]:
+    """Console errors from the most recent dump_dom, newest call only."""
+    return list(_LAST_CONSOLE)
+
+
+#: Substrings that identify a JavaScript failure in a console line. Plain
+#: containment rather than a regex: this list is the entire specification, and a
+#: reader should not have to parse word boundaries to see what counts.
+_JS_ERROR_TOKENS = (
+    "Uncaught",
+    "Error:",
+    "is not a function",
+    "is not defined",
+)
+
+
+def console_errors(stderr: str) -> list[str]:
+    """Uncaught page errors from chrome's stderr, ignoring its own chatter.
+
+    Only CONSOLE lines are considered, and only those naming a JS error type: a
+    404 for a favicon and a deprecation notice are not defects in this page,
+    whereas an uncaught ReferenceError means the view did not render at all.
+    """
+    found: list[str] = []
+    for line in stderr.splitlines():
+        if ":CONSOLE(" not in line and ":CONSOLE:" not in line:
+            continue
+        if any(token in line for token in _JS_ERROR_TOKENS):
+            found.append(line.split("] ", 1)[-1].strip())
+    return found
 
 
 def _strip_code(dom: str) -> str:

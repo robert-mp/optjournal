@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 
-__all__ = ["bs_price", "implied_vol", "expected_move"]
+__all__ = ["bs_delta", "bs_price", "expected_move", "implied_vol"]
 
 #: Continuously-compounded risk-free rate, as an ASSUMPTION rather than a
 #: measurement. A term structure would be more precise, but the sensitivity is
@@ -82,6 +82,37 @@ def bs_price(
     if is_put:
         return strike * discount * _norm_cdf(-d2) - spot * carry * _norm_cdf(-d1)
     return spot * carry * _norm_cdf(d1) - strike * discount * _norm_cdf(d2)
+
+
+def bs_delta(
+    spot: float,
+    strike: float,
+    years: float,
+    sigma: float,
+    right: str,
+    *,
+    rate: float = RISK_FREE,
+    yield_: float = DIVIDEND_YIELD,
+) -> float:
+    """Rate of change of value per unit of underlying, per contract unit.
+
+    Signed by the RIGHT only, not by the position: a call is positive and a put
+    negative, and multiplying by a signed quantity is the caller's job. A short
+    put therefore ends up positive, which is the whole point of selling one.
+
+    At or past expiry delta is the step function -- fully in or fully out -- which
+    is what a held-to-expiry contract actually behaves like on its last day.
+    """
+    is_put = str(right).upper().startswith("P")
+    if years <= 0 or sigma <= 0:
+        if is_put:
+            return -1.0 if spot < strike else 0.0
+        return 1.0 if spot > strike else 0.0
+    d1 = (
+        math.log(spot / strike) + (rate - yield_ + 0.5 * sigma * sigma) * years
+    ) / (sigma * math.sqrt(years))
+    carry = math.exp(-yield_ * years)
+    return -carry * _norm_cdf(-d1) if is_put else carry * _norm_cdf(d1)
 
 
 def implied_vol(

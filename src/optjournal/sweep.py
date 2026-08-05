@@ -82,6 +82,9 @@ class Page:
     #: Tags stripped too: only what a reader sees.
     text: str
     payload: dict[str, Any]
+    #: Uncaught JS errors the browser reported while rendering this page. Last,
+    #: because it is the only field with a default and a dataclass requires that.
+    console: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -380,6 +383,20 @@ def check_closing_events_are_captioned(p: Page) -> Verdict:
     return ok()
 
 
+def check_no_uncaught_javascript(p: Page) -> Verdict:
+    """The page rendered without the browser refusing to run it.
+
+    Added after a single undefined identifier blanked the whole Trades view while
+    470 Python tests stayed green: the payload contract reads page.html's source
+    and the unit suite reads pure functions, and neither knows the browser threw.
+    Every other check here reads what DID render, so a view that rendered nothing
+    passes them all by having nothing to disagree with.
+    """
+    if p.console:
+        return bad("; ".join(p.console[:2]))
+    return ok()
+
+
 def check_replay_renders_from_url(p: Page) -> Verdict:
     """A replay panel opens from the URL alone, with a price line and its strikes.
 
@@ -512,6 +529,7 @@ CHECKS: tuple[Check, ...] = (
     check_positions_side_is_colourable,
     check_no_blank_contract_cells,
     check_closing_events_are_captioned,
+    check_no_uncaught_javascript,
     check_replay_renders_from_url,
     check_drilldown_renders_from_url,
     check_drilldown_legs_have_context,
@@ -638,6 +656,7 @@ def sweep_journal(
                 )
                 continue
             page = Page(tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay,
+                        console=tuple(browser.last_console_errors()),
                         dom=dom, markup=browser.markup(dom),
                         text=browser.rendered_text(dom), payload=payload)
             result.pages.append((name, page.label, [(c.__name__, c(page)) for c in CHECKS]))

@@ -65,7 +65,7 @@ _HEADER = (
 
 
 def page(tab="dashboard", body="", ccy=None, kind=None, calday=None, replay=None,
-         payload=None):
+         payload=None, console=()):
     """A page as the browser really delivers it: markup, header and script.
 
     Built through the same three views `sweep_journal` uses, so a check that
@@ -74,7 +74,8 @@ def page(tab="dashboard", body="", ccy=None, kind=None, calday=None, replay=None
     dom = ("<html><body>" + _HEADER.format(tab=tab) + body
            + _SCRIPT + "</body></html>")
     return Page(
-        tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay, dom=dom,
+        tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay,
+        console=tuple(console), dom=dom,
         markup=browser.markup(dom), text=browser.rendered_text(dom),
         payload=payload or {"stats": {}},
     )
@@ -101,7 +102,7 @@ def _costs(pill, commission, per_unit):
 def _bare(dom, tab, payload=None):
     """A page from an explicit DOM, for checks about the frame itself."""
     return Page(
-        tab=tab, ccy=None, kind=None, calday=None, replay=None, dom=dom,
+        tab=tab, ccy=None, kind=None, calday=None, replay=None, console=(), dom=dom,
         markup=browser.markup(dom), text=browser.rendered_text(dom),
         payload=payload or {"stats": {}},
     )
@@ -286,6 +287,11 @@ CASES: list[tuple[str, sweep.Check, Page, Page]] = [
      page(tab="calendar", calday="2026-08-04", body=_DRILL_OK, payload=_DRILL_PAYLOAD),
      page(tab="calendar", calday="2026-08-04", body=_DRILL_NO_SELECTION,
           payload=_DRILL_PAYLOAD)),
+    ("no uncaught javascript",
+     sweep.check_no_uncaught_javascript,
+     page(tab="trades", body="<div>fine</div>"),
+     page(tab="trades", body="<div>blank</div>",
+          console=("Uncaught ReferenceError: geo is not defined",))),
     ("replay draws its line and strikes",
      sweep.check_replay_renders_from_url,
      page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_OK,

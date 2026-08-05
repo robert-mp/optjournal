@@ -43,7 +43,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from optjournal.blackscholes import expected_move, implied_vol
+from optjournal.blackscholes import (
+    bs_delta,
+    bs_price,
+    expected_move,
+    implied_vol,
+)
 from optjournal.history import build_history
 from optjournal.marketdata import BAR_SIZES, SOURCE_RANK, Bar, BarFetchError, fetch_bars
 
@@ -55,7 +60,9 @@ __all__ = [
     "MARKET_TZ",
     "BandContract",
     "close_series",
+    "ReplayLeg",
     "expected_move_band",
+    "modelled_marks",
     "epoch_et",
     "et_day",
     "replay_bars",
@@ -415,6 +422,23 @@ def close_series(
 
 
 @dataclass(frozen=True, slots=True)
+class ReplayLeg:
+    """One leg, with everything the modelled P&L needs to follow it over time."""
+
+    conid: str
+    strike: float
+    right: str
+    expiry: str
+    multiplier: float = 100.0
+    #: (epoch, signed quantity delta, price per unit) per fill, oldest first.
+    fills: tuple[tuple[int, float, float], ...] = ()
+    #: For a contract with no fills anywhere: the position held throughout the
+    #: window and the price it was acquired at, from the snapshot's cost basis.
+    seed_quantity: float = 0.0
+    seed_price: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class BandContract:
     """One leg, reduced to what a vol solve needs and nothing else."""
 
@@ -472,6 +496,82 @@ def _spot_at(points: list[tuple[int, float]], ts: int) -> float | None:
     return points[-1][1]
 
 
+def _vol_series(
+    conn: sqlite3.Connection,
+    contracts: list[BandContract],
+    points: list[tuple[int, float]],
+    underlying_conid: str | None,
+) -> dict[str, list[tuple[int, float]]]:
+    """Implied vol per leg per session, from each option's OWN daily closes.
+
+    The reference implementation this feature imitates labels its band
+    "IV ref: VIX" -- S&P 500 implied vol applied to a gold ETF -- because the
+    underlying is all it has. We hold the contract's prices, so we can ask what
+    the market charged for THIS contract.
+
+    An option's daily close is paired with the underlying's daily close for the
+    same session, matched on the ET trading DAY (see et_day for why the raw
+    timestamps cannot be compared). Pairing against the CHART series instead
+    looks equivalent and is not: a chart may be hourly, and an option's daily
+    stamp then falls in the overnight gap between two hourly bars, so
+    interpolating there prices the option against a spot the market never showed
+    and books the discrepancy as volatility.
+
+    Per LEG rather than averaged, because pricing a leg wants its own vol; the
+    band averages afterwards, since expected move is a property of the underlying
+    and a strangle's two legs are two observations of it.
+    """
+    if not points or not contracts or not underlying_conid:
+        return {}
+    low, high = points[0][0], points[-1][0]
+    daily = {
+        et_day(stamp): close
+        for stamp, close in close_series(conn, str(underlying_conid), bar_size="1d")
+    }
+    out: dict[str, list[tuple[int, float]]] = {}
+    for contract in contracts:
+        expiry = _expiry_epoch(contract.expiry)
+        if expiry is None:
+            continue
+        # A day of slack either side because the join is BY DAY and the source
+        # stamps the two series differently: an option's bar for the same session
+        # lands at 04:00Z, hours BEFORE a chart window that starts at the 13:30Z
+        # open, so clipping to the exact window drops the first day's vol.
+        closes = close_series(
+            conn, contract.conid, bar_size="1d",
+            start=low - 86400, end=high + 86400,
+        )
+        found: list[tuple[int, float]] = []
+        for stamp, close in closes:
+            spot = daily.get(et_day(stamp))
+            if spot is None:
+                continue
+            years = (expiry - stamp) / (365.0 * 86400)
+            vol = implied_vol(close, spot, contract.strike, years, contract.right)
+            if vol is not None:
+                found.append((stamp, vol))
+        if found:
+            out[contract.conid] = sorted(found)
+    return out
+
+
+def _held_forward(series: list[tuple[int, float]], stamp: int) -> float | None:
+    """The last observed value at or before ``stamp``, or None before the first.
+
+    Held forward rather than interpolated toward the next observation: an
+    interpolated vol asserts a value between two closes that nothing was priced
+    at, while holding forward says only "this is the last thing the market told
+    us". None before the first observation, so a gap reads as absent information
+    rather than as a narrow range or a zero P&L.
+    """
+    found: float | None = None
+    for observed_at, value in series:
+        if observed_at > stamp:
+            break
+        found = value
+    return found
+
+
 def expected_move_band(
     conn: sqlite3.Connection,
     contracts: list[BandContract],
@@ -481,80 +581,119 @@ def expected_move_band(
 ) -> list[list[float]]:
     """A one-standard-deviation envelope, per underlying bar.
 
-    The vol comes from the option's OWN closes rather than from a volatility
-    index. The reference implementation labels its band "IV ref: VIX" -- S&P 500
-    implied vol applied to a gold ETF -- because the underlying is all it has;
-    we hold the contract's prices, so we can ask what the market charged for
-    THIS contract. Averaged across legs, because expected move is a property of
-    the underlying and a strangle's two legs are two observations of it.
-
-    The vol solve pairs an option's DAILY close with the underlying's DAILY
-    close for the same session, matched on the ET trading DAY (see et_day). Both come from one
-    source with one stamping convention (midnight ET), so the pair is
-    simultaneous by construction. Pairing against the CHART series instead looks
-    equivalent and is not: a chart may be hourly, and an option's daily stamp
-    then falls in the overnight gap between two hourly bars, so interpolating
-    there prices the option against a spot the market never showed and books the
-    discrepancy as volatility.
-
-    Vol is held forward from the last observation rather than interpolated
-    toward the next: an interpolated vol asserts a value between two closes that
-    nothing was priced at, and holding forward says only "this is the last thing
-    the market told us". Points before the first solvable close get NO band, so
-    a gap reads as absent information rather than as a narrow range.
+    Spot and time-to-expiry are per BAR, so the envelope moves and tapers hourly;
+    the vol input steps daily, because the source serves no intraday option
+    history and there is nothing finer to solve against.
 
     The horizon is the NEAREST expiry among the legs, which is the one that
     dominates the risk. That is also what makes the envelope narrow as a trade
     ages and step outward when a roll pushes expiry further out.
     """
-    if not points or not contracts or not underlying_conid:
+    vols = _vol_series(conn, contracts, points, underlying_conid)
+    if not vols:
         return []
-    low, high = points[0][0], points[-1][0]
-    daily = {
-        et_day(stamp): close
-        for stamp, close in close_series(conn, str(underlying_conid), bar_size="1d")
-    }
-    observed: dict[int, list[float]] = {}
-    expiries: list[int] = []
-    for contract in contracts:
-        expiry = _expiry_epoch(contract.expiry)
-        if expiry is None:
-            continue
-        expiries.append(expiry)
-        # A day of slack either side because the join is BY DAY and the source
-        # stamps the two series differently: an option's bar for the same session
-        # lands at 04:00Z, hours BEFORE a chart window that starts at the 13:30Z
-        # open, so clipping to the exact window drops the first day's vol.
-        closes = close_series(
-            conn, contract.conid, bar_size="1d",
-            start=low - 86400, end=high + 86400,
-        )
-        for stamp, close in closes:
-            spot = daily.get(et_day(stamp))
-            if spot is None:
-                continue
-            years = (expiry - stamp) / (365.0 * 86400)
-            vol = implied_vol(close, spot, contract.strike, years, contract.right)
-            if vol is not None:
-                observed.setdefault(stamp, []).append(vol)
-    if not observed or not expiries:
+    expiries = [
+        expiry
+        for expiry in (_expiry_epoch(c.expiry) for c in contracts if c.conid in vols)
+        if expiry is not None
+    ]
+    if not expiries:
         return []
-    series = sorted((stamp, sum(v) / len(v)) for stamp, v in observed.items())
     horizon = min(expiries)
     band: list[list[float]] = []
-    current: float | None = None
-    cursor = 0
     for stamp, spot in points:
-        while cursor < len(series) and series[cursor][0] <= stamp:
-            current = series[cursor][1]
-            cursor += 1
-        if current is None:
+        observed = [
+            vol
+            for vol in (_held_forward(series, stamp) for series in vols.values())
+            if vol is not None
+        ]
+        if not observed:
             continue
-        move = expected_move(spot, current, (horizon - stamp) / (365.0 * 86400))
+        average = sum(observed) / len(observed)
+        move = expected_move(spot, average, (horizon - stamp) / (365.0 * 86400))
         if move is None:
             continue
         band.append([stamp, round(spot - move, 4), round(spot + move, 4)])
     return band
+
+
+def modelled_marks(
+    conn: sqlite3.Connection,
+    legs: list[ReplayLeg],
+    points: list[tuple[int, float]],
+    *,
+    underlying_conid: str | None,
+) -> list[list[float]]:
+    """Modelled P&L and effective delta per bar: ``[ts, pnl, delta]``.
+
+    P&L is cash flow to date plus the mark-to-market of whatever is still open --
+    the standard formulation, and the reason it behaves correctly through a
+    partial close or a roll rather than only for a clean open-then-close. A
+    closing fill moves value out of the open leg and into realised cash, so once
+    a position is flat the figure FREEZES at what the trade made instead of
+    continuing to mark a contract nobody holds.
+
+    The PRICING is exact: repricing an option's own close at the vol solved from
+    it returns that close to 1e-14, so nothing is approximated in the model
+    itself. The chart's mark is not a restatement of a broker figure though --
+    it applies that vol to the BAR's spot and the BAR's time to expiry, and the
+    source stamps an option close at midnight ET while the underlying bar for the
+    same session carries the session's own time. So the series TRACKS the broker's
+    mark rather than matching it: the LEAP lands $75 from the snapshot's
+    unrealised on a $3,000 position, which is that drift plus the snapshot being a
+    day older than the latest bar. Close enough to trust the shape, not close
+    enough to quote as the position's value -- which is why the card beside the
+    chart still states the broker's figure.
+
+    Gross of commission, unlike every accounting figure in this journal. A
+    per-bar commission would have to invent when the cost was incurred, and the
+    card beside the chart already states the net figure the broker billed.
+
+    Effective delta is ``sum(signed quantity * delta)``, without the multiplier,
+    so a delta-neutral strangle reads 0.0 and a short put reads a positive
+    fraction -- the scale the reference chart uses.
+    """
+    contracts = [
+        BandContract(conid=leg.conid, strike=leg.strike, right=leg.right,
+                     expiry=leg.expiry)
+        for leg in legs
+    ]
+    vols = _vol_series(conn, contracts, points, underlying_conid)
+    if not vols:
+        return []
+    marks: list[list[float]] = []
+    for stamp, spot in points:
+        cash = 0.0
+        value = 0.0
+        delta = 0.0
+        priced = False
+        for leg in legs:
+            expiry = _expiry_epoch(leg.expiry)
+            series = vols.get(leg.conid)
+            if expiry is None or not series:
+                continue
+            # Position and cash as of this bar. A snapshot-only contract has no
+            # fills anywhere -- that is what makes it snapshot-only -- so it is
+            # seeded from its cost basis and held flat across the window.
+            quantity = leg.seed_quantity
+            cash -= leg.seed_quantity * leg.seed_price * leg.multiplier
+            for fill_at, delta_qty, price in leg.fills:
+                if fill_at > stamp:
+                    break
+                quantity += delta_qty
+                cash -= delta_qty * price * leg.multiplier
+            vol = _held_forward(series, stamp)
+            if vol is None:
+                continue
+            years = (expiry - stamp) / (365.0 * 86400)
+            unit = bs_price(spot, leg.strike, years, vol, leg.right)
+            value += quantity * unit * leg.multiplier
+            delta += quantity * bs_delta(spot, leg.strike, years, vol, leg.right)
+            priced = True
+        if not priced:
+            continue
+        marks.append([stamp, round(cash + value, 2), round(delta, 4)])
+    return marks
 
 
 def _trim_to_context(

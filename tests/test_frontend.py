@@ -1,0 +1,109 @@
+"""The frontend seam: run the JS unit suite, and police what may live in it.
+
+`pytest` is the one command that has to be green, so the node suite runs from
+here rather than needing to be remembered separately. It is SKIPPED, not failed,
+when node is absent -- the Python half of this project must stay installable and
+testable on a machine with no JavaScript runtime at all.
+
+The boundary tests matter as much as the suite. A seam only keeps its value while
+the pure side stays pure: the moment a DOM call lands in replay.js, the module
+stops being importable by `node --test` and the tests quietly stop covering the
+code that actually runs.
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+MODULE = ROOT / "src" / "optjournal" / "static" / "replay.js"
+SUITE = ROOT / "tests" / "frontend"
+PAGE = ROOT / "src" / "optjournal" / "page.html"
+
+
+def test_the_module_exists_where_the_page_and_the_tests_both_expect_it():
+    assert MODULE.is_file(), f"no module at {MODULE}"
+    assert SUITE.is_dir()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node runtime")
+def test_the_javascript_suite_passes():
+    """One `pytest` covers both languages, so neither half can rot unnoticed."""
+    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [shutil.which("node") or "node", "--test", str(SUITE)],
+        capture_output=True, text=True, cwd=ROOT, timeout=120, check=False,
+    )
+    assert result.returncode == 0, (
+        "the JS unit suite failed:\n"
+        + result.stdout[-4000:] + "\n" + result.stderr[-2000:]
+    )
+    passed = re.search(r"^# pass (\d+)$", result.stdout, re.M)
+    assert passed and int(passed.group(1)) > 0, (
+        "node reported no passing tests -- the suite is not being discovered"
+    )
+
+
+#: Anything that only exists in a browser. A seam is only worth having while the
+#: pure side stays pure: one `document` here and the module stops being importable
+#: by `node --test`, at which point the tests quietly stop covering the code that
+#: actually runs.
+_BROWSER_ONLY = (
+    "document",
+    "window",
+    "localStorage",
+    "setInterval",
+    "setTimeout",
+    "fetch(",
+    "location",
+    "innerHTML",
+    "querySelector",
+)
+
+
+def _code_only(source: str) -> str:
+    """The module minus its comments.
+
+    The first version of this check matched the word `document` inside a comment
+    explaining that documents are forbidden here -- a scan that fails on its own
+    documentation tests spelling, not structure.
+    """
+    without_blocks = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    return re.sub(r"^\s*//.*$", "", without_blocks, flags=re.M)
+
+
+@pytest.mark.parametrize("token", _BROWSER_ONLY)
+def test_the_pure_module_touches_no_browser_api(token):
+    source = _code_only(MODULE.read_text())
+    assert token not in source, (
+        f"replay.js references {token!r}. Move it to page.html: this module has "
+        "to stay importable by node, with no DOM and no globals."
+    )
+
+
+def test_the_page_imports_the_module_rather_than_duplicating_it():
+    """Two copies of the same scale is worse than one untested copy: the tests
+    would pass against a function the page no longer runs.
+    """
+    page = PAGE.read_text()
+    assert "/static/replay.js" in page, "page.html does not import the module"
+    assert 'type="module"' in page, "an ES module needs a module script tag"
+
+
+def test_the_page_does_not_redefine_what_the_module_exports():
+    """Catches the specific rot this seam exists to prevent -- a helper copied
+    back into the page during a quick fix, leaving the tested version orphaned.
+    """
+    exported = set(re.findall(r"^export function (\w+)", MODULE.read_text(), re.M))
+    assert exported, "no exports found; the extraction regex is wrong"
+    page = PAGE.read_text()
+    duplicated = sorted(
+        name for name in exported if re.search(rf"\bfunction {name}\s*\(", page)
+    )
+    assert not duplicated, (
+        f"page.html redefines {duplicated}, which replay.js already exports"
+    )
