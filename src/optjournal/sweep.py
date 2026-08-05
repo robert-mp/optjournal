@@ -441,13 +441,22 @@ def check_replay_renders_from_url(p: Page) -> Verdict:
     if steps and max(steps) - min(steps) > 0.5:
         return bad(f"x steps span {min(steps)}..{max(steps)} -- the axis is "
                    "spacing bars by elapsed time, not by position")
-    labels = re.findall(r'class="sklab"[^>]*>([^<]+)<', p.markup)
+    labels = re.findall(r'class="sklab[^"]*"[^>]*>([^<]+)<', p.markup)
     if len(labels) != len(replay["strikes"]):
         return bad(f"{len(labels)} strike labels, payload holds {len(replay['strikes'])}")
+    # The label carries the strike and the right. Side is no longer written out:
+    # it is the dash, and the legend says so -- which is what frees the label to
+    # sit on the segment instead of crowding the right margin the delta axis uses.
     for strike_row in replay["strikes"]:
-        want = f"{strike_row['put_call']} {strike_row['side']}"
-        if not any(lab.strip().endswith(want) for lab in labels):
-            return bad(f"no strike label reads '{want}': {labels}")
+        want = str(strike_row["put_call"]).upper()
+        if not any(lab.strip().upper().endswith(want) for lab in labels):
+            return bad(f"no strike label ends in '{want}': {labels}")
+        css = f'class="sk {"call" if want == "C" else "put"}'
+        if css not in p.markup:
+            return bad(f"a {want} strike is not hue-coded: expected {css!r}")
+        dashed = 'class="sk put long"' in p.markup or 'class="sk call long"' in p.markup
+        if strike_row["side"] == "long" and not dashed:
+            return bad("a bought strike is not dashed, so it reads as sold")
     # The band is the only modelled series on the panel and the only one with no
     # broker figure to contradict it, so its absence is invisible everywhere else.
     if replay.get("band") and 'class="emband"' not in p.markup:
@@ -468,6 +477,48 @@ def check_replay_renders_from_url(p: Page) -> Verdict:
                    f"{len(replay['points'])} bars -- part of the series is unreachable")
     if 'id="rclip"' not in p.markup:
         return bad("no reveal clip, so scrubbing cannot hide the future")
+    # The clip has to be a real SVG group. A rename once turned <g> into <geo>,
+    # an unknown element, so the price line inside it stopped rendering entirely
+    # -- while every markup check still passed, because the STRING was present.
+    if 'clip-path="url(#rclip)"' not in p.markup:
+        return bad("the reveal group is not applying the clip path")
+    if not re.search(r"<g\b[^>]*clip-path", p.markup):
+        return bad("the clipped layer is not an SVG <g>, so nothing inside it draws")
+    # A segment's ends must reflect the holding period: it may only touch an edge
+    # of the plot where the payload says the position extended past it. Asserted
+    # edge by edge rather than by a width threshold -- the first version used one,
+    # and failed a correct chart whose entry was four bars into a 134-bar window,
+    # so the segment legitimately covered 97% of the width.
+    spans = re.findall(r'class="sk [^"]*" x1="([\d.]+)"[^>]*x2="([\d.]+)"', p.markup)
+    if replay["strikes"] and not spans:
+        return bad("no strike segments rendered")
+    first, last = replay["points"][0][0], replay["points"][-1][0]
+    # The plot edges come from the AXIS lines. Deriving them from the segments
+    # themselves was circular: with one segment, its own end trivially equalled
+    # "the edge" and the assertion could never fail.
+    axes = re.findall(r'class="ax" x1="([\d.]+)"[^>]*x2="([\d.]+)"', p.markup)
+    if not axes:
+        return bad("no axis lines, so the plot edges cannot be established")
+    left = min(float(a) for a, _ in axes)
+    right = max(float(b) for _, b in axes)
+    for strike_row, (raw_x1, raw_x2) in zip(replay["strikes"], spans, strict=False):
+        started = strike_row.get("frm")
+        ended = strike_row.get("to")
+        if started and started > first and float(raw_x1) <= left:
+            return bad(
+                f"the {strike_row['strike']:g}{strike_row['put_call']} segment "
+                "starts at the plot edge, but it was opened after the first bar"
+            )
+        if ended and ended < last and float(raw_x2) >= right:
+            return bad(
+                f"the {strike_row['strike']:g}{strike_row['put_call']} segment "
+                "runs to the plot edge, but it went flat before the last bar"
+            )
+    # Eff delta: computed per bar and useless if it never reaches the page.
+    if replay.get("marks") and 'class="dline"' not in p.markup:
+        return bad(f"{len(replay['marks'])} marks held, no eff-delta series drawn")
+    if 'class="rkey"' not in p.markup:
+        return bad("no legend, so the hue and dash encodings are unexplained")
     return ok()
 
 

@@ -149,6 +149,35 @@ export function sessionBreaks(points, dayOf) {
   return breaks;
 }
 
+/** Symmetric domain for the effective-delta axis, or null when there is none.
+ *
+ * Symmetric on purpose: delta-neutral is the state a strangle is opened in, and
+ * it should read as the middle of the axis rather than as some arbitrary height.
+ * The floor stops a genuinely flat series from being magnified into noise -- a
+ * position that never moved off 0.001 should look flat, not dramatic.
+ */
+export function deltaDomain(marks, floor = 0.05) {
+  const values = marks.map((m) => m[2]).filter((v) => Number.isFinite(v));
+  if (!values.length) return null;
+  const reach = Math.max(floor, ...values.map(Math.abs));
+  return { lo: -reach, hi: reach, reach };
+}
+
+/** Pixel span of a strike's holding period, clamped to the plot.
+ *
+ * A null start or end means "beyond this chart": still held, or an entry date we
+ * do not have. Clamping to the edge is the honest rendering of both -- the line
+ * runs to where the picture stops, rather than stopping where the data does and
+ * implying the position did too.
+ */
+export function strikeSpan(strike, geometry, box) {
+  const from = strike.frm == null ? null : geometry.at(strike.frm);
+  const to = strike.to == null ? null : geometry.at(strike.to);
+  const x1 = from ? from.x : box.left;
+  const x2 = to ? to.x : box.left + box.width;
+  return { x1: Math.min(x1, x2), x2: Math.max(x1, x2) };
+}
+
 /** Upper and lower edges of the expected-move envelope, as point lists. */
 export function bandEdges(band, geometry) {
   const upper = [];

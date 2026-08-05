@@ -150,10 +150,12 @@ _REPLAY_PAYLOAD = {
         "lc:C1@2026-07-24": {
             "key": "lc:C1@2026-07-24", "underlying": "TSLA", "label": "Short put",
             "bar_size": "1h", "points": [[100, 370.0], [200, 340.0], [300, 323.0]],
-            "strikes": [{"strike": 270.0, "put_call": "P", "side": "short"}],
+            "strikes": [{"strike": 270.0, "put_call": "P", "side": "short",
+                         "frm": 150, "to": 280}],
             "opened_at": "2026-07-24", "closed_at": "2026-08-03",
             "opened_ts": 150, "closed_ts": 280, "fills": [150, 280],
             "band": [[100, 320.0, 420.0], [200, 290.0, 390.0], [300, 275.0, 371.0]],
+            "marks": [[100, 100.0, 0.4], [200, 250.0, 0.3], [300, 792.0, 0.0]],
         },
     },
 }
@@ -161,23 +163,28 @@ _REPLAY_CTL = (
     '<input id="rscrub" type="range" min="0" max="2" value="2">'
     '<select id="rspeed"><option value="240">1x</option></select>'
 )
+#: A whole panel as the page really emits one. Fuller than it looks necessary:
+#: each element here is one the check asserts on, and every one of them was added
+#: after a defect that shipped because nothing looked for it.
 _REPLAY_OK = (
+    '<div class="rkey">put strike</div>'
     '<div class="replay"><svg>'
     '<defs><clipPath id="rclip"><rect id="rclipr"/></clipPath></defs>'
     '<polygon class="emband" points="1,2 3,4"/>'
     '<line class="edge in" x1="3" y1="0" x2="3" y2="9"/>'
-    '<polyline class="pxline" points="1,2 3,4 5,6"/>'
-    '<text class="sklab">270P short</text></svg>' + _REPLAY_CTL + '</div>'
+    '<line class="ax" x1="52" y1="12" x2="52" y2="240"/>'
+    '<line class="ax" x1="52" y1="240" x2="874" y2="240"/>'
+    '<line class="sk put" x1="100" y1="5" x2="300" y2="5"/>'
+    '<text class="sklab put">270P</text>'
+    '<g clip-path="url(#rclip)">'
+    '<polyline class="dline" points="1,2 3,4"/>'
+    '<polyline class="pxline" points="1,2 3,4 5,6"/></g>'
+    '</svg>' + _REPLAY_CTL + '</div>'
 )
 #: The failure this excludes: an axis frame with no line reads as "this trade
 #: did nothing", which is a claim about the trade rather than about the data.
-_REPLAY_NO_LINE = (
-    '<div class="replay"><svg>'
-    '<defs><clipPath id="rclip"><rect id="rclipr"/></clipPath></defs>'
-    '<polygon class="emband" points="1,2 3,4"/>'
-    '<line class="edge in" x1="3" y1="0" x2="3" y2="9"/>'
-    '<text class="sklab">270P short</text></svg>' + _REPLAY_CTL + '</div>'
-)
+_REPLAY_NO_LINE = _REPLAY_OK.replace(
+    '<polyline class="pxline" points="1,2 3,4 5,6"/>', '')
 
 
 _SIDE_OK = '<td class="side buy">Long</td><td class="side sell">Short</td>'

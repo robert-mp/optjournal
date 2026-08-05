@@ -11,11 +11,13 @@ import test from "node:test";
 import {
   bandEdges,
   clampIndex,
+  deltaDomain,
   domainOf,
   frameAt,
   markAt,
   plotGeometry,
   sessionBreaks,
+  strikeSpan,
 } from "../../src/optjournal/static/replay.js";
 
 const BOX = { left: 52, top: 12, width: 792, height: 228 };
@@ -158,6 +160,54 @@ test("session breaks land on the first bar of each new day", () => {
   ];
   assert.deepEqual(sessionBreaks(points, dayOf), [2, 4]);
   assert.deepEqual(sessionBreaks(points, () => "same"), []);
+});
+
+test("the delta axis is symmetric about zero", () => {
+  // Delta-neutral is the state a strangle is opened in; it should read as the
+  // middle of the axis rather than as some arbitrary height.
+  const domain = deltaDomain([
+    [1, 0, 0.4],
+    [2, 0, -0.1],
+  ]);
+  assert.equal(domain.lo, -0.4);
+  assert.equal(domain.hi, 0.4);
+});
+
+test("a flat delta series is not magnified into noise", () => {
+  const domain = deltaDomain([
+    [1, 0, 0.001],
+    [2, 0, -0.001],
+  ]);
+  assert.equal(domain.reach, 0.05, "the floor did not apply");
+});
+
+test("no marks means no delta axis", () => {
+  assert.equal(deltaDomain([]), null);
+  assert.equal(deltaDomain([[1, 5, null]]), null);
+});
+
+test("a strike held to the end of the chart runs to the right edge", () => {
+  const geo = geometry();
+  const box = BOX;
+  const open = strikeSpan({ strike: 100, frm: 2000, to: null }, geo, box);
+  assert.equal(open.x2, box.left + box.width, "an open leg stopped short");
+  assert.ok(open.x1 > box.left, "the segment should start at entry, not the edge");
+});
+
+test("a strike with no known entry spans the whole plot", () => {
+  // The snapshot-only case: stopping where the data does would imply the
+  // position did too.
+  const span = strikeSpan({ strike: 700, frm: null, to: null }, geometry(), BOX);
+  assert.equal(span.x1, BOX.left);
+  assert.equal(span.x2, BOX.left + BOX.width);
+});
+
+test("a closed strike's segment ends at its buyback", () => {
+  const geo = geometry();
+  const span = strikeSpan({ strike: 100, frm: 1000, to: 2000 }, geo, BOX);
+  assert.equal(span.x1, geo.xs[0]);
+  assert.equal(span.x2, geo.xs[1]);
+  assert.ok(span.x2 < BOX.left + BOX.width, "it should not reach the right edge");
 });
 
 test("band edges pair upper with lower at the same x", () => {

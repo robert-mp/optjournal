@@ -97,33 +97,49 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def _strikes_of(legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One entry per distinct contract, sided by how the position was OPENED.
+def _strikes_of(legs: list[ReplayLeg]) -> list[dict[str, Any]]:
+    """One entry per contract, sided by how it was OPENED and spanning when held.
 
-    A closed lifecycle holds the same strike twice -- sold to open, bought to
-    close -- and drawing it twice would put two lines on top of each other and
-    imply two contracts. First occurrence wins because events arrive in
-    chronological order, so the opening fill decides short vs long: a strike you
-    sold is a level you are defending, and one you bought is a level you paid
-    for. The chart encodes that difference, so reversing it inverts the meaning
-    of every line on the panel.
+    The window is what makes a strike a SEGMENT rather than a full-width rule.
+    Drawn edge to edge, a strike claims to have existed for the whole chart --
+    including the session of context before entry, and every bar after a roll
+    moved it somewhere else. The reference implementation draws segments for
+    exactly this reason: the picture should say which levels were live when.
+
+    Side comes from the opening fill because a closed contract holds the same
+    strike twice, sold to open and bought to close. A strike you sold is a level
+    you are defending and one you bought is a level you paid for; the chart
+    encodes that difference, so reading it off the wrong fill inverts the meaning
+    of every line.
+
+    ``to`` is None while the contract is still held, which the page draws to the
+    right edge. ``frm`` is None only for a snapshot-only contract, whose entry
+    date is unknown -- drawn full width, because the honest statement there is
+    "held throughout" rather than a guessed start.
     """
-    seen: dict[tuple[float, str], dict[str, Any]] = {}
+    out: list[dict[str, Any]] = []
     for leg in legs:
-        raw = leg.get("strike")
-        if raw is None:
-            continue
-        right = str(leg.get("put_call") or "")
-        key = (float(raw), right)
-        if key in seen:
-            continue
-        sold = str(leg.get("buy_sell") or "").upper().startswith("SELL")
-        seen[key] = {
-            "strike": float(raw),
-            "put_call": right,
+        # Running position, so the segment ends where the contract went flat
+        # rather than at whichever fill happened to be last.
+        quantity = leg.seed_quantity
+        opened_at: int | None = None
+        closed_at: int | None = None
+        sold = leg.seed_quantity < 0
+        for index, (stamp, delta_qty, _price) in enumerate(leg.fills):
+            if index == 0:
+                opened_at, sold = stamp, delta_qty < 0
+            quantity += delta_qty
+            if quantity == 0:
+                closed_at = stamp
+                break
+        out.append({
+            "strike": leg.strike,
+            "put_call": leg.right,
             "side": "short" if sold else "long",
-        }
-    return sorted(seen.values(), key=lambda s: s["strike"])
+            "frm": opened_at,
+            "to": closed_at,
+        })
+    return sorted(out, key=lambda row: row["strike"])
 
 
 def _band_contracts(rows: list[dict[str, Any]]) -> list[BandContract]:
@@ -234,7 +250,7 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "label": lifecycle.get("label"),
             "bar_size": bars["bar_size"],
             "points": [[ts, close] for ts, close in bars["points"]],
-            "strikes": _strikes_of(legs),
+            "strikes": _strikes_of(_replay_legs(legs)),
             "opened_at": opened,
             "closed_at": closed,
             # Epochs, so the page never parses a timezone. Every journal stamp is
@@ -279,14 +295,17 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "label": "Open position",
             "bar_size": bars["bar_size"],
             "points": [[ts, close] for ts, close in bars["points"]],
-            # A snapshot row states a side, not a buy_sell. Short is what SELL
-            # means here, so it maps onto the same encoding the legs use.
-            "strikes": _strikes_of([{
-                "strike": row.get("strike"),
-                "put_call": row.get("put_call"),
-                "buy_sell": "SELL"
-                if str(row.get("side") or "").upper() == "SHORT" else "BUY",
-            }]),
+            # A snapshot row has no fills, so its side comes from the signed
+            # position and its window stays unknown -- drawn full width.
+            "strikes": _strikes_of([ReplayLeg(
+                conid=str(row.get("conid") or ""),
+                strike=float(row.get("strike") or 0.0),
+                right=str(row.get("put_call") or ""),
+                expiry=str(row.get("expiry") or ""),
+                multiplier=float(row.get("multiplier") or 100.0),
+                seed_quantity=float(row.get("position") or 0.0),
+                seed_price=float(row.get("cost_basis_price") or 0.0),
+            )]),
             "opened_at": opened,
             "closed_at": None,
             # A snapshot row has no fills anywhere -- that is what makes it

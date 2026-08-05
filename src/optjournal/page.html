@@ -196,9 +196,31 @@ td.n,th.n{text-align:right}
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2);cursor:pointer}
 .rread{font-size:11.5px;color:var(--dim);white-space:nowrap;min-width:150px;
   text-align:right}
-.sk{stroke:var(--leather1);stroke-width:1.3}
+.rauto{font-size:11px;color:var(--dim2);white-space:nowrap;cursor:pointer;
+  display:flex;align-items:center;gap:4px}
+.rkey{font-size:10.5px;color:var(--dim);margin-top:8px;display:flex;
+  flex-wrap:wrap;gap:2px;align-items:baseline}
+.lg{font-weight:700;margin-right:3px}
+.lg.put{color:#d98f8f} .lg.call{color:#7fbf9a}
+.lg.px{color:var(--fg)} .lg.dl{color:var(--dim)}
+.lg.em{color:var(--leather1)}
+/* Two independent readings of one line: HUE says put or call, DASH says short or
+   long. Deliberately not the pos/neg palette -- green/red means signed money
+   everywhere else on this page, so these are a cooler green and a warmer rose
+   that read as categories rather than as profit. */
+.sk{stroke-width:1.6}
+.sk.put{stroke:#d98f8f}
+.sk.call{stroke:#7fbf9a}
 .sk.long{stroke-dasharray:5 4}
-.sklab{fill:var(--kicker);font-size:11px;font-family:var(--mono)}
+.sklab{font-size:10.5px;font-family:var(--mono);letter-spacing:.02em}
+.sklab.put{fill:#d98f8f}
+.sklab.call{fill:#7fbf9a}
+/* Effective delta: dotted and dim, on its own right-hand scale. A derived
+   sensitivity, not something that traded, so it must not read as firmly as the
+   price line. */
+.dline{fill:none;stroke:var(--dim);stroke-width:1.1;stroke-dasharray:1.5 3}
+.dax{fill:var(--dim2)}
+.zero{stroke:var(--line2);stroke-width:1;stroke-dasharray:2 4;opacity:.7}
 .linkish{background:none;border:none;color:var(--dim);cursor:pointer;
   font:inherit;font-size:11px;text-decoration:underline;padding:0}
 .linkish:hover{color:var(--fg)}
@@ -275,8 +297,8 @@ td.n,th.n{text-align:right}
      these functions being global. -->
 <script type="module">
 import {
-  MIN_POINTS, bandEdges, clampIndex, domainOf, frameAt, markAt,
-  plotGeometry, sessionBreaks,
+  MIN_POINTS, bandEdges, clampIndex, deltaDomain, domainOf, frameAt, markAt,
+  plotGeometry, sessionBreaks, strikeSpan,
 } from '/static/replay.js';
 
 /* ===================== the payload contract =====================
@@ -590,6 +612,9 @@ import {
  * @property {number} strike
  * @property {string} put_call
  * @property {string} side -- "short" or "long", from the OPENING fill
+ * @property {number|null} frm -- epoch the contract was opened; null when unknown
+ *   (a snapshot-only contract), which the page draws full width
+ * @property {number|null} to -- epoch it went flat; null while still held
  */
 
 /** @typedef {Object} FxBlock -- presentation rates (stats.fx_quotes)
@@ -699,8 +724,8 @@ import {
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local oc odtes open opts out ps pts range rows yrs active shown
- * @local RGEO geo edges fr xy sks
- * @local play scrub speed
+ * @local RGEO geo edges fr xy sks mks dd sp spot
+ * @local play scrub speed loop
  */
 
 const $=s=>document.querySelector(s);
@@ -1285,7 +1310,8 @@ function replayChart(rp){
   if(pts.length<MIN_POINTS) return `<div class="empty">no price bars stored for ${
     esc(rp.underlying||'this underlying')} yet — run <code>optjournal bars</code></div>`;
   const sks=(rp.strikes||[]).filter(sk=>sk&&isFinite(sk.strike));
-  const W=920,H=270,L=52,R=76,T=12,B=30, iw=W-L-R, ih=H-T-B;
+  const W=920,H=280,L=52,R=46,T=22,B=30, iw=W-L-R, ih=H-T-B;
+  const mks=rp.marks||[];
   /* Every scale below comes from /static/replay.js, which node unit-tests. The
      page keeps only the markup: a wrong <text> shows up in the sweep's rendered
      DOM, whereas a wrong scale renders perfectly and is simply untrue. */
@@ -1308,11 +1334,35 @@ function replayChart(rp){
     return `<line class="sess" x1="${x}" y1="${T}" x2="${x}" y2="${T+ih}"/>`;
   }).join('');
   const line=pts.map((p,i)=>`${geo.xs[i].toFixed(1)},${geo.yOf(p[1]).toFixed(1)}`).join(' ');
-  const strikes=sks.map(sk=>{const y=geo.yOf(sk.strike).toFixed(1);
-    return `<line class="${sk.side==='long'?'sk long':'sk'}" x1="${L}" y1="${y}"
-      x2="${L+iw}" y2="${y}"/><text class="sklab" x="${L+iw+7}" y="${
-      (Number(y)+3.5).toFixed(1)}">${strike(sk.strike)}${esc(sk.put_call||'')} ${
-      esc(sk.side)}</text>`;}).join('');
+  /* SEGMENTS, not full-width rules: a strike drawn edge to edge claims to have
+     existed for the whole chart, including the context before entry and every
+     bar after a roll moved it elsewhere. Coloured by right and dashed by side,
+     so put/call and short/long are two independent readings of one line -- the
+     encoding the reference implementation uses, which is why it needs no label
+     per line beyond the strike itself. */
+  const strikes=sks.map(sk=>{
+    const y=geo.yOf(sk.strike), sp=strikeSpan(sk,geo,{left:L,width:iw});
+    const kind=String(sk.put_call||'').toUpperCase()==='C'?'call':'put';
+    return `<line class="sk ${kind}${sk.side==='long'?' long':''}" x1="${
+      sp.x1.toFixed(1)}" y1="${y.toFixed(1)}" x2="${sp.x2.toFixed(1)}" y2="${
+      y.toFixed(1)}"/><text class="sklab ${kind}" x="${(sp.x1+4).toFixed(1)}" y="${
+      (y-5).toFixed(1)}">${strike(sk.strike)}${esc(sk.put_call||'')}</text>`;
+  }).join('');
+  /* Effective delta on its OWN axis, because it is not a price: the sum of signed
+     quantity times delta, so a delta-neutral strangle sits on the centre line and
+     a short put rides above it. Dotted to stay subordinate -- a derived
+     sensitivity, not something that traded. */
+  const dd=deltaDomain(mks);
+  const y2=v=>T+ih/2-(v/dd.reach)*(ih/2);
+  const dline=!dd?'':mks.map(m=>{
+    const spot=geo.at(m[0]);
+    return spot?`${spot.x.toFixed(1)},${y2(m[2]).toFixed(1)}`:'';
+  }).filter(Boolean).join(' ');
+  const dax=!dd?'':[dd.reach,0,-dd.reach].map(v=>
+    `<text class="tk dax" x="${L+iw+6}" y="${(y2(v)+3.5).toFixed(1)}">${
+      num(v,2)}</text>`).join('')
+    +`<line class="zero" x1="${L}" y1="${y2(0).toFixed(1)}" x2="${L+iw}" y2="${
+      y2(0).toFixed(1)}"/>`;
   /* Expected move, one standard deviation to the position's expiry, from the
      implied vol backed out of the option's OWN closes. Spot and time-to-expiry
      are per bar so the envelope moves and tapers hourly; the vol input steps
@@ -1334,27 +1384,47 @@ function replayChart(rp){
     `<circle class="fill" cx="${m.x.toFixed(1)}" cy="${m.y.toFixed(1)}" r="3.2"/>`).join('');
   RGEO={points:pts,marks:rp.band?rp.marks||[]:[],xs:geo.xs,size:rp.bar_size,dp:dp};
   const opening=frameAt(RGEO,pts.length-1);
-  return `<svg viewBox="0 0 ${W} ${H}" role="img" preserveAspectRatio="xMidYMid meet"
+  /* The legend states the encoding rather than making the reader infer it: a
+     dashed line means two different things on this chart (a long strike, and the
+     expected-move edge), and hue means put or call rather than profit or loss.
+     Rendered only for what is actually drawn -- a legend entry for an absent
+     series is a promise the picture does not keep. */
+  const key=[
+    sks.some(sk=>String(sk.put_call).toUpperCase()==='P')
+      ?'<span class="lg put">—</span> put strike':'',
+    sks.some(sk=>String(sk.put_call).toUpperCase()==='C')
+      ?'<span class="lg call">—</span> call strike':'',
+    sks.some(sk=>sk.side==='long')?'<span class="dim2">dashed = bought</span>':'',
+    '<span class="lg px">—</span> underlying',
+    dd?'<span class="lg dl">···</span> eff Δ (right)':'',
+    edges.upper.length?'<span class="lg em">▬</span> expected move (1 SD)':'',
+  ].filter(Boolean).join('<span class="dim2"> · </span>');
+  return `<div class="rkey">${key}</div>
+  <svg viewBox="0 0 ${W} ${H}" role="img" preserveAspectRatio="xMidYMid meet"
     ><title>${esc(rp.underlying||'')} ${num(pts[0][1],dp)} → ${
       num(pts[pts.length-1][1],dp)} across ${pts.length} ${
       rp.bar_size==='1h'?'hourly':'daily'} bars</title>
     <defs><clipPath id="rclip"><rect id="rclipr" x="0" y="0" width="${W}" height="${H}"/></clipPath></defs>
-    ${band}${yticks}${breaks}${strikes}
+    ${band}${yticks}${dax}${breaks}${strikes}
     <line class="ax" x1="${L}" y1="${T}" x2="${L}" y2="${T+ih}"/>
     <line class="ax" x1="${L}" y1="${T+ih}" x2="${L+iw}" y2="${T+ih}"/>
     ${edge(geo.at(rp.opened_ts),'edge in','entry')}${edge(geo.at(rp.closed_ts),'edge out','exit')}
-    <geo clip-path="url(#rclip)"><polyline class="pxline" points="${line}"/>${dots}</geo>
+    <g clip-path="url(#rclip)">${dline?`<polyline class="dline" points="${
+      dline}"/>`:''}<polyline class="pxline" points="${line}"/>${dots}</g>
     <line id="rcross" class="cross" x1="${geo.xs[pts.length-1].toFixed(1)}" y1="${T}" x2="${
       geo.xs[pts.length-1].toFixed(1)}" y2="${T+ih}"/>
     ${xticks}</svg>
   <div class="rctl">
+    <button class="rbtn" data-rseek="0" title="to the start">|◀</button>
     <button class="rbtn" data-rplay="1">▶ play</button>
+    <button class="rbtn" data-rseek="${pts.length-1}" title="to the end">▶|</button>
     <input class="rscrub" id="rscrub" type="range" min="0" max="${pts.length-1}"
       value="${pts.length-1}" step="1" aria-label="replay position">
     <select class="rspeed" id="rspeed" aria-label="playback speed">
       <option value="240">1×</option><option value="120">2×</option>
       <option value="60">4×</option><option value="24">10×</option>
     </select>
+    <label class="rauto"><input type="checkbox" id="rloop"> loop</label>
     <span class="rread mono" id="rread">${replayReadout(opening,rp.bar_size,dp)}</span>
   </div>`;
 }
@@ -1405,11 +1475,23 @@ function bindReplayControls(){
     const step=Number((speed&&speed.value)||240);
     RTIMER=setInterval(()=>{
       const next=Number(scrub.value)+1;
-      if(next>Number(scrub.max)){replayStop();play.textContent='▶ play';return;}
+      if(next>Number(scrub.max)){
+        /* Loop rather than stop, when asked. A short trade is 20-odd bars, which
+           is over in a few seconds -- watching it twice is often how the shape
+           registers. */
+        const loop=$('#rloop');
+        if(loop&&loop.checked){scrub.value='0';replaySeek(0);return;}
+        replayStop();play.textContent='▶ play';return;
+      }
       scrub.value=String(next);replaySeek(next);
     },step);
   };
   if(speed) speed.onchange=()=>{ if(RTIMER&&play){play.onclick();play.onclick();} };
+  /* Jump to either end. Stops playback first: leaving a timer running would have
+     it march away from the position just asked for. */
+  document.querySelectorAll('[data-rseek]').forEach(el=>
+    el.onclick=()=>{replayStop();if(play)play.textContent='▶ play';
+      scrub.value=el.dataset.rseek;replaySeek(Number(scrub.value));});
 }
 
 function replayPanel(rp,label,valueHtml){
@@ -1423,8 +1505,11 @@ function replayPanel(rp,label,valueHtml){
     <div class="pills"><span class="pill">${esc(label)} ${valueHtml}</span></div>
   </div>${replayChart(rp)}
   <div class="note">The line is the UNDERLYING's price, not the option's — it is
-    what the strikes are read against. A solid strike was sold, a dashed one
-    bought.</div></div>`;
+    what the strikes are read against. Each strike spans only the period it was
+    held; hue says put or call, and a dashed one was bought rather than sold.
+    Expected move and eff Δ are modelled from the vol implied by the option's own
+    closes, so they are estimates: the card above states the figure the broker
+    billed.</div></div>`;
 }
 
 function trades(){
