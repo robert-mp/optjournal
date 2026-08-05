@@ -541,3 +541,78 @@ def test_a_mixed_currency_journal_scope_serves_no_native_cost_figure():
     mixed = analyse(_stmt([usd, sek]))
     assert len(mixed.journal_native_by_ccy) == 2, "the fake did not span currencies"
     assert _journal_native(mixed) == (None, None)
+
+
+def test_friction_has_no_as_charged_figure_because_part_of_it_is_estimated():
+    """`total_friction` and `account_friction` deliberately have NO native
+    counterpart, and that is a statement about the data rather than a gap.
+
+    Both include the AutoFX markup, which is basis points applied to a converted
+    notional -- IBKR never billed it as a line item in any currency. There is no
+    figure "as charged" for a cost that was never charged explicitly, so offering
+    one would invent precision instead of recovering it. Stated friction, which is
+    commission plus taxes plus fees, is all real charges and does get one.
+    """
+    r = analyse(_stmt([_fill("OPT", "-2.00", qty="3")]))
+    assert hasattr(r, "total_stated_friction_native_by_ccy")
+    for absent in ("total_friction_native_by_ccy", "account_friction_native_by_ccy"):
+        assert not hasattr(r, absent), (
+            f"{absent} exists; friction mixes a real charge with an estimate and"
+            " must not claim a billing currency"
+        )
+    # Stated friction reconciles with the total it decomposes.
+    assert sum(r.total_stated_friction_native_by_ccy.values()) \
+        == r.total_stated_friction_base
+
+
+def test_the_account_level_gate_withholds_on_a_mixed_scope_but_is_applied():
+    """"Withheld because the scope is mixed" and "never considered" look
+    identical in a payload until a currency becomes uniform -- only one of them
+    then starts producing a figure. The account-level ledgers deliberately span
+    asset categories, so on a multi-currency account the gate almost always
+    withholds; the point is that it is asked.
+    """
+    from optjournal.serialize import _gate
+
+    usd = _fill("STK", "-25.00", qty="100")
+    usd.ibCommissionCurrency = "USD"
+    mixed = analyse(_stmt([_fill("OPT", "-2.00", qty="3"), usd]))
+    # Journal scope is single-currency, so it answers.
+    assert _gate(mixed.journal_native_by_ccy)[1] is not None
+    # One non-journal currency: the account-level ledger answers too.
+    assert _gate(mixed.other_native_by_ccy) == (25.0, "USD")
+
+    sek = _fill("STK", "-9.00", qty="5")
+    sek.ibCommissionCurrency = "SEK"
+    spanning = analyse(_stmt([_fill("OPT", "-2.00", qty="3"), usd, sek]))
+    assert _gate(spanning.other_native_by_ccy) == (None, None)
+
+
+def test_analysis_stays_a_leaf_module():
+    """analysis.py must import nothing from optjournal.
+
+    It is pure statement mathematics, and the README's layering rule says
+    imports only point down. The temptation is real and specific: the
+    single-currency gate it needs for its per-currency ledgers lives in stats,
+    and importing it would be one line. That line would point an import upward
+    -- stats reads the database, analysis does not -- and cost this module the
+    property that makes it trivially testable against a hand-built statement.
+    The gate is applied by serialize instead, which already holds both.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parent.parent / "src" / "optjournal" / "analysis.py"
+    tree = ast.parse(src.read_text())
+    internal = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("optjournal"):
+            internal.append(node.module)
+        if isinstance(node, ast.ImportFrom) and node.level:
+            internal.append("." * node.level + (node.module or ""))
+        if isinstance(node, ast.Import):
+            internal += [a.name for a in node.names if a.name.startswith("optjournal")]
+    assert not internal, (
+        f"analysis.py now imports {internal}; it is a leaf by design. If it needs"
+        " a shared rule, apply that rule in serialize, which already imports both."
+    )

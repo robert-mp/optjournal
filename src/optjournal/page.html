@@ -452,6 +452,20 @@ td.n,th.n{text-align:right}
  * @property {number} fx_commission_base
  * @property {number} journal_commission_base
  * @property {number|null} journal_commission_native -- as charged, null when mixed
+ * @property {number|null} other_commission_native -- as charged, null when the scope is mixed
+ * @property {string|null} other_commission_native_ccy
+ * @property {number|null} other_taxes_native
+ * @property {string|null} other_taxes_native_ccy
+ * @property {number|null} commission_native -- account-wide, as charged
+ * @property {string|null} commission_native_ccy
+ * @property {number|null} fees_native
+ * @property {string|null} fees_native_ccy
+ * @property {number|null} taxes_native
+ * @property {string|null} taxes_native_ccy
+ * @property {number|null} stated_friction_native -- commission+taxes+fees; friction has NO native (estimate)
+ * @property {string|null} stated_friction_native_ccy
+ * @property {number|null} fx_commission_native
+ * @property {string|null} fx_commission_native_ccy
  * @property {string|null} journal_commission_native_ccy
  * @property {number} journal_taxes_base
  * @property {number} journal_friction_base

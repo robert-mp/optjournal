@@ -34,7 +34,9 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
                   (episodes)   (periods, scopes)  (cost report)
                        └──────────────┼───────────────┘
                                       ▼
-                     serialize.py (JSON payload contract)
+                     serialize.py (JSON payload contract; applies
+                                   stats.one_currency() to analysis's
+                                   per-currency ledgers)
                      render.py    (terminal reports)
                                       │
                             ┌─────────┴─────────┐
@@ -50,9 +52,9 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `ingest.py` | statement → SQLite, idempotent upserts (stores every asset category; scoping is query-time) |
 | `db.py` | connection, schema migration, `open_journal()` |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
-| `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts |
-| `analysis.py` | cost/friction report from the raw statement (whole account) |
-| `serialize.py` | the JSON payload the page renders and `--json` emits |
+| `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts, `one_currency()` |
+| `analysis.py` | cost/friction report from the raw statement (whole account); a leaf — imports nothing internal |
+| `serialize.py` | the JSON payload the page renders and `--json` emits; applies `one_currency()` to `analysis`'s per-currency ledgers |
 | `render.py` | human-readable terminal reports |
 | `web.py` | loopback HTTP server; `ServeConfig` injected per server |
 | `page.html` | the entire frontend: no build step, no external resources |
@@ -70,8 +72,32 @@ Layering rules (import direction only goes down this list):
 3. Presentation (`serialize`, `render`) consumes domain objects and never
    opens its own connections (the two `*_data(conn)` readers are the
    deliberate exception: they wrap single SELECTs over views).
+4. A domain module produces raw material; the layer that already holds
+   several of them composes. `analysis.py` accumulates commission, taxes
+   and fees keyed by the currency they were *billed* in, and deliberately
+   does not decide whether one currency can speak for a total — that
+   judgement is `stats.one_currency()`, and `serialize.py` applies it,
+   because it is the only module that already imports both. The
+   alternative was `analysis` importing `stats`, which would point an
+   import upward and cost this module its leaf status for one function.
 
-Three invariants worth knowing before changing the UI:
+Four invariants worth knowing before changing the UI:
+
+* **A charge is shown in the currency it was charged in, when the reader
+  is already looking at that currency.** IBKR bills commission per trade
+  in the instrument's currency (and, on FX conversions, in the account
+  base) and debits it there — no euros move for a dollar commission. So
+  `*_base` figures are an accounting translation, converted per row at
+  IBKR's own rate for that row's date, and restating a sum of them into a
+  display currency sends each charge on a round trip through two different
+  rates. Where one currency accounts for a whole figure, the payload also
+  carries it `_native` with its `_ccy`, and the page prefers that: the
+  card says "as charged" rather than "restated". Where a figure spans
+  currencies — this account's stock trades span four — the native value is
+  withheld as `null`, because an exact-looking number covering part of a
+  total is worse than an honest approximation of all of it. `friction`
+  never carries a native figure at all: it includes the estimated AutoFX
+  markup, which IBKR never billed as a line item in any currency.
 
 * **A tab's numbers change only in response to a control that tab
   displays.** The Trade Types control drives Dashboard/Calendar/Trades

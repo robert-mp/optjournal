@@ -153,6 +153,10 @@ class FxPair:
     commission_signed: Decimal = ZERO
     autofx_conversions: int = 0
     autofx_notional_base: Decimal = ZERO
+    #: Conversion commission as charged, per billing currency. On this account
+    #: that is always the base currency -- IBKR bills FX conversion fees in base
+    #: while the row's currency is the pair's quote.
+    native_by_ccy: dict[str, Decimal] = field(default_factory=dict)
 
     @property
     def commission_base(self) -> Decimal:
@@ -246,6 +250,10 @@ class FeeCategory:
     count: int = 0
     total_base: Decimal = ZERO
     examples: list[str] = field(default_factory=list)
+    #: The fee as charged, per currency it was levied in. A CashTransaction
+    #: carries its own currency, so unlike the AutoFX markup this is a real
+    #: charge with a real denomination.
+    native_by_ccy: dict[str, Decimal] = field(default_factory=dict)
 
     @property
     def per_year_base(self) -> Decimal:
@@ -315,6 +323,64 @@ class CostReport:
             for ccy, amount in g.native_by_ccy.items():
                 out[ccy] = out.get(ccy, ZERO) - amount
         return out
+
+    @staticmethod
+    def _merge(*ledgers: dict[str, Decimal], negate: bool = False) -> dict[str, Decimal]:
+        """Sum per-currency ledgers, optionally flipping IBKR's sign.
+
+        Charges arrive negative and the report presents cost as positive, so a
+        breakdown that did not flip would disagree in sign with the total it
+        decomposes.
+        """
+        out: dict[str, Decimal] = {}
+        for ledger in ledgers:
+            for ccy, amount in ledger.items():
+                out[ccy] = out.get(ccy, ZERO) + (-amount if negate else amount)
+        return out
+
+    @property
+    def other_native_by_ccy(self) -> dict[str, Decimal]:
+        """Commission on instruments the journal does not cover, as charged."""
+        return self._merge(*(g.native_by_ccy for g in self.other_commissions),
+                           negate=True)
+
+    @property
+    def other_taxes_native_by_ccy(self) -> dict[str, Decimal]:
+        return self._merge(*(g.taxes_native_by_ccy for g in self.other_commissions),
+                           negate=True)
+
+    @property
+    def total_native_by_ccy(self) -> dict[str, Decimal]:
+        """Commission across every asset category, as charged."""
+        return self._merge(*(g.native_by_ccy for g in self.commissions), negate=True)
+
+    @property
+    def total_taxes_native_by_ccy(self) -> dict[str, Decimal]:
+        return self._merge(*(g.taxes_native_by_ccy for g in self.commissions),
+                           negate=True)
+
+    @property
+    def total_fees_native_by_ccy(self) -> dict[str, Decimal]:
+        """Fees as levied. Already magnitudes, so no sign flip."""
+        return self._merge(*(f.native_by_ccy for f in self.fees))
+
+    @property
+    def total_fx_commission_native_by_ccy(self) -> dict[str, Decimal]:
+        return self._merge(*(p.native_by_ccy for p in self.fx), negate=True)
+
+    @property
+    def total_stated_friction_native_by_ccy(self) -> dict[str, Decimal]:
+        """Stated costs as charged: commission, taxes and fees.
+
+        `total_friction` and `account_friction` deliberately have NO native
+        counterpart. Both include `total_autofx_spread_base`, which is an
+        ESTIMATE -- basis points applied to a converted notional -- and was never
+        billed as a line item in any currency. There is no figure "as charged"
+        for a cost IBKR never charged explicitly, so offering one would be
+        inventing precision rather than recovering it.
+        """
+        return self._merge(self.total_native_by_ccy, self.total_taxes_native_by_ccy,
+                           self.total_fees_native_by_ccy)
 
     @property
     def journal_friction_native_by_ccy(self) -> dict[str, Decimal]:
@@ -502,6 +568,8 @@ def analyse(
         notional = abs(_to_base(t.proceeds, rate))
         p.notional_base += notional
         p.commission_signed += commission
+        if t.ibCommission:
+            p.native_by_ccy[billed] = p.native_by_ccy.get(billed, ZERO) + t.ibCommission
         if _is_autofx(t):
             p.autofx_conversions += 1
             p.autofx_notional_base += notional
@@ -520,6 +588,11 @@ def analyse(
             cat = fees.setdefault(name, FeeCategory(name=name))
             cat.count += 1
             cat.total_base += abs(amount_base)
+            fee_ccy = str(getattr(c, "currency", None) or "") or base_currency
+            if c.amount:
+                cat.native_by_ccy[fee_ccy] = (
+                    cat.native_by_ccy.get(fee_ccy, ZERO) + abs(c.amount)
+                )
             if len(cat.examples) < 3 and c.description:
                 cat.examples.append(c.description)
         elif "WHTAX" in kind:

@@ -141,6 +141,11 @@ def positions_data(conn: sqlite3.Connection) -> list[Row]:
     ).fetchall()
     return [dict(r) for r in rows]
 
+def _gate(ledger: dict) -> tuple[float | None, str | None]:
+    """Apply the single-currency gate to a per-currency ledger."""
+    return one_currency({c: float(v) for c, v in ledger.items()})
+
+
 def _journal_native(report: CostReport) -> tuple[float | None, str | None]:
     """The journal's commission as charged, gated to a single currency.
 
@@ -223,14 +228,24 @@ def costs_data(report: CostReport) -> Row:
         "journal_asset": report.journal_asset,
         "totals": {
             "commission_base": _num(report.total_commission_base),
+            "commission_native": _gate(report.total_native_by_ccy)[0],
+            "commission_native_ccy": _gate(report.total_native_by_ccy)[1],
             "fees_base": _num(report.total_fees_base),
+            "fees_native": _gate(report.total_fees_native_by_ccy)[0],
+            "fees_native_ccy": _gate(report.total_fees_native_by_ccy)[1],
             "taxes_base": _num(report.total_taxes_base),
+            "taxes_native": _gate(report.total_taxes_native_by_ccy)[0],
+            "taxes_native_ccy": _gate(report.total_taxes_native_by_ccy)[1],
             "autofx_notional_base": _num(report.total_autofx_notional_base),
             "autofx_spread_base": _num(report.total_autofx_spread_base),
             "stated_friction_base": _num(report.total_stated_friction_base),
+            "stated_friction_native": _gate(report.total_stated_friction_native_by_ccy)[0],
+            "stated_friction_native_ccy": _gate(report.total_stated_friction_native_by_ccy)[1],
             "friction_base": _num(report.total_friction_base),
             "fx_notional_base": _num(report.total_fx_notional_base),
             "fx_commission_base": _num(report.total_fx_commission_base),
+            "fx_commission_native": _gate(report.total_fx_commission_native_by_ccy)[0],
+            "fx_commission_native_ccy": _gate(report.total_fx_commission_native_by_ccy)[1],
             # Scope split. `commission_base` above spans the whole account, so
             # a consumer that wants this journal's cost must read the journal_*
             # keys -- presenting the account figure as the journal's was the
@@ -252,8 +267,21 @@ def costs_data(report: CostReport) -> Row:
             # page from a restated total would have put "as charged" beside a
             # per-unit figure that was not.
             "journal_per_unit_native": _journal_per_unit_native(report),
+            # Account-level figures take the same gate. On a multi-currency
+            # account it almost always withholds -- these deliberately span
+            # asset categories -- but "withheld because the scope is mixed" is
+            # a different statement from "never considered", and only one of
+            # them survives a currency becoming uniform later.
+            #
+            # account_friction and total_friction are ABSENT on purpose: both
+            # include the estimated AutoFX markup, which was never billed as a
+            # line item in any currency, so no as-charged figure exists.
             "other_commission_base": _num(report.other_commission_base),
+            "other_commission_native": _gate(report.other_native_by_ccy)[0],
+            "other_commission_native_ccy": _gate(report.other_native_by_ccy)[1],
             "other_taxes_base": _num(report.other_taxes_base),
+            "other_taxes_native": _gate(report.other_taxes_native_by_ccy)[0],
+            "other_taxes_native_ccy": _gate(report.other_taxes_native_by_ccy)[1],
             "account_friction_base": _num(report.account_friction_base),
             "credit_fills": sum(g.credit_fills for g in report.commissions),
         },
