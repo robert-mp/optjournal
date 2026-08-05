@@ -47,9 +47,19 @@ def _dt(value: str | None) -> datetime | None:
 
 
 def _underlying(order: Row) -> str | None:
-    """The order's single underlying, or None when it has none or several."""
+    """The order's single underlying, or None when it has none or several.
+
+    A stock's underlying IS the stock, so `symbol` is the fallback rather than
+    a guess: reading only `underlying_symbol` left every equities lifecycle
+    nameless, and the Trades tab rendered its card heading as a literal "?"
+    for a position whose ticker sat one column away. Real IBKR data happens to
+    populate `underlyingSymbol` on stock rows, which is why this surfaced only
+    on the synthetic journal -- exactly the kind of gap demo data should be
+    exposing rather than hiding.
+    """
     names = {
-        str(leg.get("underlying_symbol") or "") for leg in order.get("legs", ())
+        str(leg.get("underlying_symbol") or leg.get("symbol") or "")
+        for leg in order.get("legs", ())
     } - {""}
     return names.pop() if len(names) == 1 else None
 

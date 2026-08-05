@@ -38,7 +38,17 @@ from pathlib import Path
 
 __all__ = ["SCHEMA_VERSION", "connect", "migrate", "open_journal"]
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+#: Columns added to existing tables after their CREATE statement shipped.
+#: `executescript(_SCHEMA)` uses CREATE TABLE IF NOT EXISTS, which is a no-op on
+#: a table that already exists -- so a new column in _SCHEMA reaches new
+#: databases only. Existing ones need the ALTER, and every journal on disk is an
+#: existing one. Idempotent: the column list is read first, so re-running is
+#: free and an interrupted migration resumes.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("trades", "ib_commission_currency", "TEXT"),
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -87,6 +97,13 @@ CREATE TABLE IF NOT EXISTS trades (
   proceeds_base           REAL,
   ib_commission           REAL,
   ib_commission_base      REAL,
+  -- The currency IBKR billed the commission in. Stored rather than assumed:
+  -- ib_commission_base is ib_commission x fx_rate_to_base, and that rate
+  -- belongs to the INSTRUMENT's currency. The two agree on every row observed
+  -- so far, but if IBKR ever bills in a third currency the conversion would
+  -- silently apply the wrong rate, so the assumption is now recorded and
+  -- checked at ingest instead of being invisible.
+  ib_commission_currency  TEXT,
   taxes                   REAL,
   fifo_pnl_realized       REAL,
   fifo_pnl_realized_base  REAL,
@@ -284,6 +301,12 @@ def migrate(conn: sqlite3.Connection) -> int:
     for view in _VIEWS:
         conn.execute(f"DROP VIEW IF EXISTS {view}")
     conn.executescript(_SCHEMA)
+    # After the script, because a table the script just created already has the
+    # column and the existence check below then makes this a no-op.
+    for table, column, decl in _ADDED_COLUMNS:
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
     row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
     current = row["v"] if row and row["v"] is not None else 0
     if current < SCHEMA_VERSION:

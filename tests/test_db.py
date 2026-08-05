@@ -366,3 +366,92 @@ def test_fractional_stock_quantities_survive_ingest(tmp_path):
     assert len(report.episodes) == 1
     assert report.episodes[0].is_closed
     conn.close()
+
+
+def test_a_column_added_after_ship_reaches_an_existing_database(tmp_path):
+    """`executescript(_SCHEMA)` uses CREATE TABLE IF NOT EXISTS, which is a
+    no-op on a table that already exists -- so a new column in the schema text
+    reaches new databases only, and every journal on disk is an old one. The
+    explicit ALTER is what makes the column real for them, and it must be
+    idempotent because migrate() runs on every single connection.
+    """
+    from optjournal.db import _ADDED_COLUMNS, connect, migrate
+
+    path = tmp_path / "j.db"
+    conn = connect(path)
+    migrate(conn)
+    for table, column, _decl in _ADDED_COLUMNS:
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        assert column in cols, f"{table}.{column} missing after migrate"
+    # Simulate the pre-column database: drop it and migrate again.
+    conn.execute("ALTER TABLE trades DROP COLUMN ib_commission_currency")
+    assert "ib_commission_currency" not in {
+        r["name"] for r in conn.execute("PRAGMA table_info(trades)")
+    }
+    migrate(conn)
+    assert "ib_commission_currency" in {
+        r["name"] for r in conn.execute("PRAGMA table_info(trades)")
+    }, "the ALTER did not run on a database missing the column"
+    migrate(conn)  # idempotent -- a second run must not raise
+    conn.close()
+
+
+def test_commission_currency_is_stored_and_read_back(tmp_path):
+    """Stored rather than assumed. ib_commission_base is commission x
+    fx_rate_to_base, and that rate belongs to the INSTRUMENT's currency -- so
+    the base figure is only right while the commission is billed in that same
+    currency. It is on every row observed, but an assumption that is never
+    checked fails silently, so the field is persisted and compared.
+    """
+    from optjournal.db import connect, migrate
+    from optjournal.demo import write_demo_statement
+    from optjournal.ingest import ingest_file
+
+    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    conn = connect(tmp_path / "demo.db")
+    migrate(conn)
+    result = ingest_file(conn, statement)
+
+    rows = conn.execute(
+        "SELECT currency, ib_commission, ib_commission_currency FROM trades"
+        " WHERE ib_commission IS NOT NULL AND ib_commission <> 0"
+    ).fetchall()
+    assert rows, "no commissioned trades to check"
+    stored = [r["ib_commission_currency"] for r in rows]
+    assert all(stored), "the commission currency was not persisted"
+    # The invariant the base conversion depends on.
+    for r in rows:
+        assert r["ib_commission_currency"] == r["currency"], (
+            "commission currency differs from the instrument currency, which"
+            " means ib_commission_base used the wrong rate"
+        )
+    # Agreement means no warning; the warning exists for the day it disagrees.
+    assert not [w for w in result.warnings if "commission billed in" in w]
+    conn.close()
+
+
+def test_a_commission_billed_in_another_currency_warns_without_aborting(tmp_path):
+    """A warning, not a raise: a genuine broker quirk should surface, not abort
+    an ingest. The native amount is still stored correctly either way -- only
+    the base conversion would be suspect, so the run continues and says so.
+    """
+    from optjournal.db import connect, migrate
+    from optjournal.demo import write_demo_statement
+    from optjournal.ingest import ingest_file
+
+    src = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    doctored = tmp_path / "doctored.xml"
+    raw = src.read_text()
+    # Bill one USD option's commission in GBP, leaving everything else intact.
+    # The demo emits a Flex XML statement, so this is an attribute, not JSON.
+    assert 'ibCommissionCurrency="USD"' in raw
+    doctored.write_text(raw.replace('ibCommissionCurrency="USD"',
+                                    'ibCommissionCurrency="GBP"', 1))
+
+    conn = connect(tmp_path / "d.db")
+    migrate(conn)
+    result = ingest_file(conn, doctored)
+    assert [w for w in result.warnings if "commission billed in GBP" in w], \
+        f"no warning raised; got {result.warnings}"
+    assert result.trades_inserted, "the ingest aborted instead of warning"
+    conn.close()

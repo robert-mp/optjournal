@@ -291,6 +291,10 @@ td.n,th.n{text-align:right}
  * @property {number|null} avg_win_base -- null without wins
  * @property {number|null} avg_loss_base -- null without losses
  * @property {number} open_premium_base -- excluded from P&L until positions close
+ * @property {number|null} open_premium_native -- as received, null when mixed
+ * @property {string|null} open_premium_native_ccy
+ * @property {number|null} options_friction_native -- as charged, null when mixed
+ * @property {string|null} options_friction_native_ccy
  * @property {number} open_commission_base -- excluded the same way
  * @property {number|null} open_commission_native -- as charged, null when mixed
  * @property {string|null} open_commission_native_ccy -- the currency charged
@@ -675,6 +679,14 @@ const commissionOf=s=>
 const openCommissionOf=s=>
   chargeOf(s.open_commission_native,s.open_commission_native_ccy,
            s.open_commission_base);
+const openPremiumOf=s=>
+  chargeOf(s.open_premium_native,s.open_premium_native_ccy,s.open_premium_base);
+const frictionOf=s=>
+  chargeOf(s.options_friction_native,s.options_friction_native_ccy,
+           s.options_friction_base);
+/* A leg already carries its own native proceeds and the currency it filled
+   in, so the same rule applies with no payload addition. */
+const legProceedsOf=l=>chargeOf(l.proceeds,l.currency,l.proceeds_base);
 /* Which basis the figure on screen actually uses -- three states, not two.
    "restated" is a claim, and it is false when the reader is looking at the
    base currency: that figure is IBKR's own conversion, unrestated, and saying
@@ -683,6 +695,14 @@ const commissionBasis=s=>commissionIsNative(s)?'as charged'
   :DISP()===BASE()?`IBKR's figure in ${BASE()}`:`restated from ${BASE()}`;
 
 const cls=v=>v==null||Number(v)===0?'':Number(v)>0?'pos':'neg';
+/* A strike is an identifier as much as a number: 267.5 and 268 are different
+   contracts. `num(v,0)` rounded, so a half-strike rendered as a contract that
+   does not exist -- latent on this account only because every strike it has
+   ever held is whole. Whole strikes still render bare ("270", not "270.00"),
+   because padding every strike to two places to accommodate the rare half is
+   noise on the common case. */
+const strike=v=>v==null?'':Number.isInteger(Number(v))?num(v,0)
+  :num(v,String(v).split('.')[1].length>2?2:String(v).split('.')[1].length);
 const pct=(v,d=1)=>v==null?'—':num(v,d)+'%';
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const monthLabel=m=>{if(!m||m==='ALL')return 'All time';
@@ -909,12 +929,12 @@ function dashboard(){
           in Net P&L: premium is a liability until the position closes, and it
           lands there, in full, on the day it does."
           >open premium <b class="${cls(s.open_premium_base)}">${
-          cash(s.open_premium_base)}</b></span>`:''}
+          openPremiumOf(s)}</b></span>`:''}
         <span class="pill" title="Commission on ${esc(s.asset_category)} trades${
           opt?', closed round trips only -- commission on open positions is on the Commissions card':''}.
           Commission carries an asset category, so this figure is genuinely
           scoped to this journal."
-          >${esc(s.asset_category)} <b>${cash(s.options_friction_base)}</b></span>
+          >${esc(s.asset_category)} <b>${frictionOf(s)}</b></span>
       </div></div>
     <div class="stats">${cards}</div>
     ${s.closed_episodes===0?`<div class="note">No round trip has fully closed yet,
@@ -1099,14 +1119,14 @@ function legRow(l,extra=''){
      card, already under its strategy header, passes nothing. */
   return `<div class="leg${extra?' ctx':''}">
     <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
-    <span class="mono">${esc(l.underlying_symbol||'')}
-      <b>${l.strike!=null?num(l.strike,0):''}${esc(l.put_call||'')}</b>
+    <span class="mono">${esc(l.underlying_symbol||l.symbol||'')}
+      <b>${strike(l.strike)}${esc(l.put_call||'')}</b>
       <span class="dim">${esc(l.expiry||'')}</span></span>
     ${extra}
     <span class="mono dim">×${Math.abs(l.quantity)}</span>
     <span class="mono" title="fill price, always in the contract's own currency"
       >${money(l.avg_price,l.currency)}</span>
-    <span class="mono ${cls(l.proceeds_base)}">${cash(l.proceeds_base)}</span>
+    <span class="mono ${cls(l.proceeds_base)}">${legProceedsOf(l)}</span>
   </div>`;
 }
 function groupLabel(legs){
@@ -1531,6 +1551,12 @@ function applyHash(){
   S.type=hs.get('type')||null;
   S.month=hs.get('month')||null;
   S.ccy=(hs.get('ccy')||'').toUpperCase()||null;
+  /* The drill-down selection was the one piece of view state the URL did not
+     carry, so a link to "that day" was unshareable and a reload silently
+     dropped the panel while leaving the calendar looking untouched. Validated
+     against the payload in draw(), not here: a day from another month means
+     nothing in this one, and applyHash runs before the state it would check. */
+  S.calday=hs.get('calday')||null;
 }
 function syncHash(push){
   const hs=new URLSearchParams();
@@ -1541,6 +1567,7 @@ function syncHash(push){
   if(S.type) hs.set('type',S.type);
   if(S.month) hs.set('month',S.month);
   if(S.ccy&&S.ccy!==BASE()) hs.set('ccy',S.ccy);
+  if(S.calday) hs.set('calday',S.calday);
   const next=hs.toString()?'#'+hs:'';
   if(next===(location.hash||'')) return;
   /* A tab jump is a navigation, so it pushes and the back button walks tabs.
@@ -1559,6 +1586,13 @@ function draw(push){
      rather than in load() because a hash edit is a same-document navigation
      -- load() never runs for it, only the hashchange -> draw path does. */
   if(S.ccy&&S.state&&S.ccy!==BASE()&&!QUOTES().some(qo=>qo.code===S.ccy)) S.ccy=null;
+  /* A day the payload holds no fills for cannot be drilled into, so it heals
+     out of the URL rather than sitting there describing nothing -- the same
+     discipline the display currency follows. Checked HERE, before syncHash:
+     dayDetail's own guard runs during render, by which point the stale key has
+     already been written to the address bar. */
+  if(S.calday&&S.state&&!(((S.state.stats||{}).days)||[])
+      .some(dy=>dy.day===S.calday)) S.calday=null;
   syncHash(push);
   renderTabs();
   renderCcy();

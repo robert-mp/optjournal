@@ -254,6 +254,10 @@ class MonthStats:
     #: liability until the position closes, not profit.
     open_premium_base: float = 0.0
 
+    #: Open premium as received or paid, same single-currency rule.
+    open_premium_native: float | None = None
+    open_premium_native_ccy: str | None = None
+
     #: Commission already paid on *currently open* episodes. Point-in-time,
     #: like `open_premium_base`, and excluded from `commissions_base` for the
     #: same reason the premium is excluded from P&L: it belongs to an outcome
@@ -305,6 +309,18 @@ class MonthStats:
         figure on this panel that is scoped to the journalled instruments.
         """
         return abs(self.commissions_base)
+
+    @property
+    def options_friction_native(self) -> float | None:
+        """The same friction as charged, or None when the scope is mixed.
+
+        Derived from `commissions_native` rather than tracked separately: they
+        are the same money, and computing the magnitude twice is how the two
+        drift apart.
+        """
+        if self.commissions_native is None:
+            return None
+        return abs(self.commissions_native)
 
     @property
     def account_friction_base(self) -> float:
@@ -873,6 +889,16 @@ def month_stats(
     stats.open_premium_base = sum(
         e.proceeds_base for e in report.open if scope.has_episode(e)
     )
+    # Premium is cash received or paid in the contract's own currency, so it
+    # takes the same treatment as commission: exact when one currency accounts
+    # for the whole figure, withheld when they are mixed.
+    premium_by_ccy: dict[str, float] = {}
+    for e in report.open:
+        if scope.has_episode(e) and e.proceeds:
+            premium_by_ccy[e.currency] = premium_by_ccy.get(e.currency, 0.0) + e.proceeds
+    stats.open_premium_native, stats.open_premium_native_ccy = _one_currency(
+        premium_by_ccy
+    )
     wins = [e.realized_pnl_base for e in closed if e.realized_pnl_base > 0]
     losses = [e.realized_pnl_base for e in closed if e.realized_pnl_base < 0]
     stats.wins, stats.losses = len(wins), len(losses)
@@ -905,6 +931,8 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "avg_win_base": stats.avg_win_base,
         "avg_loss_base": stats.avg_loss_base,
         "open_premium_base": stats.open_premium_base,
+        "open_premium_native": stats.open_premium_native,
+        "open_premium_native_ccy": stats.open_premium_native_ccy,
         "open_commission_base": stats.open_commission_base,
         "open_commission_native": stats.open_commission_native,
         "open_commission_native_ccy": stats.open_commission_native_ccy,
@@ -912,6 +940,9 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "net_liq_date": stats.net_liq_date,
         "gain_pct_of_net_liq": stats.gain_pct_of_net_liq,
         "options_friction_base": stats.options_friction_base,
+        "options_friction_native": stats.options_friction_native,
+        # Friction is commission, so it names the same currency.
+        "options_friction_native_ccy": stats.commissions_native_ccy,
         "account_friction_base": stats.account_friction_base,
         "total_friction_base": stats.total_friction_base,
         "green_days": stats.green_days,

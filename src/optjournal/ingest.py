@@ -227,6 +227,21 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult) -
         proceeds = _f(t.proceeds)
         commission = _f(t.ibCommission)
         realized = _f(t.fifoPnlRealized)
+        # `ib_commission_base` is commission x fxRateToBase, and that rate is
+        # the INSTRUMENT's. So the conversion is only right while the commission
+        # is billed in the instrument's currency. IBKR does send the commission
+        # currency separately; it agrees on every row observed, but agreement
+        # that is assumed rather than checked fails silently. A warning, not a
+        # raise: a real broker quirk should surface, not abort an ingest -- the
+        # native figure is still stored correctly either way, and only the base
+        # conversion would be suspect.
+        commission_ccy = _s(t.ibCommissionCurrency)
+        if commission and commission_ccy and commission_ccy != _s(t.currency):
+            result.warnings.append(
+                f"trade {t.tradeID}: commission billed in {commission_ccy} but the"
+                f" instrument trades in {_s(t.currency)}; ib_commission_base used"
+                f" the instrument's fxRateToBase and may be wrong"
+            )
 
         cur = conn.execute(
             "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
@@ -234,9 +249,10 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult) -
             " underlying_symbol, underlying_conid, put_call, strike, expiry,"
             " multiplier, buy_sell, open_close, notes, level_of_detail, quantity,"
             " trade_price, currency, fx_rate_to_base, proceeds, proceeds_base,"
-            " ib_commission, ib_commission_base, taxes, fifo_pnl_realized,"
+            " ib_commission, ib_commission_base, ib_commission_currency, taxes,"
+            " fifo_pnl_realized,"
             " fifo_pnl_realized_base, mtm_pnl, raw, source_file, first_seen_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(trade_id) DO NOTHING",
             (
                 _s(t.tradeID), _s(t.ibExecID), _s(t.transactionID), _s(t.ibOrderID),
@@ -250,6 +266,7 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult) -
                 None if proceeds is None else proceeds * rate,
                 commission,
                 None if commission is None else commission * rate,
+                commission_ccy,
                 _f(t.taxes), realized,
                 None if realized is None else realized * rate,
                 _f(t.mtmPnl),

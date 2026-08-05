@@ -1101,12 +1101,34 @@ def test_hash_carries_every_piece_of_view_state():
     """Persisting only the filter restores a view that was never on screen.
 
     Reload would come back with the 0DTE scope applied but the month dropped
-    and the tab reset to Dashboard.
+    and the tab reset to Dashboard. `calday` joined the set late: the
+    drill-down selection was the one piece of view state the URL did not carry,
+    so "that day" was unshareable and a reload dropped the panel while leaving
+    the calendar looking untouched.
     """
     js = _code_only(_js())
-    for key in ("'tab'", "'type'", "'month'", "'ccy'"):
+    for key in ("'tab'", "'type'", "'month'", "'ccy'", "'calday'"):
         assert f"hs.set({key}," in js, f"{key} is not written to the hash"
         assert f"hs.get({key})" in js, f"{key} is not read back from the hash"
+
+
+def test_a_calday_the_payload_cannot_show_heals_out_of_the_hash():
+    """Validated in draw(), BEFORE syncHash writes the URL.
+
+    dayDetail has its own guard, but it runs during render -- by which point the
+    stale key is already in the address bar. A day from another month, or one
+    the current filter excludes, must not survive in a URL describing nothing.
+    Client-side only, so a calday change redraws without refetching: the
+    hashchange handler compares only the server-side keys.
+    """
+    js = _code_only(_js()).replace(" ", "").replace("\n", "")
+    assert "if(S.calday&&S.state&&!(((S.state.stats||{}).days)||[])" in js, \
+        "calday is not healed against the payload"
+    draw = _fn("draw").replace(" ", "").replace("\n", "")
+    assert draw.index("S.calday=null") < draw.index("syncHash("), \
+        "the heal must run before the hash is written"
+    assert "calday" not in _code_only(_js()).split("window.onhashchange")[1], \
+        "a calday change must not trigger a refetch"
 
 
 def test_calendar_chevrons_walk_the_range_through_load():
@@ -1373,3 +1395,45 @@ def test_the_calendar_pills_describe_the_month_on_the_grid():
     # The fallback is the newest ACTIVE month, not the newest month of the
     # account's life -- month_range[0] is only the last resort.
     assert "active[active.length-1]" in flat
+
+
+def test_strike_keeps_a_half_and_stays_bare_when_whole():
+    """A strike is an identifier as much as a number: 267.5 and 268 are
+    different contracts, and num(v,0) rounded one into the other. Latent on
+    this account only because every strike it has held is whole -- which is
+    also why whole strikes must keep rendering bare rather than being padded
+    to two places for the rare half.
+    """
+    js = _code_only(_js()).replace(" ", "").replace("\n", "")
+    assert "conststrike=v=>v==null?''" in js, "the strike helper is gone"
+    assert "Number.isInteger(Number(v))?num(v,0)" in js
+    leg = _fn("legRow").replace(" ", "")
+    assert "${strike(l.strike)}" in leg, "legRow still formats the strike inline"
+    assert "num(l.strike,0)" not in leg, "the rounding call survives"
+
+
+def test_a_leg_falls_back_to_its_own_symbol_for_display():
+    """A stock leg's underlying is the stock, so a blank underlying_symbol must
+    not blank the contract cell -- it rendered as empty space beside a real
+    position on the synthetic journal.
+    """
+    leg = _fn("legRow").replace(" ", "")
+    assert "esc(l.underlying_symbol||l.symbol||'')" in leg
+
+
+def test_proceeds_and_friction_follow_the_same_charge_rule_as_commission():
+    """Premium and friction are cash in a contract's own currency, so they take
+    the treatment commission takes: exact when one currency accounts for the
+    figure, restated when mixed. Routed through the same chargeOf() so a change
+    to the rule cannot reach one figure and miss another.
+    """
+    js = _code_only(_js()).replace(" ", "").replace("\n", "")
+    for helper in ("openPremiumOf=s=>chargeOf(s.open_premium_native,",
+                   "frictionOf=s=>chargeOf(s.options_friction_native,",
+                   "legProceedsOf=l=>chargeOf(l.proceeds,l.currency,l.proceeds_base)"):
+        assert helper in js, f"missing {helper}"
+    card = _fn("dashboard").replace(" ", "").replace("\n", "")
+    assert "openPremiumOf(s)" in card and "frictionOf(s)" in card
+    assert "cash(s.open_premium_base)}</b>" not in card, "pill bypasses the rule"
+    assert "cash(s.options_friction_base)" not in card, "pill bypasses the rule"
+    assert "legProceedsOf(l)" in _fn("legRow").replace(" ", "")

@@ -398,7 +398,10 @@ def _trade_elements(orders: list[Order]) -> list[dict[str, str]]:
                     subCategory="COMMON" if stock else leg.put_call,
                     multiplier=_q(mult),
                     listingExchange="NASDAQ" if stock else "CBOE",
-                    underlyingSymbol="" if stock else leg.underlying,
+                    # Real statements carry the ticker itself on a stock row;
+                    # emitting "" made the demo LESS faithful than reality and
+                    # hid a nameless-lifecycle bug the real data cannot reach.
+                    underlyingSymbol=sym if stock else leg.underlying,
                     underlyingConid="" if stock
                         else _UNDERLYING_CONID[leg.underlying],
                     strike="" if stock else _q(leg.strike),
@@ -448,7 +451,7 @@ def _position_elements(positions: list[Position]) -> list[dict[str, str]]:
             "cusip": "", "isin": "", "figi": "",
             "listingExchange": "NASDAQ" if stock else "CBOE",
             "underlyingConid": "" if stock else _UNDERLYING_CONID[p.underlying],
-            "underlyingSymbol": "" if stock else p.underlying,
+            "underlyingSymbol": sym if stock else p.underlying,
             "underlyingSecurityID": "",
             "underlyingListingExchange": "" if stock else "NASDAQ", "issuer": "",
             "multiplier": _q(mult),
