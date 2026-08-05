@@ -194,15 +194,18 @@ def month_range(conn: sqlite3.Connection) -> list[str]:
 class DayPnl:
     day: str
     trades: int = 0
-    realized_base: float = 0.0
+    #: Realised P&L for the day. IBKR reports it natively per fill and per
+    #: episode with the currency it settled in, so a day whose trades all
+    #: settled in one currency has an exact figure, not only a translation.
+    realized: Money = Money.restated(0.0)
 
     @property
     def is_green(self) -> bool:
-        return self.realized_base > 0
+        return self.realized.base > 0
 
     @property
     def is_red(self) -> bool:
-        return self.realized_base < 0
+        return self.realized.base < 0
 
 
 @dataclass(slots=True)
@@ -213,7 +216,11 @@ class MonthStats:
 
     total_trades: int = 0          #: fills
     orders: int = 0
-    net_pnl_base: float = 0.0      #: realised, already net of commission
+    #: Realised, already net of commission. IBKR reports each episode's P&L in
+    #: the currency it settled in, so the dollars that actually moved are known
+    #: -- `.base` is the translation, `.native` the exact figure where one
+    #: currency accounts for the whole period.
+    net_pnl: Money = Money.restated(0.0)
     #: For options, the commission of round trips *closed in the period* --
     #: the same attribution as the P&L, wins and trade count, because IBKR's
     #: episode P&L is already net of every leg's commission. Summing by fill
@@ -237,8 +244,10 @@ class MonthStats:
     open_episodes: int = 0
     wins: int = 0
     losses: int = 0
-    avg_win_base: float | None = None
-    avg_loss_base: float | None = None
+    #: None -- not zero -- when nothing won or lost: an average of no outcomes
+    #: is undefined, and zero would read as a break-even trade.
+    avg_win: Money | None = None
+    avg_loss: Money | None = None
 
     #: Net premium sitting in *currently open* episodes: positive when short
     #: premium was collected, negative for long debits. Point-in-time like
@@ -286,7 +295,9 @@ class MonthStats:
     def gain_pct_of_net_liq(self) -> float | None:
         if not self.net_liq_base:
             return None
-        return self.net_pnl_base / self.net_liq_base * 100.0
+        # Base over base: NAV arrives from IBKR in base only (the section is
+        # EquitySummaryByReportDateInBase), so the ratio has no native form.
+        return self.net_pnl.base / self.net_liq_base * 100.0
 
     @property
     def options_friction(self) -> Money:
@@ -572,7 +583,7 @@ class Cohort:
     episodes: int = 0
     wins: int = 0
     losses: int = 0
-    net_pnl_base: float = 0.0
+    net_pnl: Money = Money.restated(0.0)
     commission_base: float = 0.0
     contracts: int = 0
 
@@ -582,27 +593,31 @@ class Cohort:
         return None if not decided else self.wins / decided * 100.0
 
     @property
-    def avg_pnl_base(self) -> float | None:
+    def avg_pnl(self) -> Money | None:
         """Mean outcome per round trip, wins and losses together.
 
         The figure that answers "is this cohort worth trading": a high win
         rate with a worse average is a losing strategy, and the two numbers
         only mean something side by side.
         """
-        return None if not self.episodes else self.net_pnl_base / self.episodes
+        return self.net_pnl.per(self.episodes)
 
 
 def _cohort(label: str, episodes: list[Any]) -> Cohort:
     c = Cohort(label=label)
     for e in episodes:
         c.episodes += 1
-        c.net_pnl_base += e.realized_pnl_base
         c.commission_base += abs(e.commission_base)
         c.contracts += e.contracts
         if e.realized_pnl_base > 0:
             c.wins += 1
         elif e.realized_pnl_base < 0:
             c.losses += 1
+    # Built once rather than advanced per episode: a frozen figure cannot have
+    # its amount moved without its currency coming along.
+    c.net_pnl = Money.charged(
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in episodes
+    )
     return c
 
 
@@ -642,8 +657,8 @@ def cohort_data(c: Cohort) -> dict[str, Any]:
         "wins": c.wins,
         "losses": c.losses,
         "win_rate": c.win_rate,
-        "net_pnl_base": c.net_pnl_base,
-        "avg_pnl_base": c.avg_pnl_base,
+        "net_pnl": c.net_pnl.payload(),
+        "avg_pnl": None if c.avg_pnl is None else c.avg_pnl.payload(),
         "commission_base": c.commission_base,
         "contracts": c.contracts,
     }
@@ -678,19 +693,26 @@ def daily_series(
         params.append(asset_category)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
-    buckets: dict[str, DayPnl] = {}
+    # Counts and P&L rows accumulate separately because a `Money` is frozen:
+    # the figure is built once per day, from every row that contributed, rather
+    # than advanced in place with its currency tracked somewhere else.
+    counts: dict[str, int] = {}
+    ledger: dict[str, list[tuple[float | None, float | None, str | None]]] = {}
     for row in conn.execute(
-        f"SELECT trade_date, trade_id, fifo_pnl_realized_base FROM trades {where}", params
+        f"SELECT trade_date, trade_id, fifo_pnl_realized_base, fifo_pnl_realized,"
+        f" currency FROM trades {where}", params
     ):
         day = _day_of(row["trade_date"])
         if day is None or not _in_period(row["trade_date"], period):
             continue
         if not scope.has_trade(row["trade_id"]):
             continue
-        bucket = buckets.setdefault(day, DayPnl(day=day))
-        bucket.trades += 1
+        counts[day] = counts.get(day, 0) + 1
         if not episode_pnl:
-            bucket.realized_base += row["fifo_pnl_realized_base"] or 0.0
+            ledger.setdefault(day, []).append(
+                (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"],
+                 row["currency"])
+            )
 
     if episode_pnl:
         if report is None:
@@ -701,9 +723,14 @@ def daily_series(
                 continue
             if not scope.has_episode(ep):
                 continue
-            bucket = buckets.setdefault(day, DayPnl(day=day))
-            bucket.realized_base += ep.realized_pnl_base
-    return [buckets[k] for k in sorted(buckets)]
+            ledger.setdefault(day, []).append(
+                (ep.realized_pnl_base, ep.realized_pnl, ep.currency)
+            )
+    return [
+        DayPnl(day=day, trades=counts.get(day, 0),
+               realized=Money.charged(ledger.get(day, ())))
+        for day in sorted(set(counts) | set(ledger))
+    ]
 
 
 def _net_liq_for(
@@ -774,9 +801,11 @@ def month_stats(
     #: without its currency, which is the property that keeps the two in step.
     fill_commission_base = 0.0
     native: dict[str, float] = {}
+    fill_pnl: list[tuple[float | None, float | None, str | None]] = []
     for row in conn.execute(
         f"SELECT trade_date, trade_id, ib_order_id, fifo_pnl_realized_base,"
-        f" ib_commission_base, ib_commission, currency FROM trades {where}", params
+        f" fifo_pnl_realized, ib_commission_base, ib_commission, currency"
+        f" FROM trades {where}", params
     ):
         if not _in_period(row["trade_date"], period):
             continue
@@ -790,7 +819,8 @@ def month_stats(
             # sold is realised and "fully closed" is not a crisp event.
             # Commission rides the same basis: on the fill's day, because
             # that is also where the P&L it nets against is attributed.
-            stats.net_pnl_base += row["fifo_pnl_realized_base"] or 0.0
+            fill_pnl.append((row["fifo_pnl_realized_base"],
+                             row["fifo_pnl_realized"], row["currency"]))
             fill_commission_base += row["ib_commission_base"] or 0.0
             if row["ib_commission"]:
                 native[row["currency"]] = (
@@ -799,6 +829,7 @@ def month_stats(
     stats.orders = len(orders)
     if not episode_pnl:
         stats.commissions = Money.gated(fill_commission_base, native)
+        stats.net_pnl = Money.charged(fill_pnl)
 
     # Fees are account-level CashTransaction rows, never trade-linked -- verified
     # against real data, where none of the 65 fee rows carries a conid or tradeID.
@@ -832,7 +863,9 @@ def month_stats(
         # date. An open episode contributes nothing -- including any realised
         # P&L IBKR booked on a *partial* close, and any premium collected on
         # the opening sale. Those count on the day the position goes flat.
-        stats.net_pnl_base = sum(e.realized_pnl_base for e in closed)
+        stats.net_pnl = Money.charged(
+            (e.realized_pnl_base, e.realized_pnl, e.currency) for e in closed
+        )
         # Commission follows the trade, not the fill: the round trip's whole
         # commission -- opening legs included -- lands in the close period,
         # because the net P&L above already contains it. A month that merely
@@ -856,11 +889,17 @@ def month_stats(
         (e.proceeds_base, e.proceeds, e.currency)
         for e in report.open if scope.has_episode(e)
     )
-    wins = [e.realized_pnl_base for e in closed if e.realized_pnl_base > 0]
-    losses = [e.realized_pnl_base for e in closed if e.realized_pnl_base < 0]
+    wins = [e for e in closed if e.realized_pnl_base > 0]
+    losses = [e for e in closed if e.realized_pnl_base < 0]
     stats.wins, stats.losses = len(wins), len(losses)
-    stats.avg_win_base = sum(wins) / len(wins) if wins else None
-    stats.avg_loss_base = sum(losses) / len(losses) if losses else None
+    # `Money.per` divides base and native by the same count, so an average can
+    # never be an exact numerator over a restated one.
+    stats.avg_win = Money.charged(
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in wins
+    ).per(len(wins))
+    stats.avg_loss = Money.charged(
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in losses
+    ).per(len(losses))
     stats.net_liq_base, stats.net_liq_date = _net_liq_for(conn, period)
 
     stats.days = daily_series(conn, period, asset_category, scope, report=report)
@@ -875,7 +914,7 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "asset_category": stats.asset_category,
         "total_trades": stats.total_trades,
         "orders": stats.orders,
-        "net_pnl_base": stats.net_pnl_base,
+        "net_pnl": stats.net_pnl.payload(),
         # A `Money` figure serialises as one nested object rather than three
         # parallel keys. The page reads `.base`, `.native` and `.ccy` off it
         # through a single helper, so a new gated figure costs no new display
@@ -889,8 +928,8 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "wins": stats.wins,
         "losses": stats.losses,
         "win_rate": stats.win_rate,
-        "avg_win_base": stats.avg_win_base,
-        "avg_loss_base": stats.avg_loss_base,
+        "avg_win": None if stats.avg_win is None else stats.avg_win.payload(),
+        "avg_loss": None if stats.avg_loss is None else stats.avg_loss.payload(),
         "open_premium": stats.open_premium.payload(),
         "open_commission": stats.open_commission.payload(),
         "net_liq_base": stats.net_liq_base,
@@ -902,7 +941,7 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "green_days": stats.green_days,
         "red_days": stats.red_days,
         "days": [
-            {"day": d.day, "trades": d.trades, "realized_base": d.realized_base}
+            {"day": d.day, "trades": d.trades, "realized": d.realized.payload()}
             for d in stats.days
         ],
     }

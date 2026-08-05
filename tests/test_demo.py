@@ -141,8 +141,8 @@ def test_has_closed_round_trips_with_wins_and_losses(conn):
     """The real account has none, so these metrics were permanently empty."""
     s = month_stats(conn, period=None)
     assert s.wins and s.losses, "need both sides for Win Rate to mean anything"
-    assert s.avg_win_base is not None and s.avg_loss_base is not None
-    assert s.avg_win_base > 0 > s.avg_loss_base
+    assert s.avg_win is not None and s.avg_loss is not None
+    assert s.avg_win.base > 0 > s.avg_loss.base
     assert 0 < s.win_rate < 100
 
 
@@ -218,8 +218,8 @@ def test_the_years_account_for_everything(conn):
     assert sum(y.closed_episodes for y in years) == everything.closed_episodes
     assert sum(y.wins for y in years) == everything.wins
     assert sum(y.losses for y in years) == everything.losses
-    assert sum(y.net_pnl_base for y in years) == pytest.approx(
-        everything.net_pnl_base, abs=1e-9
+    assert sum(y.net_pnl.base for y in years) == pytest.approx(
+        everything.net_pnl.base, abs=1e-9
     )
     assert sum(y.commissions.base for y in years) == pytest.approx(
         everything.commissions.base, abs=1e-9
@@ -281,8 +281,8 @@ def test_a_year_crossing_round_trip_counts_in_the_year_it_closed(conn):
     )
     # The realised P&L follows the closing fill's own trade date, so the two
     # measures agree about which year the money landed in.
-    assert after["2026"].net_pnl_base == pytest.approx(
-        before["2026"].net_pnl_base + 90.0, abs=1e-9
+    assert after["2026"].net_pnl.base == pytest.approx(
+        before["2026"].net_pnl.base + 90.0, abs=1e-9
     )
     # And the reconciliation still holds with a boundary-crossing episode.
     everything = month_stats(conn, None)
@@ -303,7 +303,7 @@ def test_the_demo_has_exactly_one_odte_round_trip(conn):
     assert odte.episodes == 1
     assert rest.episodes > 1, "a cohort of one needs something to compare against"
     assert odte.win_rate is not None
-    assert odte.avg_pnl_base == pytest.approx(odte.net_pnl_base, abs=1e-9), (
+    assert odte.avg_pnl.base == pytest.approx(odte.net_pnl.base, abs=1e-9), (
         "one round trip, so the average is the total"
     )
 
@@ -359,7 +359,7 @@ def test_scope_narrows_every_trade_derived_figure(conn):
     assert 0 < only.total_trades < everything.total_trades
     assert 0 < only.closed_episodes < everything.closed_episodes
     assert only.orders < everything.orders
-    assert abs(only.net_pnl_base) < abs(everything.net_pnl_base)
+    assert abs(only.net_pnl.base) < abs(everything.net_pnl.base)
     assert abs(only.commissions.base) < abs(everything.commissions.base)
     assert len(only.days) < len(everything.days)
 
@@ -385,8 +385,8 @@ def test_the_default_scope_changes_nothing(conn):
     """ALL_TRADES must be a true no-op, not a filter that happens to pass all."""
     plain = month_stats(conn, None)
     explicit = month_stats(conn, None, scope=ALL_TRADES)
-    assert (plain.total_trades, plain.net_pnl_base, plain.closed_episodes) == (
-        explicit.total_trades, explicit.net_pnl_base, explicit.closed_episodes
+    assert (plain.total_trades, plain.net_pnl.base, plain.closed_episodes) == (
+        explicit.total_trades, explicit.net_pnl.base, explicit.closed_episodes
     )
     assert ALL_TRADES.trade_ids is None, "no id set to build when nothing is filtered"
     assert available_months(conn) == available_months(conn, "OPT", ALL_TRADES)
@@ -410,8 +410,8 @@ def test_the_months_account_for_everything(conn):
     assert len(months) == 14, "the demo spans fourteen months with option fills"
     assert sum(m.total_trades for m in months) == everything.total_trades
     assert sum(m.closed_episodes for m in months) == everything.closed_episodes
-    assert sum(m.net_pnl_base for m in months) == pytest.approx(
-        everything.net_pnl_base, abs=1e-9
+    assert sum(m.net_pnl.base for m in months) == pytest.approx(
+        everything.net_pnl.base, abs=1e-9
     )
 
 
@@ -426,8 +426,8 @@ def test_the_months_under_each_year_sum_to_that_year(conn):
     for year, months in by_year.items():
         assert sum(m.total_trades for m in months) == years[year].total_trades, year
         assert sum(m.closed_episodes for m in months) == years[year].closed_episodes
-        assert sum(m.net_pnl_base for m in months) == pytest.approx(
-            years[year].net_pnl_base, abs=1e-9
+        assert sum(m.net_pnl.base for m in months) == pytest.approx(
+            years[year].net_pnl.base, abs=1e-9
         ), year
 
 
@@ -436,7 +436,7 @@ def test_a_monthly_row_equals_what_the_month_selector_produces(conn):
     for row in monthly_stats(conn):
         picked = month_stats(conn, row.month)
         assert row.total_trades == picked.total_trades, row.month
-        assert row.net_pnl_base == pytest.approx(picked.net_pnl_base, abs=1e-9)
+        assert row.net_pnl.base == pytest.approx(picked.net_pnl.base, abs=1e-9)
         assert row.closed_episodes == picked.closed_episodes
         assert row.win_rate == picked.win_rate
 
@@ -513,18 +513,18 @@ def test_a_partial_close_contributes_nothing_until_the_position_is_flat(conn):
         " WHERE asset_category = 'OPT'"
     ).fetchone()["s"]
     stats = month_stats(conn, None)
-    assert booked > stats.net_pnl_base, (
+    assert booked > stats.net_pnl.base, (
         "precondition: a partial close must have booked per-fill P&L that the"
         " episode rule excludes"
     )
     report = build_history(conn)
-    assert stats.net_pnl_base == pytest.approx(
+    assert stats.net_pnl.base == pytest.approx(
         sum(e.realized_pnl_base for e in report.closed)
     ), "Net P&L must equal the sum of fully closed round trips, nothing else"
 
     partial_month = month_stats(conn, "2026-02")
     assert partial_month.total_trades == 1, "the buyback fill is activity"
-    assert partial_month.net_pnl_base == 0, (
+    assert partial_month.net_pnl.base == 0, (
         "the month holding only the partial close realises nothing"
     )
 
@@ -536,19 +536,19 @@ def test_the_whole_outcome_lands_on_the_day_the_round_trip_closed(conn):
     days = {d.day: d for d in daily_series(conn)}
     # The partial-close day shows the fill and no money.
     partial = days["2026-02-11"]
-    assert partial.trades == 1 and partial.realized_base == 0
+    assert partial.trades == 1 and partial.realized.base == 0
     # The 0DTE round trip opened and closed on 2026-01-16; the whole outcome
     # sits on that day and equals the episode's own figure.
     report = build_history(conn)
     zero_dte = next(e for e in report.closed if e.is_odte)
-    assert days["2026-01-16"].realized_base == pytest.approx(
+    assert days["2026-01-16"].realized.base == pytest.approx(
         zero_dte.realized_pnl_base
     )
     # And nothing realised sits on any day without a close.
     close_days = {_day_of(e.closed_at) for e in report.closed}
     for day, bucket in days.items():
         if day not in close_days:
-            assert bucket.realized_base == 0, day
+            assert bucket.realized.base == 0, day
 
 
 def test_stock_pnl_keeps_ibkrs_per_fill_realisation(conn):
@@ -563,10 +563,10 @@ def test_stock_pnl_keeps_ibkrs_per_fill_realisation(conn):
         " WHERE asset_category = 'STK'"
     ).fetchone()["s"]
     stats = month_stats(conn, None, asset_category="STK")
-    assert stats.net_pnl_base == pytest.approx(booked)
-    assert stats.net_pnl_base > 0, "the scripted stock round trip is a win"
+    assert stats.net_pnl.base == pytest.approx(booked)
+    assert stats.net_pnl.base > 0, "the scripted stock round trip is a win"
     sale_month = month_stats(conn, "2025-09", asset_category="STK")
-    assert sale_month.net_pnl_base == pytest.approx(booked), (
+    assert sale_month.net_pnl.base == pytest.approx(booked), (
         "stock realisation lands in the month the lot was sold"
     )
 
@@ -597,7 +597,7 @@ def test_gain_pct_of_net_liq_uses_the_nav_at_the_periods_end(conn):
     assert everything.net_liq_base is not None
     assert everything.net_liq_date == "2026-02-27", "TO_DATE caps the last row"
     assert everything.gain_pct_of_net_liq == pytest.approx(
-        everything.net_pnl_base / everything.net_liq_base * 100.0
+        everything.net_pnl.base / everything.net_liq_base * 100.0
     )
     # A month period reads its own month-end NAV, not the latest overall.
     october = month_stats(conn, "2025-10")

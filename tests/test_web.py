@@ -392,8 +392,8 @@ def test_stats_panel_keys_present(state):
     """The dashboard's ten stat cards each need a real key."""
     s = state["stats"]
     for key in (
-        "total_trades", "orders", "net_pnl_base", "commissions", "fees_base",
-        "wins", "losses", "win_rate", "avg_win_base", "avg_loss_base",
+        "total_trades", "orders", "net_pnl", "commissions", "fees_base",
+        "wins", "losses", "win_rate", "avg_win", "avg_loss",
         "closed_episodes", "open_episodes", "green_days", "red_days", "days",
         "total_friction_base", "net_liq_base", "gain_pct_of_net_liq",
     ):
@@ -456,7 +456,7 @@ def test_a_fill_free_month_is_an_honest_zero_not_all_time(populated):
     )
     assert st["selected_month"] == chosen, "in-range month must be honoured"
     assert st["stats"]["total_trades"] == 0
-    assert st["stats"]["net_pnl_base"] in (0, 0.0, None)
+    assert st["stats"]["net_pnl"]["base"] in (0, 0.0, None)
 
 
 def test_a_month_outside_the_account_life_still_heals_to_all_time(populated):
@@ -500,7 +500,7 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
     # The open month has the fills but only the outcomes that closed IN it.
     assert opened["total_trades"] > 0, "the opening fills are that month's activity"
     assert opened["closed_episodes"] == len(closed_in(open_month))
-    assert opened["net_pnl_base"] == pytest.approx(
+    assert opened["net_pnl"]["base"] == pytest.approx(
         sum(e.realized_pnl_base for e in closed_in(open_month))
     ), "the spanning episode's outcome must not leak into the month that opened it"
     assert opened["wins"] + opened["losses"] == opened["closed_episodes"]
@@ -514,7 +514,7 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
 
     # The close month carries the outcome, spanning episode included.
     assert closed["closed_episodes"] == len(closed_in(close_month)) >= 1
-    assert closed["net_pnl_base"] == pytest.approx(
+    assert closed["net_pnl"]["base"] == pytest.approx(
         sum(e.realized_pnl_base for e in closed_in(close_month))
     )
     # ... and the round trip's WHOLE commission, opening legs included.
@@ -921,8 +921,8 @@ def test_annual_rows_reconcile_with_the_all_time_row(state):
     years, everything = state["annual"], state["annual_total"]
     assert sum(y["total_trades"] for y in years) == everything["total_trades"]
     assert sum(y["closed_episodes"] for y in years) == everything["closed_episodes"]
-    assert sum(y["net_pnl_base"] for y in years) == pytest.approx(
-        everything["net_pnl_base"], abs=1e-9
+    assert sum(y["net_pnl"]["base"] for y in years) == pytest.approx(
+        everything["net_pnl"]["base"], abs=1e-9
     )
 
 
@@ -1018,8 +1018,8 @@ def test_monthly_is_in_the_payload_and_reconciles_with_annual(state):
     for y in years:
         rows = by_year[y["month"]]
         assert sum(m["total_trades"] for m in rows) == y["total_trades"]
-        assert sum(m["net_pnl_base"] for m in rows) == pytest.approx(
-            y["net_pnl_base"], abs=1e-9
+        assert sum(m["net_pnl"]["base"] for m in rows) == pytest.approx(
+            y["net_pnl"]["base"], abs=1e-9
         )
 
 
@@ -1384,6 +1384,45 @@ def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
         "the open-positions figure bypasses the shared rule"
 
 
+def test_net_pnl_is_shown_as_realised_not_restated(state):
+    """The headline number took the same treatment as commission, and the error
+    it was carrying was far larger.
+
+    IBKR books each episode's realised P&L in the currency it settled in, and
+    stores that native figure alongside the base translation. Restating the base
+    sum into a display currency sends every episode on a round trip -- its own
+    date's rate out, one snapshot rate back -- so the figure drifted by
+    $1.62 on this account's Net P&L, against $0.03 on its commission. The
+    dashboard leads with that number.
+    """
+    pnl = state["stats"]["net_pnl"]
+    assert set(pnl) == {"base", "native", "ccy"}
+    # Every closed option episode on this account settled in USD, so the gate
+    # answers rather than withholding.
+    assert pnl["ccy"] == "USD"
+    assert pnl["native"] is not None
+    # The two readings are close but NOT equal -- if they were, the conversion
+    # would be a no-op and this test would prove nothing.
+    assert pnl["native"] != pytest.approx(pnl["base"])
+
+    # Averages divide both halves by the same count, so an average can never be
+    # an exact numerator over a restated denominator.
+    win = state["stats"]["avg_win"]
+    if win is not None and win["native"] is not None:
+        assert win["ccy"] == pnl["ccy"]
+
+    # Daily rows carry it too, so the calendar and the chart agree with the card.
+    days = [d for d in state["stats"]["days"] if d["realized"]["base"]]
+    assert days, "fixture has no day with realised P&L"
+    for day in days:
+        assert set(day["realized"]) == {"base", "native", "ccy"}
+
+    # And the page shows it through the one rule.
+    js = _code_only(_js()).replace(" ", "").replace("\n", "")
+    assert "moneyOf(s.net_pnl)" in js
+    assert "cash(s.net_pnl" not in js, "a display site bypasses the rule"
+
+
 def test_the_page_has_exactly_one_native_first_rule():
     """`natCash(v, rate)` was a second implementation of native-first display,
     surviving beside `chargeOf` for the Positions tab. Two hops rather than one:
@@ -1419,8 +1458,8 @@ def test_the_calendar_pills_describe_the_month_on_the_grid():
     assert "s.green_days" not in cal and "s.red_days" not in cal, \
         "pills read the period-wide counts again"
     flat = cal.replace(" ", "").replace("\n", "")
-    assert "shown.filter(dy=>dy.realized_base>0).length" in flat
-    assert "shown.filter(dy=>dy.realized_base<0).length" in flat
+    assert "shown.filter(dy=>dy.realized.base>0).length" in flat
+    assert "shown.filter(dy=>dy.realized.base<0).length" in flat
     # The fallback is the newest ACTIVE month, not the newest month of the
     # account's life -- month_range[0] is only the last resort.
     assert "active[active.length-1]" in flat
