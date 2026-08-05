@@ -195,7 +195,8 @@ def ingest_file(
             ),
         )
 
-        _ingest_trades(conn, stmt, path.name, assets, result)
+        _ingest_trades(conn, stmt, path.name, assets, result,
+                       base_currency=_base_currency(sections))
         _ingest_cash(conn, stmt, path.name, result)
 
     _ingest_positions(conn, sections, path.name, assets, result)
@@ -211,7 +212,40 @@ def _base_currency(sections: dict[str, list[dict[str, str]]]) -> str:
     return (rows[0].get("currency") if rows else None) or "EUR"
 
 
-def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult) -> None:
+def _commission_base(
+    commission: float | None,
+    commission_ccy: str | None,
+    instrument_ccy: str | None,
+    rate: float,
+    base_ccy: str | None,
+) -> float | None:
+    """The commission in base currency, converted at a rate that applies to it.
+
+    `fxRateToBase` belongs to the INSTRUMENT's currency, so using it on the
+    commission is right only while the two currencies agree. On this account
+    they disagree on FX conversions: IBKR bills the commission on an EUR.SEK
+    conversion in EUR while the row's currency is SEK, and multiplying a EUR
+    amount by the SEK->EUR rate stored a figure 11x too small.
+
+    Three cases, in order of what the data can actually support:
+
+    * commission already in base -- no conversion applies, rate is 1.
+    * commission in the instrument's currency -- fxRateToBase is its rate.
+    * neither -- the statement carries no rate for that currency, so None is
+      the honest answer. The native amount is stored regardless, and the
+      caller warns; inventing a rate would be worse than admitting the gap.
+    """
+    if commission is None:
+        return None
+    if base_ccy and commission_ccy and commission_ccy == base_ccy:
+        return commission
+    if not commission_ccy or commission_ccy == instrument_ccy:
+        return commission * rate
+    return None
+
+
+def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult,
+                   base_currency: str | None = None) -> None:
     for t in stmt.Trades or ():
         cat = _enum_value(t.assetCategory)
         if not _matches_filter(cat, assets):
@@ -236,11 +270,18 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult) -
         # native figure is still stored correctly either way, and only the base
         # conversion would be suspect.
         commission_ccy = _s(t.ibCommissionCurrency)
+        commission_base = _commission_base(
+            commission, commission_ccy, _s(t.currency), rate, base_currency
+        )
         if commission and commission_ccy and commission_ccy != _s(t.currency):
+            handled = (
+                f"treated as already-base {base_currency}"
+                if commission_ccy == base_currency
+                else "left unconverted: the statement carries no rate for it"
+            )
             result.warnings.append(
                 f"trade {t.tradeID}: commission billed in {commission_ccy} but the"
-                f" instrument trades in {_s(t.currency)}; ib_commission_base used"
-                f" the instrument's fxRateToBase and may be wrong"
+                f" instrument trades in {_s(t.currency)}; {handled}"
             )
 
         cur = conn.execute(
@@ -265,7 +306,7 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult) -
                 _s(t.currency), rate, proceeds,
                 None if proceeds is None else proceeds * rate,
                 commission,
-                None if commission is None else commission * rate,
+                commission_base,
                 commission_ccy,
                 _f(t.taxes), realized,
                 None if realized is None else realized * rate,

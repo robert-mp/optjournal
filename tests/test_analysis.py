@@ -11,6 +11,7 @@ import pytest
 from optjournal.analysis import (
     AUTOFX_MARKUP_BPS,
     WithholdingLine,
+    _commission_to_base,
     analyse,
     categorise_fee,
     format_report,
@@ -331,9 +332,22 @@ def test_taxes_use_the_same_sign_convention():
 
 
 def test_credit_netting_holds_on_the_real_statement(statement):
-    """Signed accumulation must equal the magnitude of the signed sum."""
+    """Signed accumulation must equal the magnitude of the signed sum.
+
+    The oracle applies the commission-currency rule rather than fxRateToBase
+    alone. It is not what this test is about -- credit netting is -- but the two
+    were entangled: the oracle recomputed the conversion, so it silently pinned
+    `commission x fxRateToBase` as correct for every row. On the real statement
+    that is wrong for exactly one, the EUR.SEK conversion IBKR bills in EUR,
+    which made this test fail on a genuine fix by 1.576966 EUR.
+    """
     signed = sum(
-        (t.ibCommission or ZERO) * (t.fxRateToBase or Decimal("1"))
+        _commission_to_base(
+            t.ibCommission, t.fxRateToBase,
+            str(getattr(t, "ibCommissionCurrency", None) or "") or None,
+            str(getattr(t, "currency", None) or "") or None,
+            "EUR",
+        )
         for t in statement.Trades or ()
     )
     assert analyse(statement).total_commission_base == -signed
@@ -450,3 +464,34 @@ def test_native_commission_is_exact_where_the_restatement_was_not(tmp_path):
     # And it is a genuinely different number from the base figure, which is
     # what makes the display distinction worth drawing.
     assert st["commissions_native"] != st["commissions_base"]
+
+
+def test_cost_analysis_converts_commission_at_a_rate_that_applies_to_it():
+    """The cost report recomputes from the statement rather than reading the
+    stored column, so repairing the database could not reach it -- the same
+    defect existed in two places and only one had been fixed.
+
+    `fxRateToBase` is the INSTRUMENT's rate. IBKR bills the commission on an FX
+    conversion in the BASE currency while the row's currency is the pair's quote,
+    so converting it understated that cost by a factor of the rate.
+    """
+    from decimal import Decimal
+
+    # The real shape: an EUR.SEK conversion, commission billed in EUR.
+    assert _commission_to_base(
+        Decimal("-1.73464"), Decimal("0.090897"), "EUR", "SEK", "EUR"
+    ) == Decimal("-1.73464"), "a base-currency commission must not be converted"
+    # Agreeing currencies keep the instrument's rate -- every other row.
+    assert _commission_to_base(
+        Decimal("-2"), Decimal("0.86892"), "USD", "USD", "EUR"
+    ) == Decimal("-2") * Decimal("0.86892")
+    # An absent commission currency is old data: fall through, do not raise.
+    assert _commission_to_base(
+        Decimal("-2"), Decimal("0.86892"), None, "USD", "EUR"
+    ) == Decimal("-2") * Decimal("0.86892")
+    # A third currency has no rate in the statement. Left unconverted rather
+    # than dropped: omitting a charge from a cost report is the worse failure.
+    assert _commission_to_base(
+        Decimal("-1.5"), Decimal("0.090897"), "GBP", "SEK", "EUR"
+    ) == Decimal("-1.5")
+    assert _commission_to_base(None, Decimal("1"), "EUR", "EUR", "EUR") == ZERO

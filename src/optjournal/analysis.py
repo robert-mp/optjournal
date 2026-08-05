@@ -116,6 +116,34 @@ def _to_base(amount: Decimal | None, rate: Decimal | None) -> Decimal:
     return amount * (rate if rate is not None else Decimal("1"))
 
 
+def _commission_to_base(
+    amount: Decimal | None, rate: Decimal | None,
+    commission_ccy: str | None, instrument_ccy: str | None, base_ccy: str,
+) -> Decimal:
+    """Commission into base, at a rate that actually applies to IT.
+
+    `fxRateToBase` is the INSTRUMENT's rate, and `_to_base` is right for every
+    amount denominated in the instrument's currency -- proceeds, taxes, notional.
+    Commission is the exception: IBKR bills the commission on an FX conversion in
+    the BASE currency while the row's currency is the pair's quote, so converting
+    it here multiplied a EUR amount by a SEK->EUR rate and reported a cost 11x
+    too small. Mirrors ingest._commission_base, which fixes the stored column;
+    this path recomputes from the statement and so needs the same rule.
+
+    A commission in some third currency has no rate in the statement. It is left
+    unconverted rather than dropped: a cost report that silently omits a charge
+    is worse than one that states it at an unconverted magnitude, and the ingest
+    warning names the row either way.
+    """
+    if amount is None:
+        return ZERO
+    if commission_ccy and commission_ccy == base_ccy:
+        return amount
+    if not commission_ccy or commission_ccy == instrument_ccy:
+        return _to_base(amount, rate)
+    return amount
+
+
 @dataclass(slots=True)
 class FxPair:
     symbol: str
@@ -397,7 +425,16 @@ def analyse(
         # Signed, not abs(): a fill can carry a commission *credit* when IBKR
         # adjusts a per-order minimum across a split order, and abs() would
         # book that credit as a further charge.
-        commission = _to_base(t.ibCommission, rate)
+        commission = _commission_to_base(
+            t.ibCommission, rate,
+            # getattr, like assetCategory above: a statement object need not
+            # carry every field, and a fake trade in a test that has nothing to
+            # say about commission currency should fall through to the
+            # instrument's rate rather than raise.
+            str(getattr(t, "ibCommissionCurrency", None) or "") or None,
+            str(getattr(t, "currency", None) or "") or None,
+            base_currency,
+        )
         g.commission_signed += commission
         g.taxes_signed += _to_base(t.taxes, rate)
         if commission > ZERO:

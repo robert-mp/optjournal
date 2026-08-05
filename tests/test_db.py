@@ -522,3 +522,81 @@ def test_the_backfill_runs_on_open_without_a_version_bump(tmp_path):
         assert c.execute(
             "SELECT COUNT(*) FROM trades WHERE ib_commission_currency IS NOT NULL"
         ).fetchone()[0] > 0, "opening the journal did not heal it"
+
+
+def test_commission_base_uses_a_rate_that_applies_to_the_commission():
+    """`fxRateToBase` is the INSTRUMENT's rate, so applying it to the commission
+    is right only while the two currencies agree.
+
+    On an EUR.SEK conversion IBKR bills the commission in EUR while the row's
+    currency is SEK -- multiplying a EUR amount by the SEK->EUR rate stored a
+    figure 11x too small. A commission in a currency the statement carries no
+    rate for yields None rather than a guess.
+    """
+    from optjournal.ingest import _commission_base
+
+    # Agreeing currencies: unchanged behaviour, the instrument's rate applies.
+    assert _commission_base(-2.0, "USD", "USD", 0.868920, "EUR") == -2.0 * 0.868920
+    # Absent commission currency: same, because that is all the old data says.
+    assert _commission_base(-2.0, None, "USD", 0.868920, "EUR") == -2.0 * 0.868920
+    # Already base: no conversion applies at all. The real defect.
+    assert _commission_base(-1.73464, "EUR", "SEK", 0.090897, "EUR") == -1.73464
+    # A third currency: no rate exists anywhere in the statement.
+    assert _commission_base(-1.5, "GBP", "SEK", 0.090897, "EUR") is None
+    # Nothing to convert.
+    assert _commission_base(None, "USD", "USD", 1.0, "EUR") is None
+
+
+def test_a_wrongly_converted_commission_is_repaired_on_open(tmp_path):
+    """Derived data, provably wrong and recomputable, so it heals by opening --
+    no command to remember. Only rows the data can DEFINITIVELY correct are
+    touched: a commission billed in base needs no conversion, so its base value
+    is its native value. A third currency has no rate and is left alone.
+    """
+    from optjournal.db import _repair_base_commission, connect, migrate, open_journal
+    from optjournal.demo import write_demo_statement
+    from optjournal.ingest import ingest_file
+
+    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    conn = connect(tmp_path / "demo.db")
+    migrate(conn)
+    ingest_file(conn, statement)
+    base = conn.execute("SELECT base_currency FROM statements").fetchone()[0]
+
+    # Recreate the defect: a row billed in base, but converted as if it were in
+    # the instrument's currency.
+    victim = conn.execute(
+        "SELECT trade_id, ib_commission FROM trades"
+        " WHERE ib_commission <> 0 AND currency <> ?", (base,)
+    ).fetchone()
+    if victim is None:  # demo holds no non-base commissioned row
+        return
+    conn.execute(
+        "UPDATE trades SET ib_commission_currency = ?,"
+        " ib_commission_base = ib_commission * 0.09 WHERE trade_id = ?",
+        (base, victim["trade_id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    with open_journal(tmp_path / "demo.db") as c:
+        row = c.execute(
+            "SELECT ib_commission, ib_commission_base FROM trades WHERE trade_id = ?",
+            (victim["trade_id"],),
+        ).fetchone()
+        assert row["ib_commission_base"] == row["ib_commission"], \
+            "opening the journal did not repair the mis-converted row"
+        # Idempotent: nothing left to repair.
+        assert _repair_base_commission(c) == 0
+
+    # A third currency is NOT touched -- there is no rate to correct it with.
+    conn = connect(tmp_path / "demo.db")
+    conn.execute(
+        "UPDATE trades SET ib_commission_currency = 'GBP',"
+        " ib_commission_base = -99.0 WHERE trade_id = ?", (victim["trade_id"],))
+    conn.commit()
+    assert _repair_base_commission(conn) == 0, "guessed at a currency with no rate"
+    assert conn.execute(
+        "SELECT ib_commission_base FROM trades WHERE trade_id = ?",
+        (victim["trade_id"],)).fetchone()[0] == -99.0
+    conn.close()

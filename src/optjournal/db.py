@@ -337,6 +337,41 @@ def _backfill_commission_currency(conn: sqlite3.Connection) -> int:
     return filled
 
 
+def _repair_base_commission(conn: sqlite3.Connection) -> int:
+    """Recompute ib_commission_base where it was converted at the wrong rate.
+
+    `fxRateToBase` belongs to the INSTRUMENT's currency, and the original ingest
+    applied it to the commission unconditionally. That is right whenever the two
+    currencies agree -- which is every row on this account except FX conversions,
+    where IBKR bills the commission in the BASE currency while the row's currency
+    is the pair's quote. A EUR amount times a SEK->EUR rate stored a figure 11x
+    too small.
+
+    Only rows the data can definitively correct are touched: commission billed in
+    the base currency needs no conversion at all, so the base value IS the native
+    value. A commission in some third currency has no rate anywhere in the
+    statement and is deliberately left alone rather than guessed at.
+
+    Self-terminating for the same reason as the backfill: after one pass no row
+    matches the WHERE, so this costs one count per open. Returns rows repaired.
+    """
+    rows = conn.execute(
+        "SELECT t.trade_id, t.ib_commission, s.base_currency"
+        " FROM trades t JOIN statements s ON s.source_file = t.source_file"
+        " WHERE t.ib_commission IS NOT NULL AND t.ib_commission <> 0"
+        "   AND t.ib_commission_currency IS NOT NULL"
+        "   AND t.ib_commission_currency <> t.currency"
+        "   AND t.ib_commission_currency = s.base_currency"
+        "   AND t.ib_commission_base IS NOT t.ib_commission"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE trades SET ib_commission_base = ib_commission WHERE trade_id = ?",
+            (row["trade_id"],),
+        )
+    return len(rows)
+
+
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply the schema. Returns the resulting schema version."""
     for view in _VIEWS:
@@ -353,6 +388,10 @@ def migrate(conn: sqlite3.Connection) -> int:
     # after the bump, so for a journal merely OPENED since then a one-shot hook
     # would silently never fire. The backfill guards itself instead.
     _backfill_commission_currency(conn)
+    # After the backfill, which is what makes the mismatch detectable: the
+    # repair's WHERE compares ib_commission_currency, so on a journal that has
+    # not been backfilled yet there is nothing for it to find.
+    _repair_base_commission(conn)
     row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
     current = row["v"] if row and row["v"] is not None else 0
     if current < SCHEMA_VERSION:
