@@ -1446,6 +1446,57 @@ def test_net_pnl_is_shown_as_realised_not_restated(state):
     assert "cash(s.net_pnl" not in js, "a display site bypasses the rule"
 
 
+def test_journal_taxes_is_a_money_and_the_gate_reaches_it():
+    """The last cash figure that shipped as a bare `_base` float.
+
+    `journal_taxes_base` had a scoped base total and no path to the as-charged
+    amount, because the journal-scoped tax ledger existed only inlined inside
+    `journal_friction_native_by_ccy` -- aggregated, but not reachable.
+
+    Both branches are exercised here rather than on the live payload, because
+    neither journal has a single taxed trade: `journal_taxes_base` is 0.0 on
+    both, so real data cannot distinguish a working gate from one that never
+    runs.
+    """
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from optjournal.analysis import analyse
+    from optjournal.serialize import costs_data
+
+    def fill(taxes, ccy, rate="1"):
+        return SimpleNamespace(
+            assetCategory=SimpleNamespace(value="OPT"), symbol="TSLA",
+            currency=ccy, ibCommissionCurrency=ccy,
+            proceeds=Decimal("-1000"), ibCommission=Decimal("-1.00"),
+            taxes=Decimal(taxes), fxRateToBase=Decimal(rate),
+            quantity=Decimal("1"), notes=[],
+        )
+
+    def totals(trades):
+        stmt = SimpleNamespace(fromDate="20250801", toDate="20260731",
+                              Trades=trades, CashTransactions=[])
+        return costs_data(analyse(stmt))["totals"]
+
+    uniform = totals([fill("-0.25", "USD"), fill("-0.75", "USD")])
+    assert set(uniform["journal_taxes"]) == {"base", "native", "ccy"}
+    assert uniform["journal_taxes"] == {"base": 1.0, "native": 1.0, "ccy": "USD"}
+    assert "journal_taxes_base" not in uniform, "the flat key outlived its Money"
+
+    # A second currency must withhold the native while keeping the base whole:
+    # an exact-looking figure covering part of a total is the failure the gate
+    # exists to prevent.
+    mixed = totals([fill("-0.25", "USD"), fill("-3.00", "SEK", rate="0.09")])
+    assert mixed["journal_taxes"]["native"] is None
+    assert mixed["journal_taxes"]["ccy"] is None
+    assert mixed["journal_taxes"]["base"] == pytest.approx(0.25 + 3.00 * 0.09)
+
+    # And the page reads it through the one rule, not a second `cash()` call.
+    js = _code_only(_js()).replace(" ", "").replace("\n", "")
+    assert "moneyOf(T.journal_taxes)" in js
+    assert "cash(T.journal_taxes" not in js, "a display site bypasses the rule"
+
+
 def test_the_page_has_exactly_one_native_first_rule():
     """`natCash(v, rate)` was a second implementation of native-first display,
     surviving beside `chargeOf` for the Positions tab. Two hops rather than one:

@@ -318,11 +318,8 @@ class CostReport:
         report presents cost as positive, and a breakdown that disagreed with
         the total it decomposes would be worse than no breakdown.
         """
-        out: dict[str, Decimal] = {}
-        for g in self.journal_commissions:
-            for ccy, amount in g.native_by_ccy.items():
-                out[ccy] = out.get(ccy, ZERO) - amount
-        return out
+        return self._merge(*(g.native_by_ccy for g in self.journal_commissions),
+                           negate=True)
 
     @staticmethod
     def _merge(*ledgers: dict[str, Decimal], negate: bool = False) -> dict[str, Decimal]:
@@ -383,18 +380,37 @@ class CostReport:
                            self.total_fees_native_by_ccy)
 
     @property
+    def journal_taxes_native_by_ccy(self) -> dict[str, Decimal]:
+        """Journal taxes as charged, per billing currency.
+
+        The taxes counterpart to `journal_native_by_ccy`, and named rather than
+        inlined so a caller can ask for taxes alone. It existed only inside
+        `journal_friction_native_by_ccy` before, which meant journal taxes had a
+        base figure and no way to reach the as-charged one -- the last cash
+        figure in the payload still shipping as a bare float.
+
+        IBKR reports a trade's tax in the instrument's currency, not the
+        commission's: `ibCommissionCurrency` labels the commission only, so a
+        row can be billed commission in EUR and tax in SEK. Keeping the two
+        ledgers separate is what lets that be represented instead of averaged.
+        """
+        return self._merge(*(g.taxes_native_by_ccy for g in self.journal_commissions),
+                           negate=True)
+
+    @property
     def journal_friction_native_by_ccy(self) -> dict[str, Decimal]:
         """Friction as charged, per currency: commission plus taxes.
 
         Merged rather than gated separately, so a scope whose commission is USD
         and whose taxes are SEK produces two entries and is correctly refused a
         single exact figure.
+
+        Composed from the two named ledgers rather than re-walking the groups,
+        so "journal friction is commission plus taxes" is one statement in one
+        place. Neither is negated again -- both are already magnitudes.
         """
-        out = dict(self.journal_native_by_ccy)
-        for g in self.journal_commissions:
-            for ccy, amount in g.taxes_native_by_ccy.items():
-                out[ccy] = out.get(ccy, ZERO) - amount
-        return out
+        return self._merge(self.journal_native_by_ccy,
+                           self.journal_taxes_native_by_ccy)
 
     @property
     def journal_taxes_base(self) -> Decimal:

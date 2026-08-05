@@ -591,6 +591,104 @@ def test_the_account_level_gate_withholds_on_a_mixed_scope_but_is_applied():
     assert (withheld.native, withheld.currency) == (None, None)
 
 
+def _taxed(asset, commission="-1.00", taxes="-0.25", ccy="USD", billed=None,
+           rate="1", qty="1"):
+    """A fill that carries currencies, which `_fill` deliberately does not.
+
+    Two currency fields, because IBKR sends two and they are independent:
+    `ibCommissionCurrency` labels the commission ONLY, while a tax has no
+    currency field of its own and so takes the instrument's. A row can be
+    billed commission in EUR and tax in SEK -- that is the case the separate
+    ledgers exist to represent, and it cannot be built without both fields.
+    """
+    return SimpleNamespace(
+        assetCategory=SimpleNamespace(value=asset),
+        symbol="TSLA",
+        currency=ccy,
+        ibCommissionCurrency=billed or ccy,
+        proceeds=Decimal("-1000"),
+        ibCommission=Decimal(commission),
+        taxes=Decimal(taxes),
+        fxRateToBase=Decimal(rate),
+        quantity=Decimal(qty),
+        notes=[],
+    )
+
+
+def test_journal_taxes_ledger_is_scoped_to_the_journal_asset():
+    """Taxes on other asset categories must not reach the journal figure.
+
+    The point of the ledger: `journal_taxes_base` was already scoped, but the
+    as-charged breakdown existed only inside `journal_friction_native_by_ccy`,
+    so journal taxes had a base figure and no way to reach the exact one.
+    """
+    r = analyse(_stmt([
+        _taxed("OPT", taxes="-0.25", ccy="USD"),
+        _taxed("STK", taxes="-9.99", ccy="SEK"),
+    ]))
+    assert r.journal_taxes_native_by_ccy == {"USD": Decimal("0.25")}
+    assert r.other_taxes_native_by_ccy == {"SEK": Decimal("9.99")}
+
+
+def test_journal_taxes_ledger_uses_the_report_sign_convention():
+    """Charges arrive negative; the report presents cost as positive.
+
+    A breakdown that did not flip would disagree in sign with the total it
+    decomposes, which is worse than no breakdown.
+    """
+    r = analyse(_stmt([_taxed("OPT", taxes="-0.25", ccy="USD")]))
+    assert r.journal_taxes_native_by_ccy == {"USD": Decimal("0.25")}
+    assert r.journal_taxes_base > 0
+
+
+def test_journal_taxes_across_currencies_produces_two_entries():
+    """Two currencies must survive as two entries for the gate to withhold.
+
+    Collapsing them here -- summing 0.25 USD and 3.00 SEK into 3.25 of nothing
+    -- would hand the gate a single-currency-looking ledger and produce an
+    exact figure covering part of a total.
+    """
+    r = analyse(_stmt([
+        _taxed("OPT", taxes="-0.25", ccy="USD"),
+        _taxed("OPT", taxes="-3.00", ccy="SEK", rate="0.09"),
+    ]))
+    assert r.journal_taxes_native_by_ccy == {
+        "USD": Decimal("0.25"), "SEK": Decimal("3.00")}
+
+
+def test_journal_friction_merges_commission_and_taxes_ledgers():
+    """Friction composes the two named ledgers, and says so in one place.
+
+    It used to re-walk the groups with an inlined tax loop, which meant
+    "friction is commission plus taxes" was stated twice -- once in the base
+    property and once, differently, in the ledger.
+    """
+    r = analyse(_stmt([_taxed("OPT", commission="-1.00", taxes="-0.25", ccy="USD")]))
+    assert r.journal_native_by_ccy == {"USD": Decimal("1.00")}
+    assert r.journal_taxes_native_by_ccy == {"USD": Decimal("0.25")}
+    assert r.journal_friction_native_by_ccy == {"USD": Decimal("1.25")}
+    assert r.journal_friction_base == r.journal_commission_base + r.journal_taxes_base
+
+
+def test_friction_keeps_commission_and_taxes_apart_when_billed_differently():
+    """Commission in EUR and tax in SEK on ONE fill must stay two entries.
+
+    Not hypothetical: this account holds an EUR.SEK conversion billed
+    commission in EUR while the instrument is SEK. `ibCommissionCurrency`
+    labels the commission only, so a merged single-ledger implementation would
+    have attributed the tax to the commission's currency and produced an exact
+    figure for a scope that has none.
+    """
+    r = analyse(_stmt([
+        _taxed("OPT", commission="-1.00", taxes="-3.00", ccy="SEK", billed="EUR",
+               rate="0.09"),
+    ]))
+    assert r.journal_native_by_ccy == {"EUR": Decimal("1.00")}
+    assert r.journal_taxes_native_by_ccy == {"SEK": Decimal("3.00")}
+    assert r.journal_friction_native_by_ccy == {
+        "EUR": Decimal("1.00"), "SEK": Decimal("3.00")}
+
+
 def test_analysis_stays_a_leaf_module():
     """analysis.py must import nothing from optjournal.
 

@@ -323,7 +323,9 @@ def costs_data(report: CostReport) -> Row:
             # keys -- presenting the account figure as the journal's was the
             # defect this split exists to remove.
             "journal_commission": _journal_commission(report).payload(),
-            "journal_taxes_base": _num(report.journal_taxes_base),
+            "journal_taxes": _money(
+                report.journal_taxes_base,
+                report.journal_taxes_native_by_ccy).payload(),
             "journal_friction": _money(
                 report.journal_friction_base,
                 report.journal_friction_native_by_ccy).payload(),

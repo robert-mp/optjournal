@@ -246,10 +246,26 @@ of work creates one:
 | `notional_base` | a cross-pair notional, so no single currency |
 | `per_base` | an FX **rate**, not an amount |
 | `win_rate`, `gain_pct_of_net_liq` | unitless |
-| `journal_taxes_base` | convertible, but needs a journal-scoped merge in `analysis.py` first — the per-group `taxes_native_by_ccy` exists and nothing aggregates it |
 
 Everything else is `Money`. When adding a figure, the question is not "should
 this be Money" but "which constructor names where it came from".
+
+`journal_taxes` was the last holdout, and its obstacle was shaped like a
+warning: the journal-scoped tax ledger *did* exist, but only inlined inside
+`journal_friction_native_by_ccy`. Aggregated, and unreachable — so journal taxes
+had a base total and no path to the as-charged figure. Extracting it as
+`journal_taxes_native_by_ccy` both exposed the figure and let friction compose
+two named ledgers instead of restating "commission plus taxes" a second time,
+differently.
+
+Neither journal holds a single taxed trade (`journal_taxes_base` is `0.0` on
+both, and no row in the database carries non-zero `taxes`), so real data cannot
+tell a working gate from one that never runs. Both branches are therefore
+exercised against hand-built statements in `test_analysis.py` and
+`test_web.py` — which is what `analysis.py` being a leaf buys. The demo is
+deliberately **not** given a fake tax: IBKR levies none on US options, and a
+fixture that emits what the broker would not is how the `underlyingSymbol` bug
+stayed hidden.
 
 ### One entry point in the page
 

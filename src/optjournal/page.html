@@ -468,7 +468,7 @@ td.n,th.n{text-align:right}
  * @property {number} fx_notional_base
  * @property {Money} fx_commission
  * @property {Money} journal_commission
- * @property {number} journal_taxes_base
+ * @property {Money} journal_taxes
  * @property {Money} journal_friction -- commission + taxes
  * @property {Money|null} journal_per_unit -- per contract; null without quantity.
  *   Both halves share a divisor, so an as-charged numerator never sits over a
@@ -1307,7 +1307,8 @@ function costs(){
      the tab exists to answer what trading actually cost. */
   const jrows=[[scope+' commission', moneyOf(T.journal_commission),
     isNative(T.journal_commission)?'as charged':'stated']];
-  if(T.journal_taxes_base) jrows.push([scope+' taxes',cash(T.journal_taxes_base),'stated']);
+  if(T.journal_taxes.base) jrows.push([scope+' taxes',moneyOf(T.journal_taxes),
+    isNative(T.journal_taxes)?'as charged':'stated']);
   /* Per contract, not a repeat of the total. With commission as the only
      component, a "journal friction" card would restate the figure beside
      itself; the per-unit rate is the one that predicts cost at volume. */
