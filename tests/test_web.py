@@ -392,7 +392,7 @@ def test_stats_panel_keys_present(state):
     """The dashboard's ten stat cards each need a real key."""
     s = state["stats"]
     for key in (
-        "total_trades", "orders", "net_pnl", "commissions", "fees_base",
+        "total_trades", "orders", "net_pnl", "commissions", "fees",
         "wins", "losses", "win_rate", "avg_win", "avg_loss",
         "closed_episodes", "open_episodes", "green_days", "red_days", "days",
         "total_friction_base", "net_liq_base", "gain_pct_of_net_liq",
@@ -731,7 +731,7 @@ def test_dashboard_friction_is_split_by_scope(state):
     """
     s = state["stats"]
     assert s["options_friction"]["base"] == abs(s["commissions"]["base"])
-    assert s["account_friction_base"] == abs(s["fees_base"])
+    assert s["account_friction_base"] == abs(s["fees"]["base"])
     # The split reapportions; it must not change or drop anything.
     assert (
         s["options_friction"]["base"] + s["account_friction_base"]

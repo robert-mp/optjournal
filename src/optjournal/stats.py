@@ -237,7 +237,12 @@ class MonthStats:
     #: `.native` is that exact figure, present only where one currency
     #: accounts for all of it; see `Money`.
     commissions: Money = Money.restated(0.0)
-    fees_base: float = 0.0
+    #: Account-level fee rows. IBKR bills each in a currency and stores it
+    #: alongside the base translation, so this takes the same treatment as
+    #: commission -- and had to, because the cost report already presented
+    #: `fees` as a Money while this panel showed a base-only float for the
+    #: same charges.
+    fees: Money = Money.restated(0.0)
 
     #: Episode-derived, so a two-fill close counts once.
     closed_episodes: int = 0
@@ -333,7 +338,7 @@ class MonthStats:
         report reads the raw statement and includes it. Do not present the two
         under the same label -- they differ by the whole of stock commission.
         """
-        return abs(self.fees_base)
+        return abs(self.fees.base)
 
     @property
     def total_friction_base(self) -> float:
@@ -836,13 +841,15 @@ def month_stats(
     # Deliberately NOT scoped: there is nothing to filter them on, and pro-rating
     # them into a fill subset would be inventing an attribution. Under an active
     # scope they stay the account's figure, which is what the pill already says.
+    fee_rows: list[tuple[float | None, float | None, str | None]] = []
     for row in conn.execute(
-        "SELECT date_time, amount_base, type FROM cash_transactions"
+        "SELECT date_time, amount_base, amount, currency, type FROM cash_transactions"
         " WHERE UPPER(type) LIKE '%FEES%'"
     ):
         if not _in_period(row["date_time"], period):
             continue
-        stats.fees_base += row["amount_base"] or 0.0
+        fee_rows.append((row["amount_base"], row["amount"], row["currency"]))
+    stats.fees = Money.charged(fee_rows)
 
     if report is None:
         report = build_history(
@@ -922,7 +929,7 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         # the friction rollups -- are the ones for which no as-charged amount
         # can exist, and the shape says so.
         "commissions": stats.commissions.payload(),
-        "fees_base": stats.fees_base,
+        "fees": stats.fees.payload(),
         "closed_episodes": stats.closed_episodes,
         "open_episodes": stats.open_episodes,
         "wins": stats.wins,
