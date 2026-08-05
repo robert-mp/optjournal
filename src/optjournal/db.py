@@ -32,6 +32,7 @@ Design notes, and the reasoning behind the non-obvious choices:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -296,6 +297,46 @@ _VIEWS = ("trade_legs", "trade_orders", "option_legs", "option_orders",
           "current_option_positions")
 
 
+def _backfill_commission_currency(conn: sqlite3.Connection) -> int:
+    """Fill ib_commission_currency from each row's own stored `raw` payload.
+
+    The column arrived after these rows were written, so a journal that has been
+    ingesting for months holds the value in `raw` and NULL in the column. No
+    broker request is needed to recover it: `raw` is the statement's own trade
+    object, ibCommissionCurrency included.
+
+    Not gated on schema_version. The version is stamped the first time migrate()
+    runs after the bump, which for any journal that has merely been OPENED since
+    then is already in the past -- a one-shot hook would silently never fire.
+    Instead the work defines its own guard: rows that still need it, and whose
+    `raw` can actually supply it. After one pass that set is empty and this costs
+    a single indexless count on a table of a few hundred rows; it can never loop.
+
+    Returns the number of rows filled, so a caller can log or test it.
+    """
+    pending = conn.execute(
+        "SELECT trade_id, raw FROM trades"
+        " WHERE ib_commission_currency IS NULL"
+        "   AND ib_commission IS NOT NULL AND ib_commission <> 0"
+        "   AND raw LIKE '%ibCommissionCurrency%'"
+    ).fetchall()
+    filled = 0
+    for row in pending:
+        try:
+            payload = json.loads(row["raw"])
+        except (TypeError, ValueError):
+            continue  # a raw we cannot parse is not a reason to fail an open
+        ccy = payload.get("ibCommissionCurrency")
+        if not ccy:
+            continue
+        conn.execute(
+            "UPDATE trades SET ib_commission_currency = ? WHERE trade_id = ?",
+            (str(ccy), row["trade_id"]),
+        )
+        filled += 1
+    return filled
+
+
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply the schema. Returns the resulting schema version."""
     for view in _VIEWS:
@@ -307,6 +348,11 @@ def migrate(conn: sqlite3.Connection) -> int:
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    # After the ALTER, so the column exists to be written into. Here rather than
+    # behind the version bump: the stamp is written the first time migrate() runs
+    # after the bump, so for a journal merely OPENED since then a one-shot hook
+    # would silently never fire. The backfill guards itself instead.
+    _backfill_commission_currency(conn)
     row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
     current = row["v"] if row and row["v"] is not None else 0
     if current < SCHEMA_VERSION:

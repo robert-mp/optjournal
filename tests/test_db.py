@@ -455,3 +455,70 @@ def test_a_commission_billed_in_another_currency_warns_without_aborting(tmp_path
         f"no warning raised; got {result.warnings}"
     assert result.trades_inserted, "the ingest aborted instead of warning"
     conn.close()
+
+
+def test_commission_currency_backfills_from_the_stored_raw(tmp_path):
+    """A journal that ingested before the column existed holds the value in
+    `raw` and NULL in the column, and no broker request is needed to recover it.
+
+    Deliberately not gated on schema_version: that stamp is written the first
+    time migrate() runs after the bump, so for any journal merely OPENED since
+    then a one-shot hook would silently never fire -- which is exactly the state
+    the real journal was in. The work guards itself instead.
+    """
+    from optjournal.db import _backfill_commission_currency, connect, migrate
+    from optjournal.demo import write_demo_statement
+    from optjournal.ingest import ingest_file
+
+    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    conn = connect(tmp_path / "demo.db")
+    migrate(conn)
+    ingest_file(conn, statement)
+
+    # Simulate the pre-column journal: the value survives only in `raw`.
+    conn.execute("UPDATE trades SET ib_commission_currency = NULL")
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE ib_commission_currency IS NOT NULL"
+    ).fetchone()[0] == 0
+
+    filled = _backfill_commission_currency(conn)
+    assert filled > 0, "nothing was recovered from raw"
+    rows = conn.execute(
+        "SELECT currency, ib_commission_currency FROM trades"
+        " WHERE ib_commission IS NOT NULL AND ib_commission <> 0"
+    ).fetchall()
+    assert all(r["ib_commission_currency"] for r in rows), "rows still NULL"
+    for r in rows:
+        assert r["ib_commission_currency"] == r["currency"]
+
+    # Self-terminating: the set it operates on is empty once it has run, so a
+    # second pass does no work and cannot loop on rows raw cannot supply.
+    assert _backfill_commission_currency(conn) == 0
+    conn.close()
+
+
+def test_the_backfill_runs_on_open_without_a_version_bump(tmp_path):
+    """migrate() performs it, so an existing journal heals by being opened --
+    no command to remember, and no dependence on a version transition that has
+    already happened.
+    """
+    from optjournal.db import connect, migrate, open_journal
+    from optjournal.demo import write_demo_statement
+    from optjournal.ingest import ingest_file
+
+    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    conn = connect(tmp_path / "demo.db")
+    migrate(conn)
+    ingest_file(conn, statement)
+    conn.execute("UPDATE trades SET ib_commission_currency = NULL")
+    conn.commit()
+    version_before = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+    conn.close()
+
+    with open_journal(tmp_path / "demo.db") as c:
+        assert c.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] \
+            == version_before, "the test relies on the version already being current"
+        assert c.execute(
+            "SELECT COUNT(*) FROM trades WHERE ib_commission_currency IS NOT NULL"
+        ).fetchone()[0] > 0, "opening the journal did not heal it"
