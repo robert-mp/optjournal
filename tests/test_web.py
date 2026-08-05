@@ -1711,3 +1711,41 @@ def test_an_event_without_a_timestamp_is_dropped():
         _event("Short put", _leg(270, "P", "SELL", "O", -3, 5.24), at=None),
     ]}
     assert web._annotations(lifecycle, []) == []
+
+
+def test_a_stat_cards_note_is_a_tooltip_not_a_visible_line():
+    """The dashboard carried nine stat cards each with a grey line under the
+    figure, and the same six words ("closed round trips") appeared on five of
+    them. Moving the note to a tooltip is what makes the row readable; the
+    dotted-underline hint is what stops it becoming information the page holds
+    and never offers.
+    """
+    card = _fn("statCard").replace(" ", "").replace("\n", "")
+    assert 'title="${esc(note)}"' in card, "the note no longer reaches a tooltip"
+    assert "class=\"k${note?'hint':''}\"" in card, (
+        "no hint class, so a card with a tooltip looks identical to one without"
+    )
+    assert '<divclass="n">' not in card, (
+        "the note is rendered as a visible line again -- that is the clutter "
+        "this removed, and it now duplicates the tooltip"
+    )
+
+
+def test_commission_is_tinted_as_a_cost():
+    """It is displayed as a magnitude, so there is no sign to colour by -- and
+    an untinted figure among green ones reads as unfinished rather than neutral.
+    Commission is never a gain, so the tint is unconditional.
+    """
+    dash = _fn("dashboard").replace(" ", "").replace("\n", "")
+    assert "'smneg'" in dash, "the Commissions card lost its cost tint"
+
+
+def test_the_open_pill_counts_positions_not_contracts():
+    """A strangle is one position holding two contracts. Reading open_episodes
+    here made the Dashboard say 5 while the Positions tab showed 3 cards.
+    """
+    dash = _fn("dashboard").replace(" ", "").replace("\n", "")
+    assert ">open<b>${s.open_positions}</b>" in dash, (
+        "the open pill is not reading the position count"
+    )
+    assert ">open<b>${s.open_episodes}</b>" not in dash

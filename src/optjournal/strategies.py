@@ -282,3 +282,36 @@ def position_groups(
         })
     out.sort(key=lambda p: str(p["opened_at"] or ""), reverse=True)
     return out
+
+
+def open_position_count(lifecycles: list[Row], episodes: list[Any]) -> int:
+    """How many POSITIONS the given open episodes form.
+
+    An episode is per CONTRACT, so a strangle is two of them and a headline
+    "open 5" counted a two-leg strangle twice and read as five separate bets.
+    Five is a true number -- it is the count of open contracts -- but it is not
+    the number of positions, and the Positions tab already groups the same book
+    into three cards, so the two disagreed on screen.
+
+    A position is a lifecycle where one exists, and the episode itself where one
+    does not. That second case is not an edge: a contract held from before the
+    archive begins has no fills to group, so it appears only as a snapshot-only
+    episode -- this journal's LEAP -- and dropping it would undercount the book
+    by exactly the position with the most history in it.
+
+    Counted from the EPISODES rather than by tallying open lifecycles, so the
+    caller's scope survives: only positions with a passed-in open episode are
+    counted, and a lifecycle filtered out by a trade-type scope contributes
+    nothing rather than being counted from its own status field.
+    """
+    owner: dict[str, int] = {}
+    for index, lifecycle in enumerate(lifecycles):
+        if lifecycle.get("status") != "open":
+            continue
+        for conid in lifecycle.get("conids") or ():
+            owner[str(conid)] = index
+    positions: set[tuple[str, object]] = set()
+    for episode in episodes:
+        conid = str(getattr(episode, "conid", "") or "")
+        positions.add(("lc", owner[conid]) if conid in owner else ("ep", conid))
+    return len(positions)

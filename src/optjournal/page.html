@@ -101,7 +101,11 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
   background:var(--panel);border:1px solid var(--line)}
 .card h2{font-size:19px;font-weight:700;margin:0 0 3px}
 .card .sub{font-size:12.5px;color:var(--dim);margin-bottom:14px}
-.crow{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+/* `flex-wrap` so a narrow viewport moves the pill strip BELOW the caption as a
+   row, rather than overflowing the card: the strip refuses to shrink (see
+   .pills), so without somewhere to wrap to it would push past the card edge. */
+.crow{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;
+  flex-wrap:wrap}
 
 .stats{display:grid;gap:13px;grid-template-columns:repeat(5,1fr)}
 @media(max-width:1180px){.stats{grid-template-columns:repeat(3,1fr)}}
@@ -109,15 +113,39 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
   .filters{grid-template-columns:1fr}}
 .stat{padding:13px 15px;border-radius:11px;background:var(--bg2);border:1px solid var(--line)}
 .stat .k{font-size:11.5px;color:var(--dim);margin-bottom:7px}
+/* Marks a card that carries a tooltip. Dotted underline plus a help cursor is
+   the long-standing convention for "there is more here on hover", and without
+   it the note would be information the page holds and never offers. */
+.stat[title]{cursor:help}
+/* A heading states its section's rule on hover. A dotted underline is the right
+   affordance under an 11px label and the wrong one under a 19px bold heading --
+   at that weight a 1px dotted line reads as a rendering artefact rather than an
+   invitation, so the heading gets an explicit glyph instead. */
+.info{display:inline-flex;align-items:center;justify-content:center;
+  width:15px;height:15px;margin-left:7px;border-radius:999px;cursor:help;
+  background:var(--panel2);border:1px solid var(--line2);
+  font-size:10px;font-weight:700;font-family:var(--mono);color:var(--dim);
+  vertical-align:middle}
+.info:hover{border-color:var(--leather1);color:var(--fg)}
+.stat .k.hint{border-bottom:1px dotted var(--line2);display:inline-block;
+  padding-bottom:2px}
 .stat .v{font-size:25px;font-weight:700;font-family:var(--mono);
   font-variant-numeric:tabular-nums;line-height:1.15}
 .stat .v.sm{font-size:19px}
-.stat .n{font-size:11px;color:var(--dim2);margin-top:5px}
 
 .pill{font-size:12px;padding:6px 12px;border-radius:999px;background:var(--panel2);
   border:1px solid var(--line2);color:var(--dim);white-space:nowrap}
 .pill b{color:var(--fg);font-weight:600}
-.pills{display:flex;gap:8px;flex-wrap:wrap}
+/* `flex:0 0 auto` is load-bearing. Without it the pill strip is a shrinkable
+   flex item, so a long caption beside it squeezed the strip to its narrowest
+   content width and every pill wrapped onto its own line -- a three-row column
+   taller than the header text, which pushed down into the stats grid. The
+   caption is the part that should reflow, so it shrinks and the pills do not. */
+.pills{display:flex;gap:8px;flex-wrap:wrap;flex:0 0 auto;justify-content:flex-end}
+/* Lets the text block shrink below its content width. A flex item defaults to
+   min-width:auto, which refuses to go under min-content and is the usual reason
+   a neighbour gets crushed instead. */
+.crow>div:first-child{min-width:0}
 
 /* ---- tables ---- */
 table{width:100%;border-collapse:collapse;font-size:13px}
@@ -394,7 +422,10 @@ import {
  * @property {Money} commissions -- options: commission of round trips CLOSED here
  * @property {Money} fees -- account-level, not attributable to the journal
  * @property {number} closed_episodes -- the headline trade count for options
- * @property {number} open_episodes
+ * @property {number} open_episodes -- open CONTRACTS; a strangle is two
+ * @property {number} open_positions -- open positions, grouping a multi-leg
+ *   strategy into one. Attached by web.build_state, not month_stats: it needs
+ *   the lifecycle grouping, which is built after the stats are
  * @property {number} wins
  * @property {number} losses
  * @property {number|null} win_rate -- null until anything closed
@@ -1022,10 +1053,18 @@ function odteFilterNote(){
 }
 
 /* ------------------------------------------------ dashboard */
+/* A stat card is a label and a figure. The note -- scope, basis, denominator --
+   moves to a tooltip rather than sitting under every card: the same six words
+   ("closed round trips") repeated across five cards is noise that crowds the
+   figures without telling a reader anything new the fifth time.
+
+   The dotted underline on the label is what keeps this honest. A tooltip nobody
+   knows to look for is deleted information, so a card with more to say says so;
+   a card with nothing extra gets no underline and no cursor change. */
 function statCard(k,v,note,klass){
-  return `<div class="stat"><div class="k">${esc(k)}</div>
-    <div class="v ${klass||''}">${v}</div>
-    ${note?`<div class="n">${esc(note)}</div>`:''}</div>`;
+  return `<div class="stat"${note?` title="${esc(note)}"`:''}>
+    <div class="k${note?' hint':''}">${esc(k)}</div>
+    <div class="v ${klass||''}">${v}</div></div>`;
 }
 function dashboard(){
   const st=S.state, s=st.stats;
@@ -1063,14 +1102,19 @@ function dashboard(){
        figure read "−€26.25" here and "€26.25" there, so a reader checking one
        against the other had to know which sign convention each surface chose.
        Commission is a cost by definition and the label says so, so the
-       magnitude is the honest form -- and the red `cls()` tint went with the
-       sign, because colouring a figure by a sign no longer shown is noise. */
+       magnitude is the honest form.
+       Tinted red unconditionally, and that is the point: this card is coloured
+       by KIND, not by sign. An earlier version dropped the tint along with the
+       sign, reasoning that colouring by an invisible sign was noise -- but the
+       result was one plain figure in a row of green ones, which reads as a
+       number the page forgot to finish rather than as a deliberate neutral.
+       A commission is never a gain, so there is no sign to consult. */
     statCard('Commissions', moneyOf(s.commissions),
       basisOf(s.commissions)
       +(opt?` · closed round trips${s.open_commission.base?` · ${
         moneyOf(s.open_commission)} on open positions`:''}`
          :' · stated by IBKR'),
-      'sm'),
+      'sm neg'),
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
@@ -1091,17 +1135,22 @@ function dashboard(){
 
   return `${filters()}
   <div class="card">
-    <div class="crow"><div><h2>${esc(label)} Statistics</h2>
+    <div class="crow"><div><h2>${esc(label)} Statistics<span class="info"
+      title="${opt?`Options P&L counts fully closed round trips only, on the day
+      they closed — an open or partially closed position contributes nothing
+      until it is flat.`:`Stock P&L is IBKR's per-fill realisation, net of
+      commission.`}">i</span></h2>
       <div class="sub">${esc(s.asset_category)} trades and commission only —
       account-level fees and other instruments live on the Costs tab.
-      ${esc(ccyNote())} ${opt?`Options
-      P&L counts fully closed round trips only, on the day they closed — an open
-      or partially closed position contributes nothing until it is flat.`:`Stock
-      P&L is IBKR's per-fill realisation, net of commission.`}</div></div>
+      ${esc(ccyNote())}</div></div>
       <div class="pills">
         ${S.type?`<span class="pill" title="Every trade-derived figure below is
           restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
-        <span class="pill">open <b>${s.open_episodes}</b></span>
+        <span class="pill" title="Open positions, with a multi-leg strategy
+          counted once. ${s.open_episodes} open contract(s) across ${
+          s.open_positions} position(s) — the Positions tab groups the same book
+          the same way."
+          >open <b>${s.open_positions}</b></span>
         ${opt&&s.open_premium.base?`<span class="pill" title="Net premium sitting in
           positions that are still open — collected on shorts, paid on longs. Not
           in Net P&L: premium is a liability until the position closes, and it
@@ -1118,8 +1167,8 @@ function dashboard(){
     ${s.closed_episodes===0?`<div class="note">No round trip has fully closed yet,
       so Net P&L, Win Rate, Avg Win and Avg Loss have nothing to measure — they are
       empty rather than zero. ${s.open_premium.base?`The ${cash(s.open_premium.base)}
-      net premium in the ${s.open_episodes} open position(s) is not profit until
-      they close.`:`The ${s.open_episodes} open position(s) are under
+      net premium in the ${s.open_positions} open position(s) is not profit until
+      they close.`:`The ${s.open_positions} open position(s) are under
       <b>Positions</b>.`}</div>`:''}
   </div>
   <div class="card">

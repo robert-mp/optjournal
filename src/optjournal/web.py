@@ -78,7 +78,11 @@ from optjournal.stats import (
     scope_for,
     stats_data,
 )
-from optjournal.strategies import position_groups, strategy_groups
+from optjournal.strategies import (
+    open_position_count,
+    position_groups,
+    strategy_groups,
+)
 
 __all__ = ["build_state", "serve"]
 
@@ -533,6 +537,16 @@ def build_state(
             "history": history_data(report),
             "statements": statements_data(archive_dir, conn),
         }
+        # How many POSITIONS the open contracts form, which needs the lifecycle
+        # grouping and so cannot be computed inside month_stats. Set on both
+        # blocks because they share the Stats shape, and it is period-invariant
+        # either way: the open book is the open book whatever month is selected.
+        open_positions = open_position_count(
+            state["lifecycles"],
+            [e for e in view_report.open if scope.has_episode(e)],
+        )
+        for block in ("stats", "all_time"):
+            state[block]["open_positions"] = open_positions
         # Annual is all-time by construction and ignores both filters. The month
         # selector because a year-by-year table filtered to one month would have
         # a single row -- and the trade-type scope because this tab renders no

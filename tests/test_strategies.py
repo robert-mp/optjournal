@@ -13,6 +13,7 @@ import pytest
 from optjournal.strategies import (
     WINDOW_S,
     classify,
+    open_position_count,
     position_groups,
     strategy_groups,
 )
@@ -329,3 +330,57 @@ def test_every_level_aggregates_the_leaf_rows_not_the_level_below():
     assert uniform["proceeds"]["native"] == pytest.approx(140.0)
     assert uniform["proceeds"]["ccy"] == "USD"
     assert uniform["proceeds"]["base"] == pytest.approx(126.0)
+
+
+# --------------------------------------------------------------------------
+# counting positions rather than contracts
+# --------------------------------------------------------------------------
+
+def test_a_strangle_is_one_open_position_not_two():
+    """The bug this fixes, from the real book: the Dashboard read "open 5" for
+    two strangles and a LEAP, because an episode is per CONTRACT. Five open
+    contracts is a true number; five open positions is not, and the Positions
+    tab already grouped the same book into three cards.
+    """
+    order = _order("10", "2026-08-03 11:11:00", [
+        _leg(underlying_symbol="META", strike=520.0, put_call="P"),
+        _leg(underlying_symbol="META", strike=675.0, put_call="C"),
+    ])
+    put, call = _Ep("P1", ["t1"]), _Ep("C1", ["t2"])
+    lifecycles = position_groups(
+        [order], episodes=[put, call],
+        trade_to_order={"t1": "10", "t2": "10"},
+    )
+    assert len(lifecycles) == 1 and lifecycles[0]["status"] == "open"
+    assert open_position_count(lifecycles, [put, call]) == 1
+    assert len(lifecycles[0]["conids"]) == 2, (
+        "the control: the position really does hold two contracts, so the "
+        "count of 1 is a grouping and not a dropped leg"
+    )
+
+
+def test_a_contract_with_no_lifecycle_still_counts_as_a_position():
+    """The LEAP: bought before the archive begins, so it has no fills to group
+    and appears only as a snapshot-only episode. Counting lifecycles alone would
+    omit exactly the position with the most history in it.
+    """
+    order = _order("10", "2026-08-03 11:11:00", [_leg(underlying_symbol="META")])
+    traded, snapshot = _Ep("P1", ["t1"]), _Ep("LEAP", [])
+    lifecycles = position_groups(
+        [order], episodes=[traded], trade_to_order={"t1": "10"},
+    )
+    assert open_position_count(lifecycles, [traded, snapshot]) == 2
+
+
+def test_the_count_follows_the_episodes_it_is_given():
+    """Counted from the episodes rather than by tallying open lifecycles, so a
+    caller's trade-type scope survives: a lifecycle whose episodes were all
+    filtered out must contribute nothing rather than count itself in.
+    """
+    order = _order("10", "2026-08-03 11:11:00", [_leg(underlying_symbol="META")])
+    ep = _Ep("P1", ["t1"])
+    lifecycles = position_groups(
+        [order], episodes=[ep], trade_to_order={"t1": "10"},
+    )
+    assert open_position_count(lifecycles, [ep]) == 1, "the control"
+    assert open_position_count(lifecycles, []) == 0
