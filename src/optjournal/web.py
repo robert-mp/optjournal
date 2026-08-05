@@ -171,7 +171,14 @@ def build_state(
                 month_stats(conn, None, asset_category=view_category,
                             scope=scope, report=view_report)
             ),
-            "positions": positions_data(conn),
+            # The basis fallback the page used to assemble itself: a snapshot
+            # row without a cost basis borrows the open episode's, matched on
+            # conid. Passed as a plain dict so serialize stays a conn reader.
+            "positions": positions_data(
+                conn,
+                {e.conid: e.cost_basis for e in view_report.open
+                 if e.cost_basis is not None},
+            ),
             "orders": orders,
             # The same orders folded into the strategies they were placed
             # as -- a strangle sold as two same-second orders is one group.

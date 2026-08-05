@@ -122,6 +122,27 @@ def test_per_divides_both_halves_by_the_same_quantity():
     assert Money.gated(-6.07, {"USD": -6.97}).per(0) is None
 
 
+def test_at_rate_derives_base_from_the_row_that_owns_the_rate():
+    """For figures IBKR reports natively with no base column -- a position's
+    cost basis and unrealised P&L -- the base is derived from that row's own
+    `fxRateToBase`. A single row is single-currency by construction, so the gate
+    has nothing to decide and the native is always offered.
+    """
+    # The real LEAP row: 818.30 USD at 0.86714 is the 709.580662 IBKR stored.
+    value = Money.at_rate(818.30, 0.86714, "USD")
+    assert value.native == 818.30
+    assert value.base == pytest.approx(709.580662)
+    assert value.currency == "USD"
+
+    # No rate to convert with: the native stands as its own base rather than
+    # the figure vanishing.
+    assert Money.at_rate(818.30, None, "USD") == Money(
+        base=818.30, native=818.30, currency="USD")
+    # Nothing to interpret -- a zero base, not a half-set figure.
+    assert Money.at_rate(None, 0.86714, "USD") == Money(base=0.0)
+    assert Money.at_rate(818.30, 0.86714, None) == Money(base=818.30)
+
+
 def test_the_payload_shape_is_stable_so_the_page_tests_for_null():
     """All three keys are always present. The page checks for a null value and
     never for a missing property, so an absent key can never be mistaken for a

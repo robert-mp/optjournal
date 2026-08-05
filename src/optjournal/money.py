@@ -109,6 +109,29 @@ class Money:
                 ledger[row_ccy] = ledger.get(row_ccy, 0.0) + row_native
         return cls.gated(base, ledger)
 
+    @classmethod
+    def at_rate(
+        cls, native: float | None, rate: float | None, currency: str | None
+    ) -> Money:
+        """One row's amount, with the base derived from that row's own rate.
+
+        For figures IBKR reports natively and never converts -- a position's
+        market value, cost basis and unrealised P&L all arrive with the row's
+        `fxRateToBase` and no base column at all. A single row is
+        single-currency by construction, so the gate has nothing to decide and
+        the native is always offered.
+
+        This replaces `natCash(v, rate)` in the page, which multiplied to base
+        and then applied the display rate -- two hops, so a USD value shown in
+        USD had round-tripped through EUR at two different rates. Carrying the
+        native means the display can use it verbatim.
+        """
+        if native is None or currency is None:
+            return cls(base=0.0) if native is None else cls(base=float(native))
+        amount = float(native)
+        base = amount if rate is None else amount * float(rate)
+        return cls(base=base, native=amount, currency=currency)
+
     @property
     def is_exact(self) -> bool:
         """Whether an as-charged figure is available."""

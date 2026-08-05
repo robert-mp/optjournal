@@ -320,10 +320,13 @@ td.n,th.n{text-align:right}
  * @property {number} position
  * @property {number} mark_price
  * @property {number} position_value
- * @property {number} position_value_base
- * @property {number} cost_basis_money
+ * @property {number} position_value_base -- raw column; read `value` instead
+ * @property {number} cost_basis_money -- raw column; read `cost_basis` instead
  * @property {number} cost_basis_price
- * @property {number} fifo_pnl_unrealized
+ * @property {number} fifo_pnl_unrealized -- raw column; read `unrealized` instead
+ * @property {Money} value -- market value, native and base
+ * @property {Money} cost_basis -- falls back to the open episode's basis
+ * @property {Money} unrealized -- no base column exists; derived at the row rate
  * @property {string} side
  * @property {string|null} open_date_time
  * @property {string} currency
@@ -653,11 +656,6 @@ const conv=v=>{if(v==null)return null;const q=QUOTE();
   return q?Number(v)*q.per_base:Number(v);};
 /* An amount already in base currency: restate and symbol in one step. */
 const cash=(v,d)=>money(conv(v),DISP(),d);
-/* An amount in an instrument currency, carrying that row's own rate to base.
-   Two hops rather than one, because the row rate is exact for that row and the
-   display rate is a presentation choice applied uniformly afterwards. */
-const natCash=(v,rate,d)=>
-  cash(v==null||rate==null?null:Number(v)*Number(rate),d);
 
 /* ---- commission: a charge, not an analytic total ----------------------
    Commission is billed in one currency and debited in that currency -- IBKR
@@ -1224,8 +1222,7 @@ function positions(){
      put, which has fills on record, rendered a dash even though the snapshot
      held -1569.907847. The history lookup stays as a fallback for a snapshot
      row that lacks the column. */
-  const basis={}; open.forEach(ep=>{if(ep.cost_basis!=null)basis[ep.conid]=ep.cost_basis;});
-  let val=0; ps.forEach(pos=>val+=(pos.position_value_base||0));
+  let val=0; ps.forEach(pos=>val+=(pos.value.base||0));
   /* Snapshot rows grouped by the LIFECYCLE that opened them, via conid --
      the same episode-exact linkage the Trades tab uses, so the strangle is
      one position with two contract rows beneath it. Rows no open lifecycle
@@ -1247,11 +1244,9 @@ function positions(){
     <td class="side ${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
     <td class="n mono ${cls(pos.position)}">${pos.position}</td>
     <td class="n mono">${money(pos.mark_price,pos.currency)}</td>
-    <td class="n mono">${cash(pos.position_value_base)}</td>
-    <td class="n mono">${natCash(pos.cost_basis_money!=null?pos.cost_basis_money
-      :basis[pos.conid],pos.fx_rate_to_base)}</td>
-    <td class="n mono ${cls(pos.fifo_pnl_unrealized)}">${
-      natCash(pos.fifo_pnl_unrealized,pos.fx_rate_to_base)}</td>
+    <td class="n mono">${moneyOf(pos.value)}</td>
+    <td class="n mono">${moneyOf(pos.cost_basis)}</td>
+    <td class="n mono ${cls(pos.unrealized.base)}">${moneyOf(pos.unrealized)}</td>
     <td class="dim">${esc(pos.currency)}</td>
     <td class="dim2">${ep.snapshot_only?'snapshot only':ep.entry_outside_window?'partial':'complete'}</td>
   </tr>`;};
@@ -1260,7 +1255,7 @@ function positions(){
        and one name for two shapes blinds the payload guard to both. */
     const label=bkt.lc?`${bkt.lc.underlying||''} — ${bkt.lc.label}, opened ${
       String(bkt.lc.opened_at||'').slice(0,10)}`:'Ungrouped — no opening fills in the archive';
-    let uv=0; bkt.rows.forEach(pos=>uv+=(pos.position_value_base||0));
+    let uv=0; bkt.rows.forEach(pos=>uv+=(pos.value.base||0));
     /* The subtotal sums `value`, so it sits in the `value` column. It used to
        ride a colspan=8 label and land in column 9 -- under `record` -- four
        columns adrift of the figures it totals, which is exactly the "total in

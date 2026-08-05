@@ -135,11 +135,41 @@ def orders_data(
         out.append(row)
     return out
 
-def positions_data(conn: sqlite3.Connection) -> list[Row]:
+def positions_data(
+    conn: sqlite3.Connection, cost_basis_fallback: dict[str, float] | None = None
+) -> list[Row]:
+    """Open-position snapshot rows, each with its money figures interpreted.
+
+    The row is returned verbatim because it IS the record -- a point-in-time
+    snapshot IBKR sent. The three `Money` keys beside it are the interpretation:
+    a position carries its native amount and its own `fxRateToBase`, and two of
+    the three have no base column at all, so the base was previously derived in
+    the page by `natCash(v, rate)`. That multiplied to base and then applied the
+    display rate, so a USD value shown under a USD toggle had round-tripped
+    through EUR at two different rates -- the same defect corrected for
+    commission. Deriving here means the page reads a `Money` and shows the
+    native verbatim.
+    """
     rows = conn.execute(
         "SELECT * FROM current_option_positions ORDER BY expiry, strike"
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        row = dict(r)
+        ccy, rate = row.get("currency"), row.get("fx_rate_to_base")
+        row["value"] = Money.at_rate(row.get("position_value"), rate, ccy).payload()
+        # A snapshot row does not always carry a basis; the open episode for the
+        # same conid does. Resolved here rather than in the page, which used to
+        # pick the fallback and then convert it with its own rate arithmetic --
+        # a second converter is what this change exists to remove.
+        basis = row.get("cost_basis_money")
+        if basis is None and cost_basis_fallback:
+            basis = cost_basis_fallback.get(str(row.get("conid")))
+        row["cost_basis"] = Money.at_rate(basis, rate, ccy).payload()
+        row["unrealized"] = Money.at_rate(
+            row.get("fifo_pnl_unrealized"), rate, ccy).payload()
+        out.append(row)
+    return out
 
 def _money(base: Any, ledger: dict) -> Money:
     """A cost figure: the base total, plus the as-charged amount where one exists.

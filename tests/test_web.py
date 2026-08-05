@@ -1384,6 +1384,29 @@ def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
         "the open-positions figure bypasses the shared rule"
 
 
+def test_the_page_has_exactly_one_native_first_rule():
+    """`natCash(v, rate)` was a second implementation of native-first display,
+    surviving beside `chargeOf` for the Positions tab. Two hops rather than one:
+    it multiplied the native by the row's rate to reach base, then applied the
+    display rate -- so a USD figure shown under a USD toggle round-tripped
+    through EUR. That is lossless only while the display rate happens to be the
+    row's rate inverted, which holds on a single-snapshot single-currency
+    account and stops holding the moment positions span report dates.
+
+    Money.at_rate carries the native, so the display uses it verbatim. One
+    concept, one implementation.
+    """
+    js = _code_only(_js()).replace(" ", "").replace("\n", "")
+    assert "natCash" not in js, "a second native-first converter is back"
+    for key in ("pos.value", "pos.cost_basis", "pos.unrealized"):
+        assert f"moneyOf({key})" in js, f"{key} does not route through the rule"
+    # The raw columns stay in the payload (the row IS the snapshot record) but
+    # the page must not reach past the Money to reach them.
+    for raw in ("pos.position_value_base", "pos.cost_basis_money",
+                "pos.fifo_pnl_unrealized"):
+        assert raw not in js, f"the page reads {raw} instead of its Money"
+
+
 def test_the_calendar_pills_describe_the_month_on_the_grid():
     """Under "All time" the payload's days span the account while the grid can
     draw only one month, so the pills described a scope the grid could not
