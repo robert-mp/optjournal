@@ -35,7 +35,7 @@ from typing import Any
 
 from optjournal import __version__
 from optjournal.analysis import analyse
-from optjournal.bars import attach_sparks, spark_series
+from optjournal.bars import replay_bars
 from optjournal.db import open_journal
 from optjournal.flex import (
     FETCH_COOLDOWN_S,
@@ -88,6 +88,124 @@ def _is_loopback(host: str) -> bool:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _strikes_of(legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One entry per distinct contract, sided by how the position was OPENED.
+
+    A closed lifecycle holds the same strike twice -- sold to open, bought to
+    close -- and drawing it twice would put two lines on top of each other and
+    imply two contracts. First occurrence wins because events arrive in
+    chronological order, so the opening fill decides short vs long: a strike you
+    sold is a level you are defending, and one you bought is a level you paid
+    for. The chart encodes that difference, so reversing it inverts the meaning
+    of every line on the panel.
+    """
+    seen: dict[tuple[float, str], dict[str, Any]] = {}
+    for leg in legs:
+        raw = leg.get("strike")
+        if raw is None:
+            continue
+        right = str(leg.get("put_call") or "")
+        key = (float(raw), right)
+        if key in seen:
+            continue
+        sold = str(leg.get("buy_sell") or "").upper().startswith("SELL")
+        seen[key] = {
+            "strike": float(raw),
+            "put_call": right,
+            "side": "short" if sold else "long",
+        }
+    return sorted(seen.values(), key=lambda s: s["strike"])
+
+
+def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
+    """Build one replay per trade and point rows at it by key.
+
+    Replays live in a shared ``replays`` map rather than inline on each row,
+    because a strangle's two position rows are ONE trade: a copy each would ship
+    the underlying series twice and let a reader open two charts of the same
+    position and wonder why they differ.
+
+    Only an OPEN lifecycle claims a position row. Close a strike and reopen it
+    and both lifecycles share a conid, so claiming by conid alone would aim a
+    live position at the chart of a trade that already ended.
+
+    A row no open lifecycle claims gets its own single-strike replay. That is the
+    snapshot-only case -- the LEAP, which has no fills anywhere and is otherwise
+    the position with the most history and no way to see it.
+
+    Position ROWS gain no key. The page resolves a row to its lifecycle's replay
+    through the same open-lifecycle-by-conid map it already builds to group the
+    table, so a strangle's two legs open one chart showing both strikes. Writing
+    the key onto the row instead would make the row scope-dependent -- the trade
+    type filter changes which lifecycles exist, so the same position would carry
+    a different key under a different filter, and the open book is the open book
+    whatever subset of trades you are looking at.
+    """
+    replays: dict[str, dict[str, Any]] = {}
+
+    for lifecycle in state["lifecycles"]:
+        conids = [str(c) for c in (lifecycle.get("conids") or [])]
+        opened, closed = lifecycle.get("opened_at"), lifecycle.get("closed_at")
+        key = "lc:" + "-".join(conids) + "@" + str(opened or "")[:10]
+        legs = [
+            leg
+            for event in (lifecycle.get("events") or [])
+            for order in (event.get("orders") or [])
+            for leg in (order.get("legs") or [])
+        ]
+        bars = replay_bars(
+            conn, str(lifecycle.get("underlying") or ""),
+            opened_at=opened, closed_at=closed,
+        )
+        replays[key] = {
+            "key": key,
+            "underlying": lifecycle.get("underlying"),
+            "label": lifecycle.get("label"),
+            "bar_size": bars["bar_size"],
+            "points": [[ts, close] for ts, close in bars["points"]],
+            "strikes": _strikes_of(legs),
+            "opened_at": opened,
+            "closed_at": closed,
+        }
+        lifecycle["replay_key"] = key
+
+    claimed = {
+        str(conid): lifecycle["replay_key"]
+        for lifecycle in state["lifecycles"]
+        if lifecycle.get("status") == "open"
+        for conid in (lifecycle.get("conids") or [])
+    }
+    for row in state["positions"]:
+        conid = str(row.get("conid") or "")
+        if conid in claimed:
+            continue
+        key = "pos:" + conid
+        opened = row.get("open_date_time")
+        bars = replay_bars(
+            conn, str(row.get("underlying_symbol") or ""),
+            opened_at=opened, closed_at=None,
+        )
+        replays[key] = {
+            "key": key,
+            "underlying": row.get("underlying_symbol"),
+            "label": "Open position",
+            "bar_size": bars["bar_size"],
+            "points": [[ts, close] for ts, close in bars["points"]],
+            # A snapshot row states a side, not a buy_sell. Short is what SELL
+            # means here, so it maps onto the same encoding the legs use.
+            "strikes": _strikes_of([{
+                "strike": row.get("strike"),
+                "put_call": row.get("put_call"),
+                "buy_sell": "SELL"
+                if str(row.get("side") or "").upper() == "SHORT" else "BUY",
+            }]),
+            "opened_at": opened,
+            "closed_at": None,
+        }
+
+    state["replays"] = replays
 
 
 def build_state(
@@ -236,28 +354,7 @@ def build_state(
         }
         base_ccy = str(state["stats"].get("base_currency") or "")
         state["fx"] = {"base": base_ccy, "quotes": fx_quotes(conn, base_ccy)}
-
-        # Row miniatures, attached to the rows the serializers just produced
-        # rather than to anything the grouping layers received -- those stay
-        # read-only lenses over their input, an invariant the suite pins.
-        #
-        # A position row is exactly one contract, so every row gets a real
-        # series. A LIFECYCLE can span several (a strangle's two legs, a roll
-        # chain), and a single line cannot honestly stand for two legs: the
-        # position's value is their sum, and summing needs timestamp-aligned
-        # series that dropping null closes does not give us. So a multi-contract
-        # lifecycle gets no miniature rather than one leg passed off as the
-        # whole, and the replay chart draws the legs separately where it can.
-        spark_conids = {str(row.get("conid") or "") for row in state["positions"]}
-        for lifecycle in state["lifecycles"]:
-            legs = [str(c) for c in (lifecycle.get("conids") or [])]
-            if len(legs) == 1:
-                spark_conids.add(legs[0])
-        sparks = spark_series(conn, sorted(c for c in spark_conids if c))
-        attach_sparks(state["positions"], sparks)
-        for lifecycle in state["lifecycles"]:
-            legs = [str(c) for c in (lifecycle.get("conids") or [])]
-            lifecycle["spark"] = sparks.get(legs[0], []) if len(legs) == 1 else []
+        _attach_replays(conn, state)
 
     newest = newest_statement(archive_dir)
     if newest is not None:

@@ -145,8 +145,32 @@ td.n,th.n{text-align:right}
 .day.clk{cursor:pointer}
 .day.clk:hover{border-color:#8a6a4e}
 .day.selected{outline:2px solid #c98a5c;outline-offset:-2px}
-.spark{vertical-align:middle;display:inline-block;overflow:visible}
-.sparkcell{width:1%;white-space:nowrap;padding-right:10px}
+/* Replay drill-down. The panel is the chart's home rather than a table cell:
+   reading a strike against a price scale needs a y-axis, and an axis needs
+   room. Clicking the card header opens it, the same act as clicking a calendar
+   day -- one drill-down grammar, not two. */
+.rk{cursor:pointer}
+.rk:hover .rhint{color:var(--fg)}
+.rhint{font-size:11px;color:var(--dim2);white-space:nowrap;letter-spacing:.03em}
+.caret{display:inline-block;transition:transform .12s ease}
+.caret.open{transform:rotate(90deg)}
+.replay{margin-top:14px;padding:14px 16px 10px;border-radius:12px;
+  background:var(--bg2);border:1px solid var(--line)}
+.replay svg{display:block;width:100%;height:auto;margin-top:6px}
+.rpanel>td{padding:0 0 4px 0;background:var(--bg2)}
+.ax{stroke:var(--line2);stroke-width:1}
+.gr{stroke:var(--line);stroke-width:1}
+.tk{fill:var(--dim2);font-size:11px;font-family:var(--mono)}
+.pxline{stroke:var(--fg);stroke-width:1.7;fill:none;stroke-linejoin:round}
+/* Solid short, dashed long -- the encoding the reference chart uses, and the
+   distinction that matters: a strike you sold is a level you are defending,
+   one you bought is a level you paid for. Deliberately NOT the pos/neg
+   palette: green/red means signed money everywhere else on this page, and
+   reusing it for "which way round the contract is" would make the two
+   meanings compete. */
+.sk{stroke:var(--leather1);stroke-width:1.3}
+.sk.long{stroke-dasharray:5 4}
+.sklab{fill:var(--kicker);font-size:11px;font-family:var(--mono)}
 .linkish{background:none;border:none;color:var(--dim);cursor:pointer;
   font:inherit;font-size:11px;text-decoration:underline;padding:0}
 .linkish:hover{color:var(--fg)}
@@ -265,6 +289,7 @@ td.n,th.n{text-align:right}
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
  * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
+ * @property {Object} replays -- Replay by key; rows resolve into it (web._attach_replays)
  * @property {OdteBlock} odte
  * @property {FxBlock} fx
  * @property {Array} costs -- Costs per statement section, may be empty
@@ -324,8 +349,6 @@ td.n,th.n{text-align:right}
  * @property {number} mark_price
  * @property {number} position_value
  * @property {number} position_value_base -- raw column; read `value` instead
- * @property {Array} spark -- decimated daily closes, oldest first (bars.spark_series);
- *   empty when no bars have been backfilled for this contract yet
  * @property {number} cost_basis_money -- raw column; read `cost_basis` instead
  * @property {number} cost_basis_price
  * @property {number} fifo_pnl_unrealized -- raw column; read `unrealized` instead
@@ -503,6 +526,24 @@ td.n,th.n{text-align:right}
  * @property {string|null} asset_filter
  */
 
+/** @typedef {Object} Replay -- one trade's chart data (web._attach_replays)
+ * @property {string} key -- "lc:<conids>@<date>" or "pos:<conid>"
+ * @property {string|null} underlying -- the symbol the price line belongs to
+ * @property {string|null} label -- the strategy name, or "Open position"
+ * @property {string|null} bar_size -- "1h" or "1d"; the panel states which, so a
+ *   flat stretch reads as a quiet week rather than a coarser grid
+ * @property {Array} points -- [ts, close] pairs of the UNDERLYING, oldest first
+ * @property {Array} strikes -- Strike rows, one per distinct contract
+ * @property {string|null} opened_at -- null for a snapshot-only contract
+ * @property {string|null} closed_at -- null while the position is open
+ */
+
+/** @typedef {Object} Strike -- one contract as a horizontal reference line
+ * @property {number} strike
+ * @property {string} put_call
+ * @property {string} side -- "short" or "long", from the OPENING fill
+ */
+
 /** @typedef {Object} FxBlock -- presentation rates (stats.fx_quotes)
  * @property {string} base
  * @property {Array} quotes -- FxQuote rows; empty hides the currency toggle
@@ -559,9 +600,7 @@ td.n,th.n{text-align:right}
  * @property {Money|null} realized_pnl -- null until the lifecycle is closed
  * @property {Money|null} commission -- same rule
  * @property {Array} events -- StrategyGroup rows
- * @property {Array} spark -- decimated daily closes; EMPTY for a multi-leg
- *   lifecycle, because one line cannot honestly stand for two legs whose
- *   summed value we cannot align (web.build_state says why)
+ * @property {string} replay_key -- index into State.replays
  */
 
 /** @typedef {Object} Sync -- fetch machinery state (web.build_state)
@@ -588,7 +627,7 @@ td.n,th.n{text-align:right}
  * @property {Array} [warnings]
  */
 
-/** @typedef {Object} ChartPoint -- page-side: built from Stats.days for the sparkline
+/** @typedef {Object} ChartPoint -- page-side: built from Stats.days for the equity curve
  * @property {number} x
  * @property {number} y
  * @property {number} n
@@ -608,20 +647,24 @@ td.n,th.n{text-align:right}
  * @payload f:FxRow stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
  * @payload mo:Money
  * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle
- * @payload res:SyncResponse pt:ChartPoint bkt:Bucket
+ * @payload res:SyncResponse pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local oc odtes open opts out ps pts range rows yrs active shown
- * @local vs
+ * @local sks ys
  */
 
 const $=s=>document.querySelector(s);
 const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
-  /* Selected calendar day for the drill-down. View-local: deliberately NOT in
-     the URL hash -- a day selection is an inspection, not a view state worth
-     a link, and putting it in the hash would grow the hash contract for no
-     navigational gain. Cleared when the month changes underneath it. */
-  calday:null};
+  /* Selected calendar day for the drill-down, and the open replay's key. Both
+     ARE in the URL hash: which drill-down is open is navigational -- a link to
+     "that day" or "that trade's chart" should survive a reload, and before the
+     day was recorded a refresh silently dropped the panel while leaving the
+     calendar looking untouched. Both are healed in draw() against the payload,
+     because a selection from another month or another scope means nothing here.
+     A future scrubber POSITION would not belong in the hash: that is an
+     inspection inside an open panel, not which panel is open. */
+  calday:null,replay:null};
 
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -1165,40 +1208,81 @@ function groupLabel(legs){
   if(legs.length>1) return oc.length>1?'ROLL':(closing?'SPREAD CLOSE':'SPREAD');
   return closing?'CLOSING':'OPENING';
 }
-function sparkline(v,opts){
-  /* A row miniature: one polyline, no axes, no labels, no library. Explicitly
-     NOT the replay chart -- that one needs a y-axis, because reading a strike
-     line against a price scale is its whole purpose, and a 100px table cell
-     has no room for one.
+/* ------------------------------------------------ replay */
+/* Bars are stored epoch UTC and read in EXCHANGE time, not the reader's. The
+   x axis of a trading chart has to agree with the session: a 09:30 ET open
+   rendered in Irish local time reads 14:30, and every "what happened at the
+   open" question then needs mental arithmetic. Every contract in this journal
+   is US-listed, so one zone covers it; a non-US underlying would need its own
+   exchange zone rather than this constant. */
+const MKT='America/New_York';
+const rstamp=(ts,size)=>new Date(ts*1000).toLocaleString(undefined,
+  size==='1h'?{timeZone:MKT,month:'short',day:'numeric',hour:'numeric'}
+             :{timeZone:MKT,year:'2-digit',month:'short',day:'numeric'});
 
-     An absent series renders an em dash rather than a flat line, so "no bars
-     yet" and "did not move" stay distinguishable. Two points is the minimum
-     that can express a direction; one point is a dot that reads as a trend it
-     does not have.
-
-     Values arrive already decimated and null-free from bars.spark_series --
-     min/max preserving, with the true first and last pinned, so the endpoints
-     mean what the eye reads them to mean. */
-  const vs=(v||[]).filter(n=>typeof n==='number'&&isFinite(n));
-  if(vs.length<2) return '<span class="dim2">—</span>';
-  const w=(opts&&opts.w)||100, h=(opts&&opts.h)||24, pad=2.5;
-  const lo=Math.min(...vs), hi=Math.max(...vs), span=(hi-lo)||1;
-  const pts=vs.map((n,i)=>{
-    const px=pad+(i*(w-2*pad))/(vs.length-1);
-    const py=h-pad-((n-lo)*(h-2*pad))/span;
-    return px.toFixed(1)+','+py.toFixed(1);
-  }).join(' ');
-  /* Direction over the whole series, through the same cls() the page uses for
-     signed money, so it lands in the pos/neg palette and green/red means one
-     thing everywhere. `stroke="currentColor"` is what picks it up: .pos/.neg
-     set `color`, not `stroke`. */
-  return `<svg class="spark ${cls(vs[vs.length-1]-vs[0])}" viewBox="0 0 ${w} ${h}"
-    width="${w}" height="${h}" preserveAspectRatio="none" role="img"
-    ><title>${vs[0].toFixed(2)} → ${vs[vs.length-1].toFixed(2)} (${
-      vs.length} daily closes)</title
-    ><polyline points="${pts}" fill="none" stroke="currentColor"
-      stroke-width="1.25" stroke-linejoin="round"/></svg>`;
+function replayChart(rp){
+  const pts=(rp.points||[]).filter(p=>p&&isFinite(p[1]));
+  if(pts.length<2) return `<div class="empty">no price bars stored for ${
+    esc(rp.underlying||'this underlying')} yet — run <code>optjournal bars</code></div>`;
+  const sks=(rp.strikes||[]).filter(sk=>sk&&isFinite(sk.strike));
+  const W=920,H=270,L=52,R=76,T=12,B=30, iw=W-L-R, ih=H-T-B;
+  const ys=pts.map(p=>p[1]), xs=pts.map(p=>p[0]);
+  /* The y domain spans the strikes as well as the price path. A strike is the
+     level the whole chart exists to compare against, so a far-OTM one clipped
+     off-canvas would leave a price line and no answer to "how close did it
+     get" -- which is the question the panel is for. */
+  const vals=ys.concat(sks.map(sk=>sk.strike));
+  const lo0=Math.min(...vals), hi0=Math.max(...vals);
+  const gap=(hi0-lo0)*0.07||1, lo=lo0-gap, hi=hi0+gap, vspan=hi-lo;
+  const t0=Math.min(...xs), t1=Math.max(...xs), tspan=(t1-t0)||1;
+  const X=t=>L+((t-t0)*iw)/tspan, Y=v=>T+ih-((v-lo)*ih)/vspan;
+  const dp=vspan>40?0:2;
+  const yticks=[0,0.25,0.5,0.75,1].map(f=>lo+f*vspan).map(v=>
+    `<line class="gr" x1="${L}" y1="${Y(v).toFixed(1)}" x2="${L+iw}" y2="${
+      Y(v).toFixed(1)}"/><text class="tk" x="${L-7}" y="${
+      (Y(v)+3.5).toFixed(1)}" text-anchor="end">${num(v,dp)}</text>`).join('');
+  /* Ticks land on real bars, not on an even split of the span: sessions are
+     not evenly spaced, so an interpolated label can name a timestamp that has
+     no bar -- a weekend midnight on a daily series. */
+  const xticks=[0,0.5,1].map(f=>pts[Math.round(f*(pts.length-1))]).map((pt,i)=>
+    `<text class="tk" x="${X(pt[0]).toFixed(1)}" y="${H-10}" text-anchor="${
+      i===0?'start':i===2?'end':'middle'}">${esc(rstamp(pt[0],rp.bar_size))}</text>`
+  ).join('');
+  const line=pts.map(p=>`${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(' ');
+  const strikes=sks.map(sk=>{const y=Y(sk.strike).toFixed(1);
+    return `<line class="${sk.side==='long'?'sk long':'sk'}" x1="${L}" y1="${y}"
+      x2="${L+iw}" y2="${y}"/><text class="sklab" x="${L+iw+7}" y="${
+      (Number(y)+3.5).toFixed(1)}">${strike(sk.strike)}${esc(sk.put_call||'')} ${
+      esc(sk.side)}</text>`;}).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" preserveAspectRatio="xMidYMid meet"
+    ><title>${esc(rp.underlying||'')} ${num(ys[0],dp)} → ${num(ys[ys.length-1],dp)} across ${
+      pts.length} ${rp.bar_size==='1h'?'hourly':'daily'} bars</title>
+    ${yticks}${strikes}
+    <line class="ax" x1="${L}" y1="${T}" x2="${L}" y2="${T+ih}"/>
+    <line class="ax" x1="${L}" y1="${T+ih}" x2="${L+iw}" y2="${T+ih}"/>
+    <polyline class="pxline" points="${line}"/>${xticks}</svg>`;
 }
+
+/* The scorecard is passed in rather than derived here, because what counts as
+   "the P&L" depends on the caller: a closed lifecycle states realised money the
+   accounting layer computed, while an open one has only unrealised value from
+   the position snapshot. Deciding that inside the chart would put an accounting
+   rule in a renderer. */
+function replayPanel(rp,label,valueHtml){
+  const bars=rp.bar_size==='1h'?'hourly bars':rp.bar_size==='1d'?'daily bars':'no bars';
+  const when=rp.opened_at?`${esc(String(rp.opened_at).slice(0,16))}${
+    rp.closed_at?` → ${esc(String(rp.closed_at).slice(0,16))}`:' → open'}`
+    :'entry date unknown — every bar held';
+  return `<div class="replay"><div class="crow">
+    <div><div class="kicker">replay · ${esc(rp.underlying||'?')} underlying</div>
+      <div class="sub mono">${when} · ${esc(bars)} · times ET</div></div>
+    <div class="pills"><span class="pill">${esc(label)} ${valueHtml}</span></div>
+  </div>${replayChart(rp)}
+  <div class="note">The line is the UNDERLYING's price, not the option's — it is
+    what the strikes are read against. A solid strike was sold, a dashed one
+    bought.</div></div>`;
+}
+
 function trades(){
   /* One card per POSITION LIFECYCLE: a short put opened in July and bought
      back in August is one position with two events, not two unrelated
@@ -1218,16 +1302,30 @@ function trades(){
     const openLc=lc.status==='open';
     const when=openLc?`opened ${esc((lc.opened_at||'').slice(0,10))} · still open`
       :`${esc((lc.opened_at||'').slice(0,10))} → ${esc((lc.closed_at||'').slice(0,10))}`;
+    /* Unrealised for an open lifecycle comes from the position snapshot, summed
+       over the legs this lifecycle holds -- realised money does not exist until
+       the position is flat, the same rule the Dashboard and the stat cards
+       follow. Summed in base through `.base` because two legs can be quoted in
+       different currencies, which is what the Money gate exists to catch. */
+    const rp=(S.state.replays||{})[lc.replay_key];
+    const shown=S.replay===lc.replay_key;
+    let uz=0; (S.state.positions||[]).forEach(pos=>{
+      if((lc.conids||[]).map(String).includes(String(pos.conid)))
+        uz+=(pos.unrealized.base||0);});
+    const score=openLc?['Unrealised',`<b class="${cls(uz)}">${cash(uz)}</b>`]
+      :['Realised',`<b class="${cls(lc.realized_pnl?.base)}">${
+        lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—'}</b>`];
     return `<div class="card">
-      <div class="crow"><div><h2>${esc(lc.underlying||'?')}
+      <div class="crow${rp?' rk':''}"${rp?` data-replay="${esc(lc.replay_key)}"`:''}><div><h2>${
+        esc(lc.underlying||'?')}
         <span class="dim" style="font-size:14px;font-weight:500">${esc(lc.label)}</span>
         <span class="pill" style="margin-left:8px;font-size:11px"
           >${openLc?'OPEN':'CLOSED'}</span></h2>
         <div class="sub mono">${when} · ${lc.fills} fill(s) · ${evs.length} event(s)</div></div>
-        ${(lc.spark||[]).length?`<div style="text-align:right">
-          <div class="dim2" style="font-size:10.5px">daily close</div>
-          ${sparkline(lc.spark,{w:150,h:32})}</div>`:''}
+        ${rp?`<div class="rhint">${shown?'hide replay':'replay'
+          } <span class="caret${shown?' open':''}">▸</span></div>`:''}
       </div>
+      ${shown&&rp?replayPanel(rp,score[0],score[1]):''}
       <div class="stats" style="grid-template-columns:repeat(3,1fr)">
         ${statCard('Proceeds', moneyOf(lc.proceeds),
           nat&&nat!==DISP()?`${money(legs.reduce((a,l)=>a+(l.proceeds||0),0),nat)} as filled`:'',
@@ -1294,9 +1392,21 @@ function positions(){
     if(!seen[key]){seen[key]={lc,rows:[]};buckets.push(seen[key]);}
     seen[key].rows.push(pos);
   });
+  /* A row resolves to its LIFECYCLE's replay where an open one claims it, so
+     clicking either leg of a strangle opens one chart showing both strikes --
+     the position is the strategy, not the contract. `lcByConid` is the same map
+     the grouping above uses and carries the same open-only rule the payload
+     applied, so the two agree on who claims what by construction. A row nothing
+     claims falls back to its own single-strike replay: that is the snapshot-only
+     case, which has no lifecycle anywhere and is otherwise the position with the
+     most history and no way to see it. */
+  const rkeyOf=pos=>{const lc=lcByConid[String(pos.conid)];
+    const key=(lc&&lc.replay_key)||('pos:'+pos.conid);
+    return (S.state.replays||{})[key]?key:null;};
   const row=pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
-    return `<tr><td class="mono">${esc(pos.symbol)}</td>
-    <td class="sparkcell">${sparkline(pos.spark)}</td>
+    const key=rkeyOf(pos); const shown=key&&S.replay===key;
+    return `<tr${key?` class="rk" data-replay="${esc(key)}"`:''}><td class="mono">${
+      esc(pos.symbol)}</td>
     <td class="side ${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
     <td class="n mono ${cls(pos.position)}">${pos.position}</td>
     <td class="n mono">${money(pos.mark_price,pos.currency)}</td>
@@ -1305,7 +1415,9 @@ function positions(){
     <td class="n mono ${cls(pos.unrealized.base)}">${moneyOf(pos.unrealized)}</td>
     <td class="dim">${esc(pos.currency)}</td>
     <td class="dim2">${ep.snapshot_only?'snapshot only':ep.entry_outside_window?'partial':'complete'}</td>
-  </tr>`;};
+  </tr>${shown?`<tr class="rpanel"><td colspan="9">${
+    replayPanel((S.state.replays||{})[key],'Unrealised',
+      `<b class="${cls(pos.unrealized.base)}">${moneyOf(pos.unrealized)}</b>`)}</td></tr>`:''}`;};
   const grpRow=bkt=>{
     /* Not `b` -- that name is the DOM button binding elsewhere in this page,
        and one name for two shapes blinds the payload guard to both. */
@@ -1319,11 +1431,13 @@ function positions(){
        checkable. Label spans contract..mark, the subtotal takes value, and a
        trailing span covers cost basis..record.
 
-       The label span is 5, not 4: the `trend` miniature added a column between
-       contract and side, and a colspan left at 4 would slide the subtotal one
-       column left into `mark` -- reintroducing the exact defect this comment
-       records fixing. Pinned by a test for that reason. */
-    return `<tr class="grp"><td colspan="5" class="dim">${esc(label)}</td>
+       The label span covers contract..mark, so it must equal the count of
+       columns before `value`. It is derived from the header in a test rather
+       than trusted, because a column added or removed anywhere to the left
+       slides the subtotal into a neighbouring column -- which is exactly the
+       "total in a column that is not its own" defect this comment records
+       fixing, and it has already happened once. */
+    return `<tr class="grp"><td colspan="4" class="dim">${esc(label)}</td>
       <td class="n mono ${cls(uv)}">${cash(uv)}</td>
       <td colspan="4"></td></tr>${bkt.rows.map(row).join('')}`;};
   return `<div class="card">
@@ -1333,7 +1447,7 @@ function positions(){
       starts. Grouped by the strategy each position was opened as.</div></div>
       <div class="pills"><span class="pill">book value
         <b class="${cls(val)}">${cash(val)}</b></span></div></div>
-    ${ps.length?`<table><thead><tr><th>contract</th><th>trend</th><th>side</th><th class="n">qty</th>
+    ${ps.length?`<table><thead><tr><th>contract</th><th>side</th><th class="n">qty</th>
       <th class="n">mark</th><th class="n">value</th><th class="n">cost basis</th>
       <th class="n">unrealised</th><th>price ccy</th><th>record</th></tr></thead><tbody>
       ${buckets.map(grpRow).join('')}</tbody></table>`:'<div class="empty">no open options</div>'}
@@ -1632,6 +1746,7 @@ function applyHash(){
      against the payload in draw(), not here: a day from another month means
      nothing in this one, and applyHash runs before the state it would check. */
   S.calday=hs.get('calday')||null;
+  S.replay=hs.get('replay')||null;
 }
 function syncHash(push){
   const hs=new URLSearchParams();
@@ -1643,6 +1758,7 @@ function syncHash(push){
   if(S.month) hs.set('month',S.month);
   if(S.ccy&&S.ccy!==BASE()) hs.set('ccy',S.ccy);
   if(S.calday) hs.set('calday',S.calday);
+  if(S.replay) hs.set('replay',S.replay);
   const next=hs.toString()?'#'+hs:'';
   if(next===(location.hash||'')) return;
   /* A tab jump is a navigation, so it pushes and the back button walks tabs.
@@ -1668,6 +1784,11 @@ function draw(push){
      already been written to the address bar. */
   if(S.calday&&S.state&&!(((S.state.stats||{}).days)||[])
       .some(dy=>dy.day===S.calday)) S.calday=null;
+  /* Same discipline for the replay key: a lifecycle that the current trade-type
+     filter excludes leaves its key describing nothing, and a key that outlives
+     its panel is how the old registry rotted. Checked before syncHash so the
+     address bar never carries a key the page cannot open. */
+  if(S.replay&&S.state&&!((S.state.replays||{})[S.replay])) S.replay=null;
   syncHash(push);
   renderTabs();
   renderCcy();
@@ -1686,6 +1807,11 @@ function draw(push){
   document.querySelectorAll('[data-calday]').forEach(el=>
     el.onclick=()=>{const k=el.dataset.calday;
       S.calday=S.calday===k?null:k;draw();});
+  /* Replay drill-down: same toggle, same pure redraw. Every bar is already in
+     the payload, so opening a chart costs no request. */
+  document.querySelectorAll('[data-replay]').forEach(el=>
+    el.onclick=()=>{const k=el.dataset.replay;
+      S.replay=S.replay===k?null:k;draw();});
   document.querySelectorAll('[data-calday-clear]').forEach(el=>
     el.onclick=()=>{S.calday=null;draw();});
   /* Server-side like the month filter, so the aggregations are recomputed

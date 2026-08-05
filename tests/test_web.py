@@ -244,6 +244,10 @@ def _shape_samples(state: dict) -> dict[str, dict]:
     costs = first(state["costs"])
     orders = state["orders"]
     history = state["history"]
+    replays = list(state["replays"].values())
+    # A replay whose contract has strikes -- an empty strikes list would leave
+    # the Strike shape unanchored and quietly exempt it from the contract.
+    striped = first([r for r in replays if r["strikes"]])
     samples = {
         "State": state,
         "Stats": state["stats"],
@@ -267,6 +271,8 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         "Cohort": state["odte"]["cohort"],
         "StrategyGroup": first(state["strategies"]),
         "Lifecycle": first(state["lifecycles"]),
+        "Replay": striped,
+        "Strike": first(striped["strikes"]) if striped else None,
         "Sync": state["sync"],
     }
     missing = sorted(k for k, v in samples.items() if v is None)

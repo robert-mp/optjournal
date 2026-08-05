@@ -8,6 +8,7 @@ offline and deterministic.
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 
 import pytest
 
@@ -16,8 +17,8 @@ from optjournal.bars import (
     BackfillOutcome,
     backfill_bars,
     bars_manifest,
-    decimate,
-    spark_series,
+    close_series,
+    replay_bars,
     upsert_bars,
 )
 from optjournal.db import connect, migrate
@@ -105,39 +106,13 @@ def test_occ_symbol_drops_ibkrs_padding():
 
 
 # --------------------------------------------------------------------------
-# decimation
+# windows
 # --------------------------------------------------------------------------
 
-def test_decimation_keeps_the_true_first_and_last_values():
-    """A sparkline's endpoint is what the eye reads as "where it is now".
-    Bucketing alone emits each bucket's min/max in occurrence order, so the
-    last element would be an extreme of the final bucket -- which had the LEAP's
-    miniature ending at 5.30 against a real mark of 8.20.
-    """
-    values = [float(n) for n in range(200)]
-    out = decimate(values, points=20)
-    assert out[0] == values[0]
-    assert out[-1] == values[-1]
+def _ts(day: str) -> int:
+    """Epoch seconds for a YYYY-MM-DD day, matching bars._epoch."""
+    return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC).timestamp())
 
-
-def test_decimation_preserves_extremes():
-    """Every-nth sampling would drop exactly the spike a sparkline exists to
-    show.
-    """
-    values = [1.0] * 100
-    values[47] = 99.0
-    out = decimate(values, points=10)
-    assert 99.0 in out, "the spike was averaged out of existence"
-
-
-def test_a_short_series_is_left_alone():
-    values = [1.0, 2.0, 3.0]
-    assert decimate(values, points=64) == values
-
-
-# --------------------------------------------------------------------------
-# the manifest
-# --------------------------------------------------------------------------
 
 def _option_trade(conn, *, conid, symbol, underlying, ucid, date, trade_id):
     conn.execute(
@@ -253,7 +228,7 @@ def test_an_unknown_bar_size_is_refused(conn):
                     source="yahoo", bars=[_bar(100)])
 
 
-def test_a_sparkline_never_splices_two_granularities(conn):
+def test_a_series_never_splices_two_granularities(conn):
     """One conid can hold hourly across a short trade AND daily across a LEAP.
     Selecting both would append two weeks of hourly to three years of daily and
     draw the join as a price move.
@@ -262,9 +237,75 @@ def test_a_sparkline_never_splices_two_granularities(conn):
                 source="yahoo", bars=[_bar(100, 10.0), _bar(200, 11.0)])
     upsert_bars(conn, conid="C1", symbol="AAA", bar_size="1h",
                 source="yahoo", bars=[_bar(300, 99.0), _bar(400, 98.0)])
-    daily = spark_series(conn, ["C1"], bar_size="1d")["C1"]
-    assert daily == [10.0, 11.0]
-    assert 99.0 not in daily
+    daily = close_series(conn, "C1", bar_size="1d")
+    assert daily == [(100, 10.0), (200, 11.0)]
+    assert 99.0 not in [close for _, close in daily]
+
+
+def test_a_series_carries_timestamps_and_drops_nulls(conn):
+    """Sessions are not evenly spaced -- weekends, holidays, and a half-length
+    15:30 bar -- so x cannot be inferred from position in the list. A quiet
+    strike with no print stays absent rather than becoming a zero.
+    """
+    upsert_bars(conn, conid="C1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(100, 10.0), _bar(200, None), _bar(300, 12.0)])
+    assert close_series(conn, "C1", bar_size="1d") == [(100, 10.0), (300, 12.0)]
+
+
+def test_a_series_clips_to_the_window_inclusively(conn):
+    upsert_bars(conn, conid="C1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(100, 1.0), _bar(200, 2.0), _bar(300, 3.0)])
+    got = close_series(conn, "C1", bar_size="1d", start=200, end=300)
+    assert got == [(200, 2.0), (300, 3.0)]
+
+
+def test_replay_picks_the_granularity_the_backfill_stored(conn):
+    """The chart must ask for what the manifest wrote. Both use _bar_size_for,
+    so a short trade gets hourly and a long one daily by construction rather
+    than by coincidence.
+    """
+    _option_trade(conn, conid="OPT1", symbol="AAA  260101P00100000",
+                  underlying="AAA", ucid="U1", date="2026-01-05", trade_id="o1")
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1h", source="yahoo",
+                bars=[_bar(_ts("2026-01-06"), 50.0), _bar(_ts("2026-01-07"), 51.0)])
+    got = replay_bars(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
+    assert got["bar_size"] == "1h"
+    assert got["conid"] == "U1"
+    assert [c for _, c in got["points"]] == [50.0, 51.0]
+
+
+def test_replay_falls_back_to_a_coarser_series_rather_than_drawing_nothing(conn):
+    """A partial backfill should degrade to a coarser chart, not a blank panel.
+    The size actually drawn is returned so the panel can say which it is.
+    """
+    _option_trade(conn, conid="OPT1", symbol="AAA  260101P00100000",
+                  underlying="AAA", ucid="U1", date="2026-01-05", trade_id="o1")
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(_ts("2026-01-06"), 50.0)])
+    got = replay_bars(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
+    assert got["bar_size"] == "1d", "hourly was empty, so daily should be drawn"
+    assert got["points"]
+
+
+def test_replay_of_a_snapshot_only_contract_draws_every_bar_held(conn):
+    """The LEAP has no opening fill anywhere, so its window is unknown. Drawing
+    everything held beats inventing an entry date by matching cost basis against
+    the series.
+    """
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(_ts("2025-02-03"), 10.0), _bar(_ts("2026-01-06"), 20.0)])
+    conn.execute(
+        "INSERT INTO securities (conid, symbol, underlying_symbol, underlying_conid,"
+        " raw, updated_at) "
+        "VALUES ('OPTX', 'AAA  270101C00700000', 'AAA', 'U1', '{}', 'now')"
+    )
+    got = replay_bars(conn, "AAA", opened_at=None, closed_at=None)
+    assert [c for _, c in got["points"]] == [10.0, 20.0]
+
+
+def test_replay_of_an_unknown_symbol_is_empty_not_invented(conn):
+    got = replay_bars(conn, "NOPE", opened_at="2026-01-05", closed_at="2026-01-12")
+    assert got == {"conid": None, "bar_size": None, "points": []}
 
 
 def test_backfill_collects_failures_without_abandoning_the_book(conn):

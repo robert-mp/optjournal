@@ -64,7 +64,8 @@ _HEADER = (
 )
 
 
-def page(tab="dashboard", body="", ccy=None, kind=None, calday=None, payload=None):
+def page(tab="dashboard", body="", ccy=None, kind=None, calday=None, replay=None,
+         payload=None):
     """A page as the browser really delivers it: markup, header and script.
 
     Built through the same three views `sweep_journal` uses, so a check that
@@ -73,7 +74,7 @@ def page(tab="dashboard", body="", ccy=None, kind=None, calday=None, payload=Non
     dom = ("<html><body>" + _HEADER.format(tab=tab) + body
            + _SCRIPT + "</body></html>")
     return Page(
-        tab=tab, ccy=ccy, kind=kind, calday=calday, dom=dom,
+        tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay, dom=dom,
         markup=browser.markup(dom), text=browser.rendered_text(dom),
         payload=payload or {"stats": {}},
     )
@@ -100,7 +101,7 @@ def _costs(pill, commission, per_unit):
 def _bare(dom, tab, payload=None):
     """A page from an explicit DOM, for checks about the frame itself."""
     return Page(
-        tab=tab, ccy=None, kind=None, calday=None, dom=dom,
+        tab=tab, ccy=None, kind=None, calday=None, replay=None, dom=dom,
         markup=browser.markup(dom), text=browser.rendered_text(dom),
         payload=payload or {"stats": {}},
     )
@@ -125,15 +126,15 @@ _CALENDAR_LIES = (
 )
 
 #: The check derives the expected spans from the header row, so the fixture has
-#: to carry one. Ten columns with `value` sixth means 5 before and 4 after.
+#: to carry one. Nine columns with `value` fifth means 4 before and 4 after.
 _POS_HEAD = (
-    "<tr><th>contract</th><th>trend</th><th>side</th><th>qty</th><th>mark</th>"
+    "<tr><th>contract</th><th>side</th><th>qty</th><th>mark</th>"
     "<th>value</th><th>cost basis</th><th>unrealised</th><th>price ccy</th>"
     "<th>record</th></tr>"
 )
 _POS_OK = (
     _POS_HEAD
-    + '<tr class="grp"><td colspan="5" class="dim">x</td><td></td>'
+    + '<tr class="grp"><td colspan="4" class="dim">x</td><td></td>'
       '<td colspan="4"></td></tr>'
 )
 #: The original: a colspan=8 label put the subtotal in the last column, under
@@ -141,6 +142,26 @@ _POS_OK = (
 _POS_WRONG_COLUMN = (
     _POS_HEAD + '<tr class="grp"><td colspan="8" class="dim">x</td><td></td></tr>'
 )
+
+_REPLAY_PAYLOAD = {
+    "stats": {},
+    "replays": {
+        "lc:C1@2026-07-24": {
+            "key": "lc:C1@2026-07-24", "underlying": "TSLA", "label": "Short put",
+            "bar_size": "1h", "points": [[100, 370.0], [200, 340.0], [300, 323.0]],
+            "strikes": [{"strike": 270.0, "put_call": "P", "side": "short"}],
+            "opened_at": "2026-07-24", "closed_at": "2026-08-03",
+        },
+    },
+}
+_REPLAY_OK = (
+    '<div class="replay"><svg><polyline class="pxline" points="1,2 3,4 5,6"/>'
+    '<text class="sklab">270P short</text></svg></div>'
+)
+#: The failure this excludes: an axis frame with no line reads as "this trade
+#: did nothing", which is a claim about the trade rather than about the data.
+_REPLAY_NO_LINE = '<div class="replay"><svg><text class="sklab">270P short</text></svg></div>'
+
 
 _SIDE_OK = '<td class="side buy">Long</td><td class="side sell">Short</td>'
 #: `side` alone has no hue; the column renders as unstyled text.
@@ -249,6 +270,12 @@ CASES: list[tuple[str, sweep.Check, Page, Page]] = [
      page(tab="calendar", calday="2026-08-04", body=_DRILL_OK, payload=_DRILL_PAYLOAD),
      page(tab="calendar", calday="2026-08-04", body=_DRILL_NO_SELECTION,
           payload=_DRILL_PAYLOAD)),
+    ("replay draws its line and strikes",
+     sweep.check_replay_renders_from_url,
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_OK,
+          payload=_REPLAY_PAYLOAD),
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_NO_LINE,
+          payload=_REPLAY_PAYLOAD)),
     ("drill-down legs carry ctx",
      sweep.check_drilldown_legs_have_context,
      page(tab="calendar", calday="2026-08-04", body=_DRILL_OK, payload=_DRILL_PAYLOAD),
@@ -301,6 +328,22 @@ def test_drilldown_heals_a_day_that_has_no_fills():
     lying = page(tab="calendar", calday="1999-01-01",
                  body="<h3>1999-01-01 — 3 fill(s)</h3>", payload=_DRILL_PAYLOAD)
     assert sweep.check_drilldown_renders_from_url(lying).status == FAIL
+
+
+def test_replay_heals_a_key_that_names_no_trade():
+    """A stale replay key must fall back, not draw an empty frame.
+
+    The trade-type filter changes which lifecycles exist, so a bookmarked key
+    legitimately stops resolving -- and an axis with no line is the same class of
+    lie as a drill-down panel captioned with a day that had no fills.
+    """
+    healed = page(tab="trades", replay="lc:nosuch@1999-01-01",
+                  body="<div>cards</div>", payload=_REPLAY_PAYLOAD)
+    assert sweep.check_replay_renders_from_url(healed).status == PASS
+
+    lying = page(tab="trades", replay="lc:nosuch@1999-01-01",
+                 body=_REPLAY_OK, payload=_REPLAY_PAYLOAD)
+    assert sweep.check_replay_renders_from_url(lying).status == FAIL
 
 
 def test_no_check_reads_the_raw_dom():

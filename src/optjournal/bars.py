@@ -2,7 +2,7 @@
 
 ``marketdata`` knows how to ask a source for OHLCV and nothing else. This
 module owns the journal-shaped half: which contract over which window, the
-idempotent write, and the decimated series a sparkline draws.
+idempotent write, and the timestamped series the replay chart draws.
 
 **The fetch set is derived, not scheduled.** A position's bar window is a
 finite, immutable interval -- once a position closes, the bars covering it
@@ -48,11 +48,10 @@ from optjournal.marketdata import BAR_SIZES, SOURCE_RANK, Bar, BarFetchError, fe
 __all__ = [
     "BackfillOutcome",
     "BarRequest",
-    "attach_sparks",
     "backfill_bars",
     "bars_manifest",
-    "decimate",
-    "spark_series",
+    "close_series",
+    "replay_bars",
     "upsert_bars",
 ]
 
@@ -72,10 +71,6 @@ HOURLY_LIMIT_DAYS = 40
 #: for the LEAP returned bars from 2025-02-03, the contract's listing date --
 #: so asking wide costs nothing and needs no guess about an unknown open date.
 SNAPSHOT_FLOOR_DAYS = 1100
-
-#: Points kept in a row sparkline. Enough for a ~120px miniature without
-#: shipping 459 values per row to draw 120 pixels.
-SPARK_POINTS = 64
 
 _COLUMNS = (
     "conid", "symbol", "bar_size", "ts",
@@ -316,82 +311,83 @@ def backfill_bars(
     )
 
 
-def decimate(values: list[float], points: int = SPARK_POINTS) -> list[float]:
-    """Thin a series to about ``points`` values, preserving extremes and ends.
-
-    Every-nth sampling would drop exactly the spikes a sparkline exists to
-    show, so each bucket contributes its minimum and its maximum in the order
-    they occurred. The result is therefore approximately ``points`` long, not
-    exactly.
-
-    The genuine first and last values are pinned verbatim. Bucketing alone
-    emits each bucket's min/max in occurrence order, so the final element would
-    be an extreme of the last bucket rather than the latest value -- and a
-    sparkline's endpoint is exactly what the eye reads as "where it is now".
-    Without this the LEAP's miniature ended at 5.30 against a real mark of
-    8.20.
-    """
-    if points < 2 or len(values) <= points:
-        return list(values)
-    buckets = max(1, points // 2)
-    size = len(values) / buckets
-    out: list[float] = []
-    for index in range(buckets):
-        chunk = values[int(index * size):int((index + 1) * size)] or []
-        if not chunk:
-            continue
-        low, high = min(chunk), max(chunk)
-        first_is_low = chunk.index(low) <= chunk.index(high)
-        out.extend([low, high] if first_is_low else [high, low])
-    if out:
-        out[0] = values[0]
-        out[-1] = values[-1]
-    return out
-
-
-def spark_series(
+def close_series(
     conn: sqlite3.Connection,
-    conids: list[str],
+    conid: str,
     *,
-    bar_size: str = "1d",
-    points: int = SPARK_POINTS,
-) -> dict[str, list[float]]:
-    """A decimated close series per conid, oldest first, newest last.
+    bar_size: str,
+    start: int | None = None,
+    end: int | None = None,
+) -> list[tuple[int, float]]:
+    """Timestamped closes for one conid at one granularity, oldest first.
 
-    ``bar_size`` is explicit and single because a conid can hold more than one
-    granularity: an underlying charted hourly across a short trade AND daily
-    across a LEAP. Selecting both and ordering by ``(bar_size, ts)`` would
-    splice three years of daily onto two weeks of hourly and draw the join as a
-    price move. A row miniature is a daily series; the full replay chart reads
-    the table directly and picks its own granularity.
+    ``bar_size`` is required and single, never "whatever this conid has". An
+    underlying legitimately holds BOTH hourly across a five-day trade and daily
+    across a LEAP; selecting both and ordering by ts would splice three years of
+    daily onto two weeks of hourly and draw the join as a price move.
 
-    Closes only: a sparkline needs the shape, not the range, and the renderer
-    normalises. Null closes are dropped rather than carried as gaps -- a
-    miniature has no room to distinguish the two, whereas the full chart does
-    and must.
+    Timestamps are carried, unlike the row miniature this replaces: a chart with
+    a real time axis cannot infer x from position in the list, because sessions
+    are not evenly spaced (weekends, holidays, and a half-length 15:30 bar).
+
+    Null closes are dropped. A quiet strike genuinely has no print, and the
+    window is clipped inclusively so a caller asking for a trade's span gets
+    exactly that span.
     """
-    if not conids:
-        return {}
-    placeholders = ", ".join("?" for _ in conids)
+    clauses = ["bar_size = ?", "conid = ?", "close IS NOT NULL"]
+    args: list[Any] = [bar_size, str(conid)]
+    if start is not None:
+        clauses.append("ts >= ?")
+        args.append(int(start))
+    if end is not None:
+        clauses.append("ts <= ?")
+        args.append(int(end))
     rows = conn.execute(
-        f"SELECT conid, ts, close FROM price_bars "
-        f"WHERE bar_size = ? AND conid IN ({placeholders}) AND close IS NOT NULL "
-        f"ORDER BY conid, ts",
-        [bar_size, *(str(c) for c in conids)],
+        f"SELECT ts, close FROM price_bars WHERE {' AND '.join(clauses)} ORDER BY ts",
+        args,
     ).fetchall()
-    gathered: dict[str, list[float]] = {}
-    for row in rows:
-        gathered.setdefault(str(row["conid"]), []).append(float(row["close"]))
-    return {conid: decimate(values, points) for conid, values in gathered.items()}
+    return [(int(r["ts"]), float(r["close"])) for r in rows]
 
 
-def attach_sparks(rows: list[dict[str, Any]], series: dict[str, list[float]]) -> None:
-    """Give each row its own ``spark`` series, keyed by the row's ``conid``.
+def replay_bars(
+    conn: sqlite3.Connection,
+    symbol: str,
+    *,
+    opened_at: str | None,
+    closed_at: str | None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """The underlying series a replay chart should draw for one trade window.
 
-    Writes into the rows the serializers just produced, not into anything the
-    grouping layers received -- those stay read-only lenses over their input,
-    an invariant the suite pins.
+    Granularity comes from the same ``_bar_size_for`` the manifest used, so what
+    the chart asks for is what the backfill stored -- a short trade gets its
+    hourly series and a LEAP its daily one, by construction rather than by
+    coincidence.
+
+    A preferred size that yields nothing falls back to the other, because a
+    partial backfill should degrade to a coarser chart rather than a blank one.
+    The size actually drawn is returned so the panel can say which it is: a
+    reader comparing two charts must not have to guess whether a flat stretch is
+    a quiet week or a coarser grid.
     """
-    for row in rows:
-        conid = str(row.get("conid") or "")
-        row["spark"] = series.get(conid, [])
+    conids = _underlying_conids(conn)
+    conid = conids.get(str(symbol or "").strip())
+    empty: dict[str, Any] = {"conid": None, "bar_size": None, "points": []}
+    if not conid:
+        return empty
+    moment = now or datetime.now(UTC)
+    start = _epoch(opened_at)
+    end = _epoch(closed_at) or int(moment.timestamp())
+    if start is None:
+        # No opening fill anywhere (a snapshot-only contract such as the LEAP).
+        # Its window is unknown, so draw every bar held rather than inventing an
+        # entry date by matching cost basis against the series.
+        start = 0
+    pad = PAD_DAYS * 86400
+    lo, hi = max(0, start - pad), end + pad
+    preferred = _bar_size_for(start or lo, end, kind="underlying")
+    for size in (preferred, "1d" if preferred == "1h" else "1h"):
+        points = close_series(conn, conid, bar_size=size, start=lo, end=hi)
+        if points:
+            return {"conid": conid, "bar_size": size, "points": points}
+    return {"conid": conid, "bar_size": preferred, "points": []}

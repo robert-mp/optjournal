@@ -69,6 +69,7 @@ class Page:
     ccy: str | None
     kind: str | None
     calday: str | None
+    replay: str | None
     #: The raw dump, INCLUDING the page's own <script> source. NO check reads
     #: this, deliberately: a pattern for a rendered cell matches the template
     #: literal that generates it just as well, and every structural check in
@@ -91,6 +92,8 @@ class Page:
             bits.append(f"type={self.kind}")
         if self.calday:
             bits.append(f"calday={self.calday}")
+        if self.replay:
+            bits.append(f"replay={self.replay}")
         return " ".join(bits)
 
     def url_hash(self) -> str:
@@ -101,6 +104,8 @@ class Page:
             parts.append(f"type={self.kind}")
         if self.calday:
             parts.append(f"calday={self.calday}")
+        if self.replay:
+            parts.append(f"replay={self.replay}")
         return "#" + "&".join(parts)
 
 
@@ -375,6 +380,47 @@ def check_closing_events_are_captioned(p: Page) -> Verdict:
     return ok()
 
 
+def check_replay_renders_from_url(p: Page) -> Verdict:
+    """A replay panel opens from the URL alone, with a price line and its strikes.
+
+    The panel is the only place the price bars are rendered, so a broken chart is
+    invisible to every other check: they read money and rows, and an empty <svg>
+    would still leave the card looking untouched.
+
+    A stale key must heal away rather than draw an empty frame -- an axis with no
+    line reads as "this trade did nothing", which is a claim about the trade
+    rather than about the data.
+    """
+    if not p.replay:
+        return skip("not a replay page")
+    replay = (p.payload.get("replays") or {}).get(p.replay)
+    if replay is None:
+        if 'class="replay"' in p.markup:
+            return bad(f"stale replay={p.replay} rendered a panel anyway")
+        return ok()
+    panels = p.markup.count('class="replay"')
+    if panels != 1:
+        return bad(f"{panels} replay panels rendered for one key, expected exactly 1")
+    if not replay["points"]:
+        # Honest empty state, not a blank chart pretending to be one.
+        if "no price bars stored" not in p.text:
+            return bad("no bars stored, but the panel does not say so")
+        return ok()
+    if 'class="pxline"' not in p.markup:
+        return bad("panel rendered but the underlying price line is absent")
+    drawn = len(re.findall(r'class="pxline" points="([^"]*)"', p.markup)[0].split())
+    if drawn != len(replay["points"]):
+        return bad(f"{drawn} points drawn, payload holds {len(replay['points'])}")
+    labels = re.findall(r'class="sklab"[^>]*>([^<]+)<', p.markup)
+    if len(labels) != len(replay["strikes"]):
+        return bad(f"{len(labels)} strike labels, payload holds {len(replay['strikes'])}")
+    for strike_row in replay["strikes"]:
+        want = f"{strike_row['put_call']} {strike_row['side']}"
+        if not any(lab.strip().endswith(want) for lab in labels):
+            return bad(f"no strike label reads '{want}': {labels}")
+    return ok()
+
+
 def check_drilldown_renders_from_url(p: Page) -> Verdict:
     """A calendar day panel opens from the URL alone, with one cell selected.
 
@@ -433,6 +479,7 @@ CHECKS: tuple[Check, ...] = (
     check_positions_side_is_colourable,
     check_no_blank_contract_cells,
     check_closing_events_are_captioned,
+    check_replay_renders_from_url,
     check_drilldown_renders_from_url,
     check_drilldown_legs_have_context,
 )
@@ -527,18 +574,29 @@ def sweep_journal(
         quotes = [q["code"] for q in (payload.get("fx") or {}).get("quotes") or []]
         quote = quotes[0] if quotes else None
 
-        coords: list[tuple[str, str | None, str | None, str | None]] = [
-            (t, c, k, None) for t, c, k in page_coords(quote)
+        coords: list[tuple[str, str | None, str | None, str | None, str | None]] = [
+            (t, c, k, None, None) for t, c, k in page_coords(quote)
         ]
         # Drill-downs, which only became URL-addressable when calday joined the
         # hash. One invented day proves the healing branch.
         all_days = (payload.get("stats") or {}).get("days") or []
         days = [d["day"] for d in all_days if d.get("trades")]
-        coords += [("calendar", None, None, d) for d in days[:caldays]]
-        coords += [("calendar", None, None, "1999-01-01")]
+        coords += [("calendar", None, None, d, None) for d in days[:caldays]]
+        coords += [("calendar", None, None, "1999-01-01", None)]
+        # Replay panels. A lifecycle key exercises the Trades entry point and a
+        # standalone position key the snapshot-only one -- the LEAP, whose chart
+        # is reachable ONLY from Positions because it has no lifecycle at all.
+        # One invented key proves the healing branch, the same shape as the
+        # invented calday above.
+        replays = payload.get("replays") or {}
+        lc_keys = [k for k in replays if k.startswith("lc:")]
+        pos_keys = [k for k in replays if k.startswith("pos:")]
+        coords += [("trades", None, None, None, k) for k in lc_keys[:2]]
+        coords += [("positions", None, None, None, k) for k in pos_keys[:1]]
+        coords += [("trades", None, None, None, "lc:nosuchconid@1999-01-01")]
 
-        for tab, ccy, kind, calday in coords:
-            page = Page(tab=tab, ccy=ccy, kind=kind, calday=calday,
+        for tab, ccy, kind, calday, replay in coords:
+            page = Page(tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay,
                         dom="", markup="", text="", payload=payload)
             dom = browser.dump_dom(base + "/" + page.url_hash(), profile)
             if dom is None:
@@ -546,7 +604,7 @@ def sweep_journal(
                     (name, page.label, [("render", skip("no browser produced a DOM"))])
                 )
                 continue
-            page = Page(tab=tab, ccy=ccy, kind=kind, calday=calday,
+            page = Page(tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay,
                         dom=dom, markup=browser.markup(dom),
                         text=browser.rendered_text(dom), payload=payload)
             result.pages.append((name, page.label, [(c.__name__, c(page)) for c in CHECKS]))
