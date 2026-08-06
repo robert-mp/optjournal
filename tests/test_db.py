@@ -365,7 +365,7 @@ def test_a_column_added_after_ship_reaches_an_existing_database(tmp_path):
     explicit ALTER is what makes the column real for them, and it must be
     idempotent because migrate() runs on every single connection.
     """
-    from optjournal.db import _ADDED_COLUMNS, connect, migrate
+    from optjournal.db import _ADDED_COLUMNS
 
     path = tmp_path / "j.db"
     conn = connect(path)
@@ -393,9 +393,7 @@ def test_commission_currency_is_stored_and_read_back(tmp_path):
     currency. It is on every row observed, but an assumption that is never
     checked fails silently, so the field is persisted and compared.
     """
-    from optjournal.db import connect, migrate
     from optjournal.demo import write_demo_statement
-    from optjournal.ingest import ingest_file
 
     statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     conn = connect(tmp_path / "demo.db")
@@ -425,9 +423,7 @@ def test_a_commission_billed_in_another_currency_warns_without_aborting(tmp_path
     an ingest. The native amount is still stored correctly either way -- only
     the base conversion would be suspect, so the run continues and says so.
     """
-    from optjournal.db import connect, migrate
     from optjournal.demo import write_demo_statement
-    from optjournal.ingest import ingest_file
 
     src = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     doctored = tmp_path / "doctored.xml"
@@ -466,9 +462,7 @@ def test_the_commission_warning_does_not_repeat_on_every_re_ingest(tmp_path):
     a USD instrument billed in USD -- there is no divergent row for it to
     notice. Hence a statement doctored to carry one.
     """
-    from optjournal.db import connect, migrate
     from optjournal.demo import write_demo_statement
-    from optjournal.ingest import ingest_file
 
     src = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     doctored = tmp_path / "doctored.xml"
@@ -514,9 +508,8 @@ def test_commission_currency_backfills_from_the_stored_raw(tmp_path):
     then a one-shot hook would silently never fire -- which is exactly the state
     the real journal was in. The work guards itself instead.
     """
-    from optjournal.db import _backfill_commission_currency, connect, migrate
+    from optjournal.db import _backfill_commission_currency
     from optjournal.demo import write_demo_statement
-    from optjournal.ingest import ingest_file
 
     statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     conn = connect(tmp_path / "demo.db")
@@ -551,9 +544,8 @@ def test_the_backfill_runs_on_open_without_a_version_bump(tmp_path):
     no command to remember, and no dependence on a version transition that has
     already happened.
     """
-    from optjournal.db import connect, migrate, open_journal
+    from optjournal.db import open_journal
     from optjournal.demo import write_demo_statement
-    from optjournal.ingest import ingest_file
 
     statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     conn = connect(tmp_path / "demo.db")
@@ -601,9 +593,8 @@ def test_a_wrongly_converted_commission_is_repaired_on_open(tmp_path):
     touched: a commission billed in base needs no conversion, so its base value
     is its native value. A third currency has no rate and is left alone.
     """
-    from optjournal.db import _repair_base_commission, connect, migrate, open_journal
+    from optjournal.db import _repair_base_commission, open_journal
     from optjournal.demo import write_demo_statement
-    from optjournal.ingest import ingest_file
 
     statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     conn = connect(tmp_path / "demo.db")
