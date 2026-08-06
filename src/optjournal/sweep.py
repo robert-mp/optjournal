@@ -81,30 +81,32 @@ class Page:
     #: because it is the only field with a default and a dataclass requires that.
     console: tuple[str, ...] = ()
 
+    def _coords(self) -> list[str]:
+        """The optional coordinates that are set, as `key=value`, in hash order.
+
+        One walk feeding both the label and the URL, which differ only in their
+        separators and whether `tab` carries its key. They were two twelve-line
+        methods stepping through the same four fields in lockstep, so a new
+        coordinate meant editing both -- and a page whose label disagreed with the
+        hash that produced it is a sweep report naming a page it did not render.
+        """
+        return [
+            f"{key}={value}"
+            for key, value in (
+                ("ccy", self.ccy),
+                ("type", self.kind),
+                ("calday", self.calday),
+                ("replay", self.replay),
+            )
+            if value
+        ]
+
     @property
     def label(self) -> str:
-        bits = [self.tab]
-        if self.ccy:
-            bits.append(f"ccy={self.ccy}")
-        if self.kind:
-            bits.append(f"type={self.kind}")
-        if self.calday:
-            bits.append(f"calday={self.calday}")
-        if self.replay:
-            bits.append(f"replay={self.replay}")
-        return " ".join(bits)
+        return " ".join([self.tab, *self._coords()])
 
     def url_hash(self) -> str:
-        parts = [f"tab={self.tab}"]
-        if self.ccy:
-            parts.append(f"ccy={self.ccy}")
-        if self.kind:
-            parts.append(f"type={self.kind}")
-        if self.calday:
-            parts.append(f"calday={self.calday}")
-        if self.replay:
-            parts.append(f"replay={self.replay}")
-        return "#" + "&".join(parts)
+        return "#" + "&".join([f"tab={self.tab}", *self._coords()])
 
 
 @dataclass(frozen=True, slots=True)

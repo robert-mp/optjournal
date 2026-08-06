@@ -110,6 +110,22 @@ def _day_of(value: str | None) -> str | None:
     return None
 
 
+def _category_where(asset_category: str | None) -> tuple[str, tuple[Any, ...]]:
+    """A trades WHERE clause narrowing to one asset category, or nothing.
+
+    `None` means every category, and returns an empty clause rather than a
+    tautology -- the callers interpolate this straight into their SQL.
+
+    One helper because the same predicate was spelled three ways across four
+    queries here: a ternary tuple twice, and twice as a `clauses` list built up
+    for a single condition that never gained a second one. Three spellings of one
+    rule is how a fix reaches some of the queries and not the rest.
+    """
+    if not asset_category:
+        return "", ()
+    return "WHERE asset_category = ?", (asset_category,)
+
+
 def fx_quotes(conn: sqlite3.Connection, base: str) -> list[dict[str, Any]]:
     """Alternative display currencies, with the rate converting base into each.
 
@@ -473,7 +489,7 @@ def available_months(
     Scoped, so the month dropdown cannot offer a month that the active filter
     has emptied -- picking one would show a blank dashboard and look broken.
     """
-    where, params = ("WHERE asset_category = ?", (asset_category,)) if asset_category else ("", ())
+    where, params = _category_where(asset_category)
     rows = conn.execute(
         f"SELECT DISTINCT trade_date, trade_id FROM trades {where}", params
     ).fetchall()
@@ -495,7 +511,7 @@ def available_years(
     Unscoped, unlike `available_months`: the only caller is the Annual tab,
     which shows no filter bar and so must not narrow. See `build_state`.
     """
-    where, params = ("WHERE asset_category = ?", (asset_category,)) if asset_category else ("", ())
+    where, params = _category_where(asset_category)
     rows = conn.execute(f"SELECT DISTINCT trade_date FROM trades {where}", params).fetchall()
     years = {d[:4] for d in (_day_of(r["trade_date"]) for r in rows) if d}
     return sorted(years, reverse=True)
@@ -685,11 +701,7 @@ def daily_series(
     IBKR's per-fill realisation on the fill's day.
     """
     episode_pnl = asset_category == _EPISODE_PNL_CATEGORY
-    clauses, params = [], []
-    if asset_category:
-        clauses.append("asset_category = ?")
-        params.append(asset_category)
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    where, params = _category_where(asset_category)
 
     # Counts and P&L rows accumulate separately because a `Money` is frozen:
     # the figure is built once per day, from every row that contributed, rather
@@ -785,11 +797,7 @@ def month_stats(
         asset_category=asset_category or "ALL",
     )
 
-    clauses, params = [], []
-    if asset_category:
-        clauses.append("asset_category = ?")
-        params.append(asset_category)
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    where, params = _category_where(asset_category)
 
     episode_pnl = asset_category == _EPISODE_PNL_CATEGORY
     orders: set[str] = set()
