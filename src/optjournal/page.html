@@ -1825,7 +1825,7 @@ function positions(){
     const key=rkeyOf(pos); const shown=key&&S.replay===key;
     return `<tr${key?` class="rk" data-replay="${esc(key)}"`:''}><td class="mono">${
       esc(pos.symbol)}</td>
-    <td class="side ${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
+    <td class="side">${esc(pos.side)}</td>
     <td class="n mono ${cls(pos.position)}">${pos.position}</td>
     <td class="n mono">${money(pos.mark_price,pos.currency)}</td>
     <td class="n mono">${moneyOf(pos.value)}</td>
