@@ -263,6 +263,47 @@ def test_years_are_newest_first_and_span_only_traded_years(conn):
     assert years == ["2026", "2025"]
 
 
+def test_the_annual_tab_ignores_the_month_selector_it_does_not_display(demo, tmp_path):
+    """The README's invariant: a tab's numbers change only in response to a
+    control that tab displays. Annual renders no filter bar.
+
+    Here rather than in `test_web.py` because that module's version is
+    structurally blind: it drives the REAL journal, which holds a single calendar
+    year, so `annual` has one row and a year-granular leak cannot change it. The
+    demo spans 2025 and 2026, which is the only fixture that can see this.
+
+    Mutation-verified: filtering `annual` by the selected month passed all 597
+    tests, and the observable effect is that picking a 2025 month silently deletes
+    the 2026 row from a tab with no month control on it -- the reader has nothing
+    on screen to explain why a year vanished.
+    """
+    from optjournal.web import build_state
+
+    db = tmp_path / "annual.db"
+    conn = connect_migrated(db)
+    ingest_file(conn, demo)
+    conn.close()
+
+    kw = {"db_path": db, "archive_dir": demo.parent, "query_id": None}
+    unfiltered = build_state(**kw)
+    years = [row["month"] for row in unfiltered["annual"]]
+    assert len(years) > 1, (
+        f"precondition: this fixture must span more than one year, got {years}"
+    )
+
+    # A month in the EARLIER year, so a leak would drop the later year's row.
+    earlier = next(m for m in reversed(unfiltered["months"]) if m.startswith(years[-1]))
+    filtered = build_state(**kw, month=earlier)
+    assert filtered["selected_month"] == earlier, "precondition: the filter applied"
+    assert filtered["stats"]["month"] == earlier, "the Dashboard SHOULD follow it"
+    assert [row["month"] for row in filtered["annual"]] == years, (
+        "the Annual tab followed the month selector, which it does not display"
+    )
+    assert filtered["annual_total"] == unfiltered["annual_total"], (
+        "the Annual total row moved with a control the tab does not render"
+    )
+
+
 def test_a_year_crossing_round_trip_counts_in_the_year_it_closed(conn):
     """The attribution rule, which the generated data cannot exercise.
 

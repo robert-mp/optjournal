@@ -153,6 +153,26 @@ MUTANTS: tuple[Mutant, ...] = (
         breaks="Decimals would reach the payload, so JSON carries strings",
     ),
     Mutant(
+        key="asset-sentinel",
+        module="cli.py",
+        find='        if raw.strip().upper() == "ALL"',
+        replace='        if False',
+        breaks="`ingest` would store ZERO trades and exit 0 -- silent total loss",
+    ),
+    Mutant(
+        key="annual-filter",
+        module="web.py",
+        find='        state["annual"] = [\n'
+             "            stats_data(s) for s in annual_stats(conn, "
+             "asset_category=asset_category)\n        ]",
+        replace='        state["annual"] = [\n'
+                "            stats_data(s) for s in annual_stats(conn, "
+                "asset_category=asset_category)\n"
+                "            if selected is None or s.month.startswith(selected[:4])\n"
+                "        ]",
+        breaks="the Annual tab would follow a month control it does not display",
+    ),
+    Mutant(
         key="quarantine",
         module="stats.py",
         find="from optjournal.money import Money, win_rate",
