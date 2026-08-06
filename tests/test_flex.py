@@ -29,14 +29,13 @@ KNOWN_UNMODELLED_SECTIONS = {
     "SecuritiesInfo",
     "CorporateActions",
     "Transfers",
-    # Anticipated, not yet emitted. The Flex query does not request Equity
-    # Summary today, which is why `Gain % of Net Liq` is a hardcoded em-dash --
-    # net liquidation value is the missing denominator for every return metric.
-    # Declared here in advance so enabling that section is a one-click change
-    # in IBKR rather than a one-click change plus a red build: the parser
-    # tolerates the section (verified by injecting it into a real statement) and
-    # `raw_sections` surfaces it generically, so nothing else needs to change to
-    # ingest it. Persisting it still requires a table and an ingest branch.
+    # Emitted, ingested, and load-bearing: the section is enabled on the Flex
+    # query, `ingest._ingest_equity_summaries` persists it (259 rows in the real
+    # journal), and it is the denominator behind `Gain % of Net Liq`. It appears
+    # in THIS set for a different reason from the rest -- not "we do not read it"
+    # but "py_ibkr does not model it", so it reaches us through the
+    # `sections.raw_sections` shim rather than as a typed attribute. That is what
+    # this set means: unmodelled by the parser, whatever we then do with it.
     "EquitySummaryInBase",
 }
 

@@ -21,6 +21,7 @@ understands.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -478,6 +479,30 @@ def test_the_matrix_covers_every_tab():
     """
     covered = {tab for tab, _, _ in sweep.page_coords("USD")}
     assert covered == set(sweep.TABS), f"tabs not swept: {set(sweep.TABS) - covered}"
+
+
+def test_sweep_tabs_match_the_tabs_the_page_declares():
+    """`sweep.TABS` against page.html's own `TABS`, which is the real list.
+
+    The test above holds the matrix to `sweep.TABS`, so both would stay green
+    while `sweep.TABS` itself drifted from the page -- and the drift is silent in
+    the direction that matters: add a tab to the UI, forget this tuple, and the
+    sweep reports "every page passed" over a page it never opened.
+
+    Parsed rather than imported because the page is the source: it is where a tab
+    is added, and a Python constant restating a JS literal is only ever a copy.
+    """
+    page = (
+        Path(sweep.__file__).resolve().parent / "page.html"
+    ).read_text(encoding="utf-8")
+    block = re.search(r"const TABS=\[(.*?)\n\];", page, re.S)
+    assert block, "page.html no longer declares a TABS array"
+    declared = re.findall(r"\['([a-z0-9]+)'", block.group(1))
+    assert declared, "no tab keys parsed out of page.html's TABS"
+    assert list(sweep.TABS) == declared, (
+        f"sweep.TABS is {list(sweep.TABS)} but the page declares {declared}. "
+        "A tab missing here is never swept, and the sweep still reports a pass."
+    )
 
 
 def test_the_matrix_exercises_both_axes():
