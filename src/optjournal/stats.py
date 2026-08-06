@@ -40,7 +40,7 @@ from datetime import date
 from typing import Any
 
 from optjournal.history import build_history
-from optjournal.money import Money
+from optjournal.money import Money, win_rate
 
 __all__ = [
     "ALL_TRADES",
@@ -285,8 +285,8 @@ class MonthStats:
 
     @property
     def win_rate(self) -> float | None:
-        decided = self.wins + self.losses
-        return None if not decided else self.wins / decided * 100.0
+        """See `money.win_rate`: None when nothing was decided, not zero."""
+        return win_rate(self.wins, self.losses)
 
     @property
     def green_days(self) -> int:
@@ -594,8 +594,8 @@ class Cohort:
 
     @property
     def win_rate(self) -> float | None:
-        decided = self.wins + self.losses
-        return None if not decided else self.wins / decided * 100.0
+        """See `money.win_rate`: None when nothing was decided, not zero."""
+        return win_rate(self.wins, self.losses)
 
     @property
     def avg_pnl(self) -> Money | None:

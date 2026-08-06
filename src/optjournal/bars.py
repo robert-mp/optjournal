@@ -70,6 +70,7 @@ __all__ = [
     "modelled_marks",
     "epoch_et",
     "et_day",
+    "expiry_epoch",
     "replay_bars",
     "upsert_bars",
 ]
@@ -645,13 +646,19 @@ class BandContract:
     anchors: tuple[tuple[int, float], ...] = ()
 
 
-def _expiry_epoch(expiry: str | None) -> int | None:
+def expiry_epoch(expiry: str | None) -> int | None:
     """Epoch of an option's expiry, at the 16:00 ET close of its expiry date.
 
     Both formats the payload actually carries are accepted: a leg states an
     expiry as ``2026-09-04`` while a position snapshot row keeps IBKR's raw
     ``20260918``. Handling one and rejecting the other silently produced a band
     for the snapshot-only LEAP and none for any traded lifecycle.
+
+    Public because `demo.py` prices its synthetic contracts against the same
+    expiry instant this module solves vol at. It had its own copy taking the zone
+    as a parameter and was called with `bars.MARKET_TZ` -- so the two agreed only
+    by the caller remembering to pass the right clock, for a value that is a
+    property of the market rather than of the caller.
     """
     text = str(expiry or "").strip()
     for fmt in ("%Y%m%d", "%Y-%m-%d"):
@@ -727,7 +734,7 @@ def _vol_series(
     }
     out: dict[str, list[tuple[int, float]]] = {}
     for contract in contracts:
-        expiry = _expiry_epoch(contract.expiry)
+        expiry = expiry_epoch(contract.expiry)
         if expiry is None:
             continue
         # A day of slack either side because the join is BY DAY and the source
@@ -835,7 +842,7 @@ def expected_move_band(
         return []
     expiries = [
         expiry
-        for expiry in (_expiry_epoch(c.expiry) for c in contracts if c.conid in vols)
+        for expiry in (expiry_epoch(c.expiry) for c in contracts if c.conid in vols)
         if expiry is not None
     ]
     if not expiries:
@@ -914,7 +921,7 @@ def modelled_marks(
         delta = 0.0
         priced = False
         for leg in legs:
-            expiry = _expiry_epoch(leg.expiry)
+            expiry = expiry_epoch(leg.expiry)
             series = vols.get(leg.conid)
             if expiry is None or not series:
                 continue

@@ -818,7 +818,14 @@ def write_demo_bars(conn) -> int:
     session on real data too. Emitting hourly option bars here would give the
     demo a fidelity the real journal cannot have.
     """
-    from optjournal.bars import MARKET_TZ, close_series, epoch_et, et_day, upsert_bars
+    from optjournal.bars import (
+        MARKET_TZ,
+        close_series,
+        epoch_et,
+        et_day,
+        expiry_epoch,
+        upsert_bars,
+    )
     from optjournal.blackscholes import bs_price, implied_vol
     from optjournal.marketdata import Bar
 
@@ -830,12 +837,15 @@ def write_demo_bars(conn) -> int:
         if not underlying or strike is None or right not in ("P", "C"):
             continue
         spots = close_series(conn, underlying, bar_size="1d")
-        expiry = _expiry_epoch_utc(contract["expiry"], MARKET_TZ)
+        expiry = expiry_epoch(contract["expiry"])
         if not spots or expiry is None:
             continue
 
-        anchor_at = epoch_et(contract["anchor_at"]) or _report_epoch(
-            contract["report_date"], MARKET_TZ
+        # A snapshot's report date names the session it describes, so its 16:00
+        # ET close is the instant the mark was taken -- the same parse an expiry
+        # needs, which is why both go through `bars.expiry_epoch`.
+        anchor_at = epoch_et(contract["anchor_at"]) or expiry_epoch(
+            contract["report_date"]
         )
         anchor_price = contract["anchor_price"]
         if anchor_at is None or anchor_price is None:
@@ -890,23 +900,6 @@ def write_demo_bars(conn) -> int:
                 bar_size="1d", source=SYNTHETIC_SOURCE, bars=bars,
             )
     return written
-
-
-def _expiry_epoch_utc(expiry, tz) -> int | None:
-    """Epoch of the 16:00 ET close on an expiry date, in either stored format."""
-    text = str(expiry or "").strip()
-    for fmt in ("%Y%m%d", "%Y-%m-%d"):
-        try:
-            day = datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-        return int(day.replace(hour=16, tzinfo=tz).timestamp())
-    return None
-
-
-def _report_epoch(report_date, tz) -> int | None:
-    """Epoch of a snapshot's report date, at the 16:00 ET close it describes."""
-    return _expiry_epoch_utc(report_date, tz)
 
 
 def _midnight_et(day: str, tz) -> int:

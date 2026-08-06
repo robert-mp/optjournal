@@ -711,9 +711,9 @@ def test_the_band_accepts_both_expiry_formats_the_payload_carries(conn):
     Handling one and rejecting the other produced a band for the LEAP and none
     for any traded lifecycle.
     """
-    from optjournal.bars import _expiry_epoch
-    assert _expiry_epoch("20260904") == _expiry_epoch("2026-09-04")
-    assert _expiry_epoch("nonsense") is None
+    from optjournal.bars import expiry_epoch
+    assert expiry_epoch("20260904") == expiry_epoch("2026-09-04")
+    assert expiry_epoch("nonsense") is None
 
 
 def test_backfill_collects_failures_without_abandoning_the_book(conn):

@@ -35,6 +35,25 @@ from typing import Any
 FILL_MONEY_FIELDS = ("proceeds", "commission", "realized_pnl")
 
 
+def win_rate(wins: int, losses: int) -> float | None:
+    """Percentage of decided outcomes that won, or None when none were decided.
+
+    ``None`` rather than ``0.0``, which is the whole reason this is a named
+    function: a win rate of zero means "everything lost", and a scope with no
+    closed round trips has not lost anything. The display shows an em dash for
+    the first and "0.0%" for the second, so collapsing them would report a
+    flawless month as a total failure.
+
+    Lives here, beside `Money`, because this module is the leaf every layer may
+    import and the rule was written out three times character for character --
+    `HistoryReport`, `MonthStats` and `Cohort` -- none of them carrying the
+    reasoning above. Three copies of an undocumented convention is how one of
+    them later "fixes" the None into a zero.
+    """
+    decided = wins + losses
+    return None if not decided else wins / decided * 100.0
+
+
 def one_currency(by_ccy: dict[str, float]) -> tuple[float | None, str | None]:
     """The total and its currency, when exactly one currency accounts for it.
 

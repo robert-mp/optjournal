@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from optjournal.money import win_rate
+
 __all__ = [
     "Episode",
     "HistoryReport",
@@ -244,8 +246,8 @@ class HistoryReport:
 
     @property
     def win_rate(self) -> float | None:
-        decided = self.wins + self.losses
-        return None if not decided else self.wins / decided * 100.0
+        """See `money.win_rate`: None when nothing was decided, not zero."""
+        return win_rate(self.wins, self.losses)
 
 
 #: Currency conversions are never position round trips. IBKR emits no
