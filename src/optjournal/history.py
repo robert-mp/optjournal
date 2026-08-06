@@ -251,6 +251,28 @@ class HistoryReport:
 NON_POSITION_CATEGORIES = frozenset({"CASH"})
 
 
+def _position_scope_where(asset_category: str | None) -> tuple[str, tuple[Any, ...]]:
+    """The category predicate the snapshot and the trade query must agree on.
+
+    `None` means every POSITION-BEARING category, which is not the same as no
+    filter: currency conversions never form a position, so the clause becomes a
+    `NOT IN` rather than an empty string. Deliberately unlike
+    `stats._category_where`, which has no exclusion and may return "" -- an
+    episode built from a scope the snapshot query did not share would decide
+    open-versus-closed against the wrong book.
+
+    One helper because this was written out twice, and the two copies had already
+    diverged in spelling (an inline `','.join(...)` against a named
+    `placeholders`), which is how the exclusion ends up applied in one query and
+    not the other.
+    """
+    if asset_category:
+        return "WHERE asset_category = ?", (asset_category,)
+    excluded = sorted(NON_POSITION_CATEGORIES)
+    placeholders = ",".join("?" for _ in excluded)
+    return f"WHERE asset_category NOT IN ({placeholders})", tuple(excluded)
+
+
 def _new_episode(row: Any) -> Episode:
     return Episode(
         conid=str(row["conid"] or ""),
@@ -319,13 +341,7 @@ def _held(
     conn: sqlite3.Connection, asset_category: str | None
 ) -> tuple[dict[str, Any], str | None]:
     """Open positions from the newest snapshot, keyed by conid, and its date."""
-    if asset_category:
-        where, params = "WHERE asset_category = ?", (asset_category,)
-    else:
-        excluded = sorted(NON_POSITION_CATEGORIES)
-        where = f"WHERE asset_category NOT IN ({','.join('?' for _ in excluded)})"
-        params = tuple(excluded)
-
+    where, params = _position_scope_where(asset_category)
     row = conn.execute(
         f"SELECT MAX(report_date) AS d FROM position_snapshots {where}", params
     ).fetchone()
@@ -388,15 +404,7 @@ def build_history(
     """
     held, snapshot_date = _held(conn, asset_category)
 
-    if asset_category:
-        where = "WHERE asset_category = ?"
-        params: tuple[Any, ...] = (asset_category,)
-    else:
-        excluded = sorted(NON_POSITION_CATEGORIES)
-        placeholders = ",".join("?" for _ in excluded)
-        where = f"WHERE asset_category NOT IN ({placeholders})"
-        params = tuple(excluded)
-
+    where, params = _position_scope_where(asset_category)
     rows = conn.execute(
         f"SELECT * FROM trades {where} "
         "ORDER BY conid, COALESCE(date_time, trade_date), trade_id",

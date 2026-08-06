@@ -234,6 +234,33 @@ def test_asset_scope_filters(conn):
     assert len(build_history(conn, asset_category=None).episodes) == 2
 
 
+def test_the_snapshot_and_the_trade_query_share_one_category_predicate():
+    """Both must scope identically, or an episode is judged against the wrong book.
+
+    `_held` reads the newest position snapshot to decide whether a pre-archive
+    episode is still open; `build_history` reads the trades. If one applied the
+    `NON_POSITION_CATEGORIES` exclusion and the other did not, a position would be
+    reconstructed from trades the snapshot query never considered -- and the
+    symptom is a wrong open/closed verdict, not an error.
+
+    The predicate was written out twice and the copies had already diverged in
+    spelling, which is how one of them ends up fixed alone. Asserted on the
+    helper's own output, including that `None` yields the exclusion rather than
+    an empty clause: an empty string here would silently widen both queries to
+    include currency conversions.
+    """
+    from optjournal.history import _position_scope_where
+
+    narrow, params = _position_scope_where("OPT")
+    assert narrow == "WHERE asset_category = ?" and params == ("OPT",)
+
+    wide, wide_params = _position_scope_where(None)
+    assert "NOT IN" in wide, "None must exclude non-position categories, not widen"
+    assert wide_params == tuple(sorted(NON_POSITION_CATEGORIES))
+    # One placeholder per excluded category, or sqlite raises on the bind.
+    assert wide.count("?") == len(NON_POSITION_CATEGORIES)
+
+
 # ------------------------------------------------------------------- totals
 
 
