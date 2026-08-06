@@ -82,6 +82,44 @@ def test_the_page_imports_the_module_rather_than_duplicating_it():
     assert 'type="module"' in page, "an ES module needs a module script tag"
 
 
+def test_the_page_imports_exactly_what_it_calls():
+    """No stale names in the import list, and nothing called without importing.
+
+    Both directions, because they fail differently. An unused import is a quiet
+    lie about what the page does -- three of them (`clampIndex`, `domainOf`,
+    `markAt`) had accumulated, each a function the page never calls and replay.js
+    uses internally, so a reader auditing the seam saw twelve names where nine
+    were live. A MISSING import is worse and louder: the page throws a
+    ReferenceError at render, which no Python-side test would catch.
+    """
+    page = PAGE.read_text()
+    block = re.search(r"import\s*\{([^}]*)\}\s*from\s*'/static/replay\.js'", page)
+    assert block, "no replay.js import block found in page.html"
+    imported = {n.strip() for n in block.group(1).split(",") if n.strip()}
+
+    # Comments stripped, or the comment explaining WHY a name was dropped from
+    # the import list counts as a use of it and the guard can never go green.
+    # Same line the payload-read guard draws, through the same helper.
+    body = code_only(page.replace(block.group(0), ""))
+    called = {name for name in imported if re.search(rf"\b{name}\b", body)}
+
+    assert imported == called, (
+        f"unused imports: {sorted(imported - called)}. Each is a name the page "
+        "claims to use and does not; drop it from the import list."
+    )
+    # The other direction: every exported name the page references must be
+    # imported, or it is an undefined identifier at runtime.
+    exported = set(re.findall(r"^export (?:function|const) (\w+)", MODULE.read_text(), re.M))
+    referenced = {
+        name for name in exported
+        if re.search(rf"(?<![\w.]){name}\s*\(", body) or re.search(rf"\b{name}\b", body)
+    }
+    assert referenced <= imported, (
+        f"page.html uses {sorted(referenced - imported)} without importing it, "
+        "which is a ReferenceError at render time"
+    )
+
+
 def test_the_page_does_not_redefine_what_the_module_exports():
     """Catches the specific rot this seam exists to prevent -- a helper copied
     back into the page during a quick fix, leaving the tested version orphaned.

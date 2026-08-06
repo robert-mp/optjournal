@@ -365,9 +365,14 @@ td.n,th.n{text-align:right}
      are no inline on* attributes anywhere in this page, so nothing depended on
      these functions being global. -->
 <script type="module">
+/* Only what the page actually calls. `clampIndex`, `domainOf` and `markAt` were
+   imported here and never used: each is called INSIDE replay.js (by frameAt and
+   plotGeometry) and unit-tested there directly, so they stay exported -- it was
+   only this import list that had gone stale. A stale name here reads as "the
+   page uses this", which is how the reader's map of what the page does drifts
+   from what it does. test_frontend pins the list against the calls. */
 import {
-  MIN_POINTS, bandEdges, clampIndex, deltaDomain, domainOf, frameAt, indexOfTs,
-  markAt, reachedEvents,
+  MIN_POINTS, bandEdges, deltaDomain, frameAt, indexOfTs, reachedEvents,
   plotGeometry, sessionBreaks, strikeSpan,
 } from '/static/replay.js';
 

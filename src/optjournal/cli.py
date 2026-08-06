@@ -104,6 +104,25 @@ def _open_db(args) -> sqlite3.Connection:
     return conn
 
 
+def _asset_filter(raw: str) -> tuple[str, ...]:
+    """Decode a `--assets` value into the tuple `ingest` and `serve` expect.
+
+    "ALL" is a sentinel rather than a category, so it becomes
+    `ASSET_FILTER_ALL`; anything else is a comma list of IBKR category codes,
+    upper-cased because the codes are (`OPT`, `STK`) and a lower-case `opt`
+    would silently match nothing.
+
+    One decoder because three subcommands took the same option and each spelled
+    the same four lines out -- the kind of copy where a fix to the parsing lands
+    in one command and not the others.
+    """
+    return (
+        ASSET_FILTER_ALL
+        if raw.strip().upper() == "ALL"
+        else tuple(a.strip().upper() for a in raw.split(",") if a.strip())
+    )
+
+
 # ------------------------------------------------------------------- commands
 
 
@@ -289,11 +308,7 @@ def cmd_demo(args) -> int:
 
 
 def cmd_ingest(args) -> int:
-    assets = (
-        ASSET_FILTER_ALL
-        if args.assets.strip().upper() == "ALL"
-        else tuple(a.strip().upper() for a in args.assets.split(",") if a.strip())
-    )
+    assets = _asset_filter(args.assets)
     paths = args.paths or sorted(args.archive.glob("activity-*.xml"))
     if not paths:
         return _no_statements(args)
@@ -487,11 +502,7 @@ def cmd_serve(args) -> int:
     """Run the local web UI. Blocks until interrupted."""
     from optjournal.web import serve
 
-    assets = (
-        ASSET_FILTER_ALL
-        if args.assets.strip().upper() == "ALL"
-        else tuple(a.strip().upper() for a in args.assets.split(",") if a.strip())
-    )
+    assets = _asset_filter(args.assets)
     # --db and --archive default to None on this subcommand, so an explicit path
     # always wins over --demo rather than being silently redirected.
     db = args.db or (DEFAULT_DEMO_DB if args.demo else DEFAULT_DB)
@@ -542,11 +553,7 @@ def cmd_sync(args) -> int:
         return EXIT_CONFIG
 
     started = datetime.now(UTC).isoformat(timespec="seconds")
-    assets = (
-        ASSET_FILTER_ALL
-        if args.assets.strip().upper() == "ALL"
-        else tuple(a.strip().upper() for a in args.assets.split(",") if a.strip())
-    )
+    assets = _asset_filter(args.assets)
 
     result = fetch(
         query_id,

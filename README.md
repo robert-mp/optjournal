@@ -59,10 +59,13 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `bars.py` | the journal-shaped half of price bars — which contract over which window (from episodes), the idempotent write, the series a chart reads, and the expected-move band |
 | `blackscholes.py` | option pricing and the implied vol backed out of a market price. A leaf: pure float maths, `math.erf` for the normal CDF, so no numpy or scipy |
 | `analysis.py` | cost/friction report from the raw statement (whole account); a leaf — imports nothing internal |
+| `strategies.py` | orders folded into the strategies they were placed as (a strangle sold as two same-second orders is one group), then linked into position lifecycles via episode trade ids |
 | `serialize.py` | the JSON payload the page renders and `--json` emits; wraps `analysis`'s per-currency ledgers into `Money` |
-| `render.py` | human-readable terminal reports |
+| `render.py` | human-readable terminal reports. Bound to `serialize`'s shapes by `tests/test_render.py`: it once read flat money keys the `Money` conversion had removed, and `orders`/`history` died on `float(dict)` behind a green suite |
+| `cli.py` | argparse wiring only: every command opens the database via `db.open_journal` and emits through `_emit(data, text, json)`, so `--json` comes for free |
 | `web.py` | loopback HTTP server; `ServeConfig` injected per server |
 | `page.html` | the entire frontend: no build step, no external resources |
+| `static/replay.js` | the replay chart's arithmetic as pure functions over plain data — no DOM, no globals — so `node --test` can unit-test the scales and the scrub. A function belongs here if it takes data and returns data; the moment it touches `document` it belongs in the page |
 | `browser.py` | headless browser discovery and the DOM dump, in three views: raw, markup (scripts stripped), text |
 | `sweep.py` | the page matrix and its checks; each a pure function of a rendered page |
 | `demo.py` | deterministic synthetic statement; refuses to touch real data |
