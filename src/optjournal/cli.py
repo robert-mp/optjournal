@@ -336,25 +336,31 @@ def cmd_bars(args) -> int:
     session never change, and the upsert makes a repeat a no-op. `--dry-run`
     prints the derived windows without spending a request, which is the way to
     see what a run would ask for before it asks.
+
+    `--live` narrows the run to what cannot be collected later -- the intraday
+    bars of a still-open option, which the source serves only while the session
+    is running. That is the market-hours poll; a full run is for everything else.
     """
     conn = _open_db(args)
+    live = getattr(args, "live", False)
 
     def day(epoch: int) -> str:
         return datetime.fromtimestamp(epoch, UTC).date().isoformat()
 
     if args.dry_run:
-        requests = bars_manifest(conn)
+        requests = bars_manifest(conn, perishable_only=live)
         data = [dataclasses.asdict(r) for r in requests]
         lines = [f"{len(requests)} window(s) derived, nothing fetched"]
         lines += [
             f"  {r.kind:<10} {r.symbol:<20} {r.bar_size}  "
             f"{day(r.start)} -> {day(r.end)}"
+            + ("  live-only" if r.perishable else "")
             for r in requests
         ]
         _emit(data, "\n".join(lines), args.json)
         return EXIT_OK if requests else EXIT_NO_DATA
 
-    outcome = backfill_bars(conn)
+    outcome = backfill_bars(conn, perishable_only=live)
     data = dataclasses.asdict(outcome)
     lines = [
         f"{outcome.written} bar(s) stored across {outcome.requested} window(s)"
@@ -661,6 +667,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="backfill price bars for the windows positions imply")
     p.add_argument("--dry-run", action="store_true",
                    help="print the derived windows without fetching anything")
+    p.add_argument("--live", action="store_true",
+                   help="only the intraday bars of open options, which the "
+                        "source serves during the session and never after")
     p.set_defaults(func=cmd_bars)
 
     p = sub.add_parser("sync", parents=[common, archive, database],

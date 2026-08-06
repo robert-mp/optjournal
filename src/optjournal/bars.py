@@ -139,6 +139,10 @@ class BarRequest:
     start: int
     end: int
     kind: str
+    #: True when this data exists only while the session is running and can
+    #: never be backfilled -- an option's intraday bars. Everything else can be
+    #: re-fetched at leisure, so only these justify polling during market hours.
+    perishable: bool = False
 
     @property
     def key(self) -> tuple[str, str]:
@@ -207,8 +211,15 @@ def _epoch(stamp: str | None) -> int | None:
 def _bar_size_for(start: int, end: int, *, kind: str) -> str:
     """Hourly for a short underlying window, daily otherwise.
 
-    An option leg is always daily: the source has no intraday option history,
-    so asking hourly would spend a request to receive an empty series.
+    An option leg's HISTORY is daily-only: the source keeps no intraday option
+    bars for a past session, so asking hourly over a historical window spends a
+    request to receive an empty series. Measured pre-market, every contract in
+    this book returned zero hourly bars while the underlying still returned five
+    days of them -- the retention is asymmetric, not merely short.
+
+    The live session is the exception, and `bars_manifest` handles it separately:
+    an option DOES serve hourly bars while its session is in progress. Those can
+    only be collected as they happen, never backfilled.
     """
     if kind == "option":
         return "1d"
@@ -239,12 +250,19 @@ def _underlying_conids(conn: sqlite3.Connection) -> dict[str, str]:
 
 
 def bars_manifest(
-    conn: sqlite3.Connection, *, now: datetime | None = None
+    conn: sqlite3.Connection, *, now: datetime | None = None,
+    perishable_only: bool = False,
 ) -> list[BarRequest]:
     """Every (contract, granularity, window) the journal's own positions imply.
 
     Windows for the same ``(conid, bar_size)`` are merged to their union, so an
     overlapping pair becomes one request rather than two.
+
+    ``perishable_only`` narrows the result to data that cannot be collected
+    later: the intraday bars of an option that is still open. That is what a
+    market-hours poll should ask for, and asking for the whole manifest seven
+    times a session would re-fetch three years of settled daily history to
+    collect a handful of new hourly rows.
     """
     moment = now or datetime.now(UTC)
     ceiling = int((moment + timedelta(days=1)).timestamp())
@@ -254,7 +272,9 @@ def bars_manifest(
     underlyings = _underlying_conids(conn)
     merged: dict[tuple[str, str], BarRequest] = {}
 
-    def add(conid: str, symbol: str, start: int, end: int, kind: str) -> None:
+    def add(
+        conid: str, symbol: str, start: int, end: int, kind: str, *, open_: bool
+    ) -> None:
         size = _bar_size_for(start, end, kind=kind)
         _emit(conid, symbol, start, end, kind, size)
         # An hourly underlying window ALSO needs its daily series, because the
@@ -266,13 +286,24 @@ def bars_manifest(
         # the same conid. One extra request per underlying per window.
         if kind == "underlying" and size == "1h":
             _emit(conid, symbol, start, end, kind, "1d")
+        # A STILL-OPEN option whose replay is drawn hourly also gets an hourly
+        # request, and it is the only perishable one in the manifest. Gated on
+        # the underlying's own granularity rule rather than a second threshold,
+        # so the option is collected hourly exactly when the chart renders it
+        # hourly: the strangles qualify, the LEAP does not -- months of hourly
+        # option bars would be thousands of rows the chart never draws.
+        if kind == "option" and open_ and _bar_size_for(
+            start, end, kind="underlying"
+        ) == "1h":
+            _emit(conid, symbol, start, end, kind, "1h", perishable=True)
 
     def _emit(
-        conid: str, symbol: str, start: int, end: int, kind: str, size: str
+        conid: str, symbol: str, start: int, end: int, kind: str, size: str,
+        *, perishable: bool = False,
     ) -> None:
         request = BarRequest(
             conid=str(conid), symbol=str(symbol), bar_size=size,
-            start=start, end=end, kind=kind,
+            start=start, end=end, kind=kind, perishable=perishable,
         )
         existing = merged.get(request.key)
         if existing is None:
@@ -283,6 +314,9 @@ def bars_manifest(
             start=min(existing.start, request.start),
             end=max(existing.end, request.end),
             kind=existing.kind,
+            # Sticky through a merge: two windows for one contract are the same
+            # rows, and if either was only collectable live then so is the union.
+            perishable=existing.perishable or request.perishable,
         )
 
     report = build_history(conn, asset_category="OPT")
@@ -296,13 +330,15 @@ def bars_manifest(
         end = min((closed + pad) if closed is not None else ceiling, ceiling)
         if end <= start:
             continue
-        add(episode.conid, episode.symbol, start, end, "option")
+        open_ = not episode.is_closed
+        add(episode.conid, episode.symbol, start, end, "option", open_=open_)
         name = (episode.underlying_symbol or "").strip()
         conid = underlyings.get(name)
         if name and conid:
-            add(conid, name, start, end, "underlying")
+            add(conid, name, start, end, "underlying", open_=open_)
 
-    return sorted(merged.values(), key=lambda r: (r.kind, r.symbol, r.bar_size))
+    requests = [r for r in merged.values() if r.perishable or not perishable_only]
+    return sorted(requests, key=lambda r: (r.kind, r.symbol, r.bar_size))
 
 
 def upsert_bars(
@@ -347,14 +383,18 @@ def backfill_bars(
     source: str = "yahoo",
     fetch: Callable[..., list[Bar]] = fetch_bars,
     now: datetime | None = None,
+    perishable_only: bool = False,
 ) -> BackfillOutcome:
     """Fetch and store every window the manifest names.
 
     ``fetch`` is injected so the suite can exercise the whole path without a
     network call. A per-request failure is collected rather than raised: one
     unreachable contract should not abandon the rest of the book.
+
+    ``perishable_only`` restricts the run to the intraday bars of open options --
+    the market-hours poll. See :func:`bars_manifest`.
     """
-    requests = bars_manifest(conn, now=now)
+    requests = bars_manifest(conn, now=now, perishable_only=perishable_only)
     written = skipped = 0
     failures: list[str] = []
     for request in requests:

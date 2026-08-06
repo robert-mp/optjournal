@@ -58,6 +58,58 @@ def _chart(stamps, **columns) -> dict:
 # marketdata: reading the wire
 # --------------------------------------------------------------------------
 
+def test_the_live_stub_bar_is_dropped():
+    """The bug this closes, found in the real DB. The source appends a synthetic
+    bar for the moment you asked, stamped at that moment rather than on the grid:
+    a 13:17 request returns 09:00, 10:00, 11:00, 12:00 and then 12:35. Its
+    timestamp is unique per request, so it upserts over nothing -- each poll
+    deposits a fresh phantom bar. Six such rows were already stored from two
+    backfills during one session, and polling hourly through a session would have
+    added seven a day per contract.
+    """
+    hour = 3600
+    base = 1785_000_000 - (1785_000_000 % hour)   # on the grid by construction
+    stamps = [base, base + hour, base + 2 * hour, base + 2 * hour + 2100]
+    bars = parse_chart(
+        _chart(stamps, open=[1.0] * 4, high=[1.0] * 4, low=[1.0] * 4,
+               close=[1.0, 2.0, 3.0, 4.0], volume=[1] * 4),
+        symbol="X", bar_size="1h",
+    )
+    assert [b.ts for b in bars] == stamps[:3], "the off-grid stub survived"
+    assert [b.close for b in bars] == [1.0, 2.0, 3.0]
+
+
+def test_the_grid_is_anchored_on_the_first_bar_not_the_clock():
+    """An underlying's hourly bars sit on the half hour (09:30 ET), an option's
+    on the hour. Anchoring on the first bar -- always a real session bar -- keeps
+    both correct without the parser knowing which asset it is reading, and
+    without depending on when it ran, which is what lets a fixture test it.
+    """
+    hour = 3600
+    base = 1785_000_000 - (1785_000_000 % hour) + 1800   # half-past grid
+    stamps = [base, base + hour, base + hour + 900]
+    bars = parse_chart(
+        _chart(stamps, open=[1.0] * 3, high=[1.0] * 3, low=[1.0] * 3,
+               close=[1.0] * 3, volume=[1] * 3),
+        symbol="X", bar_size="1h",
+    )
+    assert [b.ts for b in bars] == stamps[:2]
+
+
+def test_a_daily_bar_for_a_live_session_is_kept():
+    """Daily bars are deliberately NOT grid-filtered. A daily bar for a session
+    in progress is legitimately incomplete and the replay chart draws it as
+    "where it is now", so filtering it would delete the live point.
+    """
+    stamps = [1785_000_000, 1785_000_123]
+    bars = parse_chart(
+        _chart(stamps, open=[1.0, 1.0], high=[1.0, 1.0], low=[1.0, 1.0],
+               close=[1.0, 2.0], volume=[1, 1]),
+        symbol="X", bar_size="1d",
+    )
+    assert [b.ts for b in bars] == stamps
+
+
 def test_null_prices_survive_as_null():
     """The rule that outranks the rest. A quiet option strike has no print on
     roughly one session in five; writing 0.0 there would draw the position's
@@ -122,33 +174,103 @@ def _ts(day: str) -> int:
     return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC).timestamp())
 
 
-def _option_trade(conn, *, conid, symbol, underlying, ucid, date, trade_id):
+def _option_trade(conn, *, conid, symbol, underlying, ucid, date, trade_id,
+                  open_close="O", quantity=-1):
+    """One option fill. `open_close`/`quantity` default to a short open, and are
+    parameters so a test can close an episode -- which is what decides whether
+    the manifest asks for that contract's perishable intraday bars.
+    """
     conn.execute(
         "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, account_id,"
         " trade_date, date_time, asset_category, symbol, conid,"
         " underlying_symbol, underlying_conid, open_close, quantity,"
         " trade_price, currency, fx_rate_to_base, raw, source_file,"
         " first_seen_at)"
-        " VALUES (?,?,?, 'U1', ?, ?, 'OPT', ?, ?, ?, ?, 'O', -1, 1.0,"
+        " VALUES (?,?,?, 'U1', ?, ?, 'OPT', ?, ?, ?, ?, ?, ?, 1.0,"
         " 'USD', 1.0, '{}', 't.xml', 'now')",
         (trade_id, trade_id, trade_id, date, f"{date} 15:00:00",
-         symbol, conid, underlying, ucid),
+         symbol, conid, underlying, ucid, open_close, quantity),
     )
     conn.commit()
 
 
-def test_option_windows_are_daily_whatever_their_length(conn):
-    """Not a policy choice: the source serves option contracts at daily
-    granularity only, so asking hourly would spend a request to receive an
-    empty series.
+#: A fixed "now" so window lengths are arithmetic rather than wall-clock.
+_NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+
+
+def test_option_history_is_daily_only(conn):
+    """Not a policy choice: the source keeps no intraday bars for an option's
+    PAST sessions, so asking hourly over a historical window spends a request to
+    receive an empty series. Measured pre-market, every contract in the real book
+    returned zero hourly bars while its underlying still returned five days.
     """
     _option_trade(conn, conid="C1", symbol="AAA  260101P00100000",
                   underlying="AAA", ucid="U1", date="2026-01-05",
                   trade_id="t1")
-    requests = bars_manifest(conn)
-    options = [r for r in requests if r.kind == "option"]
+    options = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "option"]
     assert options, "no option window derived"
     assert {r.bar_size for r in options} == {"1d"}
+    assert not any(r.perishable for r in options), (
+        "a seven-month window cannot be collected live and must not claim to be"
+    )
+
+
+def test_a_short_open_option_also_asks_for_live_intraday_bars(conn):
+    """The one thing that cannot be backfilled. An option serves hourly bars
+    while its session runs and discards them afterwards, so the only way to hold
+    an hourly option series is to collect it as it happens.
+    """
+    _option_trade(conn, conid="C1", symbol="AAA  260801P00100000",
+                  underlying="AAA", ucid="U1", date="2026-08-03",
+                  trade_id="t1")
+    options = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "option"]
+    assert {r.bar_size for r in options} == {"1d", "1h"}
+    hourly = [r for r in options if r.bar_size == "1h"]
+    assert [r.perishable for r in hourly] == [True]
+    assert not any(r.perishable for r in options if r.bar_size == "1d"), (
+        "the daily series is settled history and can be re-fetched at leisure"
+    )
+
+
+def test_a_closed_option_asks_for_no_live_bars(conn):
+    """Its sessions are over, so its intraday bars are already gone. Asking
+    would spend a request per poll for a series the source will never return.
+    """
+    for trade_id, oc, qty in (("t1", "O", -1), ("t2", "C", 1)):
+        _option_trade(conn, conid="C1", symbol="AAA  260801P00100000",
+                      underlying="AAA", ucid="U1", date="2026-08-03",
+                      trade_id=trade_id, open_close=oc, quantity=qty)
+    options = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "option"]
+    assert options, "a closed contract still needs its daily history"
+    assert {r.bar_size for r in options} == {"1d"}
+
+
+def test_a_long_open_option_asks_for_no_live_bars(conn):
+    """The LEAP. Its replay is drawn daily over hundreds of sessions, so hourly
+    bars would be thousands of rows the chart never draws -- and the gate is the
+    chart's own granularity rule, not a second threshold that could disagree.
+    """
+    _option_trade(conn, conid="LEAP", symbol="AAA  270617C00700000",
+                  underlying="AAA", ucid="U1", date="2025-02-03",
+                  trade_id="t1")
+    options = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "option"]
+    assert {r.bar_size for r in options} == {"1d"}
+
+
+def test_perishable_only_narrows_to_what_cannot_wait(conn):
+    """What the market-hours poll asks for. Running the whole manifest seven
+    times a session would re-fetch years of settled daily history to collect a
+    handful of new hourly rows.
+    """
+    _option_trade(conn, conid="C1", symbol="AAA  260801P00100000",
+                  underlying="AAA", ucid="U1", date="2026-08-03",
+                  trade_id="t1")
+    full = bars_manifest(conn, now=_NOW)
+    live = bars_manifest(conn, now=_NOW, perishable_only=True)
+    assert len(full) > len(live), "the control: the filter must remove something"
+    assert live, "nothing derived for an open short-dated option"
+    assert all(r.perishable and r.kind == "option" and r.bar_size == "1h"
+               for r in live)
 
 
 def test_underlying_granularity_follows_the_window_length(conn):

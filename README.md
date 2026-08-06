@@ -108,6 +108,43 @@ the ET trading **day**, not the timestamp, because the source does not stamp the
 alike: an option's daily bar arrives at 04:00Z (midnight ET) while its
 underlying's arrives at 13:30Z (the session open).
 
+### Perishable data
+
+Bar retention is **asymmetric**, and the collection schedule follows from it
+rather than from convenience. Measured pre-market on 2026-08-06: every option
+contract in the book returned **zero** hourly bars, while its underlying still
+returned five days of them. An option's intraday series exists only while its
+session is running, so it cannot be backfilled at any price — miss the session
+and those bars are gone.
+
+That splits collection in two, and `bars_manifest` marks the difference with
+`BarRequest.perishable`:
+
+| | what | when | cron |
+|---|---|---|---|
+| Perishable | intraday bars of an **open** option whose replay is drawn hourly | only during its own session | `optjournal-bars-live`, hourly at :05 past, 10:05–16:05 **ET**, weekdays |
+| Re-fetchable | daily option closes, the whole underlying series | any time | `optjournal-bars-daily`, 12:30 Dublin, Tue–Sat |
+
+Both live in `cron/optjournal_bars.py`. `--live` restricts a run to the
+perishable set: running the full manifest seven times a session would re-fetch
+three years of settled daily history to collect a handful of new hourly rows.
+The LEAP is deliberately excluded from hourly collection — the gate is the
+chart's own granularity rule, so an option is collected hourly exactly when its
+replay is *drawn* hourly.
+
+The intraday series is **cumulative within a session** — a 13:00 poll returns
+every completed bar since the open — which is what makes a lost poll harmless
+and lets the cron treat a fetch failure as a quiet retry rather than an alert.
+
+`marketdata.parse_chart` drops bars off the series' own grid. The source appends
+a synthetic bar for the moment you asked, stamped at that moment: a 13:17 request
+returns 09:00, 10:00, 11:00, 12:00 and then **12:35**. That stamp is unique per
+request, so it upserts over nothing and every poll deposits a fresh phantom bar —
+six such rows were already stored from two backfills during one session, and
+polling hourly would have added seven a day per contract. Daily bars are
+deliberately *not* filtered: a daily bar for a session in progress is
+legitimately incomplete and the chart draws it as "where it is now".
+
 Layering rules (import direction only goes down this list):
 
 1. Entry points (`cli`, `web`) construct dependencies — paths from

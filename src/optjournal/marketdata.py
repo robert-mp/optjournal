@@ -194,7 +194,41 @@ def parse_chart(payload: Any, *, symbol: str, bar_size: str) -> list[Bar]:
         for index, stamp in enumerate(stamps)
         if stamp is not None
     ]
-    return sorted(bars, key=lambda bar: bar.ts)
+    return _on_grid(sorted(bars, key=lambda bar: bar.ts), bar_size)
+
+
+#: Seconds per intraday bar. Daily bars are deliberately absent: a daily bar for
+#: a session in progress is legitimately incomplete and the chart draws it as
+#: "where it is now", so grid-filtering it would delete the live point.
+_INTRADAY_SECONDS = {"1h": 3600}
+
+
+def _on_grid(bars: list[Bar], bar_size: str) -> list[Bar]:
+    """Intraday bars aligned to the series' own grid, dropping the live stub.
+
+    The source appends a synthetic bar for the moment you asked, stamped at that
+    moment rather than on the grid: a 13:17 request returns 09:00, 10:00, 11:00,
+    12:00 and then 12:35. Its timestamp is unique per request, so it does not
+    upsert over anything -- each poll deposits a fresh phantom bar. Six such rows
+    were already in this journal from two backfills during one session, and
+    polling hourly through a session would have added seven a day per contract.
+
+    Anchored on the FIRST bar's phase rather than the modal phase or a clock.
+    The first bar of a window is always a real session bar, whereas a modal vote
+    is ambiguous on a two-bar series and a clock comparison would make the parser
+    depend on when it ran -- untestable against a fixture, which is the whole
+    reason this function lives beside the reader rather than in the fetch.
+
+    One real bar is dropped by this: the underlying's post-close 16:00 print,
+    which is half an hour off a 09:30 grid. That costs nothing, because the
+    session's close is what the DAILY series carries -- the hourly series exists
+    to show movement WITHIN a session, not to restate its close.
+    """
+    seconds = _INTRADAY_SECONDS.get(bar_size)
+    if seconds is None or not bars:
+        return bars
+    phase = bars[0].ts % seconds
+    return [bar for bar in bars if bar.ts % seconds == phase]
 
 
 def _number(value: Any) -> float | None:
