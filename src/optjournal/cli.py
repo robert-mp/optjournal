@@ -561,7 +561,7 @@ def cmd_sync(args) -> int:
     # `first_seen_at` is stamped per row at insert, so anything at or after this
     # run's start timestamp is genuinely new to the journal rather than a row
     # re-presented by an overlapping statement.
-    new_trades = [
+    new_trade_rows = [
         dict(r)
         for r in conn.execute(
             "SELECT trade_date, symbol, buy_sell, open_close, quantity, trade_price,"
@@ -581,11 +581,22 @@ def cmd_sync(args) -> int:
         "raw_path": str(result.raw_path),
         "raw_bytes": result.raw_bytes,
         "already_ingested": ingested.already_ingested,
-        "new_trades": new_trades,
+        # A COUNT under `new_trades`, matching `web._do_sync` and the page's
+        # SyncResponse typedef. This key used to hold the row LIST here and the
+        # count there -- one name, two types, across two sync implementations
+        # that compute the same figure from the same table. Nothing broke,
+        # because each consumer only ever met one producer (the cron reads this
+        # payload, the page reads web's), which is exactly what makes it a trap:
+        # the first reader to meet the other shape would have iterated an int or
+        # formatted a list.
+        "new_trades": len(new_trade_rows),
+        # The rows themselves, under a name that says it is a list. The cron
+        # prints one line per fill from these.
+        "new_trade_rows": new_trade_rows,
         "new_cash": new_cash,
         "positions_written": ingested.positions_written,
         "warnings": ingested.warnings,
-        "changed": bool(new_trades or new_cash),
+        "changed": bool(new_trade_rows or new_cash),
     }
 
     lines = [f"sync {query_id}  {result.raw_bytes:,} bytes -> {result.raw_path.name}"]
@@ -597,8 +608,10 @@ def cmd_sync(args) -> int:
             f" {ingested.positions_written})"
         )
     else:
-        lines.append(f"  {len(new_trades)} new trade(s), {new_cash} new cash row(s)")
-        for t in new_trades:
+        lines.append(
+            f"  {len(new_trade_rows)} new trade(s), {new_cash} new cash row(s)"
+        )
+        for t in new_trade_rows:
             lines.append(
                 f"    {t['trade_date']}  {t['symbol']:<24}"
                 f" {t['open_close'] or '-'} {t['buy_sell'] or '-':<4}"

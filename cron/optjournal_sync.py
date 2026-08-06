@@ -164,9 +164,12 @@ def _run(query_id: str) -> subprocess.CompletedProcess[str]:
 
 
 def _describe(payload: dict) -> str:
-    trades = payload.get("new_trades") or []
+    # `new_trade_rows` is the row list; `new_trades` beside it is the COUNT, the
+    # same shape web._do_sync sends the page. They were once one key holding
+    # both, differing by which sync produced it.
+    trades = payload.get("new_trade_rows") or []
     lines = [
-        f"*IBKR sync* — {len(trades)} new trade(s), "
+        f"*IBKR sync* — {payload.get('new_trades', len(trades))} new trade(s), "
         f"{payload.get('new_cash', 0)} new cash row(s)"
     ]
     for t in trades:
