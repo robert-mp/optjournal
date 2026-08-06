@@ -13,10 +13,11 @@ coupling that matters is concentrated in three specific places, not spread throu
 work** whose hard part is not the parser — it is that `history.py` trusts IBKR to
 compute realised P&L. **Multi-tenancy is not a feature of this app**: the plumbing
 is ready, but the security model is a deliberate inversion, so it is a separate
-product decision rather than a refactor. And the test suite is not too large --
-measured, not guessed: a 16-defect mutation survey found a median of 2 tests per
-defect and no defect caught by more than 8, so there is nothing worth deleting
-for its own sake.
+product decision rather than a refactor. And the test suite is not too large, but
+that was the wrong question: it is **mis-aimed**. Median 2 tests per defect and
+none caught by more than 8, so there is nothing worth deleting -- yet a wider
+survey found real defects that all 597 tests miss, including one that makes
+`ingest` store nothing and exit 0. See [Measuring the suite](#the-test-suite-measured-and-the-answer-is-no).
 
 ## On dependency injection: yes, but narrowly
 
@@ -165,11 +166,26 @@ count -- see "the method" below, which mattered more than the results.
 | `web._snapshot_leg` takes abs() of the seeded quantity | **0** |
 | `web.serve` stops refusing a non-loopback bind | 4 |
 
-**The suite is not oversized. It is well-targeted.** Median 2 tests per defect;
-the maximum is 8, and that 8 is the Money gate -- a rule that genuinely spans four
-layers (money, analysis, strategies, web), so tests in four files noticing it is
-correct rather than redundant. There is no defect here caught by fifteen tests,
-which is the signature of coupling I went looking for and did not find.
+**The suite is not oversized. It is also not as well-targeted as this table
+suggested** -- two corrections, both from being challenged rather than from
+re-reading my own work:
+
+1. **The counts here were inflated by one.** The harness counted its own
+   stale-mutant guard as a catcher, because a mutation removes the very text that
+   guard looks for. Fixed in `2886cd1`. A disputed `_num` figure I reported as 11
+   is really 4. Corrected across 15 mutants: median 2, max 8, min 1 -- the shape
+   holds, the numbers were wrong.
+
+2. **Median-2 measures the defects I chose, not the codebase.** This survey covered
+   8 of 22 modules. A wider one found real defects that all 597 tests miss, and the
+   worst was in code written the same day: dropping the `"ALL"` sentinel from
+   `cli._asset_filter` makes `optjournal ingest` store ZERO trades, positions and
+   securities and exit 0. Every test passed because they all hand
+   `ingest_file` the already-decoded `ASSET_FILTER_ALL` constant and never
+   exercise the decoder. Closed in `a1f34d1`.
+
+So "do the tests earn their place" and "does the suite cover the code" are
+different questions, and answering the first was not evidence for the second.
 
 Both zeroes are now closed (`f3a23dd`, `3709773`), and they were different in
 kind. `_flat` was a genuine test gap on a live path -- it decides whether a round
@@ -211,6 +227,7 @@ Independently shippable, in order. Effort is my estimate of focused work.
 | ~~2~~ | ~~Mutation survey~~ — **DONE**: 16 defects, table above. | — | — |
 | ~~3~~ | ~~Cut redundant tests~~ — **DONE, as nothing to cut**: median 2 tests/defect. Instead CLOSED the two zeroes (`f3a23dd`, `3709773`). | — | — |
 | ~~4~~ | ~~Scope `assert_not_real` by data~~ — **DONE** (`1370bca`), and it unblocked the survey. | — | — |
+| 4b | Sentinels for the remaining audit findings: `analysis.py` (abs on quantity, `credit_fills` `>` vs `>=`, fee currency attribution, the FEES gate, withholding sign), `serialize._wire` enum leak, `positions_data` cost-basis fallback, `render.table` header sizing, `web._strikes_of` side-from-last-fill, `flex` cooldown ordering, `sources._qty` fractional branch. | Each is a real output change no test sees; two of the same batch were verified and closed in `a1f34d1`. | M |
 | 5 | Add `broker` to the schema; make `(broker, trade_id)` the identity. Migrate the existing journal as `ibkr`. | Cheap now, expensive after a second broker's rows land. | M |
 | 6 | Honour `account_id` in the domain queries, or state in the README that one file means one account. | Latent silent-merge defect; same scoping fix as step 5. | M |
 | 7 | Introduce `NormalisedFill` + a `StatementSource` Protocol; move py_ibkr attribute reads out of `ingest.py` into `sources/ibkr.py`. Registry like `SCOPE_BUILDERS`. | The actual seam. Makes a second broker additive rather than invasive. | L |
