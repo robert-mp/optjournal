@@ -13,8 +13,10 @@ coupling that matters is concentrated in three specific places, not spread throu
 work** whose hard part is not the parser — it is that `history.py` trusts IBKR to
 compute realised P&L. **Multi-tenancy is not a feature of this app**: the plumbing
 is ready, but the security model is a deliberate inversion, so it is a separate
-product decision rather than a refactor. And the test suite is not too large; it
-is concentrated in the wrong places, which is a different fix.
+product decision rather than a refactor. And the test suite is not too large --
+measured, not guessed: a 16-defect mutation survey found a median of 2 tests per
+defect and no defect caught by more than 8, so there is nothing worth deleting
+for its own sake.
 
 ## On dependency injection: yes, but narrowly
 
@@ -130,29 +132,74 @@ The correct next step is not code, it is deciding whether you want a hosted prod
 If you do, the work is an auth layer plus per-tenant isolation at the entry points,
 and the domain follows unchanged. That is the payoff for the layering discipline.
 
-The one cheap thing worth doing regardless is `demo.assert_not_real`, which scopes
-demo/real separation by PATH. Per-tenant paths would multiply the paths it must
-know about; scoping it by DATA (as `write_demo_bars` already does) is more robust
-and is a small, independently valuable change.
+One cheap thing was worth doing regardless, and is now done (`1370bca`):
+`demo.assert_not_real` scoped demo/real separation by PATH, so per-tenant paths
+would have multiplied what it had to know. It now asks the DATA, as
+`write_demo_bars` already did. That turned out to fix a live defect rather than
+merely prepare for one -- the path test refused only the developer's own checkout
+and waved through every copy of it, and it was also why the suite failed from a
+copied tree, which had blocked the mutation survey entirely.
 
-## The test suite: concentrated wrongly, not oversized
+## The test suite: measured, and the answer is "no"
 
-Your hunch is right in aggregate and wrong where it counts. Evidence, from
-mutation testing in a scratch clone:
+Mutation survey, 16 real defects injected one at a time in scratch clones. Each
+run proved the mutation was the code pytest actually imported before trusting the
+count -- see "the method" below, which mattered more than the results.
 
-**Dropped the `len(live) != 1` guard in `money.one_currency`** — so a figure
-spanning USD, SEK and KRW claims to be a USD figure, the exact defect the Money
-model exists to prevent. Result: **1 of 579 tests failed, and it was an unrelated
-path test in `test_demo.py`. All 11 money tests passed.** The real journal has
-stock trades in four currencies, so this is not hypothetical.
+| defect | tests that caught it |
+|---|---|
+| `money.one_currency` gate: report the first of several currencies | 8 |
+| `Money.payload` omits null keys instead of always emitting three | 3 |
+| `Money.__abs__` drops the currency | 1 |
+| `Money.per` divides base only, not native | 1 |
+| `money.win_rate` returns 0.0 instead of None when nothing decided | 1 |
+| `history._flat` accepts a 0.5 residual | **0** |
+| `stats._in_period` compares the raw stored value, not the normalised day | 1 |
+| `month_stats` attributes closed P&L by opened date | 2 |
+| `marketdata._on_grid` keeps the off-grid live stub | 2 |
+| `bars.epoch_et` reads journal stamps as UTC, not ET | 2 |
+| `bars.expiry_epoch` accepts only one of the two stored formats | 3 |
+| `bars.replay_model` stops sharing the vol solve | 1 |
+| `ingest._commission_base` always converts, ignoring the currency | 1 |
+| `render._charged` reads base where it means native | 2 |
+| `web._snapshot_leg` takes abs() of the seeded quantity | **0** |
+| `web.serve` stops refusing a non-loopback bind | 4 |
 
-So the suite has a hole at its most load-bearing invariant, while `test_web.py` is
-1,770 lines largely greping page source. Cutting by count would make it worse.
-The right sequence is: measure with mutation testing, add sentinels where defects
-survive, and only then delete the tests that were shown to catch nothing a sharper
-test already catches. A test that caught a real shipped bug stays regardless — the
-README and several docstrings name those (the `render.py` Money keys, the
-`o.fill_count` blank panel, three sweep checks that could never fail).
+**The suite is not oversized. It is well-targeted.** Median 2 tests per defect;
+the maximum is 8, and that 8 is the Money gate -- a rule that genuinely spans four
+layers (money, analysis, strategies, web), so tests in four files noticing it is
+correct rather than redundant. There is no defect here caught by fifteen tests,
+which is the signature of coupling I went looking for and did not find.
+
+Both zeroes are now closed (`f3a23dd`, `3709773`), and they were different in
+kind. `_flat` was a genuine test gap on a live path -- it decides whether a round
+trip is CLOSED, and fractional stock lots make it reachable on real data.
+`_snapshot_leg` was a FIXTURE gap: the path is unreachable in both journals
+because every short they hold is claimed by an open lifecycle, so no test could
+have caught it without constructing the case.
+
+So the honest revision to the hunch: there is nothing worth deleting for its own
+sake. The `test_web.py` source-greping is the one place I would still look, but it
+is 1,770 lines *because* the frontend has no executable seam -- the fix is more
+`replay.js`-style extraction, and the regex guards then fall away as a
+consequence. That is a frontend task, not a test-cutting task.
+
+### The method, because it produced three false results first
+
+Every one of these failures presented as "the mutation was caught by nothing" --
+an alarming coverage result rather than a broken harness:
+
+1. `uv run pytest` inside a clone resolves to the ORIGINAL project.
+2. `cp -R` copies `.venv`, whose editable-install `.pth` hardcodes the original
+   repo's `src`, so even the clone's own interpreter imported the original.
+3. On macOS `/tmp` is a symlink to `/private/tmp`, so the guard I added to catch
+   (1) and (2) rejected correct clones.
+
+The working recipe: clone, rewrite `.venv/.../_editable_impl_optjournal.pth` to
+the clone's `src`, then run `env -u PYTHONPATH -u VIRTUAL_ENV .venv/bin/python -m
+pytest`, and assert with a canary that the imported module lives under the clone
+before believing any number. My first "1 of 579" claim about the Money gate came
+from (1) and was wrong: the real answer is 8.
 
 ## Tasks
 
@@ -160,10 +207,10 @@ Independently shippable, in order. Effort is my estimate of focused work.
 
 | # | Task | Why now | Effort |
 |---|---|---|---|
-| 1 | Add the `one_currency` gate sentinel: a mixed-currency ledger must withhold `native`. | A measured hole at the model's core invariant. Cheapest, highest-value item here. | S |
-| 2 | Full mutation survey (~15 defects) in a scratch clone; record which tests caught each. | Turns "too many tests" into evidence. Cutting without it is guessing. | M |
-| 3 | Cut what step 2 proves redundant; keep every test that pins a shipped bug. | The entropy you actually asked about, done from data. | M |
-| 4 | Scope `assert_not_real` by data rather than path. | Independently right; removes a path assumption before any tenant work. | S |
+| ~~1~~ | ~~`one_currency` gate sentinel~~ — **VOID**: already guarded by 8 tests. My "1 of 579" was a broken-harness artefact. | — | — |
+| ~~2~~ | ~~Mutation survey~~ — **DONE**: 16 defects, table above. | — | — |
+| ~~3~~ | ~~Cut redundant tests~~ — **DONE, as nothing to cut**: median 2 tests/defect. Instead CLOSED the two zeroes (`f3a23dd`, `3709773`). | — | — |
+| ~~4~~ | ~~Scope `assert_not_real` by data~~ — **DONE** (`1370bca`), and it unblocked the survey. | — | — |
 | 5 | Add `broker` to the schema; make `(broker, trade_id)` the identity. Migrate the existing journal as `ibkr`. | Cheap now, expensive after a second broker's rows land. | M |
 | 6 | Honour `account_id` in the domain queries, or state in the README that one file means one account. | Latent silent-merge defect; same scoping fix as step 5. | M |
 | 7 | Introduce `NormalisedFill` + a `StatementSource` Protocol; move py_ibkr attribute reads out of `ingest.py` into `sources/ibkr.py`. Registry like `SCOPE_BUILDERS`. | The actual seam. Makes a second broker additive rather than invasive. | L |
