@@ -18,7 +18,7 @@ import shutil
 import subprocess
 
 import pytest
-from conftest import ROOT
+from conftest import ROOT, code_only
 
 MODULE = ROOT / "src" / "optjournal" / "static" / "replay.js"
 SUITE = ROOT / "tests" / "frontend"
@@ -64,20 +64,9 @@ _BROWSER_ONLY = (
 )
 
 
-def _code_only(source: str) -> str:
-    """The module minus its comments.
-
-    The first version of this check matched the word `document` inside a comment
-    explaining that documents are forbidden here -- a scan that fails on its own
-    documentation tests spelling, not structure.
-    """
-    without_blocks = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
-    return re.sub(r"^\s*//.*$", "", without_blocks, flags=re.M)
-
-
 @pytest.mark.parametrize("token", _BROWSER_ONLY)
 def test_the_pure_module_touches_no_browser_api(token):
-    source = _code_only(MODULE.read_text())
+    source = code_only(MODULE.read_text())
     assert token not in source, (
         f"replay.js references {token!r}. Move it to page.html: this module has "
         "to stay importable by node, with no DOM and no globals."

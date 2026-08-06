@@ -19,6 +19,7 @@ back to the behaviour it exercises.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -68,6 +69,31 @@ def connect_migrated(path: Path) -> sqlite3.Connection:
     c = connect(path)
     migrate(c)
     return c
+
+
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+#: The `(?<!:)` keeps `://` in a URL from being mistaken for a comment start.
+#: A protocol-relative `"//host"` would still be stripped, which is acceptable
+#: here: `test_page_loads_no_external_resources` asserts the page has none.
+_LINE_COMMENT = re.compile(r"(?<!:)//[^\n]*")
+
+
+def code_only(source: str) -> str:
+    """JavaScript with its comments removed, so prose is not scanned as code.
+
+    Both JS guards need this and each had grown its own version. They had
+    drifted into different behaviour: this one strips a comment wherever it
+    starts, while `test_frontend`'s only matched comments occupying a WHOLE line
+    (`^\\s*//.*$`), so a trailing `const x = 1; // reads document.title` left the
+    word `document` in the "code" and would have failed that module's
+    browser-API check on its own documentation. Verified, not assumed.
+
+    Regex rather than a real tokenizer, which is sound for these two files: they
+    use block comments almost exclusively, the markers are balanced (asserted by
+    `test_page_comments_are_balanced`), and neither puts a comment marker inside
+    a string literal. The helper is tested directly rather than trusted.
+    """
+    return _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", source))
 
 
 def add_statement(

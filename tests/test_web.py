@@ -21,7 +21,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from conftest import RAW_DIR
+from conftest import RAW_DIR, code_only
 
 from optjournal import web
 from optjournal.cli import main
@@ -34,16 +34,6 @@ from optjournal.config import (
 from optjournal.db import connect, migrate
 from optjournal.history import build_history
 from optjournal.web import build_state, page_html, serve
-
-#: Attributes on DOM nodes, promises and builtins -- not API payload keys.
-_NOT_PAYLOAD = {
-    "addEventListener", "background", "catch", "className", "color", "disabled",
-    "filter", "isoformat", "join", "json", "length", "map", "ok", "push",
-    "querySelector", "replace", "status", "style", "textContent", "then",
-    "title", "toLocaleString", "some", "find", "forEach", "concat", "padStart",
-    "split", "slice", "onclick", "onchange", "classList", "dataset",
-    "innerHTML", "add", "remove", "getDay", "getDate", "toFixed",
-}
 
 
 @pytest.fixture
@@ -76,33 +66,17 @@ def _js() -> str:
     return _IMPORT.sub("", script, count=1)
 
 
-_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
 #: The leading ES module import. Dropped from the scanned script rather than
-#: stripped by _code_only, because its quoted path parses as a property read on a
-#: binding named `replay` that exists nowhere -- and stripping ALL string
+#: stripped by `code_only`, because its quoted path parses as a property read on
+#: a binding named `replay` that exists nowhere -- and stripping ALL string
 #: literals broke the tests that legitimately assert on them.
 _IMPORT = re.compile(r"^\s*import\s*\{[^}]*\}\s*from\s*['\"][^'\"]+['\"];?", re.M)
-#: The `(?<!:)` keeps `://` in a URL from being mistaken for a comment start.
-#: A protocol-relative `"//host"` would still be stripped, which is acceptable
-#: here: `test_page_loads_no_external_resources` asserts the page has none.
-_LINE_COMMENT = re.compile(r"(?<!:)//[^\n]*")
 
-
-def _code_only(js: str) -> str:
-    """The script with comments removed, so prose is not scanned as code.
-
-    The guards below look for `ident.attr`. A comment that mentions a dotted
-    expression in passing -- "this used to read from history.open" -- is
-    indistinguishable from a real property access, and tripped the
-    classification guard with a binding that exists nowhere in the code. A
-    comment is not code, so it must not be scanned.
-
-    Stripping is regex-based rather than a real tokenizer, which is sound for
-    this file: it uses block comments exclusively, they are balanced, and it
-    contains no `://` and no comment markers inside string literals. The
-    helper is tested directly rather than trusted.
-    """
-    return _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", js))
+#: Shared with test_frontend, which needs the same stripping over replay.js. The
+#: guards below look for `ident.attr`, and a comment mentioning a dotted
+#: expression in passing -- "this used to read from history.open" -- is
+#: indistinguishable from a real property access.
+_code_only = code_only
 
 
 def test_code_only_strips_comments_and_keeps_code():
@@ -358,13 +332,19 @@ def test_every_js_property_read_resolves():
     touching a fixture."""
     shapes, bindings, _ = _parse_contract(_js())
     js = _code_only(_js())
+    # No suppression list. There used to be one -- 39 DOM, promise and builtin
+    # attribute names -- left over from before the contract moved into the page.
+    # It suppressed nothing: the `@payload`/`@local` table now decides which
+    # bindings are scanned at all, so a DOM node's binding is classified `@local`
+    # and never reaches this loop. Keeping it was actively unsafe, because `ok`
+    # and `status` are BOTH in that list and real declared payload keys, so a
+    # typo on either would have passed silently -- exactly the bug class this
+    # test exists to catch.
     missing = []
     for var, shape in bindings.items():
         declared = shapes.get(shape, {})
         for match in re.finditer(rf"(?<![\w.]){re.escape(var)}\.([a-z_][a-z0-9_]*)\b", js):
             attr = match.group(1)
-            if attr in _NOT_PAYLOAD:
-                continue
             if attr not in declared:
                 missing.append(f"{var}.{attr} (shape {shape})")
 
