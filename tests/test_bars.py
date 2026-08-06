@@ -29,6 +29,7 @@ from optjournal.bars import (
     epoch_et,
     et_day,
     expected_move_band,
+    expiry_epoch,
     last_traded_day,
     modelled_marks,
     replay_bars,
@@ -529,6 +530,27 @@ def test_two_daily_series_join_on_the_trading_day_not_the_timestamp(conn):
     """
     day = _ts("2026-07-27")
     assert et_day(day + 4 * 3600) == et_day(day + 13 * 3600 + 1800) == "2026-07-27"
+
+
+def test_the_cached_helpers_stay_pure_across_a_dst_boundary():
+    """`et_day` and `expiry_epoch` are `functools.cache`d, so purity is load-bearing.
+
+    Both are keyed on one scalar and read no clock, no database and no global --
+    which is what makes caching them safe, and what this pins. The DST pair is the
+    case worth naming: the ET offset changes across it (EDT is UTC-4, EST UTC-5),
+    so a cache keyed on anything coarser than the exact timestamp, or a helper
+    that consulted "now", would answer one of these two wrongly. The account has
+    held positions across two such boundaries.
+    """
+    edt = int(datetime(2026, 7, 1, 12, tzinfo=MARKET_TZ).timestamp())
+    est = int(datetime(2026, 1, 15, 12, tzinfo=MARKET_TZ).timestamp())
+    assert et_day(edt) == "2026-07-01"
+    assert et_day(est) == "2026-01-15"
+    # Same answer on a second call, which is the cache's only observable effect.
+    assert (et_day(edt), et_day(est)) == ("2026-07-01", "2026-01-15")
+    # A cached function must still accept the None the payload really carries.
+    assert expiry_epoch(None) is None and expiry_epoch("") is None
+    assert expiry_epoch("20260904") == expiry_epoch("2026-09-04")
 
 
 def test_the_band_solves_vol_from_the_options_own_closes(conn):

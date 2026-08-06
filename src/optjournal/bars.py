@@ -40,6 +40,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import cache
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -647,6 +648,11 @@ class BandContract:
     anchors: tuple[tuple[int, float], ...] = ()
 
 
+#: Cached: a pure function of one short string, called from inside per-bar loops.
+#: Measured over the demo journal, one `build_state` made 1,490 calls against 11
+#: distinct expiries. The key space is the number of contracts the journal has
+#: ever held, so it cannot grow with traffic.
+@cache
 def expiry_epoch(expiry: str | None) -> int | None:
     """Epoch of an option's expiry, at the 16:00 ET close of its expiry date.
 
@@ -671,6 +677,17 @@ def expiry_epoch(expiry: str | None) -> int | None:
     return None
 
 
+#: Cached, and this is the one that pays: `zoneinfo` conversion plus `strftime`
+#: per call, from inside every bar loop. One `build_state` made 11,446 calls
+#: against 1,030 distinct timestamps -- an 11x repeat, and caching both this and
+#: `expiry_epoch` took the demo payload from 61ms to 40ms.
+#:
+#: Unbounded is correct here rather than lazy: the key space is exactly the
+#: distinct bar timestamps in the database (1,291 in the real journal, 1,554 in
+#: the demo, growing by roughly fifteen a trading day), and an entry is an int
+#: plus a ten-character string. A `maxsize` would add eviction bookkeeping to
+#: protect against a few hundred kilobytes.
+@cache
 def et_day(stamp: int) -> str:
     """The ET calendar date a bar belongs to, as YYYY-MM-DD.
 
