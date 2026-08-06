@@ -22,54 +22,39 @@ copy goes stale.
 
 from __future__ import annotations
 
-import http.server
 import json
 import re
-import threading
 import urllib.request
-from functools import partial
 
 import pytest
+from conftest import connect_migrated
 
 from optjournal import browser, web
-from optjournal.db import connect, migrate
 from optjournal.demo import write_demo_statement
-from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
+from optjournal.ingest import ingest_file
 
 
 @pytest.fixture(scope="module")
 def served(tmp_path_factory):
     """A live optjournal server over a demo journal, on an ephemeral port.
 
-    Wired exactly as ``serve()`` wires production -- same ServeConfig, same
-    handler, same threading server -- so the render exercises the real
-    request path, not a lookalike. Port 0 lets the OS pick, so the suite
-    never collides with a journal already serving on 8765/8766.
+    Through ``web.serve_ephemeral``, which wires the same ServeConfig and
+    handler production uses -- so the render exercises the real request path,
+    not a lookalike, and the OS picks the port so the suite never collides with
+    a journal already serving on 8765/8766. That spin-up used to be twelve lines
+    here and twelve byte-identical lines in sweep.py, both reaching through
+    ``web._Handler``.
     """
     root = tmp_path_factory.mktemp("render")
     statement = write_demo_statement(root / "demo", root / "demo.db")
-    conn = connect(root / "demo.db")
-    migrate(conn)
+    conn = connect_migrated(root / "demo.db")
     ingest_file(conn, statement)
     conn.close()
 
-    cfg = web.ServeConfig(
-        db_path=root / "demo.db",
-        archive_dir=statement.parent,
-        query_id=None,
-        assets=tuple(DEFAULT_ASSET_FILTER),
-    )
-
-    class _Srv(http.server.ThreadingHTTPServer):
-        daemon_threads = True
-
-    httpd = _Srv(("127.0.0.1", 0), partial(web._Handler, cfg))
-    port = httpd.socket.getsockname()[1]
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        httpd.shutdown()
+    with web.serve_ephemeral(
+        db_path=root / "demo.db", archive_dir=statement.parent,
+    ) as base:
+        yield base
 
 
 def test_the_dashboard_renders_from_the_payload(served, tmp_path):

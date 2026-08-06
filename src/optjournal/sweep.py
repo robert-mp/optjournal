@@ -35,21 +35,16 @@ evidence.
 
 from __future__ import annotations
 
-import http.server
 import json
 import re
-import threading
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
 from typing import Any
 
 from optjournal import browser, web
-from optjournal.ingest import DEFAULT_ASSET_FILTER
 
 PASS = "pass"
 FAIL = "fail"
@@ -649,33 +644,6 @@ def page_coords(quote: str | None) -> list[tuple[str, str | None, str | None]]:
     return coords
 
 
-@contextmanager
-def _serve(db_path: Path, archive_dir: Path, query_id: str | None) -> Iterator[str]:
-    """The real handler over a real journal on an ephemeral port.
-
-    Wired exactly as `serve()` wires production -- same ServeConfig, same
-    handler -- so the sweep exercises the request path rather than a lookalike,
-    and never collides with a journal already serving on 8765/8766.
-    """
-    cfg = web.ServeConfig(
-        db_path=db_path,
-        archive_dir=archive_dir,
-        query_id=query_id,
-        assets=tuple(DEFAULT_ASSET_FILTER),
-    )
-
-    class _Srv(http.server.ThreadingHTTPServer):
-        daemon_threads = True
-
-    httpd = _Srv(("127.0.0.1", 0), partial(web._Handler, cfg))
-    port = httpd.socket.getsockname()[1]
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        httpd.shutdown()
-
-
 @dataclass
 class Result:
     """What the sweep found, per page and in total."""
@@ -709,7 +677,13 @@ def sweep_journal(
 ) -> Result:
     """Render one journal's whole matrix and apply every check to every page."""
     result = Result()
-    with _serve(db_path, archive_dir, query_id) as base:
+    # web.serve_ephemeral, not a spin-up of our own: it wires the same
+    # ServeConfig and handler production uses, so the sweep exercises the
+    # real request path. This module and test_rendered had each built that
+    # twelve-line block separately, byte-identical.
+    with web.serve_ephemeral(
+        db_path=db_path, archive_dir=archive_dir, query_id=query_id,
+    ) as base:
         with urllib.request.urlopen(base + "/api/state") as res:
             payload = json.load(res)
         quotes = [q["code"] for q in (payload.get("fx") or {}).get("quotes") or []]

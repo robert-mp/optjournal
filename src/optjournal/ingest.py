@@ -33,14 +33,14 @@ from optjournal.sections import raw_sections
 
 __all__ = [
     "ASSET_FILTER_ALL",
-    "ASSET_FILTER_OPTIONS",
     "IngestResult",
     "ingest_file",
 ]
 
 log = logging.getLogger(__name__)
 
-ASSET_FILTER_OPTIONS = ("OPT",)
+#: The empty tuple means "store every category", which is why it needs a name:
+#: `assets=()` at a call site reads as "store nothing".
 ASSET_FILTER_ALL: tuple[str, ...] = ()
 #: What `assets=` means when the caller does not say: everything. A narrower
 #: default here is what made the cron and the Sync button quietly re-narrow a

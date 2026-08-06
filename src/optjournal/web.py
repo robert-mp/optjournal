@@ -27,6 +27,8 @@ import socket
 import sqlite3
 import threading
 import urllib.parse
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -84,7 +86,7 @@ from optjournal.strategies import (
     strategy_groups,
 )
 
-__all__ = ["build_state", "serve"]
+__all__ = ["build_state", "serve", "serve_ephemeral"]
 
 log = logging.getLogger(__name__)
 
@@ -815,6 +817,51 @@ def serve(
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nstopped")
+
+
+@contextmanager
+def serve_ephemeral(
+    *,
+    db_path: Path,
+    archive_dir: Path,
+    query_id: str | None = None,
+    assets: tuple[str, ...] = DEFAULT_ASSET_FILTER,
+) -> Iterator[str]:
+    """A real server on an OS-picked port, for the duration of the block.
+
+    Yields the base URL. Wired through the same `ServeConfig` and `_Handler` as
+    `serve()`, so a caller exercises the production request path rather than a
+    lookalike -- which is the whole point, and the reason this lives here rather
+    than in whichever caller needed it first.
+
+    It exists because the sweep and the browser-render test had each built this
+    twelve-line spin-up for themselves, byte-identical down to the docstring
+    phrase "not a lookalike", and both reached through `web._Handler` -- a
+    private name, so the copies could not even be called wrong, only kept in
+    step by hand. Port 0 in both, so neither collides with a journal already
+    serving on 8765.
+
+    Unlike `serve()` this does not print, does not block, and does not refuse a
+    non-loopback host, because it never binds one: 127.0.0.1 is hardcoded.
+    """
+    cfg = ServeConfig(
+        db_path=db_path,
+        archive_dir=archive_dir,
+        query_id=query_id,
+        assets=tuple(assets),
+    )
+
+    class _Ephemeral(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+        address_family = socket.AF_INET
+
+    httpd = _Ephemeral(("127.0.0.1", 0), partial(_Handler, cfg))
+    port = httpd.socket.getsockname()[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        httpd.shutdown()
 
 
 #: The page is a separate file so it can be edited with HTML/CSS tooling and
