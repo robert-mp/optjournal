@@ -742,6 +742,36 @@ def test_dashboard_friction_is_split_by_scope(state):
     )
 
 
+def test_a_snapshot_leg_keeps_the_sign_of_the_position_it_seeds():
+    """A short snapshot-only contract must seed a NEGATIVE quantity.
+
+    Found by mutation: wrapping `seed_quantity` in `abs()` passed all 579 tests.
+    Neither journal reaches it -- every short position they hold is claimed by an
+    open lifecycle, so it never takes the `_snapshot_leg` path -- but the path is
+    reachable the moment a short is held with no fills in the archive, which is
+    exactly what the LEAP was before it was traded.
+
+    The sign is the whole meaning of the row. It decides the strike's side (a
+    level you are defending versus one you paid for) and it flips the modelled
+    P&L: a short position gains as the option decays, so `abs()` would draw the
+    curve upside down and label the strike 'long'.
+
+    A dict rather than a database row because `_snapshot_leg` reads a mapping,
+    and the property is about the sign, not about SQL.
+    """
+    from optjournal.web import _snapshot_leg, _strikes_of
+
+    short = {"conid": "C1", "strike": 270.0, "put_call": "P", "expiry": "20260904",
+             "multiplier": 100.0, "position": -5, "cost_basis_price": 3.20}
+    leg = _snapshot_leg(short)
+    assert leg.seed_quantity == -5.0, "the short sign was discarded"
+    assert _strikes_of([leg])[0]["side"] == "short"
+
+    long_ = dict(short, position=2)
+    assert _snapshot_leg(long_).seed_quantity == 2.0
+    assert _strikes_of([_snapshot_leg(long_)])[0]["side"] == "long"
+
+
 def test_every_position_carries_a_cost_basis(state):
     """The book table shows a cost basis per row, so every row must have one.
 
