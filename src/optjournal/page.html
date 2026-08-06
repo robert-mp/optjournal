@@ -821,7 +821,7 @@ import {
  * @payload e:Annotation
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
- * @local oc odtes open opts out ps pts range rows yrs active shown
+ * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks mks dd sp spot
  * @local play scrub speed loop ev reached
  */
@@ -1397,18 +1397,6 @@ function legRow(l,extra=''){
       >${money(l.avg_price,l.currency)}</span>
     <span class="mono ${cls(l.money.proceeds.base)}">${moneyOf(l.money.proceeds)}</span>
   </div>`;
-}
-function groupLabel(legs){
-  /* Derived from the legs, not assumed. This read 'SPREAD' for anything
-     multi-leg and 'OPENING' for everything else, so every closing order was
-     labelled OPENING -- invisible while the only real order in the archive was
-     a single opening one, and wrong on 7 of 16 orders as soon as there was
-     closing activity to look at. A mixed order is a roll: one leg closes an
-     expiry and another opens the next. */
-  const oc=[...new Set(legs.map(l=>String(l.open_close||'').toUpperCase()))];
-  const closing=oc.length===1&&oc[0]==='C';
-  if(legs.length>1) return oc.length>1?'ROLL':(closing?'SPREAD CLOSE':'SPREAD');
-  return closing?'CLOSING':'OPENING';
 }
 /* ------------------------------------------------ replay */
 /* Bars are stored epoch UTC and read in EXCHANGE time, not the reader's. The
