@@ -457,6 +457,64 @@ def test_a_commission_billed_in_another_currency_warns_without_aborting(tmp_path
     conn.close()
 
 
+def test_the_commission_warning_does_not_repeat_on_every_re_ingest(tmp_path):
+    """A warning reports a decision TAKEN, so a duplicate row must not warn.
+
+    The real failure, seen in a nightly cron notification: the message read
+    "0 new trade(s)" and carried a per-trade commission warning in the same
+    breath. The warning was appended before the INSERT, so it fired whether or
+    not `ON CONFLICT DO NOTHING` did anything -- describing a conversion choice
+    made once, on 2026-08-03, as though it had just been made again.
+
+    That matters beyond tidiness. IBKR's Flex window rolls about 365 days, so
+    the row stays in every statement for a year: the warning would have fired
+    daily until August 2027. A warning that cries every day over
+    correctly-handled data is one nobody reads on the day it means something.
+
+    `test_ingests_cleanly` asserts exactly this property already
+    (`again.warnings == []`) and passes regardless, because every demo trade is
+    a USD instrument billed in USD -- there is no divergent row for it to
+    notice. Hence a statement doctored to carry one.
+    """
+    from optjournal.db import connect, migrate
+    from optjournal.demo import write_demo_statement
+    from optjournal.ingest import ingest_file
+
+    src = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    doctored = tmp_path / "doctored.xml"
+    raw = src.read_text()
+    assert 'ibCommissionCurrency="USD"' in raw
+    doctored.write_text(raw.replace('ibCommissionCurrency="USD"',
+                                    'ibCommissionCurrency="GBP"', 1))
+
+    conn = connect(tmp_path / "d.db")
+    migrate(conn)
+
+    first = ingest_file(conn, doctored)
+    warned = [w for w in first.warnings if "commission billed in GBP" in w]
+    assert len(warned) == 1, f"expected exactly one warning, got {first.warnings}"
+    assert first.trades_inserted, "nothing was inserted, so nothing was decided"
+
+    # Same statement again. Every row is a no-op, so the run has decided
+    # nothing and has nothing to report.
+    again = ingest_file(conn, doctored, reingest=True)
+    assert again.trades_inserted == 0, "re-ingest stopped being idempotent"
+    assert again.trades_skipped_existing > 0
+    assert not [w for w in again.warnings if "commission billed in" in w], (
+        "the commission warning repeated on a row that was skipped as existing"
+        f"; got {again.warnings}"
+    )
+
+    # The stored figure is untouched by the second pass -- the point is that the
+    # warning was noise, not that the conversion was wrong.
+    row = conn.execute(
+        "SELECT ib_commission_currency, ib_commission_base FROM trades"
+        " WHERE ib_commission_currency = 'GBP'"
+    ).fetchone()
+    assert row["ib_commission_currency"] == "GBP"
+    conn.close()
+
+
 def test_commission_currency_backfills_from_the_stored_raw(tmp_path):
     """A journal that ingested before the column existed holds the value in
     `raw` and NULL in the column, and no broker request is needed to recover it.

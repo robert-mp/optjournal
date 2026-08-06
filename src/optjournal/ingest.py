@@ -273,16 +273,6 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult,
         commission_base = _commission_base(
             commission, commission_ccy, _s(t.currency), rate, base_currency
         )
-        if commission and commission_ccy and commission_ccy != _s(t.currency):
-            handled = (
-                f"treated as already-base {base_currency}"
-                if commission_ccy == base_currency
-                else "left unconverted: the statement carries no rate for it"
-            )
-            result.warnings.append(
-                f"trade {t.tradeID}: commission billed in {commission_ccy} but the"
-                f" instrument trades in {_s(t.currency)}; {handled}"
-            )
 
         cur = conn.execute(
             "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
@@ -317,6 +307,25 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult,
         )
         if cur.rowcount:
             result.trades_inserted += 1
+            # Warned here rather than beside the conversion, because a warning
+            # is a report of a decision TAKEN -- and on a duplicate row no
+            # decision is taken, the INSERT is a no-op. Emitting it before the
+            # insert made the nightly cron report "0 new trade(s)" next to a
+            # per-trade warning, every run, about one row settled on
+            # 2026-08-03. It would have gone on firing until that row aged out
+            # of IBKR's rolling window in August 2027, and a warning that fires
+            # daily on correctly-handled data is one nobody reads when it
+            # finally means something.
+            if commission and commission_ccy and commission_ccy != _s(t.currency):
+                handled = (
+                    f"treated as already-base {base_currency}"
+                    if commission_ccy == base_currency
+                    else "left unconverted: the statement carries no rate for it"
+                )
+                result.warnings.append(
+                    f"trade {t.tradeID}: commission billed in {commission_ccy} but the"
+                    f" instrument trades in {_s(t.currency)}; {handled}"
+                )
         else:
             result.trades_skipped_existing += 1
 
