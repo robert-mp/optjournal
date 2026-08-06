@@ -685,12 +685,6 @@ class Result:
             if v.status == FAIL
         ]
 
-    def tally(self) -> dict[str, int]:
-        out = {PASS: 0, FAIL: 0, SKIP: 0}
-        for _, _, checks in self.pages:
-            for _, v in checks:
-                out[v.status] += 1
-        return out
 
 
 def sweep_journal(
@@ -753,16 +747,31 @@ def sweep_journal(
     return result
 
 
+def _tally(checks: list[tuple[str, Verdict]]) -> dict[str, int]:
+    """Pass/fail/skip counts for ONE page's checks.
+
+    Per page, which is the granularity the report prints. `Result` used to carry a
+    per-JOURNAL `tally` property that nothing called, while `format_report`
+    accumulated its own per-page counts inline -- so the two were never
+    interchangeable and the unread one could not have been substituted for the
+    read one. Keyed by all three statuses whether or not they occur, so a page
+    with no skips still prints " 0 skip" rather than raising.
+    """
+    out = {PASS: 0, FAIL: 0, SKIP: 0}
+    for _, verdict in checks:
+        out[verdict.status] += 1
+    return out
+
+
 def format_report(results: list[Result]) -> str:
     """A report that states its skips, because a skip is not a pass."""
     lines: list[str] = []
     total = {PASS: 0, FAIL: 0, SKIP: 0}
     for result in results:
         for journal, label, checks in result.pages:
-            tally = {PASS: 0, FAIL: 0, SKIP: 0}
-            for _, v in checks:
-                tally[v.status] += 1
-                total[v.status] += 1
+            tally = _tally(checks)
+            for status, n in tally.items():
+                total[status] += n
             mark = "FAIL" if tally[FAIL] else "ok"
             lines.append(
                 f"  {mark:4}  {journal:5} {label:38}  "

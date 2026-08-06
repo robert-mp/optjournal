@@ -1185,8 +1185,8 @@ def test_hash_is_applied_before_the_first_load():
     )
 
 
-def test_a_tab_from_the_hash_is_validated_against_the_enabled_tabs():
-    """An unknown or disabled id in the URL must not render an empty tab.
+def test_a_tab_from_the_hash_is_validated_against_the_tabs_that_exist():
+    """An unknown id in the URL must not render an empty tab.
 
     And an ABSENT key must reset to the default rather than leave the current
     tab standing: the back button lands on entries whose hash has no tab key,
@@ -1196,9 +1196,18 @@ def test_a_tab_from_the_hash_is_validated_against_the_enabled_tabs():
     js = _code_only(_js())
     assert "HASH_TABS().includes(tab)" in js
     assert re.search(r"S\.tab=\(tab&&HASH_TABS\(\)\.includes\(tab\)\)\?tab:'dashboard'", js)
-    # Built from TABS with the disabled ones filtered out, so it cannot drift
-    # from the tab bar as tabs are added or gated.
-    assert re.search(r"HASH_TABS\s*=\s*\(\)\s*=>\s*TABS\.filter", js)
+    # DERIVED from TABS, whatever the derivation -- that is the invariant, so the
+    # list cannot drift from the tab bar as tabs are added. It used to be pinned
+    # as `TABS.filter`, over a third "disabled reason" slot that was null in every
+    # entry; pinning the spelling made removing the dead slot fail a test about
+    # hash routing, which is not what this test is for.
+    assert re.search(r"HASH_TABS\s*=\s*\(\)\s*=>\s*TABS\b", js), \
+        "HASH_TABS must be derived from TABS, not restate the ids"
+    # Every tab in the bar is reachable by hash, and nothing else is.
+    tabs = re.search(r"const TABS=\[(.*?)\n\];", _js(), re.S)
+    declared = re.findall(r"\['([a-z0-9]+)'", tabs.group(1))
+    assert declared, "no tab ids parsed"
+    assert len(declared) == len(set(declared)), "a duplicate tab id would shadow"
 
 
 def test_hashchange_only_refetches_when_the_server_side_keys_moved():

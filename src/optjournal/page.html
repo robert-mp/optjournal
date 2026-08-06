@@ -43,7 +43,6 @@ html,body{margin:0;background:var(--bg);color:var(--fg);
 .tab.on{background:linear-gradient(160deg,var(--leather1),var(--leather2));
   border-color:#a06840;color:var(--leatherfg);
   box-shadow:0 1px 0 rgba(255,255,255,.16) inset,0 2px 10px rgba(0,0,0,.4)}
-.tab:disabled{color:var(--dim2);cursor:not-allowed;opacity:.55}
 /* `align-items` must be pinned on BOTH levels, and the reason differs at each.
    On the column itself, the default `stretch` is opted out of by .icobtn's
    explicit width -- and a definite cross-size lands the item at the cross-axis
@@ -934,19 +933,28 @@ const monthLabel=m=>{if(!m||m==='ALL')return 'All time';
   const[y,mm]=m.split('-');return MONTHS[+mm-1]+' '+y;};
 
 /* ------------------------------------------------ tabs */
+/* [id, label]. There used to be a third slot carrying a per-tab "disabled
+   reason", rendered as `disabled title="..."`. It was null in every entry, and
+   deliberately so: the one real reason it ever held was a hardcoded "No 0DTE
+   trades in this account" that contradicted the data -- the same defect
+   `odteSelectable` was written to fix. Gating a VIEW is not the same question as
+   gating a FILTER, and only the filter bar can answer it, because only it is
+   re-derived from the payload on every render. The slot, the `disabled?` branch
+   it fed, HASH_TABS' filter over it and `.tab:disabled` all went together; a
+   mechanism kept "in case" is a mechanism nobody has tested. */
 const TABS=[
-  ['dashboard','Dashboard',null],
-  ['calendar','Calendar',null],
-  ['trades','Trades',null],
-  ['positions','Positions',null],
-  ['costs','Costs',null],
-  ['annual','Annual',null],
-  ['odte','0DTE',null],
+  ['dashboard','Dashboard'],
+  ['calendar','Calendar'],
+  ['trades','Trades'],
+  ['positions','Positions'],
+  ['costs','Costs'],
+  ['annual','Annual'],
+  ['odte','0DTE'],
 ];
 function renderTabs(){
-  $('#tabs').innerHTML=TABS.map(([id,label,disabled])=>
+  $('#tabs').innerHTML=TABS.map(([id,label])=>
     `<button class="tab${S.tab===id?' on':''}" data-tab="${id}"
-      ${disabled?`disabled title="${esc(disabled)}"`:''}>${esc(label)}</button>`).join('');
+      >${esc(label)}</button>`).join('');
   document.querySelectorAll('.tab[data-tab]').forEach(b=>
     b.onclick=()=>{S.tab=b.dataset.tab;draw(true);});
 }
@@ -2135,7 +2143,7 @@ function cog(){
    `replaceState`, not `location.hash = ...`: assigning pushes a history entry
    per click, so toggling a filter a few times buries the page under back-button
    history. Nothing here is a navigation. */
-const HASH_TABS=()=>TABS.filter(t=>!t[2]).map(t=>t[0]);
+const HASH_TABS=()=>TABS.map(t=>t[0]);
 function applyHash(){
   /* Not `h` -- that is the history payload everywhere else in this page, and
      one name for two shapes is what blinds the payload guard to both. */
