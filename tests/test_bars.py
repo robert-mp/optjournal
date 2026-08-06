@@ -751,9 +751,7 @@ def test_backfill_counts_an_empty_series_as_skipped_not_failed(conn):
 # --------------------------------------------------------------------------
 def _session_bars(conn, conid, symbol, day, *, bar_size="1h", hours=(14, 15, 16)):
     """Bars stamped inside one ET trading day, on the hour."""
-    base = int(
-        datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC).timestamp()
-    )
+    base = _ts(day)
     upsert_bars(
         conn, conid=conid, symbol=symbol, bar_size=bar_size, source="yahoo",
         bars=[_bar(base + hour * 3600) for hour in hours],

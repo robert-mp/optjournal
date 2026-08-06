@@ -458,13 +458,6 @@ def test_a_fill_free_month_is_an_honest_zero_not_all_time(populated):
     assert st["stats"]["net_pnl"]["base"] in (0, 0.0, None)
 
 
-def test_a_month_outside_the_account_life_still_heals_to_all_time(populated):
-    st = build_state(
-        db_path=populated, archive_dir=RAW_DIR, query_id=None, month="1999-01"
-    )
-    assert st["selected_month"] is None
-
-
 def test_a_trade_counts_only_in_the_month_it_closed(populated):
     """A round trip opened in one month and closed in the next belongs -- as a
     trade, a win/loss and P&L -- to the close month alone. The open month gets
@@ -666,7 +659,14 @@ def test_month_filter_narrows_the_payload(populated):
         assert day["day"].startswith(months[0])
 
 
-def test_unknown_month_falls_back_to_all_time(populated):
+def test_a_month_outside_the_account_life_falls_back_to_all_time(populated):
+    """A hand-edited `#month=1999-01` must not render a calendar of nothing.
+
+    Distinct from `test_a_fill_free_month_is_an_honest_zero`: a month INSIDE the
+    account's life with no fills is selectable and shows zeros, while one outside
+    it heals to all-time. Both directions of `month_range` matter, which is why
+    each has a test.
+    """
     state = build_state(
         db_path=populated, archive_dir=RAW_DIR, query_id=None, month="1999-01"
     )
