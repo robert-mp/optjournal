@@ -31,6 +31,17 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from optjournal.bars import (
+    MARKET_TZ,
+    close_series,
+    epoch_et,
+    et_day,
+    expiry_epoch,
+    upsert_bars,
+)
+from optjournal.blackscholes import bs_price, implied_vol
+from optjournal.marketdata import Bar
+
 #: Marks the output unmistakably. `statements` and the UI show the query name.
 QUERY_NAME = "optjournal-demo"
 DEMO_ACCOUNT = "U0000000"
@@ -818,17 +829,6 @@ def write_demo_bars(conn) -> int:
     session on real data too. Emitting hourly option bars here would give the
     demo a fidelity the real journal cannot have.
     """
-    from optjournal.bars import (
-        MARKET_TZ,
-        close_series,
-        epoch_et,
-        et_day,
-        expiry_epoch,
-        upsert_bars,
-    )
-    from optjournal.blackscholes import bs_price, implied_vol
-    from optjournal.marketdata import Bar
-
     _assert_demo_database(conn)
     written = 0
     for contract in _option_contracts(conn):
