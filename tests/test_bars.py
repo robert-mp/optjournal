@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from optjournal.bars import (
     CONTEXT_BARS,
     HOURLY_LIMIT_DAYS,
+    MARKET_TZ,
     BackfillOutcome,
     BandContract,
+    ReplayLeg,
+    audit_perishable,
     backfill_bars,
     bars_manifest,
     close_series,
@@ -25,6 +28,8 @@ from optjournal.bars import (
     epoch_et,
     et_day,
     expected_move_band,
+    last_traded_day,
+    modelled_marks,
     replay_bars,
     upsert_bars,
 )
@@ -585,6 +590,78 @@ def test_the_band_is_absent_rather_than_narrow_without_a_vol(conn):
     assert band == []
 
 
+def test_marks_stop_at_expiry_rather_than_pricing_a_settled_contract(conn):
+    """Past expiry the model does not degrade, it lies with confidence: bs_price
+    clamps to intrinsic and bs_delta to 1.0, so a position still marked open
+    draws a P&L that keeps swinging with spot and a delta pinned at the top of
+    its axis for as long as the window runs. Measured on the demo's snapshot-only
+    call, that was two months of tail on a contract that had settled.
+
+    The band already stopped, because expected_move refuses a negative horizon.
+    The two series are drawn on one chart, so a mark outstaying its band says the
+    position was live after the envelope said it had expired.
+    """
+    spot, strike, vol = 100.0, 90.0, 0.40
+    expiry, expiry_ts = "2026-01-16", _ts("2026-01-16") + 16 * 3600
+    # A daily series that runs a fortnight PAST expiry.
+    days = [f"2026-01-{n:02d}" for n in (12, 13, 14, 15, 16, 20, 21, 22, 23)]
+    opens = [epoch_et(f"{day} 09:30:00") for day in days]
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(stamp, spot) for stamp in opens])
+    option = []
+    for day in days:
+        stamp = epoch_et(f"{day} 00:00:00")
+        years = (expiry_ts - stamp) / (365.0 * 86400)
+        if years <= 0:
+            continue      # the source stops too: an expired contract has no close
+        option.append(_bar(stamp, bs_price(spot, strike, years, vol, "P")))
+    upsert_bars(conn, conid="OPT1", symbol="AAA  260116P00090000", bar_size="1d",
+                source="yahoo", bars=option)
+
+    points = [(stamp, spot) for stamp in opens]
+    leg = ReplayLeg(
+        conid="OPT1", strike=strike, right="P", expiry=expiry,
+        fills=((opens[0], -1.0, 3.0),),
+    )
+    marks = modelled_marks(conn, [leg], points, underlying_conid="U1")
+    band = expected_move_band(
+        conn,
+        [BandContract(conid="OPT1", strike=strike, right="P", expiry=expiry)],
+        points, underlying_conid="U1",
+    )
+    assert marks, "the control: marks must exist while the contract is alive"
+    assert max(row[0] for row in marks) <= expiry_ts, (
+        "a settled contract is still being priced"
+    )
+    assert max(row[0] for row in marks) == max(row[0] for row in band), (
+        "the mark series and the band end on different bars"
+    )
+    assert all(abs(row[2]) <= 1.0 for row in marks), (
+        "delta pinned past its true range, which is the clamp showing through"
+    )
+
+
+def test_a_computed_bar_never_displaces_a_fetched_one(conn):
+    """The demo computes option bars because its symbols do not exist upstream.
+    They are ranked below every real source so the relationship is one-way: a
+    genuine fetch upgrades a computed row, and a re-run of the demo generator can
+    never overwrite real market history it happens to also cover.
+    """
+    stamp = _ts("2026-01-05") + 13 * 3600
+    upsert_bars(conn, conid="X", symbol="AAA", bar_size="1d",
+                source="synthetic", bars=[_bar(stamp, 1.0)])
+    upsert_bars(conn, conid="X", symbol="AAA", bar_size="1d",
+                source="yahoo", bars=[_bar(stamp, 2.0)])
+    assert close_series(conn, "X", bar_size="1d") == [(stamp, 2.0)], (
+        "a real fetch failed to upgrade a computed row"
+    )
+    upsert_bars(conn, conid="X", symbol="AAA", bar_size="1d",
+                source="synthetic", bars=[_bar(stamp, 3.0)])
+    assert close_series(conn, "X", bar_size="1d") == [(stamp, 2.0)], (
+        "a computed bar overwrote real market history"
+    )
+
+
 def test_a_fill_anchors_vol_where_the_source_has_no_history(conn):
     """The defect this closes, measured on the real journal: the TSLA 270P was
     sold on 2026-07-24 and the price source's first bar for that contract is
@@ -671,3 +748,176 @@ def test_backfill_counts_an_empty_series_as_skipped_not_failed(conn):
     assert outcome.ok
     assert outcome.written == 0
     assert outcome.skipped == outcome.requested
+
+
+# --------------------------------------------------------------------------
+# the session audit: noticing a session whose perishable bars never landed
+# --------------------------------------------------------------------------
+def _session_bars(conn, conid, symbol, day, *, bar_size="1h", hours=(14, 15, 16)):
+    """Bars stamped inside one ET trading day, on the hour."""
+    base = int(
+        datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC).timestamp()
+    )
+    upsert_bars(
+        conn, conid=conid, symbol=symbol, bar_size=bar_size, source="yahoo",
+        bars=[_bar(base + hour * 3600) for hour in hours],
+    )
+
+
+def _open_short_option(conn, *, date="2026-08-03", conid="C1"):
+    """An open short-dated short option: the one shape that is collected live."""
+    _option_trade(conn, conid=conid, symbol="AAA  260901P00100000",
+                  underlying="AAA", ucid="UAAA", date=date, trade_id=f"t{conid}")
+
+
+def test_a_day_the_market_did_not_trade_is_not_a_fault(conn):
+    """The holiday guard, and the reason there is no date list anywhere.
+
+    US markets shut around nine days a year plus the odd half-session. Alarming
+    on each would be nine false reports a year on a job whose entire value is
+    that its silence means something.
+    """
+    _open_short_option(conn)
+    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    audited = audit_perishable(conn, day="2026-08-06", now=_NOW)
+    assert not audited.market_traded, "no underlying bars, yet it claims a session"
+    assert audited.ok, "a closed market was reported as lost data"
+    assert not audited.missing
+
+
+def test_a_traded_day_with_no_option_bars_is_reported(conn):
+    """The control for the test above: the SAME shape, one underlying bar added,
+    and the verdict must invert. Without this, a market_traded oracle stuck at
+    False would pass every audit forever and the job would be decorative.
+    """
+    _open_short_option(conn)
+    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
+    assert audited.market_traded, "the underlying's own bars say it traded"
+    assert not audited.ok
+    assert audited.missing == ("AAA  260901P00100000",)
+    assert not audited.covered
+
+
+def test_a_covered_session_is_silent(conn):
+    _open_short_option(conn)
+    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    _session_bars(conn, "C1", "AAA  260901P00100000", "2026-08-05")
+    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
+    assert audited.ok
+    assert audited.covered == ("AAA  260901P00100000",)
+    assert not audited.missing
+
+
+def test_a_contract_opened_after_the_session_is_not_reported_missing(conn):
+    """Otherwise every new position would trigger a report on the day it opened:
+    it cannot have bars for a session it did not exist in, and calling that a
+    loss would make the job cry wolf on the most ordinary event there is.
+    """
+    _open_short_option(conn, date="2026-08-06")
+    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
+    assert audited.ok, "a position opened today was blamed for yesterday"
+    assert not audited.missing and not audited.covered
+
+
+def test_only_the_contracts_the_poll_asks_for_are_audited(conn):
+    """Eligibility is the live manifest itself, not a second rule. A rule of its
+    own would drift from the collector and then report on a book neither holds --
+    the LEAP is the case that proves it, since it is deliberately never collected
+    hourly and so can never be missing hourly bars.
+    """
+    _option_trade(conn, conid="LEAP", symbol="AAA  270617C00700000",
+                  underlying="AAA", ucid="UAAA", date="2025-02-03",
+                  trade_id="tleap")
+    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
+    assert audited.market_traded
+    assert audited.ok, "the LEAP was audited for bars nothing ever collects"
+    assert not audited.missing and not audited.covered
+
+
+def test_the_audited_day_skips_weekends_and_holidays(conn):
+    """Walking back to the last day an underlying traded, rather than
+    subtracting one day: on a Monday the previous session is Friday, and the
+    same mechanism covers a holiday without knowing which days those are.
+    """
+    _open_short_option(conn, date="2026-07-20")
+    _session_bars(conn, "UAAA", "AAA", "2026-07-31")     # a Friday
+    monday = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+    assert last_traded_day(conn, now=monday) == "2026-07-31"
+    assert audit_perishable(conn, now=monday).day == "2026-07-31"
+
+
+def test_no_recent_underlying_bars_reports_nothing_rather_than_guessing(conn):
+    """An empty or un-backfilled journal is the daily job's problem. Reporting it
+    here as well would double up on a failure that job already surfaces.
+    """
+    _open_short_option(conn)
+    audited = audit_perishable(conn, now=_NOW)
+    assert not audited.market_traded
+    assert audited.ok
+    assert audited.day == "2026-08-05", "the fallback day must still be yesterday"
+
+
+def test_a_bar_from_a_neighbouring_session_does_not_count_as_coverage(conn):
+    """The day is matched on the ET trading date, not on a raw epoch window.
+    Comparing timestamps against a UTC midnight boundary would count a 20:00 ET
+    bar -- which is 00:00Z the NEXT day -- as the following session's coverage.
+    """
+    _open_short_option(conn)
+    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    _session_bars(conn, "C1", "AAA  260901P00100000", "2026-08-04")
+    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
+    assert not audited.ok, "yesterday's bars were counted as today's"
+    assert audited.missing == ("AAA  260901P00100000",)
+
+
+def test_the_audit_exit_codes_separate_all_three_outcomes(tmp_path, capsys):
+    """The cron reads nothing but the exit code to decide whether to speak, so
+    the three states have to be distinguishable: covered (silent), missing
+    (report), and nothing-to-check (also silent, but for a different reason a
+    human reading `cron_list` needs to be able to tell apart).
+    """
+    from optjournal.cli import main
+
+    db = tmp_path / "audit.db"
+    conn = connect(db)
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
+        " to_date, base_currency, asset_filter, ingested_at)"
+        " VALUES ('t.xml','x','U1','2025-01-01','2026-12-31','EUR','OPT','now')"
+    )
+    _open_short_option(conn)
+
+    argv = ["bars", "--audit", "--db", str(db)]
+    assert main(argv) == 3, "an un-backfilled journal is not a lost session"
+
+    # Derived exactly as last_traded_day derives it. Computing it as
+    # et_day(now - 86400) instead would agree almost always and disagree in a
+    # narrow window around a DST transition -- the same trap that already put a
+    # January fixture on the wrong trading day earlier in this module.
+    yesterday = (
+        datetime.now(UTC).astimezone(MARKET_TZ) - timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    _session_bars(conn, "UAAA", "AAA", yesterday)
+    conn.commit()
+    assert main(argv) == 1, "a traded day with no option bars must report"
+    assert "MISSING" in capsys.readouterr().out
+
+    _session_bars(conn, "C1", "AAA  260901P00100000", yesterday)
+    conn.commit()
+    assert main(argv) == 0, "a covered session must be silent"
+
+
+def test_the_audit_refuses_to_be_combined_with_a_fetch(tmp_path):
+    """`--audit` reads and `--live` writes. One argv asking for both has no
+    single meaning, and guessing which won would make a cron's behaviour depend
+    on flag order.
+    """
+    from optjournal.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["bars", "--audit", "--live"])

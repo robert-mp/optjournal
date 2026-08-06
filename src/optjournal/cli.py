@@ -24,7 +24,7 @@ from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 from optjournal import __version__, browser
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import prune_archive
-from optjournal.bars import backfill_bars, bars_manifest
+from optjournal.bars import audit_perishable, backfill_bars, bars_manifest
 from optjournal.compat import unknown_codes
 from optjournal.config import (
     DEFAULT_ARCHIVE,
@@ -233,17 +233,32 @@ def cmd_demo(args) -> int:
     to replace, so a fake one landing there would be indistinguishable from a
     real one afterwards.
     """
-    from optjournal.demo import QUERY_NAME, write_demo_statement
+    from optjournal.demo import (
+        QUERY_NAME,
+        reset_demo_rows,
+        write_demo_bars,
+        write_demo_statement,
+    )
 
     out, db = args.out, args.db
     path = write_demo_statement(out, db)
     with open_journal(db) as conn:
+        # Replace rather than add to. Trades dedupe on identifiers the generator
+        # derives deterministically, so a changed contract would arrive under an
+        # existing trade_id and be ignored, leaving the database describing a
+        # statement it was not built from.
+        reset_demo_rows(conn)
         result = ingest_file(conn, path, reingest=True)
+        # Computed from whatever UNDERLYING bars are already stored, so this is
+        # a no-op on a fresh database and fills in once `bars` has run. Ordered
+        # after the ingest because the contracts it prices come from it.
+        option_bars = write_demo_bars(conn)
 
     payload = {
         "query_name": QUERY_NAME, "statement": str(path), "db": str(db),
         "trades": result.trades_inserted, "cash": result.cash_inserted,
         "positions": result.positions_written,
+        "option_bars": option_bars,
     }
     lines = [
         f"wrote {path.name}  ({path.stat().st_size:,} bytes)",
@@ -251,6 +266,16 @@ def cmd_demo(args) -> int:
         f" {result.positions_written} open positions,"
         f" {result.equity_summaries_written} NAV rows",
         f"  database: {db}",
+    ]
+    lines += [
+        f"  {option_bars} synthetic option bar(s), priced off the stored"
+        " underlying series"
+        if option_bars else
+        "  0 synthetic option bars: no underlying series stored yet. Run"
+        f" `optjournal bars --db {db}` for the real NVDA/SPY history, then"
+        " re-run this to price the options against it."
+    ]
+    lines += [
         "",
         "synthetic data -- closed round trips, a vertical spread, a roll, an",
         "expiry, an assignment, a 0DTE trade and a credited multi-fill order.",
@@ -340,12 +365,42 @@ def cmd_bars(args) -> int:
     `--live` narrows the run to what cannot be collected later -- the intraday
     bars of a still-open option, which the source serves only while the session
     is running. That is the market-hours poll; a full run is for everything else.
+
+    `--audit` fetches nothing and asks the opposite question: did the last
+    session's perishable bars actually land? The live poll swallows a failed
+    fetch on purpose, so this is the only thing that notices a session where
+    every poll failed. Exit 3 means there was nothing to check.
     """
     conn = _open_db(args)
     live = getattr(args, "live", False)
 
     def day(epoch: int) -> str:
         return datetime.fromtimestamp(epoch, UTC).date().isoformat()
+
+    if getattr(args, "audit", False):
+        result = audit_perishable(conn)
+        data = dataclasses.asdict(result) | {"ok": result.ok}
+        if not result.market_traded:
+            lines = [f"{result.day}: the market did not trade, nothing to audit"]
+        elif not result.covered and not result.missing:
+            lines = [f"{result.day}: no contract was eligible for hourly collection"]
+        elif result.missing:
+            lines = [
+                f"{result.day}: NO hourly option bars for "
+                f"{len(result.missing)} of {len(result.covered) + len(result.missing)}"
+                " eligible contract(s) -- that session is unrecoverable"
+            ]
+            lines += [f"  MISSING: {symbol}" for symbol in result.missing]
+            lines += [f"  ok:      {symbol}" for symbol in result.covered]
+        else:
+            lines = [
+                f"{result.day}: hourly option bars present for all "
+                f"{len(result.covered)} eligible contract(s)"
+            ]
+        _emit(data, "\n".join(lines), args.json)
+        if not result.market_traded or not (result.covered or result.missing):
+            return EXIT_NO_DATA
+        return EXIT_ERROR if result.missing else EXIT_OK
 
     if args.dry_run:
         requests = bars_manifest(conn, perishable_only=live)
@@ -665,11 +720,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("bars", parents=[common, database],
                        help="backfill price bars for the windows positions imply")
-    p.add_argument("--dry-run", action="store_true",
-                   help="print the derived windows without fetching anything")
-    p.add_argument("--live", action="store_true",
-                   help="only the intraday bars of open options, which the "
-                        "source serves during the session and never after")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="print the derived windows without fetching anything")
+    mode.add_argument("--live", action="store_true",
+                      help="only the intraday bars of open options, which the "
+                           "source serves during the session and never after")
+    mode.add_argument("--audit", action="store_true",
+                      help="report whether the last session's perishable option "
+                           "bars actually landed; fetches nothing")
     p.set_defaults(func=cmd_bars)
 
     p = sub.add_parser("sync", parents=[common, archive, database],

@@ -55,8 +55,12 @@ from optjournal.marketdata import BAR_SIZES, SOURCE_RANK, Bar, BarFetchError, fe
 __all__ = [
     "BackfillOutcome",
     "BarRequest",
+    "SessionAudit",
+    "audit_perishable",
     "backfill_bars",
     "bars_manifest",
+    "last_traded_day",
+    "market_traded_on",
     "MARKET_TZ",
     "BandContract",
     "close_series",
@@ -422,6 +426,153 @@ def backfill_bars(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SessionAudit:
+    """Whether one session's perishable bars actually landed.
+
+    Exists because the live poll treats a fetch failure as a quiet retry, which
+    is right seven times a session and wrong once a day: the intraday series is
+    cumulative within a session, so a single lost poll costs nothing, but a
+    session where EVERY poll failed is gone for good and says nothing about it.
+    One question, asked once, about the only thing that cannot be recovered.
+    """
+
+    #: The ET trading date examined, YYYY-MM-DD.
+    day: str
+    #: Whether the market traded that day at all -- see market_traded_on.
+    market_traded: bool
+    #: Contracts that were asked for AND have hourly bars for the day.
+    covered: tuple[str, ...]
+    #: Contracts that were asked for and have none. The reportable set.
+    missing: tuple[str, ...]
+
+    @property
+    def ok(self) -> bool:
+        """True when there is nothing for a human to do.
+
+        A day the market did not trade is not a fault, and neither is a book
+        holding nothing eligible -- both produce no bars for entirely correct
+        reasons, and alarming on either would train the reader to ignore this.
+        """
+        return not self.market_traded or not self.missing
+
+
+def market_traded_on(conn: sqlite3.Connection, day: str) -> bool:
+    """Whether any UNDERLYING has hourly bars for the given ET date.
+
+    The holiday oracle, and deliberately not a hardcoded calendar. US markets
+    shut around nine days a year plus the odd half-session; a date list would
+    need maintaining forever and would be wrong the first year it was not. The
+    underlying's own hourly series answers the question directly: unlike an
+    option's, it is retained for days and is re-fetched by the daily backfill,
+    so by the time this runs it is an independent witness to whether the session
+    happened. No bars for anyone means the market was shut; bars for the
+    underlying but none for an option means collection failed.
+    """
+    conids = set(_underlying_conids(conn).values())
+    if not conids:
+        return False
+    placeholders = ", ".join("?" for _ in conids)
+    rows = conn.execute(
+        f"SELECT ts FROM price_bars WHERE bar_size = '1h' AND conid IN ({placeholders})",
+        sorted(conids),
+    ).fetchall()
+    return any(et_day(int(row["ts"])) == day for row in rows)
+
+
+def last_traded_day(
+    conn: sqlite3.Connection, *, now: datetime | None = None, lookback: int = 10
+) -> str | None:
+    """The most recent ET date strictly before today that an underlying traded.
+
+    Walking backwards from yesterday rather than subtracting one day skips
+    weekends and holidays with the same mechanism and no calendar: the first day
+    that has underlying bars is the last session. Bounded by ``lookback``
+    because the source only retains a few days of hourly, so a longer walk would
+    silently pick a date whose option bars were never collectable anyway.
+    """
+    moment = (now or datetime.now(UTC)).astimezone(MARKET_TZ)
+    for back in range(1, lookback + 1):
+        day = (moment - timedelta(days=back)).strftime("%Y-%m-%d")
+        if market_traded_on(conn, day):
+            return day
+    return None
+
+
+def _first_fill_epochs(conn: sqlite3.Connection) -> dict[str, int]:
+    """Earliest fill epoch per option conid, for excluding same-day openings."""
+    rows = conn.execute(
+        "SELECT conid, MIN(first_fill_at) AS opened FROM trade_legs"
+        " WHERE asset_category = 'OPT' GROUP BY conid"
+    ).fetchall()
+    out: dict[str, int] = {}
+    for row in rows:
+        stamp = epoch_et(row["opened"])
+        if stamp is not None:
+            out[str(row["conid"])] = stamp
+    return out
+
+
+def audit_perishable(
+    conn: sqlite3.Connection,
+    *,
+    day: str | None = None,
+    now: datetime | None = None,
+) -> SessionAudit:
+    """Did the given session actually produce the option bars it should have?
+
+    Eligibility comes from ``bars_manifest(perishable_only=True)`` -- the exact
+    set the live poll asks for -- rather than from a second rule of its own. An
+    audit with its own idea of what should have been collected drifts from the
+    collector and then reports on a book neither of them has.
+
+    One correctness cost of reusing the manifest, stated because it bounds what
+    this can catch: the manifest is derived from what is open NOW, so a contract
+    that CLOSED during the audited session is no longer eligible and goes
+    unexamined. The reverse case is handled -- a contract opened after the
+    session cannot have bars for it, and counting that as missing would alarm
+    every time a position was opened.
+    """
+    audited = day or last_traded_day(conn, now=now)
+    if audited is None:
+        # No underlying bars for any recent day. Either the journal is empty or
+        # the daily backfill has not run; both are the daily job's business, not
+        # this one's, and reporting them here would double up on its failure.
+        moment = (now or datetime.now(UTC)).astimezone(MARKET_TZ)
+        return SessionAudit(
+            day=(moment - timedelta(days=1)).strftime("%Y-%m-%d"),
+            market_traded=False, covered=(), missing=(),
+        )
+    traded = market_traded_on(conn, audited)
+    if not traded:
+        # Nothing was collectable, so nothing is missing. Walking the manifest
+        # anyway would fill `missing` on a day the market was shut -- true of the
+        # bars and false about the world, and a payload whose `missing` list
+        # contradicts its own `ok` is worse than one that says nothing.
+        return SessionAudit(day=audited, market_traded=False, covered=(), missing=())
+    end_of_day = int(
+        datetime.strptime(audited, "%Y-%m-%d")
+        .replace(hour=23, minute=59, tzinfo=MARKET_TZ).timestamp()
+    )
+    opened = _first_fill_epochs(conn)
+    covered: list[str] = []
+    missing: list[str] = []
+    for request in bars_manifest(conn, now=now, perishable_only=True):
+        entry = opened.get(request.conid)
+        if entry is not None and entry > end_of_day:
+            continue  # opened after the session; it could not have bars for it
+        stamps = conn.execute(
+            "SELECT ts FROM price_bars WHERE conid = ? AND bar_size = '1h'",
+            (request.conid,),
+        ).fetchall()
+        found = any(et_day(int(row["ts"])) == audited for row in stamps)
+        (covered if found else missing).append(request.symbol)
+    return SessionAudit(
+        day=audited, market_traded=traded,
+        covered=tuple(sorted(covered)), missing=tuple(sorted(missing)),
+    )
+
+
 def close_series(
     conn: sqlite3.Connection,
     conid: str,
@@ -781,6 +932,16 @@ def modelled_marks(
             if vol is None:
                 continue
             years = (expiry - stamp) / (365.0 * 86400)
+            if years < 0:
+                # The contract is gone. Pricing past expiry is not merely
+                # imprecise, it is confidently wrong: bs_price clamps to
+                # intrinsic and bs_delta to 1.0, so a held position draws a P&L
+                # that keeps swinging with spot and a delta pinned at the top of
+                # its axis for as long as the window runs. Measured on the demo's
+                # snapshot-only call, that was two months of tail on a contract
+                # that had settled. Skipping means the series ENDS at expiry,
+                # which is where the band already ends.
+                continue
             unit = bs_price(spot, leg.strike, years, vol, leg.right)
             value += quantity * unit * leg.multiplier
             delta += quantity * bs_delta(spot, leg.strike, years, vol, leg.right)

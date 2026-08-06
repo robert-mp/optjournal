@@ -41,11 +41,16 @@ times a session -- roughly 1,800 times a year:
 * Anything else       -> raise. MeshClaw's failure dedup suppresses repeats.
 
 The consequence worth stating plainly: a session in which EVERY poll fails is
-lost silently. That is the accepted cost of not alerting on transient failure,
-and the honest place to catch it is a once-daily audit asking whether
-yesterday's session produced any hourly option bars at all -- one signal about
-the thing that actually matters, rather than seven a day about things that do
-not.
+lost silently. ``audit`` is the catch for that -- one signal a day about the
+thing that actually matters, rather than seven a day about things that do not.
+
+``audit``  Fetches nothing. Asks whether the last session's perishable bars
+           actually landed, and reports if they did not. It has to exist because
+           the policy above is deliberately deaf to a failed poll: the retry is
+           right seven times a session and wrong once a day, since a lost
+           session cannot be re-collected at any price and would otherwise leave
+           no trace anywhere. It reports rather than completing, because the
+           question recurs every day.
 
 Register with:
 
@@ -63,6 +68,13 @@ Register with:
         timezone="Europe/Dublin",
         timeout=600,
     )
+    cron_add(
+        name="optjournal-bars-audit",
+        script="~/.meshclaw/crons/optjournal_bars.py:audit",
+        cron_expr="0 13 * * 2-6",
+        timezone="Europe/Dublin",
+        timeout=120,
+    )
 
 `live` is expressed in America/New_York because market hours are an Eastern
 concept and the schedule then follows US DST without being edited twice a year.
@@ -73,6 +85,12 @@ grid; the 16:05 run is what reaches for the final hour of the session.
 12:00, deliberately: a position opened yesterday is only in the database once
 that sync has ingested it, and the manifest is derived from positions. The gap
 clears the sync's own 720s worst case with margin.
+
+`audit` runs at 13:00 Dublin, AFTER `daily` and not before it, because it uses
+the underlying's hourly series as its holiday oracle -- and it is `daily` that
+tops that series up for the session just gone. Run first, it would read a stale
+underlying, conclude the market was shut, and pass a genuinely lost session. The
+thirty-minute gap clears daily's 600s timeout.
 """
 
 from __future__ import annotations
@@ -81,7 +99,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from mesh_claw.cron_script import Skip
+from mesh_claw.cron_script import Report, Skip
 
 PROJECT = Path.home() / ".meshclaw" / "workspace" / "optjournal"
 CLI = PROJECT / ".venv" / "bin" / "optjournal"
@@ -147,3 +165,44 @@ def live(ctx) -> None:
 def daily(ctx) -> None:
     """Collect everything re-fetchable: daily closes and underlying series."""
     _collect()
+
+
+def audit(ctx) -> None:
+    """Report a session whose perishable option bars never landed.
+
+    Report rather than Done, because the question is asked again tomorrow; and
+    Report rather than raise, because a missing session is a fact to be told
+    once, not a fault to be retried -- no amount of retrying brings the bars
+    back, so a Skip here would loop forever on something already lost.
+
+    A timeout or a crash DOES raise: unlike a fetch, this run touches nothing
+    but the local database, so failing to complete means the tooling is broken
+    rather than the market being unreachable. Staying quiet about that would
+    leave the one thing watching for silent loss silently broken itself.
+    """
+    if not CLI.exists():
+        raise RuntimeError(f"optjournal CLI not found at {CLI}")
+
+    proc = _run("--audit")
+    if proc.returncode in (EXIT_OK, EXIT_NO_DATA):
+        return  # covered, or nothing to check: both silent by design
+    if proc.returncode != EXIT_ERROR:
+        raise RuntimeError(
+            f"optjournal bars --audit exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout or '').strip()[:500]}"
+        )
+
+    result = json.loads(proc.stdout)
+    missing = result.get("missing") or []
+    eligible = len(missing) + len(result.get("covered") or [])
+    raise Report(
+        f"optjournal: no hourly option bars for {len(missing)} of {eligible} "
+        f"contract(s) on {result.get('day')}. An option's intraday series "
+        "exists only while its own session runs, so that session cannot be "
+        "backfilled -- the replay chart's band and delta will stay coarse "
+        "across it.\n"
+        + "\n".join(f"  missing: {symbol}" for symbol in missing)
+        + "\n\nCheck `optjournal-bars-live` in cron_list: a whole session of "
+        "polls failing is what this catches, and the poll itself stays quiet "
+        "about it on purpose."
+    )

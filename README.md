@@ -124,6 +124,7 @@ That splits collection in two, and `bars_manifest` marks the difference with
 |---|---|---|---|
 | Perishable | intraday bars of an **open** option whose replay is drawn hourly | only during its own session | `optjournal-bars-live`, hourly at :05 past, 10:05–16:05 **ET**, weekdays |
 | Re-fetchable | daily option closes, the whole underlying series | any time | `optjournal-bars-daily`, 12:30 Dublin, Tue–Sat |
+| Audit | did yesterday's perishable bars actually land? | after the daily run | `optjournal-bars-audit`, 13:00 Dublin, Tue–Sat |
 
 Both live in `cron/optjournal_bars.py`. `--live` restricts a run to the
 perishable set: running the full manifest seven times a session would re-fetch
@@ -135,6 +136,29 @@ replay is *drawn* hourly.
 The intraday series is **cumulative within a session** — a 13:00 poll returns
 every completed bar since the open — which is what makes a lost poll harmless
 and lets the cron treat a fetch failure as a quiet retry rather than an alert.
+
+That tolerance has one hole, and `bars --audit` is the only thing that sees it: a
+session where *every* poll failed is gone and says nothing about it. The audit
+asks one question a day, about the one thing that cannot be recovered, and stays
+silent otherwise. Three properties make it trustworthy rather than noisy:
+
+- **Eligibility is the live manifest itself**, not a second rule. An audit with
+  its own idea of what should have been collected drifts from the collector and
+  then reports on a book neither of them holds.
+- **The underlying's own hourly series is the holiday oracle.** No date list
+  anywhere: US markets shut around nine days a year, a hardcoded calendar would
+  need maintaining forever, and the underlying's series — retained for days, and
+  re-fetched by the daily run — already answers whether the session happened. No
+  bars for anyone means the market was shut; bars for the underlying and none for
+  an option means collection failed.
+- **A contract opened after the audited session is excluded**, so opening a
+  position never triggers a report.
+
+It runs *after* `optjournal-bars-daily`, not before, precisely because that oracle
+depends on the daily run having topped the underlying up. Run first, it would read
+a stale series, conclude the market was shut, and pass a genuinely lost session.
+Exit codes are the whole interface: `0` covered, `1` bars missing (report), `3`
+nothing to check.
 
 `marketdata.parse_chart` drops bars off the series' own grid. The source appends
 a synthetic bar for the moment you asked, stamped at that moment: a 13:17 request
@@ -405,8 +429,42 @@ so `--json` comes for free.
 * `optjournal demo` refuses to write into the real archive or database,
   and `serve --demo --query-id` is refused outright: one Sync click would
   ingest real trades into the synthetic database.
+* `demo.write_demo_bars` refuses a database holding any statement that is not
+  a demo one. Every row in `price_bars` is supposed to be something a source
+  really served, so a **computed** bar in the real journal would break the
+  reproducibility the archive exists to provide — and unlike a fake statement it
+  would sit there looking exactly like a fetched one. The check is on the data,
+  not on the path, so pointing `--db` at a copy of the real journal is refused
+  too. Computed bars are also ranked below every real source
+  (`marketdata.SOURCE_RANK`), so a genuine fetch always displaces one and never
+  the reverse.
 * The server binds loopback only and refuses anything else: no
   authentication, and the UI exposes an entire brokerage account.
+
+### The demo's option bars are computed
+
+The demo charts real NVDA and SPY history, but its option symbols are invented,
+so the price source returns 404 for every one: zero option bars against 1,680
+underlying ones. The band and the effective delta both solve implied vol from an
+option's own daily closes, so both were reaching for a series that can never
+exist — the demo drew a price line and nothing that made it a replay.
+
+Each contract is priced from **one observation the statement itself states** — an
+opening fill, or a snapshot's mark — by solving the vol that reproduces it at the
+real spot for that day, then repricing along the real spot path. Deriving from the
+statement rather than assuming a plausible vol is what keeps the bars consistent
+with the demo's own P&L; the bar for the anchor's own session carries that price
+verbatim. Vol then drifts in slow regimes with a small per-session jitter, both
+fixed by the calendar day so a re-run is reproducible.
+
+A contract whose anchor cannot be solved is **skipped, not defaulted** — and that
+turned out to be a real signal rather than a nuisance. It found two: `SPY 600C`
+and `SPY 640C` were written for a price level SPY never traded at during their
+windows, leaving the statement claiming premiums *below intrinsic*, which no
+volatility can produce. Nothing had caught it, because a strike enters no P&L
+arithmetic: every money assertion passed while those two replays silently carried
+no band, no delta and no modelled P&L. `test_demo.py` now pins each contract's
+premium against the real close for its own date.
 
 ## Development
 

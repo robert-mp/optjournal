@@ -65,7 +65,11 @@ BAR_SIZES = ("1h", "1d")
 #: one leaves it alone. Broker marks beat a public endpoint, so adding an IBKR
 #: source later upgrades history in place with no migration and no re-fetch of
 #: what is already good.
-SOURCE_RANK: dict[str, int] = {"yahoo": 10, "ibkr": 20}
+#:
+#: ``synthetic`` is the demo's computed bars and sits below everything real, so a
+#: genuine fetch always displaces one and never the reverse. It is listed rather
+#: than left to the ELSE-0 default so the ordering is stated in one place.
+SOURCE_RANK: dict[str, int] = {"synthetic": 0, "yahoo": 10, "ibkr": 20}
 
 _CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 _TIMEOUT_S = 25

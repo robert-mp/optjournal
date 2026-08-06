@@ -634,3 +634,335 @@ def test_the_equities_selection_switches_category_and_reaches_no_further(conn,
         assert stk[key] == plain[key], f"{key} must not follow the control"
     # Offerability is derived from the data, not asserted in markup.
     assert plain["asset_counts"]["STK"] == 3
+
+
+# ------------------------------------------------------- synthetic option bars
+
+#: Every option contract the demo scripts, with the REAL close of its underlying
+#: on the day the statement first states a price for it. Transcribed rather than
+#: fetched because these are settled historical closes and cannot change, and
+#: because the whole point is to check the demo's strikes against the market the
+#: chart actually draws -- a fixture at invented price levels would agree with
+#: invented strikes and prove nothing.
+#:
+#: This table is the oracle the demo lacked. Two call strikes had been chosen for
+#: a price level SPY never traded at during their windows, leaving the statement
+#: claiming a premium below the contract's intrinsic value. Nothing caught it:
+#: strike does not enter any P&L arithmetic, so every money assertion passed
+#: while the replay chart's band, delta and modelled P&L were silently absent.
+_REAL_SPOT_AT_ANCHOR = [
+    # symbol,                     anchor day,   real close, strike, right, price
+    ("NVDA  250620P00105000", "2025-05-12", 123.00, 105.0, "P", 2.10),
+    ("NVDA  250815P00112000", "2025-07-09", 162.88, 112.0, "P", 3.35),
+    ("NVDA  251017P00160000", "2025-09-08", 168.31, 160.0, "P", 2.10),
+    ("NVDA  251017P00170000", "2025-09-08", 168.31, 170.0, "P", 4.55),
+    ("NVDA  260320P00140000", "2026-01-27", 188.52, 140.0, "P", 5.05),
+    ("SPY   250417C00580000", "2025-03-05", 583.06, 580.0, "C", 9.10),
+    ("SPY   251121P00560000", "2025-10-20", 671.30, 560.0, "P", 5.80),
+    ("SPY   251219P00555000", "2025-11-17", 665.67, 555.0, "P", 6.15),
+    ("SPY   260116C00695000", "2026-01-16", 691.66, 695.0, "C", 1.95),
+    ("SPY   260417P00590000", "2026-01-08", 689.51, 590.0, "P", 7.20),
+    ("SPY   260618C00740000", "2026-02-27", 685.99, 740.0, "C", 11.40),
+]
+
+#: Approximate years from each anchor to expiry. Only needs to be close: the
+#: assertion is that a vol EXISTS, not that it takes a particular value.
+_YEARS_TO_EXPIRY = {
+    "NVDA  250620P00105000": 0.11, "NVDA  250815P00112000": 0.10,
+    "NVDA  251017P00160000": 0.11, "NVDA  251017P00170000": 0.11,
+    "NVDA  260320P00140000": 0.14, "SPY   250417C00580000": 0.12,
+    "SPY   251121P00560000": 0.09, "SPY   251219P00555000": 0.09,
+    "SPY   260116C00695000": 0.0007, "SPY   260417P00590000": 0.27,
+    "SPY   260618C00740000": 0.30,
+}
+
+
+@pytest.mark.parametrize(
+    ("symbol", "day", "spot", "strike", "right", "price"), _REAL_SPOT_AT_ANCHOR,
+    ids=[row[0].strip() for row in _REAL_SPOT_AT_ANCHOR],
+)
+def test_every_scripted_option_is_priceable_against_the_real_market(
+    symbol, day, spot, strike, right, price
+):
+    """A demo premium must be above intrinsic at the real spot for its own date.
+
+    Below intrinsic there is no volatility that reproduces the price, so the vol
+    solve refuses it -- correctly -- and the contract silently loses its band,
+    its effective delta and its modelled P&L. The demo exists to exercise paths
+    the real account cannot, so a contract that cannot be priced exercises
+    nothing.
+    """
+    from optjournal.blackscholes import implied_vol
+
+    intrinsic = max(0.0, (strike - spot) if right == "P" else (spot - strike))
+    assert price > intrinsic, (
+        f"{symbol} is priced at {price} on {day} when {spot} spot makes it worth "
+        f"{intrinsic:.2f} at once -- no volatility can produce that"
+    )
+    vol = implied_vol(price, spot, strike, _YEARS_TO_EXPIRY[symbol], right)
+    assert vol is not None, f"{symbol} has no implied vol on {day}"
+    assert 0.01 < vol < 3.0, f"{symbol} implies an absurd {vol:.1%} vol"
+
+
+def test_a_premium_below_intrinsic_has_no_vol_at_all():
+    """The control for the test above. Without it, an implied_vol that returned a
+    number for every input would make that whole parametrized set vacuous -- and
+    the strike bug it exists to catch would pass again.
+
+    These are the two contracts as they were actually scripted, against the spot
+    their windows really traded at.
+    """
+    from optjournal.blackscholes import implied_vol
+
+    assert implied_vol(1.95, 691.66, 600.0, 0.0007, "C") is None, (
+        "a 600 call at 1.95 with spot at 692 is 92 dollars in the money"
+    )
+    assert implied_vol(11.40, 685.99, 640.0, 0.30, "C") is None, (
+        "a 640 call at 11.40 with spot at 686 is 46 dollars in the money"
+    )
+
+
+def _with_underlying(conn, symbol="SPY", closes=((0, 690.0),)):
+    """Store a daily underlying series at given (day offset, close) pairs."""
+    from datetime import UTC, datetime, timedelta
+
+    from optjournal.bars import upsert_bars
+    from optjournal.demo import _UNDERLYING_CONID
+    from optjournal.marketdata import Bar
+
+    start = datetime(2026, 1, 5, 5, 0, tzinfo=UTC)   # midnight ET
+    bars = [
+        Bar(ts=int((start + timedelta(days=offset)).timestamp()),
+            open=close, high=close, low=close, close=close, volume=0)
+        for offset, close in closes
+    ]
+    upsert_bars(conn, conid=_UNDERLYING_CONID[symbol], symbol=symbol,
+                bar_size="1d", source="yahoo", bars=bars)
+
+
+def test_synthetic_bars_reprice_the_statements_own_anchor(conn):
+    """The property that makes computed bars trustworthy rather than decorative.
+
+    Vol is solved from a price the statement itself states, and the bar for that
+    same session carries that price verbatim -- so the series the chart draws
+    passes through the figure the journal reports. A generator that assumed a
+    plausible vol instead would mark positions at values contradicting the
+    realised P&L printed beside them.
+    """
+    from optjournal.bars import close_series, epoch_et, et_day
+    from optjournal.blackscholes import implied_vol
+    from optjournal.demo import _UNDERLYING_CONID, write_demo_bars
+
+    _with_underlying(conn, "SPY", [(n, 690.0 - n) for n in range(40)])
+    assert write_demo_bars(conn) > 0, "no bars written for a priceable contract"
+
+    # The partial-close SPY 590 put: opened 2026-01-08 at 7.20.
+    leg = conn.execute(
+        "SELECT conid, first_fill_at, avg_price FROM trade_legs"
+        " WHERE symbol = 'SPY   260417P00590000' ORDER BY first_fill_at LIMIT 1"
+    ).fetchone()
+    option = close_series(conn, str(leg["conid"]), bar_size="1d")
+    assert option, "the contract got no bars"
+
+    anchor_day = et_day(epoch_et(leg["first_fill_at"]))
+    priced = {et_day(stamp): close for stamp, close in option}
+    assert priced[anchor_day] == pytest.approx(abs(float(leg["avg_price"])), abs=0.01), (
+        "the session the statement priced does not carry the statement's price"
+    )
+
+    spots = {
+        et_day(stamp): close
+        for stamp, close in close_series(
+            conn, _UNDERLYING_CONID["SPY"], bar_size="1d"
+        )
+    }
+    for stamp, close in option[:5]:
+        vol = implied_vol(close, spots[et_day(stamp)], 590.0, 0.27, "P")
+        assert vol is not None, f"a generated bar at {close} cannot be solved back"
+
+
+def test_the_generated_vol_steps_between_sessions(conn):
+    """Otherwise the demo misrepresents the feature it exists to show. On real
+    data the vol input is re-solved from each session's own close, so the band
+    steps; a single vol held flat across a window would draw a smooth cone the
+    real journal never produces.
+    """
+    from optjournal.bars import close_series
+    from optjournal.demo import write_demo_bars
+
+    # A FLAT underlying, so any variation in the option's price can only come
+    # from the vol input rather than from spot moving.
+    _with_underlying(conn, "SPY", [(n, 690.0) for n in range(40)])
+    write_demo_bars(conn)
+    conid = conn.execute(
+        "SELECT conid FROM trade_legs WHERE symbol = 'SPY   260417P00590000'"
+        " LIMIT 1"
+    ).fetchone()["conid"]
+    closes = [close for _stamp, close in close_series(conn, str(conid), bar_size="1d")]
+    assert len(closes) > 5, "too few bars to judge"
+    # Decay alone would make this monotonic; stepping vol must break that.
+    falling = all(b <= a for a, b in zip(closes, closes[1:], strict=False))
+    assert not falling, "the vol input never changed between sessions"
+
+
+def test_synthetic_bars_are_stamped_where_the_source_stamps_them(conn):
+    """Midnight ET, which is where the price source puts an option's daily bar --
+    and NOT the session open, where it puts the underlying's. The two series are
+    joined on the trading day precisely because those conventions differ, so bars
+    emitted at the open here would make the demo the one place a raw-timestamp
+    join works and leave that bug untestable.
+    """
+    from datetime import datetime
+
+    from optjournal.bars import MARKET_TZ, close_series
+    from optjournal.demo import write_demo_bars
+
+    _with_underlying(conn, "SPY", [(n, 690.0 - n) for n in range(40)])
+    write_demo_bars(conn)
+    rows = conn.execute(
+        "SELECT ts FROM price_bars WHERE source = 'synthetic' LIMIT 20"
+    ).fetchall()
+    assert rows, "no synthetic bars to check"
+    for row in rows:
+        local = datetime.fromtimestamp(int(row["ts"]), MARKET_TZ)
+        assert (local.hour, local.minute) == (0, 0), (
+            f"stamped {local:%H:%M} ET, not midnight"
+        )
+    assert not close_series(conn, "nope", bar_size="1h"), "sanity: no hourly bars"
+
+
+def test_synthetic_bars_are_reproducible(conn):
+    """`optjournal demo` must produce the same journal twice. The vol jitter is
+    hashed from the calendar day rather than drawn from `random` for exactly this
+    reason -- otherwise every re-run would move the band and no chart in the demo
+    could be compared with itself.
+    """
+    from optjournal.demo import write_demo_bars
+
+    _with_underlying(conn, "SPY", [(n, 690.0 - n) for n in range(40)])
+    write_demo_bars(conn)
+    first = conn.execute(
+        "SELECT conid, ts, close FROM price_bars WHERE source = 'synthetic'"
+        " ORDER BY conid, ts"
+    ).fetchall()
+    conn.execute("DELETE FROM price_bars WHERE source = 'synthetic'")
+    conn.commit()
+    write_demo_bars(conn)
+    second = conn.execute(
+        "SELECT conid, ts, close FROM price_bars WHERE source = 'synthetic'"
+        " ORDER BY conid, ts"
+    ).fetchall()
+    assert first, "nothing generated"
+    assert [tuple(r) for r in first] == [tuple(r) for r in second]
+
+
+def test_synthetic_bars_refuse_a_database_holding_a_real_statement(conn):
+    """Every row in `price_bars` is supposed to be something a source served, so
+    a computed one in the real journal would break the reproducibility the
+    archive exists to provide -- and would be indistinguishable from a fetched
+    row afterwards. Scoped to the DATA rather than to a path, so pointing `--db`
+    at a copy of the real journal is refused too.
+    """
+    from optjournal.demo import write_demo_bars
+
+    _with_underlying(conn, "SPY", [(n, 690.0 - n) for n in range(40)])
+    assert write_demo_bars(conn) > 0, "the control: it works before the intruder"
+    conn.execute(
+        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
+        " to_date, base_currency, asset_filter, ingested_at)"
+        " VALUES ('activity-U123-real.xml','y','U123','2026-01-01','2026-02-01',"
+        " 'EUR','OPT','now')"
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="real statements"):
+        write_demo_bars(conn)
+
+
+def test_a_rerun_replaces_the_demo_and_keeps_the_real_underlying_series(conn):
+    """Trades dedupe on identifiers the generator derives deterministically, so a
+    changed contract arrives under an existing trade_id and the insert is a no-op
+    -- the database keeps describing a statement it was not built from. Found by
+    changing a strike and watching the old one survive alongside a snapshot of
+    the new one.
+
+    The underlying series must survive: it is real market history that cost
+    network requests, and re-fetching it is the expensive part of a rebuild.
+    """
+    from optjournal.demo import DEMO_ACCOUNT, reset_demo_rows, write_demo_bars
+
+    _with_underlying(conn, "SPY", [(n, 690.0 - n) for n in range(40)])
+    write_demo_bars(conn)
+    before = conn.execute(
+        "SELECT COUNT(*) AS n FROM price_bars WHERE source = 'yahoo'"
+    ).fetchone()["n"]
+    assert before > 0 and conn.execute(
+        "SELECT COUNT(*) AS n FROM trades WHERE account_id = ?", (DEMO_ACCOUNT,)
+    ).fetchone()["n"] > 0
+
+    reset_demo_rows(conn)
+    for table in ("trades", "position_snapshots", "statements"):
+        left = conn.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE account_id = ?",
+            (DEMO_ACCOUNT,),
+        ).fetchone()["n"]
+        assert left == 0, f"{table} kept demo rows a re-ingest would not replace"
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM price_bars WHERE source = 'yahoo'"
+    ).fetchone()["n"] == before, "the real underlying history was thrown away"
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM price_bars WHERE source = 'synthetic'"
+    ).fetchone()["n"] == 0, "stale computed bars survived a rebuild"
+
+
+def test_every_demo_replay_carries_a_band_and_an_effective_delta(demo, tmp_path):
+    """The guard that was missing while the demo was blank.
+
+    Both the payload contract and the render sweep check that markup MATCHES the
+    payload, so an empty band satisfied every one of them: nothing drawn, nothing
+    to draw, no complaint. 322 render checks passed across 42 pages while two of
+    the demo's ten replays carried no band, no effective delta and no modelled
+    P&L at all -- and the demo exists precisely to exercise what the real account
+    cannot.
+
+    Asserted absolutely rather than conditionally because the demo's data is
+    fixed: every contract it scripts is priceable against the real underlying
+    series (see the parametrized test above), so a replay without a band means
+    something upstream stopped working rather than data being unavailable.
+    """
+    from optjournal.db import open_journal
+    from optjournal.demo import write_demo_bars
+    from optjournal.web import build_state
+
+    db = tmp_path / "replays.db"
+    with open_journal(db) as conn:
+        ingest_file(conn, demo)
+        _with_underlying(conn, "SPY", [(n, 690.0 - n * 0.5) for n in range(60)])
+        _with_underlying(conn, "NVDA", [(n, 190.0 - n * 0.4) for n in range(60)])
+        assert write_demo_bars(conn) > 0, "no option bars generated"
+
+    state = build_state(db_path=db, archive_dir=tmp_path / "demo", query_id=None)
+    replays = state.get("replays") or {}
+    assert replays, "no replays in the payload at all"
+
+    blank = sorted(
+        key for key, replay in replays.items()
+        if replay.get("points") and not (replay.get("band") and replay.get("marks"))
+    )
+    assert not blank, (
+        f"{len(blank)} of {len(replays)} replays draw a price line and nothing "
+        f"modelled on it: {blank}"
+    )
+    compared = 0
+    for key, replay in replays.items():
+        # A replay outside this fixture's fabricated underlying window has no
+        # points and so nothing to compare -- the assertion above already covers
+        # the case that matters, which is points WITHOUT a band.
+        band, marks = replay.get("band") or [], replay.get("marks") or []
+        if not band or not marks:
+            continue
+        compared += 1
+        assert band[-1][0] == marks[-1][0], (
+            f"{key}: band ends at {band[-1][0]}, marks run to {marks[-1][0]}"
+        )
+    assert compared, "nothing was actually compared"
+

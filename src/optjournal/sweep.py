@@ -461,6 +461,24 @@ def check_replay_renders_from_url(p: Page) -> Verdict:
     # broker figure to contradict it, so its absence is invisible everywhere else.
     if replay.get("band") and 'class="emband"' not in p.markup:
         return bad(f"payload holds {len(replay['band'])} band rows, none drawn")
+    # Band and marks come from ONE vol series, so either both exist or neither
+    # does, and they must end on the same bar. Two consumers reading one series
+    # can disagree: expected_move refuses a negative horizon while bs_price
+    # quietly clamps to intrinsic, which had the mark series outliving the band
+    # by two months on a contract that had already settled. The checks above are
+    # each conditional on their own series, so neither could see the mismatch.
+    band, marks = replay.get("band") or [], replay.get("marks") or []
+    if bool(band) != bool(marks):
+        return bad(
+            f"{len(band)} band rows against {len(marks)} marks -- one vol series "
+            "reached only one of its two consumers"
+        )
+    if band and marks and band[-1][0] != marks[-1][0]:
+        return bad(
+            "band ends at bar stamped "
+            f"{band[-1][0]} but marks run to {marks[-1][0]} -- the position is "
+            "being priced past the envelope's own horizon"
+        )
     # An entry inside the window must be marked, or the session of context either
     # side reads as part of the trade.
     opened = replay.get("opened_ts")

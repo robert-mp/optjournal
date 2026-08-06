@@ -24,9 +24,10 @@ is the provenance root for every report and costs IBKR requests to rebuild.
 from __future__ import annotations
 
 import hashlib
+import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -229,12 +230,20 @@ def _script() -> tuple[list[Order], list[Position], list[Cash]]:
     ]))
 
     # 7. A 0DTE round trip: opened and closed on expiry day.
+    #    The strike is OTM against the REAL SPY series this journal charts (692
+    #    on 2026-01-16), not against a round number. It was 600 until the replay
+    #    chart existed, which made the contract $92 in the money while the
+    #    statement claimed it sold for 1.95 -- a price below intrinsic, which no
+    #    volatility can produce, so the vol solve correctly refused it and the
+    #    band, the delta and the modelled P&L were all silently absent here.
+    #    3.4 points OTM implies 46% at the sale rising to 69% at the buyback,
+    #    which is the shape a 0DTE call really does trade at.
     same = d(2026, 1, 16)
     orders.append(Order(same, label="0DTE: opened", time="100200", legs=[
-        Leg("SPY", same, "C", Decimal("600"), -3, Decimal("1.95"), "O"),
+        Leg("SPY", same, "C", Decimal("695"), -3, Decimal("1.95"), "O"),
     ]))
     orders.append(Order(same, label="0DTE: closed", time="153000", legs=[
-        Leg("SPY", same, "C", Decimal("600"), 3, Decimal("0.35"), "C",
+        Leg("SPY", same, "C", Decimal("695"), 3, Decimal("0.35"), "C",
             realized=Decimal("476.10")),
     ]))
 
@@ -279,11 +288,19 @@ def _script() -> tuple[list[Order], list[Position], list[Cash]]:
 
     # Still open at period end. The second has no opening fill in the
     # period at all, so its basis exists only in the snapshot.
+    #
+    # The long call's strike is OTM against the real SPY series for the same
+    # reason as the 0DTE above: at 640 it was $133 in the money while the
+    # snapshot marked it at 11.40, so its only vol observation was unsolvable.
+    # That one matters more than the others, because a snapshot-only contract has
+    # no fills to fall back on -- bars are the ONLY thing that can price it, and
+    # this is the demo's stand-in for the real journal's LEAP. At 740 the mark
+    # implies 18%, which is ordinary for SPY.
     exp = d(2026, 3, 20)
     positions = [
         Position("NVDA", exp, "P", Decimal("140"), -5, Decimal("3.80"),
                  Decimal("-2521.75")),
-        Position("SPY", d(2026, 6, 18), "C", Decimal("640"), 2, Decimal("11.40"),
+        Position("SPY", d(2026, 6, 18), "C", Decimal("740"), 2, Decimal("11.40"),
                  Decimal("3980.00"), snapshot_only=True),
         Position("SPY", d(2026, 4, 17), "P", Decimal("590"), -2, Decimal("4.05"),
                  Decimal("-1436.72")),
@@ -643,3 +660,254 @@ def write_demo_statement(archive_dir: Path, db_path: Path | None = None) -> Path
     dest = archive_dir / f"activity-demo-{TO_DATE:%Y%m%dT000000Z}.xml"
     dest.write_text(build_demo_statement(), encoding="utf-8")
     return dest
+
+
+# ---------------------------------------------------------------- option bars
+
+def reset_demo_rows(conn) -> int:
+    """Delete the demo account's rows so a re-run REPLACES rather than adds to.
+
+    Found by changing a strike: a re-ingest reported "0 fills" and left the old
+    contract in place, because trades are deduplicated on identifiers this module
+    derives deterministically -- so the same trade_id arrived carrying a
+    different symbol and the insert was a no-op rather than an update. Position
+    snapshots did accumulate, leaving BOTH strikes open at once. The result is a
+    database whose contracts contradict the statement it was built from, which is
+    the one thing the demo cannot afford to be, since its whole purpose is to be
+    an oracle for arithmetic the real account cannot exercise.
+
+    Scoped to ``account_id = DEMO_ACCOUNT`` rather than to a path: that predicate
+    can only ever match synthetic rows, so it stays safe whatever ``--db`` points
+    at, including a database that also holds real data. `securities` carries no
+    account, so demo contracts there are matched by conid instead -- they are
+    generated from a hash in a private range and cannot collide with a real one.
+    """
+    before = conn.total_changes
+    conn.execute(
+        "DELETE FROM securities WHERE conid IN"
+        " (SELECT conid FROM trades WHERE account_id = ?"
+        "  UNION SELECT conid FROM position_snapshots WHERE account_id = ?)",
+        (DEMO_ACCOUNT, DEMO_ACCOUNT),
+    )
+    for table in (
+        "trades", "cash_transactions", "position_snapshots",
+        "equity_summaries", "statements",
+    ):
+        conn.execute(f"DELETE FROM {table} WHERE account_id = ?", (DEMO_ACCOUNT,))
+    # Computed bars only. The UNDERLYING series in the same table is real NVDA
+    # and SPY history that cost network requests to fetch, and a changed strike
+    # leaves its old conid's synthetic bars behind as orphans referenced by no
+    # contract. Filtering on the source keeps the two apart precisely, since
+    # nothing but this module ever writes that value.
+    conn.execute("DELETE FROM price_bars WHERE source = ?", (SYNTHETIC_SOURCE,))
+    conn.commit()
+    return conn.total_changes - before
+
+
+#: The demo's option bars are computed, not fetched, and are marked as such.
+#: Ranked below every real source in marketdata.SOURCE_RANK, so a genuine fetch
+#: displaces one and never the reverse.
+SYNTHETIC_SOURCE = "synthetic"
+
+#: Deterministic per-session variation in the solved vol, as a fraction. Without
+#: it every bar prices at one vol, the band is a smooth cone and the demo
+#: misrepresents the feature: on real data the vol input STEPS each session,
+#: because it is re-solved from that session's own close.
+#:
+#: Split into a slow component and a fast one because the first attempt used a
+#: single per-day hash, and an uncorrelated draw per session does not look like
+#: volatility -- it looks like noise. The effective delta plotted straight from
+#: it jumped every bar, which is the one thing real IV never does: it drifts in
+#: regimes over weeks. The slow term is that drift; the fast one is the session
+#: jitter riding on top.
+_VOL_DRIFT = 0.10
+_VOL_JITTER = 0.02
+
+#: Sessions per drift cycle. Roughly two trading months, so a window of a few
+#: weeks sees a trend rather than a full oscillation.
+_DRIFT_PERIOD = 44.0
+
+
+def _session_vol(base: float, day: str) -> float:
+    """`base` on a vol path that drifts slowly and jitters slightly.
+
+    Both terms are fixed by the calendar day rather than drawn from `random`,
+    because `optjournal demo` must be reproducible -- a re-run that produced
+    different bars would move every band in the demo and make no chart in it
+    comparable with itself.
+    """
+    ordinal = datetime.strptime(day, "%Y-%m-%d").toordinal()
+    drift = math.sin(2 * math.pi * (ordinal % _DRIFT_PERIOD) / _DRIFT_PERIOD)
+    digest = hashlib.sha1(day.encode()).hexdigest()
+    jitter = (int(digest[:4], 16) / 0xFFFF) * 2 - 1     # -1.0 .. +1.0
+    return max(0.01, base * (1.0 + drift * _VOL_DRIFT + jitter * _VOL_JITTER))
+
+
+def _assert_demo_database(conn) -> None:
+    """Refuse to compute bars into a database holding any real statement.
+
+    `assert_not_real` guards the two default paths; this guards the DATA, which
+    is the invariant that actually matters. Every bar in `price_bars` is supposed
+    to be something a source really served, so a computed row in the real journal
+    would break the reproducibility the archive exists to provide -- and unlike a
+    fake statement it would sit there looking exactly like a fetched one.
+    """
+    rows = conn.execute("SELECT DISTINCT source_file FROM statements").fetchall()
+    intruders = [
+        str(row["source_file"]) for row in rows
+        if not str(row["source_file"]).startswith("activity-demo-")
+    ]
+    if intruders:
+        raise ValueError(
+            "refusing to write synthetic bars into a database containing real "
+            f"statements: {', '.join(sorted(intruders)[:3])}. Computed bars are "
+            "indistinguishable from fetched ones once stored."
+        )
+
+
+def _option_contracts(conn) -> list[dict]:
+    """Every option contract the demo holds, with the one price that anchors it.
+
+    The anchor is an opening fill where there is one, and the snapshot's mark
+    otherwise. A snapshot-only contract has no fills anywhere -- that is what
+    makes it snapshot-only -- so its mark is the only price the statement ever
+    states for it, and without bars it can be priced at no point on the chart.
+    """
+    rows = conn.execute(
+        "SELECT conid, symbol, underlying_symbol, put_call, strike, expiry,"
+        "       MIN(first_fill_at) AS anchor_at, NULL AS report_date,"
+        "       (SELECT avg_price FROM trade_legs i WHERE i.conid = o.conid"
+        "        ORDER BY i.first_fill_at LIMIT 1) AS anchor_price"
+        "  FROM trade_legs o WHERE asset_category = 'OPT' GROUP BY conid"
+        " UNION ALL "
+        "SELECT conid, symbol, underlying_symbol, put_call, strike, expiry,"
+        "       NULL AS anchor_at, report_date, mark_price AS anchor_price"
+        "  FROM position_snapshots WHERE asset_category = 'OPT'"
+        "   AND conid NOT IN (SELECT conid FROM trade_legs"
+        "                      WHERE asset_category = 'OPT')"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def write_demo_bars(conn) -> int:
+    """Compute the demo's option bars from its REAL underlying series.
+
+    The demo charts genuine NVDA and SPY history, but its option symbols are
+    invented, so the price source returns 404 for every one of them: measured on
+    the demo database, zero option bars against 1,680 underlying ones. The
+    expected-move band and the effective delta both solve implied vol from an
+    option's own daily closes, so both were reaching for a series that can never
+    exist -- the demo rendered a price line and nothing that made it a replay.
+
+    Each contract is priced from ONE observation the statement itself states --
+    an opening fill, or a snapshot's mark -- by solving the vol that reproduces
+    it at the real spot for that day, then repricing along the real spot path.
+    Deriving from the statement rather than assuming a plausible vol is what
+    keeps the bars consistent with the demo's own P&L: a hand-picked 30% would
+    have marked positions at prices contradicting the realised figures beside
+    them.
+
+    A contract whose anchor cannot be solved is SKIPPED rather than defaulted.
+    That is a real signal, not a nuisance: an unsolvable anchor means the
+    statement's price is below intrinsic against the real underlying, which is
+    the statement being wrong about the market rather than the market being
+    strange. It found two -- see the strike comments in `_script`.
+
+    Daily bars only. Both consumers read `bar_size="1d"`, because the source
+    serves no intraday option history and the vol input therefore steps per
+    session on real data too. Emitting hourly option bars here would give the
+    demo a fidelity the real journal cannot have.
+    """
+    from optjournal.bars import MARKET_TZ, close_series, epoch_et, et_day, upsert_bars
+    from optjournal.blackscholes import bs_price, implied_vol
+    from optjournal.marketdata import Bar
+
+    _assert_demo_database(conn)
+    written = 0
+    for contract in _option_contracts(conn):
+        underlying = _UNDERLYING_CONID.get(str(contract["underlying_symbol"]))
+        strike, right = contract["strike"], str(contract["put_call"] or "")
+        if not underlying or strike is None or right not in ("P", "C"):
+            continue
+        spots = close_series(conn, underlying, bar_size="1d")
+        expiry = _expiry_epoch_utc(contract["expiry"], MARKET_TZ)
+        if not spots or expiry is None:
+            continue
+
+        anchor_at = epoch_et(contract["anchor_at"]) or _report_epoch(
+            contract["report_date"], MARKET_TZ
+        )
+        anchor_price = contract["anchor_price"]
+        if anchor_at is None or anchor_price is None:
+            continue
+        by_day = {et_day(stamp): (stamp, close) for stamp, close in spots}
+        anchored = by_day.get(et_day(anchor_at))
+        if anchored is None:
+            continue
+        base_vol = implied_vol(
+            abs(float(anchor_price)), anchored[1], float(strike),
+            (expiry - anchor_at) / (365.0 * 86400), right,
+        )
+        if base_vol is None:
+            continue
+
+        # The window a replay can draw: from the anchor's own session to expiry,
+        # clipped to what the underlying actually holds. Starting AT the anchor
+        # rather than earlier because a price before a contract was observed is
+        # an extrapolation, and this journal leaves a gap as a gap.
+        bars: list[Bar] = []
+        for stamp, spot in spots:
+            if stamp < anchored[0] or stamp > expiry:
+                continue
+            day = et_day(stamp)
+            if stamp == anchored[0]:
+                # The session the statement itself priced. Emitted verbatim
+                # rather than re-derived, so the demo's own figure appears in the
+                # series it charts instead of within a tolerance of it -- the
+                # jitter below would otherwise move the one bar whose value is
+                # not a model output at all.
+                close = round(abs(float(anchor_price)), 2)
+            else:
+                years = (expiry - stamp) / (365.0 * 86400)
+                price = bs_price(
+                    spot, float(strike), years, _session_vol(base_vol, day), right
+                )
+                if price is None:
+                    continue
+                close = round(max(0.01, price), 2)
+            # Stamped at midnight ET, which is where the price source puts an
+            # option's daily bar -- and the reason bars.et_day exists. Emitting
+            # them at the session open instead would make the demo the one place
+            # the two daily series join on a raw timestamp, so the join bug that
+            # silently emptied the band would be untestable here.
+            bars.append(Bar(
+                ts=_midnight_et(day, MARKET_TZ),
+                open=close, high=close, low=close, close=close, volume=0,
+            ))
+        if bars:
+            written += upsert_bars(
+                conn, conid=str(contract["conid"]), symbol=str(contract["symbol"]),
+                bar_size="1d", source=SYNTHETIC_SOURCE, bars=bars,
+            )
+    return written
+
+
+def _expiry_epoch_utc(expiry, tz) -> int | None:
+    """Epoch of the 16:00 ET close on an expiry date, in either stored format."""
+    text = str(expiry or "").strip()
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            day = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return int(day.replace(hour=16, tzinfo=tz).timestamp())
+    return None
+
+
+def _report_epoch(report_date, tz) -> int | None:
+    """Epoch of a snapshot's report date, at the 16:00 ET close it describes."""
+    return _expiry_epoch_utc(report_date, tz)
+
+
+def _midnight_et(day: str, tz) -> int:
+    return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=tz).timestamp())
