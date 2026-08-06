@@ -10,8 +10,9 @@ unguarded invariant, and the suite should grow there: that is how `history._flat
 (a 0.4-share residual booking a partial close as a completed round trip) and
 `web._snapshot_leg`'s sign were found, both of which had passed 579 tests. A
 defect caught by fifteen tests means fourteen are coupled to something they are
-not about. Measured on this suite, the median is 2 and the maximum is 8 -- and
-that 8 is the Money currency gate, a rule that genuinely spans four layers.
+not about. Measured on this suite (13 mutants): median 2, maximum 8, minimum 1.
+That 8 is the Money currency gate, a rule genuinely spanning money, analysis,
+strategies and web.
 
 **Equivalent mutants are not findings.** Some changes have no observable effect,
 so "no test caught it" says nothing. The tool reports the count; deciding whether
@@ -145,6 +146,13 @@ MUTANTS: tuple[Mutant, ...] = (
         breaks="the page would see a missing property where it tests for null",
     ),
     Mutant(
+        key="num-decimal",
+        module="serialize.py",
+        find="    return float(value)",
+        replace="    return value",
+        breaks="Decimals would reach the payload, so JSON carries strings",
+    ),
+    Mutant(
         key="quarantine",
         module="stats.py",
         find="from optjournal.money import Money, win_rate",
@@ -180,6 +188,18 @@ class MutationOutcome:
 
 
 _PTH = "_editable_impl_optjournal.pth"
+
+#: Tests that fail for EVERY mutant because the mutation removes the text they
+#: look for, not because they noticed the defect. Excluded from the count.
+#:
+#: This inflated every published figure by one before it was spotted: the Money
+#: currency gate was reported as "caught by 8 tests" when the real answer is 7,
+#: and a disputed `_num` result as 5 when it is 4. A harness that counts its own
+#: guard as a catcher overstates coverage everywhere, uniformly, which is the
+#: hardest kind of error to notice -- every number looks plausible.
+_SELF_REFERENTIAL = frozenset({
+    "tests/test_layering.py::test_every_mutant_pattern_still_matches_its_module",
+})
 
 
 def _pytest(clone: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -253,9 +273,13 @@ def run_mutant(mutant: Mutant, *, source: Path, workdir: Path) -> MutationOutcom
 
     result = _pytest(clone)
     failed = tuple(
-        re.sub(r"\s.*$", "", line[len("FAILED "):])
-        for line in (result.stdout or "").splitlines()
-        if line.startswith("FAILED ")
+        name
+        for name in (
+            re.sub(r"\s.*$", "", line[len("FAILED "):])
+            for line in (result.stdout or "").splitlines()
+            if line.startswith("FAILED ")
+        )
+        if name not in _SELF_REFERENTIAL
     )
     shutil.rmtree(clone, ignore_errors=True)
     return MutationOutcome(mutant, "measured", failed=len(failed), tests=failed)
