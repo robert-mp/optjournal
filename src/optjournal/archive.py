@@ -40,6 +40,7 @@ __all__ = [
     "DuplicateGroup",
     "PruneResult",
     "duplicate_groups",
+    "newest_statement",
     "prune_archive",
     "subsumed_candidates",
 ]
@@ -203,3 +204,20 @@ def prune_archive(
     # has just deleted.
     result.subsumed = subsumed_candidates(conn) if conn is not None else []
     return result
+
+
+def newest_statement(archive_dir: Path) -> Path | None:
+    """Most recently archived statement, or None if the archive is empty.
+
+    Here rather than in `serialize.py`, which is where it used to sit: it
+    returns a `Path`, and that module's contract is "take domain objects and
+    return JSON-safe dicts". A statement-store question belongs with the
+    statement store, beside the dedupe and prune that answer the others. Both
+    entry points asked `serialize` for a filesystem fact, which is the sort of
+    import that makes a layer look like it does more than it does.
+
+    Lexical sort is a real ordering, not a guess: archive filenames carry a
+    `YYYYMMDDTHHMMSSZ` stamp, so string order is time order.
+    """
+    files = sorted(archive_dir.glob("activity-*.xml"))
+    return files[-1] if files else None

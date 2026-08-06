@@ -23,7 +23,7 @@ from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 
 from optjournal import __version__, browser
 from optjournal.analysis import analyse, format_report
-from optjournal.archive import prune_archive
+from optjournal.archive import newest_statement, prune_archive
 from optjournal.bars import audit_perishable, backfill_bars, bars_manifest
 from optjournal.compat import unknown_codes
 from optjournal.config import (
@@ -46,7 +46,6 @@ from optjournal.render import (
 from optjournal.serialize import (
     costs_data,
     history_data,
-    newest_statement,
     orders_data,
     positions_data,
     statements_data,

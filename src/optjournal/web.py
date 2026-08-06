@@ -37,6 +37,7 @@ from typing import Any
 
 from optjournal import __version__
 from optjournal.analysis import analyse
+from optjournal.archive import newest_statement
 from optjournal.bars import (
     BandContract,
     ReplayLeg,
@@ -61,7 +62,6 @@ from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
 from optjournal.serialize import (
     costs_data,
     history_data,
-    newest_statement,
     orders_data,
     positions_data,
     statements_data,

@@ -443,8 +443,3 @@ def statements_data(
             }
         )
     return out
-
-def newest_statement(archive_dir: Path) -> Path | None:
-    """Most recently archived statement, or None if the archive is empty."""
-    files = sorted(archive_dir.glob("activity-*.xml"))
-    return files[-1] if files else None
