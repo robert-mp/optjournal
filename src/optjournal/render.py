@@ -68,6 +68,22 @@ def _money(value: Any, places: int = 2) -> str:
     return f"{float(value):,.{places}f}"
 
 
+def _charged(mo: Any, places: int = 2) -> str:
+    """The as-charged amount of a `Money` payload key.
+
+    Withheld -- rendered "-" -- whenever no single currency accounts for the
+    figure, which an order spanning currencies legitimately does. The `_base`
+    column beside it always answers, so the pair reads as "exactly this, or
+    the translation" rather than as a missing number.
+    """
+    return _money((mo or {}).get("native"), places)
+
+
+def _base(mo: Any, places: int = 2) -> str:
+    """The base-currency translation of a `Money` payload key. Always present."""
+    return _money((mo or {}).get("base"), places)
+
+
 # ------------------------------------------------------------------ statement
 
 
@@ -118,9 +134,9 @@ def render_orders(data: list[Row]) -> str:
             f"{o['leg_count']} leg(s) / {o['fills']} fill(s){tag}"
         )
         out.append(
-            f"  {o['first_fill_at']}   proceeds {_money(o['proceeds'])}"
-            f"   commission {_money(o['commission'], 4)}"
-            f"   base {_money(o['proceeds_base'])}"
+            f"  {o['first_fill_at']}   proceeds {_charged(o['proceeds'])}"
+            f"   commission {_charged(o['commission'], 4)}"
+            f"   base {_base(o['proceeds'])}"
         )
         out.append(
             table(
@@ -206,8 +222,8 @@ def render_history(data: Row) -> str:
                         _day(e["closed_at"]),
                         e["holding_days"] if e["holding_days"] is not None else "-",
                         e["contracts"],
-                        _money(e["realized_pnl"]),
-                        _money(e["realized_pnl_base"]),
+                        _charged(e["realized_pnl"]),
+                        _base(e["realized_pnl"]),
                         e["status"],
                     ]
                     for e in closed
@@ -239,7 +255,7 @@ def render_history(data: Row) -> str:
                         _day(e["opened_at"], "pre-archive"),
                         e["net_qty"],
                         e["open_fills"] + e["close_fills"],
-                        _money(e["commission_base"], 4),
+                        _base(e["commission"], 4),
                         _money(e["cost_basis"]),
                         "snapshot only" if e["snapshot_only"]
                         else ("entry missing" if e["entry_outside_window"]
