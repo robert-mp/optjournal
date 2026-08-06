@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import sqlite3
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -641,26 +642,73 @@ def _equity_summary_elements() -> list[dict[str, str]]:
     return out
 
 
+def _holds_real_statement(archive_dir: Path) -> Path | None:
+    """The first non-demo statement in `archive_dir`, or None if it holds none.
+
+    Identified by the account the statement states, not by its filename: a real
+    statement carries the broker's own account id, the demo carries
+    ``DEMO_ACCOUNT``. Read as bytes rather than parsed, because this runs before
+    anything is written and must not depend on py_ibkr accepting the file.
+    """
+    if not archive_dir.is_dir():
+        return None
+    needle = f'accountId="{DEMO_ACCOUNT}"'.encode()
+    for path in sorted(archive_dir.glob("activity-*.xml")):
+        try:
+            head = path.read_bytes()[:4096]
+        except OSError:  # pragma: no cover - unreadable file is not our business
+            continue
+        if b"accountId=" in head and needle not in head:
+            return path
+    return None
+
+
 def assert_not_real(archive_dir: Path, db_path: Path | None = None) -> None:
-    """Refuse to write synthetic data anywhere the real archive lives.
+    """Refuse to write synthetic data anywhere real data lives.
 
     The archive is the provenance root for every report, statements are
     deduplicated by content hash, and re-fetching one costs an IBKR request
-    against a lockout budget. A fake statement landing in `raw/` would be
+    against a lockout budget. A fake statement landing beside real ones would be
     indistinguishable from a real one after the fact.
+
+    Scoped to the DATA rather than to a path, matching `reset_demo_rows` and
+    `write_demo_bars` -- and this is a correctness change, not tidying. The path
+    test only knew one location, `<repo>/raw` and `<repo>/journal.db`, so it
+    refused the developer's own checkout and waved through every copy of it: a
+    backup, a clone, a restored snapshot. It was also why the suite failed when
+    run from a copied tree, since the "real" archive it compared against was no
+    longer at that path.
+
+    Now a directory is refused when it holds a statement for any account other
+    than the demo's, and a database when it holds a non-demo statement row. Both
+    questions the data can answer wherever it sits.
     """
-    real_archive = Path(__file__).resolve().parent.parent.parent / "raw"
-    if archive_dir.resolve() == real_archive.resolve():
+    intruder = _holds_real_statement(archive_dir)
+    if intruder is not None:
         raise ValueError(
-            f"refusing to write demo data into the real archive {real_archive}. "
-            f"Pass --out with a separate directory."
+            f"refusing to write demo data into {archive_dir}: it already holds the "
+            f"real statement {intruder.name}. Pass --out with a separate directory."
         )
-    if db_path is not None:
-        real_db = Path(__file__).resolve().parent.parent.parent / "journal.db"
-        if db_path.resolve() == real_db.resolve():
+    if db_path is not None and db_path.exists():
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT account_id FROM statements WHERE account_id IS NOT NULL"
+                ).fetchall()
+        except sqlite3.Error:
+            # No statements table yet, or not a journal at all: nothing real to
+            # protect, and refusing here would block a legitimate fresh --db.
+            return
+        real = sorted({
+            str(r["account_id"]) for r in rows
+            if str(r["account_id"]) != DEMO_ACCOUNT
+        })
+        if real:
             raise ValueError(
-                f"refusing to ingest demo data into the real database {real_db}. "
-                f"Pass --db with a separate path."
+                f"refusing to ingest demo data into {db_path}: it holds statements "
+                f"for real account(s) {', '.join(real)}. Pass --db with a separate "
+                f"path."
             )
 
 

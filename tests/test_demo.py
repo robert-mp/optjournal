@@ -14,11 +14,12 @@ generator surfaces here rather than quietly weakening every test that uses it.
 
 from __future__ import annotations
 
+import shutil
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from conftest import add_statement, connect_migrated
+from conftest import RAW_DIR, ROOT, add_statement, connect_migrated
 
 from optjournal.demo import (
     FROM_DATE,
@@ -110,13 +111,42 @@ def test_commission_minimum_binds_and_over_collection_is_credited():
     assert any(c > 0 for c in split), "no credit, so the sign path is untested"
 
 
-def test_refuses_to_touch_the_real_archive_or_database(tmp_path):
-    root = Path(__file__).resolve().parent.parent
-    with pytest.raises(ValueError, match="real archive"):
-        assert_not_real(root / "raw")
-    with pytest.raises(ValueError, match="real database"):
-        assert_not_real(tmp_path, root / "journal.db")
-    assert_not_real(tmp_path, tmp_path / "demo.db")  # a scratch pair is fine
+def test_refuses_to_touch_real_data_wherever_it_sits(tmp_path):
+    """The refusal is about the DATA, not about two hardcoded paths.
+
+    It used to compare `archive_dir` against `<repo>/raw` and `db_path` against
+    `<repo>/journal.db`, which had it backwards in both directions: it refused
+    only the developer's own checkout, and waved through every copy of it -- a
+    backup, a clone, a restored snapshot. It also made this very test
+    location-dependent, so the suite failed when run from a copied tree because
+    the "real" archive was no longer at the path it compared against.
+
+    Built from the real archive rather than a fixture, because the property under
+    test is "recognises real data", and only real data proves it.
+    """
+    real_statements = sorted(RAW_DIR.glob("activity-*.xml"))
+    if not real_statements:
+        pytest.skip("needs an archived statement")
+
+    # A COPY of a real statement, at a path the old check had never heard of.
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.mkdir()
+    shutil.copy(real_statements[0], elsewhere)
+    with pytest.raises(ValueError, match="real statement"):
+        assert_not_real(elsewhere)
+
+    # A copy of the real DATABASE, likewise.
+    db_copy = tmp_path / "restored.db"
+    shutil.copy(ROOT / "journal.db", db_copy)
+    with pytest.raises(ValueError, match="real account"):
+        assert_not_real(tmp_path / "fresh", db_copy)
+
+    # A scratch pair is fine, and so is a directory holding only demo output --
+    # otherwise `optjournal demo` could not be run twice.
+    assert_not_real(tmp_path / "scratch", tmp_path / "scratch" / "demo.db")
+    demo_dir = tmp_path / "demo-out"
+    write_demo_statement(demo_dir, demo_dir / "demo.db")
+    assert_not_real(demo_dir, demo_dir / "demo.db")
 
 
 # ------------------------------------------------------------ what it unlocks
