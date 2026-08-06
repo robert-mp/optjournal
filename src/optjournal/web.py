@@ -40,12 +40,10 @@ from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.bars import (
     ReplayLeg,
-    band_contracts,
     delta_around,
     epoch_et,
-    expected_move_band,
-    modelled_marks,
     replay_bars,
+    replay_model,
 )
 from optjournal.db import open_journal
 from optjournal.flex import (
@@ -324,7 +322,9 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
         # legs, or a segment could be drawn for a position the P&L series was not
         # walking. Same reason `_snapshot_leg` is one constructor.
         replay_legs = _replay_legs(legs)
-        marks = modelled_marks(
+        # One vol solve behind both, via bars.replay_model. Solving per consumer
+        # meant 20 solves for 10 replays and 60% of build_state inside them.
+        band, marks = replay_model(
             conn, replay_legs, bars["points"], underlying_conid=bars["conid"],
         )
         replays[key] = {
@@ -345,12 +345,9 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 {ts for ts in (epoch_et(leg.get("first_fill_at")) for leg in legs)
                  if ts is not None}
             ),
-            # From the same legs the marks walk, so the band and the P&L series
+            # From the same solve the marks walk, so the band and the P&L series
             # cannot disagree about what the market charged for a contract.
-            "band": expected_move_band(
-                conn, band_contracts(replay_legs), bars["points"],
-                underlying_conid=bars["conid"],
-            ),
+            "band": band,
             "marks": marks,
             "events": _annotations(lifecycle, marks),
         }
@@ -376,6 +373,9 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
         # could disagree, and the chart would draw a segment for a position the
         # P&L series was not following.
         legs = [_snapshot_leg(row)]
+        band, marks = replay_model(
+            conn, legs, bars["points"], underlying_conid=bars["conid"],
+        )
         replays[key] = {
             "key": key,
             "underlying": row.get("underlying_symbol"),
@@ -393,13 +393,8 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "opened_ts": epoch_et(opened),
             "closed_ts": None,
             "fills": [],
-            "band": expected_move_band(
-                conn, band_contracts(legs), bars["points"],
-                underlying_conid=bars["conid"],
-            ),
-            "marks": modelled_marks(
-                conn, legs, bars["points"], underlying_conid=bars["conid"],
-            ),
+            "band": band,
+            "marks": marks,
             # No fills means no events to annotate. Explicitly empty rather than
             # absent, so the page reads one shape for every replay.
             "events": [],

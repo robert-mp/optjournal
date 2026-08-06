@@ -738,6 +738,65 @@ def test_the_band_accepts_both_expiry_formats_the_payload_carries(conn):
     assert expiry_epoch("nonsense") is None
 
 
+def test_the_band_and_the_marks_share_one_vol_solve(conn, monkeypatch):
+    """`replay_model` solves implied vol ONCE and hands it to both consumers.
+
+    Measured before this existed: 20 solves for 10 replays, with `_vol_series`
+    accounting for 60% of `build_state` and half of that being exact
+    recomputation over identical inputs.
+
+    Counted rather than timed, because a timing assertion is flaky and a call
+    count is exact. The property is also correctness and not only speed: with one
+    solve the envelope and the P&L series drawn inside it cannot disagree about
+    what the market charged for a contract.
+    """
+    from optjournal import bars as bars_mod
+
+    calls = []
+    original = bars_mod._vol_series
+    monkeypatch.setattr(
+        bars_mod, "_vol_series",
+        lambda *a, **k: (calls.append(1), original(*a, **k))[1],
+    )
+
+    leg = ReplayLeg(
+        conid="C1", strike=270.0, right="P", expiry="2026-09-04",
+        fills=((_ts("2026-07-27"), -3.0, 5.24),),
+    )
+    points = [(_ts("2026-07-27") + h * 3600, 320.0 + h) for h in range(6)]
+    bars_mod.replay_model(conn, [leg], points, underlying_conid="U1")
+
+    assert len(calls) == 1, (
+        f"replay_model solved vol {len(calls)} times; the band and the marks must "
+        "share one solve, or half the work is recomputation and the two halves of "
+        "one chart can disagree"
+    )
+
+
+def test_a_supplied_empty_vol_series_is_not_re_solved(conn, monkeypatch):
+    """`{}` is a real answer -- nothing solved -- and must not trigger a re-solve.
+
+    The guard is `vols is None` rather than `vols or _vol_series(...)` for exactly
+    this: a contract whose price the model cannot reproduce returns an empty dict,
+    which is falsey, so the truthiness spelling would re-run the full solve on
+    precisely the input that just failed to produce anything.
+    """
+    from optjournal import bars as bars_mod
+
+    calls = []
+    monkeypatch.setattr(
+        bars_mod, "_vol_series", lambda *a, **k: (calls.append(1), {})[1]
+    )
+    points = [(_ts("2026-07-27") + h * 3600, 320.0) for h in range(3)]
+    leg = ReplayLeg(conid="C1", strike=270.0, right="P", expiry="2026-09-04")
+
+    assert bars_mod.expected_move_band(
+        conn, [], points, underlying_conid="U1", vols={}) == []
+    assert bars_mod.modelled_marks(
+        conn, [leg], points, underlying_conid="U1", vols={}) == []
+    assert not calls, "an empty-but-supplied vol series was solved again"
+
+
 def test_the_band_and_the_marks_solve_against_one_projection():
     """Both are drawn on one chart, so both must read the same contracts.
 

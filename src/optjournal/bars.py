@@ -70,6 +70,7 @@ __all__ = [
     "delta_around",
     "expected_move_band",
     "modelled_marks",
+    "replay_model",
     "epoch_et",
     "et_day",
     "expiry_epoch",
@@ -844,6 +845,7 @@ def expected_move_band(
     points: list[tuple[int, float]],
     *,
     underlying_conid: str | None,
+    vols: dict[str, list[tuple[int, float]]] | None = None,
 ) -> list[list[float]]:
     """A one-standard-deviation envelope, per underlying bar.
 
@@ -855,7 +857,11 @@ def expected_move_band(
     dominates the risk. That is also what makes the envelope narrow as a trade
     ages and step outward when a roll pushes expiry further out.
     """
-    vols = _vol_series(conn, contracts, points, underlying_conid)
+    # `is None`, not `vols or ...`: an empty dict is the legitimate answer when
+    # nothing solved, and the truthiness spelling would re-run the whole solve
+    # for exactly that case.
+    if vols is None:
+        vols = _vol_series(conn, contracts, points, underlying_conid)
     if not vols:
         return []
     expiries = [
@@ -919,6 +925,7 @@ def modelled_marks(
     points: list[tuple[int, float]],
     *,
     underlying_conid: str | None,
+    vols: dict[str, list[tuple[int, float]]] | None = None,
 ) -> list[list[float]]:
     """Modelled P&L and effective delta per bar: ``[ts, pnl, delta]``.
 
@@ -949,7 +956,8 @@ def modelled_marks(
     so a delta-neutral strangle reads 0.0 and a short put reads a positive
     fraction -- the scale the reference chart uses.
     """
-    vols = _vol_series(conn, band_contracts(legs), points, underlying_conid)
+    if vols is None:
+        vols = _vol_series(conn, band_contracts(legs), points, underlying_conid)
     if not vols:
         return []
     marks: list[list[float]] = []
@@ -995,6 +1003,41 @@ def modelled_marks(
             continue
         marks.append([stamp, round(cash + value, 2), round(delta, 4)])
     return marks
+
+
+def replay_model(
+    conn: sqlite3.Connection,
+    legs: list[ReplayLeg],
+    points: list[tuple[int, float]],
+    *,
+    underlying_conid: str | None,
+) -> tuple[list[list[float]], list[list[float]]]:
+    """The band and the modelled marks for one replay, as ``(band, marks)``.
+
+    Solves the vol series ONCE and hands it to both. They are the two halves of
+    one picture -- an envelope and the P&L series drawn inside it -- and they were
+    each solving it independently: measured over the demo journal, that was 20
+    solves for 10 replays, with `_vol_series` accounting for 60% of the whole
+    `build_state` and half of that being exact recomputation.
+
+    Sharing the solve is also the stronger correctness statement, not just the
+    faster one. The band and the marks now cannot disagree about what the market
+    charged for a contract, because there is one answer rather than two that
+    happen to match -- the same reason `band_contracts` is a single projection.
+
+    Composed here rather than in `web.py` so the caller cannot get the sharing
+    half-right: passing the solve to one function and not the other would look
+    correct and silently keep the cost.
+    """
+    contracts = band_contracts(legs)
+    vols = _vol_series(conn, contracts, points, underlying_conid)
+    band = expected_move_band(
+        conn, contracts, points, underlying_conid=underlying_conid, vols=vols
+    )
+    marks = modelled_marks(
+        conn, legs, points, underlying_conid=underlying_conid, vols=vols
+    )
+    return band, marks
 
 
 def delta_around(marks: list[list[float]], stamp: int) -> tuple[float | None, float | None]:
