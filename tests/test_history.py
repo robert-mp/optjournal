@@ -39,8 +39,8 @@ _TRADE_SQL = (
     " open_close, notes, quantity, trade_price, currency, fx_rate_to_base,"
     " proceeds, proceeds_base, ib_commission, ib_commission_base,"
     " fifo_pnl_realized, fifo_pnl_realized_base, raw, source_file, first_seen_at)"
-    " VALUES (?,?,?,?, 'U1', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', 1.0,"
-    " ?, ?, ?, ?, ?, ?, '{}', 't.xml', 'now')"
+    " VALUES (?,?,?,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', 1.0,"
+    " ?, ?, ?, ?, ?, ?, '{}', ?, 'now')"
 )
 
 
@@ -58,13 +58,16 @@ def add_trade(
     commission: float = -1.0,
     realized: float = 0.0,
     asset: str = "OPT",
+    account_id: str = "U1",
+    source_file: str = "t.xml",
 ) -> None:
     proceeds = -qty * price * 100
     conn.execute(
         _TRADE_SQL,
-        (tid, f"e{tid}", f"x{tid}", f"o{tid}", date, f"{date} 10:00:00", asset,
-         symbol, conid, open_close, notes, qty, price, proceeds, proceeds,
-         commission, commission, realized, realized),
+        (tid, f"e{tid}", f"x{tid}", f"o{tid}", account_id, date,
+         f"{date} 10:00:00", asset, symbol, conid, open_close, notes, qty, price,
+         proceeds, proceeds, commission, commission, realized, realized,
+         source_file),
     )
 
 
@@ -146,6 +149,63 @@ def test_reentry_after_close_is_a_separate_episode(conn):
     assert closed[0].realized_pnl == 100.0
     assert still_open[0].net_qty == 5
     assert still_open[0].realized_pnl == 0.0
+
+
+def test_the_same_contract_in_two_accounts_is_two_episodes(conn):
+    """A position exists within an account, so the same conid in two accounts is
+    two positions -- not one fused round trip.
+
+    The episode walk grouped by conid alone, so two accounts trading the same
+    contract merged into a single episode whose quantities cancelled and whose
+    P&L summed. Demonstrated on hand-built rows: a +200 round trip in one account
+    and a -150 in another became one CLOSED episode reporting +50, an outcome
+    neither account had. Nothing was wrong on this journal because it holds one
+    account, which is exactly why the merge was silent.
+    """
+    add_statement(conn, source_file="b.xml", account_id="U2")
+    # U1: a winning round trip in contract C1.
+    add_trade(conn, "1", conid="C1", open_close="O", qty=-3, price=3.0,
+              account_id="U1")
+    add_trade(conn, "2", conid="C1", open_close="C", qty=3, price=1.0,
+              date="2026-03-05", realized=200.0, account_id="U1")
+    # U2: a losing round trip in the SAME contract.
+    add_trade(conn, "3", conid="C1", open_close="O", qty=-2, price=2.0,
+              date="2026-03-02", account_id="U2", source_file="b.xml")
+    add_trade(conn, "4", conid="C1", open_close="C", qty=2, price=3.5,
+              date="2026-03-06", realized=-150.0, account_id="U2",
+              source_file="b.xml")
+
+    report = build_history(conn)
+    assert len(report.episodes) == 2, "the two accounts' trades were fused"
+    by_account = {e.account_id: e for e in report.episodes}
+    assert by_account["U1"].realized_pnl == 200.0
+    assert by_account["U2"].realized_pnl == -150.0
+    assert all(e.status == "CLOSED" for e in report.episodes)
+
+
+def test_a_snapshot_is_matched_to_its_own_account(conn):
+    """The snapshot lookup keys on (broker, account_id, conid) too.
+
+    A conid-only key would let one account's holding decide the open/closed
+    verdict for another's: U2 still holds C1, so a conid-keyed lookup would mark
+    U1's fully-closed round trip in C1 as OPEN.
+    """
+    add_statement(conn, source_file="b.xml", account_id="U2")
+    add_trade(conn, "1", conid="C1", open_close="O", qty=-2, account_id="U1")
+    add_trade(conn, "2", conid="C1", open_close="C", qty=2, date="2026-03-05",
+              realized=50.0, account_id="U1")
+    add_trade(conn, "3", conid="C1", open_close="O", qty=-4, date="2026-03-02",
+              account_id="U2", source_file="b.xml")
+    # Only U2 still holds C1 at the snapshot.
+    conn.execute(
+        "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
+        " asset_category, position, currency, fx_rate_to_base, raw, source_file,"
+        " ingested_at) VALUES ('2026-12-31','C1','U2','OPT1','OPT',-4,'USD',1.0,"
+        " '{}','b.xml','now')"
+    )
+    report = build_history(conn)
+    u1 = next(e for e in report.episodes if e.account_id == "U1")
+    assert u1.status == "CLOSED", "U1's round trip must not be held open by U2's position"
 
 
 def test_partial_close_stays_open(conn):

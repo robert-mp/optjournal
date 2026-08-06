@@ -118,6 +118,12 @@ class Episode:
     symbol: str
     asset_category: str
     currency: str
+    #: Which broker and account this position belongs to. Part of the episode's
+    #: identity, since the same contract held in two accounts is two positions --
+    #: defaulted so the many hand-built Episodes in the suite need no change, and
+    #: so a snapshot row missing either still produces an episode.
+    broker: str = "ibkr"
+    account_id: str = ""
     underlying_symbol: str | None = None
     put_call: str | None = None
     strike: float | None = None
@@ -277,6 +283,8 @@ def _new_episode(row: Any) -> Episode:
     return Episode(
         conid=str(row["conid"] or ""),
         symbol=str(row["symbol"] or ""),
+        broker=str(row["broker"] or ""),
+        account_id=str(row["account_id"] or ""),
         asset_category=str(row["asset_category"] or ""),
         currency=str(row["currency"] or ""),
         underlying_symbol=row["underlying_symbol"],
@@ -340,7 +348,13 @@ def _finalise(ep: Episode, still_held: bool) -> None:
 def _held(
     conn: sqlite3.Connection, asset_category: str | None
 ) -> tuple[dict[str, Any], str | None]:
-    """Open positions from the newest snapshot, keyed by conid, and its date."""
+    """Open positions from the newest snapshot, and its date.
+
+    Keyed by `(broker, account_id, conid)` -- the same identity the episode walk
+    uses, and for the same reason: the same contract held in two accounts is two
+    positions, so a conid-only key would let one account's holding answer the
+    open/closed question for another's.
+    """
     where, params = _position_scope_where(asset_category)
     row = conn.execute(
         f"SELECT MAX(report_date) AS d FROM position_snapshots {where}", params
@@ -350,7 +364,7 @@ def _held(
         return {}, None
 
     held = {
-        str(r["conid"]): dict(r)
+        (str(r["broker"] or ""), str(r["account_id"] or ""), str(r["conid"])): dict(r)
         for r in conn.execute(
             f"SELECT * FROM position_snapshots {where} AND report_date = ?"
             " AND position != 0",
@@ -374,6 +388,8 @@ def _from_snapshot(row: dict[str, Any]) -> Episode:
         symbol=str(row.get("symbol") or ""),
         asset_category=str(row.get("asset_category") or ""),
         currency=str(row.get("currency") or ""),
+        broker=str(row.get("broker") or ""),
+        account_id=str(row.get("account_id") or ""),
         underlying_symbol=row.get("underlying_symbol"),
         put_call=row.get("put_call"),
         strike=row.get("strike"),
@@ -405,15 +421,23 @@ def build_history(
     held, snapshot_date = _held(conn, asset_category)
 
     where, params = _position_scope_where(asset_category)
+    # Grouped by (broker, account_id, conid), not by conid alone. A position
+    # exists WITHIN an account: the same contract held in two accounts is two
+    # positions, and the same conid at two brokers need not even be the same
+    # instrument. Ordering by conid alone fused them into one episode -- verified
+    # on hand-built rows, where a +200 round trip in one account and a -150 one in
+    # another became a single fabricated +50 CLOSED episode, with the position
+    # netting to flat because the quantities cancelled.
     rows = conn.execute(
         f"SELECT * FROM trades {where} "
-        "ORDER BY conid, COALESCE(date_time, trade_date), trade_id",
+        "ORDER BY broker, account_id, conid, COALESCE(date_time, trade_date), trade_id",
         params,
     ).fetchall()
 
     episodes: list[Episode] = []
     current: Episode | None = None
-    current_conid: str | None = None
+    #: (broker, account_id, conid) -- the position's identity. See the query.
+    current_key: tuple[str, str, str] | None = None
 
     def flush(*, closed_by_reentry: bool = False) -> None:
         """Finalise and store the episode in progress.
@@ -428,18 +452,22 @@ def build_history(
         """
         nonlocal current
         if current is not None:
-            still_held = False if closed_by_reentry else current.conid in held
+            still_held = (
+                False if closed_by_reentry
+                else (current.broker, current.account_id, current.conid) in held
+            )
             _finalise(current, still_held=still_held)
             episodes.append(current)
             current = None
 
     for row in rows:
         conid = str(row["conid"] or "")
+        key = (str(row["broker"] or ""), str(row["account_id"] or ""), conid)
         closing = (row["open_close"] or "").upper() == "C"
 
-        if conid != current_conid:
+        if key != current_key:
             flush()
-            current_conid = conid
+            current_key = key
 
         if current is None:
             current = _new_episode(row)
@@ -460,9 +488,9 @@ def build_history(
 
     # A held contract with no fills anywhere in the archive produces no
     # episode above, so it would silently vanish from the open book.
-    seen = {e.conid for e in episodes}
+    seen = {(e.broker, e.account_id, e.conid) for e in episodes}
     episodes.extend(
-        _from_snapshot(row) for conid, row in held.items() if conid not in seen
+        _from_snapshot(row) for key, row in held.items() if key not in seen
     )
 
     episodes.sort(key=lambda e: (e.closed_at or "", e.opened_at or ""), reverse=True)
