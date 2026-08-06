@@ -33,13 +33,21 @@ Design notes, and the reasoning behind the non-obvious choices:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-__all__ = ["SCHEMA_VERSION", "connect", "migrate", "open_journal"]
+__all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate", "open_journal"]
+
+log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 4
+
+#: The broker a row came from. Defaulted rather than nullable, because every row
+#: already in a journal came from IBKR -- the only source this project has ever
+#: had -- so the default states a fact rather than guessing one.
+DEFAULT_BROKER = "ibkr"
 
 #: Columns added to existing tables after their CREATE statement shipped.
 #: `executescript(_SCHEMA)` uses CREATE TABLE IF NOT EXISTS, which is a no-op on
@@ -49,28 +57,17 @@ SCHEMA_VERSION = 4
 #: free and an interrupted migration resumes.
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("trades", "ib_commission_currency", "TEXT"),
+    # Identity is per broker, not global. See _rekey_trades_by_broker.
+    ("trades", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
+    ("cash_transactions", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
+    ("position_snapshots", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
+    ("statements", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
 )
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS schema_version (
-  version     INTEGER NOT NULL,
-  applied_at  TEXT    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS statements (
-  source_file     TEXT PRIMARY KEY,
-  sha256          TEXT NOT NULL,
-  account_id      TEXT NOT NULL,
-  from_date       TEXT NOT NULL,
-  to_date         TEXT NOT NULL,
-  when_generated  TEXT,
-  base_currency   TEXT NOT NULL,
-  asset_filter    TEXT NOT NULL,
-  ingested_at     TEXT NOT NULL
-);
-
+_TRADES_DDL = """
 CREATE TABLE IF NOT EXISTS trades (
-  trade_id                TEXT    PRIMARY KEY,
+  broker                  TEXT    NOT NULL DEFAULT 'ibkr',
+  trade_id                TEXT    NOT NULL,
   ib_exec_id              TEXT    NOT NULL,
   transaction_id          TEXT    NOT NULL,
   ib_order_id             TEXT,
@@ -111,9 +108,42 @@ CREATE TABLE IF NOT EXISTS trades (
   mtm_pnl                 REAL,
   raw                     TEXT    NOT NULL,
   source_file             TEXT    NOT NULL REFERENCES statements(source_file),
-  first_seen_at           TEXT    NOT NULL
+  first_seen_at           TEXT    NOT NULL,
+  -- Identity is per broker: two brokers may both number a fill 1.
+  PRIMARY KEY (broker, trade_id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS trades_exec       ON trades(ib_exec_id);
+"""
+
+#: Indexes over columns _ADDED_COLUMNS may still be about to create, so they
+#: cannot live in _SCHEMA: `executescript` runs BEFORE the ALTERs, and
+#: CREATE INDEX validates its column list even under IF NOT EXISTS -- on a
+#: pre-migration journal that is "no such column: broker".
+#:
+#: Per broker, like the primary key: an execution id is unique within the broker
+#: that issued it, not across brokers.
+_LATE_INDEXES = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS trades_exec ON trades(broker, ib_exec_id)",
+)
+
+_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS schema_version (
+  version     INTEGER NOT NULL,
+  applied_at  TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS statements (
+  source_file     TEXT PRIMARY KEY,
+  sha256          TEXT NOT NULL,
+  account_id      TEXT NOT NULL,
+  from_date       TEXT NOT NULL,
+  to_date         TEXT NOT NULL,
+  when_generated  TEXT,
+  base_currency   TEXT NOT NULL,
+  asset_filter    TEXT NOT NULL,
+  ingested_at     TEXT NOT NULL
+);
+
+{_TRADES_DDL}
 CREATE INDEX        IF NOT EXISTS trades_date       ON trades(trade_date);
 CREATE INDEX        IF NOT EXISTS trades_order      ON trades(ib_order_id);
 CREATE INDEX        IF NOT EXISTS trades_underlying ON trades(underlying_symbol, trade_date);
@@ -408,6 +438,92 @@ def _repair_base_commission(conn: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def _rekey_trades_by_broker(conn: sqlite3.Connection) -> bool:
+    """Make trade identity `(broker, trade_id)` instead of `trade_id` alone.
+
+    Returns True when a rebuild happened. Idempotent: the current key is read
+    first, so re-running is free.
+
+    Why it needs a rebuild at all: SQLite cannot alter a PRIMARY KEY, and both of
+    this table's identity constraints assumed one broker. `trade_id` was the
+    PRIMARY KEY and `ib_exec_id` carried a UNIQUE index -- IBKR's own identifiers,
+    treated as globally unique. A second broker numbering a fill `1` would either
+    collide (raising) or, worse, be silently swallowed by the ingest's
+    `ON CONFLICT(trade_id) DO NOTHING` and reported as a duplicate.
+
+    Done as the standard twelve-step table rebuild, with two safety properties
+    that matter because this runs against a journal whose statements cost IBKR
+    requests to refetch:
+
+    * It counts rows before and after and raises rather than committing a partial
+      copy, so a failure leaves the original table in place.
+    * `INSERT INTO ... SELECT` names its columns explicitly rather than using
+      `SELECT *`, so a column added later cannot silently shift into the wrong
+      position.
+
+    The ingest's conflict target moves with it (`ON CONFLICT(broker, trade_id)`),
+    and `trades_exec` becomes UNIQUE over `(broker, ib_exec_id)` for the same
+    reason.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(trades)")}
+    if "broker" not in cols:
+        return False  # _ADDED_COLUMNS has not run yet; nothing to rekey
+    pk = [r["name"] for r in conn.execute("PRAGMA table_info(trades)") if r["pk"]]
+    if pk == ["broker", "trade_id"]:
+        return False  # already rekeyed
+
+    before = conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()["n"]
+    # Only the columns BOTH tables have. The old table can be missing one the
+    # shipped DDL declares -- `broker` itself on a journal whose ALTER has not run
+    # in this process, or any column added by a later _ADDED_COLUMNS entry -- and
+    # naming it in the SELECT is "no such column". Anything absent takes its DDL
+    # default, which for `broker` is exactly the fact we want recorded.
+    live = [r["name"] for r in conn.execute("PRAGMA table_info(trades)")]
+    shipped = {
+        line.strip().split()[0]
+        for line in _TRADES_DDL.splitlines()
+        if line.startswith("  ") and not line.strip().startswith(("--", "PRIMARY"))
+    }
+    ordered = [c for c in live if c in shipped]
+    names = ", ".join(ordered)
+    # Rebuilt from the shipped DDL rather than from the live table, so the new
+    # table is exactly what a fresh journal gets -- otherwise a journal migrated
+    # today and one created today would differ.
+    new_ddl = _TRADES_DDL.replace(
+        "CREATE TABLE IF NOT EXISTS trades", "CREATE TABLE trades_rekeyed"
+    )
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        # The views must go first: SQLite validates them on RENAME, so
+        # `trades_rekeyed RENAME TO trades` fails with "error in view trade_legs:
+        # no such table: main.trades" while any view still selects from the table
+        # being replaced. migrate() drops them at the top and _SCHEMA recreates
+        # them below, but this runs between those two points, so it drops them
+        # again rather than depending on where it sits in that sequence.
+        for view in _VIEWS:
+            conn.execute(f"DROP VIEW IF EXISTS {view}")
+        conn.execute("DROP TABLE IF EXISTS trades_rekeyed")
+        conn.executescript(new_ddl)
+        conn.execute(f"INSERT INTO trades_rekeyed ({names}) SELECT {names} FROM trades")
+        after = conn.execute("SELECT COUNT(*) AS n FROM trades_rekeyed").fetchone()["n"]
+        if after != before:
+            raise RuntimeError(
+                f"refusing to swap in a partial copy of trades: {before} rows in, "
+                f"{after} out. The original table is untouched."
+            )
+        conn.execute("DROP TABLE trades")
+        conn.execute("ALTER TABLE trades_rekeyed RENAME TO trades")
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+    # The caller re-runs _SCHEMA, which recreates the views and the indexes the
+    # dropped table took with it.
+    conn.executescript(_SCHEMA)
+    conn.commit()
+    log.info("rekeyed %d trades on (broker, trade_id)", before)
+    return True
+
+
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply the schema. Returns the resulting schema version."""
     for view in _VIEWS:
@@ -423,6 +539,11 @@ def migrate(conn: sqlite3.Connection) -> int:
     # behind the version bump: the stamp is written the first time migrate() runs
     # after the bump, so for a journal merely OPENED since then a one-shot hook
     # would silently never fire. The backfill guards itself instead.
+    # After the ALTER that adds `broker`, and before the backfills, so anything
+    # they write lands in the rebuilt table rather than in one about to be dropped.
+    _rekey_trades_by_broker(conn)
+    for statement in _LATE_INDEXES:
+        conn.execute(statement)
     _backfill_commission_currency(conn)
     # After the backfill, which is what makes the mismatch detectable: the
     # repair's WHERE compares ib_commission_currency, so on a journal that has

@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from optjournal.db import DEFAULT_BROKER
 from optjournal.flex import load
 from optjournal.sections import raw_sections
 
@@ -275,7 +276,7 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult,
         )
 
         cur = conn.execute(
-            "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
+            "INSERT INTO trades (broker, trade_id, ib_exec_id, transaction_id, ib_order_id,"
             " account_id, trade_date, date_time, asset_category, symbol, conid,"
             " underlying_symbol, underlying_conid, put_call, strike, expiry,"
             " multiplier, buy_sell, open_close, notes, level_of_detail, quantity,"
@@ -283,9 +284,10 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult,
             " ib_commission, ib_commission_base, ib_commission_currency, taxes,"
             " fifo_pnl_realized,"
             " fifo_pnl_realized_base, mtm_pnl, raw, source_file, first_seen_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(trade_id) DO NOTHING",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(broker, trade_id) DO NOTHING",
             (
+                DEFAULT_BROKER,
                 _s(t.tradeID), _s(t.ibExecID), _s(t.transactionID), _s(t.ibOrderID),
                 _s(stmt.accountId), _s(t.tradeDate), _s(t.dateTime), cat,
                 _s(t.symbol), _s(t.conid), _s(t.underlyingSymbol),

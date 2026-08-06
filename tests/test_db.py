@@ -8,6 +8,8 @@ are computable by hand.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from conftest import STATEMENTS, add_statement
 
@@ -639,3 +641,127 @@ def test_a_wrongly_converted_commission_is_repaired_on_open(tmp_path):
         "SELECT ib_commission_base FROM trades WHERE trade_id = ?",
         (victim["trade_id"],)).fetchone()[0] == -99.0
     conn.close()
+
+
+# --- broker identity ---------------------------------------------------------
+#
+# `trade_id` was the PRIMARY KEY and `ib_exec_id` carried a UNIQUE index: IBKR's
+# own identifiers, treated as globally unique. A second broker numbering a fill
+# `1` would either raise or, worse, be silently swallowed by the ingest's
+# ON CONFLICT ... DO NOTHING and reported as a duplicate.
+
+
+def test_trade_identity_is_per_broker(conn):
+    """Two brokers may both issue trade id '1', and both rows must survive."""
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="ibkr")
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="schwab")
+
+    rows = conn.execute(
+        "SELECT broker, trade_id FROM trades ORDER BY broker"
+    ).fetchall()
+    assert [(r["broker"], r["trade_id"]) for r in rows] == [
+        ("ibkr", "1"), ("schwab", "1"),
+    ], "the second broker's fill was dropped as a duplicate"
+
+
+def test_the_same_broker_still_cannot_insert_a_trade_twice(conn):
+    """The dedupe that makes ingest idempotent must keep working WITHIN a broker.
+
+    This is the half that would break silently if the conflict target were simply
+    widened without thought: overlapping statements re-present the same fills, and
+    first-write-wins is what keeps `first_seen_at` truthful.
+    """
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="ibkr")
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_trade(conn, trade_id="1", ib_exec_id="E9", broker="ibkr")
+
+
+def test_execution_ids_are_also_scoped_to_their_broker(conn):
+    """`trades_exec` was UNIQUE on `ib_exec_id` alone -- the second global-identity
+    assumption, and the one easy to miss because it is an index rather than a key.
+    """
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="A", ib_exec_id="E1", broker="ibkr")
+    _insert_trade(conn, trade_id="B", ib_exec_id="E1", broker="schwab")
+    assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 2
+    # Still unique within one broker.
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_trade(conn, trade_id="C", ib_exec_id="E1", broker="ibkr")
+
+
+def test_an_existing_journal_is_rekeyed_losslessly(tmp_path):
+    """The migration rebuilds `trades`, which is the risky kind of change.
+
+    Built as a pre-migration journal on purpose: the old table is created with
+    `trade_id` as the sole PRIMARY KEY and no broker column, then `migrate` is
+    asked to rekey it. Asserting on row COUNT alone would pass a rebuild that
+    scrambled columns, so every value is compared.
+    """
+    db = tmp_path / "old.db"
+    old = sqlite3.connect(db)
+    old.executescript(
+        "CREATE TABLE statements (source_file TEXT PRIMARY KEY, sha256 TEXT NOT NULL,"
+        " account_id TEXT NOT NULL, from_date TEXT NOT NULL, to_date TEXT NOT NULL,"
+        " when_generated TEXT, base_currency TEXT NOT NULL, asset_filter TEXT NOT NULL,"
+        " ingested_at TEXT NOT NULL);"
+        # Faithful to the shipped pre-migration table in the columns that matter
+        # here: sole `trade_id` key, no `broker`, and the columns _SCHEMA indexes
+        # (ib_order_id, underlying_symbol) present -- a fixture without those fails
+        # on CREATE INDEX for a reason that has nothing to do with rekeying.
+        "CREATE TABLE trades (trade_id TEXT PRIMARY KEY, ib_exec_id TEXT NOT NULL,"
+        " transaction_id TEXT NOT NULL, ib_order_id TEXT, account_id TEXT NOT NULL,"
+        " trade_date TEXT NOT NULL, asset_category TEXT NOT NULL, symbol TEXT NOT NULL,"
+        " underlying_symbol TEXT,"
+        " quantity INTEGER NOT NULL, currency TEXT NOT NULL, fx_rate_to_base REAL NOT NULL,"
+        " raw TEXT NOT NULL, source_file TEXT NOT NULL, first_seen_at TEXT NOT NULL);"
+    )
+    old.execute(
+        "INSERT INTO statements VALUES ('s.xml','x','U1','2026-07-01','2026-07-31',"
+        " NULL,'EUR','ALL','now')"
+    )
+    old.execute(
+        "INSERT INTO trades VALUES ('T1','E1','X1','O1','U1','2026-07-24','OPT',"
+        " 'TSLA  260904P00270000','TSLA',-3,'USD',0.9,'{}','s.xml','then')"
+    )
+    old.commit()
+    old.close()
+
+    conn = connect(db)
+    assert [r["name"] for r in conn.execute("PRAGMA table_info(trades)") if r["pk"]] == [
+        "trade_id"
+    ], "fixture is not a pre-migration journal"
+    migrate(conn)
+
+    assert [r["name"] for r in conn.execute("PRAGMA table_info(trades)") if r["pk"]] == [
+        "broker", "trade_id",
+    ]
+    row = dict(conn.execute("SELECT * FROM trades").fetchone())
+    assert row["broker"] == "ibkr", "existing rows are IBKR's; that is a fact, not a guess"
+    # Every original value intact, in the right column.
+    assert (row["trade_id"], row["ib_exec_id"]) == ("T1", "E1")
+    assert row["symbol"] == "TSLA  260904P00270000"
+    assert (row["ib_order_id"], row["underlying_symbol"]) == ("O1", "TSLA")
+    assert (row["quantity"], row["currency"], row["fx_rate_to_base"]) == (-3, "USD", 0.9)
+    assert row["first_seen_at"] == "then", "first_seen_at must survive a rebuild"
+    # The views the rebuild had to drop are back.
+    views = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='view'")}
+    assert "trade_legs" in views and "current_option_positions" in views
+
+
+def test_rekeying_is_idempotent(tmp_path):
+    """migrate() runs on every connection, so the rebuild must not repeat."""
+    db = tmp_path / "j.db"
+    conn = connect(db)
+    migrate(conn)
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="T1", ib_exec_id="E1")
+    conn.commit()
+    for _ in range(3):
+        migrate(conn)
+    assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
+    assert not conn.execute(
+        "SELECT name FROM sqlite_master WHERE name='trades_rekeyed'"
+    ).fetchall(), "the scratch table was left behind"
