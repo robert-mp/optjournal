@@ -207,12 +207,6 @@ td.n,th.n{text-align:right}
 .gr{stroke:var(--line);stroke-width:1}
 .tk{fill:var(--dim2);font-size:11px;font-family:var(--mono)}
 .pxline{stroke:var(--fg);stroke-width:1.7;fill:none;stroke-linejoin:round}
-/* Solid short, dashed long -- the encoding the reference chart uses, and the
-   distinction that matters: a strike you sold is a level you are defending,
-   one you bought is a level you paid for. Deliberately NOT the pos/neg
-   palette: green/red means signed money everywhere else on this page, and
-   reusing it for "which way round the contract is" would make the two
-   meanings compete. */
 /* Session boundary. Faint on purpose: it restores the day breaks that an
    ordinal axis collapses, without competing with the price line. */
 .sess{stroke:var(--line);stroke-width:1;stroke-dasharray:2 5}
@@ -1419,6 +1413,14 @@ const etday=ts=>new Date(ts*1000).toLocaleDateString('en-CA',{timeZone:MKT});
    Everything else on this page redraws wholesale on interaction, which is right
    for a click and wrong for a continuous drag. */
 let RGEO=null, RTIMER=null;
+/* The events a replay can place on the timeline: those carrying a real epoch.
+   ONE filter, because two readers must agree about the set -- the geometry
+   decides which cards `replaySeek` reveals, and the renderer decides which cards
+   exist to be revealed. Spelled twice, a card could exist and never be reached,
+   or be reached and not exist. `Number.isFinite` rather than the bare global:
+   `isFinite("")` is true, so a blank stamp used to pass as a timestamp. */
+const timedEvents=rp=>(rp.events||[]).filter(e=>e&&Number.isFinite(e.ts));
+
 function replayStop(){ if(RTIMER){clearInterval(RTIMER);RTIMER=null;} }
 
 function replayChart(rp){
@@ -1499,7 +1501,7 @@ function replayChart(rp){
   const dots=(rp.fills||[]).map(ts=>geo.at(ts)).filter(Boolean).map(m=>
     `<circle class="fill" cx="${m.x.toFixed(1)}" cy="${m.y.toFixed(1)}" r="3.2"/>`).join('');
   RGEO={points:pts,marks:rp.band?rp.marks||[]:[],xs:geo.xs,size:rp.bar_size,dp:dp,
-    events:(rp.events||[]).filter(e=>e&&isFinite(e.ts))};
+    events:timedEvents(rp)};
   const opening=frameAt(RGEO,pts.length-1);
   /* The legend states the encoding rather than making the reader infer it: a
      dashed line means two different things on this chart (a long strike, and the
@@ -1554,7 +1556,7 @@ function replayChart(rp){
    Each card seeks to its own event, which makes the strip a table of contents
    for the trade: click "Short put close" to jump the chart to the buyback. */
 function replayEvents(rp,pts){
-  const evs=(rp.events||[]).filter(e=>e&&isFinite(e.ts));
+  const evs=timedEvents(rp);
   if(!evs.length) return '';
   return `<div class="evs">${evs.map(e=>{
     const legs=(e.legs||[]).map(l=>
