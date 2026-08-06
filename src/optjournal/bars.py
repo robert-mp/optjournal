@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import cache
 from typing import Any
@@ -67,6 +67,7 @@ __all__ = [
     "BandContract",
     "close_series",
     "ReplayLeg",
+    "ReplaySeries",
     "delta_around",
     "expected_move_band",
     "modelled_marks",
@@ -618,6 +619,27 @@ def close_series(
 
 
 @dataclass(frozen=True, slots=True)
+class ReplaySeries:
+    """The underlying series one replay chart draws, and which grid it is on.
+
+    A dataclass rather than the three-key dict this returned, built at three
+    separate exits and read by string key at six call sites. `bars["conid"]` is a
+    `KeyError` at render time if it is ever mistyped, and the empty case had to
+    restate all three keys to stay the same shape as the populated one.
+
+    `bar_size` is carried even when `points` is empty, because the panel says
+    which grid it drew: a reader comparing two charts must not have to guess
+    whether a flat stretch is a quiet week or a coarser grid.
+    """
+
+    #: None when the symbol resolves to no underlying the journal knows.
+    conid: str | None
+    #: The grid actually drawn, or the preferred one when nothing was stored.
+    bar_size: str | None
+    points: list[tuple[int, float]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
 class ReplayLeg:
     """One leg, with everything the modelled P&L needs to follow it over time."""
 
@@ -1090,7 +1112,7 @@ def replay_bars(
     opened_at: str | None,
     closed_at: str | None,
     now: datetime | None = None,
-) -> dict[str, Any]:
+) -> ReplaySeries:
     """The underlying series a replay chart should draw for one trade window.
 
     Granularity comes from the same ``_bar_size_for`` the manifest used, so what
@@ -1106,9 +1128,8 @@ def replay_bars(
     """
     conids = _underlying_conids(conn)
     conid = conids.get(str(symbol or "").strip())
-    empty: dict[str, Any] = {"conid": None, "bar_size": None, "points": []}
     if not conid:
-        return empty
+        return ReplaySeries(conid=None, bar_size=None)
     moment = now or datetime.now(UTC)
     start = _epoch(opened_at)
     # A journal stamp truncates to its date, so a closing day's epoch is that
@@ -1132,5 +1153,5 @@ def replay_bars(
             # so everything held is the answer rather than a trimmed slice.
             if start:
                 points = _trim_to_context(points, start, end, size)
-            return {"conid": conid, "bar_size": size, "points": points}
-    return {"conid": conid, "bar_size": preferred, "points": []}
+            return ReplaySeries(conid=conid, bar_size=size, points=points)
+    return ReplaySeries(conid=conid, bar_size=preferred)

@@ -325,14 +325,14 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
         # One vol solve behind both, via bars.replay_model. Solving per consumer
         # meant 20 solves for 10 replays and 60% of build_state inside them.
         band, marks = replay_model(
-            conn, replay_legs, bars["points"], underlying_conid=bars["conid"],
+            conn, replay_legs, bars.points, underlying_conid=bars.conid,
         )
         replays[key] = {
             "key": key,
             "underlying": lifecycle.get("underlying"),
             "label": lifecycle.get("label"),
-            "bar_size": bars["bar_size"],
-            "points": [[ts, close] for ts, close in bars["points"]],
+            "bar_size": bars.bar_size,
+            "points": [[ts, close] for ts, close in bars.points],
             "strikes": _strikes_of(replay_legs),
             "opened_at": opened,
             "closed_at": closed,
@@ -374,14 +374,14 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
         # P&L series was not following.
         legs = [_snapshot_leg(row)]
         band, marks = replay_model(
-            conn, legs, bars["points"], underlying_conid=bars["conid"],
+            conn, legs, bars.points, underlying_conid=bars.conid,
         )
         replays[key] = {
             "key": key,
             "underlying": row.get("underlying_symbol"),
             "label": "Open position",
-            "bar_size": bars["bar_size"],
-            "points": [[ts, close] for ts, close in bars["points"]],
+            "bar_size": bars.bar_size,
+            "points": [[ts, close] for ts, close in bars.points],
             # A snapshot row has no fills, so its side comes from the signed
             # position and its window stays unknown -- drawn full width.
             "strikes": _strikes_of(legs),
