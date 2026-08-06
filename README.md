@@ -133,18 +133,24 @@ Both live in `cron/optjournal_bars.py`. `--live` restricts a run to the
 perishable set: running the full manifest seven times a session would re-fetch
 three years of settled daily history to collect a handful of new hourly rows.
 
-> **Deployment, and a live hazard.** MeshClaw requires cron scripts under
-> `~/.meshclaw/crons/`, which is not version controlled, so the implementations
-> live here and the deployed file should be a **loader shim** that locates one by
-> path — that is what `~/.meshclaw/crons/optjournal_sync.py` is, and why editing
-> `cron/optjournal_sync.py` takes effect immediately.
-> `~/.meshclaw/crons/optjournal_bars.py` is **still a byte-for-byte copy**, so an
-> edit to `cron/optjournal_bars.py` changes nothing about what actually runs and
-> says nothing about it. They are identical today; nothing keeps them so. The fix
-> is to replace that file with a shim delegating `live`, `daily` and `audit`,
-> modelled on the sync one. It matters more here than anywhere else in this
-> project, because a perishable session missed is a session no later run can
-> recover.
+> **Deployment.** MeshClaw requires cron scripts under `~/.meshclaw/crons/`,
+> which is not version controlled, so the implementations live here and each
+> deployed file is a **loader shim** that resolves one by path at run time. That
+> is what makes editing `cron/*.py` take effect: the shim carries an `IMPL` path,
+> a `_load()`, and one delegate per registered entry point, and nothing else.
+>
+> `optjournal_bars.py` was a byte-for-byte copy for a while, which is the failure
+> this pattern exists to prevent — an edit is reviewed, committed, and simply
+> never runs, silently, and the copy stays equal only until the next commit
+> touches that file. `tests/test_cron.py` now asserts both deployed files are
+> shims and that every registered entry point resolves to real code, so the state
+> cannot come back unnoticed. It matters more here than anywhere else in this
+> project: a perishable session missed is a session no later run can recover.
+>
+> Each shim is deliberately self-contained, repeating ~15 lines rather than
+> importing a shared helper — that helper would have to live in the same
+> unversioned directory, which is the problem being solved. A shim whose only job
+> is to have no dependencies may not acquire one.
 The LEAP is deliberately excluded from hourly collection — the gate is the
 chart's own granularity rule, so an option is collected hourly exactly when its
 replay is *drawn* hourly.

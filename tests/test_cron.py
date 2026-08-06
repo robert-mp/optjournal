@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+from pathlib import Path
 
 import pytest
 from conftest import ROOT
@@ -62,6 +63,73 @@ def sync_cron():
 @pytest.fixture(scope="module")
 def bars_cron():
     return _load_cron("optjournal_bars")
+
+
+#: Where MeshClaw requires cron scripts to live. Not version controlled, which is
+#: the whole reason the files there must be shims rather than copies.
+DEPLOYED = Path.home() / ".meshclaw" / "crons"
+
+
+@pytest.mark.skipif(not DEPLOYED.is_dir(), reason="no MeshClaw cron directory")
+@pytest.mark.parametrize("name", ["optjournal_sync", "optjournal_bars"])
+def test_the_deployed_cron_is_a_shim_not_a_copy(name):
+    """The deployed file must LOAD the repo's implementation, not duplicate it.
+
+    `optjournal_bars.py` was a byte-for-byte copy for a while, and the failure is
+    silent in the direction that matters: an edit to `cron/optjournal_bars.py` is
+    reviewed, committed and simply never runs. The two stayed equal only because
+    no commit after the hand-copy happened to touch that file.
+
+    It matters most for the bars jobs specifically. An option's intraday series
+    exists only while its own session runs, so a fix that appeared deployed and
+    was not costs sessions that no later run can recover.
+
+    Asserted structurally rather than by diffing bytes: a diff would pass the day
+    someone re-copied the file, which is exactly the state being forbidden.
+    """
+    deployed = DEPLOYED / f"{name}.py"
+    if not deployed.is_file():
+        pytest.skip(f"{name} is not deployed on this machine")
+    text = deployed.read_text(encoding="utf-8")
+
+    assert "importlib.util" in text and "spec_from_file_location" in text, (
+        f"{deployed} does not load its implementation by path -- if it is a copy "
+        "of the repo file, edits to the repo will never run"
+    )
+    # The path it resolves must be the versioned file, and that file must exist.
+    impl = CRON_DIR / f"{name}.py"
+    assert impl.is_file(), f"no versioned implementation at {impl}"
+    assert f'"{name}.py"' in text or f"'{name}.py'" in text, (
+        f"{deployed} does not name {name}.py, so it may point at the wrong file"
+    )
+    # A shim delegates; it does not carry the logic. The implementations shell out
+    # to the CLI via subprocess, so its absence here is the signal.
+    assert "subprocess" not in text, (
+        f"{deployed} contains implementation logic (subprocess), so it is a copy"
+    )
+
+
+@pytest.mark.skipif(not DEPLOYED.is_dir(), reason="no MeshClaw cron directory")
+def test_every_deployed_entry_point_exists_in_the_implementation():
+    """Each registered entry point must resolve through the shim to real code.
+
+    A shim exposing `live`/`daily`/`audit` that delegates to a module lacking one
+    of them fails at the scheduled minute, not at deploy time -- and for the live
+    poll that minute is inside a session whose bars cannot be re-collected.
+    """
+    expected = {"optjournal_sync": ["sync"],
+                "optjournal_bars": ["live", "daily", "audit"]}
+    for name, entries in expected.items():
+        deployed = DEPLOYED / f"{name}.py"
+        if not deployed.is_file():
+            continue
+        text = deployed.read_text(encoding="utf-8")
+        impl = _load_cron(name)
+        for entry in entries:
+            assert f"def {entry}(" in text, f"{deployed} does not expose {entry}"
+            assert callable(getattr(impl, entry, None)), (
+                f"{name}.py has no {entry}() for the shim to delegate to"
+            )
 
 
 def test_both_crons_load_with_only_the_standard_library(sync_cron, bars_cron):
