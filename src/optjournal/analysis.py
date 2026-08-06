@@ -194,7 +194,15 @@ class CommissionGroup:
 
     asset_category: str
     fills: int = 0
-    quantity: int = 0
+    #: Total units traded, the denominator of `per_unit_base`. Decimal rather
+    #: than int because stock lots are legitimately fractional -- dividend
+    #: reinvestment buys 1.79 shares -- and this used to accumulate
+    #: `int(abs(quantity))` per fill, truncating each one toward zero BEFORE
+    #: adding. Truncating per fill rather than at the end is what made it
+    #: severe: a thousand half-share buys summed to 0, not 500, so the per-unit
+    #: figure vanished on the exact accounts that trade fractionally. See
+    #: db.py's note on the same distinction in the schema.
+    quantity: Decimal = ZERO
     #: Commission AS CHARGED, keyed by the currency IBKR billed it in. A group
     #: can span currencies (this account's stock trades span four), and those
     #: amounts cannot be added -- so the breakdown is carried and the decision
@@ -241,7 +249,7 @@ class CommissionGroup:
         """Commission per contract or share. The figure that scales with volume."""
         if not self.quantity:
             return None
-        return self.commission_base / Decimal(self.quantity)
+        return self.commission_base / self.quantity
 
 
 @dataclass(slots=True)
@@ -555,7 +563,7 @@ def analyse(
         # A per-unit figure on a currency conversion would be commission per
         # euro, which is not a rate anyone charges or reads.
         if cat != "CASH" and t.quantity is not None:
-            g.quantity += int(abs(t.quantity))
+            g.quantity += abs(Decimal(str(t.quantity)))
 
         if cat != "CASH":
             continue
@@ -651,19 +659,27 @@ def format_report(report: CostReport) -> str:
     out.append(f"Cost report  {report.from_date} .. {report.to_date}  (base {cur})")
 
     out.append("\nExecution commission")
-    out.append(f"  {'asset':<10}{'fills':>7}{'qty':>9}{'commission':>13}{'per unit':>11}")
+    # qty is 13 wide, not 9: a fractional lot spends four digits on the fraction
+    # (5,089.0013 is 10 characters before the separator), and a column that fits
+    # only whole quantities silently runs into `fills` on the accounts that
+    # trade fractionally -- the same accounts the quantity fix was for.
+    out.append(f"  {'asset':<10}{'fills':>7}{'qty':>13}{'commission':>13}{'per unit':>11}")
     for g in report.commissions:
         per = f"{g.per_unit_base:,.4f}" if g.per_unit_base is not None else "-"
+        # normalize(), so a whole quantity reads "750" rather than "750.0000"
+        # while a fractional lot keeps the digits that make it fractional.
+        qty = f"{g.quantity.normalize():,f}" if g.quantity else "-"
         out.append(
-            f"  {g.asset_category:<10}{g.fills:>7}{g.quantity or '-':>9}"
+            f"  {g.asset_category:<10}{g.fills:>7}{qty:>13}"
             f"{g.commission_base:>13,.4f}{per:>11}"
         )
     out.append(
-        f"  {'TOTAL':<10}{sum(g.fills for g in report.commissions):>7}{'':>9}"
+        f"  {'TOTAL':<10}{sum(g.fills for g in report.commissions):>7}{'':>13}"
         f"{report.total_commission_base:>13,.4f}"
     )
     if report.total_taxes_base:
-        out.append(f"  {'taxes':<10}{'':>16}{report.total_taxes_base:>13,.4f}")
+        # 20 = the fills (7) and qty (13) columns this row leaves empty.
+        out.append(f"  {'taxes':<10}{'':>20}{report.total_taxes_base:>13,.4f}")
 
     out.append("\nFX conversions")
     out.append(

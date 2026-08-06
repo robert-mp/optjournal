@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -66,6 +67,109 @@ def test_fee_counts_match_statement(statement):
 
 def test_format_report_does_not_raise(statement):
     assert "Cost report" in format_report(analyse(statement))
+
+
+def _cash(kind, amount, currency="EUR", rate="1", symbol=None, description=""):
+    """A CashTransaction, named by its enum MEMBER (FEES, WHTAX, BROKERINTRCVD).
+
+    Member name rather than the human label, because `analyse` reads
+    `str(c.type).upper()` and py_ibkr's str() yields 'CashAction.FEES' -- so the
+    text the code branches on is the member name, not IBKR's 'Other Fees'. A
+    fixture that used the label would test a string the code never sees.
+    """
+    return SimpleNamespace(
+        # A plain string, not SimpleNamespace(__str__=...): dunder lookup goes
+        # to the TYPE, so an instance attribute named __str__ is never called
+        # and the fixture would silently stringify as "namespace(...)".
+        type=f"CashAction.{kind}",
+        amount=Decimal(amount),
+        currency=currency,
+        fxRateToBase=Decimal(rate),
+        symbol=symbol,
+        description=description,
+    )
+
+
+def _cash_stmt(cash):
+    return SimpleNamespace(
+        fromDate="20250801", toDate="20260731", Trades=[], CashTransactions=cash,
+    )
+
+
+# ------------------------------------------------------- cash classification
+#
+# Three separate gates read the same `kind` string, and each was unguarded.
+# They share a failure mode: a cash row landing in the wrong bucket still
+# produces a well-formed report, just with the wrong number in it.
+
+
+def test_only_fee_rows_are_counted_as_fees():
+    """The gate is a SUBSTRING test against an enum member name.
+
+    That is the hazard worth pinning: `CashAction.BROKERINTRCVD` does not
+    contain 'INTEREST' but does contain 'INT', so a well-meaning widening of
+    this gate books interest you RECEIVED as a cost you paid -- and the archive
+    holds three such rows. Deposits are the same shape of mistake with a much
+    larger number attached.
+    """
+    r = analyse(_cash_stmt([
+        _cash("FEES", "-1.30", description="OPRA NP L1"),
+        _cash("BROKERINTRCVD", "4.20"),
+        _cash("BROKERINTPAID", "-0.80"),
+        _cash("DEPOSITWITHDRAW", "-5000.00"),
+    ]))
+    assert sum(c.count for c in r.fees) == 1, (
+        f"{[(c.name, c.count) for c in r.fees]} -- only the FEES row is a fee"
+    )
+    assert sum(c.total_base for c in r.fees) == Decimal("1.30")
+
+
+def test_a_fee_is_denominated_in_its_own_currency_not_the_base():
+    """A CashTransaction carries its own currency, and 313 archived fees are KRW.
+
+    Attributing them to the base would put a KRW figure under a EUR label --
+    the as-charged half of `Money` exists precisely so a fee can be shown in
+    what it was actually billed in. The base total stays EUR either way, which
+    is why this is invisible without asserting on the native ledger.
+    """
+    r = analyse(_cash_stmt([
+        _cash("FEES", "-1490.00", currency="KRW", rate="0.00057865",
+              description="KRW CUSTODY FEE ON STK"),
+    ]), base_currency="EUR")
+    cat = r.fees[0]
+    assert set(cat.native_by_ccy) == {"KRW"}, (
+        f"billed in {set(cat.native_by_ccy)}, but the row says KRW"
+    )
+    assert cat.native_by_ccy["KRW"] == Decimal("1490.00")
+    # The base translation is unchanged -- only the denomination was at stake.
+    assert cat.total_base == Decimal("1490.00") * Decimal("0.00057865")
+
+
+def test_withholding_is_a_positive_amount_however_ibkr_signs_it():
+    """IBKR sends WHTAX as a NEGATIVE amount; the rate must not invert.
+
+    All ten archived withholding rows are negative. Accumulated verbatim, the
+    withheld total goes negative, and `effective_rate` -- withheld/(net+withheld)
+    -- returns a negative percentage on a real tax that was really paid. The
+    dividend keeps its sign because a dividend is income.
+    """
+    r = analyse(_cash_stmt([
+        _cash("DIVIDEND", "0.85", symbol="ACME"),
+        _cash("WHTAX", "-0.15", symbol="ACME"),
+    ]))
+    line = next(w for w in r.withholding if w.symbol == "ACME")
+    assert line.withheld_base == Decimal("0.15"), "the withheld amount stayed negative"
+    assert line.gross_base == Decimal("0.85")
+    assert line.effective_rate == Decimal("15")
+    assert line.effective_rate > ZERO, "a tax paid cannot be a negative rate"
+
+
+def test_withholding_over_the_real_statement_is_never_negative(statement):
+    """The same invariant over the archive, which is where the signs came from."""
+    for w in analyse(statement).withholding:
+        assert w.withheld_base >= ZERO, w.symbol
+        if w.effective_rate is not None:
+            assert w.effective_rate >= ZERO, w.symbol
 
 
 def test_withholding_without_dividend_has_no_rate():
@@ -318,6 +422,22 @@ def test_commission_credit_is_netted_not_added():
     assert stk.commission_base != Decimal("0.3569")
 
 
+def test_a_charged_fill_is_not_counted_as_a_credit():
+    """`credit_fills` counts credits, so a charge must not increment it.
+
+    The count is the fingerprint the report prints a note about ("N fill(s)
+    carried a commission credit"), so a gate of `!= ZERO` rather than `> ZERO`
+    turns that note into a claim that every fill was credited. The two credit
+    tests above happen to fail on that widening, but incidentally -- they assert
+    a count of 1 for other reasons. This one is about the gate itself.
+    """
+    r = analyse(_stmt([_fill("STK", "-0.35"), _fill("STK", "-0.35")]))
+    assert r.commissions[0].credit_fills == 0, "a charge was booked as a credit"
+    assert "commission credit" not in format_report(r)
+    # A zero commission is not a credit either: nothing was given back.
+    assert analyse(_stmt([_fill("STK", "0")])).commissions[0].credit_fills == 0
+
+
 def test_a_net_credit_category_reports_negative_cost():
     """A category that was net credited is a negative cost, not a positive one."""
     r = analyse(_stmt([_fill("STK", "0.50"), _fill("STK", "-0.20")]))
@@ -328,6 +448,94 @@ def test_a_net_credit_category_reports_negative_cost():
 def test_taxes_use_the_same_sign_convention():
     r = analyse(_stmt([_fill("OPT", "-1.00", taxes="-0.25")]))
     assert r.commissions[0].taxes_base == Decimal("0.25")
+
+
+# ---------------------------------------------------------- fractional lots
+#
+# `quantity` is the denominator of `per_unit_base`, and it used to accumulate
+# `int(abs(t.quantity))` -- truncating EVERY FILL toward zero before adding.
+# Truncating per fill rather than once at the end is what made it severe: any
+# fill under one whole unit contributed nothing at all. The archive holds
+# 0.0007-share IBKR fills and 1.79-share dividend-reinvestment buys, so this is
+# not a hypothetical shape. db.py's schema note and `ingest._quantity` both
+# already treat a fractional lot as lossless; this is the third place that has
+# to agree, and it was the one that did not.
+
+
+def test_a_sub_unit_fill_is_not_truncated_to_nothing():
+    """One 0.5-share fill must contribute 0.5, not 0.
+
+    The narrowest statement of the bug: with `int()`, quantity stays 0, so
+    `per_unit_base` returns None and the per-unit column shows a dash. A dash
+    reads as "not applicable" rather than "we discarded your denominator",
+    which is why this was invisible.
+    """
+    r = analyse(_stmt([_fill("STK", "-0.35", qty="0.5")]))
+    g = r.commissions[0]
+    assert g.quantity == Decimal("0.5"), "a sub-unit fill was truncated away"
+    assert g.per_unit_base == Decimal("0.7"), "0.35 over 0.5 shares is 0.70"
+
+
+def test_truncation_does_not_compound_across_fills():
+    """The severity: per-fill truncation loses more than the final fraction.
+
+    A thousand half-share buys are 500 shares. Truncating each fill first gives
+    0 -- so the figure does not merely round, it disappears, and the more
+    fractional the account the worse it gets. Asserted against the arithmetic
+    the old code produced so a regression names itself.
+    """
+    r = analyse(_stmt([_fill("STK", "-0.35", qty="0.5") for _ in range(1000)]))
+    g = r.commissions[0]
+    assert g.quantity == Decimal("500.0")
+    assert g.per_unit_base == Decimal("0.7")
+    assert g.fills == 1000, "the fill count was never in doubt; the units were"
+
+
+def test_a_mixed_lot_keeps_the_fraction_the_statement_stated(statement):
+    """Over the real archive: the group total equals the sum of the fills.
+
+    Recomputed from the statement rather than hard-coded, so this holds as the
+    corpus grows. Two archived statements carry a 5089.0013-share stock total
+    whose .0013 comes from two dividend-reinvestment fills.
+    """
+    r = analyse(statement)
+    expected: dict[str, Decimal] = {}
+    for t in statement.Trades or ():
+        cat = str(getattr(t.assetCategory, "value", t.assetCategory) or "?").upper()
+        if cat == "CASH" or t.quantity is None:
+            continue
+        expected[cat] = expected.get(cat, ZERO) + abs(Decimal(str(t.quantity)))
+    for g in r.commissions:
+        if g.asset_category == "CASH":
+            continue
+        assert g.quantity == expected.get(g.asset_category, ZERO), g.asset_category
+
+
+def test_a_fractional_quantity_reaches_the_payload_as_a_number():
+    """`quantity` is a Decimal now, and Decimal is not JSON-serialisable.
+
+    The gate that keeps the internal exactness from leaking a string into the
+    payload -- `json.dumps(default=str)` would turn 500.0013 into "500.0013"
+    and the page's `num()` would render it as text. Same trap `_num` exists for.
+    """
+    data = costs_data(analyse(_stmt([_fill("STK", "-0.35", qty="1.79")])))
+    qty = data["commissions"][0]["quantity"]
+    assert isinstance(qty, float), f"{type(qty).__name__} reached the payload"
+    assert qty == pytest.approx(1.79)
+    json.dumps(data)  # raises on a stray Decimal
+
+
+def test_the_report_shows_a_whole_quantity_without_false_precision():
+    """A round lot reads "750", a fractional one keeps its digits.
+
+    Formatting, not arithmetic -- but the reason the field was an int in the
+    first place was to get this for free, so the replacement has to earn it
+    back or the fix trades a wrong number for an unreadable one.
+    """
+    whole = format_report(analyse(_stmt([_fill("STK", "-1.00", qty="750")])))
+    assert "750" in whole and "750.0000" not in whole
+    frac = format_report(analyse(_stmt([_fill("STK", "-1.00", qty="1.79")])))
+    assert "1.79" in frac
 
 
 def test_credit_netting_holds_on_the_real_statement(statement):

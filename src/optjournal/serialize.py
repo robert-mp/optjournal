@@ -236,7 +236,11 @@ def _journal_per_unit(report: CostReport) -> Row | None:
     here -- two divisions that had to agree by inspection. That property is gone
     rather than left unread, so there is no second answer to fall back to.
     """
-    qty = sum(g.quantity for g in report.journal_commissions)
+    # float(), because `quantity` is a Decimal to keep fractional share lots
+    # exact while they accumulate, and `Money` is the float domain the payload
+    # speaks. Coerced here, at the boundary that already owns that conversion
+    # (see `_num`), rather than letting a Decimal cross into `Money.per`.
+    qty = float(sum(g.quantity for g in report.journal_commissions))
     per = _journal_commission(report).per(qty)
     return None if per is None else per.payload()
 
@@ -273,7 +277,7 @@ def costs_data(report: CostReport) -> Row:
             {
                 "asset_category": g.asset_category,
                 "fills": g.fills,
-                "quantity": g.quantity,
+                "quantity": _num(g.quantity),
                 "commission_base": _num(g.commission_base),
                 "taxes_base": _num(g.taxes_base),
                 "per_unit_base": _num(g.per_unit_base),

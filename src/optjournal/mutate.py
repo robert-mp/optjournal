@@ -131,6 +131,14 @@ MUTANTS: tuple[Mutant, ...] = (
                "instrument's rate, storing an EUR amount 11x too small",
     ),
     Mutant(
+        key="qty-truncate",
+        module="analysis.py",
+        find="            g.quantity += abs(Decimal(str(t.quantity)))",
+        replace="            g.quantity += int(abs(t.quantity))",
+        breaks="a thousand half-share fills would sum to 0 units, so the per-unit "
+               "commission column silently shows a dash",
+    ),
+    Mutant(
         key="snapshot-sign",
         module="web.py",
         find='        seed_quantity=float(row.get("position") or 0.0),',
