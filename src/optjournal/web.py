@@ -651,7 +651,7 @@ def _do_sync(
         "ok": True,
         "kind": "synced",
         "archive": result.raw_path.name,
-        "reused_archive": result.duplicate_of is not None,
+        "reused_archive": result.is_duplicate,
         "already_ingested": ingested.already_ingested,
         "duplicate_of": ingested.duplicate_of,
         "new_trades": new_trades,

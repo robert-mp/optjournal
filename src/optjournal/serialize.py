@@ -231,9 +231,10 @@ def _journal_per_unit(report: CostReport) -> Row | None:
     """Commission per contract, or None when the scope has no quantity.
 
     Both halves come from one `Money.per`, so the base and as-charged figures
-    are guaranteed to share a denominator. Previously the base came from
-    `report.journal_per_unit_base` and the native was divided separately here,
-    which is two divisions that had to agree by inspection.
+    are guaranteed to share a denominator. The base used to come from a separate
+    `CostReport.journal_per_unit_base` property while the native was divided
+    here -- two divisions that had to agree by inspection. That property is gone
+    rather than left unread, so there is no second answer to fall back to.
     """
     qty = sum(g.quantity for g in report.journal_commissions)
     per = _journal_commission(report).per(qty)

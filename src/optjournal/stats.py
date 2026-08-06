@@ -377,15 +377,8 @@ class TradeScope:
     trade_ids: frozenset[str] | None = None
     order_ids: frozenset[str] | None = None
 
-    @property
-    def is_everything(self) -> bool:
-        return self.trade_ids is None
-
     def has_trade(self, trade_id: Any) -> bool:
         return self.trade_ids is None or str(trade_id or "") in self.trade_ids
-
-    def has_order(self, order_id: Any) -> bool:
-        return self.order_ids is None or str(order_id or "") in self.order_ids
 
     def has_episode(self, episode: Any) -> bool:
         """In scope when any of the episode's own fills is.
