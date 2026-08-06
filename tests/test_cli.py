@@ -20,6 +20,8 @@ string the user types, and the tuple the ingest receives.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from conftest import STATEMENTS, connect_migrated
 
@@ -108,3 +110,66 @@ def test_an_explicit_narrow_filter_really_narrows(tmp_path):
         for r in conn.execute("SELECT DISTINCT asset_category FROM trades")
     }
     assert categories == {"OPT"}, f"--assets OPT stored {categories}"
+
+
+# --------------------------------------------------------- the wire vocabulary
+#
+# `optjournal show` is the only consumer of `summary_data`, and neither had a
+# test -- so `_wire`, which turns py_ibkr's Enum members into the short codes
+# the payload and the page both speak, was unguarded end to end.
+#
+# The failure is quiet in the worst way: py_ibkr's Enum members stringify as
+# 'AssetClass.STOCK', which is a perfectly good string. Nothing raises. The
+# summary just reports its categories under names no other layer uses, and
+# `by_asset` stops joining to the 'STK' the database stores.
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_the_summary_reports_ibkrs_codes_not_python_enum_names(capsys):
+    """Over a real statement, through the real command.
+
+    Asserted on the JSON rather than the text, because the payload is what a
+    consumer joins on -- and asserted by ABSENCE of the class name as well as
+    presence of the code, since a mapping that emitted both would satisfy only
+    half of this.
+    """
+    assert main(["show", str(STATEMENTS[-1]), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    stmt = data["statements"][0]
+
+    for field in ("by_asset", "by_open_close", "by_buy_sell", "cash_by_type"):
+        keys = set(stmt[field])
+        assert keys, f"{field} is empty, so it proves nothing"
+        assert not any("." in k for k in keys), (
+            f"{field} leaked a dotted Python name: {keys}"
+        )
+        assert not any(k.startswith(("AssetClass", "BuySell", "OpenClose",
+                                     "CashAction")) for k in keys), (
+            f"{field} leaked an enum class name: {keys}"
+        )
+
+    # The specific codes every other layer speaks. STK because the archive holds
+    # stock; O/C because that is what the schema and the page's filters store.
+    assert "STK" in stmt["by_asset"], stmt["by_asset"]
+    assert {"O", "C"} & set(stmt["by_open_close"]), stmt["by_open_close"]
+    assert {"BUY", "SELL"} & set(stmt["by_buy_sell"]), stmt["by_buy_sell"]
+
+
+def test_a_value_less_enum_falls_back_to_its_last_component():
+    """The fallback branch, which real data cannot reach.
+
+    py_ibkr gives every member a `.value`, so the archive always takes the first
+    path. The fallback exists for a member that only implements __str__ -- a
+    plausible shape for a future broker's parser -- and without it that member
+    would reach the payload as 'AssetClass.STOCK'.
+    """
+    from optjournal.serialize import _wire
+
+    class Bare:
+        def __str__(self) -> str:
+            return "AssetClass.STOCK"
+
+    assert _wire(Bare()) == "STOCK"
+    # An undotted string passes through, and None is the dash the reports show.
+    assert _wire("STK") == "STK"
+    assert _wire(None) == "-"

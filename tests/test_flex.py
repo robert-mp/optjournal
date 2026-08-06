@@ -8,6 +8,7 @@ statements exercise that.
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -193,3 +194,96 @@ def test_backoff_is_capped_not_unbounded():
     ]
     assert max(waits) == flex.MAX_RETRY_INTERVAL
     assert waits == sorted(waits), "backoff must be monotonically non-decreasing"
+
+
+# --- request-budget guard -----------------------------------------------------
+#
+# Every fetch spends one request against an IBKR allowance that locks the token
+# out when exhausted, and a statement is regenerated once a day -- so a second
+# fetch inside the window cannot return new information and can only cost. The
+# cooldown is the only thing standing between a retry loop and a lockout, and it
+# had no test at all.
+#
+# What makes it fragile is ORDERING rather than arithmetic: the guard has to fire
+# before anything with a side effect. Removing the check entirely, or letting a
+# reordering put it after `read_token` or the download, leaves a function that
+# still behaves correctly on every happy path.
+
+
+def _record(archive_dir, query_id, when):
+    """Write the fetch-state file the cooldown reads, as `_record_fetch` does."""
+    flex._write_state(archive_dir, {
+        str(query_id): {"last_fetch": when.isoformat(timespec="seconds"),
+                        "sha256": "x" * 64, "archive": "activity-x.xml"},
+    })
+
+
+def test_a_recent_fetch_is_refused_before_anything_is_spent(tmp_path, monkeypatch):
+    """The guard runs before the keyring, let alone before the network.
+
+    Asserted by making both fail loudly: if `fetch` reaches either one, this test
+    errors with that call's message instead of raising FetchCooldown, which names
+    the ordering regression precisely. A test that only asserted FetchCooldown
+    would still pass if the guard had drifted after the download.
+    """
+    def no(*_a, **_k):
+        raise AssertionError("a request was spent before the cooldown was checked")
+
+    monkeypatch.setattr(flex, "read_token", no)
+    monkeypatch.setattr(flex, "FlexClient", no)
+
+    _record(tmp_path, "1591754", datetime.now(UTC) - timedelta(seconds=60))
+    with pytest.raises(flex.FetchCooldown) as caught:
+        flex.fetch("1591754", archive_dir=tmp_path, cooldown_s=900)
+    # The retry hint is what a caller backs off on, so it must be usable.
+    assert 0 < caught.value.retry_after_s <= 900
+
+
+def test_a_fetch_outside_the_window_is_allowed(tmp_path):
+    """The guard must not be a permanent refusal -- 0 means "go now"."""
+    _record(tmp_path, "1591754", datetime.now(UTC) - timedelta(seconds=1_000))
+    assert flex.cooldown_remaining(tmp_path, "1591754", cooldown_s=900) == 0
+
+
+def test_a_never_fetched_query_is_not_in_cooldown(tmp_path):
+    """No state file at all is the first-run case, not an error."""
+    assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+    assert flex.last_fetch(tmp_path, "1591754") is None
+
+
+def test_force_bypasses_the_cooldown_deliberately(tmp_path, monkeypatch):
+    """`force=True` is the documented override, so it must reach the token.
+
+    Proven by asserting it gets PAST the guard: TokenMissing here means the
+    cooldown let it through, which is the whole claim. Stopping at the keyring
+    keeps this test off the network.
+    """
+    def no_token(*_a, **_k):
+        raise flex.TokenMissing("reached the keyring")
+
+    monkeypatch.setattr(flex, "read_token", no_token)
+    _record(tmp_path, "1591754", datetime.now(UTC) - timedelta(seconds=60))
+    with pytest.raises(flex.TokenMissing):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True, cooldown_s=900)
+
+
+def test_the_cooldown_can_be_disabled_but_not_by_accident(tmp_path):
+    """`cooldown_s=0` disables the guard; a positive default is what ships.
+
+    The second half matters more than the first: a default of 0 would silently
+    remove the protection for every caller that does not pass the argument.
+    """
+    _record(tmp_path, "1591754", datetime.now(UTC))
+    assert flex.cooldown_remaining(tmp_path, "1591754", cooldown_s=0) == 0
+    assert flex.FETCH_COOLDOWN_S > 0, "the shipped default must protect the budget"
+
+
+def test_an_unparseable_timestamp_does_not_wedge_fetching(tmp_path):
+    """A corrupt state file must fail open, not lock the archive out forever.
+
+    The file is written by us, so a bad value means something went wrong locally
+    -- and the cost of failing open is one request, while failing closed would
+    make the tool permanently unusable with no way to tell why.
+    """
+    flex._write_state(tmp_path, {"1591754": {"last_fetch": "not-a-timestamp"}})
+    assert flex.cooldown_remaining(tmp_path, "1591754") == 0

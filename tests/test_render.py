@@ -31,6 +31,7 @@ from optjournal.render import (
     render_positions,
     render_statements,
     render_summary,
+    table,
 )
 from optjournal.serialize import (
     history_data,
@@ -142,3 +143,52 @@ def test_summary_renders_without_a_statement_path():
 )
 def test_an_empty_payload_says_so_rather_than_raising(render, empty):
     assert render(empty)
+
+
+# ------------------------------------------------------------- column sizing
+#
+# `table` is the primitive under every report in this module, and its sizing
+# rule was unguarded: nothing failed when the header stopped counting toward
+# column width. That defect does not raise -- it produces a table whose header
+# row runs past its separator and whose columns no longer line up under their
+# labels, which is exactly the failure a reader is least likely to report as a
+# bug and most likely to work around.
+
+
+def test_a_header_wider_than_its_content_still_fits():
+    """Width is max(header, cells), and the header is the half that was dropped.
+
+    'commission' over a cell of '1.0' is the everyday case: the reports in this
+    module label narrow numeric columns with long words. Sizing to the cells
+    alone gives a 3-wide column holding a 10-character label.
+    """
+    out = table(["commission", "q"], [["1.0", "2"]])
+    lines = out.splitlines()
+    assert len({len(line) for line in lines}) == 1, (
+        f"rows disagree on width:\n{out}"
+    )
+    # The separator is built from the same widths, so it is the honest witness.
+    header, sep, row = lines
+    assert len(header) == len(sep) == len(row)
+    assert "commission" in header
+
+
+def test_content_wider_than_its_header_widens_the_column():
+    """The other direction, so the max() cannot be replaced by the header alone."""
+    out = table(["q", "n"], [["1234567890", "2"]])
+    lines = out.splitlines()
+    assert len({len(line) for line in lines}) == 1, f"ragged:\n{out}"
+    assert "1234567890" in lines[2]
+
+
+def test_alignment_defaults_to_label_then_numbers():
+    """First column left, the rest right -- the convention the docstring states."""
+    out = table(["asset", "qty"], [["OPT", "5"]])
+    label, _sep, row = out.splitlines()
+    assert row.index("OPT") == label.index("asset"), "first column is not left-aligned"
+    assert row.rstrip().endswith("5"), "a numeric column is not right-aligned"
+
+
+def test_an_empty_table_says_none_rather_than_raising():
+    """No rows means no cells to take a max() over, which would be a ValueError."""
+    assert table(["a", "b"], []) == "  (none)"

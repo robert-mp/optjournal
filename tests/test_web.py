@@ -772,6 +772,59 @@ def test_a_snapshot_leg_keeps_the_sign_of_the_position_it_seeds():
     assert _strikes_of([_snapshot_leg(long_)])[0]["side"] == "long"
 
 
+def test_a_closed_contract_takes_its_side_from_the_OPENING_fill():
+    """A round trip holds the same strike twice, so which fill decides is the bug.
+
+    Sold to open then bought to close: the closing fill is a BUY, so reading
+    side off the last fill labels every short you sold as a long you bought --
+    and the chart's whole point is that difference (a level you are defending
+    versus one you paid for). Every closed position in a journal inverts at once,
+    which paradoxically makes it harder to notice: nothing looks inconsistent.
+
+    Two fills with opposite signs, because a single-fill leg cannot tell the two
+    readings apart -- and that is why the existing snapshot test above, whose leg
+    has no fills at all, does not cover this.
+    """
+    from optjournal.bars import ReplayLeg
+    from optjournal.web import _strikes_of
+
+    sold_to_open = ReplayLeg(
+        conid="C1", strike=105.0, right="P", expiry="20260904",
+        fills=((1_000, -3.0, 2.50), (2_000, 3.0, 0.40)),
+    )
+    row = _strikes_of([sold_to_open])[0]
+    assert row["side"] == "short", "side was read off the closing fill"
+    # The window is the other half of the meaning: the segment must END where
+    # the contract went flat, not run to the right edge as if still held.
+    assert row["frm"] == 1_000 and row["to"] == 2_000
+
+    bought_to_open = ReplayLeg(
+        conid="C2", strike=580.0, right="C", expiry="20260904",
+        fills=((1_000, 4.0, 1.10), (2_000, -4.0, 3.30)),
+    )
+    assert _strikes_of([bought_to_open])[0]["side"] == "long"
+
+
+def test_the_segment_ends_where_the_position_goes_flat_not_at_the_last_fill():
+    """A partial close leaves the contract held, so the segment stays open.
+
+    The running position is what distinguishes the two: sold 3, bought back 1,
+    and the contract is still short 2 -- so `to` must be None (drawn to the right
+    edge) rather than the timestamp of that second fill. Reading the last fill
+    instead would retire a live strike from the chart.
+    """
+    from optjournal.bars import ReplayLeg
+    from optjournal.web import _strikes_of
+
+    partly_closed = ReplayLeg(
+        conid="C3", strike=590.0, right="C", expiry="20260904",
+        fills=((1_000, -3.0, 2.50), (2_000, 1.0, 1.20)),
+    )
+    row = _strikes_of([partly_closed])[0]
+    assert row["side"] == "short"
+    assert row["to"] is None, "a partial close retired a strike that is still held"
+
+
 def test_every_position_carries_a_cost_basis(state):
     """The book table shows a cost basis per row, so every row must have one.
 

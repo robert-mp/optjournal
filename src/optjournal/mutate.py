@@ -10,9 +10,18 @@ unguarded invariant, and the suite should grow there: that is how `history._flat
 (a 0.4-share residual booking a partial close as a completed round trip) and
 `web._snapshot_leg`'s sign were found, both of which had passed 579 tests. A
 defect caught by fifteen tests means fourteen are coupled to something they are
-not about. Measured on this suite (13 mutants): median 2, maximum 8, minimum 1.
-That 8 is the Money currency gate, a rule genuinely spanning money, analysis,
-strategies and web.
+not about. Measured on this suite: median 2, minimum 1, maximum 8 -- that 8 is
+the Money currency gate, a rule genuinely spanning money, analysis, strategies
+and web.
+
+The uncaught result keeps earning its place. A later round added ten mutants for
+findings a code audit raised, and EIGHT were caught by nothing: the fee currency
+attribution, the fee/interest gate, the withholding sign, the enum-to-wire
+mapping, the table's column sizing, the strike side of a closed contract, and
+the Flex request-budget cooldown (which had no test at all). One of the ten was
+not a missing test but a live defect -- `analysis` accumulated
+`int(abs(quantity))` per fill, so any lot under one whole unit contributed
+nothing and a thousand half-share buys summed to zero.
 
 **Equivalent mutants are not findings.** Some changes have no observable effect,
 so "no test caught it" says nothing. The tool reports the count; deciding whether
@@ -194,6 +203,77 @@ MUTANTS: tuple[Mutant, ...] = (
         find="    if not _is_loopback(host):",
         replace="    if False:",
         breaks="an unauthenticated brokerage dashboard could bind a public interface",
+    ),
+    Mutant(
+        key="credit-gate",
+        module="analysis.py",
+        find="        if commission > ZERO:\n            g.credit_fills += 1",
+        replace="        if commission != ZERO:\n            g.credit_fills += 1",
+        breaks="every charged fill would be reported as carrying a commission CREDIT",
+    ),
+    Mutant(
+        key="fee-ccy",
+        module="analysis.py",
+        find='            fee_ccy = str(getattr(c, "currency", None) or "") or base_currency',
+        replace="            fee_ccy = base_currency",
+        breaks="313 KRW custody fees would claim to be EUR amounts",
+    ),
+    Mutant(
+        key="fee-kind",
+        module="analysis.py",
+        find='        if "FEES" in kind:',
+        replace='        if "FEES" in kind or "INT" in kind:',
+        breaks="broker interest RECEIVED would be booked as a cost. `kind` is an "
+               "enum MEMBER NAME, so a loose substring is the live hazard: "
+               "BROKERINTRCVD contains 'INT' but not 'INTEREST'",
+    ),
+    Mutant(
+        key="withholding-sign",
+        module="analysis.py",
+        find="            withheld[key] += abs(amount_base)",
+        replace="            withheld[key] += amount_base",
+        breaks="withholding arrives negative, so the effective tax rate would invert",
+    ),
+    Mutant(
+        key="wire-enum",
+        module="serialize.py",
+        find="    inner = getattr(value, \"value\", None)\n"
+             "    if isinstance(inner, str) and inner:\n"
+             "        return inner",
+        replace="    inner = None",
+        breaks="the payload would carry 'AssetClass.STOCK' where the page reads 'STK'",
+    ),
+    Mutant(
+        key="table-width",
+        module="render.py",
+        find="        max(len(str(headers[i])), *(len(r[i]) for r in cells))",
+        replace="        max(len(r[i]) for r in cells)",
+        breaks="a header longer than its column would overflow and misalign the table",
+    ),
+    Mutant(
+        key="strike-side",
+        module="web.py",
+        find="            if index == 0:\n                opened_at, sold = stamp, delta_qty < 0",
+        replace="            opened_at, sold = (stamp if index == 0 else opened_at), "
+                "delta_qty < 0",
+        breaks="a closed contract would take its side from the CLOSING fill, "
+               "labelling every short you sold as a long you bought",
+    ),
+    Mutant(
+        key="cooldown-order",
+        module="flex.py",
+        find="    if not force:\n        _check_cooldown(archive_dir, query_id, cooldown_s)\n\n"
+             "    token = read_token(account)",
+        replace="    token = read_token(account)",
+        breaks="the request-budget guard would be gone: every call spends an IBKR "
+               "request against a lockout allowance",
+    ),
+    Mutant(
+        key="qty-lossless",
+        module="sources.py",
+        find="    return i if abs(f - i) < 1e-9 else f",
+        replace="    return i",
+        breaks="a 0.0007-share fill would be stored as 0 shares",
     ),
 )
 
