@@ -8,16 +8,14 @@ files may be removed.
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
+from conftest import add_statement
 
 from optjournal.archive import (
     duplicate_groups,
     prune_archive,
     subsumed_candidates,
 )
-from optjournal.db import connect, migrate
 
 
 def write_statement(archive_dir, stamp: str, body: str) -> None:
@@ -30,20 +28,10 @@ def archive(tmp_path):
     return tmp_path / "raw"
 
 
-@pytest.fixture
-def conn(tmp_path) -> sqlite3.Connection:
-    c = connect(tmp_path / "j.db")
-    migrate(c)
-    return c
-
-
 def add_statement_row(conn, name: str, frm: str, to: str) -> None:
-    conn.execute(
-        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-        " to_date, base_currency, asset_filter, ingested_at)"
-        " VALUES (?, 'x', 'U1', ?, ?, 'EUR', 'OPT', 'now')",
-        (name, frm, to),
-    )
+    """A statement row identified by file and period, which is what pruning
+    matches on -- the rest of the columns are the shared default."""
+    add_statement(conn, source_file=name, from_date=frm, to_date=to)
 
 
 def add_trade_row(conn, tid: str, source_file: str) -> None:

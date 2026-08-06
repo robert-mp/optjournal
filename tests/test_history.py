@@ -11,11 +11,10 @@ case naive per-contract grouping gets wrong.
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 import pytest
+from conftest import STATEMENTS, add_statement, connect_migrated
 
-from optjournal.db import connect, migrate
 from optjournal.history import (
     NON_POSITION_CATEGORIES,
     Episode,
@@ -25,19 +24,12 @@ from optjournal.history import (
 )
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 
-RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
-STATEMENTS = sorted(RAW_DIR.glob("activity-*.xml"))
-
 
 @pytest.fixture
 def conn(tmp_path) -> sqlite3.Connection:
-    c = connect(tmp_path / "history.db")
-    migrate(c)
-    c.execute(
-        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-        " to_date, base_currency, asset_filter, ingested_at)"
-        " VALUES ('t.xml','x','U1','2026-01-01','2026-12-31','EUR','OPT','now')"
-    )
+    """A journal holding only the statement row the trade builders hang off."""
+    c = connect_migrated(tmp_path / "history.db")
+    add_statement(c, from_date="2026-01-01")
     return c
 
 
@@ -288,8 +280,7 @@ def test_real_sive_round_trip(tmp_path):
     less 73.86 closing commission = 131,326.14; difference 68,683.68, which is
     exactly IBKR's fifoPnlRealized. That makes this an independent oracle.
     """
-    conn = connect(tmp_path / "all.db")
-    migrate(conn)
+    conn = connect_migrated(tmp_path / "all.db")
     for path in STATEMENTS:
         ingest_file(conn, path, assets=ASSET_FILTER_ALL)
 
@@ -312,8 +303,7 @@ def test_real_sive_round_trip(tmp_path):
 def test_real_option_book_matches_snapshot(tmp_path):
     """History's open book must agree with the position snapshot, including the
     long call that has no opening trade anywhere in the archive."""
-    conn = connect(tmp_path / "opt.db")
-    migrate(conn)
+    conn = connect_migrated(tmp_path / "opt.db")
     for path in STATEMENTS:
         ingest_file(conn, path)
 

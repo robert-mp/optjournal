@@ -11,13 +11,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
+from conftest import RAW_DIR
 from py_ibkr import Trade
 
 from optjournal import flex
 from optjournal.flex import load
 from optjournal.sections import MODELLED_SECTIONS, raw_sections, section_tags
-
-RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
 
 # `requestID` is an artefact of the Flex request itself, not trade data, and
 # py_ibkr deliberately omits it. Anything else appearing here is real drift.

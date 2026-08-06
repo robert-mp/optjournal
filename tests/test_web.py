@@ -21,6 +21,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from conftest import RAW_DIR
 
 from optjournal import web
 from optjournal.cli import main
@@ -32,11 +33,7 @@ from optjournal.config import (
 )
 from optjournal.db import connect, migrate
 from optjournal.history import build_history
-from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal.web import build_state, page_html, serve
-
-RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
-STATEMENTS = sorted(RAW_DIR.glob("activity-*.xml"))
 
 #: Attributes on DOM nodes, promises and builtins -- not API payload keys.
 _NOT_PAYLOAD = {
@@ -50,17 +47,13 @@ _NOT_PAYLOAD = {
 
 
 @pytest.fixture
-def populated(tmp_path) -> Path:
-    """A journal database with every archived statement ingested."""
-    if not STATEMENTS:
-        pytest.skip("needs an archived statement")
-    db = tmp_path / "web.db"
-    conn = connect(db)
-    migrate(conn)
-    for path in STATEMENTS:
-        ingest_file(conn, path, assets=ASSET_FILTER_ALL)
-    conn.close()
-    return db
+def populated(populated_db) -> Path:
+    """A journal with every archived statement ingested.
+
+    An alias for the shared `populated_db`, kept because this module names it
+    forty times and the indirection costs nothing.
+    """
+    return populated_db
 
 
 @pytest.fixture

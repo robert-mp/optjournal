@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from conftest import RAW_DIR, STATEMENTS
 
 from optjournal.analysis import (
     AUTOFX_MARKUP_BPS,
@@ -19,11 +19,10 @@ from optjournal.analysis import (
 from optjournal.flex import load
 from optjournal.serialize import costs_data
 
-RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
 ZERO = Decimal("0")
 
 
-@pytest.fixture(params=sorted(RAW_DIR.glob("activity-*.xml")), ids=lambda p: p.name)
+@pytest.fixture(params=STATEMENTS, ids=lambda p: p.name)
 def statement(request):
     return load(request.param).FlexStatements[0]
 

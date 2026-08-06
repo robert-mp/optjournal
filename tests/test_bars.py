@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from conftest import add_statement, connect_migrated
 
 from optjournal.bars import (
     CONTEXT_BARS,
@@ -34,7 +35,6 @@ from optjournal.bars import (
     upsert_bars,
 )
 from optjournal.blackscholes import bs_price
-from optjournal.db import connect, migrate
 from optjournal.marketdata import Bar, BarFetchError, occ_symbol, parse_chart
 
 DAY = 86400
@@ -42,13 +42,9 @@ DAY = 86400
 
 @pytest.fixture()
 def conn(tmp_path) -> sqlite3.Connection:
-    c = connect(tmp_path / "bars.db")
-    migrate(c)
-    c.execute(
-        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-        " to_date, base_currency, asset_filter, ingested_at)"
-        " VALUES ('t.xml','x','U1','2025-01-01','2026-12-31','EUR','OPT','now')"
-    )
+    """A journal holding only the statement row that trade rows hang off."""
+    c = connect_migrated(tmp_path / "bars.db")
+    add_statement(c)
     return c
 
 
@@ -882,13 +878,8 @@ def test_the_audit_exit_codes_separate_all_three_outcomes(tmp_path, capsys):
     from optjournal.cli import main
 
     db = tmp_path / "audit.db"
-    conn = connect(db)
-    migrate(conn)
-    conn.execute(
-        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-        " to_date, base_currency, asset_filter, ingested_at)"
-        " VALUES ('t.xml','x','U1','2025-01-01','2026-12-31','EUR','OPT','now')"
-    )
+    conn = connect_migrated(db)
+    add_statement(conn)
     _open_short_option(conn)
 
     argv = ["bars", "--audit", "--db", str(db)]

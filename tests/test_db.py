@@ -8,23 +8,17 @@ are computable by hand.
 
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
-
 import pytest
+from conftest import STATEMENTS, add_statement
 
 from optjournal.db import SCHEMA_VERSION, connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 
-RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
-STATEMENTS = sorted(RAW_DIR.glob("activity-*.xml"))
-
-
-@pytest.fixture
-def conn(tmp_path) -> sqlite3.Connection:
-    c = connect(tmp_path / "test.db")
-    migrate(c)
-    return c
+# `conn` comes from conftest. The explicit connect()/migrate() pairs further
+# down are NOT replaced with the shared helper on purpose: this module is what
+# tests migration, so a test asserting that migrate() is idempotent, or that a
+# schema bump heals an existing journal, has to call it itself. Hiding those
+# calls behind a fixture would leave the subject under test invisible.
 
 
 def test_migrate_sets_version(conn):
@@ -159,10 +153,8 @@ def _insert_trade(conn, **kw):
 
 
 def _statement_row(conn):
-    conn.execute(
-        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-        " to_date, base_currency, asset_filter, ingested_at)"
-        " VALUES ('s.xml','x','U1','2026-07-01','2026-07-31','EUR','OPT','now')"
+    add_statement(
+        conn, source_file="s.xml", from_date="2026-07-01", to_date="2026-07-31"
     )
 
 
@@ -342,10 +334,8 @@ def test_fractional_stock_quantities_survive_ingest(tmp_path):
 
     conn = connect(tmp_path / "frac.db")
     migrate(conn)
-    conn.execute(
-        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-        " to_date, base_currency, asset_filter, ingested_at)"
-        " VALUES ('t.xml', 'x', 'U0', '2025', '2025', 'EUR', 'ALL', 'now')"
+    add_statement(
+        conn, account_id="U0", from_date="2025", to_date="2025", asset_filter="ALL"
     )
     for tid, qty, oc in (("t1", 413.22, "O"), ("t2", -413.22, "C")):
         conn.execute(

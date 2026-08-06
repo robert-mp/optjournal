@@ -19,11 +19,10 @@ crashing.
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 import pytest
+from conftest import RAW_DIR, STATEMENTS, connect_migrated
 
-from optjournal.db import connect, migrate
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal.render import (
@@ -40,17 +39,13 @@ from optjournal.serialize import (
     statements_data,
 )
 
-RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
-STATEMENTS = sorted(RAW_DIR.glob("activity-*.xml"))
-
 
 @pytest.fixture
 def conn(tmp_path) -> sqlite3.Connection:
     """A journal with every archived statement folded in, as the CLI sees it."""
     if not STATEMENTS:
         pytest.skip("needs an archived statement")
-    c = connect(tmp_path / "render.db")
-    migrate(c)
+    c = connect_migrated(tmp_path / "render.db")
     for path in STATEMENTS:
         ingest_file(c, path, assets=ASSET_FILTER_ALL)
     return c

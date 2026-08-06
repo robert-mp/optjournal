@@ -18,8 +18,8 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from conftest import add_statement, connect_migrated
 
-from optjournal.db import connect, migrate
 from optjournal.demo import (
     FROM_DATE,
     TO_DATE,
@@ -54,8 +54,7 @@ def demo(tmp_path) -> Path:
 
 @pytest.fixture
 def conn(demo, tmp_path):
-    db = connect(tmp_path / "demo.db")
-    migrate(db)
+    db = connect_migrated(tmp_path / "demo.db")
     # The production default: everything stored, categories scoped per query.
     ingest_file(db, demo)
     yield db
@@ -456,8 +455,7 @@ def test_the_scope_reaches_the_payload_end_to_end(demo, tmp_path):
     from optjournal.web import build_state
 
     db = tmp_path / "state.db"
-    conn = connect(db)
-    migrate(conn)
+    conn = connect_migrated(db)
     ingest_file(conn, demo)
     conn.close()
 
@@ -603,9 +601,9 @@ def test_gain_pct_of_net_liq_uses_the_nav_at_the_periods_end(conn):
     october = month_stats(conn, "2025-10")
     assert october.net_liq_date == "2025-10-31"
     # A NAV-less database yields None, not zero -- unavailable is not broke.
-    bare = connect(Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent
-                   / "bare.db")
-    migrate(bare)
+    bare = connect_migrated(
+        Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent / "bare.db"
+    )
     assert month_stats(bare, None).net_liq_base is None
     bare.close()
 
@@ -867,11 +865,12 @@ def test_synthetic_bars_refuse_a_database_holding_a_real_statement(conn):
 
     _with_underlying(conn, "SPY", [(n, 690.0 - n) for n in range(40)])
     assert write_demo_bars(conn) > 0, "the control: it works before the intruder"
-    conn.execute(
-        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-        " to_date, base_currency, asset_filter, ingested_at)"
-        " VALUES ('activity-U123-real.xml','y','U123','2026-01-01','2026-02-01',"
-        " 'EUR','OPT','now')"
+    # A statement that is NOT a demo one: the file name and account are the
+    # whole point, since the refusal is scoped to what the data says rather
+    # than to which path the database sits at.
+    add_statement(
+        conn, source_file="activity-U123-real.xml", sha256="y",
+        account_id="U123", from_date="2026-01-01", to_date="2026-02-01",
     )
     conn.commit()
     with pytest.raises(ValueError, match="real statements"):
