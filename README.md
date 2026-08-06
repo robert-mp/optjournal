@@ -49,8 +49,10 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 |---|---|
 | `config.py` | filesystem defaults (`raw/`, `journal.db`, `demo/`) |
 | `flex.py` | IBKR Flex fetch: token, retries, lockout budget, cooldown |
+| `fills.py` | `NormalisedFill`: one executed fill in broker-neutral terms. A leaf, like `money.py` -- the seam between a broker's statement and the database |
+| `sources.py` | `StatementSource` Protocol and the `SOURCES` registry: reads a broker's statement into `NormalisedFill`s. `IbkrSource` is the only implementation today and the one place that knows py_ibkr's attribute names |
 | `archive.py` | statement store: content-hash dedupe, prune |
-| `ingest.py` | statement → SQLite, idempotent upserts (stores every asset category; scoping is query-time) |
+| `ingest.py` | fills → SQLite, idempotent upserts (stores every asset category; scoping is query-time). Trades arrive via `sources`, so the writer is broker-agnostic |
 | `db.py` | connection, schema migration, `open_journal()` |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
 | `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one. See [The Money model](#the-money-model) |

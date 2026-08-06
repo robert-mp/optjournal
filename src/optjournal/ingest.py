@@ -31,6 +31,7 @@ from typing import Any
 from optjournal.db import DEFAULT_BROKER
 from optjournal.flex import load
 from optjournal.sections import raw_sections
+from optjournal.sources import source_for
 
 __all__ = [
     "ASSET_FILTER_ALL",
@@ -113,15 +114,6 @@ def _enum_value(value: Any) -> str | None:
     return _s(getattr(value, "value", value))
 
 
-def _notes(value: Any) -> str | None:
-    """Trade notes arrive as a list of Code enums. Store them wire-form."""
-    if not value:
-        return None
-    if isinstance(value, (list, tuple)):
-        return ";".join(str(getattr(c, "value", c)) for c in value)
-    return _s(getattr(value, "value", value))
-
-
 def _matches_filter(asset_category: str | None, wanted: Iterable[str]) -> bool:
     allowed = tuple(wanted)
     if not allowed:
@@ -135,9 +127,16 @@ def ingest_file(
     *,
     assets: Iterable[str] = DEFAULT_ASSET_FILTER,
     reingest: bool = False,
+    broker: str = DEFAULT_BROKER,
 ) -> IngestResult:
-    """Ingest one archived statement. Safe to call repeatedly."""
+    """Ingest one archived statement. Safe to call repeatedly.
+
+    `broker` selects the statement source (see sources.py) and is stamped on
+    every trade row. Defaults to IBKR, the only source today, so existing
+    callers are unchanged.
+    """
     path = Path(path)
+    source = source_for(broker)
     raw_bytes = path.read_bytes()
     digest = hashlib.sha256(raw_bytes).hexdigest()
     result = IngestResult(source_file=path.name)
@@ -196,9 +195,18 @@ def ingest_file(
             ),
         )
 
-        _ingest_trades(conn, stmt, path.name, assets, result,
-                       base_currency=_base_currency(sections))
         _ingest_cash(conn, stmt, path.name, result)
+
+    # Trades come through the broker seam (sources.py), not by reading py_ibkr
+    # attributes here -- so a second broker is a new source, not an edit to this
+    # writer. Run after the statement rows above, because a trade's source_file
+    # references one. The other sections still read py_ibkr/raw dicts directly;
+    # moving them across the same boundary is future work, and the trade path is
+    # where the IBKR vocabulary was densest.
+    base_currency = _base_currency(sections)
+    for _account_id, fills in source.statements(path):
+        _ingest_trades(conn, fills, path.name, assets, result,
+                       base_currency=base_currency)
 
     _ingest_positions(conn, sections, path.name, assets, result)
     _ingest_securities(conn, sections, assets, result)
@@ -245,34 +253,40 @@ def _commission_base(
     return None
 
 
-def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult,
+def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
                    base_currency: str | None = None) -> None:
-    for t in stmt.Trades or ():
-        cat = _enum_value(t.assetCategory)
-        if not _matches_filter(cat, assets):
+    """Write broker-neutral fills into the trades table.
+
+    Reads `NormalisedFill`s (sources.py), never a broker's own model, so this
+    writer is the same for every broker. `fill.broker` stamps the row and joins
+    the composite key `(broker, trade_id)`.
+    """
+    for fill in fills:
+        if not _matches_filter(fill.asset_category, assets):
             result.trades_filtered_out += 1
             continue
 
-        qty = _qty(t.quantity)
+        qty = fill.quantity
         if qty is None:
-            result.warnings.append(f"trade {t.tradeID}: unparseable quantity")
+            result.warnings.append(f"trade {fill.trade_id}: unparseable quantity")
             continue
 
-        rate = _f(t.fxRateToBase) or 1.0
-        proceeds = _f(t.proceeds)
-        commission = _f(t.ibCommission)
-        realized = _f(t.fifoPnlRealized)
+        rate = fill.fx_rate_to_base
+        proceeds = fill.proceeds
+        commission = fill.commission
+        realized = fill.realized_pnl
         # `ib_commission_base` is commission x fxRateToBase, and that rate is
         # the INSTRUMENT's. So the conversion is only right while the commission
-        # is billed in the instrument's currency. IBKR does send the commission
-        # currency separately; it agrees on every row observed, but agreement
-        # that is assumed rather than checked fails silently. A warning, not a
-        # raise: a real broker quirk should surface, not abort an ingest -- the
-        # native figure is still stored correctly either way, and only the base
-        # conversion would be suspect.
-        commission_ccy = _s(t.ibCommissionCurrency)
+        # is billed in the instrument's currency. A broker that sends the
+        # commission currency separately lets this be checked rather than
+        # assumed; it agrees on every IBKR row observed, but agreement that is
+        # assumed rather than checked fails silently. A warning, not a raise: a
+        # real broker quirk should surface, not abort an ingest -- the native
+        # figure is stored correctly either way, only the base conversion is
+        # suspect.
+        commission_ccy = fill.commission_currency
         commission_base = _commission_base(
-            commission, commission_ccy, _s(t.currency), rate, base_currency
+            commission, commission_ccy, fill.currency, rate, base_currency
         )
 
         cur = conn.execute(
@@ -288,22 +302,21 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult,
             " ON CONFLICT(broker, trade_id) DO NOTHING",
             (
                 DEFAULT_BROKER,
-                _s(t.tradeID), _s(t.ibExecID), _s(t.transactionID), _s(t.ibOrderID),
-                _s(stmt.accountId), _s(t.tradeDate), _s(t.dateTime), cat,
-                _s(t.symbol), _s(t.conid), _s(t.underlyingSymbol),
-                _s(t.underlyingConid), _enum_value(t.putCall), _f(t.strike),
-                _s(t.expiry), _f(t.multiplier), _enum_value(t.buySell),
-                _enum_value(t.openCloseIndicator), _notes(t.notes),
-                _enum_value(t.levelOfDetail), qty, _f(t.tradePrice),
-                _s(t.currency), rate, proceeds,
+                fill.trade_id, fill.exec_id, fill.transaction_id, fill.order_id,
+                fill.account_id, fill.trade_date, fill.date_time,
+                fill.asset_category, fill.symbol, fill.conid,
+                fill.underlying_symbol, fill.underlying_conid, fill.put_call,
+                fill.strike, fill.expiry, fill.multiplier, fill.buy_sell,
+                fill.open_close, fill.notes, fill.level_of_detail, qty,
+                fill.trade_price, fill.currency, rate, proceeds,
                 None if proceeds is None else proceeds * rate,
                 commission,
                 commission_base,
                 commission_ccy,
-                _f(t.taxes), realized,
+                fill.taxes, realized,
                 None if realized is None else realized * rate,
-                _f(t.mtmPnl),
-                json.dumps(_model_dump(t), default=str, sort_keys=True),
+                fill.mtm_pnl,
+                json.dumps(fill.raw, default=str, sort_keys=True),
                 source_file, _now(),
             ),
         )
@@ -318,15 +331,15 @@ def _ingest_trades(conn, stmt, source_file: str, assets, result: IngestResult,
             # of IBKR's rolling window in August 2027, and a warning that fires
             # daily on correctly-handled data is one nobody reads when it
             # finally means something.
-            if commission and commission_ccy and commission_ccy != _s(t.currency):
+            if commission and commission_ccy and commission_ccy != fill.currency:
                 handled = (
                     f"treated as already-base {base_currency}"
                     if commission_ccy == base_currency
                     else "left unconverted: the statement carries no rate for it"
                 )
                 result.warnings.append(
-                    f"trade {t.tradeID}: commission billed in {commission_ccy} but the"
-                    f" instrument trades in {_s(t.currency)}; {handled}"
+                    f"trade {fill.trade_id}: commission billed in {commission_ccy}"
+                    f" but the instrument trades in {fill.currency}; {handled}"
                 )
         else:
             result.trades_skipped_existing += 1
