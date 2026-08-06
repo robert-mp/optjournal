@@ -218,6 +218,29 @@ def _replay_legs(rows: list[dict[str, Any]]) -> list[ReplayLeg]:
     ]
 
 
+def _snapshot_leg(row: dict[str, Any]) -> ReplayLeg:
+    """The single leg a position snapshot row implies.
+
+    One constructor because the strikes and the modelled marks need the SAME
+    leg: built twice, the two could disagree about the seed quantity or price
+    and the chart would draw a strike segment for a position the P&L series was
+    not following.
+
+    Seeded rather than filled: a row reaching this path has no fills anywhere --
+    that is what makes it snapshot-only -- so the position is held flat across
+    the window at the basis the snapshot states.
+    """
+    return ReplayLeg(
+        conid=str(row.get("conid") or ""),
+        strike=float(row.get("strike") or 0.0),
+        right=str(row.get("put_call") or ""),
+        expiry=str(row.get("expiry") or ""),
+        multiplier=float(row.get("multiplier") or 100.0),
+        seed_quantity=float(row.get("position") or 0.0),
+        seed_price=float(row.get("cost_basis_price") or 0.0),
+    )
+
+
 def _annotations(
     lifecycle: dict[str, Any], marks: list[list[float]]
 ) -> list[dict[str, Any]]:
@@ -326,9 +349,12 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             conn, str(lifecycle.get("underlying") or ""),
             opened_at=opened, closed_at=closed,
         )
+        # Grouped once and shared: the strikes and the marks must follow the same
+        # legs, or a segment could be drawn for a position the P&L series was not
+        # walking. Same reason `_snapshot_leg` is one constructor.
+        replay_legs = _replay_legs(legs)
         marks = modelled_marks(
-            conn, _replay_legs(legs), bars["points"],
-            underlying_conid=bars["conid"],
+            conn, replay_legs, bars["points"], underlying_conid=bars["conid"],
         )
         replays[key] = {
             "key": key,
@@ -336,7 +362,7 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "label": lifecycle.get("label"),
             "bar_size": bars["bar_size"],
             "points": [[ts, close] for ts, close in bars["points"]],
-            "strikes": _strikes_of(_replay_legs(legs)),
+            "strikes": _strikes_of(replay_legs),
             "opened_at": opened,
             "closed_at": closed,
             # Epochs, so the page never parses a timezone. Every journal stamp is
@@ -373,6 +399,10 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             conn, str(row.get("underlying_symbol") or ""),
             opened_at=opened, closed_at=None,
         )
+        # One leg, shared by the strikes and the marks below: built twice they
+        # could disagree, and the chart would draw a segment for a position the
+        # P&L series was not following.
+        legs = [_snapshot_leg(row)]
         replays[key] = {
             "key": key,
             "underlying": row.get("underlying_symbol"),
@@ -381,15 +411,7 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "points": [[ts, close] for ts, close in bars["points"]],
             # A snapshot row has no fills, so its side comes from the signed
             # position and its window stays unknown -- drawn full width.
-            "strikes": _strikes_of([ReplayLeg(
-                conid=str(row.get("conid") or ""),
-                strike=float(row.get("strike") or 0.0),
-                right=str(row.get("put_call") or ""),
-                expiry=str(row.get("expiry") or ""),
-                multiplier=float(row.get("multiplier") or 100.0),
-                seed_quantity=float(row.get("position") or 0.0),
-                seed_price=float(row.get("cost_basis_price") or 0.0),
-            )]),
+            "strikes": _strikes_of(legs),
             "opened_at": opened,
             "closed_at": None,
             # A snapshot row has no fills anywhere -- that is what makes it
@@ -402,21 +424,8 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 conn, _band_contracts([row]), bars["points"],
                 underlying_conid=bars["conid"],
             ),
-            # No fills anywhere -- that is what makes it snapshot-only -- so the
-            # position is seeded from the snapshot's own cost basis and held flat
-            # across the window.
             "marks": modelled_marks(
-                conn,
-                [ReplayLeg(
-                    conid=str(row.get("conid") or ""),
-                    strike=float(row.get("strike") or 0.0),
-                    right=str(row.get("put_call") or ""),
-                    expiry=str(row.get("expiry") or ""),
-                    multiplier=float(row.get("multiplier") or 100.0),
-                    seed_quantity=float(row.get("position") or 0.0),
-                    seed_price=float(row.get("cost_basis_price") or 0.0),
-                )],
-                bars["points"], underlying_conid=bars["conid"],
+                conn, legs, bars["points"], underlying_conid=bars["conid"],
             ),
             # No fills means no events to annotate. Explicitly empty rather than
             # absent, so the page reads one shape for every replay.
