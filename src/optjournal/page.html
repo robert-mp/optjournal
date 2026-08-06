@@ -1926,6 +1926,36 @@ function costs(){
 }
 
 /* ------------------------------------------------ annual */
+/* The Annual and Month tables print the same stats payload, and used to spell
+   the row and the header out twice each -- ten to twelve <td>s in the same order,
+   diverging only in the first cell and in whether the avg-win/avg-loss pair is
+   shown. Two copies of a column ORDER is the dangerous kind: swap two <th>s in
+   one table and every figure below them still renders, just under the wrong
+   heading, which no test and no glance catches.
+
+   `wide` adds the avg pair to both the header and the row together, which is
+   what makes them impossible to disagree about. */
+const statsHead=(first,wide)=>`<tr><th>${first}</th><th class="n">fills</th>
+  <th class="n">orders</th><th class="n">closed</th><th class="n">W</th>
+  <th class="n">L</th><th class="n">win rate</th><th class="n">net P&amp;L</th>
+  ${wide?`<th class="n">avg win</th><th class="n">avg loss</th>`:''}
+  <th class="n">commission</th><th class="n">green/red</th></tr>`;
+
+function statsRow(s,{label,wide=false,klass=''}={}){ return `<tr${klass?` class="${klass}"`:''}>
+  <td class="mono">${esc(label)}</td>
+  <td class="n mono">${s.total_trades}</td>
+  <td class="n mono">${s.orders}</td>
+  <td class="n mono">${s.closed_episodes}</td>
+  <td class="n mono pos">${s.wins}</td>
+  <td class="n mono neg">${s.losses}</td>
+  <td class="n mono">${pct(s.win_rate)}</td>
+  <td class="n mono ${cls(s.net_pnl.base)}">${moneyOf(s.net_pnl)}</td>
+  ${wide?`<td class="n mono">${s.avg_win==null?'—':moneyOf(s.avg_win)}</td>
+  <td class="n mono">${s.avg_loss==null?'—':moneyOf(s.avg_loss)}</td>`:''}
+  <td class="n mono">${moneyOf(s.commissions)}</td>
+  <td class="n mono"><span class="pos">${s.green_days}</span>/<span
+    class="neg">${s.red_days}</span></td></tr>`; }
+
 function annual(){
   const yrs=S.state.annual||[], tot=S.state.annual_total||{};
   if(!yrs.length) return `<div class="card"><div class="empty">no trades to summarise</div></div>`;
@@ -1938,20 +1968,8 @@ function annual(){
      of its own rows whenever the filter was on. */
   let best=yrs[0];
   yrs.forEach(s=>{if(s.net_pnl.base>best.net_pnl.base)best=s;});
-  const row=(s,klass)=>`<tr class="${klass||''}">
-    <td class="mono">${esc(s.month==='ALL'?'all time':s.month)}</td>
-    <td class="n mono">${s.total_trades}</td>
-    <td class="n mono">${s.orders}</td>
-    <td class="n mono">${s.closed_episodes}</td>
-    <td class="n mono pos">${s.wins}</td>
-    <td class="n mono neg">${s.losses}</td>
-    <td class="n mono">${pct(s.win_rate)}</td>
-    <td class="n mono ${cls(s.net_pnl.base)}">${moneyOf(s.net_pnl)}</td>
-    <td class="n mono">${s.avg_win==null?'—':moneyOf(s.avg_win)}</td>
-    <td class="n mono">${s.avg_loss==null?'—':moneyOf(s.avg_loss)}</td>
-    <td class="n mono">${moneyOf(s.commissions)}</td>
-    <td class="n mono"><span class="pos">${s.green_days}</span>/<span
-      class="neg">${s.red_days}</span></td></tr>`;
+  const row=(s,klass)=>statsRow(s,{
+    label:s.month==='ALL'?'all time':s.month, wide:true, klass:klass||''});
   return `<div class="card">
     <div class="crow"><div><h2>Year by year</h2>
       <div class="sub">${esc(ccyNote())} A round trip counts in the year it
@@ -1962,11 +1980,7 @@ function annual(){
         ${yrs.length>1?`<span class="pill">best <b>${esc(best.month)}</b>
           <b class="${cls(best.net_pnl.base)}">${moneyOf(best.net_pnl)}</b></span>`:''}
       </div></div>
-    <table><thead><tr><th>year</th><th class="n">fills</th><th class="n">orders</th>
-      <th class="n">closed</th><th class="n">W</th><th class="n">L</th>
-      <th class="n">win rate</th><th class="n">net P&amp;L</th><th class="n">avg win</th>
-      <th class="n">avg loss</th><th class="n">commission</th>
-      <th class="n">green/red</th></tr></thead><tbody>
+    <table><thead>${statsHead('year',true)}</thead><tbody>
       ${yrs.map(s=>row(s)).join('')}
       ${row(tot,'grp')}
     </tbody></table>
@@ -1991,27 +2005,13 @@ function monthlyTable(){
     const y=String(s.month).slice(0,4);
     if(y!==year){year=y;
       out.push(`<tr class="grp"><td class="mono dim" colspan="10">${esc(y)}</td></tr>`);}
-    out.push(`<tr>
-      <td class="mono">${esc(monthLabel(s.month))}</td>
-      <td class="n mono">${s.total_trades}</td>
-      <td class="n mono">${s.orders}</td>
-      <td class="n mono">${s.closed_episodes}</td>
-      <td class="n mono pos">${s.wins}</td>
-      <td class="n mono neg">${s.losses}</td>
-      <td class="n mono">${pct(s.win_rate)}</td>
-      <td class="n mono ${cls(s.net_pnl.base)}">${moneyOf(s.net_pnl)}</td>
-      <td class="n mono">${moneyOf(s.commissions)}</td>
-      <td class="n mono"><span class="pos">${s.green_days}</span>/<span
-        class="neg">${s.red_days}</span></td></tr>`);
+    out.push(statsRow(s,{label:monthLabel(s.month)}));
   });
   return `<h2 style="font-size:15px;margin-top:20px">Month by month</h2>
     <div class="note">Grouped under the year each month belongs to, so the rows
       above them can be checked by adding these up. A month with fills but nothing
       closed shows no win rate rather than 0%.</div>
-    <table><thead><tr><th>month</th><th class="n">fills</th><th class="n">orders</th>
-      <th class="n">closed</th><th class="n">W</th><th class="n">L</th>
-      <th class="n">win rate</th><th class="n">net P&amp;L</th>
-      <th class="n">commission</th><th class="n">green/red</th></tr></thead>
+    <table><thead>${statsHead('month',false)}</thead>
       <tbody>${out.join('')}</tbody></table>`;
 }
 

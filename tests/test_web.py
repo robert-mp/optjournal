@@ -1368,16 +1368,32 @@ def test_dashboard_commission_reads_the_same_as_the_tables():
     helper, so a change to the basis cannot land on one surface only. That is
     a stronger guarantee than the identical-expression assertion this replaced,
     which passed only while the three call sites happened to be spelled alike.
+
+    The two tables reach it through `statsRow`, which is a further step in the
+    same direction -- they no longer spell the row out at all, so they cannot
+    spell it differently. What matters is that no surface computes the figure its
+    own way, which is what the negative assertion below pins.
     """
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
     assert "constchargeOf=(nat,ccy,base)=>isNativeCharge(nat,ccy)" in js, \
         "the shared charge helper is gone"
-    for fn in ("dashboard", "annual", "monthlyTable"):
+    # The Dashboard card reads the payload key directly; both tables render
+    # through `statsRow`, which is the only place a stats row's cells exist.
+    assert "moneyOf(s.commissions)" in _fn("dashboard").replace(" ", ""), \
+        "the dashboard card does not use the shared helper"
+    row = _fn("statsRow").replace(" ", "").replace("\n", "")
+    assert "moneyOf(s.commissions)" in row, \
+        "statsRow does not use the shared helper, so both tables bypass it"
+    for fn in ("dashboard", "annual", "monthlyTable", "statsRow"):
         body = _fn(fn).replace(" ", "").replace("\n", "")
-        assert "moneyOf(s.commissions)" in body, \
-            f"{fn} does not use the shared helper"
         assert "cash(Math.abs(s.commissions.base))" not in body, \
             f"{fn} bypasses the helper and can drift from the others"
+    # Neither table may re-derive a commission cell of its own: one row renderer
+    # is the whole point, and a second `<td>` carrying commission would be a
+    # second answer.
+    for fn in ("annual", "monthlyTable"):
+        assert "commissions" not in _fn(fn), \
+            f"{fn} reads commissions directly again instead of through statsRow"
     # Magnitude, not sign: the tint went with the sign it no longer shows.
     assert "cls(s.commissions.base)" not in _fn("dashboard").replace(" ", "")
 
