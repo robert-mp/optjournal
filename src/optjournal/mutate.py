@@ -21,7 +21,11 @@ mapping, the table's column sizing, the strike side of a closed contract, and
 the Flex request-budget cooldown (which had no test at all). One of the ten was
 not a missing test but a live defect -- `analysis` accumulated
 `int(abs(quantity))` per fill, so any lot under one whole unit contributed
-nothing and a thousand half-share buys summed to zero.
+nothing and a thousand half-share buys summed to zero. An eleventh candidate
+turned out to be unreachable code (`serialize`'s cost-basis fallback, whose two
+sides read the same column), and was deleted rather than sentinelled -- worth
+recording because "no test caught it" has three possible answers, not two: add a
+test, fix the code, or delete the code.
 
 **Equivalent mutants are not findings.** Some changes have no observable effect,
 so "no test caught it" says nothing. The tool reports the count; deciding whether

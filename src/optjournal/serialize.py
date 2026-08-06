@@ -170,9 +170,7 @@ def orders_data(
         out.append(row)
     return out
 
-def positions_data(
-    conn: sqlite3.Connection, cost_basis_fallback: dict[str, float] | None = None
-) -> list[Row]:
+def positions_data(conn: sqlite3.Connection) -> list[Row]:
     """Open-position snapshot rows, each with its money figures interpreted.
 
     The row is returned verbatim because it IS the record -- a point-in-time
@@ -184,6 +182,17 @@ def positions_data(
     through EUR at two different rates -- the same defect corrected for
     commission. Deriving here means the page reads a `Money` and shows the
     native verbatim.
+
+    There was a `cost_basis_fallback` parameter here, for "a snapshot row
+    without a basis borrows the open episode's, matched on conid". It could
+    never fire. Both sides read `position_snapshots.cost_basis_money` for the
+    same latest `report_date` -- `current_option_positions` is a view over that
+    table, and `history._from_snapshot` sets `Episode.cost_basis` from that
+    column -- so whenever the row's basis was NULL the fallback's was too, and
+    the caller's dict comprehension dropped it for being None. Measured on the
+    archive: the one conid the fallback offered already held that exact value in
+    its own row. Removed rather than left as dead insurance, because a fallback
+    that cannot fire still reads as a reason to trust the field.
     """
     rows = conn.execute(
         "SELECT * FROM current_option_positions ORDER BY expiry, strike"
@@ -193,14 +202,8 @@ def positions_data(
         row = dict(r)
         ccy, rate = row.get("currency"), row.get("fx_rate_to_base")
         row["value"] = Money.at_rate(row.get("position_value"), rate, ccy).payload()
-        # A snapshot row does not always carry a basis; the open episode for the
-        # same conid does. Resolved here rather than in the page, which used to
-        # pick the fallback and then convert it with its own rate arithmetic --
-        # a second converter is what this change exists to remove.
-        basis = row.get("cost_basis_money")
-        if basis is None and cost_basis_fallback:
-            basis = cost_basis_fallback.get(str(row.get("conid")))
-        row["cost_basis"] = Money.at_rate(basis, rate, ccy).payload()
+        row["cost_basis"] = Money.at_rate(
+            row.get("cost_basis_money"), rate, ccy).payload()
         row["unrealized"] = Money.at_rate(
             row.get("fifo_pnl_unrealized"), rate, ccy).payload()
         out.append(row)

@@ -838,6 +838,39 @@ def test_every_position_carries_a_cost_basis(state):
         assert pos.get("cost_basis_money") is not None, pos["symbol"]
 
 
+def test_the_basis_comes_from_the_position_row_and_needs_no_fallback(populated):
+    """`positions_data` needs no help from `history`, and pinning that is the point.
+
+    There used to be a `cost_basis_fallback` argument here -- a snapshot row
+    without a basis borrowing the open episode's, matched on conid -- and it
+    could never fire, because both sides read the SAME COLUMN of the same table
+    for the same report_date. It was removed; this is the guard that keeps it
+    removed, by asserting the property that made it dead rather than by trusting
+    a comment.
+
+    Read straight from the database with no history pass at all: if a row is ever
+    genuinely missing a basis, this fails and says so, which is the signal that
+    would justify a real fallback (from somewhere other than the same column).
+    """
+    from optjournal.db import connect
+    from optjournal.serialize import positions_data
+
+    conn = connect(populated)
+    rows = conn.execute("SELECT * FROM current_option_positions").fetchall()
+    assert rows, "the archive should hold open option positions"
+    assert all(r["cost_basis_money"] is not None for r in rows), (
+        "a snapshot row has no basis, so a fallback would now be earning its "
+        "place -- but not from Episode.cost_basis, which reads this same column"
+    )
+    # And the payload is derived from it, not merely adjacent to it. Matched on
+    # conid rather than by position, since positions_data sorts by expiry/strike.
+    basis_of = {str(r["conid"]): r["cost_basis_money"] for r in rows}
+    payload = positions_data(conn)
+    assert len(payload) == len(rows)
+    for pos in payload:
+        assert pos["cost_basis"]["native"] == basis_of[str(pos["conid"])]
+
+
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "127.0.0.2"])
 def test_loopback_addresses_accepted(host):
     from optjournal.web import _is_loopback
