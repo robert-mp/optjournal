@@ -96,8 +96,14 @@ def _resolve_path(args) -> Path | None:
 
 
 def _open_db(args) -> sqlite3.Connection:
-    """A migrated connection the caller owns. Prefer `open_journal` for new
-    code; this exists for commands whose connection outlives one block."""
+    """A migrated connection the CALLER closes.
+
+    For the commands that genuinely need one outliving a single block -- ingest
+    and sync read rows back after writing, prune and bars hand the same handle to
+    several calls. Anything that makes one call wants `open_journal`, which closes
+    it; three commands used this for a single call each and so never closed
+    anything, which is exactly the drift `open_journal` was written to stop.
+    """
     conn = connect(args.db)
     migrate(conn)
     return conn
@@ -349,20 +355,23 @@ def cmd_ingest(args) -> int:
 
 
 def cmd_orders(args) -> int:
-    data = orders_data(_open_db(args))
+    with open_journal(args.db) as conn:
+        data = orders_data(conn)
     _emit(data, render_orders(data), args.json)
     return EXIT_OK if data else EXIT_NO_DATA
 
 
 def cmd_positions(args) -> int:
-    data = positions_data(_open_db(args))
+    with open_journal(args.db) as conn:
+        data = positions_data(conn)
     _emit(data, render_positions(data), args.json)
     return EXIT_OK if data else EXIT_NO_DATA
 
 
 def cmd_history(args) -> int:
     scope = None if args.assets.strip().upper() == "ALL" else args.assets.strip().upper()
-    report = build_history(_open_db(args), asset_category=scope)
+    with open_journal(args.db) as conn:
+        report = build_history(conn, asset_category=scope)
     data = history_data(report)
     _emit(data, render_history(data), args.json)
     return EXIT_OK if report.episodes else EXIT_NO_DATA

@@ -203,13 +203,6 @@ class Episode:
         size = max(abs(self.opened_qty), abs(self.closed_qty))
         return int(size) if float(size).is_integer() else size
 
-    @property
-    def return_on_commission(self) -> float | None:
-        """Realized P&L per unit of commission paid. None when no commission."""
-        if not self.commission_base:
-            return None
-        return self.realized_pnl_base / abs(self.commission_base)
-
 
 @dataclass(slots=True)
 class HistoryReport:
