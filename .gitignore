@@ -43,3 +43,7 @@ demo/
 # in by a broad `git add -A`, and the archive is the only data this repo is
 # supposed to carry.
 build/
+
+# Assistant tooling: workflow scripts and session state, not project source.
+# Written here by the harness rather than by anyone working on the journal.
+.claude/

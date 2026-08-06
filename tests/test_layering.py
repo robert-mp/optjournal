@@ -136,3 +136,46 @@ def test_the_leaf_list_names_only_real_modules():
         name for name in LEAVES | MAY_MODEL if not (PACKAGE / f"{name}.py").is_file()
     )
     assert not missing, f"these are not modules: {missing}"
+
+
+# --- the mutation harness itself ---------------------------------------------
+
+
+def test_every_mutant_pattern_still_matches_its_module():
+    """A mutant whose `find` no longer appears mutates nothing.
+
+    This is the harness's own silent-failure mode, and the one that matters most:
+    refactor the code a mutant targets and it stops testing anything, while
+    `optjournal mutate` keeps printing a reassuring "caught" line for every
+    OTHER defect. `run_mutant` reports `stale-mutant` at runtime, but only for a
+    mutant someone actually runs -- this fails in the ordinary suite.
+
+    Found by using it: the commission mutant originally patched the CALL SITE of
+    `_commission_base`, so the unit test on the rule itself could not see it. It
+    reported 1 test where the truth was 2, which reads as thinner coverage than
+    exists.
+    """
+    from optjournal.mutate import MUTANTS
+
+    stale = []
+    for mutant in MUTANTS:
+        source = (PACKAGE / mutant.module).read_text(encoding="utf-8")
+        if mutant.find not in source:
+            stale.append(f"{mutant.key} (pattern absent from {mutant.module})")
+    assert not stale, (
+        "these mutants no longer match their target and would mutate nothing: "
+        f"{stale}. Update the pattern or drop the mutant."
+    )
+
+
+def test_no_mutant_is_a_no_op():
+    """`find` and `replace` must differ, or the mutant proves nothing.
+
+    A mutant that replaces text with itself reports "caught by 0 tests" for a
+    defect that was never injected -- the worst possible output, because it looks
+    like an unguarded invariant.
+    """
+    from optjournal.mutate import MUTANTS
+
+    noops = [m.key for m in MUTANTS if m.find == m.replace]
+    assert not noops, f"these mutants change nothing: {noops}"

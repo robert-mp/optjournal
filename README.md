@@ -70,6 +70,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `static/replay.js` | the replay chart's arithmetic as pure functions over plain data — no DOM, no globals — so `node --test` can unit-test the scales and the scrub. A function belongs here if it takes data and returns data; the moment it touches `document` it belongs in the page |
 | `browser.py` | headless browser discovery and the DOM dump, in three views: raw, markup (scripts stripped), text |
 | `sweep.py` | the page matrix and its checks; each a pure function of a rendered page |
+| `mutate.py` | mutation testing: known defects, and which tests notice each. Answers "what would a real bug cost" rather than "what is covered" — see [Measuring the suite](#measuring-the-suite) |
 | `demo.py` | deterministic synthetic statement; refuses to touch real data |
 | `sections.py`, `compat.py` | shims over py-ibkr's partial statement model |
 
@@ -260,6 +261,50 @@ Four invariants worth knowing before changing the UI:
   key the API stops sending fails, and a key it sends undeclared fails),
   and the binding table may be neither incomplete nor stale. A typo'd key
   fails a test instead of rendering a blank cell.
+
+## Measuring the suite
+
+`optjournal mutate` injects a known defect and reports which tests notice. It
+answers a different question from coverage: not "did this line run" but "would a
+wrong line be caught, and by how many tests".
+
+Two results are worth acting on. A real defect caught by **zero** tests is an
+unguarded invariant — that is how a `_flat` epsilon wide enough to book a
+0.4-share residual as a closed round trip was found, having passed 579 tests, and
+how `_snapshot_leg` silently taking `abs()` of a short position was found. A
+defect caught by **fifteen** tests would mean fourteen are coupled to something
+they are not about. Measured here: median 2, maximum 8, and that 8 is the Money
+currency gate, a rule that genuinely spans four layers.
+
+**Equivalent mutants are not findings.** Some changes have no observable effect,
+so "nothing caught it" says nothing about the suite. The tool reports; judging
+whether a defect is real is the reader's job.
+
+It also settled a question that intuition kept getting wrong. `test_web.py` is the
+largest test file and much of it greps the page's JavaScript rather than executing
+it, which reads like a smell. Ablation says otherwise: typo a payload key the page
+reads and the browser renders an **em dash** where a real mark price should be —
+no `undefined`, no `NaN`, nothing an executed assertion can see, and
+`test_rendered.py` passes. Only the source-text guard catches it, and that is the
+bug class the four historical examples above all belong to. The greps are the
+defence, not the smell.
+
+The harness lives in the repo rather than in a scratch directory because getting
+it right took three attempts, and each failure looked like an alarming coverage
+result rather than a broken tool:
+
+* `uv run pytest` inside a clone resolves to the **original** project.
+* `cp -R` copies `.venv`, whose editable-install `.pth` hardcodes the original
+  repo's `src`, so even the clone's own interpreter imports the original.
+* On macOS `/tmp` is a symlink to `/private/tmp`, so a guard written to catch the
+  first two by string prefix rejects correct clones.
+
+Each produced "caught by nothing" for a defect that was in fact well covered, and
+the first conclusion drawn from it — that the Money gate had one test — was wrong;
+the real answer is eight. So `mutate.py` proves the mutation is the code pytest
+imported before it will report a number, and refuses to report one otherwise. A
+harness that can silently measure the wrong tree is worse than none, because its
+output looks like evidence.
 
 ## The Money model
 
@@ -510,9 +555,10 @@ premium against the real close for its own date.
 ## Development
 
 ```bash
-uv run pytest -q            # 573 tests; the raw/ statements are fixtures
+uv run pytest -q            # 595 tests; the raw/ statements are fixtures
 uv run ruff check src tests cron
 uv run optjournal sweep     # every page in a real browser (~2 min)
+uv run optjournal mutate    # inject known defects, see which tests notice (~3 min)
 ```
 
 The suite covers four layers: unit tests over domain arithmetic (with the

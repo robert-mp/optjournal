@@ -31,6 +31,7 @@ from optjournal.config import (
     DEFAULT_DB,
     DEFAULT_DEMO_DB,
     DEFAULT_DEMO_DIR,
+    ROOT,
 )
 from optjournal.db import connect, migrate, open_journal
 from optjournal.flex import FetchCooldown, TokenMissing, fetch, load
@@ -506,6 +507,41 @@ def cmd_sweep(args) -> int:
     return EXIT_ERROR if any(r.failures for r in results) else EXIT_OK
 
 
+def cmd_mutate(args) -> int:
+    """Inject known defects and report which tests notice each.
+
+    Deliberately not part of `pytest`, for the same reason as `sweep`: it clones
+    the repo and runs the whole suite once per mutant, so it costs minutes where
+    the suite costs seconds.
+
+    What it answers is not "what is covered" but "what would a real bug cost". A
+    defect caught by nothing is an unguarded invariant -- that is how a 0.4-share
+    residual booking a partial close as a closed round trip was found, having
+    passed 579 tests. A defect caught by fifteen tests means fourteen are coupled
+    to something they are not about.
+
+    Judge equivalence before believing an uncaught result: some changes have no
+    observable effect, and for those "no test caught it" says nothing.
+    """
+    from optjournal import mutate
+
+    outcomes = mutate.run_all(
+        source=ROOT, workdir=args.workdir, only=tuple(args.only or ()),
+    )
+    data = [
+        {"defect": o.mutant.key, "module": o.mutant.module,
+         "breaks": o.mutant.breaks, "status": o.status,
+         "failed": o.failed, "tests": list(o.tests), "detail": o.detail}
+        for o in outcomes
+    ]
+    _emit(data, mutate.format_report(outcomes), args.json)
+    # A mutant nothing caught, or a measurement that could not be trusted, is
+    # what a human needs to look at. Exit 1 so a scripted run can say so.
+    if any(o.status != "measured" or o.failed == 0 for o in outcomes):
+        return EXIT_ERROR
+    return EXIT_OK
+
+
 def cmd_serve(args) -> int:
     """Run the local web UI. Blocks until interrupted."""
     from optjournal.web import serve
@@ -797,6 +833,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", type=Path, default=None,
                    help=f"journal database (default: {DEFAULT_DB})")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("mutate", parents=[common],
+                       help="inject known defects, report which tests catch each")
+    p.add_argument("--only", action="append", metavar="KEY",
+                   help="run just this defect (repeatable); default is all")
+    p.add_argument("--workdir", type=Path, default=Path("/tmp/optjournal-mutants"),
+                   help="where clones are built (default: /tmp/optjournal-mutants)")
+    p.set_defaults(func=cmd_mutate)
 
     p = sub.add_parser("sweep", parents=[common],
                        help="render every page in a browser and check it")
