@@ -132,6 +132,19 @@ That splits collection in two, and `bars_manifest` marks the difference with
 Both live in `cron/optjournal_bars.py`. `--live` restricts a run to the
 perishable set: running the full manifest seven times a session would re-fetch
 three years of settled daily history to collect a handful of new hourly rows.
+
+> **Deployment, and a live hazard.** MeshClaw requires cron scripts under
+> `~/.meshclaw/crons/`, which is not version controlled, so the implementations
+> live here and the deployed file should be a **loader shim** that locates one by
+> path — that is what `~/.meshclaw/crons/optjournal_sync.py` is, and why editing
+> `cron/optjournal_sync.py` takes effect immediately.
+> `~/.meshclaw/crons/optjournal_bars.py` is **still a byte-for-byte copy**, so an
+> edit to `cron/optjournal_bars.py` changes nothing about what actually runs and
+> says nothing about it. They are identical today; nothing keeps them so. The fix
+> is to replace that file with a shim delegating `live`, `daily` and `audit`,
+> modelled on the sync one. It matters more here than anywhere else in this
+> project, because a perishable session missed is a session no later run can
+> recover.
 The LEAP is deliberately excluded from hourly collection — the gate is the
 chart's own granularity rule, so an option is collected hourly exactly when its
 replay is *drawn* hourly.
@@ -389,7 +402,9 @@ contradiction, not a rounding difference.
 `web.build_state` → declare its shape in `page.html`'s `@typedef` blocks
 and its binding in the `@payload` table (same file, same diff) → add the
 shape's extractor to `tests/test_web.py::_shape_samples` → view function
-in `page.html` + entry in `TABS` + register in the `views` dispatch →
+in `page.html` + entry in `TABS` + register in the `views` dispatch → add the
+key to `sweep.TABS` (a test holds it to `page.html`'s own list, because a tab
+missing there is never swept and the sweep still reports a pass) →
 tests asserting its figures reconcile with an existing independent number
 (see the Annual total-row tests).
 
@@ -421,7 +436,22 @@ journal.
 
 **A new CLI command**: `cmd_*` function + subparser in `cli.py`, opening
 the database via `db.open_journal`. Emit through `_emit(data, text, json)`
-so `--json` comes for free.
+so `--json` comes for free. Reach for `_open_db` only if the connection has to
+outlive one block (ingest and sync read rows back after writing); it hands back a
+handle the caller must close, and three commands that used it for a single call
+each simply never closed one.
+
+**A new terminal report**: a `render_*` in `render.py` reading the serializer's
+shapes, plus a case in `tests/test_render.py` that builds its payload with the
+REAL serializer over the real archive. A hand-written dict would have passed
+throughout the window when `orders` and `history` were both crashing.
+
+**A new cron job**: implementation in `cron/`, a loader shim under
+`~/.meshclaw/crons/` that locates it by path (never a copy — see below), and a
+case in `tests/test_cron.py`. The cron scripts run under MeshClaw's interpreter,
+which has no py_ibkr, so they may import nothing from the `optjournal` package
+and must shell out to the CLI instead. Exit codes are mirrored rather than
+imported for that reason, and a test holds the copies to `cli.py`'s originals.
 
 ## Data safety
 
@@ -472,7 +502,7 @@ premium against the real close for its own date.
 ## Development
 
 ```bash
-uv run pytest -q            # 399 tests; the raw/ statements are fixtures
+uv run pytest -q            # 573 tests; the raw/ statements are fixtures
 uv run ruff check src tests cron
 uv run optjournal sweep     # every page in a real browser (~2 min)
 ```
@@ -482,6 +512,24 @@ generator itself under test — see `test_demo.py`), payload-contract guards
 binding `page.html` to `build_state`, static checks over the page's JavaScript
 (history discipline, hash round-tripping), and one executed render in a real
 browser engine (`test_rendered.py`).
+
+Shared scaffolding lives in `tests/conftest.py` — `RAW_DIR`/`STATEMENTS`, a
+migrated `conn`, a `populated_db`, `add_statement`, and the `code_only` comment
+stripper both JS guards use. What a *trade row* contains stays in the module
+asserting it: that is the subject of those tests, not setup for them.
+
+**Every consumer of a payload is bound to its producer by a test**, because the
+one that was not shipped broken: `render.py` kept reading the flat money keys the
+`Money` conversion had removed, and `optjournal orders` and `optjournal history`
+both died on `float(dict)` behind a green suite. The page has its `@typedef`
+guards, `--json` has the sweep, the terminal reports have `test_render.py`, and
+the crons have `test_cron.py`. A new consumer needs one too.
+
+Three rules the README used to state in prose and nothing enforced now have
+tests in `test_layering.py`: the leaf modules import nothing from the package,
+only `bars` and `demo` may import `blackscholes` (the modelled-number
+quarantine), and the import graph is acyclic — which matters because the cron
+loads this package under an interpreter that has no py_ibkr.
 
 `optjournal sweep` goes further than the suite can afford to: it renders **every
 page both journals can show** — each tab, the currency toggle, the asset switch,
