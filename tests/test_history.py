@@ -217,6 +217,58 @@ def test_snapshot_only_not_duplicated_when_trades_exist(conn):
 # ----------------------------------------------------------------- exclusions
 
 
+def test_a_residual_position_is_not_flat():
+    """`_flat` decides whether a round trip is CLOSED, and nothing tested it.
+
+    Found by mutation: replacing the epsilon with `abs(qty) < 0.5` -- so 0.4
+    shares still held counts as flat -- passed all 579 tests. That defect books a
+    partially-closed lot as a completed round trip, which means its P&L counts in
+    the period and the remaining position disappears from the open book. Both
+    halves of "nothing counts until the position is flat" break at once, silently.
+
+    The epsilon exists for float dust on FRACTIONAL lots (a dividend
+    reinvestment buys 1.79 shares), so the test has to pin both sides: dust is
+    flat, a real fraction of a share is not.
+    """
+    from optjournal.history import _FLAT_EPS, _flat
+
+    assert _flat(0) and _flat(0.0)
+    # Integral quantities are exact -- options cannot leave dust.
+    assert not _flat(1) and not _flat(-1)
+    # Dust from float arithmetic on a fractional lot is not a position.
+    assert _flat(_FLAT_EPS / 10) and _flat(-_FLAT_EPS / 10)
+    # A real residual IS a position, however small a share fraction it is.
+    assert not _flat(0.4), "0.4 shares held is not flat"
+    assert not _flat(-0.4), "a short residual is not flat"
+    assert not _flat(0.01), "a hundredth of a share is still a position"
+    # The epsilon must stay far below any quantity a broker can report.
+    assert _FLAT_EPS < 1e-4, "epsilon wide enough to swallow a real residual"
+
+
+def test_a_fractional_residual_leaves_the_episode_open(conn):
+    """The same property end to end, through `build_history`.
+
+    The unit test above pins the predicate; this pins the consequence, because
+    that is what a reader cares about: sell all but a fraction of a lot and the
+    episode must stay OPEN and contribute no realised P&L.
+    """
+    add_trade(conn, "1", conid="S1", symbol="SIVE", asset="STK",
+              open_close="O", qty=10.0, price=100.0)
+    add_trade(conn, "2", conid="S1", symbol="SIVE", asset="STK",
+              open_close="C", qty=-9.6, price=110.0, date="2026-03-10",
+              realized=96.0)
+    add_snapshot(conn, "S1", position=0.4, symbol="SIVE", asset="STK")
+
+    report = build_history(conn, asset_category="STK")
+    assert len(report.episodes) == 1
+    episode = report.episodes[0]
+    assert episode.status == "OPEN", (
+        "0.4 shares are still held, so the round trip is not complete"
+    )
+    assert episode.net_qty == pytest.approx(0.4)
+    assert report.closed == [], "a partial close must not count as an outcome"
+
+
 def test_currency_conversions_are_not_positions(conn):
     """FX rows carry no openCloseIndicator, so they would fuse into one episode."""
     for i in range(4):
