@@ -29,7 +29,7 @@ import threading
 import urllib.parse
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -39,8 +39,8 @@ from optjournal import __version__
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.bars import (
-    BandContract,
     ReplayLeg,
+    band_contracts,
     delta_around,
     epoch_et,
     expected_move_band,
@@ -147,37 +147,6 @@ def _strikes_of(legs: list[ReplayLeg]) -> list[dict[str, Any]]:
             "to": closed_at,
         })
     return sorted(out, key=lambda row: row["strike"])
-
-
-def _band_contracts(rows: list[dict[str, Any]]) -> list[BandContract]:
-    """The legs a vol solve can use: one per distinct contract that has a conid.
-
-    Deduplicated by conid because a closed lifecycle holds each contract twice,
-    and solving the same series of closes twice would weight that leg double in
-    the average. The fills of BOTH rows still count as vol anchors though -- an
-    opening and a closing fill are two separate observations of the same
-    contract, so they accumulate onto the one entry rather than replacing it.
-    """
-    seen: dict[str, BandContract] = {}
-    for row in rows:
-        conid = str(row.get("conid") or "")
-        strike, expiry = row.get("strike"), row.get("expiry")
-        if not conid or strike is None or not expiry:
-            continue
-        stamp, price = epoch_et(row.get("first_fill_at")), row.get("avg_price")
-        anchor = () if stamp is None or price is None else ((stamp, float(price)),)
-        existing = seen.get(conid)
-        if existing is None:
-            seen[conid] = BandContract(
-                conid=conid,
-                strike=float(strike),
-                right=str(row.get("put_call") or ""),
-                expiry=str(expiry),
-                anchors=anchor,
-            )
-        elif anchor:
-            seen[conid] = replace(existing, anchors=existing.anchors + anchor)
-    return list(seen.values())
 
 
 def _replay_legs(rows: list[dict[str, Any]]) -> list[ReplayLeg]:
@@ -376,8 +345,10 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
                 {ts for ts in (epoch_et(leg.get("first_fill_at")) for leg in legs)
                  if ts is not None}
             ),
+            # From the same legs the marks walk, so the band and the P&L series
+            # cannot disagree about what the market charged for a contract.
             "band": expected_move_band(
-                conn, _band_contracts(legs), bars["points"],
+                conn, band_contracts(replay_legs), bars["points"],
                 underlying_conid=bars["conid"],
             ),
             "marks": marks,
@@ -423,7 +394,7 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "closed_ts": None,
             "fills": [],
             "band": expected_move_band(
-                conn, _band_contracts([row]), bars["points"],
+                conn, band_contracts(legs), bars["points"],
                 underlying_conid=bars["conid"],
             ),
             "marks": modelled_marks(

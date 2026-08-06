@@ -716,6 +716,43 @@ def test_the_band_accepts_both_expiry_formats_the_payload_carries(conn):
     assert expiry_epoch("nonsense") is None
 
 
+def test_the_band_and_the_marks_solve_against_one_projection():
+    """Both are drawn on one chart, so both must read the same contracts.
+
+    They used to be built by two functions: `web._band_contracts` walked raw leg
+    dicts for the band, while `modelled_marks` projected `ReplayLeg`s inline for
+    the P&L. The two agreed -- verified across both journals -- but nothing held
+    them there, and a divergence would put an envelope and a P&L series on the
+    same axes disagreeing about what the market charged for a contract, with no
+    test between them.
+
+    Asserted structurally: `band_contracts` is the only projection, so a leg's
+    fills become its anchors and a snapshot-only leg (no fills, seeded from a
+    cost basis with no timestamp) anchors on nothing rather than on a guess.
+    """
+    from optjournal.bars import band_contracts
+
+    traded = ReplayLeg(
+        conid="C1", strike=270.0, right="P", expiry="2026-09-04",
+        fills=((1000, -3.0, 5.24), (2000, 3.0, 2.61)),
+    )
+    snapshot = ReplayLeg(
+        conid="C2", strike=700.0, right="C", expiry="20270617",
+        seed_quantity=1.0, seed_price=30.0,
+    )
+    band = band_contracts([traded, snapshot])
+    assert [c.conid for c in band] == ["C1", "C2"], "one contract per leg, in order"
+    # Every fill is a vol observation: an opening and a closing fill are two
+    # separate prices the market really charged for the same contract.
+    assert band[0].anchors == ((1000, 5.24), (2000, 2.61))
+    # A cost basis carries no timestamp, so there is nothing to anchor at.
+    assert band[1].anchors == ()
+    # The strike, right and expiry ride along unchanged -- the vol solve needs
+    # all three, and reading any of them off the wrong leg inverts the answer.
+    assert (band[0].strike, band[0].right, band[0].expiry) == (270.0, "P", "2026-09-04")
+    assert (band[1].strike, band[1].right, band[1].expiry) == (700.0, "C", "20270617")
+
+
 def test_backfill_collects_failures_without_abandoning_the_book(conn):
     """One unreachable contract must not cost the rest of the run."""
     _option_trade(conn, conid="C1", symbol="AAA  260101P00100000",

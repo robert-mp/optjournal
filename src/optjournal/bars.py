@@ -59,6 +59,7 @@ __all__ = [
     "audit_perishable",
     "backfill_bars",
     "bars_manifest",
+    "band_contracts",
     "last_traded_day",
     "market_traded_on",
     "MARKET_TZ",
@@ -865,6 +866,36 @@ def expected_move_band(
     return band
 
 
+def band_contracts(legs: list[ReplayLeg]) -> list[BandContract]:
+    """The vol-solve view of a replay's legs: one `BandContract` each.
+
+    The single projection, used by BOTH consumers. The band and the modelled
+    marks are drawn on one chart and must agree about what the market charged for
+    each contract, so deriving them from separately-built contract lists made
+    "one vol series per leg" a property of two functions happening to match --
+    they did match, verified across both journals, but nothing held them there.
+
+    A leg's own fills become its anchors, so a session the price source has no
+    history for still prices from what the market really charged. A snapshot-only
+    leg has no fills to anchor with -- that is what makes it snapshot-only -- and
+    is seeded from its cost basis instead, which carries no timestamp.
+
+    Deduplication is the caller's: `_replay_legs` already groups by conid, which
+    is what makes a contract sold to open and bought to close ONE leg with two
+    anchors rather than two legs weighting that strike double in the average.
+    """
+    return [
+        BandContract(
+            conid=leg.conid,
+            strike=leg.strike,
+            right=leg.right,
+            expiry=leg.expiry,
+            anchors=tuple((stamp, price) for stamp, _qty, price in leg.fills),
+        )
+        for leg in legs
+    ]
+
+
 def modelled_marks(
     conn: sqlite3.Connection,
     legs: list[ReplayLeg],
@@ -901,17 +932,7 @@ def modelled_marks(
     so a delta-neutral strangle reads 0.0 and a short put reads a positive
     fraction -- the scale the reference chart uses.
     """
-    contracts = [
-        BandContract(
-            conid=leg.conid, strike=leg.strike, right=leg.right, expiry=leg.expiry,
-            # The fills, so a session the price source has no history for still
-            # prices from what the market charged us. A snapshot-only leg is
-            # seeded from a cost basis with no timestamp, so it cannot anchor.
-            anchors=tuple((stamp, price) for stamp, _qty, price in leg.fills),
-        )
-        for leg in legs
-    ]
-    vols = _vol_series(conn, contracts, points, underlying_conid)
+    vols = _vol_series(conn, band_contracts(legs), points, underlying_conid)
     if not vols:
         return []
     marks: list[list[float]] = []
