@@ -299,6 +299,33 @@ MUTANTS: tuple[Mutant, ...] = (
                "request against a lockout allowance",
     ),
     Mutant(
+        key="impact-default",
+        module="events.py",
+        find='        if impact not in IMPACTS:\n            raise EventFetchError(',
+        replace='        if impact not in IMPACTS:\n            impact = "Low"\n'
+                '        if False:\n            raise EventFetchError(',
+        breaks="a high-impact release would be filed as Low, so the calendar "
+               "de-emphasises the one day that mattered and says nothing",
+    ),
+    Mutant(
+        key="vol-thin",
+        module="vol.py",
+        find="    if len(rets) < MIN_RETURNS:\n        return None",
+        replace="    if not rets:\n        return None",
+        breaks="a symbol with two closes would report a confident volatility, so "
+               "a row added yesterday reads as measured rather than as unknown",
+    ),
+    # NO mutant for `market_events`'s (source, event_id) key, for the reason
+    # already recorded above for `securities` and `equity_summaries`: SQLite
+    # rejects an upsert whose ON CONFLICT target does not match a key, so
+    # narrowing either side raises and ~25 tests report the crash rather than the
+    # silent overwrite the defect would be. A 25 in the table would read as strong
+    # coverage of something never tested.
+    #
+    # It IS guarded, by test_events.py's
+    # `test_events_are_stamped_with_the_source_that_issued_them`, which stores the
+    # same events under two sources and asserts both survive.
+    Mutant(
         key="qty-lossless",
         module="sources.py",
         find="    return i if abs(f - i) < 1e-9 else f",

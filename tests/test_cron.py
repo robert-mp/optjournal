@@ -71,7 +71,9 @@ DEPLOYED = Path.home() / ".meshclaw" / "crons"
 
 
 @pytest.mark.skipif(not DEPLOYED.is_dir(), reason="no MeshClaw cron directory")
-@pytest.mark.parametrize("name", ["optjournal_sync", "optjournal_bars"])
+@pytest.mark.parametrize(
+    "name", ["optjournal_sync", "optjournal_bars", "optjournal_market"]
+)
 def test_the_deployed_cron_is_a_shim_not_a_copy(name):
     """The deployed file must LOAD the repo's implementation, not duplicate it.
 
@@ -244,3 +246,153 @@ def test_the_bars_cron_maps_every_outcome_to_a_delivery(bars_cron):
     assert bars_cron.EXIT_ERROR == 1
     for entry in ("live", "daily", "audit"):
         assert callable(getattr(bars_cron, entry)), f"{entry} is not an entry point"
+
+
+# --- the calendar cron -------------------------------------------------------
+#
+# The interesting branch is the rate limit. The feed sits behind Cloudflare and
+# answers 429 with a `retry-after` -- hit for real while `events.py` was being
+# written, and still refusing three minutes later. A cron that treated that as a
+# failure would alert daily about a feed that is working fine; one that treated a
+# CHANGED FEED as a back-off would stay silent about a calendar filing high-impact
+# releases as Low. So the two must not be confused, and the CLI's exit code is the
+# only thing distinguishing them.
+
+
+@pytest.fixture
+def market_cron():
+    return _load_cron("optjournal_market")
+
+
+def test_the_market_cron_skips_a_back_off_and_raises_a_change(market_cron, monkeypatch):
+    """EXIT_THROTTLED is quiet and retained; anything else wakes someone.
+
+    Skip rather than Report on 429 because nothing is lost: the feed serves the
+    same week tomorrow. Raise on any other non-zero because the one failure worth
+    a human is a parse refusal -- `events.parse_events` rejects an unknown
+    `impact` rather than filing it as Low, and a calendar that de-emphasises the
+    day that mattered would otherwise look correct.
+    """
+    import subprocess
+
+    from mesh_claw.cron_script import Skip
+
+    # The real CLI is present in this checkout, but say so explicitly:
+    # a PosixPath's `exists` is read-only, so the module attribute is what
+    # gets pointed somewhere real.
+    monkeypatch.setattr(market_cron, "CLI", Path(__file__))
+
+    def throttled(*_a, **_k):
+        return subprocess.CompletedProcess(
+            [], market_cron.EXIT_THROTTLED, "",
+            "calendar: the calendar feed is rate limiting; retry in 92s",
+        )
+
+    monkeypatch.setattr(market_cron.subprocess, "run", throttled)
+    with pytest.raises(Skip, match="retry in 92s"):
+        market_cron.refresh(None)
+
+    def broken(*_a, **_k):
+        return subprocess.CompletedProcess(
+            [], market_cron.EXIT_ERROR, "", "unknown impact 'Critical'"
+        )
+
+    monkeypatch.setattr(market_cron.subprocess, "run", broken)
+    with pytest.raises(RuntimeError, match="Critical"):
+        market_cron.refresh(None)
+
+
+def test_a_quiet_week_says_nothing(market_cron, monkeypatch):
+    """No high-impact events ahead is the normal state, not news.
+
+    The job runs daily and stores ~99 rows every time, almost all of them
+    corrections nobody was waiting for. Reporting each run would train you to
+    ignore the channel -- the same policy the bars cron states for its
+    seven-times-a-session poll.
+    """
+    import json
+    import subprocess
+
+    # The real CLI is present in this checkout, but say so explicitly:
+    # a PosixPath's `exists` is read-only, so the module attribute is what
+    # gets pointed somewhere real.
+    monkeypatch.setattr(market_cron, "CLI", Path(__file__))
+
+    def ok(payload):
+        def run(*_a, **_k):
+            return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        return run
+
+    monkeypatch.setattr(market_cron.subprocess, "run", ok({
+        "stored": 99,
+        "events": [{"impact": "Low", "title": "Building Consents m/m",
+                    "country": "NZD", "day": "2026-08-09", "at": "18:45"}],
+    }))
+    assert market_cron.refresh(None) is None
+
+
+def test_high_impact_events_are_reported_with_their_figures(market_cron, monkeypatch):
+    """The one thing worth a notification, and the attribution travels with it.
+
+    `impact` is the feed's judgement; the message says so rather than presenting
+    it as the journal's, which is the same rule the AutoFX markup follows.
+    """
+    import json
+    import subprocess
+
+    from mesh_claw.cron_script import Report
+
+    # The real CLI is present in this checkout, but say so explicitly:
+    # a PosixPath's `exists` is read-only, so the module attribute is what
+    # gets pointed somewhere real.
+    monkeypatch.setattr(market_cron, "CLI", Path(__file__))
+
+    def run(*_a, **_k):
+        return subprocess.CompletedProcess([], 0, json.dumps({
+            "stored": 99,
+            "events": [
+                {"impact": "High", "title": "Non-Farm Employment Change",
+                 "country": "USD", "day": "2026-08-07", "at": "08:30",
+                 "forecast": "85K", "previous": "57K"},
+                {"impact": "Low", "title": "Building Consents m/m",
+                 "country": "NZD", "day": "2026-08-09", "at": "18:45"},
+            ],
+        }), "")
+
+    monkeypatch.setattr(market_cron.subprocess, "run", run)
+    with pytest.raises(Report) as caught:
+        market_cron.refresh(None)
+    message = str(caught.value)
+    assert "Non-Farm Employment Change" in message
+    assert "fc 85K" in message and "prev 57K" in message
+    assert "Building Consents" not in message, "a Low event was reported"
+    assert "feed's assessment" in message, "impact was not attributed"
+
+
+def test_an_empty_week_is_reported_because_the_feed_does_not_do_that(
+    market_cron, monkeypatch
+):
+    """A successful fetch storing nothing means something changed upstream.
+
+    The feed returns ~99 events for every week observed. Zero is not a quiet
+    week, it is a signal -- and staying silent about it would leave the Market tab
+    slowly emptying with nothing anywhere saying why.
+    """
+    import json
+    import subprocess
+
+    from mesh_claw.cron_script import Report
+
+    # The real CLI is present in this checkout, but say so explicitly:
+    # a PosixPath's `exists` is read-only, so the module attribute is what
+    # gets pointed somewhere real.
+    monkeypatch.setattr(market_cron, "CLI", Path(__file__))
+
+    def run(*_a, **_k):
+        return subprocess.CompletedProcess(
+            [], 0, json.dumps({"stored": 0, "events": []}), ""
+        )
+
+    monkeypatch.setattr(market_cron.subprocess, "run", run)
+    with pytest.raises(Report, match="no events"):
+        market_cron.refresh(None)
