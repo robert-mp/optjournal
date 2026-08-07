@@ -302,7 +302,7 @@ Independently shippable, in order. Effort is my estimate of focused work.
 | ~~6~~ | ~~Honour `account_id`~~ — **DONE** (`dcb49d5`): episode identity is `(broker, account_id, conid)`. | — | — |
 | ~~7~~ | ~~`NormalisedFill` + `StatementSource` Protocol~~ — **DONE** (`03ac3d7`) and then **actually finished** (`eeef122`). See below: the first pass looked complete and was not. | — | — |
 | 7b | Move the remaining sections across the seam: cash, positions, securities and equity summaries still read py_ibkr models and `raw_sections` dicts directly in `ingest.py`. | The trade path is done and is the dense one. These four are the rest of the same job, and a second broker needs them. | M |
-| 8 | Rename the IBKR vocabulary that reaches the payload (`conid`, `ib_order_id`, `fifo_*`), serializer + typedefs + binding table in one commit. | Defer until a second broker exists: it implies another schema migration, and the names are accurate while IBKR is the only source. | M |
+| 8 | Rename the IBKR vocabulary (`conid`, `ib_order_id`, `ib_commission`, `fifo_*`, `ib_exec_id`). **TODO, with a plan below.** | Deferred on purpose: 663 occurrences, another schema migration, and the names are still ACCURATE while IBKR is the only source. | L |
 | 9 | Design pass (not code) on computing FIFO realised P&L for brokers that do not supply it. | The one genuinely hard problem. Deserves a decision before implementation. | L |
 
 Steps 1-4 are pure entropy reduction and touch no architecture. 5-7 are the
@@ -340,6 +340,83 @@ one's reader so the DATA is identical and only the plumbing differs.
 The same round found a bug in the mutation harness itself (`cf2b734`): it counted
 only pytest's `FAILED` lines, so a defect caught by a *fixture's* assertion -- which
 pytest reports as `ERROR` -- read as caught by nothing.
+
+## TODO: task 8, the vocabulary rename
+
+Written down rather than done, because the cost is real and the benefit arrives
+only with a second broker. Measured, not estimated:
+
+| name | src | tests | where it hurts |
+|---|---|---|---|
+| `conid` | 270 | 159 | 22 in db.py, 15 in page.html, 13 other modules |
+| `ib_commission` | 36 | 44 | schema column, `_base` sibling, commission-currency rule |
+| `ib_order_id` | 31 | 18 | schema, two views, the `Order`/`Leg` payload shapes |
+| `fx_rate_to_base` | 23 | 17 | on four tables |
+| `fifo_pnl_realized` | 17 | 10 | schema + `_base` sibling |
+| `fifo_pnl_unrealized` | 9 | 1 | schema, payload |
+| `ib_exec_id` | 5 | 23 | schema, the UNIQUE index |
+
+**663 occurrences.** Not a sed job: `conid` is a schema column on five tables, a
+`price_bars` primary-key component, a payload key the page reads 15 times, and a
+join key in `bars.underlying_ids`.
+
+### Why it is worth doing eventually
+
+The names are accurate today and will become lies. `fifo_pnl_realized` says IBKR
+computed this with FIFO lot matching -- true, and `history.py` depends on it being
+net of both legs' commission. A broker using average-cost or supplying nothing
+would store a differently-derived number under a name that claims FIFO. That is
+the failure mode this rename prevents, and it is the same shape as every defect
+this project has actually hit: a well-formed answer under a label that no longer
+describes it.
+
+`ib_exec_id` and `ib_commission` carry a vendor prefix that will read as "the
+IBKR one" beside a second broker's column. And `conid` is IBKR's word; note that
+`price_bars` is KEYED on conid but FETCHED by OCC symbol from Yahoo, so there the
+conid is purely a local join handle and the name misleads already.
+
+### Why not now
+
+1. **Another migration.** Renaming a column means the twelve-step rebuild again,
+   over five tables, right after two migrations (v4→5, v5→6). Each is safe --
+   verified on a copy first, row counts and values compared -- but they are not
+   free, and batching one rename commit is better than three.
+2. **The names are still true.** Every row in the database did come from IBKR, so
+   today the vocabulary is accurate rather than misleading. Renaming ahead of the
+   second broker buys nothing and spends a migration.
+3. **It is mechanical once decided.** The drift tests make it safe: `test_web`'s
+   payload guard fails in both directions, so a serializer key without a typedef
+   and a typedef without a key both fail. The work is finding the 663 sites, not
+   knowing whether the change is right.
+
+### The plan, when a second broker is real
+
+Do it in this order, one commit each, each independently green:
+
+1. **Decide the target names.** Proposal, not decided: `contract_id`,
+   `order_id`, `exec_id`, `commission`, `realized_pnl`, `unrealized_pnl`.
+   `fills.py` ALREADY uses `exec_id`, `order_id`, `commission`,
+   `realized_pnl` and `unrealized_pnl` -- so the seam has chosen these and the
+   database is what disagrees. That is the argument for them over any others, and
+   it means the rename is mostly making the schema catch up rather than inventing
+   a vocabulary. (`fx_rate_to_base` needs no change: both sides already agree.)
+2. **`fills.py` and `sources.py` first**, where the only inconsistency left is
+   `conid`. Small, no schema, no payload. This is the commit that makes
+   `NormalisedPosition.conid` into `contract_id` -- deliberately NOT done when
+   those shapes were written, because a seam speaking two dialects is worse than
+   one consistent wrong name.
+3. **The schema, one table per commit**, using `_rekey_by_broker`'s rebuild (it
+   already copies named columns from the shipped DDL, so a rename is a column-list
+   change plus a mapping). Views recreate from `_SCHEMA` automatically. Verify each
+   on a copy of the live journal before applying: row counts AND values.
+4. **`serialize.py` + `page.html` in ONE commit.** The typedef blocks, the
+   `@payload` binding table and the JS readers must move together or the drift
+   test fails -- which is the point: it makes this step atomic by construction.
+5. **A mutant per renamed payload key**, asserting the page reads the new name.
+   The existing `wire-enum` mutant is the model.
+
+Do NOT rename `raw`. It holds the source's own attribute dict verbatim, camelCase
+included; that is provenance, and renaming its contents would falsify it.
 
 ## Do not do
 

@@ -544,9 +544,19 @@ journal's handling of `broker` and nothing else. Identical trade ids under two
 brokers is exactly the collision the composite keys exist for, and a real second
 broker makes it possible on day one.
 
-Four sections still read IBKR shapes directly in `ingest.py` — cash, positions,
-securities and equity summaries. They work, and they are the remaining half of
-this job.
+`ingest.py` reads no broker vocabulary of its own — a test over its AST enforces
+that, checking it imports neither `flex` nor `sections` and names none of 26 IBKR
+fields in code. So the writers really are broker-agnostic, not just described that
+way.
+
+One thing is deliberately unfinished: the database and payload still spell five
+things IBKR's way (`conid`, `ib_order_id`, `ib_commission`, `fifo_pnl_*`,
+`ib_exec_id`). Those names are *accurate* while IBKR is the only source, and
+`fills.py` has already chosen the neutral ones (`exec_id`, `order_id`,
+`commission`, `realized_pnl`), so the rename is the schema catching up rather than
+a design question. It is 663 occurrences and another migration, so it waits for a
+real second broker — see PLAN.md's "task 8" for the measured scope and the
+commit-by-commit order.
 
 **A new cron job**: implementation in `cron/`, a loader shim under
 `~/.meshclaw/crons/` that locates it by path (never a copy — see below), and a
