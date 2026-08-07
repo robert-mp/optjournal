@@ -139,6 +139,86 @@ def test_the_leaf_list_names_only_real_modules():
     assert not missing, f"these are not modules: {missing}"
 
 
+# --- the broker seam speaks one vocabulary ------------------------------------
+
+#: Words that are a specific broker's, not the trade's. A field NAME on a seam
+#: shape may not contain one: the whole point of `fills.py` is that a second
+#: broker fills these fields from its own vocabulary, so a field called `conid`
+#: asks a broker that has never heard the word to populate it.
+#:
+#: `conid` is IBKR's. It stayed on the seam until PLAN.md task 8 step 2, then moved
+#: to `contract_id` -- the DATABASE columns are still `conid`, deliberately, and
+#: that asymmetry lives in `ingest.py` alone. This test guards the seam side only.
+VENDOR_WORDS = ("conid", "ibkr", "ib_", "fifo_pnl", "flex")
+
+
+def test_no_seam_field_carries_a_brokers_own_vocabulary():
+    """The invariant `fills.py` exists for, asserted rather than described.
+
+    Nothing else enforces it. The docstring says the fields cannot carry the first
+    broker's words, and for four months `conid` did -- with the reason written down
+    beside it, which is a comment, not a guard. A field added in a hurry to a
+    frozen dataclass is exactly how the next one arrives, and it would arrive
+    silently: the suite would pass, the payload would be fine, and the seam would
+    quietly be IBKR-shaped again.
+
+    Read from the source with `ast`, so it holds for shapes no test constructs --
+    which is all of them: only `sources.py` builds these.
+    """
+    tree = ast.parse((PACKAGE / "fills.py").read_text(encoding="utf-8"))
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            if not isinstance(stmt, ast.AnnAssign) or not isinstance(
+                stmt.target, ast.Name
+            ):
+                continue
+            field = stmt.target.id
+            for word in VENDOR_WORDS:
+                if word in field.lower():
+                    offenders.append(f"{node.name}.{field} contains {word!r}")
+
+    assert not offenders, (
+        "broker-specific vocabulary on the seam: " + "; ".join(offenders) + ". "
+        "These shapes are what a SECOND broker fills in; a field named after the "
+        "first broker's word asks it for something it has no name for. Rename to "
+        "the trading term and translate in ingest.py, which is where the database "
+        "column names already differ."
+    )
+
+
+def test_ingest_is_the_only_place_the_two_vocabularies_meet():
+    """The seam says `contract_id`, the schema says `conid`, and that is contained.
+
+    Task 8 steps 3-5 (the schema and the payload) are deliberately not done -- see
+    PLAN.md. What makes deferring them safe rather than merely cheap is that the
+    mismatch is confined to `ingest.py`, whose SQL names the column while its
+    values read the attribute. If a second module starts translating, the rename
+    stops being a schema change and becomes a hunt.
+
+    Passes trivially today. It is here to fail on the commit that would spread it.
+    """
+    translating = []
+    for path in sorted(PACKAGE.glob("*.py")):
+        if path.name in {"ingest.py", "fills.py", "sources.py"}:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            # `x.contract_id` outside the seam means someone else is holding a
+            # seam shape, and the only module that should is ingest.
+            if isinstance(node, ast.Attribute) and node.attr in (
+                "contract_id", "underlying_contract_id"
+            ):
+                translating.append(f"{path.name}:{node.lineno}")
+
+    assert not translating, (
+        f"seam attributes read outside ingest.py at {translating}. The seam-to-"
+        f"schema translation is meant to live in one file so the eventual column "
+        f"rename stays a schema change; see PLAN.md task 8."
+    )
+
+
 # --- the mutation harness itself ---------------------------------------------
 
 

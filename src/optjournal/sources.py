@@ -199,9 +199,9 @@ class IbkrSource:
             date_time=_s(t.dateTime),
             asset_category=_enum_value(t.assetCategory),
             symbol=_s(t.symbol),
-            conid=_s(t.conid),
+            contract_id=_s(t.conid),
             underlying_symbol=_s(t.underlyingSymbol),
-            underlying_conid=_s(t.underlyingConid),
+            underlying_contract_id=_s(t.underlyingConid),
             put_call=_enum_value(t.putCall),
             strike=_f(t.strike),
             expiry=_s(t.expiry),
@@ -243,7 +243,7 @@ class IbkrSource:
                     settle_date=_s(getattr(c, "settleDate", None)),
                     description=_s(c.description),
                     symbol=_s(c.symbol),
-                    conid=_s(c.conid),
+                    contract_id=_s(c.conid),
                     amount=_f(c.amount) or 0.0,
                     currency=_s(c.currency),
                     fx_rate_to_base=_f(c.fxRateToBase) or 1.0,
@@ -262,7 +262,7 @@ class IbkrSource:
 
         for row in raw_sections(path).get("OpenPositions") or ():
             yield NormalisedPosition(
-                conid=_s(row.get("conid")) or "",
+                contract_id=_s(row.get("conid")) or "",
                 account_id=_s(row.get("accountId")) or "",
                 as_of=_s(row.get("reportDate")),
                 symbol=_s(row.get("symbol")),
@@ -290,7 +290,7 @@ class IbkrSource:
 
         for row in raw_sections(path).get("SecuritiesInfo") or ():
             yield NormalisedSecurity(
-                conid=_s(row.get("conid")) or "",
+                contract_id=_s(row.get("conid")) or "",
                 symbol=_s(row.get("symbol")),
                 description=_s(row.get("description")),
                 asset_category=(row.get("assetCategory") or "").upper() or None,
@@ -300,7 +300,7 @@ class IbkrSource:
                 strike=_f(row.get("strike")),
                 expiry=_s(row.get("expiry")),
                 put_call=_s(row.get("putCall")),
-                underlying_conid=_s(row.get("underlyingConid")),
+                underlying_contract_id=_s(row.get("underlyingConid")),
                 underlying_symbol=_s(row.get("underlyingSymbol")),
                 isin=_s(row.get("isin")),
                 listing_exchange=_s(row.get("listingExchange")),

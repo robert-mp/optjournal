@@ -12,16 +12,22 @@ questions and have different identities -- a fill is an event, a snapshot is a
 point-in-time observation, a contract is a definition that outlives both.
 
 Named in trading terms rather than IBKR's: `exec_id` not `ibExecID`,
-`realized_pnl` not `fifoPnlRealized`, `as_of` not `reportDate`. The point of the
-types is that a second broker fills these fields from its own vocabulary, so the
-fields cannot carry the first broker's.
+`realized_pnl` not `fifoPnlRealized`, `as_of` not `reportDate`, `contract_id` not
+`conid`. The point of the types is that a second broker fills these fields from
+its own vocabulary, so the fields cannot carry the first broker's.
 
-`conid` is the exception, and deliberately so. It is IBKR's word for a contract
-identifier, and renaming it here alone would leave the seam speaking two dialects
--- `NormalisedFill.conid` beside `NormalisedPosition.contract_id` -- which is
-worse than one consistent wrong name. The rename belongs to the pass that also
-moves the database columns and the payload keys (PLAN.md task 8), where it can be
-one commit rather than a drift.
+`contract_id` was `conid` until PLAN.md task 8 step 2, and the delay was the
+point: renaming it here alone would have left the seam speaking two dialects
+(`NormalisedFill.conid` beside `NormalisedPosition.contract_id`), which is worse
+than one consistent wrong name. It moved when every shape here could move
+together, in a commit that touches no schema and no payload.
+
+**The DATABASE columns are still `conid`, and that is deliberate, not a leftover.**
+`ingest.py` is the one place the two vocabularies meet: its SQL names the column,
+its values read the attribute, so `fill.contract_id` is written into `conid` on one
+line. That asymmetry is visible in exactly one file rather than spread across
+thirteen, and it is what makes the schema rename (task 8 steps 3-5) a change to the
+schema alone. See PLAN.md for why those steps wait for a second broker.
 
 A leaf, like `money.py`: it imports nothing internal, so both the sources that
 produce these and the ingest that consumes them can hold one without a dependency
@@ -64,9 +70,9 @@ class NormalisedFill:
 
     asset_category: str | None
     symbol: str | None
-    conid: str | None
+    contract_id: str | None
     underlying_symbol: str | None
-    underlying_conid: str | None
+    underlying_contract_id: str | None
 
     put_call: str | None
     strike: float | None
@@ -117,7 +123,7 @@ class NormalisedCash:
     settle_date: str | None
     description: str | None
     symbol: str | None
-    conid: str | None
+    contract_id: str | None
 
     amount: float
     currency: str | None
@@ -130,7 +136,7 @@ class NormalisedCash:
 class NormalisedPosition:
     """One contract held, as of one statement date.
 
-    Identity is `(broker, as_of, conid)` -- an observation, not an event, so a
+    Identity is `(broker, as_of, contract_id)` -- an observation, not an event, so a
     re-fetch of the same day CORRECTS the row rather than adding one.
 
     Load-bearing beyond the position list: `cost_basis` is the only trace of a
@@ -140,7 +146,7 @@ class NormalisedPosition:
     of that broker's episodes look closed.
     """
 
-    conid: str
+    contract_id: str
     account_id: str
     #: The statement date this observation belongs to (IBKR's `reportDate`).
     as_of: str | None
@@ -172,17 +178,18 @@ class NormalisedPosition:
 class NormalisedSecurity:
     """One contract DEFINITION: what an id means, independent of any holding.
 
-    Identity is `(broker, conid)`. A definition rather than an observation, so it
-    upserts: the same contract restated by a later statement refreshes the row.
+    Identity is `(broker, contract_id)`. A definition rather than an observation,
+    so it upserts: the same contract restated by a later statement refreshes the
+    row.
 
-    Why it needs the broker in its key even though a contract is a contract:
-    `conid` is the BROKER's numbering, not the exchange's. Two brokers can both
-    call something 12345, and keyed on conid alone the second one's row silently
+    Why it needs the broker in its key even though a contract is a contract: the
+    id is the BROKER's numbering, not the exchange's. Two brokers can both call
+    something 12345, and keyed on the id alone the second one's row silently
     overwrites the first's -- turning one broker's TSLA option into another's
     entirely different contract, with the journal reporting no error at all.
     """
 
-    conid: str
+    contract_id: str
     symbol: str | None
     description: str | None
     asset_category: str | None
@@ -192,7 +199,7 @@ class NormalisedSecurity:
     strike: float | None
     expiry: str | None
     put_call: str | None
-    underlying_conid: str | None
+    underlying_contract_id: str | None
     underlying_symbol: str | None
     isin: str | None
     listing_exchange: str | None
