@@ -155,10 +155,18 @@ def ingest_file(
         # otherwise add a redundant provenance row claiming to be a distinct
         # statement. The row data itself is protected by the primary keys;
         # this protects `statements` as an audit trail.
+        #
+        # Scoped to the broker, because "these bytes are already ingested" is a
+        # claim about one broker's archive. Unscoped it reasons across brokers,
+        # and the conclusion it draws is to SKIP -- so the fix that made every
+        # writer broker-aware would have been unobservable, the ingest returning
+        # 0 inserted and 0 skipped while reporting success. Two brokers cannot
+        # really emit identical bytes; the point is that the guard should not be
+        # the thing deciding that.
         twin = conn.execute(
             "SELECT source_file FROM statements WHERE sha256 = ? AND source_file != ?"
-            " ORDER BY ingested_at LIMIT 1",
-            (digest, path.name),
+            " AND broker = ? ORDER BY ingested_at LIMIT 1",
+            (digest, path.name, broker),
         ).fetchone()
         if twin:
             result.already_ingested = True
@@ -176,13 +184,15 @@ def ingest_file(
 
     for stmt in resp.FlexStatements:
         conn.execute(
-            "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-            " to_date, when_generated, base_currency, asset_filter, ingested_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)"
+            "INSERT INTO statements (broker, source_file, sha256, account_id,"
+            " from_date, to_date, when_generated, base_currency, asset_filter,"
+            " ingested_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(source_file) DO UPDATE SET"
             " sha256=excluded.sha256, ingested_at=excluded.ingested_at,"
             " asset_filter=excluded.asset_filter",
             (
+                broker,
                 path.name,
                 digest,
                 _s(stmt.accountId),
@@ -195,7 +205,7 @@ def ingest_file(
             ),
         )
 
-        _ingest_cash(conn, stmt, path.name, result)
+        _ingest_cash(conn, stmt, path.name, result, broker=broker)
 
     # Trades come through the broker seam (sources.py), not by reading py_ibkr
     # attributes here -- so a second broker is a new source, not an edit to this
@@ -206,9 +216,9 @@ def ingest_file(
     base_currency = _base_currency(sections)
     for _account_id, fills in source.statements(path):
         _ingest_trades(conn, fills, path.name, assets, result,
-                       base_currency=base_currency)
+                       base_currency=base_currency, broker=broker)
 
-    _ingest_positions(conn, sections, path.name, assets, result)
+    _ingest_positions(conn, sections, path.name, assets, result, broker=broker)
     _ingest_securities(conn, sections, assets, result)
     _ingest_equity_summaries(conn, sections, path.name, result)
 
@@ -254,12 +264,21 @@ def _commission_base(
 
 
 def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
-                   base_currency: str | None = None) -> None:
+                   base_currency: str | None = None,
+                   broker: str = DEFAULT_BROKER) -> None:
     """Write broker-neutral fills into the trades table.
 
     Reads `NormalisedFill`s (sources.py), never a broker's own model, so this
-    writer is the same for every broker. `fill.broker` stamps the row and joins
-    the composite key `(broker, trade_id)`.
+    writer is the same for every broker. `broker` stamps the row and joins the
+    composite key `(broker, trade_id)`.
+
+    It is a parameter rather than `DEFAULT_BROKER` inline because that constant
+    was what this wrote before, which made `ingest_file(broker=...)` accept a
+    broker, resolve its source, read its statement -- and then file every row
+    under 'ibkr'. Nothing failed: the schema default agreed with the hardcoded
+    value while IBKR was the only broker, so the argument was decorative and
+    would have stayed decorative until a second broker's rows collided with the
+    first's on `(broker, trade_id)`.
     """
     for fill in fills:
         if not _matches_filter(fill.asset_category, assets):
@@ -301,7 +320,7 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(broker, trade_id) DO NOTHING",
             (
-                DEFAULT_BROKER,
+                broker,
                 fill.trade_id, fill.exec_id, fill.transaction_id, fill.order_id,
                 fill.account_id, fill.trade_date, fill.date_time,
                 fill.asset_category, fill.symbol, fill.conid,
@@ -345,17 +364,20 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
             result.trades_skipped_existing += 1
 
 
-def _ingest_cash(conn, stmt, source_file: str, result: IngestResult) -> None:
+def _ingest_cash(conn, stmt, source_file: str, result: IngestResult,
+                 broker: str = DEFAULT_BROKER) -> None:
     for c in stmt.CashTransactions or ():
         rate = _f(c.fxRateToBase) or 1.0
         amount = _f(c.amount) or 0.0
         cur = conn.execute(
-            "INSERT INTO cash_transactions (transaction_id, account_id, date_time,"
+            "INSERT INTO cash_transactions (broker, transaction_id, account_id,"
+            " date_time,"
             " settle_date, type, description, symbol, conid, amount, currency,"
             " fx_rate_to_base, amount_base, raw, source_file, first_seen_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(transaction_id) DO NOTHING",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(broker, transaction_id) DO NOTHING",
             (
+                broker,
                 _s(c.transactionID), _s(stmt.accountId), _s(c.dateTime),
                 _s(getattr(c, "settleDate", None)), _enum_value(c.type),
                 _s(c.description), _s(c.symbol), _s(c.conid), amount,
@@ -370,7 +392,8 @@ def _ingest_cash(conn, stmt, source_file: str, result: IngestResult) -> None:
             result.cash_skipped_existing += 1
 
 
-def _ingest_positions(conn, sections, source_file: str, assets, result) -> None:
+def _ingest_positions(conn, sections, source_file: str, assets, result,
+                      broker: str = DEFAULT_BROKER) -> None:
     for row in sections.get("OpenPositions") or ():
         cat = (row.get("assetCategory") or "").upper()
         if not _matches_filter(cat, assets):
@@ -378,13 +401,14 @@ def _ingest_positions(conn, sections, source_file: str, assets, result) -> None:
         rate = _f(row.get("fxRateToBase")) or 1.0
         value = _f(row.get("positionValue"))
         conn.execute(
-            "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
+            "INSERT INTO position_snapshots (broker, report_date, conid, account_id,"
+            " symbol,"
             " asset_category, underlying_symbol, put_call, strike, expiry, multiplier,"
             " position, mark_price, position_value, position_value_base,"
             " cost_basis_money, cost_basis_price, fifo_pnl_unrealized, side,"
             " open_date_time, currency, fx_rate_to_base, raw, source_file, ingested_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(report_date, conid) DO UPDATE SET"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(broker, report_date, conid) DO UPDATE SET"
             " position=excluded.position, mark_price=excluded.mark_price,"
             " position_value=excluded.position_value,"
             " position_value_base=excluded.position_value_base,"
@@ -392,6 +416,7 @@ def _ingest_positions(conn, sections, source_file: str, assets, result) -> None:
             " raw=excluded.raw, source_file=excluded.source_file,"
             " ingested_at=excluded.ingested_at",
             (
+                broker,
                 _s(row.get("reportDate")), _s(row.get("conid")),
                 _s(row.get("accountId")), _s(row.get("symbol")), cat,
                 _s(row.get("underlyingSymbol")), _s(row.get("putCall")),

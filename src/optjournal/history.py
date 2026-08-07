@@ -348,30 +348,44 @@ def _finalise(ep: Episode, still_held: bool) -> None:
 def _held(
     conn: sqlite3.Connection, asset_category: str | None
 ) -> tuple[dict[str, Any], str | None]:
-    """Open positions from the newest snapshot, and its date.
+    """Open positions from each broker's newest snapshot, and the newest date.
 
     Keyed by `(broker, account_id, conid)` -- the same identity the episode walk
     uses, and for the same reason: the same contract held in two accounts is two
     positions, so a conid-only key would let one account's holding answer the
     open/closed question for another's.
+
+    "Newest" is PER BROKER, which is the same correction `current_option_positions`
+    needed. A single MAX over the table lets whichever broker filed most recently
+    decide what counts as current for all of them, so a broker whose statements lag
+    contributes nothing to `held` -- and this dict is what decides open versus
+    closed. Its positions do not merely vanish from the book: every episode of
+    theirs is judged against an empty holding, so a position still open reads as
+    CLOSED. Verified with a lagging second broker: `_held` returned 5 rows for one
+    broker and none for the other, having been handed 10.
+
+    The returned date is still the newest across brokers, because it is only used
+    to label the book ("as of ..."), and the honest label for a mixed-date book is
+    its most recent statement.
     """
     where, params = _position_scope_where(asset_category)
-    row = conn.execute(
-        f"SELECT MAX(report_date) AS d FROM position_snapshots {where}", params
-    ).fetchone()
-    latest = row["d"] if row else None
-    if latest is None:
-        return {}, None
-
+    # One row per broker, so a lagging broker keeps its own latest date rather
+    # than being measured against another's.
     held = {
         (str(r["broker"] or ""), str(r["account_id"] or ""), str(r["conid"])): dict(r)
         for r in conn.execute(
-            f"SELECT * FROM position_snapshots {where} AND report_date = ?"
-            " AND position != 0",
-            (*params, latest),
+            f"SELECT p.* FROM position_snapshots p {where}"
+            "  AND p.position != 0"
+            "  AND p.report_date = ("
+            f"    SELECT MAX(report_date) FROM position_snapshots {where}"
+            "      AND broker = p.broker)",
+            (*params, *params),
         )
     }
-    return held, str(latest)
+    if not held:
+        return {}, None
+    latest = max(str(r["report_date"]) for r in held.values())
+    return held, latest
 
 
 def _from_snapshot(row: dict[str, Any]) -> Episode:

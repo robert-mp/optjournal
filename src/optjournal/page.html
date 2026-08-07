@@ -497,7 +497,8 @@ import {
  * @property {string} ingested_at
  */
 
-/** @typedef {Object} Order -- one IBKR order with its fills folded (serialize.orders_data)
+/** @typedef {Object} Order -- one broker order with its fills folded (serialize.orders_data)
+ * @property {string} broker -- which broker filled it; an order id is only unique within one
  * @property {string} ib_order_id
  * @property {string} account_id
  * @property {string} asset_category
@@ -514,6 +515,7 @@ import {
  */
 
 /** @typedef {Object} Leg -- one contract's fills within an order
+ * @property {string} broker -- see Order.broker; the leg is grouped per broker too
  * @property {string} ib_order_id
  * @property {string} conid
  * @property {string} account_id

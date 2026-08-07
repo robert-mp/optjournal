@@ -42,7 +42,7 @@ __all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate", "open_journ
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -114,6 +114,65 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 """
 
+#: Hoisted for the same reason as _TRADES_DDL: `_rekey_by_broker` rebuilds these
+#: tables from the SHIPPED definition rather than from the live one, so a journal
+#: migrated today and a journal created today are identical.
+_CASH_DDL = f"""
+CREATE TABLE IF NOT EXISTS cash_transactions (
+  broker           TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}',
+  transaction_id   TEXT NOT NULL,
+  account_id       TEXT NOT NULL,
+  date_time        TEXT NOT NULL,
+  settle_date      TEXT,
+  type             TEXT NOT NULL,
+  description      TEXT,
+  symbol           TEXT,
+  conid            TEXT,
+  amount           REAL NOT NULL,
+  currency         TEXT NOT NULL,
+  fx_rate_to_base  REAL NOT NULL,
+  amount_base      REAL NOT NULL,
+  raw              TEXT NOT NULL,
+  source_file      TEXT NOT NULL REFERENCES statements(source_file),
+  first_seen_at    TEXT NOT NULL,
+  -- A transaction id is the issuing broker's, not a global handle.
+  PRIMARY KEY (broker, transaction_id)
+);
+"""
+
+_POSITIONS_DDL = f"""
+CREATE TABLE IF NOT EXISTS position_snapshots (
+  broker               TEXT    NOT NULL DEFAULT '{DEFAULT_BROKER}',
+  report_date          TEXT    NOT NULL,
+  conid                TEXT    NOT NULL,
+  account_id           TEXT    NOT NULL,
+  symbol               TEXT    NOT NULL,
+  asset_category       TEXT    NOT NULL,
+  underlying_symbol    TEXT,
+  put_call             TEXT,
+  strike               REAL,
+  expiry               TEXT,
+  multiplier           REAL,
+  position             INTEGER NOT NULL,
+  mark_price           REAL,
+  position_value       REAL,
+  position_value_base  REAL,
+  cost_basis_money     REAL,
+  cost_basis_price     REAL,
+  fifo_pnl_unrealized  REAL,
+  side                 TEXT,
+  open_date_time       TEXT,
+  currency             TEXT    NOT NULL,
+  fx_rate_to_base      REAL    NOT NULL,
+  raw                  TEXT    NOT NULL,
+  source_file          TEXT    NOT NULL REFERENCES statements(source_file),
+  ingested_at          TEXT    NOT NULL,
+  -- A conid is IBKR's numbering; another broker may reuse the integer. Two
+  -- brokers holding "contract 12345" on the same date are two positions.
+  PRIMARY KEY (broker, report_date, conid)
+);
+"""
+
 #: Indexes over columns _ADDED_COLUMNS may still be about to create, so they
 #: cannot live in _SCHEMA: `executescript` runs BEFORE the ALTERs, and
 #: CREATE INDEX validates its column list even under IF NOT EXISTS -- on a
@@ -149,52 +208,10 @@ CREATE INDEX        IF NOT EXISTS trades_order      ON trades(ib_order_id);
 CREATE INDEX        IF NOT EXISTS trades_underlying ON trades(underlying_symbol, trade_date);
 CREATE INDEX        IF NOT EXISTS trades_asset      ON trades(asset_category, trade_date);
 
-CREATE TABLE IF NOT EXISTS cash_transactions (
-  transaction_id   TEXT PRIMARY KEY,
-  account_id       TEXT NOT NULL,
-  date_time        TEXT NOT NULL,
-  settle_date      TEXT,
-  type             TEXT NOT NULL,
-  description      TEXT,
-  symbol           TEXT,
-  conid            TEXT,
-  amount           REAL NOT NULL,
-  currency         TEXT NOT NULL,
-  fx_rate_to_base  REAL NOT NULL,
-  amount_base      REAL NOT NULL,
-  raw              TEXT NOT NULL,
-  source_file      TEXT NOT NULL REFERENCES statements(source_file),
-  first_seen_at    TEXT NOT NULL
-);
+{_CASH_DDL}
 CREATE INDEX IF NOT EXISTS cash_type_date ON cash_transactions(type, date_time);
 
-CREATE TABLE IF NOT EXISTS position_snapshots (
-  report_date          TEXT    NOT NULL,
-  conid                TEXT    NOT NULL,
-  account_id           TEXT    NOT NULL,
-  symbol               TEXT    NOT NULL,
-  asset_category       TEXT    NOT NULL,
-  underlying_symbol    TEXT,
-  put_call             TEXT,
-  strike               REAL,
-  expiry               TEXT,
-  multiplier           REAL,
-  position             INTEGER NOT NULL,
-  mark_price           REAL,
-  position_value       REAL,
-  position_value_base  REAL,
-  cost_basis_money     REAL,
-  cost_basis_price     REAL,
-  fifo_pnl_unrealized  REAL,
-  side                 TEXT,
-  open_date_time       TEXT,
-  currency             TEXT    NOT NULL,
-  fx_rate_to_base      REAL    NOT NULL,
-  raw                  TEXT    NOT NULL,
-  source_file          TEXT    NOT NULL REFERENCES statements(source_file),
-  ingested_at          TEXT    NOT NULL,
-  PRIMARY KEY (report_date, conid)
-);
+{_POSITIONS_DDL}
 
 -- Daily Net Asset Value, from the EquitySummaryInBase statement section.
 -- The one figure a trade ledger cannot reconstruct: cash balances need a
@@ -266,8 +283,15 @@ CREATE TABLE IF NOT EXISTS price_bars (
 -- One row per (order, leg). Collapses partial fills, which IBKR marks with
 -- note code 'P' and which share an ib_order_id. Covers every asset category:
 -- the consumer scopes by asset_category, the view does not pre-decide.
+--
+-- GROUPed by broker as well as (ib_order_id, conid), because an order id is the
+-- issuing broker's. Without it two brokers' fills for "order 1232923637" SUM
+-- into one leg -- verified: 18 trades collapsed to 8 legs carrying doubled
+-- quantities (-6 for a position of -3). The rows were stored correctly; the
+-- view merged them on read, which is the harder version of the bug to see.
 CREATE VIEW IF NOT EXISTS trade_legs AS
 SELECT
+  broker,
   ib_order_id,
   conid,
   account_id,
@@ -293,12 +317,13 @@ SELECT
   SUM(fifo_pnl_realized)                              AS realized_pnl,
   SUM(fifo_pnl_realized_base)                          AS realized_pnl_base
 FROM trades
-GROUP BY ib_order_id, conid;
+GROUP BY broker, ib_order_id, conid;
 
 -- One row per order. A multi-leg order is a strategy: leg_count > 1 means
 -- a spread, straddle, condor and so on, submitted as a single order.
 CREATE VIEW IF NOT EXISTS trade_orders AS
 SELECT
+  broker,
   ib_order_id,
   account_id,
   -- An order never mixes categories (verified: IBKR order ids are per
@@ -317,7 +342,7 @@ SELECT
   SUM(realized_pnl)              AS realized_pnl,
   SUM(realized_pnl_base)         AS realized_pnl_base
 FROM trade_legs
-GROUP BY ib_order_id;
+GROUP BY broker, ib_order_id;
 
 -- OPT-scoped wrappers, kept for their names: "option orders" is the journal's
 -- home view and half the codebase says so.
@@ -328,12 +353,20 @@ CREATE VIEW IF NOT EXISTS option_orders AS
 SELECT * FROM trade_orders WHERE asset_category = 'OPT';
 
 -- Current option book, from the most recent snapshot only.
+--
+-- "Most recent" is per broker, via the correlated subquery. A single MAX over
+-- the whole table asks one broker's statement date to decide whether ANOTHER
+-- broker's positions are current -- so the broker whose statements lag drops out
+-- of the book entirely, silently, and the page shows a shorter position list
+-- rather than an error. `history._latest_snapshot` takes its own MAX and would
+-- need the same scoping; it already keys episodes on (broker, account_id, conid).
 CREATE VIEW IF NOT EXISTS current_option_positions AS
 SELECT *
-FROM position_snapshots
+FROM position_snapshots p
 WHERE asset_category = 'OPT'
   AND report_date = (
-    SELECT MAX(report_date) FROM position_snapshots WHERE asset_category = 'OPT'
+    SELECT MAX(report_date) FROM position_snapshots
+    WHERE asset_category = 'OPT' AND broker = p.broker
   );
 """
 
@@ -438,18 +471,34 @@ def _repair_base_commission(conn: sqlite3.Connection) -> int:
     return len(rows)
 
 
-def _rekey_trades_by_broker(conn: sqlite3.Connection) -> bool:
-    """Make trade identity `(broker, trade_id)` instead of `trade_id` alone.
+#: The tables whose identity was IBKR's own numbering, and the key each needs
+#: once a second broker exists. One entry per table, so the rebuild below is
+#: written once: `trades` needed it first and the other two need it for exactly
+#: the same reason, which was easy to miss because each looks fine alone.
+_REKEYED_TABLES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("trades", ("broker", "trade_id"), _TRADES_DDL),
+    ("cash_transactions", ("broker", "transaction_id"), _CASH_DDL),
+    ("position_snapshots", ("broker", "report_date", "conid"), _POSITIONS_DDL),
+)
+
+
+def _rekey_by_broker(conn: sqlite3.Connection, table: str,
+                     want_pk: tuple[str, ...], ddl: str) -> bool:
+    """Put `broker` at the front of `table`'s PRIMARY KEY.
 
     Returns True when a rebuild happened. Idempotent: the current key is read
     first, so re-running is free.
 
-    Why it needs a rebuild at all: SQLite cannot alter a PRIMARY KEY, and both of
-    this table's identity constraints assumed one broker. `trade_id` was the
-    PRIMARY KEY and `ib_exec_id` carried a UNIQUE index -- IBKR's own identifiers,
-    treated as globally unique. A second broker numbering a fill `1` would either
+    Why a rebuild at all: SQLite cannot alter a PRIMARY KEY, and each of these
+    tables was keyed on an identifier that is IBKR's rather than universal --
+    `trade_id`, `transaction_id`, `(report_date, conid)`. A second broker
+    numbering a fill `1`, or holding its own "contract 12345", would either
     collide (raising) or, worse, be silently swallowed by the ingest's
-    `ON CONFLICT(trade_id) DO NOTHING` and reported as a duplicate.
+    `ON CONFLICT ... DO NOTHING` and reported as an already-seen duplicate. The
+    silent case is the dangerous one: the ingest would report success.
+
+    `trades` also had a UNIQUE index on `ib_exec_id` alone, now `(broker,
+    ib_exec_id)` in `_LATE_INDEXES`, for the same reason.
 
     Done as the standard twelve-step table rebuild, with two safety properties
     that matter because this runs against a journal whose statements cost IBKR
@@ -460,37 +509,42 @@ def _rekey_trades_by_broker(conn: sqlite3.Connection) -> bool:
     * `INSERT INTO ... SELECT` names its columns explicitly rather than using
       `SELECT *`, so a column added later cannot silently shift into the wrong
       position.
-
-    The ingest's conflict target moves with it (`ON CONFLICT(broker, trade_id)`),
-    and `trades_exec` becomes UNIQUE over `(broker, ib_exec_id)` for the same
-    reason.
     """
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(trades)")}
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if not cols:
+        return False  # table does not exist yet; _SCHEMA will create it keyed
     if "broker" not in cols:
         return False  # _ADDED_COLUMNS has not run yet; nothing to rekey
-    pk = [r["name"] for r in conn.execute("PRAGMA table_info(trades)") if r["pk"]]
-    if pk == ["broker", "trade_id"]:
+    # `pk` is 1-based rank in the key, not a boolean, so a composite key must be
+    # ordered by it -- sorting by name would compare ("broker","trade_id")
+    # against a key that is really (trade_id, broker) and call them equal.
+    keyed = sorted(
+        ((r["pk"], r["name"]) for r in conn.execute(f"PRAGMA table_info({table})")
+         if r["pk"]),
+    )
+    if tuple(name for _rank, name in keyed) == want_pk:
         return False  # already rekeyed
 
-    before = conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()["n"]
+    before = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
     # Only the columns BOTH tables have. The old table can be missing one the
     # shipped DDL declares -- `broker` itself on a journal whose ALTER has not run
     # in this process, or any column added by a later _ADDED_COLUMNS entry -- and
     # naming it in the SELECT is "no such column". Anything absent takes its DDL
     # default, which for `broker` is exactly the fact we want recorded.
-    live = [r["name"] for r in conn.execute("PRAGMA table_info(trades)")]
+    live = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
     shipped = {
         line.strip().split()[0]
-        for line in _TRADES_DDL.splitlines()
+        for line in ddl.splitlines()
         if line.startswith("  ") and not line.strip().startswith(("--", "PRIMARY"))
     }
     ordered = [c for c in live if c in shipped]
     names = ", ".join(ordered)
+    scratch = f"{table}_rekeyed"
     # Rebuilt from the shipped DDL rather than from the live table, so the new
     # table is exactly what a fresh journal gets -- otherwise a journal migrated
     # today and one created today would differ.
-    new_ddl = _TRADES_DDL.replace(
-        "CREATE TABLE IF NOT EXISTS trades", "CREATE TABLE trades_rekeyed"
+    new_ddl = ddl.replace(
+        f"CREATE TABLE IF NOT EXISTS {table}", f"CREATE TABLE {scratch}"
     )
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
@@ -502,17 +556,17 @@ def _rekey_trades_by_broker(conn: sqlite3.Connection) -> bool:
         # again rather than depending on where it sits in that sequence.
         for view in _VIEWS:
             conn.execute(f"DROP VIEW IF EXISTS {view}")
-        conn.execute("DROP TABLE IF EXISTS trades_rekeyed")
+        conn.execute(f"DROP TABLE IF EXISTS {scratch}")
         conn.executescript(new_ddl)
-        conn.execute(f"INSERT INTO trades_rekeyed ({names}) SELECT {names} FROM trades")
-        after = conn.execute("SELECT COUNT(*) AS n FROM trades_rekeyed").fetchone()["n"]
+        conn.execute(f"INSERT INTO {scratch} ({names}) SELECT {names} FROM {table}")
+        after = conn.execute(f"SELECT COUNT(*) AS n FROM {scratch}").fetchone()["n"]
         if after != before:
             raise RuntimeError(
-                f"refusing to swap in a partial copy of trades: {before} rows in, "
+                f"refusing to swap in a partial copy of {table}: {before} rows in, "
                 f"{after} out. The original table is untouched."
             )
-        conn.execute("DROP TABLE trades")
-        conn.execute("ALTER TABLE trades_rekeyed RENAME TO trades")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {scratch} RENAME TO {table}")
         conn.commit()
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
@@ -520,7 +574,7 @@ def _rekey_trades_by_broker(conn: sqlite3.Connection) -> bool:
     # dropped table took with it.
     conn.executescript(_SCHEMA)
     conn.commit()
-    log.info("rekeyed %d trades on (broker, trade_id)", before)
+    log.info("rekeyed %d %s rows on %s", before, table, want_pk)
     return True
 
 
@@ -541,7 +595,8 @@ def migrate(conn: sqlite3.Connection) -> int:
     # would silently never fire. The backfill guards itself instead.
     # After the ALTER that adds `broker`, and before the backfills, so anything
     # they write lands in the rebuilt table rather than in one about to be dropped.
-    _rekey_trades_by_broker(conn)
+    for table, want_pk, ddl in _REKEYED_TABLES:
+        _rekey_by_broker(conn, table, want_pk, ddl)
     for statement in _LATE_INDEXES:
         conn.execute(statement)
     _backfill_commission_currency(conn)

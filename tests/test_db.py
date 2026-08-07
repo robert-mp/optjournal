@@ -199,6 +199,12 @@ def test_current_positions_uses_latest_report_date(conn):
 
 
 def test_snapshot_reingest_updates_rather_than_duplicates(conn):
+    """Re-ingesting the same date's snapshot updates the row, never adds one.
+
+    The conflict target names `broker` because the key does. It was
+    `(report_date, conid)` and moved when snapshot identity became per-broker --
+    a conid is IBKR's numbering, so two brokers can each hold "contract 12345".
+    """
     _statement_row(conn)
     for mark in (1.0, 5.0):
         conn.execute(
@@ -206,7 +212,8 @@ def test_snapshot_reingest_updates_rather_than_duplicates(conn):
             " asset_category, position, mark_price, currency, fx_rate_to_base, raw,"
             " source_file, ingested_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(report_date, conid) DO UPDATE SET mark_price=excluded.mark_price",
+            " ON CONFLICT(broker, report_date, conid)"
+            " DO UPDATE SET mark_price=excluded.mark_price",
             ("20260731", "C1", "U1", "TSLA P", "OPT", -3, mark, "USD", 0.9,
              "{}", "s.xml", "now"),
         )

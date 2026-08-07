@@ -35,6 +35,21 @@ sides read the same column), and was deleted rather than sentinelled -- worth
 recording because "no test caught it" has three possible answers, not two: add a
 test, fix the code, or delete the code.
 
+A fourth round asked a question the survey could not answer by inspection: is the
+broker seam real? Four mutants over `ingest`, `db`'s views and `history` said no.
+`ingest_file(broker=...)` resolved the right source, read the right statement, and
+filed every row under 'ibkr'; `trade_legs` summed two brokers' fills for the same
+order id into one leg; and two independent `MAX(report_date)` queries let whichever
+broker filed most recently decide what counted as current for the rest. All four
+were invisible with one broker, which is the shape to watch for -- a seam that
+only has one implementation is only as good as the test that uses two.
+
+That round also found a bug in THIS FILE: `run_mutant` counted only pytest's
+FAILED lines, and a defect that breaks a fixture produces ERROR. So a mutant
+caught by a fixture's own assertion was reported as caught by nothing. Fixed;
+undercounting is the dangerous direction, because a zero is what sends someone
+looking for a test that is already there.
+
 **Equivalent mutants are not findings.** Some changes have no observable effect,
 so "no test caught it" says nothing. The tool reports the count; deciding whether
 a defect is real is the reader's job.
@@ -286,6 +301,40 @@ MUTANTS: tuple[Mutant, ...] = (
         find="    return i if abs(f - i) < 1e-9 else f",
         replace="    return i",
         breaks="a 0.0007-share fill would be stored as 0 shares",
+    ),
+    Mutant(
+        key="broker-stamp",
+        module="ingest.py",
+        find='" ON CONFLICT(broker, trade_id) DO NOTHING",\n'
+             "            (\n                broker,",
+        replace='" ON CONFLICT(broker, trade_id) DO NOTHING",\n'
+                "            (\n                DEFAULT_BROKER,",
+        breaks="`ingest --broker X` would resolve X's source, read X's statement, "
+               "and then file every row under 'ibkr' -- the argument decorative",
+    ),
+    Mutant(
+        key="legs-merge",
+        module="db.py",
+        find="GROUP BY broker, ib_order_id, conid;",
+        replace="GROUP BY ib_order_id, conid;",
+        breaks="two brokers' fills for the same order id would SUM into one leg, "
+               "reporting a position of -3 as -6",
+    ),
+    Mutant(
+        key="current-book",
+        module="db.py",
+        find="    WHERE asset_category = 'OPT' AND broker = p.broker",
+        replace="    WHERE asset_category = 'OPT'",
+        breaks="whichever broker filed most recently would decide what counts as "
+               "current for all of them, so a lagging broker's book vanishes",
+    ),
+    Mutant(
+        key="held-scope",
+        module="history.py",
+        find="            \"      AND broker = p.broker)\",",
+        replace="            \"      )\",",
+        breaks="a lagging broker's held positions would be invisible to the "
+               "open/closed decision, so a position still open reads as CLOSED",
     ),
 )
 
