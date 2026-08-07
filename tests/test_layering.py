@@ -38,7 +38,8 @@ MAY_MODEL = {"bars", "demo"}
 
 #: Modules that must import nothing from the package. Each is a value type or
 #: pure arithmetic that any layer may hold without acquiring a direction.
-LEAVES = {"money", "analysis", "blackscholes", "config", "marketdata", "compat", "fills"}
+LEAVES = {"money", "analysis", "blackscholes", "config", "marketdata", "compat",
+          "fills", "events"}
 
 
 def _internal_imports(path: Path) -> set[str]:

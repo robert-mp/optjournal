@@ -15,7 +15,7 @@ import os
 import sqlite3
 import sys
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,12 @@ from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 from optjournal import __version__, browser
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import newest_statement, prune_archive
-from optjournal.bars import audit_perishable, backfill_bars, bars_manifest
+from optjournal.bars import (
+    MARKET_TZ,
+    audit_perishable,
+    backfill_bars,
+    bars_manifest,
+)
 from optjournal.compat import unknown_codes
 from optjournal.config import (
     DEFAULT_ARCHIVE,
@@ -34,6 +39,13 @@ from optjournal.config import (
     ROOT,
 )
 from optjournal.db import connect, migrate, open_journal
+from optjournal.events import (
+    EventFetchError,
+    EventRateLimited,
+    fetch_events,
+    store_events,
+    upcoming,
+)
 from optjournal.flex import FetchCooldown, TokenMissing, fetch, load
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
@@ -376,6 +388,74 @@ def cmd_history(args) -> int:
     data = history_data(report)
     _emit(data, render_history(data), args.json)
     return EXIT_OK if report.episodes else EXIT_NO_DATA
+
+
+def cmd_market(args) -> int:
+    """The economic calendar: what is coming, and what the journal already holds.
+
+    Reading and fetching are separate flags rather than one command that always
+    fetches, because they answer different questions and only one touches the
+    network. `--fetch` is what the nightly cron runs; a bare `market` is what a
+    reader runs, and it works offline.
+
+    Defaults to USD high-impact, which is the 4-of-99 slice that moves an options
+    book -- verified against a real week. `--all` is there because the table holds
+    ten countries and the default should narrow the VIEW, never the STORE (the
+    same rule ingest learned the hard way).
+    """
+    conn = _open_db(args)
+    result: dict[str, object] = {}
+    lines: list[str] = []
+
+    if args.fetch:
+        try:
+            events = fetch_events()
+        except EventRateLimited as exc:
+            # EXIT_THROTTLED, not EXIT_ERROR: the same distinction the IBKR path
+            # draws, so a nightly cron stays silent on a back-off and alerts only
+            # on something that actually changed.
+            print(f"calendar: {exc}", file=sys.stderr)
+            return EXIT_THROTTLED
+        except EventFetchError as exc:
+            print(f"calendar fetch failed: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        stored = store_events(conn, events)
+        result["fetched"] = len(events)
+        result["stored"] = stored
+        lines.append(f"calendar {len(events)} event(s) -> {stored} stored")
+
+    now = datetime.now(UTC)
+    start = int(now.timestamp())
+    end = int((now + timedelta(days=args.days)).timestamp())
+    countries = () if args.all_events else ("USD",)
+    impacts = () if args.all_events else ("High",)
+    events = upcoming(conn, start=start, end=end,
+                      countries=countries, impacts=impacts)
+    result["events"] = events
+
+    scope = "all" if args.all_events else "USD high-impact"
+    lines.append(f"\nNext {args.days} day(s), {scope}: {len(events)} event(s)")
+    if not events:
+        lines.append("  (none stored -- run `optjournal market --fetch`)")
+    for event in events:
+        when = datetime.fromtimestamp(event["starts_at"], MARKET_TZ)
+        # The feed's judgement, attributed. Same rule as the AutoFX markup: an
+        # estimate presented as ours would read as a measurement.
+        figures = " ".join(
+            f"{label} {event[key]}"
+            for label, key in (("fc", "forecast"), ("prev", "previous"))
+            if event[key]
+        )
+        lines.append(
+            f"  {when:%a %b %-d %H:%M} {event['country']:<4}"
+            f" {event['impact']:<7} {event['title']}"
+            + (f"   [{figures}]" if figures else "")
+        )
+    if events:
+        lines.append("\n  impact is the feed's assessment, not this journal's")
+
+    _emit(result, "\n".join(lines), args.json)
+    return EXIT_OK
 
 
 def cmd_bars(args) -> int:
@@ -781,6 +861,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--assets", default="OPT", metavar="LIST",
                    help="asset category to report, or ALL (default: OPT)")
     p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("market", parents=[common, database],
+                       help="economic calendar: fetch this week, or show what is stored")
+    p.add_argument("--fetch", action="store_true",
+                   help="pull this week from the feed and store it; without this, "
+                        "reads only what the journal already holds")
+    p.add_argument("--days", type=int, default=7, metavar="N",
+                   help="window to show, from today (default: 7)")
+    p.add_argument("--all", dest="all_events", action="store_true",
+                   help="every country and impact, not just USD high-impact")
+    p.set_defaults(func=cmd_market)
 
     p = sub.add_parser("bars", parents=[common, database],
                        help="backfill price bars for the windows positions imply")

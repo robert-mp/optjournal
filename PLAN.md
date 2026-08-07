@@ -664,13 +664,20 @@ docstring so the next reader does not "fix" it.
 
 ### Commits, each independently shippable
 
-**14a — the event source and its table.** `MarketSource` Protocol +
-`ForexFactorySource` in a new `events.py`, mirroring `sources.py`: one module
-knows the feed's vocabulary, `NormalisedEvent` (a frozen leaf in `fills.py` or its
-own `events` leaf) is what the writer sees. A `--dry-run` on the CLI first, so the
-shape is inspectable before anything is stored. Drift test in the shape of
-`test_flex.py::test_field_drift`: assert the six keys are present and that an
-unknown `impact` value fails loudly rather than being bucketed as Low.
+**14a — the event source and its table.** ONE module, `events.py`: a fetch, a
+parse, a normalised row, a write. No Protocol and no registry.
+
+That is a correction to my own first draft, which proposed a `MarketSource`
+Protocol mirroring `sources.py`. It is the wrong lesson to copy. The broker seam
+earned its Protocol by having a second implementation in prospect and a schema
+whose identity depended on it; a calendar has ONE feed, and an abstraction with
+one implementation is untested by construction -- which is the thing this repo
+learned the expensive way three commits ago. The `(source, event_id)` key is what
+keeps a second feed possible later; the Protocol can arrive with the second feed,
+which is when it can first be verified.
+
+Drift test in the shape of `test_flex.py::test_field_drift`: the six keys are
+present, and an unknown `impact` fails loudly rather than being bucketed as Low.
 
 **14b — `optjournal market`,** CLI + payload + tab. Text report first (it is the
 cheaper thing to verify), then `market_data()` in serialize.py, the `@typedef`

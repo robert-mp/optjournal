@@ -58,6 +58,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one. See [The Money model](#the-money-model) |
 | `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts. **Never reads `blackscholes.py`** — see [Modelled numbers](#modelled-numbers) |
 | `marketdata.py` | price-bar fetch and parse for one contract over one window. A leaf: no DB, no journal shapes |
+| `events.py` | economic calendar: fetch, parse and store this week's releases. A leaf. One feed, no Protocol — see [Adding a calendar feed](#a-new-calendar-feed) |
 | `bars.py` | the journal-shaped half of price bars — which contract over which window (from episodes), the idempotent write, the series a chart reads, and the expected-move band |
 | `blackscholes.py` | option pricing and the implied vol backed out of a market price. A leaf: pure float maths, `math.erf` for the normal CDF, so no numpy or scipy |
 | `analysis.py` | cost/friction report from the raw statement (whole account); a leaf — imports nothing internal |
@@ -548,6 +549,23 @@ each simply never closed one.
 shapes, plus a case in `tests/test_render.py` that builds its payload with the
 REAL serializer over the real archive. A hand-written dict would have passed
 throughout the window when `orders` and `history` were both crashing.
+
+<a id="a-new-calendar-feed"></a>
+**A new calendar feed**: `events.py` is deliberately NOT a Protocol with a
+registry, unlike the broker seam. That seam earned its abstraction by having a
+second implementation in prospect and a schema whose identity depended on it; a
+calendar has one feed, and an abstraction with one implementation is untested by
+construction — which this repo learned expensively (see PLAN.md's "a seam is only
+as good as the test that uses two of them"). What keeps a second feed possible is
+the `(source, event_id)` primary key, not an interface. So: add a second
+fetch/parse pair, and extract the Protocol *at that point*, when it can first be
+verified by two implementations.
+
+Two things a second feed must respect. `impact` is the FEED's judgement, stored
+verbatim and attributed on the page — an unrecognised value raises rather than
+being filed as Low, because a silently downgraded event is a calendar that
+looks right. And `event_id` is ours: ForexFactory supplies none, so it hashes
+`(starts_at, country, title)`, verified distinct across a real week's 99 rows.
 
 **A new broker**: a class satisfying `StatementSource` (a `broker` name, a
 `base_currency(path)` and a `statements(path)` yielding `NormalisedFill`s), plus

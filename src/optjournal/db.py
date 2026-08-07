@@ -42,7 +42,7 @@ __all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate", "open_journ
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -301,6 +301,52 @@ CREATE TABLE IF NOT EXISTS price_bars (
   source      TEXT    NOT NULL,
   fetched_at  TEXT    NOT NULL,
   PRIMARY KEY (conid, bar_size, ts)
+);
+
+-- Economic and geopolitical events, for the Market tab.
+--
+-- Keyed (source, event_id) for the reason `trades` is keyed (broker, trade_id):
+-- an id belongs to the feed that issued it, and a second feed numbering an event
+-- the same way would silently overwrite the first's row. That took two migrations
+-- to learn on the broker tables; it is free here.
+--
+-- `event_id` is OURS, not the feed's -- ForexFactory supplies no id, so it is a
+-- hash of (starts_at, country, title). Verified unique across all 99 rows of a
+-- real week. A re-fetch therefore CORRECTS a revised forecast in place rather
+-- than adding a second copy of the same event.
+--
+-- Rows persist rather than being replaced per fetch, and that is what makes this
+-- table more than a cache: the feed serves one week only (verified -- nextweek,
+-- thismonth and lastweek all 404), so weekly fetches accumulate a past calendar
+-- the source itself will not serve.
+CREATE TABLE IF NOT EXISTS market_events (
+  source       TEXT    NOT NULL,
+  event_id     TEXT    NOT NULL,
+  -- Epoch seconds UTC. The feed sends ISO with an offset; storing the instant
+  -- keeps one timeline, and the page renders it in bars.MARKET_TZ like every
+  -- other stamp in this journal.
+  starts_at    INTEGER NOT NULL,
+  country      TEXT    NOT NULL,
+  title        TEXT    NOT NULL,
+  -- The FEED's judgement of importance, not the journal's. Stored verbatim so
+  -- the page can attribute it rather than presenting it as our own assessment.
+  impact       TEXT    NOT NULL,
+  forecast     TEXT,
+  previous     TEXT,
+  raw          TEXT    NOT NULL,
+  fetched_at   TEXT    NOT NULL,
+  PRIMARY KEY (source, event_id)
+);
+CREATE INDEX IF NOT EXISTS market_events_when ON market_events(starts_at);
+
+-- Symbols being watched. The first table here that is USER INPUT rather than
+-- ingested fact, which is why it has no `broker` column and should not gain one:
+-- a symbol you are watching is not a broker's record of anything. Nothing joins
+-- it to `trades`; the watchlist view looks up prices and positions by symbol.
+CREATE TABLE IF NOT EXISTS watchlist (
+  symbol     TEXT PRIMARY KEY,
+  note       TEXT,
+  added_at   TEXT NOT NULL
 );
 
 -- One row per (order, leg). Collapses partial fills, which IBKR marks with
