@@ -12,6 +12,22 @@ it must never be reachable off-host. The bind address is passed explicitly
 rather than defaulted, and `serve()` refuses anything that is not a loopback
 address. Do not put this behind a reverse proxy without adding auth first.
 
+TWO different attackers, and the loopback bind only stops one. It keeps the
+journal off the NETWORK; it does nothing about YOUR OWN BROWSER, which will POST
+here on behalf of any page you have open. With no auth and a request-spending
+endpoint, that means a site in another tab could push you toward an IBKR lockout
+while the journal runs. Found by testing it rather than by reasoning: a POST
+carrying `Origin: https://evil.example` ran a real sync. So `do_POST` checks the
+origin BEFORE it routes, which is what makes a write endpoint added later safe by
+default instead of safe by remembering. See `_origin_is_same`.
+
+That check compares scheme-host-AND-PORT against the socket the server bound,
+because the first version compared only the hostname and a page served on
+`http://127.0.0.1:8799` walked straight through it -- demonstrated in a real
+browser, which is the only place it was visible. "Loopback" is not one origin;
+every local port is its own, so anything that can serve a single file locally
+would otherwise have write access.
+
 The page reads a single /api/state payload rather than one endpoint per panel.
 At this data volume the whole journal is a few KB of JSON, so one round trip is
 simpler than five and the panels can never disagree with each other.
@@ -98,6 +114,51 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return host == "localhost"
+
+
+def _origin_is_same(origin: str | None, *, host: str, port: int) -> bool:
+    """Whether a POST's `Origin` is THIS server, port included.
+
+    Binding loopback keeps the journal off the NETWORK. It does nothing about
+    your own browser, which will POST here on behalf of any page you have open --
+    and these writes are not idempotent reads. `/api/sync` spends an IBKR request
+    against a lockout budget, so an unguarded endpoint means a page in another tab
+    can push you toward a lockout while the journal runs. Confirmed, not
+    theorised: a POST carrying `Origin: https://evil.example` ran a real sync and
+    moved `last_fetch`.
+
+    THE PORT IS PART OF THE ORIGIN, and leaving it out was a real hole in the
+    first version of this function -- caught by a browser test, not by reasoning.
+    Checking only that the hostname was loopback let a page served by ANY local
+    process through: an attacker page on `http://127.0.0.1:8799` POSTed to the
+    journal on 8792 and got past the guard. Anything that can serve one file on a
+    high port -- a dev server, a `python -m http.server` in a downloads folder,
+    another tool's UI -- could then spend the request budget. Same-origin means
+    scheme, host AND port; two ports on one machine are two origins, which is
+    exactly what the browser's own rules say.
+
+    `None` is allowed, and that is the load-bearing decision. A browser ALWAYS
+    sends `Origin` on a fetch POST -- verified in a real browser against a probe
+    server, which reported `Origin: http://127.0.0.1:<port>` plus
+    `Sec-Fetch-Site: same-origin` -- so a missing header means the caller is not a
+    browser. curl and a future CLI are not the threat model; a page in a tab is.
+    Refusing `None` would break the former and stop nothing.
+
+    The bound host is compared through `_is_loopback` on BOTH sides rather than by
+    string, so a journal served on `127.0.0.1` accepts its own page loaded as
+    `localhost` -- the same server, and a browser sends whichever name was typed.
+    `http://127.0.0.1.evil.com` still fails, because its hostname is not loopback.
+    """
+    if origin is None:
+        return True
+    parts = urllib.parse.urlsplit(origin)
+    if not parts.hostname or parts.port != port:
+        return False
+    # Loopback-to-loopback rather than equality: 127.0.0.1, localhost and ::1 all
+    # name this server, and which one appears depends on what was typed.
+    if _is_loopback(host):
+        return _is_loopback(parts.hostname)
+    return parts.hostname == host
 
 
 def _now() -> str:
@@ -711,8 +772,33 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
+    def _same_origin(self) -> bool:
+        """`Origin` against the socket this server actually bound.
+
+        From `server_address`, not the `Host` header: the socket is what the
+        process is really listening on, while `Host` is client-supplied and so
+        cannot be trusted to decide whether a client is trusted.
+        """
+        address = self.server.server_address
+        bound_host = str(address[0]) if isinstance(address, tuple) else ""
+        bound_port = int(address[1]) if isinstance(address, tuple) else 0
+        return _origin_is_same(
+            self.headers.get("Origin"), host=bound_host, port=bound_port
+        )
+
     def do_POST(self) -> None:  # noqa: N802 - stdlib naming
         path, _, _q = self.path.partition("?")
+        # BEFORE the route check, so every write endpoint added later is covered
+        # by default rather than by remembering. A 403 here costs a foreign page
+        # nothing; letting it through costs an IBKR request.
+        if not self._same_origin():
+            self._json(403, {
+                "ok": False, "kind": "origin",
+                "message": "cross-origin writes are refused: this journal has no "
+                           "authentication, so a page you have open could "
+                           "otherwise spend your IBKR request budget.",
+            })
+            return
         if path != "/api/sync":
             self._json(404, {"error": "not found"})
             return

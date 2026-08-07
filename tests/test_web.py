@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from conftest import RAW_DIR, code_only
+from conftest import RAW_DIR, ROOT, code_only
 
 from optjournal import web
 from optjournal.cli import main
@@ -34,7 +34,7 @@ from optjournal.config import (
 )
 from optjournal.db import connect, migrate
 from optjournal.history import build_history
-from optjournal.web import build_state, page_html, serve
+from optjournal.web import _origin_is_same, build_state, page_html, serve
 
 
 @pytest.fixture
@@ -796,6 +796,92 @@ def test_serve_refuses_non_loopback(host, tmp_path, monkeypatch):
     monkeypatch.setattr(socket, "socket", _refuse)
     with pytest.raises(ValueError, match="Loopback only"):
         serve(db_path=tmp_path / "x.db", archive_dir=tmp_path, host=host, port=0)
+
+
+# --- cross-origin writes --------------------------------------------------
+
+
+@pytest.mark.parametrize("origin", [
+    "https://evil.example",
+    "http://evil.example:8765",
+    # A prefix comparison would pass this. The hostname is `127.0.0.1.evil.com`,
+    # which resolves to whatever that domain's owner wants.
+    "http://127.0.0.1.evil.com",
+    "http://localhost.evil.com",
+    "null",                       # a sandboxed iframe or a file:// page
+    # THE PORT. These were the hole in the first version of the guard, which
+    # compared only the hostname -- see the docstring below.
+    "http://127.0.0.1:8799",
+    "http://localhost:8799",
+    "http://127.0.0.1",           # port 80: a different origin from 8765
+])
+def test_a_cross_origin_post_is_refused(origin):
+    """Binding loopback stops the network, not your own browser.
+
+    The journal has no authentication, and its POST endpoint SPENDS AN IBKR
+    REQUEST against a lockout budget. So any page open in a tab could push you
+    toward a lockout while the journal is running. Not theorised: a POST carrying
+    `Origin: https://evil.example` ran a real sync against the live server and
+    moved `last_fetch`, which is how this was found.
+
+    THE PORT CASES ARE THE INTERESTING ONES, and they exist because the first
+    version of this guard let them through. It checked that the origin's hostname
+    was loopback, which sounds right and is not: an attacker page served on
+    `http://127.0.0.1:8799` POSTed to the journal on another port and got past it,
+    demonstrated in a real browser. Anything able to serve one file locally -- a
+    dev server, `python -m http.server` in a downloads folder, another tool's UI
+    -- could then spend the request budget. Two ports are two origins, which is
+    what the browser's own same-origin rule says, and the reasoning that skipped
+    the port is exactly the reasoning a reviewer would nod along with.
+
+    Parametrised over every shape a plausible-but-wrong implementation would
+    accept, rather than one hostile origin: `127.0.0.1.evil.com` defeats a prefix
+    test, and `127.0.0.1:8799` defeats a hostname-only test.
+    """
+    assert not _origin_is_same(origin, host="127.0.0.1", port=8765), (
+        f"{origin} may not write to this journal"
+    )
+
+
+@pytest.mark.parametrize("origin", [
+    "http://127.0.0.1:8765",
+    # The SAME server under its other names. A browser sends whichever was typed,
+    # so string equality against the bound host would refuse the page its own
+    # journal served -- which is why both sides go through `_is_loopback`.
+    "http://localhost:8765",
+    "http://[::1]:8765",
+    None,        # curl, the CLI: not a browser, so not the threat model
+])
+def test_the_pages_own_origin_may_write(origin):
+    """The other direction, and the reason `None` is allowed.
+
+    A guard that refuses the page's own POSTs would break the Sync button, which
+    is worse than useless -- it would be a security fix that removes a feature and
+    teaches you to disable it. Verified in a real browser before relying on it: a
+    same-origin `fetch(..., {method:'POST'})` sends `Origin: http://127.0.0.1:<port>`
+    and `Sec-Fetch-Site: same-origin`, so a MISSING Origin means the caller is not
+    a browser at all. Confirmed end to end afterwards: the real page's Sync POST
+    returned 400 (no query id configured), not 403, so it passed the guard.
+    """
+    assert _origin_is_same(origin, host="127.0.0.1", port=8765)
+
+
+def test_the_origin_guard_runs_before_the_route_so_new_endpoints_inherit_it():
+    """Ordering, asserted over the source: the check precedes the route match.
+
+    If the guard sat inside the `/api/sync` branch, the next write endpoint would
+    ship unguarded unless someone remembered -- and the person adding an endpoint
+    is thinking about the feature, not about a page in another tab. Cheap to get
+    right once; invisible when got wrong.
+    """
+    body = code_only((ROOT / "src" / "optjournal" / "web.py").read_text())
+    post = body[body.index("def do_POST"):]
+    guard = post.index("_same_origin")
+    route = post.index('if path != "/api/sync"')
+    assert guard < route, (
+        "the Origin check must come before the route dispatch in do_POST, so a "
+        "write endpoint added later is covered by default"
+    )
 
 
 def test_dashboard_friction_is_split_by_scope(state):
