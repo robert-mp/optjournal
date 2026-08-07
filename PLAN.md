@@ -509,14 +509,23 @@ per-fill realised P&L decides whether the fallback is needed at all, and its
 commission convention decides what the fallback must record. The prototype and
 this note make that a half-day question rather than an open one.
 
-## TODO: task 8, the vocabulary rename
+## Task 8, the vocabulary rename: STEPS 1-2 DONE, 3-5 DEFERRED
 
-Written down rather than done, because the cost is real and the benefit arrives
-only with a second broker. Measured, not estimated (re-measured 2026-08-07):
+**Steps 1 and 2 are done** (commit `4796fc6`). `conid` -> `contract_id` on every
+`fills.py` shape, with `sources.py` constructing them and `ingest.py` translating.
+No schema change, no payload key moved, no migration. Verified by re-ingesting the
+whole archive into a scratch database and hashing: 162/162 trades, 100/8 cash,
+51/51 positions, 13/13 securities, and the `conid` VALUES identical to the live
+journal on all three contract-bearing tables. The task-13 fingerprint test -- which
+compares real rows against hashes taken from the pre-seam ingest at `dcb49d5` --
+still passes, so the rename is transparent rather than merely green.
+
+**Steps 3-5 (the schema, the payload, the mutants) are deferred**, and the reason
+is below. Measured after the seam moved:
 
 | name | src | tests | where it hurts |
 |---|---|---|---|
-| `conid` | 273 | 175 | 8 column decls in db.py, 15 in page.html, 13 other modules |
+| `conid` | 254 | 181 | 8 column decls in db.py, 15 in page.html, 13 other modules |
 | `ib_commission` | 36 | 54 | schema column, `_base` sibling, commission-currency rule |
 | `ib_order_id` | 31 | 18 | schema, two views, the `Order`/`Leg` payload shapes |
 | `fx_rate_to_base` | 23 | 17 | on four tables |
@@ -524,9 +533,17 @@ only with a second broker. Measured, not estimated (re-measured 2026-08-07):
 | `fifo_pnl_unrealized` | 9 | 1 | schema, payload |
 | `ib_exec_id` | 5 | 23 | schema, the UNIQUE index |
 
-**703 occurrences**, up from 663 when this was first measured. Not a sed job:
-`conid` is a schema column on five tables, a `price_bars` primary-key component, a
-payload key the page reads 15 times, and a join key in `bars.underlying_ids`.
+**690 occurrences**, down from 703 before step 2 and 663 when first measured. Note
+what step 2 actually bought: only 19 sites in `src`, and `tests` went UP by 6
+(the two new sentinels name the vendor words in order to reject them). So the
+remaining work is essentially unchanged in size -- step 2's value is not that it
+shrank the problem but that it CONTAINED it. Every seam-to-schema translation is
+now in `ingest.py`, guarded by
+`test_ingest_is_the_only_place_the_two_vocabularies_meet`.
+
+Still not a sed job: `conid` is a schema column on five tables, a `price_bars`
+primary-key component, a payload key the page reads 15 times, and a join key in
+`bars.underlying_ids`.
 
 ### The surface grows with every feature, and where it grows matters
 
@@ -599,24 +616,19 @@ means the view bodies there name the new column, and `executescript` fails with
 happened. So the rename pass must run BEFORE `_SCHEMA`, which is the opposite of
 where `_rekey_by_broker` sits. Anyone doing this task should write that test first.
 
-### The plan, whenever it is done
+### The plan: 1-2 done, 3-5 remaining
 
-Five commits, each independently green. Step 2 is cheap and standalone and could go
-at any time; steps 3-5 are the part worth waiting for a second broker, because they
-are the ones that touch a live database and a working page.
-
-1. **Decide the target names.** Proposal, not decided: `contract_id`,
-   `order_id`, `exec_id`, `commission`, `realized_pnl`, `unrealized_pnl`.
-   `fills.py` ALREADY uses `exec_id`, `order_id`, `commission`,
-   `realized_pnl` and `unrealized_pnl` -- so the seam has chosen these and the
-   database is what disagrees. That is the argument for them over any others, and
-   it means the rename is mostly making the schema catch up rather than inventing
-   a vocabulary. (`fx_rate_to_base` needs no change: both sides already agree.)
-2. **`fills.py` and `sources.py` first**, where the only inconsistency left is
-   `conid`. Small, no schema, no payload. This is the commit that makes
-   `NormalisedPosition.conid` into `contract_id` -- deliberately NOT done when
-   those shapes were written, because a seam speaking two dialects is worse than
-   one consistent wrong name.
+1. **DONE. The target names are decided**, and `fills.py` had already chosen them:
+   `contract_id`, `order_id`, `exec_id`, `commission`, `realized_pnl`,
+   `unrealized_pnl`. The seam uses all six, so the database is what disagrees --
+   which is the argument for these over any others, and it means the remaining work
+   is making the schema catch up rather than inventing a vocabulary.
+   (`fx_rate_to_base` needs no change: both sides already agree.)
+2. **DONE (`4796fc6`).** `conid` -> `contract_id` and `underlying_conid` ->
+   `underlying_contract_id` across all four seam shapes that carry them, plus the
+   construction in `sources.py` and the attribute reads in `ingest.py`. Nineteen
+   sites in `src`. Two sentinels added, both ablated -- see "What step 2 taught"
+   below, because two of its findings change how step 3 should be done.
 3. **The schema, in ONE commit**, as a guarded `ALTER TABLE ... RENAME COLUMN`
    pass driven by a `_RENAMED_COLUMNS` table of `(table, old, new)` -- NOT
    `_rekey_by_broker`'s rebuild, see the correction above. The pass runs BEFORE
@@ -634,6 +646,61 @@ are the ones that touch a live database and a working page.
 
 Do NOT rename `raw`. It holds the source's own attribute dict verbatim, camelCase
 included; that is provenance, and renaming its contents would falsify it.
+
+### What step 2 taught, and what it changes about step 3
+
+**1. The frozen slotted dataclasses make a half-done rename impossible to miss.**
+Ablated deliberately: renaming the field but not the construction is a
+`TypeError: unexpected keyword argument` across 111 tests, not a silent `None`.
+
+The schema half has a weaker but still adequate version of the same protection,
+and it is worth knowing exactly where it stops. Tested, not assumed:
+
+* `INSERT` naming a column that no longer exists -> raises `no such column`. Loud.
+* `ON CONFLICT` naming a combination that matches no key -> raises
+  `ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint`. Loud.
+* Duplicate key with no `ON CONFLICT` at all -> raises `UNIQUE constraint failed`.
+  Loud.
+
+So a rename that merely misses a site fails loudly. **The one silent case is an
+`ON CONFLICT` that targets a DIFFERENT but still valid unique constraint.** With
+`PRIMARY KEY (broker, contract_id)` and a `UNIQUE(exec_id)` index, an upsert on
+`ON CONFLICT(exec_id)` accepts a second broker's row and quietly UPDATES the first
+broker's instead of inserting -- no error, wrong data, one row where there should
+be two. That is the exact shape that bit task 5, and `trades` has both a composite
+primary key and the `trades_exec` unique index, so it is reachable. Step 3 must
+check every `ON CONFLICT` clause names the intended key, not merely a valid one.
+
+**2. `tests/` grew while `src/` shrank, and that is expected.** The two new
+sentinels NAME the vendor words in order to reject them, so a grep for `conid`
+now counts the guard as an occurrence. Any future measurement of this task should
+count `src` only, or exclude `tests/test_layering.py`, or it will look like the
+problem is growing while it is being fixed.
+
+**3. The containment is now enforced, which is what makes step 3 small.**
+`test_ingest_is_the_only_place_the_two_vocabularies_meet` fails if any module
+other than `ingest`/`fills`/`sources` reads a seam attribute. So step 3's blast
+radius is knowable by construction rather than by grep: the schema rename touches
+`db.py`'s DDL, `ingest.py`'s SQL strings, and the modules that query columns
+directly (`history.py`, `stats.py`, `demo.py`, `bars.py`, `web.py`).
+
+**4. The fingerprint test from task 13 is the right acceptance gate for step 3
+too.** It compares real trade rows against hashes derived from a pre-seam
+worktree, so it detects a value that changed for ANY reason, including a rename
+that silently maps two columns onto each other. Run it, and re-ingest the archive
+into a scratch database and diff the counts and the value hashes against the live
+journal -- that is what verified step 2, and it caught nothing only because there
+was nothing to catch.
+
+### The remaining risk, stated plainly
+
+Step 3 is the only step that touches a live database, and the journal is the
+authoritative record of a real brokerage account. `raw/` is the provenance root, so
+a rebuild is always possible from the statements -- but a rename that silently
+mis-maps a column would produce a journal that looks right and is wrong, which is
+the exact failure shape this project keeps hitting. Hence: on a COPY first, values
+compared individually rather than counted, `migrate()` run twice to prove
+idempotency, and the fingerprint test as the gate.
 
 ## Task 14: Market Awareness and Watchlist
 
