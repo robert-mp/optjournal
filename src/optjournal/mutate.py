@@ -392,12 +392,20 @@ def run_mutant(mutant: Mutant, *, source: Path, workdir: Path) -> MutationOutcom
     target.write_text(text.replace(mutant.find, mutant.replace, 1), encoding="utf-8")
 
     result = _pytest(clone)
+    # ERROR as well as FAILED. A defect that breaks a FIXTURE is reported by
+    # pytest as an error, not a failure -- and counting only FAILED reported such
+    # a mutant as caught by NOTHING while a test was in fact catching it, in the
+    # assertion that makes the fixture refuse to build. Found exactly that way:
+    # `broker-stamp` read as uncaught because the two-broker fixture asserts the
+    # second broker's trades landed, so the mutant errored 3 tests instead of
+    # failing them. Undercounting is the dangerous direction here, since the
+    # whole point of a zero is to send someone looking for a missing test.
     failed = tuple(
         name
         for name in (
-            re.sub(r"\s.*$", "", line[len("FAILED "):])
+            re.sub(r"\s.*$", "", line.split(" ", 1)[1])
             for line in (result.stdout or "").splitlines()
-            if line.startswith("FAILED ")
+            if line.startswith(("FAILED ", "ERROR "))
         )
         if name not in _SELF_REFERENTIAL
     )
