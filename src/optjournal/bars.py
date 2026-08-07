@@ -155,6 +155,14 @@ SNAPSHOT_FLOOR_DAYS = 1100
 #: shorter than that, and the longest-dated one shows the part that matters.
 SNAPSHOT_DRAW_BARS = 504
 
+#: Calendar days of daily history to keep for a WATCHED symbol.
+#:
+#: Sized from what the watchlist reports: a 20-session realised vol needs 21
+#: closes, and 60 calendar days is ~41 sessions -- enough for the vol plus a
+#: week's change, with room for holidays. Comfortably past HOURLY_LIMIT_DAYS, so
+#: `_bar_size_for` resolves a watch window to daily without a special case.
+WATCH_LOOKBACK_DAYS = 60
+
 _COLUMNS = (
     "conid", "symbol", "bar_size", "ts",
     "open", "high", "low", "close", "volume",
@@ -389,6 +397,32 @@ def bars_manifest(
         conid = underlyings.get(name)
         if name and conid:
             add(conid, name, start, end, "underlying", open_=open_)
+
+    # Watched symbols. Without this a watchlist row is permanently blank: the
+    # manifest derives windows from POSITIONS, so a symbol you merely watch has
+    # no bars at all -- measured, GOOG had 5 daily closes and PLTR 4, which is
+    # not enough for a 20-day realised vol.
+    #
+    # Daily only, and never perishable. A watchlist wants a trend and a
+    # volatility, both of which daily closes answer; hourly bars for a symbol
+    # holding no position would multiply requests for a column nobody reads at
+    # that resolution.
+    for row in conn.execute("SELECT symbol FROM watchlist"):
+        name = str(row["symbol"] or "").strip().upper()
+        if not name:
+            continue
+        # A watched symbol has no conid -- it is not a contract this account has
+        # traded, so IBKR has never named it here. `price_bars` is keyed on conid,
+        # so it needs a stable synthetic one, and `watch:SYMBOL` is both stable
+        # and impossible to collide with an IBKR integer id. The watchlist reads
+        # bars BY SYMBOL, so nothing downstream depends on the shape of this key;
+        # it exists only to keep the primary key honest. If the same name is later
+        # traded, the real conid's rows arrive alongside and the symbol lookup
+        # finds both, which is why this is `setdefault`-like rather than a
+        # rewrite: the real id wins nothing and loses nothing.
+        add(underlyings.get(name) or f"watch:{name}", name,
+            int((moment - timedelta(days=WATCH_LOOKBACK_DAYS)).timestamp()),
+            ceiling, "watchlist", open_=False)
 
     requests = [r for r in merged.values() if r.perishable or not perishable_only]
     return sorted(requests, key=lambda r: (r.kind, r.symbol, r.bar_size))

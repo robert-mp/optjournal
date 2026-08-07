@@ -64,6 +64,7 @@ from optjournal.serialize import (
     orders_data,
     positions_data,
     statements_data,
+    watchlist_data,
 )
 from optjournal.stats import (
     EQUITY_CATEGORY,
@@ -512,6 +513,9 @@ def build_state(
             # (429 with a retry-after) and a tab reload is not a reason to spend
             # a request against it.
             "market": market_data(conn, now=datetime.now(UTC)),
+            # Prices and realised vol from bars already stored, so this
+            # spends nothing. `optjournal bars` is what fills them in.
+            "watchlist": watchlist_data(conn),
         }
         # How many POSITIONS the open contracts form, which needs the lifecycle
         # grouping and so cannot be computed inside month_stats. Set on both

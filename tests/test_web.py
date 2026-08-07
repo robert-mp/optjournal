@@ -58,6 +58,12 @@ def state(populated) -> dict:
     derives. A fixed date would fall out of the window and stop anchoring the
     shape the moment the calendar rolled over -- the same trap a hard-coded row
     count is, one layer up.
+
+    The watchlist is seeded for the same reason, and with the UNDERLYING of a
+    contract the archive actually holds -- otherwise `WatchOption` anchors to
+    nothing and the drift test quietly stops covering it. TSLA is a real open
+    position in this journal (the LEAP), which is what makes the "your options"
+    column non-empty.
     """
     from datetime import UTC, datetime, timedelta
 
@@ -74,6 +80,12 @@ def state(populated) -> dict:
          "date": f"{today + timedelta(days=1)}T17:00:00-04:00",
          "impact": "Holiday", "forecast": "", "previous": ""},
     ]))
+    conn.execute(
+        "INSERT OR IGNORE INTO watchlist (symbol, note, added_at) VALUES"
+        " ('TSLA', 'held: the LEAP', ?), ('SPY', NULL, ?)",
+        (str(today), str(today)),
+    )
+    conn.commit()
     conn.close()
     return build_state(db_path=populated, archive_dir=RAW_DIR, query_id="1591754")
 
@@ -284,6 +296,13 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         # `market` fixture), so in practice this anchors a real row.
         "MarketDay": first(state["market"]["week"]),
         "MarketEvent": first(state["market"]["events"]),
+        "Watch": first(state["watchlist"]),
+        # A watched symbol that actually HOLDS an option, so WatchOption is
+        # anchored to a real row. Sampling the first watch row would anchor it to
+        # nothing whenever the first symbol alphabetically happens to be unheld.
+        "WatchOption": first([
+            option for row in state["watchlist"] for option in row["options"]
+        ]),
         "FxBlock": state["fx"],
         "FxQuote": first(state["fx"]["quotes"]),
         "OdteBlock": state["odte"],

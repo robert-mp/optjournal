@@ -652,7 +652,7 @@ CHECKS: tuple[Check, ...] = (
 # ---------------------------------------------------------------------------
 
 TABS = ("dashboard", "calendar", "trades", "positions", "costs", "annual", "odte",
-        "market")
+        "market", "watchlist")
 
 
 def page_coords(quote: str | None) -> list[tuple[str, str | None, str | None]]:

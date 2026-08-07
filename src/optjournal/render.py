@@ -16,6 +16,7 @@ __all__ = [
     "render_positions",
     "render_statements",
     "render_summary",
+    "render_watchlist",
     "table",
 ]
 
@@ -321,3 +322,67 @@ def render_statements(data: list[Row], *, limit: int = 0) -> str:
     )
 
 
+
+
+def render_watchlist(rows: list[dict]) -> str:
+    """The watchlist as a table.
+
+    `rv` and `move` are headed as REALISED on purpose -- see vol.py. Abbreviating
+    to `iv` would fit the column better and be wrong, which is the trade this
+    project consistently refuses.
+
+    A dash means "no data", never zero: a symbol with fewer than six closes has
+    made no claim about its volatility, and printing 0.0 would put a flat row
+    beside a real one.
+    """
+    if not rows:
+        return "  (nothing watched -- `optjournal watch AAPL` adds a symbol)"
+
+    def pct(value: Any) -> str:
+        return "-" if value is None else f"{value:+.2f}%"
+
+    body = [
+        [
+            row["symbol"],
+            _money(row["last"]),
+            pct(row["change_1d"]),
+            pct(row["change_5d"]),
+            "-" if row["realised_vol"] is None else f"{row['realised_vol']:.1f}%",
+            _money(row["expected_move_5d"]),
+            # The context a broker screen cannot give: what YOU hold against it.
+            ", ".join(
+                f"{o['quantity']:+g} {_num_or(o['strike'])}{o['put_call'] or ''}"
+                for o in row["options"]
+            ) or "-",
+        ]
+        for row in rows
+    ]
+    out = [
+        table(
+            ["symbol", "last", "1d", "5d", "realised vol", "move 5d", "options"],
+            body,
+            align="<>>>>><",
+        ),
+        "",
+        "  realised vol is what the stock DID, not what the market charges for what",
+        "  it might do -- implied vol needs an option chain this journal cannot reach",
+    ]
+    thin = [r["symbol"] for r in rows if r["realised_vol"] is None]
+    if thin:
+        out.append(
+            f"  no vol yet for {', '.join(thin)}: fewer than 6 daily closes stored."
+            f" `optjournal bars` collects them."
+        )
+    return "\n".join(out)
+
+
+def _num_or(value: Any, dash: str = "") -> str:
+    """A number without trailing zeros, or `dash` when absent.
+
+    For strikes in a compact cell: 130.0 reads as 130, and a missing strike (a
+    stock leg) contributes nothing rather than a stray dot.
+    """
+    if value is None:
+        return dash
+    text = f"{float(value):g}"
+    return text

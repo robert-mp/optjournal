@@ -302,6 +302,7 @@ Independently shippable, in order. Effort is my estimate of focused work.
 | ~~6~~ | ~~Honour `account_id`~~ — **DONE** (`dcb49d5`): episode identity is `(broker, account_id, conid)`. | — | — |
 | ~~7~~ | ~~`NormalisedFill` + `StatementSource` Protocol~~ — **DONE** (`03ac3d7`) and then **actually finished** (`eeef122`). See below: the first pass looked complete and was not. | — | — |
 | 7b | Move the remaining sections across the seam: cash, positions, securities and equity summaries still read py_ibkr models and `raw_sections` dicts directly in `ingest.py`. | The trade path is done and is the dense one. These four are the rest of the same job, and a second broker needs them. | M |
+| ~~14~~ | ~~Market Awareness + Watchlist~~ — **DONE** (`c222144`, `1343981`, and this commit). Realised vol, not implied: the measurement is in `vol.py`'s docstring. | — | — |
 | 8 | Rename the IBKR vocabulary (`conid`, `ib_order_id`, `ib_commission`, `fifo_*`, `ib_exec_id`). **TODO, with a plan below.** | Deferred on purpose: 663 occurrences, another schema migration, and the names are still ACCURATE while IBKR is the only source. | L |
 | ~~9~~ | ~~Design pass on computed realised P&L~~ — **DONE as a design, plus the one buildable piece.** Prototype measured against real data, recommendation below, and the FIFO-vs-broker oracle is now in the suite. | Implementation still waits on a real second broker. | — |
 

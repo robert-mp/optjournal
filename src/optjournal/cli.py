@@ -55,6 +55,7 @@ from optjournal.render import (
     render_positions,
     render_statements,
     render_summary,
+    render_watchlist,
 )
 from optjournal.serialize import (
     costs_data,
@@ -63,6 +64,7 @@ from optjournal.serialize import (
     positions_data,
     statements_data,
     summary_data,
+    watchlist_data,
 )
 
 EXIT_OK = 0
@@ -388,6 +390,37 @@ def cmd_history(args) -> int:
     data = history_data(report)
     _emit(data, render_history(data), args.json)
     return EXIT_OK if report.episodes else EXIT_NO_DATA
+
+
+def cmd_watch(args) -> int:
+    """Manage and show the watchlist.
+
+    `add`/`rm` mutate, a bare `watch` shows. Subcommand-free on purpose: three
+    sibling commands for one three-row table would be more surface than the
+    feature has, and `watch AAPL` reading as "add AAPL" is the shape a reader
+    already expects from `git branch`.
+
+    Prices and realised vol come from bars this journal already stores, so this
+    spends no request. A symbol with no bars yet shows a dash rather than a zero
+    -- `optjournal bars` is what fills it in.
+    """
+    conn = _open_db(args)
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+
+    for symbol in (args.add or []):
+        conn.execute(
+            "INSERT INTO watchlist (symbol, note, added_at) VALUES (?,?,?)"
+            " ON CONFLICT(symbol) DO UPDATE SET note=COALESCE(excluded.note, note)",
+            (symbol.upper(), args.note, now),
+        )
+    for symbol in (args.rm or []):
+        conn.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.upper(),))
+    if args.add or args.rm:
+        conn.commit()
+
+    rows = watchlist_data(conn)
+    _emit(rows, render_watchlist(rows), args.json)
+    return EXIT_OK
 
 
 def cmd_market(args) -> int:
@@ -861,6 +894,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--assets", default="OPT", metavar="LIST",
                    help="asset category to report, or ALL (default: OPT)")
     p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("watch", parents=[common, database],
+                       help="watchlist: symbols, prices, realised vol, your context")
+    p.add_argument("add", nargs="*", metavar="SYMBOL",
+                   help="symbols to add; with none, just shows the list")
+    p.add_argument("--rm", nargs="+", metavar="SYMBOL", help="symbols to remove")
+    p.add_argument("--note", help="a note to attach to the symbols being added")
+    p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("market", parents=[common, database],
                        help="economic calendar: fetch this week, or show what is stored")

@@ -32,6 +32,7 @@ from optjournal.events import SOURCE, upcoming
 from optjournal.history import HistoryReport
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
+from optjournal.vol import expected_move, realised_vol
 
 Row = dict[str, Any]
 
@@ -533,3 +534,75 @@ def market_data(
         "impact_source": SOURCE,
         "zone": str(MARKET_TZ),
     }
+
+
+def watchlist_data(conn: sqlite3.Connection, *, lookback: int = 21) -> list[Row]:
+    """Watched symbols with price, realised vol, and this journal's own context.
+
+    The context is the part a broker app cannot show: whether YOU hold it, and
+    which option positions are open against it. That is the reason the watchlist
+    lives here rather than being a second quote screen.
+
+    `realised_vol` is named for what it is. It is NOT implied vol, which is not
+    reachable for a symbol this journal does not hold -- see `vol.py` for the
+    measurement. A column headed IV showing realised vol would be a well-formed
+    number under a label that does not describe it, which is the defect shape this
+    project keeps finding.
+
+    A symbol with too little history reports None rather than 0.0, so a row added
+    yesterday reads as "not enough data" instead of "a stock that never moved".
+    Measured on the real journal: GOOG had 5 daily closes and PLTR 4, which is
+    why `bars_manifest` has to learn about watched symbols (task 14d) before this
+    tab is useful for anything just added.
+    """
+    rows = conn.execute(
+        "SELECT symbol, note, added_at FROM watchlist ORDER BY symbol"
+    ).fetchall()
+
+    held: dict[str, list[Row]] = {}
+    for position in conn.execute(
+        "SELECT underlying_symbol, symbol, position, put_call, strike, expiry"
+        " FROM current_option_positions WHERE position != 0"
+    ):
+        key = str(position["underlying_symbol"] or "").upper()
+        held.setdefault(key, []).append({
+            "symbol": position["symbol"],
+            "quantity": position["position"],
+            "put_call": position["put_call"],
+            "strike": position["strike"],
+            "expiry": position["expiry"],
+        })
+
+    out: list[Row] = []
+    for row in rows:
+        symbol = str(row["symbol"]).upper()
+        closes = [
+            r["close"] for r in conn.execute(
+                "SELECT close FROM price_bars WHERE symbol = ? AND bar_size = '1d'"
+                " AND close IS NOT NULL ORDER BY ts DESC LIMIT ?",
+                (symbol, lookback),
+            )
+        ]
+        last = closes[0] if closes else None
+        # Change over one session and one week, from the same series. None rather
+        # than 0.0 when the history is not there, for the same reason as the vol.
+        prev = closes[1] if len(closes) > 1 else None
+        week = closes[5] if len(closes) > 5 else None
+        realised = realised_vol(closes)
+        out.append({
+            "symbol": symbol,
+            "note": row["note"],
+            "added_at": row["added_at"],
+            "last": last,
+            "closes": len(closes),
+            "change_1d": None if (last is None or prev is None)
+                         else (last - prev) / prev * 100,
+            "change_5d": None if (last is None or week is None)
+                         else (last - week) / week * 100,
+            #: REALISED, not implied. See vol.py.
+            "realised_vol": realised,
+            "expected_move_5d": expected_move(last, realised, days=5),
+            "options": held.get(symbol, []),
+            "held": bool(held.get(symbol)),
+        })
+    return out
