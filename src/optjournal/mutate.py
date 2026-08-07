@@ -10,14 +10,15 @@ unguarded invariant, and the suite should grow there: that is how `history._flat
 (a 0.4-share residual booking a partial close as a completed round trip) and
 `web._snapshot_leg`'s sign were found, both of which had passed 579 tests. A
 defect caught by fifteen tests means fourteen are coupled to something they are
-not about. Measured over all 25 mutants: **25 caught, median 2, minimum 1,
-maximum 18**.
+not about. Measured over all 31 mutants: **31 caught, median 1, minimum 1,
+maximum 19**.
 
-That 18 is `serialize._num` letting a Decimal reach the payload, and it is worth
-reading as a caution rather than as strength. Its 18 are not 18 invariants: eight
-are ONE test parametrised over the eight archived statements, and six more are
-`costs_data` assertions that each happen to read a number -- four distinct
-concerns, fanned out. Contrast the Money currency gate at 8, which spans money,
+That 19 is `serialize._num` letting a Decimal reach the payload, and it is worth
+reading as a caution rather than as strength. Its 19 are not 19 invariants: they
+are 11 distinct test FUNCTIONS, of which `test_json_exposes_both_scopes`
+contributes 9 on its own by parametrisation, and six more are `costs_data`
+assertions that each happen to read a number. Contrast the Money currency gate
+at 8, which spans money,
 analysis, strategies and web because the RULE does. So a high count separates a
 shared rule from a shared chokepoint only if you read which tests failed, which
 is why `format_report` lists them for the low counts and the JSON always does.
@@ -49,6 +50,20 @@ FAILED lines, and a defect that breaks a fixture produces ERROR. So a mutant
 caught by a fixture's own assertion was reported as caught by nothing. Fixed;
 undercounting is the dangerous direction, because a zero is what sends someone
 looking for a test that is already there.
+
+A FIFTH round found the same class of harness bug again, and it is the reason
+`tests/test_mutate.py` now exists. `loopback` makes `web.serve` bind instead of
+raise, so the test expecting a ValueError does not fail -- it SERVES FOREVER. The
+timeout added to `_pytest` killed it correctly, but the killed result carries no
+FAILED line, and the count below then read a truthful zero for an untruthful
+reason. The survey reported `UNCAUGHT` against the guard that keeps an
+unauthenticated brokerage dashboard off a public interface. Four tests were
+watching it. So a hang is now the `hung` status, not a measurement, and two
+things were fixed rather than one: the test also refuses to hang, by making the
+socket unopenable so a removed guard fails in 0.16s instead of after 500. Note
+which of the two was the real repair -- the harness change stops a hang being
+MISREPORTED, the test change stops the hang. A harness that can turn a passing
+sentinel into a zero is the same failure as one that measures the wrong tree.
 
 **Equivalent mutants are not findings.** Some changes have no observable effect,
 so "no test caught it" says nothing. The tool reports the count; deciding whether
@@ -521,6 +536,21 @@ def run_mutant(mutant: Mutant, *, source: Path, workdir: Path) -> MutationOutcom
     target.write_text(text.replace(mutant.find, mutant.replace, 1), encoding="utf-8")
 
     result = _pytest(clone)
+    # A KILLED suite measured NOTHING. Without this, the timeout path in `_pytest`
+    # returns a result whose stdout carries no FAILED line, and the count below is
+    # a truthful zero for an untruthful reason -- reported as `UNCAUGHT`, which
+    # reads as "the suite has no sentinel here" when in fact the sentinel hung.
+    # Found exactly that way: `loopback` makes `serve()` bind instead of raise, the
+    # test then serves forever, and the survey called the security guard untested.
+    # A hang is a MEASUREMENT FAILURE, not a result, so it belongs with the other
+    # untrustworthy statuses that `Report.ok` refuses.
+    if result.returncode == -signal.SIGKILL:
+        shutil.rmtree(clone, ignore_errors=True)
+        return MutationOutcome(
+            mutant, "hung",
+            detail=f"the suite did not finish within {_SUITE_TIMEOUT_S}s; a test "
+                   f"blocks rather than fails under this defect",
+        )
     # ERROR as well as FAILED. A defect that breaks a FIXTURE is reported by
     # pytest as an error, not a failure -- and counting only FAILED reported such
     # a mutant as caught by NOTHING while a test was in fact catching it, in the

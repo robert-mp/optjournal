@@ -299,16 +299,16 @@ unguarded invariant — that is how a `_flat` epsilon wide enough to book a
 0.4-share residual as a closed round trip was found, having passed 579 tests, and
 how `_snapshot_leg` silently taking `abs()` of a short position was found. A
 defect caught by **fifteen** tests suggests fourteen are coupled to something they
-are not about. Measured over all 25 mutants: 25 caught, median 2, maximum 18.
+are not about. Measured over all 31 mutants: 31 caught, median 1, maximum 19.
 
 The two high counts say different things, which is the point of reading the names
 rather than the number. At 8 is the Money currency gate — a rule that genuinely
-spans money, analysis, strategies and web. At 18 is `_num`, the Decimal-to-float
-coercion every payload flows through, and its 18 are not 18 invariants: eight are
-one test parametrised over the eight archived statements, and six more are
-`costs_data` assertions that each happen to read a number. Four distinct concerns,
-fanned out. A high count is evidence of a well-shared rule only if the tests that
-failed are about that rule; otherwise it marks a chokepoint.
+spans money, analysis, strategies and web. At 19 is `_num`, the Decimal-to-float
+coercion every payload flows through, and its 19 are not 19 invariants: they are
+**11 distinct test functions**, of which one parametrised over the archived
+statements contributes 9 on its own, and six more are `costs_data` assertions that
+each happen to read a number. A high count is evidence of a well-shared rule only
+if the tests that failed are about that rule; otherwise it marks a chokepoint.
 
 **Equivalent mutants are not findings.** Some changes have no observable effect,
 so "nothing caught it" says nothing about the suite. The tool reports; judging

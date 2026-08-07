@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import sqlite3
 from pathlib import Path
 
@@ -767,18 +768,32 @@ def test_page_escapes_interpolated_values():
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.10", "example.com"])
-def test_serve_refuses_non_loopback(host, tmp_path):
+def test_serve_refuses_non_loopback(host, tmp_path, monkeypatch):
     """The page has no auth and exposes an entire account. Loopback or nothing.
 
-    `port=0` matters, and not for this test's own result: if the guard is ever
-    removed, `serve` gets past the raise and BINDS, then serves forever. With the
-    default 8765 that is a test which silently becomes a real server on the
-    project's usual port -- found the honest way, when a leftover pytest from a
-    mutation survey was still holding 8765 a day later. Port 0 makes the OS pick
-    an ephemeral one, so the failure is a hang on a harmless port rather than a
-    hijack of the port a developer is about to use. `mutate._pytest` now times out
-    and kills the process group for the same reason.
+    FAILS FAST, and that is the whole design of this test rather than a detail. If
+    the guard is ever removed, `serve` gets past the raise and BINDS, and a test
+    that expected an exception instead serves forever: it does not fail, it hangs.
+    A hanging sentinel is worse than a missing one, because the suite reports
+    nothing rather than something -- the mutation survey called this exact guard
+    `UNCAUGHT` for that reason, so the one test standing between an unauthenticated
+    brokerage dashboard and a public interface read as untested.
+
+    So the bind is made impossible instead of merely cheap: `socket.socket` is
+    replaced for the duration, and reaching it is itself the failure. `port=0` is
+    kept as the second layer -- if some future path binds without going through
+    this name, the OS picks an ephemeral port rather than 8765, the port a
+    developer is about to use. (Found the honest way: a leftover pytest from a
+    survey was still holding 8765 a day later.) `mutate` now reports a killed
+    suite as `hung` rather than as a measured zero, which is the third layer.
     """
+    def _refuse(*a, **k):
+        raise AssertionError(
+            "serve() tried to open a socket for a non-loopback host: the guard "
+            "did not refuse, so this would have bound a public interface"
+        )
+
+    monkeypatch.setattr(socket, "socket", _refuse)
     with pytest.raises(ValueError, match="Loopback only"):
         serve(db_path=tmp_path / "x.db", archive_dir=tmp_path, host=host, port=0)
 
