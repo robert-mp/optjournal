@@ -512,21 +512,35 @@ this note make that a half-day question rather than an open one.
 ## TODO: task 8, the vocabulary rename
 
 Written down rather than done, because the cost is real and the benefit arrives
-only with a second broker. Measured, not estimated:
+only with a second broker. Measured, not estimated (re-measured 2026-08-07):
 
 | name | src | tests | where it hurts |
 |---|---|---|---|
-| `conid` | 270 | 159 | 22 in db.py, 15 in page.html, 13 other modules |
-| `ib_commission` | 36 | 44 | schema column, `_base` sibling, commission-currency rule |
+| `conid` | 273 | 175 | 8 column decls in db.py, 15 in page.html, 13 other modules |
+| `ib_commission` | 36 | 54 | schema column, `_base` sibling, commission-currency rule |
 | `ib_order_id` | 31 | 18 | schema, two views, the `Order`/`Leg` payload shapes |
 | `fx_rate_to_base` | 23 | 17 | on four tables |
-| `fifo_pnl_realized` | 17 | 10 | schema + `_base` sibling |
+| `fifo_pnl_realized` | 17 | 20 | schema + `_base` sibling |
 | `fifo_pnl_unrealized` | 9 | 1 | schema, payload |
 | `ib_exec_id` | 5 | 23 | schema, the UNIQUE index |
 
-**663 occurrences.** Not a sed job: `conid` is a schema column on five tables, a
-`price_bars` primary-key component, a payload key the page reads 15 times, and a
-join key in `bars.underlying_ids`.
+**703 occurrences**, up from 663 when this was first measured. Not a sed job:
+`conid` is a schema column on five tables, a `price_bars` primary-key component, a
+payload key the page reads 15 times, and a join key in `bars.underlying_ids`.
+
+### The surface grows with every feature, and where it grows matters
+
+Tasks 13 and 14 added 40 sites, all in the three names that were already largest.
+But the growth is NOT uniform, and the split is what decides the sequencing:
+
+* **`page.html` is unchanged at 15.** Two new tabs, no new `conid` reads. The
+  payload surface is stable.
+* **`db.py` went 45 -> 56 vocabulary lines and 4 -> 5 keys/indexes**, the new one
+  being `PRIMARY KEY (broker, conid)` on `securities`.
+
+So the schema half grows and the payload half does not. `conid` alone is 64% of the
+total. Every feature that touches a contract raises the cost of the half that was
+already the expensive one.
 
 ### Why it is worth doing eventually
 
@@ -545,21 +559,51 @@ conid is purely a local join handle and the name misleads already.
 
 ### Why not now
 
-1. **Another migration.** Renaming a column means the twelve-step rebuild again,
-   over five tables, right after two migrations (v4→5, v5→6). Each is safe --
-   verified on a copy first, row counts and values compared -- but they are not
-   free, and batching one rename commit is better than three.
-2. **The names are still true.** Every row in the database did come from IBKR, so
+1. **The names are still true.** Every row in the database did come from IBKR, so
    today the vocabulary is accurate rather than misleading. Renaming ahead of the
-   second broker buys nothing and spends a migration.
-3. **It is mechanical once decided.** The drift tests make it safe: `test_web`'s
+   second broker buys nothing and carries a migration's risk for no behaviour
+   change. This is the whole argument, and it is the only one left standing.
+2. **It is mechanical once decided.** The drift tests make it safe: `test_web`'s
    payload guard fails in both directions, so a serializer key without a typedef
-   and a typedef without a key both fail. The work is finding the 663 sites, not
+   and a typedef without a key both fail. The work is finding the 703 sites, not
    knowing whether the change is right.
 
-### The plan, when a second broker is real
+### CORRECTION: the migration is not the twelve-step rebuild
 
-Do it in this order, one commit each, each independently green:
+An earlier version of this section claimed a column rename "means the twelve-step
+rebuild again, over five tables", and used that cost as the first reason to defer.
+**That was wrong, and it was never tested before being written down.** Measured
+against SQLite 3.50.4 on a scratch database:
+
+* `ALTER TABLE ... RENAME COLUMN` works on a **primary-key component**
+  (`position_snapshots.conid`, `price_bars.conid`) with rows present, and the PK
+  keeps enforcing afterwards -- an upsert naming the NEW column in `ON CONFLICT`
+  updates in place rather than inserting a duplicate.
+* SQLite **rewrites dependent VIEW and INDEX definitions itself**. A view whose
+  body said `SUM(fifo_pnl_realized)` read `SUM(realized_pnl)` after the rename,
+  with no intervention, and still returned the same row.
+* A guarded pass (`rename only if old column present and new column absent`) is
+  **idempotent**: second and third runs are no-ops, which is what `migrate()`
+  requires since it runs on every open.
+
+So the schema step is one `ALTER` per column, not a rebuild per table. That removes
+the cost argument entirely. The reason to defer is now only reason 1 -- the names
+are accurate today -- which is a judgement about VALUE, not about risk. Worth
+being explicit that this correction makes the task *cheaper* than advertised, and
+therefore a smaller thing to say no to.
+
+**One ordering trap, confirmed by test.** `migrate()` drops the views, runs
+`_SCHEMA`, and only then reaches the table work. A renamed column in `_SCHEMA`
+means the view bodies there name the new column, and `executescript` fails with
+`no such column: realized_pnl` on an existing journal -- before any rename has
+happened. So the rename pass must run BEFORE `_SCHEMA`, which is the opposite of
+where `_rekey_by_broker` sits. Anyone doing this task should write that test first.
+
+### The plan, whenever it is done
+
+Five commits, each independently green. Step 2 is cheap and standalone and could go
+at any time; steps 3-5 are the part worth waiting for a second broker, because they
+are the ones that touch a live database and a working page.
 
 1. **Decide the target names.** Proposal, not decided: `contract_id`,
    `order_id`, `exec_id`, `commission`, `realized_pnl`, `unrealized_pnl`.
@@ -573,10 +617,15 @@ Do it in this order, one commit each, each independently green:
    `NormalisedPosition.conid` into `contract_id` -- deliberately NOT done when
    those shapes were written, because a seam speaking two dialects is worse than
    one consistent wrong name.
-3. **The schema, one table per commit**, using `_rekey_by_broker`'s rebuild (it
-   already copies named columns from the shipped DDL, so a rename is a column-list
-   change plus a mapping). Views recreate from `_SCHEMA` automatically. Verify each
-   on a copy of the live journal before applying: row counts AND values.
+3. **The schema, in ONE commit**, as a guarded `ALTER TABLE ... RENAME COLUMN`
+   pass driven by a `_RENAMED_COLUMNS` table of `(table, old, new)` -- NOT
+   `_rekey_by_broker`'s rebuild, see the correction above. The pass runs BEFORE
+   `_SCHEMA` (the trap above), skips a column already renamed so it is idempotent,
+   and raises if both names somehow exist. One commit rather than one per table
+   because a half-renamed schema is a state no `_SCHEMA` can describe: the shipped
+   DDL names either the old columns or the new ones, so the views cannot be valid
+   for both. Verify on a copy of the live journal before applying: row counts AND
+   values, and re-run `migrate()` twice to prove idempotency.
 4. **`serialize.py` + `page.html` in ONE commit.** The typedef blocks, the
    `@payload` binding table and the JS readers must move together or the drift
    test fails -- which is the point: it makes this step atomic by construction.
