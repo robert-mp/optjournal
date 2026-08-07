@@ -272,13 +272,39 @@ Two results are worth acting on. A real defect caught by **zero** tests is an
 unguarded invariant — that is how a `_flat` epsilon wide enough to book a
 0.4-share residual as a closed round trip was found, having passed 579 tests, and
 how `_snapshot_leg` silently taking `abs()` of a short position was found. A
-defect caught by **fifteen** tests would mean fourteen are coupled to something
-they are not about. Measured here: median 2, maximum 8, and that 8 is the Money
-currency gate, a rule that genuinely spans four layers.
+defect caught by **fifteen** tests suggests fourteen are coupled to something they
+are not about. Measured over all 25 mutants: 25 caught, median 2, maximum 18.
+
+The two high counts say different things, which is the point of reading the names
+rather than the number. At 8 is the Money currency gate — a rule that genuinely
+spans money, analysis, strategies and web. At 18 is `_num`, the Decimal-to-float
+coercion every payload flows through, and its 18 are not 18 invariants: eight are
+one test parametrised over the eight archived statements, and six more are
+`costs_data` assertions that each happen to read a number. Four distinct concerns,
+fanned out. A high count is evidence of a well-shared rule only if the tests that
+failed are about that rule; otherwise it marks a chokepoint.
 
 **Equivalent mutants are not findings.** Some changes have no observable effect,
 so "nothing caught it" says nothing about the suite. The tool reports; judging
 whether a defect is real is the reader's job.
+
+The zeroes keep paying for the tool. A later round added ten mutants, one per
+finding from a code audit, and **eight were caught by nothing** while 602 tests
+passed: a KRW fee claiming to be a EUR amount, broker interest received booked as
+a cost, withholding whose effective rate came out negative, `AssetClass.STOCK`
+reaching the payload where the page reads `STK`, a table that stopped sizing
+columns to their headers, a closed contract taking its side from the *closing*
+fill (so every short you sold reads as a long you bought), and the Flex
+request-budget cooldown, which had no test at all. They share a shape: each one
+produces a well-formed report with a wrong number in it, which is why reading the
+code did not find them and passing tests did not either.
+
+One of the ten was not a missing test but a live defect — `analysis` accumulated
+`int(abs(quantity))` per fill, so any lot under one whole unit contributed
+nothing and a thousand half-share buys summed to zero. An eleventh candidate was
+neither: it was unreachable code, and the right response was to delete it. So
+"caught by nothing" has three answers — add a test, fix the code, delete the code
+— and deciding which is the reader's job too.
 
 It also settled a question that intuition kept getting wrong. `test_web.py` is the
 largest test file and much of it greps the page's JavaScript rather than executing
@@ -555,11 +581,16 @@ premium against the real close for its own date.
 ## Development
 
 ```bash
-uv run pytest -q            # 595 tests; the raw/ statements are fixtures
+uv run pytest -q            # 642 tests; the raw/ statements are fixtures
 uv run ruff check src tests cron
 uv run optjournal sweep     # every page in a real browser (~2 min)
-uv run optjournal mutate    # inject known defects, see which tests notice (~3 min)
+uv run optjournal mutate    # all 25 known defects (~15 min: a full suite run each)
+uv run optjournal mutate --only fee-ccy --only strike-side   # one or a few
 ```
+
+`mutate` runs the whole suite once per mutant in a fresh clone, so a full survey
+is a coffee break rather than a pre-commit step. Use `--only` while working on one
+invariant, and the full run when changing what the suite is *for*.
 
 The suite covers four layers: unit tests over domain arithmetic (with the
 generator itself under test — see `test_demo.py`), payload-contract guards

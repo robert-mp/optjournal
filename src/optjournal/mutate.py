@@ -10,9 +10,17 @@ unguarded invariant, and the suite should grow there: that is how `history._flat
 (a 0.4-share residual booking a partial close as a completed round trip) and
 `web._snapshot_leg`'s sign were found, both of which had passed 579 tests. A
 defect caught by fifteen tests means fourteen are coupled to something they are
-not about. Measured on this suite: median 2, minimum 1, maximum 8 -- that 8 is
-the Money currency gate, a rule genuinely spanning money, analysis, strategies
-and web.
+not about. Measured over all 25 mutants: **25 caught, median 2, minimum 1,
+maximum 18**.
+
+That 18 is `serialize._num` letting a Decimal reach the payload, and it is worth
+reading as a caution rather than as strength. Its 18 are not 18 invariants: eight
+are ONE test parametrised over the eight archived statements, and six more are
+`costs_data` assertions that each happen to read a number -- four distinct
+concerns, fanned out. Contrast the Money currency gate at 8, which spans money,
+analysis, strategies and web because the RULE does. So a high count separates a
+shared rule from a shared chokepoint only if you read which tests failed, which
+is why `format_report` lists them for the low counts and the JSON always does.
 
 The uncaught result keeps earning its place. A later round added ten mutants for
 findings a code audit raised, and EIGHT were caught by nothing: the fee currency

@@ -141,7 +141,12 @@ merely prepare for one -- the path test refused only the developer's own checkou
 and waved through every copy of it, and it was also why the suite failed from a
 copied tree, which had blocked the mutation survey entirely.
 
-## The test suite: measured, and the answer is "no"
+## The test suite: measured, and the hunch was backwards
+
+The hunch was "we have too many unit tests". Measurement says the opposite: not
+one test was worth deleting, and 25 mutants later the suite has grown by 21 tests
+to close defects it could not see. The evidence came in two rounds; the first is
+the table below, the second is item 3 after it.
 
 Mutation survey, 16 real defects injected one at a time in scratch clones. Each
 run proved the mutation was the code pytest actually imported before trusting the
@@ -187,6 +192,32 @@ re-reading my own work:
 So "do the tests earn their place" and "does the suite cover the code" are
 different questions, and answering the first was not evidence for the second.
 
+3. **A wider round settled it: the suite was undersized, not oversized.** Ten
+   more mutants, one per audit finding, written BEFORE any test. **Eight were
+   caught by nothing**, and 602 tests said so:
+
+| defect | before | after |
+|---|---|---|
+| `analysis` attributes a KRW fee to the EUR base (313 archived rows) | **0** | 1 |
+| `analysis` widens the FEES gate and books interest received as a cost | **0** | 4 |
+| `analysis` keeps IBKR's negative sign on withholding, inverting the rate | **0** | 3 |
+| `serialize._wire` leaks `AssetClass.STOCK` where the page reads `STK` | **0** | 1 |
+| `render.table` stops sizing columns to their headers | **0** | 1 |
+| `web._strikes_of` sides a closed contract by its CLOSING fill | **0** | 2 |
+| `flex.fetch` loses the request-budget cooldown (no test existed at all) | **0** | 1 |
+| `analysis` truncates each fractional fill — **a live defect, not a gap** | **0** | 6 |
+| `analysis.credit_fills` counts charges as credits | 2 | 3 |
+| `sources._qty` rounds a 0.0007-share fill to 0 | 1 | 1 |
+
+   Two things this round taught that the first one could not. First, the reason
+   these were invisible is *shape*, not luck: every one produces a well-formed
+   report with a wrong number in it, and three of them (the fee currency, the
+   withholding sign, `credit_fills`) had tests nearby that asserted on
+   hand-built dataclasses and so never reached the code that computes them.
+   Second, "no test caught it" has three answers, not two: an eleventh candidate
+   was neither a gap nor a defect but unreachable code, and the right response
+   was to delete it (`3e82b21`).
+
 Both zeroes are now closed (`f3a23dd`, `3709773`), and they were different in
 kind. `_flat` was a genuine test gap on a live path -- it decides whether a round
 trip is CLOSED, and fractional stock lots make it reachable on real data.
@@ -199,6 +230,45 @@ sake. The `test_web.py` source-greping is the one place I would still look, but 
 is 1,770 lines *because* the frontend has no executable seam -- the fix is more
 `replay.js`-style extraction, and the regex guards then fall away as a
 consequence. That is a frontend task, not a test-cutting task.
+
+### The one deletion candidate, and why I did not take it
+
+`test_analysis.py` parametrises 7 tests over all 8 archived statements: 56 of its
+99 nodes. The audit recommended collapsing that to 3 representatives on the
+grounds that one statement alone reaches 216 of 220 lines.
+
+I could not reproduce the premise. Hashing each statement's structural features
+-- asset classes, currencies, commission-currency mismatches, cash types, credit
+commissions, sections present -- gives **7 distinct sets out of 8**. Only
+`20260805T092057Z` duplicates `20260804T153112Z`.
+
+Line coverage and feature distinctness are different measures, and the fan-out
+guards the second. Measured across the eight: the SEK withholding appears in
+**2**, and the fractional stock lot in the same 2. Three of this round's eight
+findings (the withholding sign, the fee currency, the per-fill truncation) were
+measured against features that a 3-fixture sample chosen for line coverage could
+easily have dropped -- so the cut would have removed the evidence that later
+proved those defects real.
+
+The honest cut is one fixture, roughly 7 nodes, which is not worth a commit.
+Recorded because the recommendation looked well-evidenced and its central number
+did not survive being checked.
+
+### Where it landed
+
+Full survey over all 25 mutants, after the sentinels: **25 caught, median 2,
+minimum 1, maximum 18, and no measurement the harness refused to trust.**
+
+The maximum moved 8 -> 18 and now sits on `serialize._num` rather than the Money
+gate. That is not a better result. Eight of those 18 are one test parametrised
+over the eight statements and six more are `costs_data` assertions that each read
+a number, so it is four concerns fanned out over a chokepoint every payload flows
+through -- whereas the gate's 8 are eight different layers applying one rule. The
+headline number cannot tell those apart, which is the argument for keeping the
+per-mutant test lists in the output and not just the counts.
+
+Net effect on the original hunch: the suite grew from 595 to 642 tests and
+nothing was deleted. What got deleted was code.
 
 ### The method, because it produced three false results first
 
@@ -227,7 +297,7 @@ Independently shippable, in order. Effort is my estimate of focused work.
 | ~~2~~ | ~~Mutation survey~~ — **DONE**: 16 defects, table above. | — | — |
 | ~~3~~ | ~~Cut redundant tests~~ — **DONE, as nothing to cut**: median 2 tests/defect. Instead CLOSED the two zeroes (`f3a23dd`, `3709773`). | — | — |
 | ~~4~~ | ~~Scope `assert_not_real` by data~~ — **DONE** (`1370bca`), and it unblocked the survey. | — | — |
-| 4b | Sentinels for the remaining audit findings: `analysis.py` (abs on quantity, `credit_fills` `>` vs `>=`, fee currency attribution, the FEES gate, withholding sign), `serialize._wire` enum leak, `positions_data` cost-basis fallback, `render.table` header sizing, `web._strikes_of` side-from-last-fill, `flex` cooldown ordering, `sources._qty` fractional branch. | Each is a real output change no test sees; two of the same batch were verified and closed in `a1f34d1`. | M |
+| ~~4b~~ | ~~Sentinels for the remaining audit findings~~ — **DONE** (`8ff9a4e`, `952a007`, `3e82b21`). Ten mutants written first: **2 caught, 8 uncaught**. See below. | — | — |
 | 5 | Add `broker` to the schema; make `(broker, trade_id)` the identity. Migrate the existing journal as `ibkr`. | Cheap now, expensive after a second broker's rows land. | M |
 | 6 | Honour `account_id` in the domain queries, or state in the README that one file means one account. | Latent silent-merge defect; same scoping fix as step 5. | M |
 | 7 | Introduce `NormalisedFill` + a `StatementSource` Protocol; move py_ibkr attribute reads out of `ingest.py` into `sources/ibkr.py`. Registry like `SCOPE_BUILDERS`. | The actual seam. Makes a second broker additive rather than invasive. | L |
