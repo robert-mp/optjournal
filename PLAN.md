@@ -390,16 +390,32 @@ Not the algorithm. Three things around it:
    broker will answer differently. **Whatever is built must record which
    convention produced a number**, which is what `Episode.net_of_commission`
    already does for IBKR and would have to do for itself.
-2. **Lot matching is a tax method, not a universal.** FIFO is one choice; IBKR
-   also offers LIFO, MaxLoss and specific-lot, and the archive already carries an
-   `SL` note code (specific-lot) on the SIVE sale — `history.py:33` documents that
-   code as a lot-matching method precisely so it is not mistaken for a closure
-   type. A computed figure silently labelled FIFO would be wrong for an account
-   using anything else, and would disagree with the broker's own tax reporting,
-   which is the number that matters in April. The measurement above cannot detect
-   this, per the caveat: full liquidations hide the method entirely. **The first
-   partial close in the archive is the test case that would settle it**, and it is
-   worth adding a guard that flags a divergence rather than discovering it later.
+2. **This account ALREADY sells specific lots, and a computed figure can never
+   follow that.** Not a hypothetical about some future broker: the SIVE sale
+   carries `notes="SL"` — IBKR's specific-lot marker, which `history.py:33`
+   documents as a lot-matching method precisely so it is not mistaken for a
+   closure type.
+
+   Which lots were sold is reported in IBKR's LOT-LEVEL detail:
+   `origTradeID`, `origTradePrice`, `origTradeDate`, `holdingPeriodDateTime`.
+   py_ibkr models all four and `raw` preserves all four, so nothing is being
+   dropped here. They are EMPTY because the Flex query asks for
+   `levelOfDetail="EXECUTION"`, and lot detail is a different level the query
+   template does not enable.
+
+   So the limit is structural rather than a matter of effort: **no computation
+   over execution-level fills can reproduce specific-lot selection**, because the
+   lot-to-close mapping is the input it lacks. FIFO agreed on SIVE only because
+   the sale was a full liquidation — every lot consumed, so FIFO, LIFO and
+   specific-lot all give basis 62,592.00. On a partial close, which is exactly
+   the trade you make to optimise tax, FIFO reports the wrong gain and in the
+   direction that overstates it.
+
+   **This is a broker-side config question, not a code one.** If the journal
+   should report a true specific-lot basis, the change is to the Flex query
+   template, and it is worth knowing before relying on these numbers in April.
+   `raw` has been preserving the fields all along, so enabling lot detail needs
+   no refetch of anything already archived.
 3. **It changes the domain's core, and every headline depends on it.**
    `realized_pnl_base` feeds win rate, profit factor, expectancy, the monthly and
    annual tables, cohorts, strategy groups and the calendar. There is no partial
@@ -460,10 +476,32 @@ Verified by ablation: charging one leg fails the real-data oracle with
 fails ONLY the hand-built test — confirming the archive genuinely cannot
 distinguish the methods.
 
-It is a test, not a feature: no schema change, no payload change, nothing in the
-domain reads it, and the walk lives in the test file rather than in `src` so it
-implies no decision task 9 has not made. If it ever fails, the failure IS the
-design input this task has been waiting for.
+**And the oracle now refuses to be reassuring.** It SKIPS, with a message, when
+every closed position is a full liquidation — which is the case today. A green
+tick would have read as "specific-lot handled" when the agreement says nothing
+about method at all. The predicate behind that skip (`_partially_closed`, computed
+from the running position rather than from `open_close`) has its own test, because
+both its failure modes are silent: under-report and the oracle skips forever,
+over-report and it starts asserting a method-sensitive agreement it has no
+evidence for.
+
+A second test pins the limitation itself: every lot field is empty across the
+archive, and one fill carries `SL`. Both are asserted, so the day a statement DOES
+carry lot detail — or the day this account stops using specific lots — the suite
+says the assumption changed rather than leaving it to be discovered in April.
+
+**What was deliberately NOT done: promoting the lot fields to columns.** I
+proposed it and then measured it: all 160 trades already carry all six fields in
+`raw`, which is precisely the case db.py's docstring describes ("a field can be
+promoted to a real column later without re-fetching"). Six always-empty columns
+plus a migration would store data that is already stored, to serve a feature that
+does not exist. The test asserting they are empty is the whole cost of staying
+ready.
+
+It is tests, not features: no schema change, no payload change, nothing in the
+domain reads any of it, and the walk lives in the test file rather than in `src`
+so it implies no decision task 9 has not made. If any of it fails, the failure IS
+the design input this task has been waiting for.
 
 **Then, when a second broker is real**: read one statement. Whether it supplies
 per-fill realised P&L decides whether the fallback is needed at all, and its

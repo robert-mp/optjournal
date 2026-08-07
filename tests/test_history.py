@@ -673,6 +673,15 @@ def test_computed_fifo_pnl_agrees_with_the_brokers_own_figure(tmp_path):
     would pass a total-only check. Tolerance is a cent: both sides are floats over
     six-figure notionals, and IBKR itself rounds its published figure (68683.68
     against a computed 68683.68001).
+
+    Only over contracts with a PARTIAL close. That restriction is the point, and
+    it currently makes this test skip -- see the assertion at the bottom, which
+    fails if there are no partial closes rather than passing quietly. A full
+    liquidation consumes every lot, so FIFO, LIFO and specific-lot all produce the
+    same basis and agreement proves nothing about the METHOD. Both closed
+    positions in the archive are full liquidations, and one of them
+    (`notes="SL"`) was closed by SPECIFIC-LOT selection while still matching a
+    FIFO walk to the cent -- exactly the false reassurance this guards against.
     """
     conn = connect_migrated(tmp_path / "fifo.db")
     for path in STATEMENTS:
@@ -680,7 +689,7 @@ def test_computed_fifo_pnl_agrees_with_the_brokers_own_figure(tmp_path):
 
     rows = [dict(r) for r in conn.execute(
         "SELECT conid, symbol, quantity, trade_price, multiplier, ib_commission,"
-        " fifo_pnl_realized FROM trades WHERE asset_category IN ('OPT','STK')"
+        " fifo_pnl_realized, notes FROM trades WHERE asset_category IN ('OPT','STK')"
         " ORDER BY COALESCE(date_time, trade_date), trade_id"
     )]
     assert rows, "the archive should hold option and stock fills"
@@ -709,6 +718,95 @@ def test_computed_fifo_pnl_agrees_with_the_brokers_own_figure(tmp_path):
         )
 
     assert sum(computed.values()) == pytest.approx(sum(reported.values()), abs=0.01)
+
+    # And the part that stops a green run from reading as more than it is.
+    partial = _partially_closed(rows)
+    if not partial:
+        pytest.skip(
+            "every closed position in the archive is a FULL liquidation, so this "
+            "agreement says nothing about lot-matching METHOD -- FIFO, LIFO and "
+            "specific-lot all give the same basis when every lot is consumed. "
+            "Skipped rather than passed on purpose: a green tick here would read "
+            "as 'specific-lot handled'. The first partial close makes this test "
+            "meaningful, and it is the case that decides PLAN.md task 9."
+        )
+
+
+def _partially_closed(rows: list[dict]) -> set[str]:
+    """Contracts whose position was reduced without reaching flat.
+
+    The only case where lot-matching method is OBSERVABLE. Computed from the
+    running position rather than from `open_close`, so a mislabelled fill cannot
+    hide one.
+    """
+    position: dict[str, float] = {}
+    partial: set[str] = set()
+    for row in rows:
+        key = str(row["conid"])
+        before = position.get(key, 0.0)
+        after = before + float(row["quantity"])
+        # Reduced toward zero but did not reach it, and was not a fresh open.
+        if before != 0 and abs(after) < abs(before) and abs(after) > 1e-9:
+            partial.add(key)
+        position[key] = after
+    return partial
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_specific_lot_selection_leaves_no_trace_this_journal_can_follow():
+    """The limitation, pinned so it is discovered here rather than in April.
+
+    A sale closed by SPECIFIC-LOT selection reports which lots were sold in
+    IBKR's lot-level detail -- `origTradeID`, `origTradePrice`, `origTradeDate`,
+    `holdingPeriodDateTime`. py_ibkr models all four and `raw` preserves all four,
+    so nothing is being dropped by this code. They are EMPTY because the Flex
+    query asks for `levelOfDetail="EXECUTION"`, and lot detail is a different
+    level the query template does not enable.
+
+    That is the honest limit: no computed P&L can reproduce specific-lot selection
+    from execution-level data, because the lot-to-close mapping is the input it
+    lacks. It is not hypothetical -- this account already sells specific lots
+    (`notes="SL"`), and got the right answer only because the sale was a full
+    liquidation, where the method cannot matter.
+
+    Asserted rather than commented so that the day a statement DOES carry lot
+    detail, this test fails and says the assumption changed. That is the trigger
+    to reconsider, and it costs no schema: `raw` already holds the fields.
+    """
+    from optjournal.flex import load
+    from optjournal.sources import _notes
+
+    lot_fields = ("origTradeID", "origTradePrice", "origTradeDate",
+                  "holdingPeriodDateTime")
+    seen_sl = False
+    populated: list[str] = []
+
+    for path in STATEMENTS:
+        for stmt in load(path).FlexStatements:
+            for trade in stmt.Trades or ():
+                # Through `sources._notes`, because py_ibkr hands back a LIST of
+                # Code enum members -- `str()` on it gives
+                # "[<Code.SPECIFICLOT: 'SL'>]", so a naive split finds no 'SL'
+                # token and this test would silently stop describing the account.
+                if "SL" in split_notes(_notes(trade.notes)):
+                    seen_sl = True
+                for field in lot_fields:
+                    value = getattr(trade, field, None)
+                    # origTradePrice arrives as "0" rather than empty when absent.
+                    if value not in (None, "", 0, "0"):
+                        populated.append(f"{trade.symbol}.{field}={value!r}")
+
+    assert seen_sl, (
+        "no fill in the archive carries the SL (specific-lot) note, so this test "
+        "no longer describes the account -- re-check whether lot selection is "
+        "still in use before trusting a computed P&L"
+    )
+    assert not populated, (
+        f"a statement now carries lot-level detail: {populated[:5]}. The Flex "
+        f"query must have moved off levelOfDetail=EXECUTION, which means specific-"
+        f"lot selection is finally followable -- see PLAN.md task 9, and note that "
+        f"`raw` has been preserving these fields all along, so no refetch is needed."
+    )
 
 
 def test_the_fifo_walk_charges_both_legs_commission():
@@ -770,3 +868,30 @@ def test_the_fifo_walk_handles_reentry_after_a_full_close():
     ]
     # Only the first round trip realises: (15 - 10) x 4 = 20. The re-entry is open.
     assert _fifo_realized(rows)["C1"] == pytest.approx(20.0)
+
+
+def test_a_partial_close_is_distinguished_from_a_full_one():
+    """The predicate the oracle's skip depends on, so it needs its own test.
+
+    If `_partially_closed` under-reports, the oracle skips forever and the
+    limitation is never surfaced. If it over-reports, the oracle starts asserting
+    a method-sensitive agreement it has no evidence for. Both failures are silent,
+    which is why this checks all three shapes rather than the interesting one.
+
+    Re-entry is the case worth naming: closed to flat then reopened is TWO
+    episodes, not a partial close, and the lot-matching method is unobservable in
+    both -- the same distinction `history.py` makes by keying on episodes rather
+    than contracts.
+    """
+    def fills(*quantities):
+        return [{"conid": "C1", "quantity": q} for q in quantities]
+
+    # 400 + 1,400 in, 1,800 out: the real SIVE shape. Every lot consumed.
+    assert _partially_closed(fills(400, 1400, -1800)) == set()
+    # Same lots, only 1,000 sold: 800 survive, so which 800 depends on the method.
+    assert _partially_closed(fills(400, 1400, -1000)) == {"C1"}
+    # Flat then reopened: two episodes, neither partial.
+    assert _partially_closed(fills(4, -4, 9)) == set()
+    # A short, since the sign of "reduced toward zero" flips.
+    assert _partially_closed(fills(-10, 4)) == {"C1"}
+    assert _partially_closed(fills(-10, 10)) == set()

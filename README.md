@@ -84,11 +84,25 @@ Realised P&L is the one worth naming explicitly, because it is stated rather tha
 derived and that is a choice. IBKR's `fifoPnlRealized` is already net of both
 legs' commission (verified arithmetically — see `history.py`'s docstring), and
 every headline the journal shows depends on it: win rate, profit factor,
-expectancy, the monthly and annual tables, cohorts, strategy groups. A broker that
-does not supply it would force this journal to compute FIFO itself. That is
-designed but not built — PLAN.md task 9 — and a test in `test_history.py` already
-reconstructs the figure from fills alone and asserts it matches IBKR's to the
-cent, so the day it stops matching, the suite says so.
+expectancy, the monthly and annual tables, cohorts, strategy groups.
+
+**Why it stays stated.** A test reconstructs the figure from fills alone and
+matches IBKR to the cent, so computing it is possible. It is still the wrong
+default, for a reason specific to this account: the SIVE sale carries `notes="SL"`,
+IBKR's SPECIFIC-LOT marker. Which lots were sold lives in lot-level detail
+(`origTradeID`, `origTradePrice`, `holdingPeriodDateTime`) that the Flex query does
+not request, so no computation over execution-level fills can reproduce it — the
+mapping is the missing input, not the arithmetic. FIFO agreed on SIVE only because
+that sale was a full liquidation, where every lot is consumed and FIFO, LIFO and
+specific-lot give the same basis. On a partial close it would be wrong, and wrong
+in the direction that overstates the gain.
+
+So the broker's figure is preferred wherever a broker supplies one: it already
+reflects lot selection and a computed figure never can. The oracle **skips rather
+than passes** while every close is a full liquidation, so a green run cannot be
+mistaken for "specific-lot handled", and a second test asserts the lot fields are
+empty — the day one arrives, the suite says the assumption changed. PLAN.md task 9
+has the design for the fallback a broker that reports nothing would need.
 
 Its output reaches the replay panel and nowhere else, through `bars.py`: the
 expected-move band, the per-bar P&L on the scorecard, and the effective-delta
