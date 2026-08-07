@@ -95,6 +95,36 @@ export function clampIndex(value, length) {
   return Math.max(0, Math.min(length - 1, index));
 }
 
+/** The same clamp, keeping the fraction between bars.
+ *
+ * Playback used to step one whole bar per timer tick, so the marker jumped from
+ * data point to data point. This is what lets it MOVE instead: a fractional
+ * position interpolates the marker's x and the reveal clip, while every VALUE
+ * still comes from a real bar (see frameAt).
+ */
+export function clampPosition(value, length) {
+  const position = Number(value);
+  if (!Number.isFinite(position) || length < 1) return 0;
+  return Math.max(0, Math.min(length - 1, position));
+}
+
+/** Linear x for a fractional position between two bars.
+ *
+ * Only the GEOMETRY is interpolated. The x axis is ordinal -- bars are evenly
+ * spaced by index, not by clock -- so a straight line between neighbouring xs is
+ * exactly where the marker belongs, with no assumption about elapsed time. A
+ * session gap is one index step like any other, which is why the chart marks
+ * breaks separately (sessionBreaks) rather than spacing them out.
+ */
+export function xAtPosition(xs, position) {
+  if (!xs.length) return 0;
+  const clamped = clampPosition(position, xs.length);
+  const low = Math.floor(clamped);
+  const high = Math.min(xs.length - 1, low + 1);
+  const t = clamped - low;
+  return xs[low] + (xs[high] - xs[low]) * t;
+}
+
 /** Everything the panel shows for one scrub position.
  *
  * `revealWidth` is the clip that HIDES the future: a replay you can see the end
@@ -105,18 +135,29 @@ export function clampIndex(value, length) {
  * than by shared index: the marks series is shorter than the bars whenever a
  * leading bar had no solvable vol, so index alignment would silently report an
  * earlier bar's P&L against a later bar's price.
+ *
+ * A FRACTIONAL `value` is accepted, and this is the line between smooth motion
+ * and fabricated data. `x` and `revealWidth` interpolate, so the marker glides.
+ * `index`, `ts`, `price`, `pnl` and `delta` snap to the NEAREST REAL BAR, so
+ * every number the panel prints is one a bar actually recorded. Interpolating
+ * those would contradict markAt directly, whose whole point is that a
+ * neighbouring bar's P&L presented as this bar's is a quiet fabrication -- and a
+ * price between two closes is a price the option never traded at.
  */
 export function frameAt(state, value) {
   const { points, marks = [], xs } = state;
-  const index = clampIndex(value, points.length);
+  const position = clampPosition(value, points.length);
+  const index = clampIndex(Math.round(position), points.length);
   const [ts, price] = points[index];
   const mark = markAt(marks, ts);
+  const x = xAtPosition(xs, position);
   return {
     index,
+    position,
     ts,
     price,
-    x: xs[index],
-    revealWidth: xs[index] + 1.2,
+    x,
+    revealWidth: x + 1.2,
     pnl: mark ? mark[1] : null,
     delta: mark ? mark[2] : null,
   };

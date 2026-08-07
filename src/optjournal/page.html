@@ -1432,7 +1432,11 @@ let RGEO=null, RTIMER=null;
    `isFinite("")` is true, so a blank stamp used to pass as a timestamp. */
 const timedEvents=rp=>(rp.events||[]).filter(e=>e&&Number.isFinite(e.ts));
 
-function replayStop(){ if(RTIMER){clearInterval(RTIMER);RTIMER=null;} }
+/* cancelAnimationFrame, since playback is a rAF loop rather than an interval --
+   it used to step one whole bar per setInterval tick, which is what made the
+   marker jump between data points. RTIMER is nulled BEFORE the cancel so a frame
+   already queued sees the null and returns instead of scheduling another. */
+function replayStop(){ if(RTIMER!==null){const h=RTIMER;RTIMER=null;cancelAnimationFrame(h);} }
 
 function replayChart(rp){
   const pts=(rp.points||[]).filter(p=>p&&isFinite(p[1]));
@@ -1651,26 +1655,43 @@ function bindReplayControls(){
   scrub.oninput=()=>{replayStop();if(play)play.textContent='▶ play';
     replaySeek(Number(scrub.value));};
   if(play) play.onclick=()=>{
-    if(RTIMER){replayStop();play.textContent='▶ play';return;}
+    if(RTIMER!==null){replayStop();play.textContent='▶ play';return;}
     /* Restart from the beginning when the cursor is already at the end,
        otherwise pressing play on a finished replay does nothing visible. */
     if(Number(scrub.value)>=Number(scrub.max)) scrub.value='0';
     play.textContent='❚❚ pause';
-    const step=Number((speed&&speed.value)||240);
-    RTIMER=setInterval(()=>{
-      const next=Number(scrub.value)+1;
-      if(next>Number(scrub.max)){
+    /* requestAnimationFrame, not setInterval stepping whole bars. The speed
+       control still means "milliseconds per bar", so the same setting plays at
+       the same rate -- but the position advances by elapsed/step per frame, a
+       FRACTION of a bar, which is what makes the marker glide instead of jumping
+       between data points. frameAt interpolates only the geometry from that
+       fraction; every value it reports still comes from a real bar. */
+    const perBar=Number((speed&&speed.value)||240);
+    const max=Number(scrub.max);
+    let position=Number(scrub.value), last=null;
+    const tick=(now)=>{
+      if(RTIMER===null) return;                    /* stopped mid-frame */
+      if(last===null) last=now;
+      position+=(now-last)/perBar;
+      last=now;
+      if(position>=max){
         /* Loop rather than stop, when asked. A short trade is 20-odd bars, which
            is over in a few seconds -- watching it twice is often how the shape
            registers. */
         const loop=$('#rloop');
-        if(loop&&loop.checked){scrub.value='0';replaySeek(0);return;}
-        replayStop();play.textContent='▶ play';return;
+        if(loop&&loop.checked){position=0;}
+        else{scrub.value=String(max);replaySeek(max);
+             replayStop();play.textContent='▶ play';return;}
       }
-      scrub.value=String(next);replaySeek(next);
-    },step);
+      /* The range input is integral, so it tracks the nearest bar while the
+         drawing follows the fraction -- the scrubber stays a bar selector. */
+      scrub.value=String(Math.round(position));
+      replaySeek(position);
+      RTIMER=requestAnimationFrame(tick);
+    };
+    RTIMER=requestAnimationFrame(tick);
   };
-  if(speed) speed.onchange=()=>{ if(RTIMER&&play){play.onclick();play.onclick();} };
+  if(speed) speed.onchange=()=>{ if(RTIMER!==null&&play){play.onclick();play.onclick();} };
   /* Jump to either end, or to an event. Stops playback first: leaving a timer
      running would have it march away from the position just asked for. The
      annotation cards carry data-rseek too, which makes the strip a table of

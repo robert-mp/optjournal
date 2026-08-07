@@ -47,3 +47,6 @@ build/
 # Assistant tooling: workflow scripts and session state, not project source.
 # Written here by the harness rather than by anyone working on the journal.
 .claude/
+
+# Playwright MCP scratch (console logs from browser verification runs).
+.playwright-mcp/

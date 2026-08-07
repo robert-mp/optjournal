@@ -11,9 +11,11 @@ import test from "node:test";
 import {
   bandEdges,
   clampIndex,
+  clampPosition,
   deltaDomain,
   domainOf,
   frameAt,
+  xAtPosition,
   indexOfTs,
   markAt,
   plotGeometry,
@@ -258,4 +260,88 @@ test("a reached card and its fill dot agree at every frame", () => {
 test("an event with no timestamp is never reached", () => {
   // A malformed event must not render as having happened at the epoch.
   assert.deepEqual(reachedEvents([{ ts: null }, {}], 9999), []);
+});
+
+/* ------------------------------------------------------------------ smoothing
+ *
+ * Playback used to step one whole bar per setInterval tick, so the marker jumped
+ * from data point to data point. It now advances by a FRACTION of a bar per
+ * animation frame, which means frameAt takes fractional positions -- and the
+ * line these tests defend is which outputs may follow that fraction. Geometry
+ * may; values may not, because a price between two closes is a price the option
+ * never traded at and a P&L between two marks is one markAt exists to refuse.
+ */
+
+test("a fractional position keeps its fraction, and is still clamped", () => {
+  assert.equal(clampPosition(1.5, 3), 1.5);
+  assert.equal(clampPosition("0.25", 3), 0.25);
+  assert.equal(clampPosition(-2, 3), 0);
+  assert.equal(clampPosition(99, 3), 2);
+  assert.equal(clampPosition("nonsense", 3), 0);
+  assert.equal(clampPosition(1.5, 0), 0);
+});
+
+test("x interpolates linearly between neighbouring bars", () => {
+  const xs = [0, 10, 20];
+  assert.equal(xAtPosition(xs, 0), 0);
+  assert.equal(xAtPosition(xs, 1), 10);
+  assert.equal(xAtPosition(xs, 0.5), 5);
+  assert.equal(xAtPosition(xs, 1.25), 12.5);
+  // Clamped at both ends rather than extrapolating off-canvas.
+  assert.equal(xAtPosition(xs, 2.9), 20);
+  assert.equal(xAtPosition(xs, -1), 0);
+  assert.equal(xAtPosition([], 1.5), 0);
+});
+
+test("the marker glides but the readout does not lie", () => {
+  const geo = geometry();
+  const state = { points: PRICE, marks: [], xs: geo.xs };
+  const half = frameAt(state, 0.5);
+  const zero = frameAt(state, 0);
+  const one = frameAt(state, 1);
+
+  // Geometry follows the fraction: strictly between the two bars.
+  assert.ok(half.x > zero.x && half.x < one.x, "x did not interpolate");
+  assert.ok(half.revealWidth > zero.revealWidth
+            && half.revealWidth < one.revealWidth);
+
+  // Values snap to the nearest REAL bar. 0.5 rounds to bar 1.
+  assert.equal(half.price, one.price);
+  assert.equal(half.ts, one.ts);
+  assert.equal(half.index, 1);
+  // And 0.4 rounds the other way, so the readout is always some bar's own.
+  const low = frameAt(state, 0.4);
+  assert.equal(low.price, zero.price);
+  assert.equal(low.ts, zero.ts);
+  assert.ok(PRICE.some(([ts, px]) => ts === low.ts && px === low.price),
+            "the frame reported a price no bar recorded");
+});
+
+test("P&L and delta never interpolate", () => {
+  // markAt is exact-or-null by design: "a neighbouring bar's P&L presented as
+  // this bar's would be a quiet fabrication". A fractional position must not
+  // become the loophole in that rule.
+  const geo = geometry();
+  const marks = [[1000, 10, 0.1], [2000, 20, 0.2], [3000, 30, 0.3]];
+  const state = { points: PRICE, marks, xs: geo.xs };
+  for (const at of [0, 0.25, 0.5, 0.75, 1, 1.5, 2]) {
+    const frame = frameAt(state, at);
+    const mark = marks.find((m) => m[0] === frame.ts);
+    assert.ok(mark, `no mark for ts ${frame.ts}`);
+    assert.equal(frame.pnl, mark[1]);
+    assert.equal(frame.delta, mark[2]);
+  }
+});
+
+test("an integer position behaves exactly as it did before", () => {
+  // The regression guard: smoothing must not change what a scrubber at bar i
+  // shows, since the range input still selects whole bars.
+  const geo = geometry();
+  const state = { points: PRICE, marks: [], xs: geo.xs };
+  for (let i = 0; i < PRICE.length; i++) {
+    const frame = frameAt(state, i);
+    assert.equal(frame.index, i);
+    assert.equal(frame.x, geo.xs[i]);
+    assert.equal(frame.revealWidth, geo.xs[i] + 1.2);
+  }
 });

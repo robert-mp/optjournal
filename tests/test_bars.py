@@ -15,7 +15,8 @@ import pytest
 from conftest import add_statement, connect_migrated
 
 from optjournal.bars import (
-    CONTEXT_BARS,
+    CONTEXT_MAX_BARS,
+    CONTEXT_MIN_BARS,
     HOURLY_LIMIT_DAYS,
     MARKET_TZ,
     BackfillOutcome,
@@ -460,9 +461,61 @@ def test_context_is_counted_in_bars_not_calendar_days(conn):
     got = replay_bars(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
     kept = [ts for ts, _ in got.points]
     before = [ts for ts in kept if ts < _ts("2026-01-12")]
+    inside = [ts for ts in kept
+              if _ts("2026-01-12") <= ts <= _ts("2026-01-16") + DAY - 1]
     after = [ts for ts in kept if ts > _ts("2026-01-16") + DAY - 1]
-    assert len(before) == CONTEXT_BARS["1d"], f"{len(before)} bars of lead-in"
-    assert len(after) == CONTEXT_BARS["1d"], f"{len(after)} bars of run-out"
+    # 5 bars inside x 0.25 = 1.25, rounded to 1, floored to CONTEXT_MIN_BARS.
+    assert len(inside) == 5, f"{len(inside)} bars inside the window"
+    assert len(before) == CONTEXT_MIN_BARS, f"{len(before)} bars of lead-in"
+    assert len(after) == CONTEXT_MIN_BARS, f"{len(after)} bars of run-out"
+    # And the padding is a minority of the chart, which is the whole point.
+    assert len(before) + len(after) < len(inside)
+
+
+def test_context_scales_with_the_window_it_pads(conn):
+    """One fixed count cannot serve a two-hour 0DTE and a ten-day hold.
+
+    Measured on the real journal before this changed: a fixed 7-hourly-bar pad
+    (exactly one session, and reasonable for a multi-day trade) put 8 pad bars
+    around the 6 real ones of a position opened the day before -- 57% of the
+    chart -- and would have put 14 around 3 on a 0DTE held two hours.
+
+    Asserted as a RATIO rather than as counts, because the property that matters
+    is "the trade is the subject of its own chart", and a count would have to be
+    restated every time the fraction is tuned.
+    """
+    _option_trade(conn, conid="OPT1", symbol="BBB  260601P00100000",
+                  underlying="BBB", ucid="U2", date="2026-01-05", trade_id="o2")
+    # 120 daily bars, so a long window has room for real context either side.
+    bars = [_bar(_ts("2026-01-01") + n * DAY, 100.0 + n) for n in range(120)]
+    upsert_bars(conn, conid="U2", symbol="BBB", bar_size="1d",
+                source="yahoo", bars=bars)
+
+    def shape(opened: str, closed: str) -> tuple[int, int]:
+        got = replay_bars(conn, "BBB", opened_at=opened, closed_at=closed)
+        lo, hi = _ts(opened), _ts(closed) + DAY - 1
+        kept = [ts for ts, _ in got.points]
+        inside = sum(1 for ts in kept if lo <= ts <= hi)
+        return inside, len(kept) - inside
+
+    # A one-session trade: the floor applies, so context exists but is minimal.
+    short_in, short_pad = shape("2026-01-10", "2026-01-10")
+    assert short_in == 1, f"{short_in} bars inside a one-day window"
+    assert short_pad == 2 * CONTEXT_MIN_BARS, f"{short_pad} pad bars on 1 inside"
+
+    # A 40-session trade: proportional, and CAPPED. 40 x 0.15 = 6, above the
+    # daily ceiling of 5, which is the case that stops a LEAP from dragging in
+    # years of lead-in.
+    long_in, long_pad = shape("2026-01-10", "2026-02-18")
+    assert long_in == 40, f"{long_in} bars inside a 40-day window"
+    assert long_pad == 2 * CONTEXT_MAX_BARS["1d"], (
+        f"{long_pad} pad bars: a long window should hit the ceiling, not scale "
+        f"forever -- three years of context around a LEAP is a different chart"
+    )
+
+    # The ratio is what a reader sees, and it must improve with window length.
+    assert long_pad / long_in < short_pad / short_in
+    assert long_pad / (long_pad + long_in) < 0.25
 
 
 def test_the_closing_session_belongs_to_the_trade(conn):

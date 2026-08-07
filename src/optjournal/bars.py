@@ -95,21 +95,65 @@ HOURLY_LIMIT_DAYS = 40
 #: bars land on one timeline without conversion.
 MARKET_TZ = ZoneInfo("America/New_York")
 
-#: Bars of context kept either side of the trade window when CHARTING. Counted
-#: in bars, not calendar days: PAD_DAYS is what gets FETCHED (wide is free and
-#: already stored), but four calendar days rendered 45-58% of every chart as
-#: padding -- on a ten-bar GOOG trade the lead-in was larger than the trade. It
-#: also varied with the weekday, since Thursday plus four days is two sessions
-#: while Monday plus four is four. One session of hourly context answers "what
-#: was it doing just before I entered"; a daily chart gets a few sessions,
-#: because at that grid one bar either side is invisible.
-CONTEXT_BARS = {"1h": 7, "1d": 3}
+#: Context either side of the trade window when CHARTING, as a FRACTION of the
+#: window itself. PAD_DAYS is what gets FETCHED (wide is free and already
+#: stored); this is what gets drawn.
+#:
+#: Proportional rather than fixed, because a fixed count cannot serve both ends
+#: of the range. The previous rule kept 7 hourly bars -- exactly one session, and
+#: a reasonable answer for a multi-day hold -- but on a one-day-old position that
+#: is 8 pad bars around 6 real ones, 57% of the chart, and on a 0DTE held two
+#: hours it would be 14 around 3. Measured on the real journal, not estimated.
+#:
+#: 0.15 rather than a larger share because the preference is explicitly for LESS
+#: padding: it holds the pad at or under ~25% of the chart for every window
+#: length the journal actually produces, where 0.25 peaked at 40%. Tabulated
+#: across 1..757 bars before choosing, not guessed.
+CONTEXT_FRACTION = 0.15
+
+#: Floor and ceiling on that fraction, in bars.
+#:
+#: The floor is ONE bar. It exists so the shortest trades keep an answer to "what
+#: was it doing just before I entered" -- pure proportionality gives a one-bar
+#: trade no lead-in at all, which loses the only thing the padding is for. One
+#: rather than two because two makes a 1-bar trade 80% padding, which is worse
+#: than the fixed rule this replaces; at a floor of one it is 67%, and a chart
+#: with a single bar inside has no good answer anyway.
+#:
+#: The ceiling exists because context stops paying at some width: three years of
+#: daily bars around a LEAP is not context, it is a different chart. Per bar size
+#: because a session is 7 hourly bars but 1 daily one, so the same number means
+#: different things -- 7 hourly bars is one session of lead-in, 5 daily bars is a
+#: trading week.
+CONTEXT_MIN_BARS = 1
+CONTEXT_MAX_BARS = {"1h": 7, "1d": 5}
+
+#: Calendar days of bars READ either side of a window, before trimming. Wider
+#: than any ceiling above can keep, so the trim decides the chart rather than the
+#: query silently capping it. Free: these rows are already stored locally.
+_READ_PAD_DAYS = 14
 
 #: How far back to look for a contract whose opening fill predates the archive.
 #: The source truncates to whatever it actually holds -- a 2025-01-01 request
 #: for the LEAP returned bars from 2025-02-03, the contract's listing date --
 #: so asking wide costs nothing and needs no guess about an unknown open date.
 SNAPSHOT_FLOOR_DAYS = 1100
+
+#: Bars DRAWN for a contract whose open date is unknown. Fetching 1100 days is
+#: right (see above); charting all of them is not -- the real LEAP produced 757
+#: daily points spanning three years for a position held about one, and a chart
+#: that wide answers a different question than "how has this position behaved".
+#:
+#: A count rather than a date, because the honest statement is "we do not know
+#: when this was opened" and any date would be a guess. Anchored on the RIGHT
+#: edge: the most recent bars are the ones a holder is actually looking at, and
+#: truncating the left says nothing false -- the series simply starts where the
+#: chart starts, as it already does for a contract whose history begins at its
+#: listing date.
+#:
+#: Two years of sessions, so a LEAP still shows its whole life when its life is
+#: shorter than that, and the longest-dated one shows the part that matters.
+SNAPSHOT_DRAW_BARS = 504
 
 _COLUMNS = (
     "conid", "symbol", "bar_size", "ts",
@@ -1091,16 +1135,28 @@ def delta_around(marks: list[list[float]], stamp: int) -> tuple[float | None, fl
 def _trim_to_context(
     points: list[tuple[int, float]], start: int, end: int, bar_size: str
 ) -> list[tuple[int, float]]:
-    """The trade window plus a bounded number of bars either side.
+    """The trade window plus context proportional to it, floored and capped.
 
     Trimming by BAR COUNT rather than by clock is what keeps two charts
     comparable: a window measured in calendar days lands on a different number
     of sessions depending on which weekday the trade opened, and once the x axis
     is ordinal a calendar-day pad has no consistent width at all.
+
+    The COUNT is proportional to the window because one number cannot serve a
+    two-hour 0DTE and a ten-day hold. See CONTEXT_FRACTION for the measurements;
+    the short version is that a fixed one-session pad made a day-old position 57%
+    padding, and the floor and ceiling keep the proportional rule honest at both
+    extremes.
+
+    Bars are counted, not timestamps -- so a weekend or a holiday inside the
+    window costs nothing, and the padding is the same shape on a Monday trade as
+    on a Thursday one.
     """
-    keep = CONTEXT_BARS.get(bar_size, 3)
-    before = [p for p in points if p[0] < start]
     inside = [p for p in points if start <= p[0] <= end]
+    ceiling = CONTEXT_MAX_BARS.get(bar_size, CONTEXT_MIN_BARS)
+    keep = max(CONTEXT_MIN_BARS,
+               min(ceiling, round(len(inside) * CONTEXT_FRACTION)))
+    before = [p for p in points if p[0] < start]
     after = [p for p in points if p[0] > end]
     return before[-keep:] + inside + after[:keep]
 
@@ -1143,15 +1199,27 @@ def replay_bars(
         # Its window is unknown, so draw every bar held rather than inventing an
         # entry date by matching cost basis against the series.
         start = 0
-    pad = PAD_DAYS * 86400
+    # Read WIDER than any trim could keep, so `_trim_to_context` is the only
+    # thing deciding how much context is drawn. PAD_DAYS (4) was used here, and
+    # it silently capped the daily ceiling at ~4 bars: a request for 5 could not
+    # be honoured because the read window did not contain a fifth. Two weeks
+    # covers the widest ceiling at both granularities (7 hourly bars is one
+    # session, 5 daily bars is a trading week) with room for weekends and
+    # holidays, and reading more rows from a local SQLite table is free.
+    pad = _READ_PAD_DAYS * 86400
     lo, hi = max(0, start - pad), end + pad
     preferred = _bar_size_for(start or lo, end, kind="underlying")
     for size in (preferred, "1d" if preferred == "1h" else "1h"):
         points = close_series(conn, conid, bar_size=size, start=lo, end=hi)
         if points:
-            # An unknown window (snapshot-only) has nothing to be context FOR,
-            # so everything held is the answer rather than a trimmed slice.
             if start:
                 points = _trim_to_context(points, start, end, size)
+            else:
+                # An unknown window (snapshot-only) has nothing to be context
+                # FOR, so there is no window to pad -- but "everything held" was
+                # 757 daily bars over three years for the LEAP. Keep the most
+                # recent stretch instead: no date is invented, and the bars kept
+                # are the ones a holder is looking at.
+                points = points[-SNAPSHOT_DRAW_BARS:]
             return ReplaySeries(conid=conid, bar_size=size, points=points)
     return ReplaySeries(conid=conid, bar_size=preferred)
