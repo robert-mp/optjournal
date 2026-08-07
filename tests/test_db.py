@@ -333,7 +333,9 @@ def test_fractional_stock_quantities_survive_ingest(tmp_path):
     """
     import json
 
-    from optjournal.ingest import _qty
+    # From `sources`, not `ingest`: quantity coercion is the reading half of the
+    # broker seam, so it moved there with the rest of the vocabulary.
+    from optjournal.sources import _qty
 
     assert _qty("3") == 3 and isinstance(_qty("3"), int)
     assert _qty("-2.0") == -2 and isinstance(_qty("-2.0"), int)

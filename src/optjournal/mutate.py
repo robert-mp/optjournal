@@ -328,6 +328,28 @@ MUTANTS: tuple[Mutant, ...] = (
         breaks="whichever broker filed most recently would decide what counts as "
                "current for all of them, so a lagging broker's book vanishes",
     ),
+    # NO MUTANT for the `securities` and `equity_summaries` keys, and the reason is
+    # worth recording rather than leaving as an omission.
+    #
+    # Both were keyed on IBKR's own identifier (`conid`, `report_date`) and are now
+    # `(broker, ...)`. That was a real defect -- both tables UPSERT, so a second
+    # broker's row REPLACED the first's -- and it is guarded, by
+    # `test_a_second_brokers_rows_are_stored_not_swallowed` and
+    # `test_a_broker_overwriting_anothers_contract_definition_is_impossible`, both
+    # verified by ablation.
+    #
+    # It cannot be expressed as a mutant here because SQLite requires an upsert's
+    # ON CONFLICT target to match a key EXACTLY. Narrow the DDL and the writer's
+    # target no longer matches; narrow the writer and it no longer matches the DDL.
+    # Either way the ingest raises "ON CONFLICT clause does not match any PRIMARY
+    # KEY", which ~109 tests report -- a loud crash rather than the silent overwrite
+    # the defect really was. A mutant that measures a crash tells you nothing about
+    # whether the suite understands the invariant, and a 109 in the table would
+    # read as strong coverage of something it never tested.
+    #
+    # The mutable half of this defect class IS covered: `broker-stamp` (the writer
+    # ignoring its broker argument) and `legs-merge` (a view grouping without it)
+    # are both silent, and both are caught.
     Mutant(
         key="held-scope",
         module="history.py",

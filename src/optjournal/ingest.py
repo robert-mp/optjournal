@@ -29,8 +29,6 @@ from pathlib import Path
 from typing import Any
 
 from optjournal.db import DEFAULT_BROKER
-from optjournal.flex import load
-from optjournal.sections import raw_sections
 from optjournal.sources import source_for
 
 __all__ = [
@@ -83,35 +81,11 @@ def _f(value: Any) -> float | None:
         return None
 
 
-def _qty(value: Any) -> int | float | None:
-    """Coerce a quantity, keeping integers exact and fractions lossless.
-
-    Options quantities are always integral and are stored as ints, which is
-    what keeps the episode flat-test exact. Stock and currency quantities are
-    legitimately fractional -- dividend reinvestment buys 1.79 shares, and a
-    full SIVE sale was 413.22 of them -- so those keep their value rather
-    than being truncated to a different position size. SQLite's INTEGER
-    affinity stores a non-integral value as REAL, losslessly.
-    """
-    f = _f(value)
-    if f is None:
-        return None
-    i = int(round(f))
-    return i if abs(f - i) < 1e-9 else f
-
-
 def _s(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value)
     return text or None
-
-
-def _enum_value(value: Any) -> str | None:
-    """py_ibkr yields Enum members; store the wire value, not 'Class.NAME'."""
-    if value is None:
-        return None
-    return _s(getattr(value, "value", value))
 
 
 def _matches_filter(asset_category: str | None, wanted: Iterable[str]) -> bool:
@@ -178,11 +152,16 @@ def ingest_file(
             )
             return result
 
-    resp = load(path)
-    sections = raw_sections(path)
     asset_filter = ",".join(assets) or "ALL"
 
-    for stmt in resp.FlexStatements:
+    # Every section arrives through the broker seam (sources.py). Nothing below
+    # reads a py_ibkr model or an IBKR attribute name, so a second broker is a new
+    # StatementSource and an unchanged writer -- which is the whole claim the seam
+    # makes, and which was only true of the trade path until now.
+    #
+    # Provenance first: `statements.source_file` is a foreign key from every other
+    # table, so its row has to exist before theirs.
+    for meta in source.metadata(path):
         conn.execute(
             "INSERT INTO statements (broker, source_file, sha256, account_id,"
             " from_date, to_date, when_generated, base_currency, asset_filter,"
@@ -195,40 +174,31 @@ def ingest_file(
                 broker,
                 path.name,
                 digest,
-                _s(stmt.accountId),
-                _s(stmt.fromDate),
-                _s(stmt.toDate),
-                _s(stmt.whenGenerated),
-                _base_currency(sections),
+                meta.account_id,
+                meta.from_date,
+                meta.to_date,
+                meta.generated_at,
+                meta.base_currency,
                 asset_filter,
                 _now(),
             ),
         )
 
-        _ingest_cash(conn, stmt, path.name, result, broker=broker)
-
-    # Trades come through the broker seam (sources.py), not by reading py_ibkr
-    # attributes here -- so a second broker is a new source, not an edit to this
-    # writer. Run after the statement rows above, because a trade's source_file
-    # references one. The other sections still read py_ibkr/raw dicts directly;
-    # moving them across the same boundary is future work, and the trade path is
-    # where the IBKR vocabulary was densest.
-    base_currency = _base_currency(sections)
+    base_currency = source.base_currency(path)
     for _account_id, fills in source.statements(path):
         _ingest_trades(conn, fills, path.name, assets, result,
                        base_currency=base_currency, broker=broker)
 
-    _ingest_positions(conn, sections, path.name, assets, result, broker=broker)
-    _ingest_securities(conn, sections, assets, result)
-    _ingest_equity_summaries(conn, sections, path.name, result)
+    _ingest_cash(conn, source.cash_transactions(path), path.name, result,
+                 broker=broker)
+    _ingest_positions(conn, source.positions(path), path.name, assets, result,
+                      broker=broker)
+    _ingest_securities(conn, source.securities(path), assets, result, broker=broker)
+    _ingest_equity_summaries(conn, source.equity_summaries(path), path.name, result,
+                             broker=broker)
 
     conn.commit()
     return result
-
-
-def _base_currency(sections: dict[str, list[dict[str, str]]]) -> str:
-    rows = sections.get("AccountInformation") or []
-    return (rows[0].get("currency") if rows else None) or "EUR"
 
 
 def _commission_base(
@@ -364,11 +334,10 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
             result.trades_skipped_existing += 1
 
 
-def _ingest_cash(conn, stmt, source_file: str, result: IngestResult,
+def _ingest_cash(conn, cash, source_file: str, result: IngestResult,
                  broker: str = DEFAULT_BROKER) -> None:
-    for c in stmt.CashTransactions or ():
-        rate = _f(c.fxRateToBase) or 1.0
-        amount = _f(c.amount) or 0.0
+    """Write broker-neutral cash transactions. `amount_base` is ours to derive."""
+    for c in cash:
         cur = conn.execute(
             "INSERT INTO cash_transactions (broker, transaction_id, account_id,"
             " date_time,"
@@ -378,11 +347,11 @@ def _ingest_cash(conn, stmt, source_file: str, result: IngestResult,
             " ON CONFLICT(broker, transaction_id) DO NOTHING",
             (
                 broker,
-                _s(c.transactionID), _s(stmt.accountId), _s(c.dateTime),
-                _s(getattr(c, "settleDate", None)), _enum_value(c.type),
-                _s(c.description), _s(c.symbol), _s(c.conid), amount,
-                _s(c.currency), rate, amount * rate,
-                json.dumps(_model_dump(c), default=str, sort_keys=True),
+                c.transaction_id, c.account_id, c.date_time,
+                c.settle_date, c.kind,
+                c.description, c.symbol, c.conid, c.amount,
+                c.currency, c.fx_rate_to_base, c.amount * c.fx_rate_to_base,
+                json.dumps(c.raw, default=str, sort_keys=True),
                 source_file, _now(),
             ),
         )
@@ -392,14 +361,15 @@ def _ingest_cash(conn, stmt, source_file: str, result: IngestResult,
             result.cash_skipped_existing += 1
 
 
-def _ingest_positions(conn, sections, source_file: str, assets, result,
+def _ingest_positions(conn, positions, source_file: str, assets, result,
                       broker: str = DEFAULT_BROKER) -> None:
-    for row in sections.get("OpenPositions") or ():
-        cat = (row.get("assetCategory") or "").upper()
+    """Write broker-neutral position snapshots, replacing the same day's row."""
+    for p in positions:
+        cat = p.asset_category or ""
         if not _matches_filter(cat, assets):
             continue
-        rate = _f(row.get("fxRateToBase")) or 1.0
-        value = _f(row.get("positionValue"))
+        rate = p.fx_rate_to_base
+        value = p.position_value
         conn.execute(
             "INSERT INTO position_snapshots (broker, report_date, conid, account_id,"
             " symbol,"
@@ -417,107 +387,88 @@ def _ingest_positions(conn, sections, source_file: str, assets, result,
             " ingested_at=excluded.ingested_at",
             (
                 broker,
-                _s(row.get("reportDate")), _s(row.get("conid")),
-                _s(row.get("accountId")), _s(row.get("symbol")), cat,
-                _s(row.get("underlyingSymbol")), _s(row.get("putCall")),
-                _f(row.get("strike")), _s(row.get("expiry")),
-                _f(row.get("multiplier")), _qty(row.get("position")),
-                _f(row.get("markPrice")), value,
+                p.as_of, p.conid,
+                p.account_id, p.symbol, cat,
+                p.underlying_symbol, p.put_call,
+                p.strike, p.expiry,
+                p.multiplier, p.quantity,
+                p.mark_price, value,
                 None if value is None else value * rate,
-                _f(row.get("costBasisMoney")), _f(row.get("costBasisPrice")),
-                _f(row.get("fifoPnlUnrealized")), _s(row.get("side")),
-                _s(row.get("openDateTime")), _s(row.get("currency")) or "EUR",
-                rate, json.dumps(row, sort_keys=True), source_file, _now(),
+                p.cost_basis, p.cost_basis_price,
+                p.unrealized_pnl, p.side,
+                p.opened_at, p.currency or "EUR",
+                rate, json.dumps(p.raw, default=str, sort_keys=True),
+                source_file, _now(),
             ),
         )
         result.positions_written += 1
 
 
-def _ingest_securities(conn, sections, assets, result) -> None:
-    for row in sections.get("SecuritiesInfo") or ():
-        cat = (row.get("assetCategory") or "").upper()
+def _ingest_securities(conn, securities, assets, result,
+                       broker: str = DEFAULT_BROKER) -> None:
+    """Write broker-neutral contract definitions, upserting on (broker, conid)."""
+    for s in securities:
+        cat = s.asset_category or ""
         if not _matches_filter(cat, assets):
             continue
         conn.execute(
-            "INSERT INTO securities (conid, symbol, description, asset_category,"
+            "INSERT INTO securities (broker, conid, symbol, description,"
+            " asset_category,"
             " sub_category, currency, multiplier, strike, expiry, put_call,"
             " underlying_conid, underlying_symbol, isin, listing_exchange, raw,"
-            " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(conid) DO UPDATE SET"
+            " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(broker, conid) DO UPDATE SET"
             " symbol=excluded.symbol, description=excluded.description,"
             " raw=excluded.raw, updated_at=excluded.updated_at",
             (
-                _s(row.get("conid")), _s(row.get("symbol")),
-                _s(row.get("description")), cat, _s(row.get("subCategory")),
-                _s(row.get("currency")), _f(row.get("multiplier")),
-                _f(row.get("strike")), _s(row.get("expiry")),
-                _s(row.get("putCall")), _s(row.get("underlyingConid")),
-                _s(row.get("underlyingSymbol")), _s(row.get("isin")),
-                _s(row.get("listingExchange")), json.dumps(row, sort_keys=True),
+                broker,
+                s.conid, s.symbol,
+                s.description, cat, s.sub_category,
+                s.currency, s.multiplier,
+                s.strike, s.expiry,
+                s.put_call, s.underlying_conid,
+                s.underlying_symbol, s.isin,
+                s.listing_exchange,
+                json.dumps(s.raw, default=str, sort_keys=True),
                 _now(),
             ),
         )
         result.securities_written += 1
 
 
-def _ingest_equity_summaries(conn, sections, source_file: str, result) -> None:
-    """Daily Net Asset Value rows, from the EquitySummaryInBase section.
+def _ingest_equity_summaries(conn, navs, source_file: str, result,
+                             broker: str = DEFAULT_BROKER) -> None:
+    """Daily Net Asset Value rows.
 
-    Only present when the Flex query template has the "Equity Summary in Base"
-    section enabled; absent sections simply yield nothing here. NAV is the one
-    figure the trade ledger cannot reconstruct -- deriving cash needs a
-    starting balance no Activity statement carries -- so this is reported
+    NAV is the one figure the trade ledger cannot reconstruct -- deriving cash
+    needs a starting balance no Activity statement carries -- so this is reported
     data, not derived.
 
-    Field access is tolerant of IBKR's shape: some deployments emit a single
-    `cash`/`stock`/`options` figure, others split them into `*Long`/`*Short`
-    pairs. Both are accepted; `total` is required, because a NAV row without
-    a NAV is noise.
+    The tolerance for IBKR's two shapes (`cash` versus `cashLong`/`cashShort`)
+    moved to `sources._combined`, where the vocabulary belongs. A row missing its
+    total is dropped by the source, so there is nothing to warn about here: the
+    warning it used to emit named `reportDate`, an IBKR field this writer can no
+    longer see, which is the point.
     """
-    def combined(row: dict[str, str], name: str) -> float | None:
-        whole = _f(row.get(name))
-        if whole is not None:
-            return whole
-        long_, short = _f(row.get(f"{name}Long")), _f(row.get(f"{name}Short"))
-        if long_ is None and short is None:
-            return None
-        return (long_ or 0.0) + (short or 0.0)
-
-    base = _base_currency(sections)
-    for row in sections.get("EquitySummaryInBase") or ():
-        day = _s(row.get("reportDate"))
-        total = combined(row, "total")
-        if not day or total is None:
-            result.warnings.append(
-                f"equity summary row skipped: reportDate={day!r} total missing"
-            )
-            continue
+    for nav in navs:
         conn.execute(
-            "INSERT INTO equity_summaries (report_date, account_id, currency,"
+            "INSERT INTO equity_summaries (broker, report_date, account_id,"
+            " currency,"
             " cash_base, stock_base, options_base, total_base, raw,"
-            " source_file, ingested_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(report_date) DO UPDATE SET"
+            " source_file, ingested_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(broker, report_date) DO UPDATE SET"
             " cash_base=excluded.cash_base, stock_base=excluded.stock_base,"
             " options_base=excluded.options_base, total_base=excluded.total_base,"
             " raw=excluded.raw, source_file=excluded.source_file,"
             " ingested_at=excluded.ingested_at",
             (
-                day, _s(row.get("accountId")) or "", base,
-                combined(row, "cash"), combined(row, "stock"),
-                combined(row, "options"), total,
-                json.dumps(row, sort_keys=True), source_file, _now(),
+                broker, nav.as_of, nav.account_id, nav.currency,
+                nav.cash, nav.stock,
+                nav.options, nav.total,
+                json.dumps(nav.raw, default=str, sort_keys=True),
+                source_file, _now(),
             ),
         )
         result.equity_summaries_written += 1
 
 
-def _model_dump(model: Any) -> dict[str, Any]:
-    """Best-effort dict of a pydantic model, for the `raw` column."""
-    for attr in ("model_dump", "dict"):
-        fn = getattr(model, attr, None)
-        if callable(fn):
-            try:
-                return fn()
-            except Exception:  # noqa: BLE001 - raw column is best-effort
-                break
-    return {}

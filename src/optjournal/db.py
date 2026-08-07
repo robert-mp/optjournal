@@ -42,7 +42,7 @@ __all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate", "open_journ
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -57,11 +57,13 @@ DEFAULT_BROKER = "ibkr"
 #: free and an interrupted migration resumes.
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("trades", "ib_commission_currency", "TEXT"),
-    # Identity is per broker, not global. See _rekey_trades_by_broker.
+    # Identity is per broker, not global. See _rekey_by_broker.
     ("trades", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
     ("cash_transactions", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
     ("position_snapshots", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
     ("statements", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
+    ("securities", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
+    ("equity_summaries", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
 )
 
 _TRADES_DDL = """
@@ -173,6 +175,56 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
 );
 """
 
+_NAV_DDL = f"""
+CREATE TABLE IF NOT EXISTS equity_summaries (
+  broker        TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}',
+  report_date   TEXT NOT NULL,
+  account_id    TEXT NOT NULL,
+  currency      TEXT NOT NULL,
+  cash_base     REAL,
+  stock_base    REAL,
+  options_base  REAL,
+  total_base    REAL NOT NULL,
+  raw           TEXT NOT NULL,
+  source_file   TEXT NOT NULL REFERENCES statements(source_file),
+  ingested_at   TEXT NOT NULL,
+  -- Per broker: each reports the value of ITS OWN account. Keyed on the date
+  -- alone, the second broker's NAV for a day overwrites the first's, so the
+  -- "gain as % of net liquidation" denominator silently becomes one account's
+  -- value measured against both accounts' P&L.
+  PRIMARY KEY (broker, report_date)
+);
+"""
+
+_SECURITIES_DDL = f"""
+CREATE TABLE IF NOT EXISTS securities (
+  broker             TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}',
+  conid              TEXT NOT NULL,
+  symbol             TEXT NOT NULL,
+  description        TEXT,
+  asset_category     TEXT,
+  sub_category       TEXT,
+  currency           TEXT,
+  multiplier         REAL,
+  strike             REAL,
+  expiry             TEXT,
+  put_call           TEXT,
+  underlying_conid   TEXT,
+  underlying_symbol  TEXT,
+  isin               TEXT,
+  listing_exchange   TEXT,
+  raw                TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  -- `conid` is the BROKER's numbering, not the exchange's, and this table
+  -- upserts. Keyed on conid alone, a second broker's contract 12345 overwrites
+  -- the first's -- so one broker's TSLA option becomes another's unrelated
+  -- contract, with no error anywhere. `bars.underlying_ids` reads this table to
+  -- resolve a symbol that has no trade row, so a wrong row here misattributes
+  -- price history.
+  PRIMARY KEY (broker, conid)
+);
+"""
+
 #: Indexes over columns _ADDED_COLUMNS may still be about to create, so they
 #: cannot live in _SCHEMA: `executescript` runs BEFORE the ALTERs, and
 #: CREATE INDEX validates its column list even under IF NOT EXISTS -- on a
@@ -218,37 +270,8 @@ CREATE INDEX IF NOT EXISTS cash_type_date ON cash_transactions(type, date_time);
 -- starting balance no Activity statement carries, so NAV must be reported,
 -- not derived. Replace-on-date like position_snapshots: re-fetching a day
 -- corrects rather than duplicates.
-CREATE TABLE IF NOT EXISTS equity_summaries (
-  report_date   TEXT PRIMARY KEY,
-  account_id    TEXT NOT NULL,
-  currency      TEXT NOT NULL,
-  cash_base     REAL,
-  stock_base    REAL,
-  options_base  REAL,
-  total_base    REAL NOT NULL,
-  raw           TEXT NOT NULL,
-  source_file   TEXT NOT NULL REFERENCES statements(source_file),
-  ingested_at   TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS securities (
-  conid              TEXT PRIMARY KEY,
-  symbol             TEXT NOT NULL,
-  description        TEXT,
-  asset_category     TEXT,
-  sub_category       TEXT,
-  currency           TEXT,
-  multiplier         REAL,
-  strike             REAL,
-  expiry             TEXT,
-  put_call           TEXT,
-  underlying_conid   TEXT,
-  underlying_symbol  TEXT,
-  isin               TEXT,
-  listing_exchange   TEXT,
-  raw                TEXT NOT NULL,
-  updated_at         TEXT NOT NULL
-);
+{_NAV_DDL}
+{_SECURITIES_DDL}
 
 -- Historical OHLCV, for underlyings and option contracts alike. One table
 -- rather than two because the shape is identical and every reader wants both
@@ -479,6 +502,8 @@ _REKEYED_TABLES: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("trades", ("broker", "trade_id"), _TRADES_DDL),
     ("cash_transactions", ("broker", "transaction_id"), _CASH_DDL),
     ("position_snapshots", ("broker", "report_date", "conid"), _POSITIONS_DDL),
+    ("securities", ("broker", "conid"), _SECURITIES_DDL),
+    ("equity_summaries", ("broker", "report_date"), _NAV_DDL),
 )
 
 

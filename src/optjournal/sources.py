@@ -31,15 +31,34 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Protocol
 
-from optjournal.fills import NormalisedFill
+from optjournal.fills import (
+    NormalisedCash,
+    NormalisedFill,
+    NormalisedNav,
+    NormalisedPosition,
+    NormalisedSecurity,
+    StatementMeta,
+)
 
 
 class StatementSource(Protocol):
-    """One broker's statements, read into broker-neutral fills.
+    """One broker's statement file, read into broker-neutral shapes.
 
-    A statement can hold more than one account, so the unit is
-    `(account_id, fills)` per statement block. The base currency travels
-    separately because it is a property of the account, not of any one fill.
+    One method per section the journal stores. `statements()` is the odd one out
+    and stays that way: a statement file can hold several account blocks, and a
+    fill has to be attributed to the block it came from, so it yields
+    `(account_id, fills)` pairs. The other four carry their own `account_id` per
+    row, so they are flat iterators.
+
+    Every method may yield nothing. A section is absent when the broker's report
+    template omits it, and that is a normal state rather than an error -- IBKR's
+    EquitySummaryInBase is only present when the Flex query enables it. What is
+    NOT harmless is `positions()` returning nothing when positions are held: see
+    `NormalisedPosition`, whose absence makes every episode look closed.
+
+    Returning iterators rather than lists so a large statement need not be held
+    in memory twice, and generators keep each reader a single pass over its
+    section.
     """
 
     #: The `broker` value stamped on every row this source produces, and the key
@@ -50,8 +69,28 @@ class StatementSource(Protocol):
         """The account's base currency, for converting native amounts."""
         ...
 
+    def metadata(self, path: Path) -> Iterator[StatementMeta]:
+        """What each statement block in the file says about itself."""
+        ...
+
     def statements(self, path: Path) -> Iterator[tuple[str, list[NormalisedFill]]]:
         """Yield `(account_id, fills)` for each statement block in the file."""
+        ...
+
+    def cash_transactions(self, path: Path) -> Iterator[NormalisedCash]:
+        """Fees, dividends, withholding and interest lines."""
+        ...
+
+    def positions(self, path: Path) -> Iterator[NormalisedPosition]:
+        """Contracts held as of the statement date."""
+        ...
+
+    def securities(self, path: Path) -> Iterator[NormalisedSecurity]:
+        """Contract definitions: what each id means."""
+        ...
+
+    def equity_summaries(self, path: Path) -> Iterator[NormalisedNav]:
+        """Daily account value, in the account's base currency."""
         ...
 
 
@@ -127,6 +166,19 @@ class IbkrSource:
                 return code
         return "EUR"
 
+    def metadata(self, path: Path) -> Iterator[StatementMeta]:
+        from optjournal.flex import load
+
+        base = self.base_currency(path)
+        for stmt in load(path).FlexStatements:
+            yield StatementMeta(
+                account_id=_s(stmt.accountId),
+                from_date=_s(stmt.fromDate),
+                to_date=_s(stmt.toDate),
+                generated_at=_s(stmt.whenGenerated),
+                base_currency=base,
+            )
+
     def statements(self, path: Path) -> Iterator[tuple[str, list[NormalisedFill]]]:
         from optjournal.flex import load
 
@@ -170,6 +222,130 @@ class IbkrSource:
             mtm_pnl=_f(t.mtmPnl),
             raw=_model_dump(t),
         )
+
+    # --- the sections py_ibkr models, read through its objects ---------------
+
+    def cash_transactions(self, path: Path) -> Iterator[NormalisedCash]:
+        from optjournal.flex import load
+
+        for stmt in load(path).FlexStatements:
+            account_id = _s(stmt.accountId) or ""
+            for c in stmt.CashTransactions or ():
+                yield NormalisedCash(
+                    transaction_id=_s(c.transactionID) or "",
+                    account_id=account_id,
+                    # `_enum_value`, not str(): py_ibkr yields CashAction members
+                    # whose str() is 'CashAction.FEES'. analysis.py branches on
+                    # this by substring, so the leak would change which bucket a
+                    # row lands in rather than merely how it prints.
+                    kind=_enum_value(c.type),
+                    date_time=_s(c.dateTime),
+                    settle_date=_s(getattr(c, "settleDate", None)),
+                    description=_s(c.description),
+                    symbol=_s(c.symbol),
+                    conid=_s(c.conid),
+                    amount=_f(c.amount) or 0.0,
+                    currency=_s(c.currency),
+                    fx_rate_to_base=_f(c.fxRateToBase) or 1.0,
+                    raw=_model_dump(c),
+                )
+
+    # --- the sections py_ibkr does NOT model, read through the shim ----------
+    #
+    # `raw_sections` returns attribute dicts straight from the XML, so these read
+    # `row.get("camelCase")` rather than an object attribute. That is still IBKR
+    # vocabulary and still belongs here: the point of the seam is that the
+    # vocabulary lives in ONE module, not that it arrives as objects.
+
+    def positions(self, path: Path) -> Iterator[NormalisedPosition]:
+        from optjournal.sections import raw_sections
+
+        for row in raw_sections(path).get("OpenPositions") or ():
+            yield NormalisedPosition(
+                conid=_s(row.get("conid")) or "",
+                account_id=_s(row.get("accountId")) or "",
+                as_of=_s(row.get("reportDate")),
+                symbol=_s(row.get("symbol")),
+                asset_category=(row.get("assetCategory") or "").upper() or None,
+                underlying_symbol=_s(row.get("underlyingSymbol")),
+                put_call=_s(row.get("putCall")),
+                strike=_f(row.get("strike")),
+                expiry=_s(row.get("expiry")),
+                multiplier=_f(row.get("multiplier")),
+                quantity=_qty(row.get("position")),
+                mark_price=_f(row.get("markPrice")),
+                position_value=_f(row.get("positionValue")),
+                cost_basis=_f(row.get("costBasisMoney")),
+                cost_basis_price=_f(row.get("costBasisPrice")),
+                unrealized_pnl=_f(row.get("fifoPnlUnrealized")),
+                side=_s(row.get("side")),
+                opened_at=_s(row.get("openDateTime")),
+                currency=_s(row.get("currency")),
+                fx_rate_to_base=_f(row.get("fxRateToBase")) or 1.0,
+                raw=dict(row),
+            )
+
+    def securities(self, path: Path) -> Iterator[NormalisedSecurity]:
+        from optjournal.sections import raw_sections
+
+        for row in raw_sections(path).get("SecuritiesInfo") or ():
+            yield NormalisedSecurity(
+                conid=_s(row.get("conid")) or "",
+                symbol=_s(row.get("symbol")),
+                description=_s(row.get("description")),
+                asset_category=(row.get("assetCategory") or "").upper() or None,
+                sub_category=_s(row.get("subCategory")),
+                currency=_s(row.get("currency")),
+                multiplier=_f(row.get("multiplier")),
+                strike=_f(row.get("strike")),
+                expiry=_s(row.get("expiry")),
+                put_call=_s(row.get("putCall")),
+                underlying_conid=_s(row.get("underlyingConid")),
+                underlying_symbol=_s(row.get("underlyingSymbol")),
+                isin=_s(row.get("isin")),
+                listing_exchange=_s(row.get("listingExchange")),
+                raw=dict(row),
+            )
+
+    def equity_summaries(self, path: Path) -> Iterator[NormalisedNav]:
+        from optjournal.sections import raw_sections
+
+        sections = raw_sections(path)
+        base = self.base_currency(path)
+        for row in sections.get("EquitySummaryInBase") or ():
+            day = _s(row.get("reportDate"))
+            total = _combined(row, "total")
+            # A NAV row without a NAV is noise. Skipped silently here rather than
+            # warned: the source reports what the statement says, and whether an
+            # omission is worth telling the user about is the ingest's call.
+            if not day or total is None:
+                continue
+            yield NormalisedNav(
+                as_of=day,
+                account_id=_s(row.get("accountId")) or "",
+                currency=base,
+                total=total,
+                cash=_combined(row, "cash"),
+                stock=_combined(row, "stock"),
+                options=_combined(row, "options"),
+                raw=dict(row),
+            )
+
+
+def _combined(row: dict[str, str], name: str) -> float | None:
+    """A figure IBKR reports either whole or split into long/short halves.
+
+    Some Flex deployments emit `cash`, others `cashLong`/`cashShort`. Both are
+    accepted, and a row carrying neither yields None rather than 0.0 -- absent and
+    zero are different claims about an account.
+    """
+    whole = _f(row.get(name))
+    if whole is not None:
+        return whole
+    long_, short = _f(row.get(f"{name}Long")), _f(row.get(f"{name}Short"))
+    if long_ is None and short is None:
+        return None
+    return (long_ or 0.0) + (short or 0.0)
 
 
 #: Registered sources, keyed by the name the `--broker` flag uses. Add a broker

@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
-from conftest import STATEMENTS, connect_migrated
+from conftest import ROOT, STATEMENTS, connect_migrated
 
 from optjournal.db import DEFAULT_BROKER
 from optjournal.fills import NormalisedFill
@@ -154,6 +154,7 @@ def two_brokers(tmp_path, monkeypatch):
 
     before = {t: count(t) for t in (
         "trades", "cash_transactions", "position_snapshots",
+        "securities", "equity_summaries",
         "trade_legs", "trade_orders", "current_option_positions",
     )}
 
@@ -178,7 +179,14 @@ def test_a_second_brokers_rows_are_stored_not_swallowed(two_brokers):
     each table DOUBLED, per broker, rather than merely that the ingest exited 0.
     """
     conn, before = two_brokers
-    for table in ("trades", "cash_transactions", "position_snapshots"):
+    # All five row tables, because all five were keyed on an identifier that is
+    # the BROKER's rather than universal, and each was found separately: trades
+    # first, then cash and snapshots, then securities and NAV. `securities` and
+    # `equity_summaries` UPSERT rather than DO NOTHING, so their failure is worse
+    # than a dropped row -- the second broker's contract 12345 overwrites the
+    # first's definition, and its NAV overwrites that day's account value.
+    for table in ("trades", "cash_transactions", "position_snapshots",
+                  "securities", "equity_summaries"):
         rows = {
             r["broker"]: r["n"] for r in conn.execute(
                 f"SELECT broker, COUNT(*) AS n FROM {table} GROUP BY broker")
@@ -282,4 +290,99 @@ def test_a_lagging_brokers_positions_are_still_current(two_brokers):
     assert open_by_broker.get("testbroker") == open_by_broker.get(DEFAULT_BROKER), (
         f"open positions differ per broker ({open_by_broker}) on identical "
         f"statements -- the lagging broker's book was closed out"
+    )
+
+
+def test_a_broker_overwriting_anothers_contract_definition_is_impossible(two_brokers):
+    """`securities` and `equity_summaries` UPSERT, which makes them the worst case.
+
+    A dropped row at least leaves the first broker's data intact. An upsert keyed
+    without the broker REPLACES it: the second broker's contract 12345 becomes the
+    definition of the first's, so `bars.underlying_ids` resolves a symbol to the
+    wrong contract and price history is attributed to an instrument that never
+    traded. Same shape for NAV, where the survivor becomes the denominator of
+    "gain as % of net liquidation" for both accounts' P&L.
+
+    Asserted by making the second broker's rows DIFFER. Identical statements
+    cannot show an overwrite -- the replacement value equals the original -- so
+    this rewrites one broker's rows and then checks the other's are untouched.
+    """
+    conn, _ = two_brokers
+    conn.execute("UPDATE securities SET symbol = 'CLOBBERED' WHERE broker = ?",
+                 ("testbroker",))
+    conn.execute("UPDATE equity_summaries SET total_base = -1 WHERE broker = ?",
+                 ("testbroker",))
+    conn.commit()
+
+    survivors = conn.execute(
+        "SELECT COUNT(*) AS n FROM securities WHERE broker = ? AND symbol = 'CLOBBERED'",
+        (DEFAULT_BROKER,),
+    ).fetchone()["n"]
+    assert survivors == 0, (
+        "one broker's securities rows changed when the other's were rewritten"
+    )
+    navs = conn.execute(
+        "SELECT COUNT(*) AS n FROM equity_summaries WHERE broker = ? AND total_base = -1",
+        (DEFAULT_BROKER,),
+    ).fetchone()["n"]
+    assert navs == 0, "one broker's NAV changed when the other's was rewritten"
+
+
+def test_ingest_reads_no_broker_vocabulary_of_its_own():
+    """The structural claim: adding a broker is a new source, not an ingest edit.
+
+    `ingest.py` must not import the IBKR parsers and must not name py_ibkr's
+    camelCase fields in CODE. Enforced statically because that is what the claim
+    IS -- a runtime test cannot distinguish "never reads an IBKR field" from
+    "happened not to hit one on this fixture".
+
+    Over the AST rather than the text, so prose is not scanned as code: the
+    commission rule's docstring legitimately explains what `fxRateToBase` is and
+    why it cannot be trusted for a commission, and a text search fails on that
+    explanation. Attribute names, string constants and imports are checked;
+    comments and docstrings are not, since documenting a broker's vocabulary is
+    the opposite of depending on it.
+
+    The seam looked finished for a whole commit while four defects hid in it, and
+    this is the guard that keeps its remaining half from drifting back: a new
+    section wired straight into the writer fails here, rather than at the point
+    someone tries to add a second broker.
+    """
+    import ast
+
+    tree = ast.parse((ROOT / "src" / "optjournal" / "ingest.py").read_text("utf-8"))
+
+    imported = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    for module in ("optjournal.flex", "optjournal.sections"):
+        assert module not in imported, (
+            f"ingest.py imports {module} again -- statement parsing belongs to "
+            f"sources.py, the one place that knows a broker's vocabulary"
+        )
+
+    # Attribute accesses (`t.fxRateToBase`) and string constants (a section name,
+    # or a `row.get(\"camelCase\")` key). Docstrings are Constants too, so only
+    # short ones are treated as identifiers -- a paragraph is prose.
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            used.add(node.attr)
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and len(node.value) < 40):
+            used.add(node.value)
+
+    ibkr = {"fxRateToBase", "assetCategory", "reportDate", "costBasisMoney",
+            "costBasisPrice", "transactionID", "tradeID", "ibExecID", "ibOrderID",
+            "ibCommission", "fifoPnlRealized", "fifoPnlUnrealized", "positionValue",
+            "markPrice", "openDateTime", "underlyingSymbol", "subCategory",
+            "listingExchange", "whenGenerated", "accountId",
+            "CashTransactions", "OpenPositions", "SecuritiesInfo",
+            "EquitySummaryInBase", "AccountInformation", "FlexStatements"}
+    leaked = sorted(ibkr & used)
+    assert not leaked, (
+        f"ingest.py reads IBKR's own vocabulary: {leaked}. Read it in sources.py "
+        f"and hand the writer a normalised shape."
     )
