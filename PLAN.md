@@ -585,6 +585,137 @@ Do it in this order, one commit each, each independently green:
 Do NOT rename `raw`. It holds the source's own attribute dict verbatim, camelCase
 included; that is provenance, and renaming its contents would falsify it.
 
+## Task 14: Market Awareness and Watchlist
+
+Two new tabs. Measured what is actually reachable before designing, because both
+features live or die on a data question rather than on UI work.
+
+### What I verified first
+
+**The econ-calendar feed is real and keyless.** ForexFactory publishes
+`https://nfs.faireconomy.media/ff_calendar_thisweek.json`: 99 events this week,
+flat JSON, six stable keys (`title`, `country`, `date`, `impact`, `forecast`,
+`previous`), ISO dates with offset, `impact` in High/Medium/Low/Holiday. The four
+USD high-impact events it lists for this week are ISM Manufacturing PMI and the
+three 08:30 jobs releases — which is exactly the "Jobs report (NFP) · 7:30 AM ·
+high" row in the mockup. So the feature is buildable with `urllib` and no new
+dependency, the same way `marketdata.fetch_bars` already calls Yahoo.
+
+**True implied vol is NOT reachable for a symbol you do not hold.** This is the
+finding that reshapes the watchlist. `bars._vol_series` solves IV from *the
+option's own daily closes*, so it only exists for contracts already in the
+journal — measured: TSLA 270617C700 has 461 bars, the traded GOOG/META legs have
+14-15, and a symbol you merely watch has none. Yahoo's options endpoint now
+answers `{"error":{"code":"Unauthorized","description":"Invalid Crumb"}}`, and the
+v6 path is gone, so there is no keyless chain to solve against.
+
+What IS computable from stored daily closes, with no chain and no model:
+**realised (historical) vol**. Verified on the real journal — TSLA 63.0% and META
+42.4% over 20 sessions, straight from `price_bars`.
+
+That is a different claim from IV and must be labelled as one. Realised vol says
+what the stock DID; implied says what the market CHARGES for what it might do. An
+options seller reads them differently, and a column headed "IV" showing realised
+vol would be the worst kind of defect this project keeps finding: a well-formed
+number under a label that does not describe it.
+
+### The recommendation, and where I am pushing back
+
+You chose "IV/vol context" for the watchlist. I would build **realised vol now,
+labelled as realised**, and treat IV as a follow-on that needs a chain source. Two
+reasons beyond the measurement:
+
+1. It puts the watchlist under the modelled-number quarantine for nothing.
+   Realised vol from closes is arithmetic over broker-stated prices — it is
+   `stdev(log returns) * sqrt(252)`, no Black-Scholes, no `blackscholes` import,
+   so `tests/test_layering.py`'s `MAY_MODEL = {"bars", "demo"}` allowlist does not
+   have to grow. Adding `watchlist` to that set is a real cost: the allowlist IS
+   the quarantine.
+2. An expected-move column derived from realised vol is honest and useful (`last
+   x rv x sqrt(days/252)`), and it is the number a seller actually wants for
+   sizing. It just must not be called IV.
+
+If you want true IV later, the seam is the same shape as the broker one: a
+`ChainSource` Protocol, and the first implementation needs a keyed provider.
+Recorded as 14c below rather than guessed at.
+
+### Schema
+
+Two tables, one migration, v6 -> v7:
+
+```
+watchlist         (symbol PK, added_at, note, target_price, kind)
+market_events     PRIMARY KEY (source, event_id)
+                  source, event_id, starts_at_utc, country, title,
+                  impact, forecast, previous, raw, fetched_at
+```
+
+`market_events` is keyed `(source, event_id)` for exactly the reason `trades` is
+keyed `(broker, trade_id)`: an id is the issuing feed's, not universal, and a
+second source would silently overwrite the first's rows. That lesson cost two
+migrations to learn; it applies here for free. `event_id` is a hash of
+`(starts_at_utc, country, title)`, since the feed supplies no id of its own — so a
+re-fetch corrects a revised forecast rather than duplicating the event.
+
+`watchlist` has no `broker` column and should not: a symbol you are watching is
+not a broker's record of anything. It is the first table in this schema that is
+genuinely user input rather than ingested fact, which is worth a note in db.py's
+docstring so the next reader does not "fix" it.
+
+### Commits, each independently shippable
+
+**14a — the event source and its table.** `MarketSource` Protocol +
+`ForexFactorySource` in a new `events.py`, mirroring `sources.py`: one module
+knows the feed's vocabulary, `NormalisedEvent` (a frozen leaf in `fills.py` or its
+own `events` leaf) is what the writer sees. A `--dry-run` on the CLI first, so the
+shape is inspectable before anything is stored. Drift test in the shape of
+`test_flex.py::test_field_drift`: assert the six keys are present and that an
+unknown `impact` value fails loudly rather than being bucketed as Low.
+
+**14b — `optjournal market`,** CLI + payload + tab. Text report first (it is the
+cheaper thing to verify), then `market_data()` in serialize.py, the `@typedef`
+block and `@payload` binding in page.html in ONE commit as the drift test
+requires, then the week strip and the day list from the mockup. `sweep.TABS` gains
+`market`, which a test already holds to page.html's own list.
+
+**14c — `optjournal watch add/rm/ls`** and the watchlist table. Prices and change
+from `price_bars`, position context from `current_option_positions`, realised vol
+and expected move computed in a new leaf (`vol.py`) that imports nothing —
+deliberately NOT `blackscholes`, so the quarantine allowlist stays at two modules.
+Every vol figure labelled `realised` in the payload key itself
+(`realised_vol_20d`, not `iv`), so the page cannot accidentally present it as
+implied.
+
+**14d — the bars manifest learns about watched symbols.** Today
+`bars_manifest` derives windows from positions only, so a watched symbol has no
+bars and its row would be empty — measured: GOOG has 5 daily closes, PLTR 4, which
+is not enough for a 20-day vol. This is the commit that makes the watchlist
+actually populate, and it is deliberately last: it changes what the nightly cron
+fetches, so it should land once the read side is proven.
+
+### What to be careful about
+
+* **The feed is `thisweek` ONLY — verified, not assumed.** `ff_calendar_nextweek`,
+  `_thismonth` and `_lastweek` all 404. The endpoint returns 2026-08-02..08 and
+  nothing else, so a "next FOMC in 12 days" card cannot be built from it. Two
+  consequences: the mockup's one-week strip is exactly what the source supports
+  (fine), and the TABLE becomes the history — because rows persist, a journal that
+  fetches weekly accumulates a past calendar the feed itself will not serve. That
+  is an argument for storing rather than rendering straight from the response, and
+  for `market_events` being append-and-correct rather than replace-per-fetch.
+  Verified the key holds: all 99 rows this week have a distinct
+  `(date, country, title)`, so hashing those three is a sound `event_id`.
+* **Impact is the feed's judgement, not a fact.** Same class as the AutoFX markup
+  caveat: the page should attribute it (`impact per ForexFactory`) rather than
+  presenting it as the journal's own assessment.
+* **Timezones.** The feed sends ISO with an offset; the mockup shows CDT while
+  every existing journal stamp is ET (`bars.MARKET_TZ`). Store UTC, render in
+  `MARKET_TZ`, and do not introduce a second display zone — one timeline is why
+  fills and bars currently line up without conversion.
+* **A cron, not a page fetch.** The Sync button spends an IBKR request and is
+  guarded by a cooldown for it. A calendar fetch is cheap but not free, and the
+  existing pattern is `cron/optjournal_*.py` shells out to the CLI. Follow it.
+
 ## Do not do
 
 - **A DI container or `Broker` ABC.** Nothing needs runtime-swappable graphs; a
