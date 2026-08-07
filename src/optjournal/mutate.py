@@ -74,8 +74,11 @@ the wrong tree is worse than none, because its output looks like evidence.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -393,18 +396,46 @@ _SELF_REFERENTIAL = frozenset({
 })
 
 
+#: Seconds a single suite run may take before the mutant is called out as hung.
+#: The clean suite is ~25s, so this is 20x headroom -- generous on purpose, since
+#: a slow machine reporting "hung" would be worse than waiting.
+_SUITE_TIMEOUT_S = 500
+
+
 def _pytest(clone: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Run the CLONE's pytest, with the parent environment stripped.
 
     `env -u PYTHONPATH -u VIRTUAL_ENV` and the clone's own interpreter, never
     `uv run` -- see the module docstring, trap 1.
+
+    TIMED OUT, and killed as a process GROUP. A mutant can make a test block
+    forever rather than fail: `loopback` removes the guard in `web.serve`, and the
+    test that expects a ValueError instead binds port 8765 and serves until
+    interrupted. Found the honest way -- a leftover pytest from a previous survey
+    was still holding that port a day later, which is also why it must be the
+    group and not just the child: pytest's own process died, the server it spawned
+    did not.
     """
-    return subprocess.run(
+    proc = subprocess.Popen(
         [str(clone / ".venv" / "bin" / "python"), "-m", "pytest",
          "-q", "--tb=no", "-p", "no:cacheprovider", *args],
-        capture_output=True, text=True, cwd=str(clone),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=str(clone),
         env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+        start_new_session=True,      # its own group, so the kill reaches children
     )
+    try:
+        out, err = proc.communicate(timeout=_SUITE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        out, err = proc.communicate()
+        return subprocess.CompletedProcess(
+            proc.args, returncode=-signal.SIGKILL,
+            stdout=(out or "") + f"\nTIMEOUT after {_SUITE_TIMEOUT_S}s",
+            stderr=err or "",
+        )
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def _prepare(source: Path, clone: Path) -> None:

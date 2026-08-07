@@ -715,9 +715,19 @@ def test_page_escapes_interpolated_values():
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.10", "example.com"])
 def test_serve_refuses_non_loopback(host, tmp_path):
-    """The page has no auth and exposes an entire account. Loopback or nothing."""
+    """The page has no auth and exposes an entire account. Loopback or nothing.
+
+    `port=0` matters, and not for this test's own result: if the guard is ever
+    removed, `serve` gets past the raise and BINDS, then serves forever. With the
+    default 8765 that is a test which silently becomes a real server on the
+    project's usual port -- found the honest way, when a leftover pytest from a
+    mutation survey was still holding 8765 a day later. Port 0 makes the OS pick
+    an ephemeral one, so the failure is a hang on a harmless port rather than a
+    hijack of the port a developer is about to use. `mutate._pytest` now times out
+    and kills the process group for the same reason.
+    """
     with pytest.raises(ValueError, match="Loopback only"):
-        serve(db_path=tmp_path / "x.db", archive_dir=tmp_path, host=host)
+        serve(db_path=tmp_path / "x.db", archive_dir=tmp_path, host=host, port=0)
 
 
 def test_dashboard_friction_is_split_by_scope(state):

@@ -69,30 +69,74 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
     the only table the seam touches, and with `first_seen_at` dropped because it
     is a wall-clock stamp rather than data.
 
-    Pinned as a stored fingerprint: the direct-read code is gone, so the only
-    thing to compare against is the value it produced, captured here as a
-    constant. If a future change to the IBKR source alters an ingested value,
-    this fails -- which is what a seam that claims to be transparent must prove.
+    Pinned PER TRADE, keyed by trade id, rather than as one hash of the whole
+    table. The first version hashed everything and asserted a row count, so it
+    broke the moment the archive grew -- which it does every time a statement is
+    fetched, for reasons that have nothing to do with the seam. A guard that fails
+    on new DATA teaches you to re-baseline it, and a guard you re-baseline on
+    reflex is not a guard.
+
+    The constants below are not "whatever the code produces today". They were
+    derived by checking out `dcb49d5` -- the commit before the seam existed -- into
+    a worktree, running its DIRECT-READ ingest over the current archive, and
+    hashing the resulting rows. Both versions produce byte-identical values,
+    including for a fill fetched from IBKR long after the direct-read code was
+    deleted. That is what makes this a comparison rather than a snapshot.
+
+    `broker` is excluded from the hash because the pre-seam schema had no such
+    column, and `first_seen_at` because it is a wall clock rather than data.
     """
     if not STATEMENTS:
         pytest.skip("needs an archived statement")
     import hashlib
     import json
 
+    #: trade_id -> sha256 (first 16) of the row as the PRE-SEAM ingest wrote it.
+    #: Checked when present, ignored when absent: a pruned archive is not a seam
+    #: failure, and nothing can attest to what deleted code would have done with a
+    #: statement it never saw. Reproduce with:
+    #:   git worktree add --detach /tmp/preseam dcb49d5
+    #:   then ingest raw/ with /tmp/preseam/src on sys.path.
+    baseline = {
+        # The 68,683.68 close. Deliberately included: its commission is billed in
+        # a currency the instrument does not trade in, which is the conversion the
+        # seam had to preserve exactly.
+        "1439867164": "49d61e3ef8e92ce2",
+        "1404562790": "16a6b4b6a94535ad",   # SIVE open, 1,400 shares
+        # Fetched 2026-08-07, so the direct-read code never saw this statement --
+        # yet both versions agree on the row. The strongest form of the claim.
+        "1534769849": "572d8269a9a2471e",   # PLTR 260918P130, sold to open
+    }
+
     conn = connect_migrated(tmp_path / "seam.db")
     for path in STATEMENTS:
         ingest_file(conn, path)
-    rows = [dict(r) for r in conn.execute(
-        "SELECT * FROM trades ORDER BY broker, trade_id")]
-    for r in rows:
-        r.pop("first_seen_at", None)
-    fingerprint = hashlib.sha256(
-        json.dumps(rows, sort_keys=True, default=str).encode()
-    ).hexdigest()[:16]
-    assert len(rows) == 160, "the real archive holds 160 trades"
-    assert fingerprint == "2deefcc5353a4955", (
-        "the trades the IBKR source ingests differ from what the direct-read "
-        "ingest produced; the seam is no longer transparent"
+    rows = {
+        str(r["trade_id"]): dict(r)
+        for r in conn.execute("SELECT * FROM trades ORDER BY broker, trade_id")
+    }
+    assert rows, "the archive should hold trades"
+
+    checked = 0
+    for trade_id, expected in baseline.items():
+        row = rows.get(trade_id)
+        if row is None:
+            continue
+        row.pop("first_seen_at", None)
+        row.pop("broker", None)
+        actual = hashlib.sha256(
+            json.dumps(row, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+        assert actual == expected, (
+            f"trade {trade_id} ({row.get('symbol')}) no longer ingests to the "
+            f"value the pre-seam direct read produced; the seam is not transparent"
+        )
+        checked += 1
+
+    assert checked, (
+        f"none of the baselined trades {sorted(baseline)} are in the archive any "
+        f"more, so this test is asserting nothing -- re-baseline it against rows "
+        f"that are present, or delete it"
     )
 
 
