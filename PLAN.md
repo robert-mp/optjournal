@@ -298,16 +298,48 @@ Independently shippable, in order. Effort is my estimate of focused work.
 | ~~3~~ | ~~Cut redundant tests~~ — **DONE, as nothing to cut**: median 2 tests/defect. Instead CLOSED the two zeroes (`f3a23dd`, `3709773`). | — | — |
 | ~~4~~ | ~~Scope `assert_not_real` by data~~ — **DONE** (`1370bca`), and it unblocked the survey. | — | — |
 | ~~4b~~ | ~~Sentinels for the remaining audit findings~~ — **DONE** (`8ff9a4e`, `952a007`, `3e82b21`). Ten mutants written first: **2 caught, 8 uncaught**. See below. | — | — |
-| 5 | Add `broker` to the schema; make `(broker, trade_id)` the identity. Migrate the existing journal as `ibkr`. | Cheap now, expensive after a second broker's rows land. | M |
-| 6 | Honour `account_id` in the domain queries, or state in the README that one file means one account. | Latent silent-merge defect; same scoping fix as step 5. | M |
-| 7 | Introduce `NormalisedFill` + a `StatementSource` Protocol; move py_ibkr attribute reads out of `ingest.py` into `sources/ibkr.py`. Registry like `SCOPE_BUILDERS`. | The actual seam. Makes a second broker additive rather than invasive. | L |
-| 8 | Rename the IBKR vocabulary that reaches the payload (`conid`, `ib_order_id`, `fifo_*`), serializer + typedefs + binding table in one commit. | Only worth doing once step 7 gives the neutral names a home. | M |
+| ~~5~~ | ~~`broker` in the schema, `(broker, trade_id)` identity~~ — **DONE** (`c5c071a`), extended in `eeef122`: `cash_transactions` and `position_snapshots` needed the same key and did not get it first time. | — | — |
+| ~~6~~ | ~~Honour `account_id`~~ — **DONE** (`dcb49d5`): episode identity is `(broker, account_id, conid)`. | — | — |
+| ~~7~~ | ~~`NormalisedFill` + `StatementSource` Protocol~~ — **DONE** (`03ac3d7`) and then **actually finished** (`eeef122`). See below: the first pass looked complete and was not. | — | — |
+| 7b | Move the remaining sections across the seam: cash, positions, securities and equity summaries still read py_ibkr models and `raw_sections` dicts directly in `ingest.py`. | The trade path is done and is the dense one. These four are the rest of the same job, and a second broker needs them. | M |
+| 8 | Rename the IBKR vocabulary that reaches the payload (`conid`, `ib_order_id`, `fifo_*`), serializer + typedefs + binding table in one commit. | Defer until a second broker exists: it implies another schema migration, and the names are accurate while IBKR is the only source. | M |
 | 9 | Design pass (not code) on computing FIFO realised P&L for brokers that do not supply it. | The one genuinely hard problem. Deserves a decision before implementation. | L |
 
-Steps 1-4 are pure entropy reduction and touch no architecture. 5-8 are the
-broker seam. 9 is the thing to think about before committing to a second broker.
-Multi-tenancy is deliberately absent: it is a product decision, and the code is
-already as ready as it can be without one.
+Steps 1-4 are pure entropy reduction and touch no architecture. 5-7 are the
+broker seam and are done; 7b is its remainder. 8 waits for a real second broker,
+and 9 is the thing to decide before committing to one. Multi-tenancy is
+deliberately absent: it is a product decision, and the code is already as ready as
+it can be without one.
+
+### A seam is only as good as the test that uses two of them
+
+Worth recording, because it is the most transferable thing this exercise
+produced. After step 7 the seam had every part a reader looks for: a Protocol, a
+registry, a broker-neutral `NormalisedFill`, `broker` on four tables, a composite
+primary key, and tests. Registering a second source and running one real statement
+through under two broker names found **four defects, none of which one broker can
+expose**:
+
+1. `ingest_file(broker=...)` resolved the right source, read the right statement,
+   and wrote every row under `'ibkr'` -- the writer had `DEFAULT_BROKER` inline, so
+   the argument was decorative and agreed with the schema default.
+2. Two of the four tables were still keyed on IBKR's own numbering, so a second
+   broker's colliding id would be silently swallowed by `ON CONFLICT DO NOTHING`.
+3. `trade_legs` GROUPed without `broker` and summed two brokers' fills into one
+   leg: 18 trades became 8 legs with doubled quantities.
+4. Two separate `MAX(report_date)` queries let the most recently filed broker
+   define "current" for all of them. In `history._held` that decides open versus
+   closed, so a lagging broker's open positions read as CLOSED.
+
+Every one produces a well-formed answer with wrong numbers in it, and every one is
+unreachable while `SOURCES` has a single entry. The generalisable rule: an
+abstraction with one implementation is untested by construction, however complete
+it looks, and the cheapest test is a second implementation that reuses the first
+one's reader so the DATA is identical and only the plumbing differs.
+
+The same round found a bug in the mutation harness itself (`cf2b734`): it counted
+only pytest's `FAILED` lines, so a defect caught by a *fixture's* assertion -- which
+pytest reports as `ERROR` -- read as caught by nothing.
 
 ## Do not do
 

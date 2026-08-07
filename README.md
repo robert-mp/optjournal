@@ -525,6 +525,29 @@ shapes, plus a case in `tests/test_render.py` that builds its payload with the
 REAL serializer over the real archive. A hand-written dict would have passed
 throughout the window when `orders` and `history` were both crashing.
 
+**A new broker**: a class satisfying `StatementSource` (a `broker` name, a
+`base_currency(path)` and a `statements(path)` yielding `NormalisedFill`s), plus
+one entry in `sources.SOURCES`. That is the whole additive part — `ingest` writes
+`NormalisedFill`s and never sees a broker's own model, and every identity in the
+schema already leads with `broker`.
+
+Then **write the two-broker test before trusting any of it**. The seam looked
+finished for a whole commit while four defects hid in it, each unreachable with a
+single source: the `broker` argument was written but ignored by the trades writer,
+two tables were still keyed on IBKR's own ids, `trade_legs` summed two brokers'
+fills into one leg with doubled quantities, and two `MAX(report_date)` queries let
+the most recent filer define "current" for everyone — which in `history._held`
+reads a still-open position as CLOSED. See
+`tests/test_sources.py::two_brokers`: it registers a second source that *reuses
+the IBKR reader*, so the data is identical and any difference in the output is the
+journal's handling of `broker` and nothing else. Identical trade ids under two
+brokers is exactly the collision the composite keys exist for, and a real second
+broker makes it possible on day one.
+
+Four sections still read IBKR shapes directly in `ingest.py` — cash, positions,
+securities and equity summaries. They work, and they are the remaining half of
+this job.
+
 **A new cron job**: implementation in `cron/`, a loader shim under
 `~/.meshclaw/crons/` that locates it by path (never a copy — see below), and a
 case in `tests/test_cron.py`. The cron scripts run under MeshClaw's interpreter,
