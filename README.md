@@ -80,6 +80,16 @@ Every figure the accounting layers report is broker-stated: a fill price, a
 commission IBKR billed, a mark from a position snapshot. `blackscholes.py` breaks
 that rule on purpose, and is quarantined for it.
 
+Realised P&L is the one worth naming explicitly, because it is stated rather than
+derived and that is a choice. IBKR's `fifoPnlRealized` is already net of both
+legs' commission (verified arithmetically — see `history.py`'s docstring), and
+every headline the journal shows depends on it: win rate, profit factor,
+expectancy, the monthly and annual tables, cohorts, strategy groups. A broker that
+does not supply it would force this journal to compute FIFO itself. That is
+designed but not built — PLAN.md task 9 — and a test in `test_history.py` already
+reconstructs the figure from fills alone and asserts it matches IBKR's to the
+cent, so the day it stops matching, the suite says so.
+
 Its output reaches the replay panel and nowhere else, through `bars.py`: the
 expected-move band, the per-bar P&L on the scorecard, and the effective-delta
 series — each labelled as modelled, on a panel whose caption says so. `stats.py`,

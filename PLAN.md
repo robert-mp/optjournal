@@ -303,7 +303,7 @@ Independently shippable, in order. Effort is my estimate of focused work.
 | ~~7~~ | ~~`NormalisedFill` + `StatementSource` Protocol~~ — **DONE** (`03ac3d7`) and then **actually finished** (`eeef122`). See below: the first pass looked complete and was not. | — | — |
 | 7b | Move the remaining sections across the seam: cash, positions, securities and equity summaries still read py_ibkr models and `raw_sections` dicts directly in `ingest.py`. | The trade path is done and is the dense one. These four are the rest of the same job, and a second broker needs them. | M |
 | 8 | Rename the IBKR vocabulary (`conid`, `ib_order_id`, `ib_commission`, `fifo_*`, `ib_exec_id`). **TODO, with a plan below.** | Deferred on purpose: 663 occurrences, another schema migration, and the names are still ACCURATE while IBKR is the only source. | L |
-| 9 | Design pass (not code) on computing FIFO realised P&L for brokers that do not supply it. | The one genuinely hard problem. Deserves a decision before implementation. | L |
+| ~~9~~ | ~~Design pass on computed realised P&L~~ — **DONE as a design, plus the one buildable piece.** Prototype measured against real data, recommendation below, and the FIFO-vs-broker oracle is now in the suite. | Implementation still waits on a real second broker. | — |
 
 Steps 1-4 are pure entropy reduction and touch no architecture. 5-7 are the
 broker seam and are done; 7b is its remainder. 8 waits for a real second broker,
@@ -340,6 +340,135 @@ one's reader so the DATA is identical and only the plumbing differs.
 The same round found a bug in the mutation harness itself (`cf2b734`): it counted
 only pytest's `FAILED` lines, so a defect caught by a *fixture's* assertion -- which
 pytest reports as `ERROR` -- read as caught by nothing.
+
+## Task 9: computing realised P&L — the design pass
+
+This was the item I called "the one genuinely hard problem". Having now built a
+prototype and measured it against real data, the shape of the answer is clearer
+than expected, and one thing is settled: **the arithmetic is not the hard part.**
+
+### What was measured
+
+A FIFO lot-matching walk over `trades` alone (no IBKR P&L read at all) reproduces
+IBKR's `fifoPnlRealized` **to the cent** on both closed positions in the archive,
+including SIVE — the case the `history.py` docstring cites, bought 400 then 1,400,
+sold 1,800, then re-entered three days later:
+
+| | |
+|---|---|
+| price basis | 400 × 27.96 + 1,400 × 36.72 = 62,592.00 |
+| + opening commission | 62,642.46 |
+| proceeds | 1,800 × 73.00 = 131,400.00 |
+| − closing commission | 131,326.14 |
+| **P&L** | **68,683.68** — IBKR's figure exactly |
+
+So the model is: match closes against opens oldest-first, P&L is
+`(exit − entry) × qty × multiplier` plus BOTH legs' commission share. Everything
+that needs is already stored, on every fill: `quantity`, `trade_price`,
+`multiplier`, `open_close`, `ib_commission`, `date_time`. Verified — no nulls.
+
+**But be precise about what that match proves.** Both closed positions are FULL
+liquidations — SIVE sold 1,800 against lots of 400 + 1,400, consuming every lot.
+When the whole position goes, FIFO, LIFO and specific-lot all produce the same
+number, because lot ORDER only matters when some lots survive. The SIVE sale even
+carries IBKR's `SL` (specific-lot) note, and FIFO still matched — not because FIFO
+is confirmed, but because on a full close the method is unobservable. The archive
+contains no partial close, so **the arithmetic is verified and the lot-matching
+POLICY is not.** That distinction is the difference between "we can compute this"
+and "we know which method the broker used", and only the first is established.
+
+### What is actually hard
+
+Not the algorithm. Three things around it:
+
+1. **The commission convention is a policy, not a fact.** Running the same walk
+   against the DEMO journal mismatches on 7 of 11 contracts. That is not a bug in
+   the walk: the demo's `realized` values are hand-written literals, and for the
+   expiry case it charges only the OPENING commission (628.05) where the walk
+   charges both (626.10). The real archive contains no expiry, so it cannot
+   settle which is right — and this is exactly the kind of question a second
+   broker will answer differently. **Whatever is built must record which
+   convention produced a number**, which is what `Episode.net_of_commission`
+   already does for IBKR and would have to do for itself.
+2. **Lot matching is a tax method, not a universal.** FIFO is one choice; IBKR
+   also offers LIFO, MaxLoss and specific-lot, and the archive already carries an
+   `SL` note code (specific-lot) on the SIVE sale — `history.py:33` documents that
+   code as a lot-matching method precisely so it is not mistaken for a closure
+   type. A computed figure silently labelled FIFO would be wrong for an account
+   using anything else, and would disagree with the broker's own tax reporting,
+   which is the number that matters in April. The measurement above cannot detect
+   this, per the caveat: full liquidations hide the method entirely. **The first
+   partial close in the archive is the test case that would settle it**, and it is
+   worth adding a guard that flags a divergence rather than discovering it later.
+3. **It changes the domain's core, and every headline depends on it.**
+   `realized_pnl_base` feeds win rate, profit factor, expectancy, the monthly and
+   annual tables, cohorts, strategy groups and the calendar. There is no partial
+   rollout: the figure is either the broker's or ours.
+
+### The recommendation
+
+**Compute it, but only as a fallback, and never silently.** Concretely:
+
+- `NormalisedFill.realized_pnl` stays `float | None`. A broker that supplies the
+  figure keeps supplying it; `None` means "this broker does not tell us".
+- A new leaf module — `lots.py`, alongside `money.py` and `fills.py` — implements
+  the FIFO walk as a pure function over fills, importing nothing internal. It is
+  the natural home: the prototype is ~30 lines and its inputs are exactly a
+  `NormalisedFill` stream.
+- `ingest` uses the broker's figure when present and the computed one when not,
+  and **stores which it used**. That is a new column, not a comment: something
+  like `pnl_source TEXT NOT NULL` holding `'broker'` or `'fifo'`. The reason it
+  must be a column rather than an inference is the whole lesson of this project —
+  a derived number that looks like a reported one is the defect shape that keeps
+  recurring here.
+- The page and the terminal reports say so when a figure is computed. Same
+  principle as the AutoFX markup caveat, which already distinguishes an estimated
+  cost from a measured one.
+
+**Why fallback rather than always-compute.** Tempting to compute everywhere for
+consistency, and I would argue against it: the broker's figure is what appears on
+the tax document. Recomputing it means either matching to the cent (in which case
+the computation adds nothing but risk) or disagreeing with the statement (in which
+case the journal is wrong by definition). The measurement above shows we CAN match
+— which is the argument for trusting the broker where it speaks, not for replacing
+it.
+
+### The one piece worth building before a second broker exists — DONE
+
+Everything above waits. This did not, and is now in
+`tests/test_history.py::test_computed_fifo_pnl_agrees_with_the_brokers_own_figure`:
+the FIFO walk run against the archive, asserted against IBKR's own figure per
+contract and in total.
+
+Two data points today, one more per closed position, so it accumulates the
+evidence while nothing depends on it. What it will catch:
+
+- the first PARTIAL close, where FIFO and specific-lot diverge and the archive
+  finally says which method IBKR used;
+- any drift in the commission convention, since the walk charges both legs and a
+  disagreement surfaces as a fixed offset rather than noise.
+
+Three hand-built tests sit beside it, because the archive cannot express what they
+check: that the walk charges BOTH legs (asserting it is not the opening-only
+reading the demo's literals use), that it matches OLDEST lots first (FIFO gives 50
+where LIFO gives 10 — without this, "FIFO agrees with IBKR" could hold for a walk
+that is not FIFO), and that a re-entry after a full close does not inherit the
+closed lots.
+
+Verified by ablation: charging one leg fails the real-data oracle with
+`SIVE: computed 68757.5379 against IBKR's 68683.6800`, and switching FIFO to LIFO
+fails ONLY the hand-built test — confirming the archive genuinely cannot
+distinguish the methods.
+
+It is a test, not a feature: no schema change, no payload change, nothing in the
+domain reads it, and the walk lives in the test file rather than in `src` so it
+implies no decision task 9 has not made. If it ever fails, the failure IS the
+design input this task has been waiting for.
+
+**Then, when a second broker is real**: read one statement. Whether it supplies
+per-fill realised P&L decides whether the fallback is needed at all, and its
+commission convention decides what the fallback must record. The prototype and
+this note make that a half-day question rather than an open one.
 
 ## TODO: task 8, the vocabulary rename
 

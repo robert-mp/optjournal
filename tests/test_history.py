@@ -587,3 +587,186 @@ def test_odte_is_unknown_rather_than_false_without_an_expiry():
     assert _ep(opened="2026-01-16 10:02:00", expiry=None).is_odte is None
     assert _ep(opened=None, expiry="2026-01-16").is_odte is None
     assert _ep(opened="not a date", expiry="2026-01-16").is_odte is None
+
+
+# --------------------------------------------- the computed-P&L oracle
+#
+# `Episode.realized_pnl` comes from IBKR's `fifoPnlRealized`, which this module's
+# docstring documents as already net of both legs' commission. A broker that does
+# not supply a per-fill figure would force this journal to compute one, and that
+# is PLAN.md's task 9 -- not built, deliberately.
+#
+# What IS built is the measurement that task needs. The walk below reconstructs
+# realised P&L from the fills alone and compares it against the broker's own
+# number wherever both exist. It has two data points today and gains one per
+# closed position, so it accumulates the evidence while nothing depends on it.
+#
+# Two things it would catch, neither visible any other way:
+#
+# * The first PARTIAL close. Both closed positions in the archive are FULL
+#   liquidations -- SIVE sold 1,800 against lots of 400 + 1,400 -- and when every
+#   lot is consumed, FIFO, LIFO and specific-lot all agree. So the arithmetic is
+#   verified and the lot-matching POLICY is not. The SIVE sale even carries IBKR's
+#   `SL` (specific-lot) note and FIFO still matched, because on a full close the
+#   method is unobservable. A partial close is where they diverge.
+# * A change in the commission convention. The walk charges BOTH legs, per the
+#   docstring's verified arithmetic, so a disagreement would appear as a fixed
+#   offset rather than noise.
+#
+# If this ever fails, the failure IS the design input task 9 is waiting for.
+
+
+def _fifo_realized(rows: list[dict]) -> dict[str, float]:
+    """Realised P&L per contract, from fills alone. FIFO lot matching.
+
+    Deliberately a local test helper rather than a module in `src`: nothing in the
+    domain reads it, and putting it in the package would imply a decision task 9
+    has not made. When that decision comes it belongs in a leaf (`lots.py`,
+    alongside `money.py`), not here.
+
+    The model, verified against IBKR on SIVE to the cent:
+    P&L = (exit - entry) x qty x multiplier, plus BOTH legs' commission share.
+    IBKR states commission negative for a charge, so it ADDS.
+    """
+    from collections import defaultdict, deque
+
+    books: dict[str, deque] = defaultdict(deque)
+    pnl: dict[str, float] = defaultdict(float)
+
+    for row in rows:
+        key = str(row["conid"])
+        qty = float(row["quantity"])
+        price = float(row["trade_price"])
+        multiplier = float(row["multiplier"] or 1.0)
+        commission = float(row["ib_commission"] or 0.0)
+        per_unit = commission / abs(qty) if qty else 0.0
+        book = books[key]
+
+        # Opposite sign to the open lots means this fill CLOSES against them.
+        # Read from the position rather than from `open_close`, so a broker that
+        # omits the indicator still works -- and so a mislabelled fill cannot
+        # make a close look like a second opening.
+        if book and (book[0][0] > 0) != (qty > 0):
+            remaining = qty
+            while book and remaining != 0:
+                lot = book[0]
+                take = min(abs(lot[0]), abs(remaining))
+                signed = take if lot[0] > 0 else -take
+                pnl[key] += (price - lot[1]) * signed * multiplier
+                pnl[key] += lot[2] * take + per_unit * take
+                lot[0] -= signed
+                remaining += signed
+                if lot[0] == 0:
+                    book.popleft()
+            if remaining != 0:      # closed more than was held: the rest opens
+                book.append([remaining, price, per_unit])
+        else:
+            book.append([qty, price, per_unit])
+    return dict(pnl)
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_computed_fifo_pnl_agrees_with_the_brokers_own_figure(tmp_path):
+    """The oracle for task 9: can this journal derive what IBKR reports?
+
+    Asserted per contract AND in total, because a compensating pair of errors
+    would pass a total-only check. Tolerance is a cent: both sides are floats over
+    six-figure notionals, and IBKR itself rounds its published figure (68683.68
+    against a computed 68683.68001).
+    """
+    conn = connect_migrated(tmp_path / "fifo.db")
+    for path in STATEMENTS:
+        ingest_file(conn, path, assets=ASSET_FILTER_ALL)
+
+    rows = [dict(r) for r in conn.execute(
+        "SELECT conid, symbol, quantity, trade_price, multiplier, ib_commission,"
+        " fifo_pnl_realized FROM trades WHERE asset_category IN ('OPT','STK')"
+        " ORDER BY COALESCE(date_time, trade_date), trade_id"
+    )]
+    assert rows, "the archive should hold option and stock fills"
+
+    computed = _fifo_realized(rows)
+    reported: dict[str, float] = {}
+    for row in rows:
+        key = str(row["conid"])
+        reported[key] = reported.get(key, 0.0) + float(row["fifo_pnl_realized"] or 0.0)
+
+    closed = {k: v for k, v in reported.items() if abs(v) > 1e-9}
+    assert closed, (
+        "no contract in the archive reports a realised P&L, so this proves "
+        "nothing -- the oracle needs at least one closed position"
+    )
+
+    for key, broker_pnl in sorted(closed.items()):
+        ours = computed.get(key, 0.0)
+        symbol = next(r["symbol"] for r in rows if str(r["conid"]) == key)
+        assert ours == pytest.approx(broker_pnl, abs=0.01), (
+            f"{symbol}: computed {ours:.4f} against IBKR's {broker_pnl:.4f}. "
+            f"Either the FIFO walk is wrong, or IBKR used a different "
+            f"lot-matching method (a PARTIAL close would do it) or a different "
+            f"commission convention. See PLAN.md task 9 -- this failure is the "
+            f"design input it is waiting for."
+        )
+
+    assert sum(computed.values()) == pytest.approx(sum(reported.values()), abs=0.01)
+
+
+def test_the_fifo_walk_charges_both_legs_commission():
+    """The convention, stated on a hand-built round trip rather than inferred.
+
+    `history.py`'s docstring proves IBKR's figure is net of BOTH opening and
+    closing commission, which is why `Episode.commission` must never be subtracted
+    again. The walk has to follow the same rule or the two are not comparable --
+    and a second broker charging differently is precisely what task 9 has to
+    record rather than assume.
+    """
+    rows = [
+        {"conid": "C1", "quantity": -3, "trade_price": 2.10, "multiplier": 100,
+         "ib_commission": -1.95, "fifo_pnl_realized": 0.0},
+        {"conid": "C1", "quantity": 3, "trade_price": 0.0, "multiplier": 100,
+         "ib_commission": -1.95, "fifo_pnl_realized": 0.0},
+    ]
+    # 630 premium received, 1.95 charged on each leg.
+    assert _fifo_realized(rows)["C1"] == pytest.approx(630.0 - 1.95 - 1.95)
+    # Not the opening-only reading, which is what the demo's hand-written
+    # literals use (628.05) and what a careless implementation would produce.
+    assert _fifo_realized(rows)["C1"] != pytest.approx(630.0 - 1.95)
+
+
+def test_the_fifo_walk_matches_oldest_lots_first():
+    """FIFO is the claim, so a partial close must consume the OLDEST lot.
+
+    The archive cannot test this -- both its closed positions are full
+    liquidations, where every method agrees. Hand-built, because the property is
+    what makes the oracle above meaningful: without it, "FIFO agrees with IBKR"
+    could hold for a walk that is not FIFO at all.
+    """
+    rows = [
+        {"conid": "C1", "quantity": 10, "trade_price": 1.00, "multiplier": 1,
+         "ib_commission": 0.0, "fifo_pnl_realized": 0.0},
+        {"conid": "C1", "quantity": 10, "trade_price": 5.00, "multiplier": 1,
+         "ib_commission": 0.0, "fifo_pnl_realized": 0.0},
+        {"conid": "C1", "quantity": -10, "trade_price": 6.00, "multiplier": 1,
+         "ib_commission": 0.0, "fifo_pnl_realized": 0.0},
+    ]
+    # FIFO sells the 1.00 lot: (6 - 1) x 10 = 50. LIFO would give (6 - 5) x 10 = 10.
+    assert _fifo_realized(rows)["C1"] == pytest.approx(50.0)
+
+
+def test_the_fifo_walk_handles_reentry_after_a_full_close():
+    """A contract closed and reopened is two episodes, and the second is flat.
+
+    The SIVE case, which `history.py`'s docstring cites as the reason episodes
+    rather than contracts are the unit: bought twice, fully sold, bought again
+    three days later. The re-entry must not inherit the closed lots.
+    """
+    rows = [
+        {"conid": "C1", "quantity": 4, "trade_price": 10.0, "multiplier": 1,
+         "ib_commission": 0.0, "fifo_pnl_realized": 0.0},
+        {"conid": "C1", "quantity": -4, "trade_price": 15.0, "multiplier": 1,
+         "ib_commission": 0.0, "fifo_pnl_realized": 0.0},
+        {"conid": "C1", "quantity": 4, "trade_price": 99.0, "multiplier": 1,
+         "ib_commission": 0.0, "fifo_pnl_realized": 0.0},
+    ]
+    # Only the first round trip realises: (15 - 10) x 4 = 20. The re-entry is open.
+    assert _fifo_realized(rows)["C1"] == pytest.approx(20.0)
