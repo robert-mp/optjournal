@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import sqlite3
 from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from optjournal.analysis import CostReport
+from optjournal.bars import MARKET_TZ
+from optjournal.events import SOURCE, upcoming
 from optjournal.history import HistoryReport
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
@@ -450,3 +453,83 @@ def statements_data(
             }
         )
     return out
+
+
+def market_data(
+    conn: sqlite3.Connection, *, now: datetime, days: int = 7
+) -> Row:
+    """The economic calendar as the Market tab draws it: a week, and its events.
+
+    Two shapes rather than one list, because the page needs both and deriving the
+    week strip in JavaScript would put a second calendar in a second language.
+    `week` is always seven days even when empty -- a strip with gaps in it would
+    read as missing data rather than as a quiet Tuesday.
+
+    The week is Monday-anchored (`weekday()`), which is what the mockup shows and
+    what an economic calendar means by a week; `days` extends the EVENT list past
+    it without stretching the strip.
+
+    Rendered in `MARKET_TZ` from stored UTC. One timeline, like every other stamp
+    here -- the feed sends offsets, the table holds instants, and the page never
+    parses a zone.
+
+    `impact` travels as the feed stated it, and `impact_source` names whose
+    judgement it is. Same rule as the AutoFX markup: an assessment presented
+    without attribution reads as a measurement.
+    """
+    monday = (now.astimezone(MARKET_TZ)
+              .replace(hour=0, minute=0, second=0, microsecond=0)
+              - timedelta(days=now.astimezone(MARKET_TZ).weekday()))
+    strip_end = monday + timedelta(days=7)
+    # The event list runs from the strip's start to whichever is later, so a
+    # `days` beyond this week still returns its events.
+    end = max(strip_end, monday + timedelta(days=days))
+
+    rows = upcoming(conn, start=int(monday.timestamp()), end=int(end.timestamp()))
+    events: list[Row] = []
+    for row in rows:
+        when = datetime.fromtimestamp(row["starts_at"], MARKET_TZ)
+        events.append({
+            "event_id": row["event_id"],
+            "source": row["source"],
+            "day": when.date().isoformat(),
+            "at": when.strftime("%H:%M"),
+            "starts_at": row["starts_at"],
+            "country": row["country"],
+            "title": row["title"],
+            "impact": row["impact"],
+            "forecast": row["forecast"],
+            "previous": row["previous"],
+        })
+
+    by_day: dict[str, int] = {}
+    high_by_day: dict[str, int] = {}
+    for event in events:
+        by_day[event["day"]] = by_day.get(event["day"], 0) + 1
+        if event["impact"] == "High":
+            high_by_day[event["day"]] = high_by_day.get(event["day"], 0) + 1
+
+    today = now.astimezone(MARKET_TZ).date().isoformat()
+    week = []
+    for offset in range(7):
+        day = (monday + timedelta(days=offset)).date().isoformat()
+        week.append({
+            "day": day,
+            "label": (monday + timedelta(days=offset)).strftime("%a"),
+            "dom": (monday + timedelta(days=offset)).day,
+            "events": by_day.get(day, 0),
+            "high": high_by_day.get(day, 0),
+            "today": day == today,
+        })
+
+    return {
+        "week": week,
+        "events": events,
+        "from_day": week[0]["day"],
+        "to_day": week[-1]["day"],
+        "today": today,
+        #: Whose judgement `impact` is. The page shows this rather than implying
+        #: the journal graded the event itself.
+        "impact_source": SOURCE,
+        "zone": str(MARKET_TZ),
+    }

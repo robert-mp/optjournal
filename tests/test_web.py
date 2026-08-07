@@ -48,6 +48,33 @@ def populated(populated_db) -> Path:
 
 @pytest.fixture
 def state(populated) -> dict:
+    """The payload, with a calendar stored.
+
+    Events are seeded rather than fetched -- no test here touches the network --
+    but they ARE stored, because the contract guard anchors `MarketEvent` to a
+    real payload row and an empty list would quietly exempt that shape.
+
+    Dated relative to now, so the events land inside the week `market_data`
+    derives. A fixed date would fall out of the window and stop anchoring the
+    shape the moment the calendar rolled over -- the same trap a hard-coded row
+    count is, one layer up.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from optjournal.db import connect
+    from optjournal.events import parse_events, store_events
+
+    today = datetime.now(UTC).date()
+    conn = connect(populated)
+    store_events(conn, parse_events([
+        {"title": "Non-Farm Employment Change", "country": "USD",
+         "date": f"{today}T08:30:00-04:00", "impact": "High",
+         "forecast": "85K", "previous": "57K"},
+        {"title": "Bank Holiday", "country": "AUD",
+         "date": f"{today + timedelta(days=1)}T17:00:00-04:00",
+         "impact": "Holiday", "forecast": "", "previous": ""},
+    ]))
+    conn.close()
     return build_state(db_path=populated, archive_dir=RAW_DIR, query_id="1591754")
 
 
@@ -250,6 +277,13 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         "CostsTotals": costs["totals"] if costs else None,
         "FxRow": first(costs["fx"]) if costs else None,
         "Statement": first(state["statements"]),
+        "Market": state["market"],
+        # The strip is always seven days, so [0] is always real. The event list
+        # is empty until the calendar has been fetched, which is why the sampler
+        # tolerates None here -- but the fixture DOES store events (see the
+        # `market` fixture), so in practice this anchors a real row.
+        "MarketDay": first(state["market"]["week"]),
+        "MarketEvent": first(state["market"]["events"]),
         "FxBlock": state["fx"],
         "FxQuote": first(state["fx"]["quotes"]),
         "OdteBlock": state["odte"],

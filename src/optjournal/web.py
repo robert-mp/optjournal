@@ -60,6 +60,7 @@ from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
 from optjournal.serialize import (
     costs_data,
     history_data,
+    market_data,
     orders_data,
     positions_data,
     statements_data,
@@ -506,6 +507,11 @@ def build_state(
             ),
             "history": history_data(report),
             "statements": statements_data(archive_dir, conn),
+            # Read-only: the page never fetches the calendar. `optjournal market
+            # --fetch` does, from the nightly cron, because the feed rate limits
+            # (429 with a retry-after) and a tab reload is not a reason to spend
+            # a request against it.
+            "market": market_data(conn, now=datetime.now(UTC)),
         }
         # How many POSITIONS the open contracts form, which needs the lifecycle
         # grouping and so cannot be computed inside month_stats. Set on both

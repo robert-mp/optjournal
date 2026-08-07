@@ -189,6 +189,26 @@ td.n,th.n{text-align:right}
 .day.clk{cursor:pointer}
 .day.clk:hover{border-color:#8a6a4e}
 .day.selected{outline:2px solid #c98a5c;outline-offset:-2px}
+/* Market strip. Reuses .cal/.day so the two calendars look like one idea; the
+   difference is what a cell holds -- a P&L figure there, event titles here. */
+.mktoday{border-color:#a06840}
+.mkdots{display:flex;flex-direction:column;gap:3px;margin-top:5px}
+.mkdot{font-size:10.5px;color:var(--dim);display:flex;align-items:center;gap:5px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mkdot.dim{color:var(--dim2)}
+/* Impact as a colour AND a word (the row shows the country pill and the title);
+   colour alone would make High indistinguishable from Low to a reader who
+   cannot separate the hues. */
+.mkimp{width:6px;height:6px;border-radius:50%;flex:0 0 auto;background:var(--dim2)}
+.mkimp.hi{background:#c2553f}
+.mkimp.md{background:#c98a5c}
+.mkimp.lo{background:#6f7b6a}
+.mksel{margin-top:16px}
+.mkrow{border:1px solid var(--line);border-radius:9px;padding:10px 12px;
+  background:var(--bg2);margin-top:7px}
+.mkrow-h{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.mkfig{font-size:11.5px;margin-top:4px}
+.mkattr{font-size:11px;margin-top:14px}
 /* Replay drill-down. The panel is the chart's home rather than a table cell:
    reading a strike against a price scale needs a y-axis, and an axis needs
    room. Clicking the card header opens it, the same act as clicking a calendar
@@ -415,6 +435,7 @@ import {
  * @property {Array} lifecycles -- Lifecycle rows: strategies linked by episode
  * @property {History} history
  * @property {Array} statements -- Statement rows, the archive inventory
+ * @property {Market} market -- the economic calendar (serialize.market_data)
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
  * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
@@ -661,6 +682,40 @@ import {
  * @property {string|null} asset_filter
  */
 
+/** @typedef {Object} Market -- the economic calendar (serialize.market_data)
+ * @property {Array} week -- MarketDay rows, always seven; a gap would read as
+ *   missing data rather than as a quiet Tuesday
+ * @property {Array} events -- MarketEvent rows over the window, oldest first
+ * @property {string} from_day
+ * @property {string} to_day
+ * @property {string} today
+ * @property {string} impact_source -- WHOSE judgement `impact` is. Shown, not
+ *   implied: an assessment without attribution reads as a measurement
+ * @property {string} zone -- the zone `day`/`at` are already rendered in
+ */
+
+/** @typedef {Object} MarketDay -- one cell of the week strip
+ * @property {string} day
+ * @property {string} label -- Mon..Sun
+ * @property {number} dom -- day of month
+ * @property {number} events
+ * @property {number} high -- of those, how many the feed calls High
+ * @property {boolean} today
+ */
+
+/** @typedef {Object} MarketEvent -- one release or meeting
+ * @property {string} event_id
+ * @property {string} source
+ * @property {string} day -- already in `Market.zone`, so the page parses no zone
+ * @property {string} at -- HH:MM, likewise
+ * @property {number} starts_at -- epoch UTC, for ordering
+ * @property {string} country
+ * @property {string} title
+ * @property {string} impact -- High|Medium|Low|Holiday, the FEED's word
+ * @property {string|null} forecast -- null when unpublished, which is not zero
+ * @property {string|null} previous
+ */
+
 /** @typedef {Object} Replay -- one trade's chart data (web._attach_replays)
  * @property {string} key -- "lc:<conids>@<date>" or "pos:<conid>"
  * @property {string|null} underlying -- the symbol the price line belongs to
@@ -815,11 +870,13 @@ import {
  * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle
  * @payload res:SyncResponse pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
  * @payload e:Annotation
+ * @payload mk:Market d:MarketDay mev:MarketEvent
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks mks dd sp spot
  * @local play scrub speed loop ev reached
+ * @local chosen withEvents
  */
 
 const $=s=>document.querySelector(s);
@@ -832,7 +889,13 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      because a selection from another month or another scope means nothing here.
      A future scrubber POSITION would not belong in the hash: that is an
      inspection inside an open panel, not which panel is open. */
-  calday:null,replay:null};
+  calday:null,replay:null,
+  /* Which market day is expanded. NOT in the hash, unlike calday:
+     the market strip always has a sensible default (today, or the
+     first day with events), so there is no state a reload could
+     silently lose -- and a link to "the calendar" means the week,
+     not one cell of it. */
+  marketday:null};
 
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -953,6 +1016,7 @@ const TABS=[
   ['costs','Costs'],
   ['annual','Annual'],
   ['odte','0DTE'],
+  ['market','Market'],
 ];
 function renderTabs(){
   $('#tabs').innerHTML=TABS.map(([id,label])=>
@@ -2048,6 +2112,72 @@ function monthlyTable(){
 }
 
 /* ------------------------------------------------ 0DTE */
+/* Market Awareness: the week ahead, and what lands on each day.
+ *
+ * Read-only. The page never fetches the calendar -- `optjournal market --fetch`
+ * does, from the nightly cron, because the feed rate limits (429 with a
+ * retry-after) and a tab reload is not a reason to spend a request against it.
+ *
+ * Every timestamp arrives ALREADY RENDERED in the payload's zone (`mk.zone`), so
+ * this function parses no dates and knows nothing about timezones. Deriving the
+ * week here would put a second calendar in a second language; serialize owns it.
+ */
+function market(){
+  const mk=S.state.market;
+  if(!mk) return `<div class="card"><div class="empty">no calendar data</div></div>`;
+  const evs=mk.events||[];
+  /* Which day is expanded. Defaults to today when today has events, else the
+     first day that does -- an empty list under an empty day would read as the
+     calendar being broken rather than as a quiet Monday. */
+  const withEvents=(mk.week||[]).filter(d=>d.events>0).map(d=>d.day);
+  const sel=S.marketday&&withEvents.includes(S.marketday)?S.marketday
+    :(withEvents.includes(mk.today)?mk.today:(withEvents[0]||null));
+
+  const cells=(mk.week||[]).map(d=>{
+    /* The dot row is a preview, capped at three: a 20-event day would otherwise
+       make one cell taller than the rest and break the strip's grid. */
+    const shown=evs.filter(mev=>mev.day===d.day).slice(0,3);
+    const dots=shown.map(mev=>
+      `<div class="mkdot"><span class="mkimp ${
+        mev.impact==='High'?'hi':mev.impact==='Medium'?'md':'lo'}"></span>${
+        esc(mev.title.length>22?mev.title.slice(0,21)+'…':mev.title)}</div>`).join('');
+    const more=d.events>shown.length?
+      `<div class="mkdot dim">+${d.events-shown.length} more</div>`:'';
+    return `<div class="day${d.day===sel?' selected':''}${
+      d.today?' mktoday':''}" data-marketday="${d.day}" role="button" tabindex="0">
+      <div class="top"><span class="dim">${esc(d.label)}</span><b>${d.dom}</b></div>
+      <div class="mkdots">${dots}${more}</div></div>`;
+  }).join('');
+
+  const chosen=evs.filter(mev=>mev.day===sel);
+  const rows=chosen.map(mev=>{
+    /* forecast and previous are null when unpublished, which is NOT zero -- a
+       holiday has no forecast and a release forecast of 0 would be a number. */
+    const figs=[['fc',mev.forecast],['prev',mev.previous]]
+      .filter(([,v])=>v!=null&&v!=='')
+      .map(([k,v])=>`${k} <b>${esc(v)}</b>`).join(' · ');
+    return `<div class="mkrow">
+      <div class="mkrow-h">
+        <span class="mkimp ${mev.impact==='High'?'hi':mev.impact==='Medium'?'md':'lo'}"
+          ></span><b>${esc(mev.title)}</b>
+        <span class="pill">${esc(mev.country)}</span>
+        <span class="dim">${esc(mev.at)}</span>
+      </div>${figs?`<div class="dim mkfig">${figs}</div>`:''}</div>`;
+  }).join('');
+
+  return `<div class="card">
+    <div class="crow"><h3>Economic Calendar</h3>
+      <span class="pill">${esc(mk.from_day)} – ${esc(mk.to_day)}</span></div>
+    <div class="cal">${cells}</div>
+    ${sel?`<div class="crow mksel"><h3>${esc(sel)}</h3>
+      <span class="dim">${chosen.length} event(s)</span></div>${rows}`
+      :`<div class="empty">no events stored for this week — run
+        <code>optjournal market --fetch</code></div>`}
+    <div class="dim mkattr">impact is ${esc(mk.impact_source)}'s assessment, not
+      this journal's · times in ${esc(mk.zone)}</div>
+  </div>`;
+}
+
 function odte(){
   const od=S.state.odte, h=S.state.history||{};
   if(!od) return `<div class="card"><div class="empty">no data</div></div>`;
@@ -2237,7 +2367,7 @@ function draw(push){
   syncHash(push);
   renderTabs();
   renderCcy();
-  const views={dashboard,calendar,trades,positions,costs,annual,odte};
+  const views={dashboard,calendar,trades,positions,costs,annual,odte,market};
   const v=views[S.tab];
   $('#body').innerHTML=(S.showCog?cog():'')+(v?v():
     `<div class="card"><div class="empty">nothing here yet</div></div>`);
@@ -2252,6 +2382,15 @@ function draw(push){
   document.querySelectorAll('[data-calday]').forEach(el=>
     el.onclick=()=>{const k=el.dataset.calday;
       S.calday=S.calday===k?null:k;draw();});
+  /* Market day: pure redraw, no request -- every event is already in the
+     payload. Not a toggle, unlike the calendar: the market view always shows
+     SOME day, so clearing the selection would leave the panel empty with no way
+     back except reloading. role=button means Enter and Space have to work. */
+  document.querySelectorAll('[data-marketday]').forEach(el=>{
+    const pick=()=>{S.marketday=el.dataset.marketday;draw();};
+    el.onclick=pick;
+    el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();pick();}};
+  });
   /* Replay drill-down: same toggle, same pure redraw. Every bar is already in
      the payload, so opening a chart costs no request. */
   document.querySelectorAll('[data-replay]').forEach(el=>
