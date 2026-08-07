@@ -592,14 +592,23 @@ that, checking it imports neither `flex` nor `sections` and names none of 26 IBK
 fields in code. So the writers really are broker-agnostic, not just described that
 way.
 
-One thing is deliberately unfinished: the database and payload still spell five
+One thing is deliberately unfinished, and the halves are now separated. The
+**seam** speaks trading terms throughout — `contract_id`, `exec_id`, `order_id`,
+`commission`, `realized_pnl` — while the **database and payload** still spell five
 things IBKR's way (`conid`, `ib_order_id`, `ib_commission`, `fifo_pnl_*`,
-`ib_exec_id`). Those names are *accurate* while IBKR is the only source, and
-`fills.py` has already chosen the neutral ones (`exec_id`, `order_id`,
-`commission`, `realized_pnl`), so the rename is the schema catching up rather than
-a design question. It is 663 occurrences and another migration, so it waits for a
-real second broker — see PLAN.md's "task 8" for the measured scope and the
-commit-by-commit order.
+`ib_exec_id`). Those names are *accurate* while IBKR is the only source, so the
+remaining rename is the schema catching up rather than a design question.
+
+What makes leaving it that way safe is that the two vocabularies meet in exactly
+one file: `ingest.py`, whose SQL names the column while its values read the
+attribute, so `fill.contract_id` is written into `conid` on a single line. A test
+fails if any other module starts reading a seam attribute, and another rejects a
+seam field whose name contains a vendor word at all. Prose is not a guard —
+`conid` sat on the seam for four months with the reason written beside it.
+
+It is 690 occurrences, so it waits for a real second broker — see PLAN.md's "task
+8" for the measured scope, the two migration traps that are confirmed by test, and
+the commit-by-commit order.
 
 **A new cron job**: implementation in `cron/`, a loader shim under
 `~/.meshclaw/crons/` that locates it by path (never a copy — see below), and a
