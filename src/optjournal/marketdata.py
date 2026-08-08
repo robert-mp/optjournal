@@ -50,9 +50,12 @@ __all__ = [
     "SOURCE_RANK",
     "Bar",
     "BarFetchError",
+    "Quote",
     "fetch_bars",
+    "fetch_quote",
     "occ_symbol",
     "parse_chart",
+    "parse_quote",
 ]
 
 #: Bar sizes this journal stores. Hourly for a position held days, daily for
@@ -101,6 +104,43 @@ class Bar:
     volume: int | None
 
 
+@dataclass(frozen=True)
+class Quote:
+    """The last trade the source knows about, and WHEN it was.
+
+    Already in every chart response, in a `meta` block the bar parser reads past
+    and drops. So this costs no extra request: `fetch_bars` and `fetch_quote` hit
+    the same URL, and the watchlist's stored close and live price come from one
+    endpoint. Measured against the live source while writing this -- a quote ten
+    seconds old beside a stored close 0.50% away from it, which is the gap that
+    made a column headed `last` misleading.
+
+    `at` is NOT decoration. A quote has no meaning without its age: outside
+    market hours the source keeps serving Friday's last trade, and a number that
+    old presented as "live" is worse than showing yesterday's close honestly. The
+    page renders the age, and the age comes from here.
+
+    Deliberately NOT `market_state`. Verified rather than assumed: the chart
+    response carries no `marketState` field for either a stock or an ETF, so a
+    boolean "market open" here would have to be inferred from the clock -- a
+    second calendar, wrong on holidays and half-days. The age is a measurement;
+    open-or-closed would be a guess wearing a measurement's clothes.
+
+    `previous_close` comes from the same block, so the change is computed against
+    what the source itself considers the prior settle rather than against a stored
+    bar that may be a different session.
+    """
+
+    symbol: str
+    price: float | None
+    #: Epoch seconds, UTC, of the last trade. None when the source omits it,
+    #: which makes the price unusable rather than merely undated -- see
+    #: `parse_quote`.
+    at: int | None
+    previous_close: float | None
+    currency: str | None
+
+
 def occ_symbol(symbol: str) -> str:
     """The journal's padded OCC symbol as the price source spells it.
 
@@ -136,17 +176,89 @@ def fetch_bars(
     if source != "yahoo":
         raise BarFetchError(f"no adapter for source {source!r}")
 
-    url = _CHART_URL.format(symbol=occ_symbol(symbol))
     query = f"?interval={bar_size}&period1={int(start)}&period2={int(end)}"
+    payload = _get_chart(symbol, query, what=bar_size, timeout=timeout)
+    return parse_chart(payload, symbol=symbol, bar_size=bar_size)
+
+
+def _get_chart(symbol: str, query: str, *, what: str, timeout: int) -> Any:
+    """One chart request, with the error wrapping both callers need.
+
+    Extracted when `fetch_quote` arrived rather than copied: bars and quotes come
+    from the SAME url and differ only in the query string, so duplicating this
+    would mean two places to fix a timeout, a user agent or an error message. The
+    parsers stay separate because they read different parts of the response.
+    """
+    url = _CHART_URL.format(symbol=occ_symbol(symbol))
     request = urllib.request.Request(url + query, headers={"User-Agent": _USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-            payload = json.load(response)
+            return json.load(response)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise BarFetchError(
-            f"{occ_symbol(symbol)} {bar_size}: {type(exc).__name__}: {exc}"
+            f"{occ_symbol(symbol)} {what}: {type(exc).__name__}: {exc}"
         ) from exc
-    return parse_chart(payload, symbol=symbol, bar_size=bar_size)
+
+
+def fetch_quote(
+    symbol: str, *, source: str = "yahoo", timeout: int = _TIMEOUT_S
+) -> Quote:
+    """The last trade for ``symbol``, from the same endpoint the bars come from.
+
+    `range=1d` is the smallest window that still carries the `meta` block; the
+    bars in the reply are discarded. One request per symbol, so a watchlist of
+    four costs four -- which is why the page fetches these on demand rather than
+    on a timer, and why they are never written to `price_bars`.
+    """
+    if source != "yahoo":
+        raise BarFetchError(f"no adapter for source {source!r}")
+    payload = _get_chart(symbol, "?interval=1d&range=1d", what="quote",
+                         timeout=timeout)
+    return parse_quote(payload, symbol=symbol)
+
+
+def parse_quote(payload: Any, *, symbol: str) -> Quote:
+    """Read a chart response's `meta` block into a :class:`Quote`.
+
+    Separate from the fetch for the same reason as `parse_chart`: the suite
+    exercises it against a captured fixture and never touches the network.
+
+    A PRICE WITHOUT A TIME IS DISCARDED. If `regularMarketTime` is missing the
+    price goes to None as well, because the page's whole defence against a stale
+    quote is showing its age -- an undated price would render as live and could be
+    Friday's. Refusing it is the same rule `money.py` applies to a figure whose
+    currency cannot be established: drop the number rather than present it
+    unqualified.
+    """
+    chart = payload.get("chart") if isinstance(payload, dict) else None
+    if not isinstance(chart, dict):
+        raise BarFetchError(f"{symbol} quote: response was not a chart payload")
+    error = chart.get("error")
+    if error:
+        code = error.get("code") if isinstance(error, dict) else error
+        raise BarFetchError(f"{symbol} quote: source reported {code!r}")
+    results = chart.get("result") or []
+    if not results:
+        raise BarFetchError(f"{symbol} quote: response carried no result")
+
+    meta = (results[0] or {}).get("meta") or {}
+
+    def number(name: str) -> float | None:
+        value = meta.get(name)
+        return float(value) if isinstance(value, int | float) else None
+
+    stamp = meta.get("regularMarketTime")
+    at = int(stamp) if isinstance(stamp, int | float) else None
+    price = number("regularMarketPrice")
+    return Quote(
+        symbol=symbol,
+        # Undated means unusable. See the docstring.
+        price=price if at is not None else None,
+        at=at,
+        previous_close=number("chartPreviousClose"),
+        currency=meta.get("currency") if isinstance(meta.get("currency"), str)
+                 else None,
+    )
 
 
 def parse_chart(payload: Any, *, symbol: str, bar_size: str) -> list[Bar]:

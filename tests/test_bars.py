@@ -37,7 +37,13 @@ from optjournal.bars import (
     upsert_bars,
 )
 from optjournal.blackscholes import bs_price
-from optjournal.marketdata import Bar, BarFetchError, occ_symbol, parse_chart
+from optjournal.marketdata import (
+    Bar,
+    BarFetchError,
+    occ_symbol,
+    parse_chart,
+    parse_quote,
+)
 
 DAY = 86400
 
@@ -158,6 +164,73 @@ def test_bars_come_back_in_time_order():
     bars = parse_chart(_chart([300, 100, 200], close=[3.0, 1.0, 2.0]),
                        symbol="X", bar_size="1d")
     assert [b.ts for b in bars] == [100, 200, 300]
+
+
+# --------------------------------------------------------------------------
+# marketdata: the live quote, from the same response
+# --------------------------------------------------------------------------
+
+def _quote_payload(**meta):
+    """A chart response carrying only what `parse_quote` reads.
+
+    Shaped from a REAL capture. The live `meta` block holds 23 keys; these four
+    are the ones read, and the field names are copied from the capture rather
+    than guessed -- `chartPreviousClose`, not `previousClose`, which the response
+    does not carry at all.
+    """
+    return {"chart": {"error": None, "result": [{"meta": dict(meta)}]}}
+
+
+def test_a_quote_carries_the_price_and_when_it_was():
+    quote = parse_quote(_quote_payload(
+        regularMarketPrice=330.915, regularMarketTime=1786114925,
+        chartPreviousClose=311.21, currency="USD",
+    ), symbol="TSLA")
+    assert (quote.price, quote.at) == (330.915, 1786114925)
+    assert quote.previous_close == 311.21
+    assert quote.currency == "USD"
+
+
+def test_an_undated_price_is_discarded():
+    """The rule that makes the live column honest.
+
+    The page's only defence against a stale quote is showing its age, so a price
+    with no timestamp would render as live and could be Friday's last trade. Same
+    rule as `money.py` applies to a figure whose currency cannot be established:
+    drop the number rather than present it unqualified.
+    """
+    quote = parse_quote(_quote_payload(regularMarketPrice=330.915), symbol="TSLA")
+    assert quote.at is None
+    assert quote.price is None, "an undated price must not reach the page"
+
+
+def test_a_quote_for_a_symbol_with_no_meta_is_empty_not_an_error():
+    """A known symbol the source has no quote for is an answer, not a failure --
+    the same distinction `parse_chart` draws for an empty timestamp array."""
+    quote = parse_quote(_quote_payload(), symbol="X")
+    assert (quote.price, quote.at, quote.previous_close) == (None, None, None)
+
+
+def test_a_quote_source_error_is_raised():
+    payload = {"chart": {"error": {"code": "Not Found"}, "result": None}}
+    with pytest.raises(BarFetchError, match="Not Found"):
+        parse_quote(payload, symbol="X")
+
+
+def test_a_quote_from_a_non_chart_payload_is_raised():
+    with pytest.raises(BarFetchError, match="not a chart payload"):
+        parse_quote({"unexpected": True}, symbol="X")
+
+
+def test_a_string_price_is_not_coerced():
+    """Defensive against the source changing shape: a price arriving as a string
+    must not become a float by accident, because the page would then compare it
+    to a stored close and render a change that was never measured.
+    """
+    quote = parse_quote(_quote_payload(
+        regularMarketPrice="330.915", regularMarketTime=1786114925,
+    ), symbol="X")
+    assert quote.price is None
 
 
 def test_occ_symbol_drops_ibkrs_padding():
