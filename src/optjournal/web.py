@@ -39,6 +39,7 @@ import http.server
 import ipaddress
 import json
 import logging
+import re
 import socket
 import sqlite3
 import threading
@@ -62,6 +63,12 @@ from optjournal.bars import (
     replay_model,
 )
 from optjournal.db import open_journal
+from optjournal.events import (
+    EventFetchError,
+    EventRateLimited,
+    fetch_events,
+    store_events,
+)
 from optjournal.flex import (
     FETCH_COOLDOWN_S,
     FetchCooldown,
@@ -73,6 +80,7 @@ from optjournal.flex import (
 )
 from optjournal.history import build_history
 from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
+from optjournal.marketdata import BarFetchError, fetch_quote
 from optjournal.serialize import (
     costs_data,
     history_data,
@@ -114,6 +122,12 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return host == "localhost"
+
+
+#: A symbol is letters, digits, dot, dash -- enough for BRK.B and foreign
+#: listings, and not enough for a path or a quote. Not a ticker universe:
+#: see `_watchlist_write` on why this journal has no such list.
+_SYMBOL_OK = re.compile(r"^[A-Za-z0-9.\-]+$")
 
 
 def _origin_is_same(origin: str | None, *, host: str, port: int) -> bool:
@@ -769,8 +783,57 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 ))
             except sqlite3.OperationalError as exc:
                 self._json(500, {"error": f"database not readable: {exc}"})
+        elif path == "/api/quotes":
+            self._json(*self._quotes())
         else:
             self._json(404, {"error": "not found"})
+
+    def _quotes(self) -> tuple[int, dict[str, Any]]:
+        """Last-trade prices for the watched symbols, fetched on demand.
+
+        A GET because it reads, but it is NOT free: one HTTP request per symbol to
+        a public endpoint. That is exactly why it is a separate route rather than
+        part of `/api/state` -- putting it there would spend N requests on every
+        page load, every tab switch and every month filter, for a column only one
+        tab shows. The page asks when the Watchlist opens and when Refresh is
+        pressed, and nothing else triggers it.
+
+        Never written to `price_bars`. A live intraday price is not a settled
+        close, and storing one would feed a half-formed session into
+        `realised_vol` -- a measurement quietly corrupted by a display feature.
+        The quote lives in the response and nowhere else.
+
+        A symbol that fails is reported as a null price rather than failing the
+        whole request: one dead ticker should not blank the other three.
+        """
+        with open_journal(self.cfg.db_path) as conn:
+            symbols = [str(row["symbol"]) for row in conn.execute(
+                "SELECT symbol FROM watchlist ORDER BY symbol")]
+        quotes: dict[str, Any] = {}
+        failed: list[str] = []
+        for symbol in symbols:
+            try:
+                quote = fetch_quote(symbol)
+            except BarFetchError as exc:
+                log.debug("quote %s failed: %s", symbol, exc)
+                failed.append(symbol)
+                continue
+            quotes[symbol] = {
+                "price": quote.price,
+                "at": quote.at,
+                "previous_close": quote.previous_close,
+                "currency": quote.currency,
+            }
+        return 200, {
+            "ok": True,
+            "quotes": quotes,
+            "failed": failed,
+            #: The server's clock at the moment it answered, so the page renders
+            #: an AGE rather than a timestamp it would have to trust its own clock
+            #: to interpret. A quote is meaningless without one -- run on a
+            #: Saturday every one of these is Friday's close, 22 hours old.
+            "asked_at": int(datetime.now(UTC).timestamp()),
+        }
 
     def _same_origin(self) -> bool:
         """`Origin` against the socket this server actually bound.
@@ -786,6 +849,86 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.headers.get("Origin"), host=bound_host, port=bound_port
         )
 
+    def _body(self, limit: int = 8192) -> dict[str, Any]:
+        """The request's JSON object, or {}.
+
+        Length-capped because `rfile.read` on a Content-Length the client chose is
+        an unbounded allocation, and this server has no framework to do it for us.
+        8KB is four orders of magnitude more than any body here needs.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}
+        if length <= 0 or length > limit:
+            return {}
+        try:
+            parsed = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, OSError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _market_fetch(self) -> tuple[int, dict[str, Any]]:
+        """Refresh the calendar from the feed. No IBKR request, no lock.
+
+        Deliberately NOT behind the sync lock: that lock exists to stop two IBKR
+        fetches racing on the archive, and this touches neither. It does hit a
+        rate-limited feed, so a 429 comes back as its own `kind` and the page says
+        so rather than reporting a failure -- nothing is lost, the same week is
+        served tomorrow.
+        """
+        try:
+            events = fetch_events()
+        except EventRateLimited as exc:
+            return 429, {"ok": False, "kind": "throttled", "message": str(exc)}
+        except EventFetchError as exc:
+            return 502, {"ok": False, "kind": "feed", "message": str(exc)}
+        with open_journal(self.cfg.db_path) as conn:
+            stored = store_events(conn, events)
+        return 200, {"ok": True, "kind": "market", "fetched": len(events),
+                     "stored": stored}
+
+    def _watchlist_write(self) -> tuple[int, dict[str, Any]]:
+        """Add or remove one watched symbol.
+
+        One symbol per request rather than a submitted list, because the UI edits
+        one row at a time and a list would need a merge rule (is an absent symbol
+        a removal?) that nothing asks for.
+
+        The symbol is upper-cased and length-checked but NOT validated against a
+        ticker universe: this journal has no such list, and inventing one would
+        reject a legitimate foreign listing. A symbol that does not exist simply
+        stores a row with no bars, which the tab already renders as a dash.
+        """
+        body = self._body()
+        symbol = str(body.get("symbol") or "").strip().upper()
+        action = str(body.get("action") or "add")
+        if not symbol or len(symbol) > 24 or not _SYMBOL_OK.match(symbol):
+            return 400, {"ok": False, "kind": "symbol",
+                         "message": f"{symbol or '(empty)'} is not a symbol"}
+        if action not in ("add", "remove"):
+            return 400, {"ok": False, "kind": "action",
+                         "message": f"unknown action {action!r}"}
+        note = body.get("note")
+        with open_journal(self.cfg.db_path) as conn:
+            if action == "remove":
+                cursor = conn.execute(
+                    "DELETE FROM watchlist WHERE symbol = ?", (symbol,))
+                changed = cursor.rowcount
+            else:
+                # COALESCE, so re-adding a symbol does not blank an existing note
+                # -- the same upsert rule `optjournal watch` uses.
+                conn.execute(
+                    "INSERT INTO watchlist (symbol, note, added_at) VALUES (?,?,?)"
+                    " ON CONFLICT(symbol) DO UPDATE SET"
+                    " note=COALESCE(excluded.note, note)",
+                    (symbol, str(note) if note else None, _now()),
+                )
+                changed = 1
+            conn.commit()
+        return 200, {"ok": True, "kind": "watchlist", "action": action,
+                     "symbol": symbol, "changed": changed}
+
     def do_POST(self) -> None:  # noqa: N802 - stdlib naming
         path, _, _q = self.path.partition("?")
         # BEFORE the route check, so every write endpoint added later is covered
@@ -798,6 +941,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                            "authentication, so a page you have open could "
                            "otherwise spend your IBKR request budget.",
             })
+            return
+        if path == "/api/market/fetch":
+            self._json(*self._market_fetch())
+            return
+        if path == "/api/watchlist":
+            self._json(*self._watchlist_write())
             return
         if path != "/api/sync":
             self._json(404, {"error": "not found"})

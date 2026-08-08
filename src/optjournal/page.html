@@ -210,6 +210,36 @@ td.n,th.n{text-align:right}
 .mkfig{font-size:11.5px;margin-top:4px}
 .mkattr{font-size:11px;margin-top:14px}
 .wnote{font-size:10.5px;margin-top:2px}
+/* Actions inside a card header. Borrowed from .seg's palette rather than given a
+   new one, so a Refresh beside a segmented toggle reads as the same family of
+   control. `sm` is the only size, kept as a modifier because a bare `.btn` would
+   invite a second, larger one that nothing needs. */
+.btn{font:inherit;font-weight:600;font-size:12.5px;padding:8px 14px;cursor:pointer;
+  border-radius:9px;color:var(--dim);background:var(--panel2);
+  border:1px solid var(--line2)}
+.btn:hover:not(:disabled){color:var(--fg);border-color:var(--dim2)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.busy{opacity:.6}
+.btn.sm{font-size:12px;padding:7px 12px}
+/* The toggle sits between the date range and Refresh, so it needs to not grow. */
+.mktoggle{flex:0 0 auto}
+.mktoggle button{padding:7px 13px;font-size:12px}
+/* Add field: an input and its button as one unit, so they cannot wrap apart. */
+.wadd{display:flex;gap:7px;align-items:center;flex:0 0 auto}
+.wadd input{font:inherit;font-size:12.5px;padding:7px 11px;width:132px;
+  border-radius:9px;color:var(--fg);background:var(--bg2);
+  border:1px solid var(--line2)}
+.wadd input::placeholder{color:var(--dim2)}
+.wadd input:disabled{opacity:.5}
+/* Remove: quiet until hovered. A row of red crosses would read as errors, and
+   the destructive act is confirmed rather than announced by colour. */
+.wrm{font:inherit;font-size:15px;line-height:1;cursor:pointer;padding:2px 7px;
+  border-radius:7px;color:var(--dim2);background:none;border:1px solid transparent}
+.wrm:hover:not(:disabled){color:#f0a0a8;border-color:var(--line2)}
+.wrm:disabled{opacity:.4;cursor:not-allowed}
+/* Marks a price as a stored close rather than a fetched quote. A glyph, not a
+   colour: the distinction is factual, not good or bad. */
+.wstale{margin-left:2px}
 /* Replay drill-down. The panel is the chart's home rather than a table cell:
    reading a strike against a price scale needs a y-axis, and an axis needs
    room. Clicking the card header opens it, the same act as clicking a calendar
@@ -694,6 +724,10 @@ import {
  * @property {string} impact_source -- WHOSE judgement `impact` is. Shown, not
  *   implied: an assessment without attribution reads as a measurement
  * @property {string} zone -- the zone `day`/`at` are already rendered in
+ * @property {string} default_scope -- what the Key view narrows to, in words,
+ *   so the toggle's label comes from the server that applied it
+ * @property {number} total_events -- every row in the window
+ * @property {number} key_events -- of those, how many survive the Key view
  */
 
 /** @typedef {Object} MarketDay -- one cell of the week strip
@@ -702,6 +736,9 @@ import {
  * @property {number} dom -- day of month
  * @property {number} events
  * @property {number} high -- of those, how many the feed calls High
+ * @property {number} key_events -- of those, how many survive the Key view. The
+ *   strip counts what the rows will show, so a day cannot display three dots
+ *   and then open empty -- which reads as broken rather than as filtered
  * @property {boolean} today
  */
 
@@ -716,6 +753,9 @@ import {
  * @property {string} impact -- High|Medium|Low|Holiday, the FEED's word
  * @property {string|null} forecast -- null when unpublished, which is not zero
  * @property {string|null} previous
+ * @property {boolean} key -- survives the default view. Decided server-side from
+ *   the same constants the CLI uses, so the page never holds its own copy of
+ *   "USD high-impact" to drift from
  */
 
 /** @typedef {Object} Watch -- one watched symbol (serialize.watchlist_data)
@@ -876,6 +916,49 @@ import {
  * @property {Array} [warnings]
  */
 
+/** @typedef {Object} MarketFetch -- the /api/market/fetch reply
+ *  (web._Handler._market_fetch). Its own shape rather than SyncResponse's: this
+ *  spends no IBKR request and cannot report a cooldown, an archive or a
+ *  duplicate, and sharing that typedef would declare six keys it never sends
+ * @property {boolean} ok
+ * @property {string} kind -- market|throttled|feed
+ * @property {string} [message]
+ * @property {number} [fetched] -- events the feed returned
+ * @property {number} [stored] -- of those, how many were written
+ */
+
+/** @typedef {Object} WatchWrite -- the /api/watchlist reply
+ *  (web._Handler._watchlist_write)
+ * @property {boolean} ok
+ * @property {string} kind -- watchlist|symbol|action
+ * @property {string} [message]
+ * @property {string} [action] -- add|remove, echoed so the toast can say which
+ * @property {string} [symbol] -- as STORED (upper-cased), not as typed
+ * @property {number} [changed] -- rows affected; 0 on removing what was absent,
+ *   which the page reports rather than claiming a removal that did nothing
+ */
+
+/** @typedef {Object} Quote -- one symbol's last trade, from QuoteReply.quotes
+ *  (marketdata.Quote). Never stored: a live intraday price is not a settled
+ *  close, and writing one into price_bars would feed a half-formed session into
+ *  realised_vol
+ * @property {number|null} price -- null when the source gave no dated price
+ * @property {number|null} at -- epoch UTC of the last trade. The page renders the
+ *   AGE from this; a price without it is discarded server-side rather than shown
+ * @property {number|null} previous_close -- the source's own prior settle
+ * @property {string|null} currency
+ */
+
+/** @typedef {Object} QuoteReply -- the /api/quotes reply
+ *  (web._Handler._quotes)
+ * @property {boolean} ok
+ * @property {Object} quotes -- symbol -> {price, at, previous_close, currency}
+ * @property {Array} failed -- symbols the source would not answer for. One dead
+ *   ticker must not blank the others, so it is a list rather than an error
+ * @property {number} asked_at -- the SERVER's clock when it answered, so the page
+ *   renders an age without trusting its own clock against the source's
+ */
+
 /** @typedef {Object} ChartPoint -- page-side: built from Stats.days for the equity curve
  * @property {number} x
  * @property {number} y
@@ -900,12 +983,14 @@ import {
  * @payload e:Annotation
  * @payload mk:Market d:MarketDay mev:MarketEvent
  * @payload w:Watch wo:WatchOption
+ * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks mks dd sp spot
  * @local play scrub speed loop ev reached
  * @local chosen withEvents ws opts thin
+ * @local JSON Object ages input mine qb wf behind
  */
 
 const $=s=>document.querySelector(s);
@@ -924,7 +1009,17 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      first day with events), so there is no state a reload could
      silently lose -- and a link to "the calendar" means the week,
      not one cell of it. */
-  marketday:null};
+  marketday:null,
+  /* Calendar filter: false (the default) shows `Market.default_scope`, true shows
+     everything stored. Not in the hash for the same reason as marketday -- and
+     deliberately DEFAULT-OFF rather than remembered, because "why is my calendar
+     empty" is a worse first impression than one extra click. */
+  mktall:false,
+  /* Live quotes, keyed by symbol, and the server clock when they were asked for.
+     NOT part of `state`: they come from their own endpoint because each one costs
+     an HTTP request, so they must not ride along on every payload reload. Null
+     until the Watchlist tab asks. */
+  quotes:null,quotesAt:null};
 
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -2155,28 +2250,49 @@ function monthlyTable(){
 function market(){
   const mk=S.state.market;
   if(!mk) return `<div class="card"><div class="empty">no calendar data</div></div>`;
-  const evs=mk.events||[];
-  /* Which day is expanded. Defaults to today when today has events, else the
-     first day that does -- an empty list under an empty day would read as the
-     calendar being broken rather than as a quiet Monday. */
-  const withEvents=(mk.week||[]).filter(d=>d.events>0).map(d=>d.day);
+
+  /* THE FILTER. 82 of a real week's 99 events are Low impact and 25 are EUR rows
+     that are all Low, so showing everything buries the four releases an options
+     book reacts to. `mev.key` and `d.key_events` are decided SERVER-SIDE from the
+     same constants the CLI uses -- the page holds no copy of "USD high-impact" to
+     drift from, and the toggle's label comes from `default_scope`. */
+  const all=S.mktall===true;
+  const evs=(mk.events||[]).filter(mev=>all||mev.key);
+  const countOf=d=>all?d.events:d.key_events;
+
+  /* Which day is expanded, chosen from the days that have events UNDER THE
+     CURRENT FILTER -- otherwise switching to Key could leave a day selected that
+     is now empty, which reads as the calendar being broken rather than filtered.
+
+     FORWARD FIRST, then back. Today when it qualifies, else the next qualifying
+     day, and only then the most recent past one. A calendar is consulted to learn
+     what is COMING, so the earliest cell of the week is the worst default: seen
+     in the browser on a Saturday, the Key view opened Monday the 3rd -- five days
+     gone -- purely because it was first in the array. Falling back to the LATEST
+     past day rather than the earliest also means a week whose events have all
+     happened opens on the most recent one. */
+  const withEvents=(mk.week||[]).filter(d=>countOf(d)>0).map(d=>d.day);
+  const ahead=withEvents.filter(d=>d>=mk.today);
+  const behind=withEvents.filter(d=>d<mk.today);
   const sel=S.marketday&&withEvents.includes(S.marketday)?S.marketday
-    :(withEvents.includes(mk.today)?mk.today:(withEvents[0]||null));
+    :(ahead[0]||behind[behind.length-1]||null);
 
   const cells=(mk.week||[]).map(d=>{
     /* The dot row is a preview, capped at three: a 20-event day would otherwise
        make one cell taller than the rest and break the strip's grid. */
-    const shown=evs.filter(mev=>mev.day===d.day).slice(0,3);
+    const mine=evs.filter(mev=>mev.day===d.day);
+    const shown=mine.slice(0,3);
     const dots=shown.map(mev=>
       `<div class="mkdot"><span class="mkimp ${
         mev.impact==='High'?'hi':mev.impact==='Medium'?'md':'lo'}"></span>${
         esc(mev.title.length>22?mev.title.slice(0,21)+'…':mev.title)}</div>`).join('');
-    const more=d.events>shown.length?
-      `<div class="mkdot dim">+${d.events-shown.length} more</div>`:'';
+    const more=mine.length>shown.length?
+      `<div class="mkdot dim">+${mine.length-shown.length} more</div>`:'';
+    const quiet=mine.length?'':`<div class="mkdot dim">—</div>`;
     return `<div class="day${d.day===sel?' selected':''}${
       d.today?' mktoday':''}" data-marketday="${d.day}" role="button" tabindex="0">
       <div class="top"><span class="dim">${esc(d.label)}</span><b>${d.dom}</b></div>
-      <div class="mkdots">${dots}${more}</div></div>`;
+      <div class="mkdots">${dots}${more}${quiet}</div></div>`;
   }).join('');
 
   const chosen=evs.filter(mev=>mev.day===sel);
@@ -2195,14 +2311,34 @@ function market(){
       </div>${figs?`<div class="dim mkfig">${figs}</div>`:''}</div>`;
   }).join('');
 
+  /* How many rows the other view would show, so the toggle states what it costs
+     rather than making you press it to find out. */
+  const hidden=(mk.total_events||0)-(mk.key_events||0);
+  const seg=`<div class="seg mktoggle">
+    <button data-mktall="0" class="${all?'':'on'}">${esc(mk.default_scope)}</button>
+    <button data-mktall="1" class="${all?'on':''}">all ${mk.total_events||0}</button>
+  </div>`;
+
+  /* The empty state distinguishes "nothing stored" from "nothing MATCHED", which
+     are different problems: the first needs a fetch, the second needs the toggle.
+     Conflating them is how a working calendar reads as broken. */
+  const empty=(mk.total_events||0)===0
+    ? `<div class="empty">no events stored for this week —
+        <b>Refresh</b> above, or run <code>optjournal market --fetch</code></div>`
+    : `<div class="empty">no ${esc(mk.default_scope)} events this week.
+        ${hidden} other event(s) are stored — switch to
+        <b>all ${mk.total_events||0}</b> to see them.</div>`;
+
   return `<div class="card">
     <div class="crow"><h3>Economic Calendar</h3>
-      <span class="pill">${esc(mk.from_day)} – ${esc(mk.to_day)}</span></div>
+      <span class="pill">${esc(mk.from_day)} – ${esc(mk.to_day)}</span>
+      ${seg}
+      <button id="mkfetch" class="btn sm">Refresh</button></div>
     <div class="cal">${cells}</div>
     ${sel?`<div class="crow mksel"><h3>${esc(sel)}</h3>
-      <span class="dim">${chosen.length} event(s)</span></div>${rows}`
-      :`<div class="empty">no events stored for this week — run
-        <code>optjournal market --fetch</code></div>`}
+      <span class="dim">${chosen.length} event(s)${
+        all?'':` · ${hidden} hidden`}</span></div>${rows}`
+      :empty}
     <div class="dim mkattr">impact is ${esc(mk.impact_source)}'s assessment, not
       this journal's · times in ${esc(mk.zone)}</div>
   </div>`;
@@ -2220,21 +2356,54 @@ function market(){
  */
 function watchlist(){
   const ws=S.state.watchlist||[];
-  if(!ws.length) return `<div class="card"><div class="empty">nothing watched yet —
-    <code>optjournal watch AAPL</code> adds a symbol</div></div>`;
   const pct=v=>v==null?'<span class="dim">—</span>':
     `<span class="${v>=0?'g':'r'}">${v>=0?'+':''}${num(v,2)}%</span>`;
+
+  /* The add field lives in the header, so editing happens where you are looking.
+     Rendered even when the list is empty -- an empty state that only tells you to
+     run a CLI command is a dead end when the button could be right there. */
+  const adder=`<form id="waddf" class="wadd">
+    <input id="wadd" placeholder="+ add symbol" maxlength="24"
+      autocomplete="off" spellcheck="false">
+    <button class="btn sm" type="submit">Add</button></form>`;
+
+  if(!ws.length) return `<div class="card">
+    <div class="crow"><h3>Watchlist</h3>${adder}</div>
+    <div class="empty">nothing watched yet — add a symbol above, or run
+      <code>optjournal watch AAPL</code></div></div>`;
+
+  /* Quotes arrive from a SEPARATE request (/api/quotes), because each one costs an
+     HTTP call and the payload is shared by every tab. Absent until asked for, so
+     every read here tolerates undefined. */
+  const qs=S.quotes||{};
   const rows=ws.map(w=>{
     /* Which contracts, not just "held": the strike and side are the reason to
        look at this row rather than a chart. */
     const opts=(w.options||[]).map(wo=>
       `${wo.quantity>0?'+':''}${wo.quantity} ${
         wo.strike!=null?num(wo.strike,0):''}${wo.put_call||''}`).join(', ');
+    const wq=qs[w.symbol];
+    /* The live price, when one has been fetched, else the stored close. Labelled
+       by WHICH it is: the two differed by 0.50% on the real journal, and a column
+       headed `last` showing yesterday's close is the defect this closes. */
+    const shown=wq&&wq.price!=null?wq.price:w.last;
+    const live=!!(wq&&wq.price!=null);
+    /* 1d MUST come from the same session as the price beside it. Caught in the
+       browser: showing the fetched quote (773.26) next to a change computed from
+       stored bars (-0.16%) put two DIFFERENT sessions in one row, because the
+       bars ended Thursday and the quote was Friday's. The quote carries its own
+       `previous_close`, so when a quote is shown the change is derived from it and
+       the row is internally consistent; without one, both fall back to the bars.
+       5d has no quote-side equivalent and stays on the bars either way -- it is a
+       week, so one session of drift does not misdescribe it. */
+    const chg1=live&&wq.previous_close?
+      (wq.price-wq.previous_close)/wq.previous_close*100 : w.change_1d;
     return `<tr>
       <td><b>${esc(w.symbol)}</b>${w.note?
         `<div class="dim wnote">${esc(w.note)}</div>`:''}</td>
-      <td class="mono r">${w.last==null?'<span class="dim">—</span>':num(w.last,2)}</td>
-      <td class="mono r">${pct(w.change_1d)}</td>
+      <td class="mono r">${shown==null?'<span class="dim">—</span>'
+        :num(shown,2)+(live?'':'<span class="dim wstale" title="stored close; press Refresh for a quote">*</span>')}</td>
+      <td class="mono r">${pct(chg1)}</td>
       <td class="mono r">${pct(w.change_5d)}</td>
       <td class="mono r">${w.realised_vol==null?
         `<span class="dim" title="${w.closes} daily close(s) stored; 6 is the minimum"
@@ -2242,21 +2411,55 @@ function watchlist(){
       <td class="mono r">${w.expected_move_5d==null?'<span class="dim">—</span>':
         '&plusmn;'+num(w.expected_move_5d,2)}</td>
       <td class="mono">${opts?esc(opts):'<span class="dim">—</span>'}</td>
+      <td class="r"><button class="wrm" data-wrm="${esc(w.symbol)}"
+        title="stop watching ${esc(w.symbol)}">&times;</button></td>
     </tr>`;
   }).join('');
   const thin=ws.filter(w=>w.realised_vol==null).map(w=>w.symbol);
   return `<div class="card">
     <div class="crow"><h3>Watchlist</h3>
-      <span class="pill">${ws.length} symbol(s)</span></div>
+      <span class="pill">${ws.length} symbol(s)</span>
+      ${adder}
+      <button id="wquote" class="btn sm">Refresh prices</button></div>
+    ${quoteNote()}
     <table class="tbl"><thead><tr>
       <th>symbol</th><th class="r">last</th><th class="r">1d</th><th class="r">5d</th>
       <th class="r">realised vol</th><th class="r">move 5d</th><th>your options</th>
+      <th></th>
     </tr></thead><tbody>${rows}</tbody></table>
     <div class="dim mkattr">realised vol is what the stock DID, not what the market
       charges for what it might do — implied vol needs an option chain this journal
       cannot reach${thin.length?` · no vol yet for ${esc(thin.join(', '))}: run
       <code>optjournal bars</code>`:''}</div>
   </div>`;
+}
+
+/* How old the fetched quotes are, in words.
+ *
+ * A price with no age is the whole problem this feature could introduce. Run on a
+ * Saturday the source returns Friday's 16:00 close for every symbol -- 22 hours
+ * old, perfectly correct, and nothing a page may call "live". So the age is
+ * stated, and past a session's length it says the DATE instead of a duration:
+ * "22h ago" invites you to read a stale number as nearly current.
+ *
+ * Deliberately not "market open/closed": the chart response carries no such
+ * field (checked), so that would be inferred from a clock this page does not
+ * own -- a guess presented beside measurements. */
+function quoteNote(){
+  const meta=S.quotesAt;
+  if(!meta) return `<div class="dim wnote">prices are stored daily closes —
+    press <b>Refresh prices</b> for a quote</div>`;
+  const ages=Object.values(S.quotes||{}).map(wq=>wq.at).filter(a=>a!=null);
+  if(!ages.length) return `<div class="dim wnote">no quote came back</div>`;
+  const newest=Math.max.apply(null,ages), age=meta-newest;
+  const when=age<90?'just now'
+    :age<3600?Math.round(age/60)+'m ago'
+    :age<6*3600?Math.round(age/3600)+'h ago'
+    :new Date(newest*1000).toISOString().slice(0,16).replace('T',' ')+' UTC';
+  const stale=age>=6*3600;
+  return `<div class="dim wnote">quotes ${esc(when)}${
+    stale?' — <b>the market was closed</b>, so this is the last session\'s close'
+    :''}</div>`;
 }
 
 function odte(){
@@ -2486,6 +2689,20 @@ function draw(push){
   document.querySelectorAll('.seg button[data-type]').forEach(b=>
     b.onclick=()=>{const t=b.dataset.type||null;
       if(t===S.type)return; S.type=t; load();});
+  /* The calendar's Key/all toggle is a PURE REDRAW: every event is already in the
+     payload, and `mev.key` was decided server-side, so filtering costs no request.
+     Clearing the day selection is the point -- the chosen day may hold nothing
+     under the other filter, and a stale selection would open an empty panel. */
+  document.querySelectorAll('.mktoggle button[data-mktall]').forEach(b=>
+    b.onclick=()=>{const want=b.dataset.mktall==='1';
+      if(want===(S.mktall===true))return; S.mktall=want; S.marketday=null; draw();});
+  bindMarketFetch();
+  bindWatchlist();
+  /* First view of the Watchlist fetches quotes once, so the tab is useful without
+     a click -- and NOT on any later redraw, because each quote is an HTTP request
+     and a redraw happens on every toggle, filter and edit. `quotesAt` is the
+     latch; Refresh is the way to ask again. */
+  if(S.tab==='watchlist'&&!S.quotesAt&&(S.state.watchlist||[]).length) loadQuotes(false);
   const st=S.state;
   $('#foot').textContent=`optjournal ${st.version} · ${st.db} · loopback only, no authentication`;
   const b=$('#sync'), rem=st.sync.cooldown_remaining_s;
@@ -2500,6 +2717,89 @@ function note(text,kind){
   const m=$('#msg'); m.innerHTML=text; m.className='show';
   const c={bad:['#3a1f22','#f0a0a8'],warn:['#3a3122','#e8cd85'],ok:['#183328','#9fe3c4']}[kind||'ok'];
   m.style.background=c[0]; m.style.color=c[1]; m.style.border='1px solid rgba(255,255,255,.07)';
+}
+
+/* Refresh the calendar from the feed.
+ *
+ * No confirm(), unlike Sync: this spends no IBKR request and touches no lockout
+ * budget, so a dialogue would train you to click through dialogues. It IS
+ * rate-limited by the feed, which comes back as its own kind and reads as "try
+ * later" rather than as a failure -- nothing is lost, the same week is served
+ * tomorrow. */
+function bindMarketFetch(){
+  const b=$('#mkfetch'); if(!b) return;
+  b.onclick=async()=>{
+    b.disabled=true; b.classList.add('busy');
+    try{
+      const r=await fetch('/api/market/fetch',{method:'POST'});
+      const mres=await r.json();
+      if(mres.kind==='throttled') note('Calendar: '+esc(mres.message||'rate limited')
+        +' — nothing lost, the same week is served later.','warn');
+      else if(!mres.ok) note('Calendar refresh failed: '+esc(mres.message||''),'bad');
+      else note(`Calendar refreshed — <b>${mres.stored}</b> of ${mres.fetched} event(s) stored.`,'ok');
+    }catch(e){note('Calendar refresh failed: '+esc(e),'bad');}
+    await load();
+  };
+}
+
+/* Add, remove, and fetch prices. Three buttons, one shape: POST, then reload.
+ *
+ * A reload rather than a local splice, so the table always shows what the
+ * DATABASE holds -- a row spliced in optimistically would show a symbol with no
+ * bars, no vol and no options as though those were measured and empty. */
+function bindWatchlist(){
+  const wf=$('#waddf');
+  if(wf) wf.onsubmit=async ev=>{
+    ev.preventDefault();
+    const input=$('#wadd'), symbol=(input.value||'').trim();
+    if(!symbol) return;
+    input.disabled=true;
+    await watchWrite({symbol:symbol,action:'add'});
+  };
+  document.querySelectorAll('[data-wrm]').forEach(el=>
+    el.onclick=async()=>{
+      const symbol=el.dataset.wrm;
+      /* Confirmed, because removing drops the note with it and there is no undo.
+         Cheap to re-add, but the note is typed by hand and gone for good. */
+      if(!confirm(`Stop watching ${symbol}?`)) return;
+      el.disabled=true;
+      await watchWrite({symbol:symbol,action:'remove'});
+    });
+  const qb=$('#wquote'); if(qb) qb.onclick=()=>loadQuotes(true);
+}
+
+async function watchWrite(body){
+  try{
+    const r=await fetch('/api/watchlist',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const wres=await r.json();
+    if(!wres.ok){note(esc(wres.message||'watchlist write failed'),'bad');return;}
+    if(wres.action==='remove'&&!wres.changed)
+      note(`${esc(wres.symbol)} was not on the watchlist.`,'warn');
+    else note(wres.action==='add'?`Watching <b>${esc(wres.symbol)}</b>.`
+      :`Stopped watching <b>${esc(wres.symbol)}</b>.`,'ok');
+  }catch(e){note('Watchlist write failed: '+esc(e),'bad');return;}
+  await load();
+  /* Quotes are keyed by symbol, so an added row simply has none until the next
+     refresh -- which is honest, and cheaper than spending a request per add. */
+  if(S.quotesAt) await loadQuotes(false);
+}
+
+/* One HTTP request PER SYMBOL, so this is never automatic beyond the first view.
+ *
+ * `announce` is false for the implicit refresh after an edit: a toast saying
+ * "prices updated" when you only removed a symbol is noise. */
+async function loadQuotes(announce){
+  const b=$('#wquote'); if(b){b.disabled=true;b.classList.add('busy');}
+  try{
+    const r=await fetch('/api/quotes');
+    const qres=await r.json();
+    S.quotes=qres.quotes||{}; S.quotesAt=qres.asked_at||null;
+    if(qres.failed&&qres.failed.length)
+      note('No quote for '+esc(qres.failed.join(', ')),'warn');
+    else if(announce) note('Prices updated.','ok');
+  }catch(e){note('Quote fetch failed: '+esc(e),'bad');}
+  draw();
 }
 
 async function load(){

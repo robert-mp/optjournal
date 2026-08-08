@@ -245,10 +245,15 @@ def test_contract_parser_is_correct():
 
 #: Shapes with no /api/state sample to check against: two page-side
 #: constructs (chart points and Positions-tab buckets are built by the page,
-#: not sent by the API) and the /api/sync reply (building a real one spends
-#: an IBKR request; it is pinned against _do_sync's source instead, in
-#: test_sync_response_shape_matches_what_the_page_reads).
-_UNSAMPLED = frozenset({"ChartPoint", "Bucket", "SyncResponse"})
+#: not sent by the API) and the replies of the four endpoints that are NOT
+#: /api/state. Those four are pinned against their handlers' source instead --
+#: see test_endpoint_reply_shapes_match_what_the_page_reads -- because building a
+#: real sample would spend an IBKR request, hit a rate-limited feed, or make one
+#: HTTP call per watched symbol.
+_UNSAMPLED = frozenset({
+    "ChartPoint", "Bucket", "SyncResponse",
+    "MarketFetch", "WatchWrite", "QuoteReply", "Quote",
+})
 
 
 def _shape_samples(state: dict) -> dict[str, dict]:
@@ -738,6 +743,40 @@ def test_sync_response_shape_matches_what_the_page_reads():
         assert f'"{key}"' in src, f"/api/sync no longer returns {key!r}"
 
 
+def test_endpoint_reply_shapes_match_what_the_page_reads():
+    """The same pin, for the three endpoints that are not /api/state.
+
+    These have no payload sample for a reason rather than by neglect: refreshing
+    the calendar hits a feed that answers 429, and a quote costs one HTTP request
+    per watched symbol. So the keys are checked against the handlers' SOURCE,
+    which is what `_UNSAMPLED` trades away the fixture for.
+
+    Crude, and it catches the failure that matters: a handler renaming a key while
+    the page keeps reading the old one renders a blank toast rather than raising,
+    because JavaScript reading a missing property yields undefined. That is the
+    exact defect this whole contract exists for.
+    """
+    import inspect
+
+    from optjournal.web import _Handler  # noqa: PLC0415 - private by design
+
+    expected = {
+        _Handler._market_fetch: ("ok", "kind", "fetched", "stored", "message"),
+        _Handler._watchlist_write: ("ok", "kind", "action", "symbol", "changed",
+                                    "message"),
+        _Handler._quotes: ("ok", "quotes", "failed", "asked_at",
+                           # one Quote entry, read per row in the watchlist
+                           "price", "at", "previous_close", "currency"),
+    }
+    for handler, keys in expected.items():
+        src = inspect.getsource(handler)
+        for key in keys:
+            assert f'"{key}"' in src, (
+                f"{handler.__name__} no longer returns {key!r}, which the page "
+                f"reads -- the cell or toast would render blank"
+            )
+
+
 def test_page_loads_no_external_resources():
     """Offline by construction, and the CSP header assumes it."""
     page = page_html()
@@ -866,22 +905,136 @@ def test_the_pages_own_origin_may_write(origin):
     assert _origin_is_same(origin, host="127.0.0.1", port=8765)
 
 
-def test_the_origin_guard_runs_before_the_route_so_new_endpoints_inherit_it():
-    """Ordering, asserted over the source: the check precedes the route match.
+def test_the_origin_guard_runs_before_every_route_so_new_endpoints_inherit_it():
+    """Ordering, asserted over the source: the check precedes EVERY route match.
 
-    If the guard sat inside the `/api/sync` branch, the next write endpoint would
-    ship unguarded unless someone remembered -- and the person adding an endpoint
-    is thinking about the feature, not about a page in another tab. Cheap to get
+    If the guard sat inside one branch, the next write endpoint would ship
+    unguarded unless someone remembered -- and the person adding an endpoint is
+    thinking about the feature, not about a page in another tab. Cheap to get
     right once; invisible when got wrong.
+
+    Checks against the FIRST path comparison rather than against `/api/sync`
+    specifically. The original version pinned `/api/sync`, and two endpoints were
+    then added that route BEFORE it -- so the assertion still passed while proving
+    nothing about them. A guard test that only covers the oldest route is the
+    shape of test that rots silently as the file grows.
     """
     body = code_only((ROOT / "src" / "optjournal" / "web.py").read_text())
     post = body[body.index("def do_POST"):]
     guard = post.index("_same_origin")
-    route = post.index('if path != "/api/sync"')
-    assert guard < route, (
-        "the Origin check must come before the route dispatch in do_POST, so a "
-        "write endpoint added later is covered by default"
+    routes = [m.start() for m in re.finditer(r'path (?:==|!=) "', post)]
+    assert routes, "do_POST no longer compares a path; this test needs rewriting"
+    assert guard < min(routes), (
+        "the Origin check must come before the FIRST path comparison in do_POST, "
+        "so every write endpoint -- including ones added later -- is covered by "
+        "default rather than by remembering"
     )
+
+
+def _post(base: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+    """A POST through a real server, so the routing and guard are exercised."""
+    import urllib.error  # noqa: PLC0415 - local to this helper
+    import urllib.request  # noqa: PLC0415
+
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(
+        f"{base}{path}", method="POST", data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+@pytest.mark.parametrize(("body", "kind"), [
+    ({"symbol": "../etc/passwd"}, "symbol"),
+    ({"symbol": ""}, "symbol"),
+    ({"symbol": "A" * 25}, "symbol"),
+    ({"symbol": "SPY DROP TABLE"}, "symbol"),
+    ({"symbol": "SPY", "action": "drop"}, "action"),
+    ({}, "symbol"),
+])
+def test_the_watchlist_endpoint_refuses_a_bad_request(populated, body, kind):
+    """A user-input table reached over HTTP, so the input is not trusted.
+
+    `watchlist` is the only table in this journal written from typed input rather
+    than from a broker statement, and now it is written from a browser. The pattern
+    accepts letters, digits, dot and dash -- enough for BRK.B and a foreign
+    listing, and not enough for a path, a space-separated injection or a quote.
+
+    Deliberately NOT validated against a ticker universe: this journal has no such
+    list, and inventing one would reject a legitimate listing. A symbol that does
+    not exist stores a row with no bars, which the tab renders as a dash.
+    """
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/watchlist", body)
+    assert status == 400
+    assert payload["kind"] == kind
+    assert payload["ok"] is False
+
+
+def test_the_watchlist_endpoint_round_trips_a_symbol(populated):
+    """Add, re-add, remove, remove again -- through the real server.
+
+    Four assertions in one test because they are one behaviour: the SEQUENCE is
+    what matters. Re-adding must not blank a note (COALESCE, matching
+    `optjournal watch`), and removing what is absent must report `changed: 0`
+    rather than claiming a removal, so the page can say "was not on the list"
+    instead of "stopped watching" something it never watched.
+    """
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        # Lower case in, upper case stored: the page shows what the DB holds.
+        status, added = _post(base, "/api/watchlist",
+                              {"symbol": "amd", "note": "a note"})
+        assert (status, added["symbol"], added["action"]) == (200, "AMD", "add")
+
+        _, again = _post(base, "/api/watchlist", {"symbol": "AMD"})
+        assert again["ok"] is True
+
+        _, removed = _post(base, "/api/watchlist",
+                           {"symbol": "AMD", "action": "remove"})
+        assert removed["changed"] == 1
+
+        _, absent = _post(base, "/api/watchlist",
+                          {"symbol": "AMD", "action": "remove"})
+        assert absent["changed"] == 0, (
+            "removing an absent symbol must report 0 rather than claiming a "
+            "removal, or the page reports one that did not happen"
+        )
+
+    conn = connect(populated)
+    note = conn.execute(
+        "SELECT note FROM watchlist WHERE symbol = 'AMD'").fetchone()
+    conn.close()
+    assert note is None, "the row should be gone"
+
+
+def test_a_re_add_keeps_the_existing_note(populated):
+    """COALESCE, asserted: a note is typed by hand and has no other source."""
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _post(base, "/api/watchlist", {"symbol": "AMD", "note": "keep me"})
+        _post(base, "/api/watchlist", {"symbol": "AMD"})
+        conn = connect(populated)
+        note = conn.execute(
+            "SELECT note FROM watchlist WHERE symbol = 'AMD'").fetchone()["note"]
+        conn.close()
+    assert note == "keep me", "a bare re-add blanked the note"
+
+
+def test_an_oversized_body_is_refused_rather_than_read(populated):
+    """`rfile.read` on a client-chosen Content-Length is an unbounded allocation.
+
+    No framework here does this for us, so the cap is explicit. 8KB is four orders
+    of magnitude more than any body this server accepts.
+    """
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/watchlist",
+                                {"symbol": "SPY", "note": "x" * 9000})
+    # The body is dropped, so the request looks empty and fails the symbol check.
+    assert status == 400
+    assert payload["kind"] == "symbol"
 
 
 def test_dashboard_friction_is_split_by_scope(state):

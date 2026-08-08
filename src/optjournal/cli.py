@@ -40,6 +40,8 @@ from optjournal.config import (
 )
 from optjournal.db import connect, migrate, open_journal
 from optjournal.events import (
+    DEFAULT_COUNTRIES,
+    DEFAULT_IMPACTS,
     EventFetchError,
     EventRateLimited,
     fetch_events,
@@ -460,8 +462,8 @@ def cmd_market(args) -> int:
     now = datetime.now(UTC)
     start = int(now.timestamp())
     end = int((now + timedelta(days=args.days)).timestamp())
-    countries = () if args.all_events else ("USD",)
-    impacts = () if args.all_events else ("High",)
+    countries = () if args.all_events else DEFAULT_COUNTRIES
+    impacts = () if args.all_events else DEFAULT_IMPACTS
     events = upcoming(conn, start=start, end=end,
                       countries=countries, impacts=impacts)
     result["events"] = events

@@ -28,7 +28,12 @@ from typing import Any
 
 from optjournal.analysis import CostReport
 from optjournal.bars import MARKET_TZ
-from optjournal.events import SOURCE, upcoming
+from optjournal.events import (
+    DEFAULT_COUNTRIES,
+    DEFAULT_IMPACTS,
+    SOURCE,
+    upcoming,
+)
 from optjournal.history import HistoryReport
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
@@ -501,14 +506,23 @@ def market_data(
             "impact": row["impact"],
             "forecast": row["forecast"],
             "previous": row["previous"],
+            #: Whether this row survives the default view. Computed HERE, from
+            #: the same constants the CLI uses, so the page filters on a flag
+            #: rather than on its own copy of "USD high-impact" -- a second copy
+            #: in JavaScript would drift the moment either side gained a country.
+            "key": (row["country"] in DEFAULT_COUNTRIES
+                    and row["impact"] in DEFAULT_IMPACTS),
         })
 
     by_day: dict[str, int] = {}
     high_by_day: dict[str, int] = {}
+    key_by_day: dict[str, int] = {}
     for event in events:
         by_day[event["day"]] = by_day.get(event["day"], 0) + 1
         if event["impact"] == "High":
             high_by_day[event["day"]] = high_by_day.get(event["day"], 0) + 1
+        if event["key"]:
+            key_by_day[event["day"]] = key_by_day.get(event["day"], 0) + 1
 
     today = now.astimezone(MARKET_TZ).date().isoformat()
     week = []
@@ -520,6 +534,10 @@ def market_data(
             "dom": (monday + timedelta(days=offset)).day,
             "events": by_day.get(day, 0),
             "high": high_by_day.get(day, 0),
+            #: The count under the DEFAULT view, so the strip and the rows agree.
+            #: Without it a day would show three dots and then open empty, which
+            #: reads as a broken calendar rather than as a filtered one.
+            "key_events": key_by_day.get(day, 0),
             "today": day == today,
         })
 
@@ -533,6 +551,13 @@ def market_data(
         #: the journal graded the event itself.
         "impact_source": SOURCE,
         "zone": str(MARKET_TZ),
+        #: What the default view narrows TO, named so the page can say it rather
+        #: than hard-coding the words beside a toggle that might mean something
+        #: else later.
+        "default_scope": " ".join(DEFAULT_COUNTRIES) + " "
+                         + "/".join(DEFAULT_IMPACTS).lower() + "-impact",
+        "total_events": len(events),
+        "key_events": sum(1 for event in events if event["key"]),
     }
 
 

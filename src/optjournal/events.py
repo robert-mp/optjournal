@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 __all__ = [
+    "DEFAULT_COUNTRIES",
+    "DEFAULT_IMPACTS",
     "IMPACTS",
     "SOURCE",
     "EventFetchError",
@@ -62,6 +64,19 @@ _URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 #: Checked rather than mapped: see the module docstring on why an unknown value
 #: raises instead of defaulting.
 IMPACTS = frozenset({"High", "Medium", "Low", "Holiday"})
+
+#: The default VIEW: what an options book actually reacts to. Measured over a
+#: real stored week -- 99 events, of which 82 are Low impact and 25 are EUR rows
+#: that are all Low. This slice is 4 of the 99.
+#:
+#: Here rather than in `cli.py` (where it was first written) because the page now
+#: needs the same default, and two copies of "USD high-impact" would drift the
+#: moment one of them gained a country. Narrowing the VIEW only -- `store_events`
+#: keeps every country and impact the feed sends, which is the rule `ingest`
+#: learned the hard way: a filter applied on the way IN cannot be undone without
+#: a refetch, and the feed will not serve a past week.
+DEFAULT_COUNTRIES = ("USD",)
+DEFAULT_IMPACTS = ("High",)
 
 #: Matching `marketdata`, whose Yahoo calls have the same shape and constraints.
 _TIMEOUT_S = 20
