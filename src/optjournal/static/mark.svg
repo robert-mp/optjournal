@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40">
+  <!-- The tab icon: the same compass rose as the page header, redrawn to stand
+       alone. It carries its own colours because a favicon renders outside the
+       page, where page.html's custom properties do not reach, and it keeps the
+       leather field because at 16px the field is most of what survives.
+
+       Deliberately NOT a scaled copy of the header mark: the ring and the
+       ordinal ticks are dropped and the star is fattened, because at 16px a
+       1.5px stroke lands on half a pixel and the fine detail turns to a smudge.
+       Same idea, drawn for the size it is actually rendered at. Kept in step
+       with page.html by hand; a build step to share them would cost more than
+       the two marks are worth.
+
+       Note for future edits: this is XML, not HTML, so a double hyphen inside
+       a comment is a fatal parse error rather than a stylistic quibble. The
+       repo's prose uses them freely, which is exactly how this file got
+       written with one and refused to render at all. -->
+  <defs>
+    <linearGradient id="leather" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b3714a"/>
+      <stop offset=".6" stop-color="#7b4a2c"/>
+      <stop offset="1" stop-color="#5d3720"/>
+    </linearGradient>
+  </defs>
+  <rect width="40" height="40" rx="9" fill="url(#leather)"/>
+  <rect x=".5" y=".5" width="39" height="39" rx="8.5" fill="none" stroke="#a06840"/>
+  <!-- Arms N, S, E, W: the vertical pair paints under the horizontal pair, so
+       north stays the last thing to survive as the icon shrinks. -->
+  <g>
+    <g transform="rotate(180 20 20)"><path fill="#fdf1e0" d="M20 5 L20 20 L15 16.6 Z"/><path fill="#43230f" fill-opacity=".92" d="M20 5 L20 20 L25 16.6 Z"/></g>
+    <g transform="rotate(90 20 20)"><path fill="#fdf1e0" d="M20 5 L20 20 L15 16.6 Z"/><path fill="#43230f" fill-opacity=".92" d="M20 5 L20 20 L25 16.6 Z"/></g>
+    <g transform="rotate(270 20 20)"><path fill="#fdf1e0" d="M20 5 L20 20 L15 16.6 Z"/><path fill="#43230f" fill-opacity=".92" d="M20 5 L20 20 L25 16.6 Z"/></g>
+    <path fill="#fdf1e0" d="M20 5 L20 20 L15 16.6 Z"/><path fill="#43230f" fill-opacity=".92" d="M20 5 L20 20 L25 16.6 Z"/>
+  </g>
+</svg>

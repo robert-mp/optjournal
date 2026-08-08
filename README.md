@@ -1,8 +1,13 @@
 # optjournal
 
 An options trading journal backed by IBKR's Flex Web Service. Fetches
-activity statements, archives them, folds them into SQLite, and serves an
-IAG-style local dashboard with cost, history, annual and 0DTE views.
+activity statements, archives them, folds them into SQLite, and serves a
+local dashboard with cost, history, annual and 0DTE views.
+
+The dashboard is branded **Bitácora** — Spanish for a ship's logbook, and for
+the binnacle that housed the compass beside it. `optjournal` stays the name of
+the package, the CLI and the database; the page is the only thing the brand
+touches.
 
 Personal local tool: single user, loopback only, data lives beside the code.
 
@@ -71,6 +76,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `web.py` | loopback HTTP server; `ServeConfig` injected per server |
 | `page.html` | the entire frontend: no build step, no external resources |
 | `static/replay.js` | the replay chart's arithmetic as pure functions over plain data — no DOM, no globals — so `node --test` can unit-test the scales and the scrub. A function belongs here if it takes data and returns data; the moment it touches `document` it belongs in the page |
+| `static/mark.svg` | the Bitácora compass rose as a standalone favicon. Carries its own colours: a favicon renders outside the page, where `page.html`'s custom properties do not reach. `web.STATIC_TYPES` is what lets it be served as an image rather than a script |
 | `browser.py` | headless browser discovery and the DOM dump, in three views: raw, markup (scripts stripped), text |
 | `sweep.py` | the page matrix and its checks; each a pure function of a rendered page |
 | `mutate.py` | mutation testing: known defects, and which tests notice each. Answers "what would a real bug cost" rather than "what is covered" — see [Measuring the suite](#measuring-the-suite) |

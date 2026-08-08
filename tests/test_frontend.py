@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from xml.etree import ElementTree
 
 import pytest
 from conftest import ROOT, code_only
@@ -133,3 +134,26 @@ def test_the_page_does_not_redefine_what_the_module_exports():
     assert not duplicated, (
         f"page.html redefines {duplicated}, which replay.js already exports"
     )
+
+
+def test_every_shipped_svg_is_well_formed_xml():
+    """An SVG is XML, and a browser refuses a malformed one outright.
+
+    Written after the favicon shipped with a `--` inside a comment, which is a
+    fatal parse error in XML and a non-event in HTML. Nothing caught it: the
+    file existed, the server returned 200 with the right MIME type, and the
+    only symptom was a browser rendering an error page instead of the mark. The
+    repo's prose uses double hyphens everywhere, so the next person to comment
+    one of these files is likely to reintroduce it.
+    """
+    svgs = sorted((ROOT / "src" / "optjournal" / "static").glob("*.svg"))
+    assert svgs, "no SVG assets found; this test is guarding nothing"
+    for path in svgs:
+        try:
+            ElementTree.parse(path)
+        except ElementTree.ParseError as exc:
+            raise AssertionError(
+                f"{path.name} is not well-formed XML and will not render in a "
+                f"browser: {exc}. A `--` inside an <!-- --> comment is the "
+                f"usual cause."
+            ) from exc
