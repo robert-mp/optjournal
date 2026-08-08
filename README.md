@@ -54,6 +54,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `archive.py` | statement store: content-hash dedupe, prune |
 | `ingest.py` | fills → SQLite, idempotent upserts (stores every asset category; scoping is query-time). Trades arrive via `sources`, so the writer is broker-agnostic |
 | `db.py` | connection, schema migration, `open_journal()` |
+| `locks.py` | cross-process `flock`, because the cron and the server are two processes and a `threading.Lock` only serialises two browser tabs. A leaf |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
 | `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one. See [The Money model](#the-money-model) |
 | `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts. **Never reads `blackscholes.py`** — see [Modelled numbers](#modelled-numbers) |

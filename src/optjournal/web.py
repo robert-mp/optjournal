@@ -749,6 +749,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # relying on the page never gaining a <script src>.
         self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'")
         self.send_header("X-Content-Type-Options", "nosniff")
+        # NOTHING HERE IS CACHEABLE. The page is read from disk per request and the
+        # payload is a live brokerage account, so a cached copy is a stale copy in
+        # both cases. Sent because the absence bit: with no headers at all a
+        # browser may reuse the page indefinitely, and an edit to page.html then
+        # appears to have no effect -- which cost real time during a fix, with the
+        # server correctly serving new code to a tab still running the old.
+        # Everything is loopback and a few KB, so there is no bandwidth to save.
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 

@@ -1037,6 +1037,64 @@ def test_an_oversized_body_is_refused_rather_than_read(populated):
     assert payload["kind"] == "symbol"
 
 
+def test_a_render_preserves_what_the_user_was_typing():
+    """The page re-renders by replacing innerHTML, which destroys live inputs.
+
+    Verified in a real browser before the fix: typing `AAP` into the watchlist's
+    add field and then triggering any redraw discarded the text, the focus AND the
+    cursor position. The trigger is not exotic -- `loadQuotes()` calls `draw()` on
+    its own when the tab opens, so a quote landing mid-keystroke ate the input.
+
+    Asserted over the source because the behaviour is DOM-dependent: `node --test`
+    cannot reach it (that is why replay.js is kept free of `document`), and the
+    project has no browser test runner. So this pins the three things that make the
+    fix work, and the browser check is recorded in the commit rather than automated:
+
+    * the capture happens BEFORE innerHTML is replaced,
+    * the restore happens AFTER,
+    * and the helpers are generic over `#body input` rather than hard-coding
+      `#wadd`, so the next input inherits the fix instead of rediscovering the bug.
+    """
+    js = code_only(_js())
+    capture = js.index("preserveInputs()")
+    render = js.index("$('#body').innerHTML=")
+    restore = js.index("restoreInputs(")
+    assert capture < render < restore, (
+        "the input capture must straddle the innerHTML replacement, or typing is "
+        "lost on every redraw"
+    )
+    helper = js[js.index("function preserveInputs"):]
+    assert "#body input" in helper, (
+        "preserveInputs must scan every input, not one known id -- a fix that only "
+        "covers #wadd leaves the next field broken"
+    )
+    assert "selectionStart" in helper and "setSelectionRange" in helper, (
+        "the CURSOR has to survive too: restoring the value but not the caret "
+        "jumps the cursor to the start mid-word"
+    )
+
+
+def test_nothing_this_server_sends_is_cacheable():
+    """A cached page is a stale page, and a cached payload is a stale account.
+
+    The page is read from disk per request precisely so an edit takes effect, and
+    the payload is a live brokerage position list. Neither may be reused.
+
+    Sent because the ABSENCE bit: with no cache headers at all, a browser may keep
+    the old page indefinitely. That happened while fixing the input bug -- the
+    server was serving corrected JS to a tab still running the previous copy, and
+    the fix appeared not to work. Everything here is loopback and a few KB, so
+    there is no bandwidth being saved by caching.
+    """
+    import inspect
+
+    from optjournal.web import _Handler  # noqa: PLC0415 - private by design
+
+    src = inspect.getsource(_Handler._send)
+    assert "Cache-Control" in src, "responses no longer forbid caching"
+    assert "no-store" in src
+
+
 def test_dashboard_friction_is_split_by_scope(state):
     """The panel is headed by an asset category, so it must not blend scopes.
 

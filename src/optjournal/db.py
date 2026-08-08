@@ -38,6 +38,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from optjournal.locks import locked
+
 __all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate", "open_journal"]
 
 log = logging.getLogger(__name__)
@@ -440,6 +442,20 @@ WHERE asset_category = 'OPT'
 """
 
 
+#: How long a writer waits for another writer before giving up.
+#:
+#: Set EXPLICITLY, because it was previously whatever sqlite3 defaulted to (5000ms
+#: today) -- a number nothing in this project chose, tested, or would notice
+#: changing. WAL lets readers run during a write but still allows only one writer,
+#: so any second writer needs a wait or it raises "database is locked" immediately.
+#:
+#: Sized from measurement rather than taste: 5,000 price-bar upserts commit in 6ms
+#: on this journal, so ordinary writes are three orders of magnitude inside this.
+#: The one write that could plausibly approach it is a migration's table rebuild,
+#: which is exactly when a second process must wait rather than fail.
+BUSY_TIMEOUT_MS = 15_000
+
+
 def connect(path: Path) -> sqlite3.Connection:
     """Open the journal database with sane pragmas applied."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -447,6 +463,9 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
+    # Two processes writing is the normal case here, not an edge: a scheduled sync
+    # while a page is open. Without this, the second one raises rather than waits.
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return conn
 
 
@@ -649,8 +668,50 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
     return True
 
 
+def _lock_path(conn: sqlite3.Connection) -> Path | None:
+    """The migration lock file beside this connection's database.
+
+    Derived from the connection rather than passed in, so `migrate(conn)` keeps
+    its signature and every existing caller is protected without being edited --
+    there are seven, and one forgotten call site would be a silent hole.
+
+    None for an in-memory database, which no other process can see and therefore
+    cannot race on.
+    """
+    for _seq, name, file in conn.execute("PRAGMA database_list"):
+        if name == "main":
+            return Path(f"{file}.migrate.lock") if file else None
+    return None
+
+
 def migrate(conn: sqlite3.Connection) -> int:
-    """Apply the schema. Returns the resulting schema version."""
+    """Apply the schema, serialised across processes. Returns the version.
+
+    HELD UNDER A CROSS-PROCESS LOCK, and that is a correctness fix rather than
+    tidiness. `open_journal` migrates on every request, and the first thing this
+    does is DROP EVERY VIEW -- so two overlapping requests meant one dropping the
+    views the other was querying. Measured before the fix: 23 failures in 90
+    attempts with six workers, and 2 in 6 trials from two simultaneous page loads,
+    surfacing to the browser as `HTTP 500: no such table:
+    current_option_positions`. Reachable by opening the journal in two tabs.
+
+    A `threading.Lock` would not have been enough: the cron and the server are two
+    processes, so the lock has to live in the filesystem. See `locks`.
+
+    The lock could be narrowed to a "is a migration needed at all" check, and that
+    would be faster -- but the version stamp is not the only thing this writes
+    (`_ADDED_COLUMNS`, the rekeys, the backfills all guard themselves), so
+    "needed" is not a single comparison. Correct and 130ms beats clever here.
+    """
+    lock = _lock_path(conn)
+    if lock is None:
+        return _migrate_unlocked(conn)
+    with locked(lock):
+        return _migrate_unlocked(conn)
+
+
+def _migrate_unlocked(conn: sqlite3.Connection) -> int:
+    """The migration itself. Call `migrate`, which holds the lock."""
     for view in _VIEWS:
         conn.execute(f"DROP VIEW IF EXISTS {view}")
     conn.executescript(_SCHEMA)

@@ -990,7 +990,7 @@ import {
  * @local RGEO geo edges fr xy sks mks dd sp spot
  * @local play scrub speed loop ev reached
  * @local chosen withEvents ws opts thin
- * @local JSON Object ages input mine qb wf behind
+ * @local JSON Object ages input mine qb wf behind was
  */
 
 const $=s=>document.querySelector(s);
@@ -2654,8 +2654,23 @@ function draw(push){
   const views={dashboard,calendar,trades,positions,costs,annual,odte,market,
     watchlist};
   const v=views[S.tab];
+  /* WHAT THE USER WAS TYPING SURVIVES THE RENDER.
+   *
+   * This page re-renders by replacing #body's innerHTML wholesale, which was free
+   * of consequence while every tab was read-only. The watchlist's add field is the
+   * first <input>, and it broke immediately: typing `AAP` and then any redraw
+   * discarded the text, the focus and the node. Verified in a browser, not
+   * reasoned about -- and the trigger is not exotic, `loadQuotes()` calls draw()
+   * on its own when the tab opens.
+   *
+   * So the value and cursor are carried across, keyed by element id. Generic
+   * rather than special-cased to #wadd: the next input must not have to rediscover
+   * this. A framework's reconciliation is the other answer to this problem, and
+   * for one field it is not worth a build step -- see the note in README. */
+  const keep=preserveInputs();
   $('#body').innerHTML=(S.showCog?cog():'')+(v?v():
     `<div class="card"><div class="empty">nothing here yet</div></div>`);
+  restoreInputs(keep);
   const sel=$('#month');
   if(sel) sel.onchange=()=>{S.month=sel.value||null;load();};
   document.querySelectorAll('button[data-calmonth]').forEach(b=>
@@ -2711,6 +2726,39 @@ function draw(push){
   else if(rem>0){b.disabled=true;
     b.title=`Cooldown: ${Math.ceil(rem/60)}m left. Prevents spending an IBKR request for data that cannot have changed.`;}
   else {b.disabled=false;b.title='Fetch from IBKR — spends one request';}
+}
+
+/* Read every text input's value, selection and focus before a render.
+ *
+ * Keyed by `id` because that is what survives innerHTML replacement: the NODES do
+ * not, so nothing can be held by reference. An input with no id is skipped rather
+ * than guessed at -- a wrong restore would put one field's text in another. */
+function preserveInputs(){
+  const keep={};
+  document.querySelectorAll('#body input').forEach(el=>{
+    if(!el.id) return;
+    keep[el.id]={value:el.value,
+      start:el.selectionStart,end:el.selectionEnd,
+      focused:document.activeElement===el};
+  });
+  return keep;
+}
+
+/* Put it back on the freshly rendered nodes.
+ *
+ * A field the new render does not contain is simply dropped: the tab changed, and
+ * carrying text into a different panel would be worse than losing it. setSelectionRange
+ * is guarded because it throws on input types that do not support selection. */
+function restoreInputs(keep){
+  Object.keys(keep||{}).forEach(id=>{
+    const el=document.getElementById(id); if(!el) return;
+    const was=keep[id];
+    el.value=was.value;
+    if(was.focused){
+      el.focus();
+      try{ el.setSelectionRange(was.start,was.end); }catch(e){ /* unsupported type */ }
+    }
+  });
 }
 
 function note(text,kind){

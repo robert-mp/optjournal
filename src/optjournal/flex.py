@@ -32,6 +32,8 @@ import keyring
 from py_ibkr import FlexClient, FlexQueryResponse
 from py_ibkr.flex.parser import parse_xml_file
 
+from optjournal.locks import locked
+
 __all__ = [
     "FETCH_COOLDOWN_S",
     "POLL_WORST_CASE_S",
@@ -67,6 +69,11 @@ FETCH_COOLDOWN_S = 900
 #: rather than in the database, so `fetch` stays usable with no DB present
 #: and the guard survives a database rebuild.
 STATE_FILE = ".fetch-state.json"
+
+#: Sibling lock file for the whole check-download-record sequence. Beside the
+#: state file it guards, in the archive directory, so one journal's fetches do
+#: not serialise against another's.
+FETCH_LOCK = ".fetch.lock"
 
 
 class FetchCooldown(RuntimeError):
@@ -336,7 +343,47 @@ def fetch(
 
     The raw XML is archived before parsing, so a parse failure still leaves
     the response on disk rather than costing another request.
+
+    HELD UNDER A CROSS-PROCESS LOCK FROM THE CHECK TO THE STAMP, because the
+    cooldown was otherwise check-then-act and the budget it guards is real. The
+    stamp is written only after a SUCCESSFUL download (so a transient failure does
+    not lock out a retry), which means the window between "cooldown cleared" and
+    "cooldown recorded" spans the whole request. That window is wide, not
+    theoretical: `read_token` alone measured 8.2 SECONDS on this machine, and the
+    download retries while IBKR generates the statement. Two threads behind a
+    barrier both cleared the guard, and three call sites can enter it -- the Sync
+    button, `optjournal fetch`, and `optjournal sync` (the noon cron). A sync
+    firing while a page is open is an ordinary Tuesday, and the cost of losing that
+    race is two requests spent against a lockout allowance.
+
+    `threading.Lock` could not have fixed this: the cron and the server are
+    different processes. `web.ServeConfig.sync_lock` remains, and is not
+    redundant -- it fails FAST for a second browser tab with "a sync is already
+    running", which is a better answer than making someone wait. This lock is the
+    correctness floor underneath it.
+
+    The lock covers `force=True` too. Forcing skips the COOLDOWN, which is a
+    judgement about whether new data can exist; it does not make two simultaneous
+    downloads writing one archive directory a good idea.
     """
+    with locked(archive_dir / FETCH_LOCK):
+        return _fetch_locked(
+            query_id, archive_dir=archive_dir, from_date=from_date,
+            to_date=to_date, account=account, force=force, cooldown_s=cooldown_s,
+        )
+
+
+def _fetch_locked(
+    query_id: str,
+    *,
+    archive_dir: Path,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    account: str | None = None,
+    force: bool = False,
+    cooldown_s: int = FETCH_COOLDOWN_S,
+) -> FetchResult:
+    """The fetch itself. Call `fetch`, which holds the lock."""
     if not force:
         _check_cooldown(archive_dir, query_id, cooldown_s)
 
