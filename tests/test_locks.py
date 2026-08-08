@@ -210,20 +210,29 @@ def test_the_fetch_lock_wraps_the_whole_check_download_record_sequence():
     )
 
 
-def test_concurrent_migrations_do_not_drop_a_view_from_under_a_reader(tmp_path):
-    """THE HTTP 500 BUG. `migrate` drops every view; `open_journal` migrates per
-    request. Two overlapping requests and one dropped the views the other queried.
+def test_a_migration_does_not_drop_a_view_from_under_a_reader(tmp_path):
+    """THE HTTP 500 BUG, and the test whose FIRST VERSION WAS WRONG.
 
-    Measured before the fix: 23 failures in 90 attempts with six workers, and 2 in
-    6 trials from two simultaneous page loads -- reaching the browser as
-    `HTTP 500: no such table: current_option_positions`.
+    `migrate` drops every view; `open_journal` migrates per request. So an
+    overlapping request could query a view another had just dropped, reaching the
+    browser as `HTTP 500: no such table: current_option_positions`.
 
-    Threads are correct HERE, unlike the fetch test: this reproduces the ORIGINAL
-    failure, which was two requests inside one threaded server. The lock is
-    cross-process anyway, which the fetch test covers.
+    The first fix was a cross-process lock, and the first version of this test ran
+    `migrate` then `SELECT` inside each worker -- which meant every reader happened
+    to hold the lock while reading, and the test passed. A REAL reader holds no
+    lock: `/api/state` migrates, releases, and only then runs its SELECTs. Split
+    into separate reader and migrator threads, the same code failed 4,941 times.
+
+    So readers and migrators are DELIBERATELY separate threads here, and must stay
+    that way. Recombining them is what made this test lie once already.
+
+    The lock is still necessary -- two interleaved migrations are their own
+    problem -- but the load-bearing guard is `schema_is_current`: a migration that
+    does not run cannot drop a view.
     """
     import sqlite3
     import threading
+    import time as _time
 
     from optjournal.db import connect, migrate
 
@@ -233,28 +242,131 @@ def test_concurrent_migrations_do_not_drop_a_view_from_under_a_reader(tmp_path):
     conn.close()
 
     errors: list[str] = []
+    stop = threading.Event()
+    guard = threading.Lock()
 
-    def worker() -> None:
-        for _ in range(12):
+    def reader() -> None:
+        # ONE long-lived connection, taking no lock -- the shape of a real request.
+        c = connect(path)
+        while not stop.is_set():
             try:
-                c = connect(path)
-                migrate(c)
                 c.execute("SELECT COUNT(*) FROM trade_orders").fetchone()
                 c.execute("SELECT COUNT(*) FROM current_option_positions").fetchone()
-                c.close()
             except sqlite3.Error as exc:  # noqa: PERF203 - the failure is the point
-                errors.append(f"{type(exc).__name__}: {exc}")
+                with guard:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+        c.close()
 
-    threads = [threading.Thread(target=worker) for _ in range(6)]
+    def migrator() -> None:
+        while not stop.is_set():
+            c = connect(path)
+            migrate(c)
+            c.close()
+
+    threads = [threading.Thread(target=reader) for _ in range(3)]
+    threads += [threading.Thread(target=migrator) for _ in range(2)]
     for t in threads:
         t.start()
+    _time.sleep(0.75)
+    stop.set()
     for t in threads:
-        t.join()
+        t.join(timeout=30)
 
     assert not errors, (
-        f"a concurrent migration dropped a view from under a reader: "
-        f"{sorted(set(errors))}"
+        f"a migration dropped a view from under a reader: {sorted(set(errors))}"
     )
+
+
+def test_a_current_schema_is_not_migrated_again(tmp_path):
+    """The guard that actually closes the race: don't run when nothing is needed.
+
+    Not an optimisation. A migration that does not run cannot drop a view, and the
+    steady state of any journal is that no migration is needed -- so the common
+    path stops touching the schema at all.
+    """
+    from optjournal.db import SCHEMA_VERSION, connect, migrate, schema_is_current
+
+    path = tmp_path / "j.db"
+    conn = connect(path)
+    assert not schema_is_current(conn), "an empty file cannot be current"
+    migrate(conn)
+    assert schema_is_current(conn)
+    assert migrate(conn) == SCHEMA_VERSION, "a no-op migrate still reports the version"
+
+    # A missing view means NOT current, however right the version stamp looks --
+    # which is the state a half-run migration leaves behind.
+    conn.execute("DROP VIEW trade_orders")
+    assert not schema_is_current(conn), (
+        "the check must look at the views, not just the version: dropping one is "
+        "exactly the damage it exists to notice"
+    )
+    migrate(conn)
+    assert schema_is_current(conn), "migrate did not repair the missing view"
+    conn.close()
+
+
+def test_a_brand_new_database_is_migrated_rather_than_skipped(tmp_path):
+    """The first-open case, which the check must answer False for and not raise.
+
+    `schema_version` does not exist yet on an empty file, so a naive check throws
+    `no such table` and every fresh journal fails to initialise. Caught by the
+    reader/migrator test above, which starts from an empty file.
+    """
+    from optjournal.db import connect, migrate, schema_is_current
+
+    conn = connect(tmp_path / "fresh.db")
+    assert schema_is_current(conn) is False
+    migrate(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM trade_orders").fetchone()[0] == 0
+    conn.close()
+
+
+def test_open_journal_rolls_back_a_failed_write(tmp_path):
+    """A statement that raises leaves the connection holding the write lock.
+
+    Measured: after a refused INSERT, `in_transaction` stays True and the next
+    writer blocks for the whole BUSY_TIMEOUT_MS before failing -- 15.49s.
+
+    `close()` happens to release it, so `open_journal` was already safe; this pins
+    the explicit rollback because a scheduler thread holds one connection across
+    many operations and has no close() to save it.
+
+    HONEST ABOUT ITS OWN STRENGTH: this test passes with the rollback removed,
+    because close() does the work today. It is a REGRESSION guard for the
+    invariant, not proof the rollback is load-bearing -- and saying so is better
+    than implying an ablation it cannot survive. The test that would fail needs a
+    connection that outlives the failed write, which arrives with the scheduler.
+    """
+    import sqlite3
+    import time as _time
+
+    from optjournal.db import connect, migrate, open_journal
+
+    path = tmp_path / "j.db"
+    conn = connect(path)
+    migrate(conn)
+    conn.close()
+
+    with pytest.raises(RuntimeError), open_journal(path) as c:
+        c.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('X','1')")
+        raise RuntimeError("a handler blew up mid-write")
+
+    started = _time.perf_counter()
+    other = connect(path)
+    try:
+        other.execute(
+            "INSERT OR IGNORE INTO watchlist (symbol, added_at) VALUES ('Y','2')")
+        other.commit()
+    except sqlite3.OperationalError as exc:  # pragma: no cover - the bug
+        pytest.fail(f"the write lock was never released: {exc}")
+    elapsed = _time.perf_counter() - started
+    assert elapsed < 1.0, (
+        f"the next writer waited {elapsed:.1f}s, so a transaction was left open"
+    )
+    rows = [r["symbol"] for r in other.execute("SELECT symbol FROM watchlist")]
+    other.close()
+    assert rows == ["Y"], "the uncommitted row survived a rollback"
 
 
 def test_migrate_holds_a_lock_derived_from_the_connection():
