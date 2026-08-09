@@ -264,3 +264,48 @@ export function reachedEvents(events, ts) {
   return events.filter((e) => e && Number.isFinite(e.ts) && e.ts <= ts)
     .map((e) => e.ts);
 }
+
+/** The bar index playback must not advance past, given where it started.
+ *
+ * Playback STOPS at a decision rather than sliding through it. A roll is the
+ * moment the trade changed shape, and the whole point of a replay is to sit at
+ * that moment and read what it did -- at 4x, an event card lit for a third of a
+ * second and the reader saw a strike move with no idea why.
+ *
+ * The bar an event stops on is `indexOfTs`'s, the same one its card seeks to and
+ * its dot is drawn at, so the pause lands exactly where the annotation is rather
+ * than a bar either side of it.
+ *
+ * `from` is EXCLUSIVE, which is what lets play resume: standing on a stop and
+ * pressing play again looks past it to the next one instead of halting on the
+ * spot forever. Returns null when no event lies ahead, meaning "run to the end".
+ */
+export function nextStop(events, points, from) {
+  let best = null;
+  for (const event of events) {
+    if (!event || !Number.isFinite(event.ts)) continue;
+    const index = indexOfTs(points, event.ts);
+    if (index <= from) continue;
+    if (best === null || index < best) best = index;
+  }
+  return best;
+}
+
+/** Bars per millisecond, so a replay's LENGTH does not set its pace.
+ *
+ * The speed control used to mean milliseconds per bar, which made the setting a
+ * different promise on every trade: a 24-bar strangle and a 461-bar LEAP at "1x"
+ * ran the same bars-per-second and therefore took 19x longer for the LEAP. The
+ * reader's question is "watch this trade", not "watch 240ms of each of its
+ * bars", so the duration is what should be fixed and the pace what should
+ * follow.
+ *
+ * `secondsFor` is the wall-clock a whole replay should take at 1x; a speed
+ * multiplier divides it. Two bars is the floor `MIN_POINTS` guarantees, and a
+ * one-bar series would otherwise divide by zero and advance infinitely fast.
+ */
+export function barsPerMs(length, secondsFor, speed = 1) {
+  const bars = Math.max(1, length - 1);
+  const ms = (Math.max(0.001, secondsFor) * 1000) / Math.max(0.001, speed);
+  return bars / ms;
+}

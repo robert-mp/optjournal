@@ -10,6 +10,7 @@ import test from "node:test";
 
 import {
   bandEdges,
+  barsPerMs,
   clampIndex,
   clampPosition,
   deltaDomain,
@@ -18,6 +19,7 @@ import {
   xAtPosition,
   indexOfTs,
   markAt,
+  nextStop,
   plotGeometry,
   reachedEvents,
   sessionBreaks,
@@ -344,4 +346,85 @@ test("an integer position behaves exactly as it did before", () => {
     assert.equal(frame.x, geo.xs[i]);
     assert.equal(frame.revealWidth, geo.xs[i] + 1.2);
   }
+});
+
+/* ------------------------------------------------------------- pausing & pace
+ *
+ * Two rules about PLAYBACK rather than about drawing. Both are arithmetic, so
+ * they live here: "which bar must playback stop on" and "how fast should it go"
+ * are decisions a test can pin, unlike whether a card looks right.
+ */
+
+test("playback stops on the bar an event's own card seeks to", () => {
+  // The pause and the annotation must agree, or the replay halts a bar away
+  // from the card it is halting FOR. indexOfTs is the single source of both.
+  const events = [{ ts: 1900 }, { ts: 2500 }];
+  assert.equal(nextStop(events, PRICE, -1), indexOfTs(PRICE, 1900));
+  assert.equal(nextStop(events, PRICE, 0), indexOfTs(PRICE, 2500),
+               "a stop already standing on was not passed");
+});
+
+test("a stop is exclusive of where playback already stands", () => {
+  /* The property that makes play resumable: were `from` inclusive, pressing
+     play while parked on an event would re-stop on that same event forever. */
+  const events = [{ ts: 2000 }];
+  const at = nextStop(events, PRICE, -1);
+  assert.equal(at, 1);
+  assert.equal(nextStop(events, PRICE, at), null,
+               "playback would be trapped on its own stop");
+});
+
+test("play resumes from a bar it is parked on", () => {
+  /* The bug this pins, found by driving the real page: the caller passed
+     `position - 1`, and since nextStop is ALREADY exclusive that asked "what
+     comes after the bar before this one" and returned the stop being stood on.
+     Playback halted instantly at the same bar, forever. `from` is the CURRENT
+     bar, so the sequence of stops must strictly advance. */
+  const events = [{ ts: 1000 }, { ts: 2000 }, { ts: 3000 }];
+  const seen = [];
+  let at = 0;                                   /* parked on bar 0's event */
+  for (let guard = 0; guard < 10; guard++) {
+    const stop = nextStop(events, PRICE, at);
+    if (stop === null) break;
+    assert.ok(stop > at, `playback did not advance past bar ${at}`);
+    seen.push(stop);
+    at = stop;
+  }
+  assert.deepEqual(seen, [1, 2], "the remaining events were not reached in turn");
+});
+
+test("no event ahead means run to the end", () => {
+  assert.equal(nextStop([], PRICE, 0), null);
+  assert.equal(nextStop([{ ts: 1000 }], PRICE, 2), null);
+  // A malformed event is not a stop, for the same reason it is not a card.
+  assert.equal(nextStop([{ ts: null }, {}], PRICE, -1), null);
+});
+
+test("the earliest event ahead wins, whatever order they arrive in", () => {
+  const events = [{ ts: 3000 }, { ts: 1000 }, { ts: 2000 }];
+  assert.equal(nextStop(events, PRICE, -1), 0);
+});
+
+test("every replay takes the same wall-clock, whatever its length", () => {
+  /* The bug this fixes: a fixed ms-per-bar made "1x" a different promise per
+     trade, so a 24-bar strangle finished while a 461-bar LEAP crawled. What
+     should be constant is the DURATION, so the pace has to follow the length. */
+  const spanOf = (rate, length) => (length - 1) / rate;      /* ms to traverse */
+  const short = barsPerMs(24, 20);
+  const leap = barsPerMs(461, 20);
+  assert.ok(Math.abs(spanOf(short, 24) - spanOf(leap, 461)) < 1e-6,
+            "a longer replay took longer at the same setting");
+  assert.ok(Math.abs(spanOf(short, 24) - 20000) < 1e-6, "1x was not 20s");
+});
+
+test("the speed multiplier divides the duration", () => {
+  const base = barsPerMs(50, 20, 1);
+  assert.ok(Math.abs(barsPerMs(50, 20, 4) - base * 4) < 1e-9);
+});
+
+test("a degenerate series has a finite pace", () => {
+  // A one-bar series would divide by zero and advance infinitely fast.
+  assert.ok(Number.isFinite(barsPerMs(1, 20)));
+  assert.ok(Number.isFinite(barsPerMs(0, 20)));
+  assert.ok(barsPerMs(2, 0) > 0, "a zero duration must not stall playback");
 });

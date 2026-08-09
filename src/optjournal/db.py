@@ -34,13 +34,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
 from optjournal.locks import locked
 
-__all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate", "open_journal"]
+__all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate",
+           "open_journal", "schema_is_current"]
 
 log = logging.getLogger(__name__)
 
@@ -684,24 +686,147 @@ def _lock_path(conn: sqlite3.Connection) -> Path | None:
     return None
 
 
+def _shipped_view_sql() -> dict[str, str]:
+    """Each view's definition as `_SCHEMA` spells it, keyed by name.
+
+    Parsed from the schema text rather than maintained beside it, because a second
+    copy of five view bodies is a second thing to forget to update -- and the
+    failure would be silent, since a stale copy simply means the view is never
+    refreshed.
+
+    SQLite stores `sql` verbatim minus `IF NOT EXISTS` (verified), so a stored
+    definition and a shipped one are directly comparable once that clause is
+    dropped and surrounding whitespace is stripped.
+
+    Located from the CREATE keyword to the next `;`, NOT by splitting `_SCHEMA` on
+    `;` and keeping chunks that start with CREATE VIEW. That was the first attempt
+    and it found one view of five: every other view is preceded by an explanatory
+    `--` comment in the same chunk, so the chunk starts with the comment. The bug
+    was invisible because the caller treated "not parsed" as "up to date" -- which
+    would have disabled view refreshing altogether while every test still passed.
+    Hence the assertion below: a view this cannot parse is a hard error, because
+    the alternative is silently never refreshing it.
+    """
+    out: dict[str, str] = {}
+    for match in re.finditer(r"CREATE VIEW IF NOT EXISTS (\w+)", _SCHEMA):
+        end = _SCHEMA.index(";", match.start())
+        body = _SCHEMA[match.start():end].strip()
+        out[match.group(1)] = body.replace(
+            "CREATE VIEW IF NOT EXISTS ", "CREATE VIEW ", 1)
+    missing = set(_VIEWS) - set(out)
+    if missing:
+        raise RuntimeError(
+            f"_shipped_view_sql could not parse {sorted(missing)} out of _SCHEMA. "
+            f"Refusing to continue: treating an unparsed view as current would "
+            f"mean its definition is never refreshed on an existing journal."
+        )
+    return out
+
+
+def _stale_views(conn: sqlite3.Connection) -> list[str]:
+    """The views that are missing or whose stored definition is out of date.
+
+    This is what makes a migration safe to run beside a reader. Dropping and
+    recreating ALL FIVE views on every request is what let one request delete the
+    view another was querying -- measured at 4,941 failures with readers and
+    migrators as separate threads, and reachable over HTTP from four concurrent
+    requests up. In the steady state this returns an empty list and no view is
+    touched at all.
+
+    Comparing SQL rather than checking existence, because a view can exist and
+    still be WRONG: `CREATE VIEW IF NOT EXISTS` never updates, which is how the
+    OPT-only order views would have survived into a journal storing every category.
+    `test_db` pins exactly that, by planting a garbage definition.
+    """
+    stored = {
+        r["name"]: (r["sql"] or "").strip()
+        for r in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'view'")
+    }
+    shipped = _shipped_view_sql()
+    return [
+        name for name in _VIEWS
+        if name not in stored or stored[name] != shipped[name]
+    ]
+
+
+def schema_is_current(conn: sqlite3.Connection) -> bool:
+    """Whether a migration would change anything structural. Cheap, and strict.
+
+    Checked, in order of cost: the version stamp, then every view's DEFINITION
+    (not merely its existence), then every `_ADDED_COLUMNS` column.
+
+    An earlier draft checked only version and view existence, and `test_db` caught
+    it -- the suite already pinned the contract it broke. `migrate` HEALS a journal
+    whose stamp looks right: `_ADDED_COLUMNS` runs ALTERs and two backfills repair
+    rows predating a column. "The version matches" is a different question from
+    "nothing needs doing", and answering the wrong one silently disabled every
+    self-healing path here.
+
+    The row-level BACKFILLS are deliberately not part of this, which is why
+    `migrate` does not use this function to skip itself -- see there. This answers
+    a narrower question: is the STRUCTURE current.
+    """
+    try:
+        row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
+    except sqlite3.OperationalError:
+        return False        # no schema_version table: nothing has been applied yet
+    if not row or row["v"] != SCHEMA_VERSION:
+        return False
+    if _stale_views(conn):
+        return False
+    for table in {table for table, _column, _decl in _ADDED_COLUMNS}:
+        columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not columns:
+            return False    # the table itself is missing
+        wanted = {c for t, c, _d in _ADDED_COLUMNS if t == table}
+        if not wanted <= columns:
+            return False
+    return True
+
+
 def migrate(conn: sqlite3.Connection) -> int:
-    """Apply the schema, serialised across processes. Returns the version.
+    """Apply the schema when it is not already applied. Returns the version.
 
-    HELD UNDER A CROSS-PROCESS LOCK, and that is a correctness fix rather than
-    tidiness. `open_journal` migrates on every request, and the first thing this
-    does is DROP EVERY VIEW -- so two overlapping requests meant one dropping the
-    views the other was querying. Measured before the fix: 23 failures in 90
-    attempts with six workers, and 2 in 6 trials from two simultaneous page loads,
-    surfacing to the browser as `HTTP 500: no such table:
-    current_option_positions`. Reachable by opening the journal in two tabs.
+    TWO guards, and the ORDER OF DISCOVERY here is worth recording because the
+    first one alone looked sufficient and was not.
 
-    A `threading.Lock` would not have been enough: the cron and the server are two
-    processes, so the lock has to live in the filesystem. See `locks`.
+    `open_journal` migrates on every request, and the first thing a migration does
+    is DROP EVERY VIEW. Two overlapping requests meant one dropping the views the
+    other was querying, reaching the browser as `HTTP 500: no such table:
+    current_option_positions`.
 
-    The lock could be narrowed to a "is a migration needed at all" check, and that
-    would be faster -- but the version stamp is not the only thing this writes
-    (`_ADDED_COLUMNS`, the rekeys, the backfills all guard themselves), so
-    "needed" is not a single comparison. Correct and 130ms beats clever here.
+    The cross-process lock (`locks`) was the first fix, and it is necessary: two
+    migrations must not interleave, and a `threading.Lock` cannot say that across
+    the cron and the server. But it is NOT SUFFICIENT, and the test that said
+    otherwise was mine and was wrong. It ran migrate-then-read inside each worker,
+    so every reader happened to hold the lock while reading. A real reader takes no
+    lock at all -- `/api/state` migrates, releases, and only then runs its SELECTs.
+    Re-measured with readers and migrators as separate threads: 4,941 failures.
+    Over real HTTP it appears from four concurrent requests upward (3 of 40), which
+    my original "0 in 10" missed only because it used two.
+
+    So the second guard is the load-bearing one: DO NOT MIGRATE WHEN THE SCHEMA IS
+    ALREADY CURRENT. A migration that does not run cannot drop a view, and the
+    steady state of a journal is that no migration is needed. The lock still covers
+    the case where one IS needed -- startup, or the first open after a version bump.
+
+    The check is deliberately outside the lock. Reading a version and a view list
+    needs no exclusion: if it races with a real migration it can only answer "not
+    current", and the lock then serialises the work.
+
+    WHY THIS DOES NOT SIMPLY RETURN EARLY WHEN `schema_is_current`. That was the
+    first attempt and `test_db` refused it, correctly: three tests require that
+    merely OPENING a journal heals it -- an ALTER for a column added after ship, and
+    two backfills that repair rows written before one. Skipping the whole migration
+    on a current-looking stamp disabled all of that silently. The row-level repairs
+    cannot be detected more cheaply than they can be performed, so they run every
+    time; they are idempotent and measured in milliseconds.
+
+    So the fix is narrower and lands where the damage actually was: `_stale_views`
+    means a view is dropped only when its stored SQL differs from the shipped SQL.
+    In the steady state nothing is dropped, so there is nothing for a concurrent
+    reader to miss, and the healing still happens.
     """
     lock = _lock_path(conn)
     if lock is None:
@@ -712,7 +837,11 @@ def migrate(conn: sqlite3.Connection) -> int:
 
 def _migrate_unlocked(conn: sqlite3.Connection) -> int:
     """The migration itself. Call `migrate`, which holds the lock."""
-    for view in _VIEWS:
+    # ONLY the views whose definition has actually changed. This used to drop all
+    # five unconditionally, which is what let one request delete the view another
+    # request was mid-query on -- the HTTP 500. `executescript` below recreates
+    # anything dropped here, since every view is CREATE VIEW IF NOT EXISTS.
+    for view in _stale_views(conn):
         conn.execute(f"DROP VIEW IF EXISTS {view}")
     conn.executescript(_SCHEMA)
     # After the script, because a table the script just created already has the
@@ -767,4 +896,17 @@ def open_journal(path: Path):
         migrate(conn)
         yield conn
     finally:
+        # Roll back before closing, and do it explicitly rather than relying on
+        # close(). A statement that raises leaves the connection IN A TRANSACTION
+        # holding the write lock -- measured: a refused INSERT leaves
+        # `in_transaction` True, and the next writer then blocks for the whole
+        # BUSY_TIMEOUT_MS before failing with "database is locked" (15.49s).
+        #
+        # `close()` happens to release it today, verified, so this is hardening
+        # rather than a live fix. It matters for what comes next: a scheduler thread
+        # holds a connection across many operations instead of one per request, and
+        # there the leak has no close() to save it. Cheap, and it makes the
+        # guarantee a property of this function rather than of sqlite3's cleanup.
+        if conn.in_transaction:
+            conn.rollback()
         conn.close()
