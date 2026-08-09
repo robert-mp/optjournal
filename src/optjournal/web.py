@@ -35,11 +35,13 @@ simpler than five and the panels can never disagree with each other.
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import ipaddress
 import json
 import logging
 import re
+import signal
 import socket
 import sqlite3
 import threading
@@ -1163,16 +1165,61 @@ def serve(
         else:
             clock.start()
             print(f"  scheduler on, {clock.tick_s}s tick -- Collection shows what it did")
+
+        # SERVE_FOREVER ON A THREAD, MAIN THREAD BLOCKED ON AN EVENT, and this
+        # shape is forced rather than stylistic.
+        #
+        # The natural reading -- `serve_forever()` on the main thread plus a
+        # `SIGTERM` handler calling `httpd.shutdown()` -- DEADLOCKS. Reproduced from
+        # first principles with the bare stdlib:
+        #
+        #     serve_forever on the MAIN thread:  HANDLER ENTERED, then still alive
+        #                                        3s later; shutdown() never returned
+        #     serve_forever on a THREAD:         SHUTDOWN RETURNED, exited in 1.0s
+        #
+        # CPython delivers signals on the main thread, so the handler interrupts
+        # `serve_forever` and then calls `shutdown()`, which waits on an event only
+        # `serve_forever` can set. `socketserver`'s own docstring says it: "This must
+        # be called while serve_forever() is running in another thread, or it will
+        # deadlock."
+        #
+        # The consequence is worse than a slow exit BECAUSE this process now holds a
+        # scheduler: `clock.stop()` below would never run, so the heartbeat would
+        # keep advancing while the listener was dead -- inverting the one honesty
+        # signal this whole plan was built to provide. The port would also stay
+        # LISTEN-bound, so launchd's respawn fails with Errno 48 and its
+        # `ExitTimeOut` eventually SIGKILLs, orphaning the in-flight run's `running`
+        # row on every NORMAL stop.
+        #
+        # `serve_ephemeral` has always had this shape, which is why the suite never
+        # saw the problem: it exercised the safe arrangement and shipped the unsafe
+        # one.
+        stop = threading.Event()
+
+        def _bye(signum: int, _frame: Any) -> None:
+            print(f"\nsignal {signum}, stopping")
+            stop.set()
+
+        # Installed only when this is the main thread. `signal.signal` raises
+        # ValueError elsewhere, and `serve` is importable and callable from a test.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(ValueError):
+                signal.signal(sig, _bye)
+
+        threading.Thread(target=httpd.serve_forever, name="optjournal-http",
+                         daemon=True).start()
         try:
-            httpd.serve_forever()
+            stop.wait()
         except KeyboardInterrupt:
             print("\nstopped")
         finally:
-            # Stopped BEFORE the server's socket closes, and joined rather than
-            # abandoned: a tick mid-write against a journal the caller is about to
-            # move or delete is the kind of race that only shows up once.
+            # ORDER MATTERS: the scheduler stops first, so no tick is mid-write when
+            # the listener goes away, and joined rather than abandoned -- a tick
+            # writing to a journal the caller is about to move is the kind of race
+            # that shows up once.
             if clock is not None:
                 clock.stop()
+            httpd.shutdown()
 
 
 @contextmanager

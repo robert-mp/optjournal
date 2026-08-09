@@ -1,0 +1,240 @@
+"""`optjournal serve` under a real signal, in a real subprocess.
+
+WHY A SUBPROCESS AND A REAL SIGNAL. `grep signal tests/` found only the mutation
+harness before this file, and that absence is exactly why the defect below shipped
+invisibly: it lives in the interaction between CPython's signal delivery, which is
+always on the main thread, and `socketserver.shutdown`, which waits on an event only
+`serve_forever` can set. Nothing short of sending the signal to a running server can
+see it.
+
+THE DEFECT, reproduced from first principles with the bare stdlib before the fix was
+written -- so the result is about `socketserver`, not about this package:
+
+    serve_forever on the MAIN thread:  HANDLER ENTERED, still alive 3s later
+                                       (shutdown() never returned)
+    serve_forever on a THREAD:         SHUTDOWN RETURNED, exited in 1.0s
+
+`socketserver`'s own docstring states it: "This must be called while serve_forever()
+is running in another thread, or it will deadlock."
+
+WHY IT MATTERS MORE NOW THAN IT WOULD HAVE BEFORE. `serve` holds a scheduler. On the
+deadlocking shape `clock.stop()` never runs, so the heartbeat keeps advancing while
+the listener is dead -- inverting the one honesty signal the scheduler was built to
+provide. Then launchd's `ExitTimeOut` SIGKILLs, orphaning the in-flight run's
+`running` row on every NORMAL stop.
+
+Ablated: restoring the main-thread shape made a real `optjournal serve` sit alive
+15s after SIGTERM. With the fix it exits in 0.53s.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+from conftest import ROOT, connect_migrated
+
+from optjournal.demo import write_demo_statement
+from optjournal.ingest import ingest_file
+
+#: The installed console script, which is what launchd will invoke. Exercising the
+#: entry point rather than `python -c "serve(...)"` is deliberate: the signal
+#: handling is installed by `serve`, but whether the MAIN thread reaches it is a
+#: property of how the process was started.
+CLI = ROOT / ".venv" / "bin" / "optjournal"
+
+#: Generous. The fix exits in ~0.5s and the broken shape never exits at all, so
+#: anything in between is a clear verdict rather than a flake.
+EXIT_BUDGET_S = 15
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@pytest.fixture()
+def journal(tmp_path) -> Path:
+    """A demo journal in a scratch directory. Never the real archive.
+
+    The served process starts a SCHEDULER, so its archive must be a scratch path:
+    pointed at the live `raw/`, a reconciler tick could spend a real IBKR request
+    during a test run.
+    """
+    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    conn = connect_migrated(tmp_path / "demo.db")
+    ingest_file(conn, statement)
+    conn.commit()
+    conn.close()
+    return tmp_path / "demo.db"
+
+
+def _serve(journal: Path, port: int) -> subprocess.Popen[str]:
+    if not CLI.exists():
+        pytest.skip(f"{CLI} is not installed; run `uv sync`")
+    return subprocess.Popen(  # noqa: S603 - a fixed argv, no shell
+        [str(CLI), "serve", "--port", str(port), "--db", str(journal),
+         "--archive", str(journal.parent / "raw")],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        # Unbuffered, or `print()` to a pipe is block-buffered and the startup
+        # banner never arrives -- the same reason the launchd plist will need
+        # PYTHONUNBUFFERED. Measured: a redirected serve log sat at 0 bytes.
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+
+
+def _wait_until_bound(proc: subprocess.Popen[str], port: int) -> None:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            pytest.fail(f"serve exited before binding:\n{proc.communicate()[0]}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.1)
+    proc.kill()
+    pytest.fail("serve never bound its port")
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_serve_exits_promptly_on_a_signal(journal, sig):
+    """BOTH signals, because they arrive from different places and one is new.
+
+    `SIGINT` is Ctrl-C, which `serve` has always handled through
+    `KeyboardInterrupt`. `SIGTERM` is what launchd sends, and before this fix
+    nothing in the suite had ever sent it -- so the handler that deadlocks was
+    added by this plan and would have been exercised for the first time by launchd
+    stopping the service.
+    """
+    port = _free_port()
+    proc = _serve(journal, port)
+    _wait_until_bound(proc, port)
+
+    started = time.monotonic()
+    proc.send_signal(sig)
+    try:
+        output = proc.communicate(timeout=EXIT_BUDGET_S)[0]
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        pytest.fail(
+            f"serve was still alive {EXIT_BUDGET_S}s after {sig.name}. That is the "
+            "socketserver deadlock: shutdown() called from a signal handler waits "
+            "on an event only serve_forever can set, and serve_forever is on the "
+            "main thread. Run it on a thread and block the main thread on an Event."
+        )
+    elapsed = time.monotonic() - started
+
+    assert proc.returncode == 0, (
+        f"serve exited {proc.returncode} on {sig.name}, not 0 -- launchd's KeepAlive "
+        f"reads a non-zero exit as a crash and respawns:\n{output}"
+    )
+    assert elapsed < EXIT_BUDGET_S, f"took {elapsed:.1f}s"
+
+
+def test_the_port_is_released_so_a_respawn_can_bind(journal):
+    """launchd's `KeepAlive` respawns within ~10s, into the same port.
+
+    A listener left LISTEN-bound makes that respawn fail with `Errno 48`, and
+    `ThrottleInterval` turns the failure into an invisible crash loop -- two stale
+    `serve` processes were found live during the surveys that produced this plan.
+    """
+    port = _free_port()
+    proc = _serve(journal, port)
+    _wait_until_bound(proc, port)
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.communicate(timeout=EXIT_BUDGET_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        pytest.fail("serve did not exit; see test_serve_exits_promptly_on_a_signal")
+
+    with socket.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError as exc:
+            pytest.fail(
+                f"port {port} is still bound after a clean exit ({exc}), so "
+                "launchd's respawn fails Errno 48 and crash-loops"
+            )
+
+
+def test_the_scheduler_is_stopped_before_the_listener_goes_away(journal):
+    """ORDER, and it is the reason the heartbeat can be trusted.
+
+    If the listener died first and the scheduler kept ticking, the heartbeat would
+    keep advancing while the journal served nothing -- the page would read
+    `scheduler alive` about a process that had stopped answering. That is the
+    two-green-days failure this plan exists to fix, wearing a new hat.
+
+    Checked on the source rather than by racing the shutdown: the invariant is an
+    ordering, and asserting it against a 0.5s exit would be a flake generator.
+    """
+    import inspect
+
+    from optjournal import web
+
+    # STATEMENTS, not mentions: `index` on the raw source finds the first
+    # occurrence, and `serve`'s own comment explains why `clock.stop()` comes first
+    # -- so the naive version of this assertion compared two comment positions and
+    # failed against correct code. Indented calls at the start of a line are the
+    # statements themselves.
+    body = inspect.getsource(web.serve)
+    stop_at = body.index("\n                clock.stop()")
+    shut_at = body.index("\n            httpd.shutdown()")
+    assert stop_at < shut_at, (
+        "the listener is shut down before the scheduler, so a tick can run against "
+        "a journal that is no longer being served -- and the heartbeat would say "
+        "the scheduler is alive"
+    )
+
+
+def test_serve_forever_runs_on_a_thread_not_the_main_one():
+    """The structural half of the deadlock fix.
+
+    Pinned in the source because the runtime symptom is a HANG: a test that only
+    checked "it exits" would still pass if someone later moved `serve_forever` back
+    to the main thread and removed the handler, which exits cleanly by default
+    disposition -- and then the first `httpd.shutdown()` added after that would
+    deadlock again, invisibly.
+    """
+    import inspect
+
+    from optjournal import web
+
+    body = inspect.getsource(web.serve)
+    assert "target=httpd.serve_forever" in body, (
+        "serve_forever is not being run on a thread, so any shutdown() from a "
+        "signal handler will deadlock (socketserver's own docstring says so)"
+    )
+    assert "stop.wait()" in body, (
+        "the main thread no longer blocks on an event, so it has nothing to be "
+        "interrupted by a signal"
+    )
+
+
+def test_a_signal_handler_is_installed_for_both_stop_signals():
+    """And it must tolerate not being the main thread.
+
+    `signal.signal` raises `ValueError` off the main thread, and `serve` is
+    importable and callable from a test or a future embedding. A bare call would
+    turn "started a server in a thread" into a crash.
+    """
+    import inspect
+
+    from optjournal import web
+
+    body = inspect.getsource(web.serve).replace(" ", "")
+    assert "signal.SIGTERM" in body and "signal.SIGINT" in body, (
+        "one of the two stop signals is unhandled"
+    )
+    assert "suppress(ValueError)" in body, (
+        "installing the handler off the main thread would raise; serve must "
+        "tolerate being called from a thread"
+    )
