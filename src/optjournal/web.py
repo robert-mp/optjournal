@@ -775,9 +775,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             name = path[len("/static/"):]
             asset = (Path(__file__).parent / "static" / name).resolve()
             root = (Path(__file__).parent / "static").resolve()
-            if name and root in asset.parents and asset.is_file():
-                self._send(200, asset.read_bytes(),
-                           "text/javascript; charset=utf-8")
+            ctype = STATIC_TYPES.get(asset.suffix)
+            if name and ctype and root in asset.parents and asset.is_file():
+                self._send(200, asset.read_bytes(), ctype)
             else:
                 self._json(404, {"error": "not found"})
         elif path == "/api/state":
@@ -1079,6 +1079,18 @@ def serve_ephemeral(
 #: The page is a separate file so it can be edited with HTML/CSS tooling and
 #: diffed sensibly, rather than living as a multi-hundred-line string literal.
 PAGE_PATH = Path(__file__).resolve().parent / "page.html"
+
+#: What `/static/` will serve, by extension. An allowlist rather than a lookup
+#: through `mimetypes`, and the reason is the 404 above: an extension absent
+#: here is not served at all. The handler used to answer `text/javascript` for
+#: every file it held, which was true while the directory held one .js module
+#: and would have shipped the favicon as a script the moment a second file
+#: arrived -- `nosniff` is set, so the browser would have refused it rather
+#: than guessing. Adding a type is a deliberate act, which is the point.
+STATIC_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".svg": "image/svg+xml",
+}
 
 
 def page_html() -> str:

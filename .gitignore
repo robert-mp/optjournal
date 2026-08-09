@@ -22,7 +22,15 @@ __pycache__/
 # casually.
 #
 # To version them anyway:  git add -f raw/
+#
+# BOTH SPELLINGS, and the second one is not redundant. `raw/` matches a
+# directory and does NOT match a SYMLINK named `raw` -- so a link pointing at
+# the real archive (the obvious way to lend a worktree the statements the suite
+# needs) showed up as untracked and was one `git add -A` away from committing a
+# pointer into this data. Caught twice by hand during one session, which is
+# twice too many for something this file exists to make impossible.
 raw/
+raw
 
 # Fetch-state sidecar: local request-budget bookkeeping, not shared state.
 .fetch-state.json
@@ -53,3 +61,19 @@ build/
 
 # Playwright MCP scratch (console logs from browser verification runs).
 .playwright-mcp/
+
+# Screenshots from browser verification. The tool writes them to whatever the
+# working directory is, which is the repo root, so they land beside the source
+# and look like project files. Four (728KB) were swept into a commit about a
+# database race and lived on mainline until someone read the file list.
+#
+# Ignored by EXTENSION rather than by name: the names are invented per run
+# ("audit-trades", "chart-negative", "focus-ring"), so a denylist of names
+# would always be one run behind. This repo ships no raster images -- the one
+# image it does ship is static/mark.svg, and SVG is deliberately not matched
+# here -- so anything matching these is scratch by construction.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
