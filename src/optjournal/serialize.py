@@ -708,12 +708,45 @@ def audit_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
 
     Answers the one question no later run can fix: an option's intraday series
     exists only while its own session runs.
+
+    `audit.ok` IS NOT ENOUGH, AND THE PAGE MUST NOT RENDER IT ALONE. `ok` is
+    `not market_traded or not missing` (bars.SessionAudit.ok), and `market_traded`
+    is answered by "does any UNDERLYING have hourly bars for that day" -- a
+    deliberately calendar-free holiday oracle. That oracle shares a failure mode
+    with the thing it certifies. Reproduced on three copies of the real journal:
+
+        healthy          traded=True  covered=5  missing=0  ok=True
+        option poll dead traded=True  covered=0  missing=5  ok=False   <- caught
+        TOTAL blackout   traded=False covered=0  missing=0  ok=True    <- MISSED
+
+    Delete every hourly bar, as a fully dead collector would, and `ok` goes GREEN
+    because "no bars for anyone" reads as a market holiday. That is the same
+    watchdog-and-watched-stop-together shape that moved this audit out of a cron in
+    the first place, one level down.
+
+    So two extra fields travel, and the page reads THEM rather than `ok`:
+
+    * `witnesses` -- how many contracts were actually checked. Falls to zero in a
+      blackout while `ok` is green, so a count is honest where a boolean is not.
+    * `blackout` -- no underlying traded across `last_traded_day`'s whole 10-day
+      lookback. Nine US market holidays a year do not fall in a ten-day row, so
+      this cannot be a quiet December: it means collection itself has stopped.
+
+    `ok` is kept, unchanged, because `optjournal bars --audit` and the cron's
+    delivery policy both key on it and this is not the commit to move that.
     """
     audit = audit_perishable(conn, now=now)
+    # `day` is None only when last_traded_day found no session in ten days, which
+    # is the blackout: the audit could not even choose a day to examine.
+    blackout = not audit.market_traded and not audit.covered and not audit.missing
     return {
         "day": audit.day,
         "market_traded": audit.market_traded,
         "covered": list(audit.covered),
         "missing": list(audit.missing),
         "ok": audit.ok,
+        #: What the check actually looked at. Zero means it proved nothing.
+        "witnesses": len(audit.covered) + len(audit.missing),
+        #: Nothing traded anywhere in the lookback -- not a holiday, a dead poll.
+        "blackout": blackout,
     }

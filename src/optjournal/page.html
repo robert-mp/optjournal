@@ -965,7 +965,14 @@ import {
  * @property {boolean} market_traded -- false on a holiday, when no bars is correct
  * @property {Array} covered -- contracts asked for that HAVE hourly bars
  * @property {Array} missing -- contracts asked for that have none
- * @property {boolean} ok -- nothing for a human to do: no missing, or no session
+ * @property {boolean} ok -- nothing for a human to do: no missing, or no session.
+ *   DO NOT render this alone: it is green in a total collection blackout, because
+ *   `market_traded` is answered by "does any underlying have bars", which fails the
+ *   same way the thing it certifies does. Read `witnesses`/`blackout` instead
+ * @property {number} witnesses -- contracts actually checked. Zero means the audit
+ *   proved nothing, which a boolean cannot say
+ * @property {boolean} blackout -- nothing traded anywhere in the 10-day lookback.
+ *   Nine US holidays a year do not fall in a ten-day row, so this is a dead poll
  */
 
 /** @typedef {Object} Watch -- one watched symbol (serialize.watchlist_data)

@@ -15,6 +15,7 @@ collapses those is the ledger that already existed.
 from __future__ import annotations
 
 import sqlite3
+from datetime import timedelta
 
 import pytest
 from conftest import connect_migrated
@@ -209,3 +210,110 @@ def test_pruning_one_job_leaves_another_alone(conn):
 
 def test_prune_is_safe_on_a_job_with_no_runs(conn):
     assert prune_runs(conn, "sync") == 0
+
+
+# ---------------------------------------------------------------------------
+# The audit payload, and the hole in `ok`.
+# ---------------------------------------------------------------------------
+
+
+def _bars_row(conn, *, conid, symbol, bar_size, ts, category="OPT"):
+    conn.execute(
+        "INSERT OR REPLACE INTO price_bars (conid, symbol, bar_size, ts, close,"
+        " source, fetched_at) VALUES (?,?,?,?,1.0,'yahoo','2026-08-09')",
+        (conid, symbol, bar_size, ts))
+    conn.execute(
+        "INSERT OR IGNORE INTO securities (broker, conid, symbol, asset_category)"
+        " VALUES ('ibkr', ?, ?, ?)", (conid, symbol, category))
+
+
+def test_a_total_blackout_is_not_reported_as_ok(conn):
+    """THE DEFECT this pair of fields exists for, and it is subtle.
+
+    `SessionAudit.ok` is `not market_traded or not missing`, and `market_traded` is
+    answered by "does any UNDERLYING have hourly bars for that day" -- a
+    calendar-free holiday oracle. But that oracle fails the SAME WAY as the thing
+    it certifies: delete every hourly bar, as a fully dead collector would, and
+    `ok` goes GREEN because "no bars for anyone" reads as a market holiday.
+
+    Reproduced on three copies of the real journal before this was written:
+
+        healthy           traded=True   covered=5  missing=0  ok=True
+        option poll dead  traded=True   covered=0  missing=5  ok=False  caught
+        TOTAL blackout    traded=False  covered=0  missing=0  ok=True   MISSED
+
+    Same watchdog-and-watched-stop-together shape that moved this audit out of a
+    cron. So the payload carries `witnesses` (how many contracts were actually
+    checked) and `blackout` (nothing traded in the whole lookback), and the page
+    reads those instead of `ok`.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.serialize import audit_data
+
+    # An empty journal IS a blackout: no underlying has bars for any recent day.
+    data = audit_data(conn, now=datetime(2026, 8, 10, 12, tzinfo=UTC))
+    assert data["ok"] is True, (
+        "premise: ok is green here, which is exactly the problem being fixed"
+    )
+    assert data["blackout"] is True, "a blackout must be distinguishable from fine"
+    assert data["witnesses"] == 0, "nothing was checked, so nothing was proved"
+
+
+def test_a_healthy_session_is_not_a_blackout(populated_db):
+    """The other direction, so `blackout` is not simply always true.
+
+    Uses the REAL archive rather than a hand-built row, and that is not laziness:
+    `market_traded_on` derives its underlying set from `_underlying_conids`, which
+    reads TRADES, not `securities`. A fixture that inserts a bar and a security row
+    but no trade yields an empty conid set and `market_traded=False` -- which is how
+    the first version of this test failed, looking like a code bug when it was a
+    fixture gap. Building the whole trade-plus-security-plus-bar graph by hand would
+    be reimplementing the ingest to test three payload keys.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.bars import last_traded_day
+    from optjournal.db import connect
+    from optjournal.serialize import audit_data
+
+    conn = connect(populated_db)
+    # Bars come from `optjournal bars`, which the suite never runs, so seed one
+    # hourly underlying bar for a day the real book was open.
+    trade = conn.execute(
+        "SELECT underlying_conid, underlying_symbol FROM trades"
+        " WHERE underlying_conid IS NOT NULL LIMIT 1").fetchone()
+    if trade is None:
+        pytest.skip("the archive holds no option trade to hang an underlying off")
+    session = datetime(2026, 8, 7, 14, 30, tzinfo=UTC)      # 10:30 ET, mid-session
+    _bars_row(conn, conid=str(trade["underlying_conid"]),
+              symbol=str(trade["underlying_symbol"]), bar_size="1h",
+              ts=int(session.timestamp()), category="STK")
+    conn.commit()
+
+    # `last_traded_day` walks back from YESTERDAY, so ask on the following day.
+    now = session + timedelta(days=1)
+    assert last_traded_day(conn, now=now) == "2026-08-07", (
+        "the seeded underlying bar should make that day the last traded one"
+    )
+    data = audit_data(conn, now=now)
+    assert data["market_traded"] is True
+    assert data["blackout"] is False, (
+        "an underlying traded, so the collector is demonstrably alive"
+    )
+    conn.close()
+
+
+def test_witnesses_counts_what_was_examined_not_what_passed(conn):
+    """`witnesses` is covered PLUS missing, so it does not fall when coverage does.
+
+    That is the point: a count that dropped on failure would be as useless as the
+    boolean. It answers "did the audit look at anything", which is a different
+    question from "did it like what it saw".
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.serialize import audit_data
+
+    data = audit_data(conn, now=datetime(2026, 8, 10, 12, tzinfo=UTC))
+    assert data["witnesses"] == len(data["covered"]) + len(data["missing"])
