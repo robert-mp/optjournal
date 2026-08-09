@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from optjournal.analysis import CostReport
-from optjournal.bars import MARKET_TZ
+from optjournal.bars import MARKET_TZ, audit_perishable
 from optjournal.events import (
     DEFAULT_COUNTRIES,
     DEFAULT_IMPACTS,
@@ -631,3 +631,89 @@ def watchlist_data(conn: sqlite3.Connection, *, lookback: int = 21) -> list[Row]
             "held": bool(held.get(symbol)),
         })
     return out
+
+
+#: How stale the scheduler's heartbeat may be before the page calls it dead. The
+#: tick is 60s, so three missed ticks is unambiguous while a single slow one is
+#: not -- and a laptop waking from sleep writes a heartbeat within one tick.
+HEARTBEAT_STALE_S = 300
+
+
+def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
+    """What the scheduler has done, and whether it is alive at all.
+
+    TWO SEPARATE QUESTIONS, and conflating them is the failure this exists for.
+    "Did the last run succeed" is `last_status`; "is anything running the
+    schedule" is the heartbeat. The MeshClaw crons answered the first with `ok`
+    for two days while the answer to the second was no -- three bars jobs green
+    while `price_bars` gained nothing, including the audit job whose whole purpose
+    was to notice. A row can therefore be green on outcome and red on freshness at
+    the same time, and the page must be able to say so.
+
+    Reads only. Writing is the runner's job; this is what the page renders.
+    """
+    rows = [dict(r) for r in conn.execute(
+        "SELECT job, last_fired_for, last_status, consecutive_failures,"
+        " heartbeat_at FROM job_state ORDER BY job")]
+
+    latest: dict[str, Row] = {}
+    for run in conn.execute(
+        # The newest run per job: id DESC is the insertion order, which is also
+        # the completion order for a single worker.
+        "SELECT job, id, fired_for, started_at, finished_at, status, detail,"
+        " done, total, note, slept FROM job_runs ORDER BY id DESC"
+    ):
+        latest.setdefault(str(run["job"]), dict(run))
+
+    jobs: list[Row] = []
+    for state in rows:
+        job = str(state["job"])
+        jobs.append({
+            "job": job,
+            "last_status": state["last_status"],
+            "last_fired_for": state["last_fired_for"],
+            "consecutive_failures": state["consecutive_failures"] or 0,
+            "last_run": latest.get(job),
+        })
+
+    # The heartbeat is one clock for the whole loop, not per job: the tick writes
+    # it, so the freshest value across jobs is the loop's own liveness. Absent
+    # entirely means the scheduler has never run here, which is NOT the same as
+    # dead and must not render as an alarm on a journal that has only ever used
+    # the CLI.
+    beats = [r["heartbeat_at"] for r in rows if r["heartbeat_at"] is not None]
+    beat = max(beats) if beats else None
+    age = None if beat is None else int(now.timestamp()) - int(beat)
+    return {
+        "jobs": jobs,
+        "heartbeat_at": beat,
+        "heartbeat_age_s": age,
+        "running": age is not None and age <= HEARTBEAT_STALE_S,
+        #: None when no scheduler has ever written a heartbeat. The page says
+        #: "not running" rather than "stale", because they need different actions.
+        "ever_ran": beat is not None,
+        "stale_after_s": HEARTBEAT_STALE_S,
+    }
+
+
+def audit_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
+    """Did the last session's perishable option bars actually land?
+
+    Computed on EVERY page load rather than by a scheduled job, and that is the
+    point rather than a shortcut. The audit was a cron, which meant the watchdog
+    and the thing it watched could stop together -- and did. Measured at 2.95 ms
+    on the real journal (the plan predicted 0.76 ms; either way it is noise
+    against a payload that already issues ~142 statements), so there is no reason
+    to make it conditional.
+
+    Answers the one question no later run can fix: an option's intraday series
+    exists only while its own session runs.
+    """
+    audit = audit_perishable(conn, now=now)
+    return {
+        "day": audit.day,
+        "market_traded": audit.market_traded,
+        "covered": list(audit.covered),
+        "missing": list(audit.missing),
+        "ok": audit.ok,
+    }

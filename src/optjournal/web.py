@@ -82,8 +82,10 @@ from optjournal.history import build_history
 from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
 from optjournal.marketdata import BarFetchError, fetch_quote
 from optjournal.serialize import (
+    audit_data,
     costs_data,
     history_data,
+    jobs_data,
     market_data,
     orders_data,
     positions_data,
@@ -591,6 +593,15 @@ def build_state(
             # Prices and realised vol from bars already stored, so this
             # spends nothing. `optjournal bars` is what fills them in.
             "watchlist": watchlist_data(conn),
+            # What the scheduler has done, and whether it is running at all.
+            # Read-only here: the runner writes, the page renders.
+            "scheduler": jobs_data(conn, now=datetime.now(UTC)),
+            # Computed on EVERY load, unconditionally, and that is the design
+            # rather than laziness: this used to be a cron, so the watchdog and
+            # the thing it watched could stop together -- and did, for two days,
+            # while three jobs reported `ok`. 2.95 ms measured on the real
+            # journal, against a payload that already issues ~142 statements.
+            "audit": audit_data(conn, now=datetime.now(UTC)),
         }
         # How many POSITIONS the open contracts form, which needs the lifecycle
         # grouping and so cannot be computed inside month_stats. Set on both

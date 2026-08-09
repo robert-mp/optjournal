@@ -635,6 +635,11 @@ import {
  * @property {Array} statements -- Statement rows, the archive inventory
  * @property {Market} market -- the economic calendar (serialize.market_data)
  * @property {Array} watchlist -- Watch rows (serialize.watchlist_data)
+ * @property {Scheduler} scheduler -- what the jobs did, and whether the loop is
+ *   alive (serialize.jobs_data). Two separate questions: see the typedef
+ * @property {Audit} audit -- did the last session's perishable bars land
+ *   (serialize.audit_data). Computed on EVERY load, because when this was a cron
+ *   the watchdog and the thing it watched stopped together
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
  * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
@@ -923,6 +928,44 @@ import {
  * @property {boolean} key -- survives the default view. Decided server-side from
  *   the same constants the CLI uses, so the page never holds its own copy of
  *   "USD high-impact" to drift from
+ */
+
+/** @typedef {Object} Scheduler -- the scheduler's own state (serialize.jobs_data)
+ *
+ *  TWO SEPARATE QUESTIONS, and conflating them is the failure this exists for.
+ *  `jobs[].last_status` answers "did the last run succeed"; `running` answers "is
+ *  anything driving the schedule at all". The MeshClaw crons answered the first
+ *  with ok for two days while the second was false -- three bars jobs green while
+ *  no bars were collected, including the audit job whose purpose was to notice. So
+ *  a row can be green on outcome and red on freshness simultaneously.
+ * @property {Array} jobs -- JobRow per registered job
+ * @property {number|null} heartbeat_at -- epoch UTC, written by the TICK LOOP
+ *   rather than by a job, so a dead loop reads as a dead heartbeat
+ * @property {number|null} heartbeat_age_s
+ * @property {boolean} running -- heartbeat fresher than stale_after_s
+ * @property {boolean} ever_ran -- false when no scheduler has EVER written a
+ *   heartbeat here. Distinct from stale: a CLI-only journal is not broken, and
+ *   rendering it as an alarm would be the noise this project avoids
+ * @property {number} stale_after_s
+ */
+
+/** @typedef {Object} JobRow -- one registered job's state (serialize.jobs_data)
+ * @property {string} job
+ * @property {string|null} last_status
+ * @property {number|null} last_fired_for -- the newest scheduled instant claimed
+ * @property {number} consecutive_failures
+ * @property {Object|null} last_run -- the newest job_runs row, or null
+ */
+
+/** @typedef {Object} Audit -- the perishable-bar check (serialize.audit_data)
+ *
+ *  The one question no later run can fix: an option's intraday series exists only
+ *  while its own session runs, so a missed session is missed permanently.
+ * @property {string} day -- the ET session examined
+ * @property {boolean} market_traded -- false on a holiday, when no bars is correct
+ * @property {Array} covered -- contracts asked for that HAVE hourly bars
+ * @property {Array} missing -- contracts asked for that have none
+ * @property {boolean} ok -- nothing for a human to do: no missing, or no session
  */
 
 /** @typedef {Object} Watch -- one watched symbol (serialize.watchlist_data)

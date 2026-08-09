@@ -86,6 +86,22 @@ def state(populated) -> dict:
         " ('TSLA', 'held: the LEAP', ?), ('SPY', NULL, ?)",
         (str(today), str(today)),
     )
+    # A job_state row and its run, for the same reason the events are seeded: the
+    # contract guard anchors `JobRow` to a real payload row, and on a journal where
+    # no job has ever run -- every fresh one -- the list is empty and the shape
+    # would be quietly exempted from the guard rather than checked by it.
+    fired = int(datetime.now(UTC).timestamp()) - 3600
+    conn.execute(
+        "INSERT OR REPLACE INTO job_state"
+        " (job, last_fired_for, last_status, consecutive_failures, heartbeat_at)"
+        " VALUES ('sync', ?, 'ok', 0, ?)",
+        (fired, int(datetime.now(UTC).timestamp())),
+    )
+    conn.execute(
+        "INSERT INTO job_runs (job, fired_for, started_at, finished_at, status,"
+        " detail, done, total) VALUES ('sync', ?, ?, ?, 'ok', '2 new trades', 1, 1)",
+        (fired, str(today), str(today)),
+    )
     conn.commit()
     conn.close()
     return build_state(db_path=populated, archive_dir=RAW_DIR, query_id="1591754")
@@ -309,6 +325,13 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         "WatchOption": first([
             option for row in state["watchlist"] for option in row["options"]
         ]),
+        "Scheduler": state["scheduler"],
+        # Sampled from the real payload, and the `scheduler` fixture seeds a
+        # job_state row so this anchors something rather than being None on a
+        # journal where no job has ever run -- which is every fresh journal, and
+        # would quietly exempt the shape.
+        "JobRow": first(state["scheduler"]["jobs"]),
+        "Audit": state["audit"],
         "FxBlock": state["fx"],
         "FxQuote": first(state["fx"]["quotes"]),
         "OdteBlock": state["odte"],
