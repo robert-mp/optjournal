@@ -914,6 +914,166 @@ def test_styling_lives_in_the_stylesheet_not_in_the_markup():
     )
 
 
+# --------------------------------------------------------------------------
+# The class contract: the page and the stylesheet name the same things.
+#
+# Extracting the CSS into its own file bought reachability -- the layout tests
+# can read every rule -- and cost co-location. A class and its rules now live in
+# two files that nothing checks against each other, which is the same shape as
+# the payload contract below, and the same shape as the defect that prompted
+# this: `.stats` was `display:grid` with four inline `grid-template-columns`
+# overrides, commit 01b34ff changed it to `display:flex` and left the overrides
+# behind, and they were inert from that moment with the whole suite green.
+#
+# Two directions, both strict. Measured before writing them: 168 classes in
+# app.css, 148 literal in page.html, exactly ONE used-but-undefined (`tbl`, on
+# the watchlist table, since deleted) and ZERO unreachable rules. Neither
+# direction needs an allowlist today, so neither has one.
+# --------------------------------------------------------------------------
+
+
+def _css_classes() -> set[str]:
+    """Every class named by a selector in the stylesheet, comments stripped.
+
+    Comments matter: app.css explains its own layout decisions, and prose about
+    `.stats` would otherwise read as a definition of it.
+    """
+    return set(re.findall(r"\.([A-Za-z][A-Za-z0-9_-]*)",
+                          re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)))
+
+
+def _literal_page_classes() -> set[str]:
+    """Class tokens the page states outright, with `${...}` blanked out.
+
+    Blanked rather than parsed: an interpolation is a JS expression whose value
+    this cannot know, so a token that only ever arrives through one is checked by
+    the other direction instead. What is left is every class written down as
+    text, which is where a typo lands.
+    """
+    tokens: set[str] = set()
+    for attr in re.finditer(r'class="([^"]*)"', page_html()):
+        plain = re.sub(r"\$\{[^{}]*\}", " ", attr.group(1))
+        tokens |= set(plain.split())
+    return tokens
+
+
+def test_every_class_the_page_writes_down_has_rules():
+    """A class with no rules is a silent no-op, and one had already shipped.
+
+    `<table class="tbl">` on the watchlist carried a class app.css never defined
+    -- zero `.tbl` rules -- and rendered acceptably only because the bare `table`
+    rule covers it. Nothing noticed for a week. The class is deleted now; this
+    stops the next one.
+
+    Not merely a typo check. It is what makes a RENAME safe: change a selector in
+    app.css and this names every element still asking for the old one, which is
+    precisely the step commit 01b34ff skipped.
+    """
+    orphans = sorted(_literal_page_classes() - _css_classes())
+    assert not orphans, (
+        f"the page asks for these classes and static/app.css defines none of them, "
+        f"so they style nothing: {orphans}"
+    )
+
+
+def test_every_rule_in_the_stylesheet_is_reachable_from_the_page():
+    """The other direction, so deleting an element cannot leave rules behind.
+
+    Dead rules are not merely clutter: they are what a reader trusts when
+    deciding what a class does, and they hide the fact that the element is gone.
+
+    Reachability, not literal use -- roughly a fifth of the classes are assembled
+    in JS (`'sm '+cls(x)`, `classList.add('busy')`, `${shown?' open':''}`), so a
+    literal-only check would fail on 21 rules that are all live. Whole-word match
+    anywhere in the page is the weakest rule that admits those, and it is
+    deliberately weak: it proves the NAME is written somewhere, not that the code
+    path runs. It still caught what it needed to -- with word boundaries off,
+    `.g`/`.lo`/`.hi` matched inside `logo` and `hidden` and the check was
+    vacuous.
+    """
+    page = page_html()
+    unreachable = sorted(
+        cls for cls in _css_classes()
+        if not re.search(rf"(?<![A-Za-z0-9_-]){re.escape(cls)}(?![A-Za-z0-9_-])", page)
+    )
+    assert not unreachable, (
+        f"static/app.css defines these and the page never names them, so they are "
+        f"dead: {unreachable}"
+    )
+
+
+def _css_rules() -> list[tuple[str, str]]:
+    """(selector, body) for every rule, comments stripped, at-rules flattened.
+
+    `@media(...){.stats{...}}` yields the inner rule, which is what wants
+    checking -- a responsive override is exactly where a stale property hides.
+    """
+    return re.findall(r"([^{}]+)\{([^{}]*)\}",
+                      re.sub(r"/\*.*?\*/", "", _css(), flags=re.S))
+
+
+def test_no_rule_sets_a_layout_property_its_display_mode_cannot_use():
+    """THE mechanism behind the dead-CSS finding, checked directly.
+
+    `grid-template-columns` on a `display:flex` box is not an error, not a
+    warning, and not visible: the property parses, sits in the CSSOM, and does
+    nothing. That is how commit 01b34ff shipped four inert declarations -- it
+    changed `.stats` from `display:grid;grid-template-columns:repeat(5,1fr)` to
+    `display:flex;flex-wrap:wrap;--sw:18%` and left four inline
+    `grid-template-columns` overrides pointing at a box that had stopped being a
+    grid. The suite was green, the page looked right, and the overrides were dead
+    from that commit until a browser check found them a day later.
+
+    Ablated by re-creating that exact rule (`.stats.s4{grid-template-columns:
+    repeat(4,1fr)}` beside the flex `.stats`): this reports it, and names `flex`
+    as the mode the element actually has.
+
+    Deliberately narrow. Only properties with NO meaning outside their mode are
+    listed -- `gap`, `align-items` and `justify-content` work in both and are
+    absent on purpose. A selector's display mode may be set by any rule sharing
+    one of its classes, because that is how `.filters` and `.leg.ctx`
+    legitimately set grid properties: their base rules declare `display:grid` in
+    this same file, which is the co-location the inline overrides lacked.
+    """
+    grid_only = ("grid-template-columns", "grid-template-rows", "grid-template-areas",
+                 "grid-auto-flow", "grid-column", "grid-row", "grid-area")
+    flex_only = ("flex-wrap", "flex-direction", "flex-basis", "flex-grow", "flex-shrink")
+
+    def classes(sel: str) -> set[str]:
+        return set(re.findall(r"\.([A-Za-z][A-Za-z0-9_-]*)", sel))
+
+    rules = _css_rules()
+    modes: dict[str, set[frozenset[str]]] = {"grid": set(), "flex": set()}
+    for sel, body in rules:
+        found = re.search(r"display:\s*([a-z-]+)", body)
+        if not found:
+            continue
+        for mode in modes:
+            if mode in found.group(1):
+                modes[mode] |= {frozenset(classes(s)) for s in sel.split(",")}
+
+    def has_mode(sel: str, mode: str) -> bool:
+        want = classes(sel)
+        # An element or id selector carries no class to match on; not checked.
+        return not want or any(want & set(m) for m in modes[mode])
+
+    orphans = []
+    for sel, body in rules:
+        for one in (s.strip() for s in sel.split(",")):
+            for mode, props in (("grid", grid_only), ("flex", flex_only)):
+                used = [p for p in props if re.search(rf"(?<![-a-z]){p}\s*:", body)]
+                if used and not has_mode(one, mode):
+                    actual = next(
+                        (m for m in modes if m != mode and has_mode(one, m)), "neither"
+                    )
+                    orphans.append(f"{one} sets {used} but is {actual}, not {mode}")
+
+    assert not orphans, (
+        "these declarations are inert -- the property means nothing in the display "
+        f"mode the element actually has: {orphans}"
+    )
+
+
 def test_page_escapes_interpolated_values():
     """Statement filenames and symbols come from IBKR, so they are untrusted.
 
