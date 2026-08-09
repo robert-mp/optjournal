@@ -401,7 +401,7 @@ asset, and no amount of care around `git add` would have protected one of them.)
 
 </details>
 
-### Step 3 — A regression net for the 21 delivery decisions, against the existing cron files
+### Step 3 — A regression net for the 21 delivery decisions, against the existing cron files — **DONE at `344fafe`**
 
 **Zero behaviour change. This is the step that makes the rewrite safe.**
 
@@ -425,7 +425,7 @@ a decision.
 is not waste: they are the oracle the new `jobs.py` tests are written against, and
 they are the reason a reviewer can believe the mapping survived.
 
-### Step 4 — The ledger and the status surface, read-only, while MeshClaw still runs
+### Step 4 — The ledger and the status surface, read-only, while MeshClaw still runs — **DONE**
 
 **Ship the status surface BEFORE the schedule moves.** If the app ships a
 scheduler before it ships a status surface, the system gets quieter and less
@@ -537,6 +537,64 @@ path cannot help, because the version is stale by definition. The `flock` around
 `migrate` is what makes that safe, which is *why the bump lands after step 1 and
 not before*. The read transaction must stay scoped to `build_state`'s ~14 ms body:
 a pinned reader blocks WAL checkpointing.
+
+#### What step 4 actually shipped, and the four places this plan was wrong
+
+Commits `0aa3d92` (ledger), `075bb0d` (the `ok` hole), `bbb983b` (the strip).
+
+**1. The crons could not write the ledger, so the CLI does.** The plan said "the
+existing MeshClaw crons get a ~10-line helper to write a `job_runs` row". They
+cannot: a cron runs under MeshClaw's own interpreter, which has no `py_ibkr`
+(verified — `import py_ibkr` there is a `ModuleNotFoundError`), which is the whole
+reason they shell out to the CLI. So `record_run` is called by the CLI commands the
+crons already invoke, and the cron files stayed untouched. Better anyway: the ledger
+records what the WORK did rather than what the cron's delivery policy decided, and
+the delivery decision was already visible in Slack.
+
+**2. `audit.ok` IS GREEN IN A TOTAL BLACKOUT.** The plan had the page render
+`state["audit"]` and said nothing about which field. `ok` is
+`not market_traded or not missing`, and `market_traded` is answered by "does any
+underlying have hourly bars that day" — an oracle that fails the same way as the
+thing it certifies. Reproduced on three copies of the real journal:
+
+```
+healthy           traded=True   covered=5  missing=0  ok=True
+option poll dead  traded=True   covered=0  missing=5  ok=False   <- caught
+TOTAL blackout    traded=False  covered=0  missing=0  ok=True    <- MISSED
+```
+
+The same watchdog-and-watched-stop-together shape that moved this audit out of a
+cron, one level down. `witnesses` and `blackout` travel now and the page reads
+those; `ok` stays for `bars --audit` and the cron policy.
+
+**3. `blackout` could not tell a stopped collector from one never started.**
+Measured, not reasoned about: `price_bars` emptied out of a copy of the real journal
+versus a fresh journal gave **byte-identical** payloads (`market_traded` False,
+`witnesses` 0, `blackout` True, `ok` True). So the demo journal — and every real
+journal before its first `optjournal bars` — showed a red collection alarm for the
+absence of something that had never been there. Added `ever_collected`. Note the
+shape of the mistake: the heartbeat already drew exactly this distinction with
+`ever_ran`, and the audit half simply did not.
+
+**4. `next_due_at`/`stale` per job did NOT ship, deliberately.** Nothing schedules
+anything yet, so there is no next instant to compute — a due time derived from a
+registry that does not exist would be a guess rendered as a fact. It lands in step 6
+with the reconciler, the first code with an opinion about when a job should fire. The
+heartbeat covers the question that actually failed.
+
+**Also deferred to step 5: `BEGIN DEFERRED` around `build_state`.** A torn-payload
+probe could not reproduce the defect — 0 of 5 attempts with a writer committing
+mid-build, against a control that also read 0 of 5. Worth doing on the argument, not
+worth claiming a fix for a failure that would not reproduce.
+
+**What building the strip cost, as a warning for step 5.** Two more instances of the
+dead-declaration shape, both found only by a browser: `<b class="pos">` inside a
+`.pill` lost its tint to `.pill b` (specificity 0,1,1 beats 0,1,0 — four figures
+affected), and `.jrow:first-child{border-top:0}` matched nothing because the card's
+first child is its header. Both were well-formed CSS under a selector that could not
+reach the element, with the whole suite green. Three guards now cover the class in
+`tests/test_web.py`: every class the page names has rules, every rule is reachable,
+and no rule sets a layout property its display mode cannot use.
 
 ### Step 5 — `jobs.py`: the registry and the runner, manual only, no thread yet
 
