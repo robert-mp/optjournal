@@ -370,7 +370,7 @@ td.n,th.n{text-align:right}
    (`borderTopWidth` 1px on row one, where it should have been 0), which is the
    third rule of this exact shape found today. A sibling combinator states the
    intent directly and cannot be wrong about its position. */
-.jrow{display:grid;grid-template-columns:96px 74px 1fr auto auto;gap:10px;
+.jrow{display:grid;grid-template-columns:96px 74px 1fr auto auto auto;gap:10px;
   align-items:baseline;padding:8px 2px}
 .jrow+.jrow{border-top:1px solid var(--line)}
 .jname{font-size:12.5px;font-weight:600}
@@ -381,11 +381,17 @@ td.n,th.n{text-align:right}
 .jdet{font-size:11.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
 .jwhen{font-size:11px}
+/* The run button. Smaller than a card-header action and right-aligned in its own
+   column, so a row of them makes a clean edge rather than a ragged one -- the
+   detail column absorbs the width difference, which is why it is the `1fr`. */
+.jrun{padding:4px 10px;font-size:11.5px;min-width:64px;justify-self:end}
 .pill.neg{border-color:#7c2f2b}
 @media(max-width:760px){
   /* The timestamp is the first thing to go: on a narrow screen the status and
-     the detail are what answer the question. */
-  .jrow{grid-template-columns:88px 70px 1fr auto}
+     the detail are what answer the question. The BUTTON stays: it is the reason
+     this panel is not read-only, and a control that disappears on a narrow
+     window is a control you cannot find. */
+  .jrow{grid-template-columns:88px 70px 1fr auto auto}
   .jwhen{display:none}
 }
 /* Actions inside a card header. Borrowed from .seg's palette rather than given a

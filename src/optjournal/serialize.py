@@ -665,15 +665,52 @@ def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
     ):
         latest.setdefault(str(run["job"]), dict(run))
 
+    # EVERY REGISTERED JOB, not only those with a `job_state` row. Reading the
+    # table alone meant a job that had never run did not appear -- no row, no Run
+    # button, no way to start it from the page. That is the `crons.json` failure
+    # wearing a new hat: `market` has never run anywhere, so it would have been
+    # invisible on the one surface built to make it runnable. The registry is the
+    # list of what EXISTS; the table only says what has happened.
+    #
+    # Imported here rather than at module scope: `jobs` imports `bars` and `sync`,
+    # and `serialize` is imported by `render` for terminal output that needs
+    # neither. The graph stays acyclic either way (`jobs` does not import
+    # `serialize`), so this is about import cost, not direction.
+    from optjournal.jobs import JOBS  # noqa: PLC0415 - see above
+
+    state_by_job = {str(r["job"]): r for r in rows}
     jobs: list[Row] = []
-    for state in rows:
-        job = str(state["job"])
+    for spec in JOBS:
+        state = state_by_job.get(spec.name)
         jobs.append({
-            "job": job,
+            "job": spec.name,
+            "last_status": None if state is None else state["last_status"],
+            "last_fired_for": None if state is None else state["last_fired_for"],
+            "consecutive_failures": (
+                0 if state is None else (state["consecutive_failures"] or 0)),
+            "last_run": latest.get(spec.name),
+            #: Whether running this spends one of IBKR's rate-limited requests.
+            #: Decided by the registry, so the page holds no copy of which jobs
+            #: touch the broker -- the same rule that keeps "USD high-impact" out
+            #: of the calendar's markup.
+            "spends_request": spec.spends_broker_request,
+        })
+    # A `job_state` row for a job no longer in the registry: kept, and marked, so a
+    # renamed job's history does not silently vanish from the page that reports on
+    # collection health.
+    for name, state in sorted(state_by_job.items()):
+        if any(spec.name == name for spec in JOBS):
+            continue
+        jobs.append({
+            "job": name,
             "last_status": state["last_status"],
             "last_fired_for": state["last_fired_for"],
             "consecutive_failures": state["consecutive_failures"] or 0,
-            "last_run": latest.get(job),
+            "last_run": latest.get(name),
+            #: Unregistered, so it cannot be run from the page and cannot spend
+            #: anything.
+            "spends_request": False,
+            "retired": True,
         })
 
     # The heartbeat is one clock for the whole loop, not per job: the tick writes

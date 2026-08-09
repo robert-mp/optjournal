@@ -269,6 +269,12 @@ def test_contract_parser_is_correct():
 _UNSAMPLED = frozenset({
     "ChartPoint", "Bucket", "SyncResponse",
     "MarketFetch", "WatchWrite", "QuoteReply", "Quote",
+    # `/api/jobs/run`, both verbs. Exempt for the same reason as the rest and one
+    # more: its keys are CONDITIONAL on the HTTP status (`jobs` only on 400,
+    # `run_id` on 202 and 409, `status` only on the GET), so no single reply
+    # carries them all and a sampled one would make four of them look absent.
+    # Pinned against the handlers' source below instead.
+    "JobReply",
 })
 
 
@@ -794,7 +800,7 @@ def test_sync_response_shape_matches_what_the_page_reads():
 
 
 def test_endpoint_reply_shapes_match_what_the_page_reads():
-    """The same pin, for the three endpoints that are not /api/state.
+    """The same pin, for the endpoints that are not /api/state.
 
     These have no payload sample for a reason rather than by neglect: refreshing
     the calendar hits a feed that answers 429, and a quote costs one HTTP request
@@ -817,6 +823,11 @@ def test_endpoint_reply_shapes_match_what_the_page_reads():
         _Handler._quotes: ("ok", "quotes", "failed", "asked_at",
                            # one Quote entry, read per row in the watchlist
                            "price", "at", "previous_close", "currency"),
+        # Both verbs of /api/jobs/run. Its keys are conditional on the status --
+        # `jobs` only on 400, `run_id` on 202 and 409 -- so a sampled reply would
+        # make four of them look absent, which is why it is source-pinned.
+        _Handler._job_run: ("ok", "kind", "message", "jobs", "run_id", "job"),
+        _Handler._job_status: ("ok", "kind", "message"),
     }
     for handler, keys in expected.items():
         src = inspect.getsource(handler)
@@ -2979,20 +2990,90 @@ def test_the_job_status_word_is_rendered_not_collapsed_to_a_colour():
     )
 
 
-def test_the_strip_is_read_only_until_the_runner_exists():
-    """No trigger, no form, no POST. Step 5 adds the runner; this is step 4c.
+def test_every_runnable_job_gets_a_button_and_a_retired_one_does_not():
+    """Step 5e replaces step 4c's read-only pin. That pin is why this one exists.
 
-    Worth pinning rather than trusting: the page already has three write paths
-    (sync, market fetch, watchlist), so adding a fourth here is one copied line --
-    and a button that posts to an endpoint the server does not implement fails
-    silently in the console, on the one panel whose purpose is to be trusted.
+    The old test forbade `<button` in the strip while `POST /api/jobs/run` did not
+    exist, because a button posting to a missing endpoint fails silently in the
+    console -- on the panel whose whole purpose is to be trusted. The endpoint
+    exists now, so the invariant flips: every REGISTERED job must be runnable from
+    here (that is what "no need to run anything from the CLI" means), and a row
+    whose job has left the registry must NOT offer a button that cannot work.
     """
-    strip = _fn("collection")
-    for forbidden in ("<button", "<form", "<input", "fetch(", "data-job"):
-        assert forbidden not in strip, (
-            f"the collection strip contains {forbidden!r}, but it is read-only "
-            "until jobs.py grows a runner (SCHEDULER_PLAN.md step 5)"
+    strip = _fn("collection").replace(" ", "").replace("\n", "")
+    assert 'class="btnsmjrun"data-job="${esc(j.job)}"' in strip, (
+        "the run button is gone, so the strip is read-only again and the jobs can "
+        "only be started from a terminal"
+    )
+    assert "j.retired" in strip, (
+        "a retired job would be offered a button that posts a name the registry "
+        "no longer knows, which the endpoint answers 400 to"
+    )
+    # The button is disabled while the job is running, or a second click races the
+    # first and gets a 409 for a system that is working.
+    assert "busy?'disabled':''" in strip.replace('"', "'"), (
+        "the button stays enabled during a run, so a double click reports a "
+        "conflict for a job that is simply still going"
+    )
+
+
+def test_only_the_job_that_spends_a_broker_request_asks_for_confirmation():
+    """The dialogue is about COST, not caution, and the payload decides.
+
+    `sync` spends one of IBKR's rate-limited Flex requests against a lockout
+    budget; the other three hit a public chart endpoint or a calendar feed where an
+    extra call costs nothing. A confirm() on all four would train the reader to
+    click through the one that matters -- the same argument that keeps `confirm`
+    off the calendar's Refresh button.
+
+    Read from `JobRow.spends_request`, which comes from the registry's
+    `spends_broker_request`, so the page holds NO list of which jobs touch the
+    broker. A second copy of that fact is a copy that drifts, exactly as a page-side
+    copy of "USD high-impact" would.
+    """
+    runner = _fn("bindJobRuns").replace(" ", "").replace("\n", "")
+    assert "j.spends_request" in runner, (
+        "the page no longer asks the payload which jobs spend a request"
+    )
+    # The GUARD, not just the word: `if(spends&&!confirm(...))return;` -- a bare
+    # search for "confirm(" survived an ablation that disabled it entirely
+    # (`if(false&&!window.confirm(`), because the substring was still there.
+    assert "if(spends&&!confirm(" in runner, (
+        "the confirmation is no longer gated on spends_request and short-circuited "
+        "to a return -- a decline must not post"
+    )
+    assert "return;" in runner, "declining the dialogue no longer aborts the run"
+    for name in ("'sync'", '"sync"', "'market'", "'bars_live'"):
+        assert name not in runner, (
+            f"the page names {name} directly, so it now holds its own copy of "
+            "which jobs touch the broker -- read spends_request instead"
         )
+
+
+def test_the_runner_renders_every_reply_the_endpoint_can_send():
+    """409 and 503 are not failures, and rendering them as one is the defect.
+
+    409 means the job is already running: a working system, so the page follows
+    the run in flight rather than reporting an error. 503 means the journal is
+    locked by another writer and waiting will fix it -- which is precisely what the
+    browser could NOT say before the guard existed, because the connection was
+    dropped after 16 seconds with no response at all.
+    """
+    runner = _fn("bindJobRuns")
+    assert "409" in runner and "pollRun" in runner, (
+        "a 409 no longer follows the run already in flight, so a working system "
+        "reports a conflict"
+    )
+    assert "503" in runner and "locked" in runner, (
+        "a 503 is not distinguished, so 'wait a moment' renders as a failure"
+    )
+    poll = _fn("pollRun")
+    assert "'nothing'" in poll.replace('"', "'"), (
+        "the poll does not distinguish `nothing` from `ok`, which is the exact "
+        "conflation that let three cron jobs look healthy while collecting nothing"
+    )
+    # Bounded, or a `running` row whose process died spins here forever.
+    assert "i<40" in poll.replace(" ", ""), "the poll loop is unbounded"
 
 
 def test_the_strip_survives_a_payload_without_a_scheduler_block():

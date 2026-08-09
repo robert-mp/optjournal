@@ -454,6 +454,12 @@ import {
  * @property {number|null} last_fired_for -- the newest scheduled instant claimed
  * @property {number} consecutive_failures
  * @property {JobRun|null} last_run -- the newest job_runs row, or null
+ * @property {boolean} spends_request -- running this costs one of IBKR's
+ *   rate-limited Flex requests. From the REGISTRY, so the page holds no copy of
+ *   which jobs touch the broker; it decides which button asks for confirmation
+ * @property {boolean} [retired] -- only on a row whose job left the registry. Its
+ *   history is kept and marked rather than dropped, so a rename does not silently
+ *   erase a job's past from the panel that reports on collection health
  */
 
 /** @typedef {Object} JobRun -- one row of the run ledger (serialize.jobs_data)
@@ -499,6 +505,25 @@ import {
  *   journal that never collected is not a fault, and measured identical without
  *   this: emptying price_bars out of the real journal and a fresh journal produced
  *   byte-identical payloads. Same distinction `Scheduler.ever_ran` draws
+ */
+
+/** @typedef {Object} JobReply -- POST/GET /api/jobs/run (web._job_run,
+ *  web._job_status)
+ *
+ *  ONE SHAPE, FOUR STATUSES, and the page branches on the HTTP code rather than on
+ *  a field: 202 started, 409 already running (a working system, so it polls the run
+ *  in flight instead of reporting a failure), 400 unknown job, 503 the journal is
+ *  locked and waiting will fix it. That last one is what the browser could not say
+ *  before the guard existed -- the connection was simply dropped after 16 seconds.
+ * @property {boolean} ok
+ * @property {string} kind -- queued|busy|unknown|id|missing|run
+ * @property {number} [run_id] -- on 202 and 409: the run to poll
+ * @property {string} [job]
+ * @property {string} [message]
+ * @property {Array} [jobs] -- on 400, the names that DO exist, because these are
+ *   underscore-separated while MeshClaw's were hyphenated
+ * @property {string} [status] -- on a GET: running|ok|nothing|missed|failed|interrupted
+ * @property {string} [detail]
  */
 
 /** @typedef {Object} Watch -- one watched symbol (serialize.watchlist_data)
@@ -727,7 +752,7 @@ import {
  * @payload mk:Market d:MarketDay mev:MarketEvent
  * @payload w:Watch wo:WatchOption
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
- * @payload sc:Scheduler j:JobRow run:JobRun au:Audit
+ * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
@@ -735,7 +760,7 @@ import {
  * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen withEvents ws opts thin
  * @local JSON Object ages input mine qb wf behind was
- * @local when
+ * @local when button
  */
 
 const $=s=>document.querySelector(s);
@@ -1253,9 +1278,18 @@ function collection(){
   /* One row per registered job. `last_status` is rendered as itself rather than
      collapsed to a colour: `nothing` (a legitimately empty run) and `ok` are both
      healthy and must stay distinguishable, because conflating them is exactly what
-     let three cron jobs report health while collecting nothing. */
+     let three cron jobs report health while collecting nothing.
+
+     EACH ROW CARRIES A RUN BUTTON, which is the point of the whole exercise --
+     nothing here should need a terminal. `sync` gets a confirm() and the others do
+     not, and the line between them is not caution but COST: sync spends one of
+     IBKR's rate-limited Flex requests against a lockout budget, and the other
+     three hit a public chart endpoint or a calendar feed where the penalty for an
+     extra call is nothing. A dialogue on all four would train you to click through
+     dialogues, which is how the one that matters stops being read. */
   const rows=(sc.jobs||[]).map(j=>{
     const run=j.last_run;
+    const busy=j.last_status==='running';
     const tint=j.last_status==='failed'||j.last_status==='interrupted'?'neg'
       :j.last_status==='ok'?'pos':'';
     const detail=run&&run.detail?run.detail:'';
@@ -1270,6 +1304,17 @@ function collection(){
       ${j.consecutive_failures>1?`<span class="pill gap neg"
         title="Consecutive failures since the last healthy run."
         >×${j.consecutive_failures}</span>`:''}
+      ${j.retired
+        /* No button: the job left the registry, so there is nothing to run. Its
+           history stays visible and labelled rather than disappearing, because a
+           row that vanishes reads as "this never happened". */
+        ? `<span class="dim2 lbl-sm" title="This job is no longer registered. Its
+            history is kept so a rename does not erase what it did."
+            >retired</span>`
+        : `<button class="btn sm jrun" data-job="${esc(j.job)}"${busy?' disabled':''}
+        title="${j.spends_request
+          ? 'Spends one IBKR Flex request against a rate-limited budget.'
+          : 'Costs no IBKR request.'}">${busy?'running':'run'}</button>`}
     </div>`;
   }).join('');
 
@@ -2803,6 +2848,7 @@ function draw(push){
       if(want===(S.mktall===true))return; S.mktall=want; S.marketday=null; draw();});
   bindMarketFetch();
   bindWatchlist();
+  bindJobRuns();
   /* First view of the Watchlist fetches quotes once, so the tab is useful without
      a click -- and NOT on any later redraw, because each quote is an HTTP request
      and a redraw happens on every toggle, filter and edit. `quotesAt` is the
@@ -2855,6 +2901,87 @@ function note(text,kind){
   const m=$('#msg'); m.innerHTML=text; m.className='show';
   const c={bad:['#3a1f22','#f0a0a8'],warn:['#3a3122','#e8cd85'],ok:['#183328','#9fe3c4']}[kind||'ok'];
   m.style.background=c[0]; m.style.color=c[1]; m.style.border='1px solid rgba(255,255,255,.07)';
+}
+
+/* Run a registered job from the page. The reason the strip exists.
+ *
+ * WHICH BUTTON ASKS FOR CONFIRMATION IS DECIDED SERVER-SIDE, by
+ * `JobRow.spends_request`, which comes from the registry's
+ * `spends_broker_request`. The page holds no list of which jobs touch the broker,
+ * for the same reason it holds no copy of "USD high-impact": a second copy of a
+ * fact is a copy that drifts. Only `sync` spends one of IBKR's rate-limited
+ * requests today; the others hit a public chart endpoint or a calendar feed where
+ * an extra call costs nothing, and a dialogue on all four would train you to click
+ * through the one that matters.
+ *
+ * EVERY REPLY THE ENDPOINT CAN SEND IS RENDERED AS ITSELF. 409 means the job is
+ * already running -- a working system, not an error -- so it polls the run already
+ * in flight instead of showing a failure. 503 means the journal is locked by
+ * another writer and waiting will fix it, which is exactly what the browser could
+ * not say before the guard existed: the connection was dropped after 16 seconds
+ * with no response at all. */
+function bindJobRuns(){
+  document.querySelectorAll('button.jrun').forEach(b=>{
+    b.onclick=async()=>{
+      const job=b.dataset.job;
+      const spends=(((S.state.scheduler||{}).jobs)||[])
+        .some(j=>j.job===job&&j.spends_request);
+      if(spends&&!confirm(
+        `Run ${job}? This spends one IBKR Flex request against a rate-limited `
+        +`budget.`)) return;
+      b.disabled=true; b.classList.add('busy'); b.textContent='running';
+      try{
+        const r=await fetch('/api/jobs/run',{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({job})});
+        const jres=await r.json();
+        if(r.status===409){
+          note(`<b>${esc(job)}</b> is already running — watching that run.`,'warn');
+          await pollRun(jres.run_id);
+        }else if(r.status===503){
+          note('The journal is locked by another writer: '
+            +esc(jres.message||'')+' Try again in a moment.','warn');
+        }else if(!jres.ok){
+          note(`Could not run ${esc(job)}: `+esc(jres.message||''),'bad');
+        }else{
+          await pollRun(jres.run_id);
+        }
+      }catch(e){note(`Could not run ${esc(job)}: `+esc(e),'bad');}
+      await load();
+    };
+  });
+}
+
+/* Follow one run to its terminal state.
+ *
+ * Polls rather than streams, because the run is synchronous today -- the POST has
+ * already returned by the time this starts, so the first read is usually the last.
+ * The loop is for step 6, when the runner moves to a thread and a 202 genuinely
+ * means "started". Bounded, so a `running` row whose process died (which the flock
+ * probe resolves on the next page load) cannot spin here forever. */
+async function pollRun(id){
+  if(!id) return;
+  for(let i=0;i<40;i++){
+    let jres;
+    try{
+      const r=await fetch(`/api/jobs/run?id=${encodeURIComponent(id)}`);
+      jres=await r.json();
+    }catch(e){note('Lost track of the run: '+esc(e),'warn'); return;}
+    if(!jres.ok) return;
+    if(jres.status!=='running'){
+      /* The four terminal statuses read differently on purpose. `nothing` is a
+         healthy empty run -- the normal outcome for a bars poll outside the
+         session -- and reporting it as success or failure is exactly the
+         conflation that let three cron jobs look fine for two days. */
+      const kind=jres.status==='ok'?'ok'
+        :jres.status==='nothing'?'warn':'bad';
+      note(`<b>${esc(jres.job)}</b> ${esc(jres.status)}`
+        +(jres.detail?` — ${esc(jres.detail)}`:''),kind);
+      return;
+    }
+    await new Promise(r=>setTimeout(r,500));
+  }
+  note('The run is taking longer than expected — it is still recorded.','warn');
 }
 
 /* Refresh the calendar from the feed.

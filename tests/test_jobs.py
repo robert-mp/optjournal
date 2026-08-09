@@ -841,3 +841,78 @@ def test_a_sync_with_no_credentials_reports_rather_than_raising(conn, tmp_path):
     row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
     assert row["status"] == "failed"
     assert "query id" in row["detail"]
+
+
+def test_every_registered_job_is_in_the_payload_even_if_it_never_ran(conn):
+    """THE gap that made the Run button useless for the job that needed it most.
+
+    `jobs_data` read `job_state`, so a job with no row did not appear -- no row on
+    the page, no button, no way to start it. That is the `crons.json` failure
+    wearing a new hat: `market` has never run anywhere, so it would have been
+    invisible on the one surface built to make it runnable. The registry says what
+    EXISTS; the table only says what has HAPPENED.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.jobs import JOBS
+    from optjournal.serialize import jobs_data
+
+    data = jobs_data(conn, now=datetime.now(UTC))          # a journal with no runs
+    assert conn.execute("SELECT COUNT(*) FROM job_state").fetchone()[0] == 0, (
+        "premise: nothing has ever run in this journal"
+    )
+    assert [row["job"] for row in data["jobs"]] == [job.name for job in JOBS], (
+        "the payload omits registered jobs that have never run, so the page cannot "
+        "offer a button for them"
+    )
+    for row in data["jobs"]:
+        assert row["last_status"] is None, "a job that never ran has no status"
+        assert row["consecutive_failures"] == 0
+        assert row["last_run"] is None
+
+
+def test_the_payload_says_which_jobs_spend_a_broker_request(conn):
+    """So the page's confirm() reads the registry rather than holding a copy.
+
+    A page-side list of which jobs touch IBKR is a second copy of a fact, and a
+    second copy drifts -- the same reason "USD high-impact" is decided server-side
+    for the calendar. Get this wrong in the permissive direction and a dialogue
+    stops appearing on the one run that spends a rate-limited request.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.serialize import jobs_data
+
+    spends = {row["job"]: row["spends_request"]
+              for row in jobs_data(conn, now=datetime.now(UTC))["jobs"]}
+    assert spends["sync"] is True
+    assert not any(v for k, v in spends.items() if k != "sync"), (
+        f"a job other than sync claims to spend a broker request: {spends}"
+    )
+
+
+def test_a_job_that_left_the_registry_keeps_its_history_and_is_marked(conn):
+    """`bars_audit` is the real case: it WAS a cron and is now a page-load field.
+
+    Its rows are still in this journal. Dropping them from the payload would make
+    the panel that reports on collection health silently forget that the audit ever
+    ran, and a row that vanishes reads as "this never happened". So the history is
+    kept, flagged `retired`, and offered no button -- pressing one would post a name
+    the registry no longer knows, which the endpoint answers 400 to.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.serialize import jobs_data
+
+    conn.execute(
+        "INSERT INTO job_state (job, last_status, consecutive_failures)"
+        " VALUES ('bars_audit', 'ok', 0)")
+    conn.commit()
+
+    rows = {row["job"]: row for row in jobs_data(conn, now=datetime.now(UTC))["jobs"]}
+    assert "bars_audit" in rows, "a retired job's history vanished from the payload"
+    assert rows["bars_audit"]["retired"] is True
+    assert rows["bars_audit"]["spends_request"] is False
+    # And a registered job never carries the flag, or every row would render as
+    # unrunnable.
+    assert "retired" not in rows["sync"]
