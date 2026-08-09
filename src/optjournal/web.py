@@ -82,6 +82,7 @@ from optjournal.ingest import DEFAULT_ASSET_FILTER
 from optjournal.jobs import (
     JOBS,
     JobBusy,
+    Scheduler,
     UnknownJob,
     interrupted_runs,
     run_job,
@@ -1110,8 +1111,16 @@ def serve(
     assets: tuple[str, ...] = DEFAULT_ASSET_FILTER,
     host: str = "127.0.0.1",
     port: int = 8765,
+    scheduler: bool = True,
 ) -> None:
-    """Serve the UI until interrupted. Loopback only, by construction."""
+    """Serve the UI until interrupted. Loopback only, by construction.
+
+    `scheduler=True` starts the 60-second reconciler in this process, which is what
+    makes `serve` the application rather than a viewer. In-process for one measured
+    reason: the IBKR fetch cooldown is a check-then-act guard on a hard lockout
+    budget, so the scheduled sync and the browser's Sync button being two threads in
+    one process beats two blind processes sharing a file.
+    """
     if not _is_loopback(host):
         raise ValueError(
             f"refusing to bind {host!r}: this UI has no authentication and "
@@ -1138,16 +1147,32 @@ def serve(
     # ThreadingHTTPServer instantiates its handler class per request; partial
     # prepends the config, which is the stdlib-sanctioned way to inject
     # dependencies into a BaseHTTPRequestHandler.
+    clock = Scheduler(ctx=JobContext(
+        archive_dir=archive_dir, db_path=db_path, query_id=query_id,
+        assets=tuple(assets),
+    )) if scheduler else None
+
     with _Server((host, port), partial(_Handler, cfg)) as httpd:
         actual = httpd.socket.getsockname()[1]
         print(f"optjournal UI on http://{host}:{actual}")
         print("  loopback only, no authentication -- do not expose this port")
         if not query_id:
             print("  no --query-id given, so Sync now is disabled")
+        if clock is None:
+            print("  scheduler OFF (--no-scheduler): nothing runs unless you press it")
+        else:
+            clock.start()
+            print(f"  scheduler on, {clock.tick_s}s tick -- Collection shows what it did")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nstopped")
+        finally:
+            # Stopped BEFORE the server's socket closes, and joined rather than
+            # abandoned: a tick mid-write against a journal the caller is about to
+            # move or delete is the kind of race that only shows up once.
+            if clock is not None:
+                clock.stop()
 
 
 @contextmanager
@@ -1174,6 +1199,16 @@ def serve_ephemeral(
 
     Unlike `serve()` this does not print, does not block, and does not refuse a
     non-loopback host, because it never binds one: 127.0.0.1 is hardcoded.
+
+    IT NEVER STARTS THE SCHEDULER, and that is a safety property rather than a
+    convenience. `tests/conftest.py` points `RAW_DIR` at the LIVE `raw/` directory,
+    and six call sites -- four in `tests/test_web.py`, one in `test_rendered.py`, one
+    in `sweep.py` -- pass it here. A scheduler started by default would let the test
+    suite fire real IBKR fetches against the real archive and the real
+    `.fetch-state.json`, spending a rate-limited budget on a `pytest` run. There is
+    deliberately no parameter to turn it on: a test that wants the loop constructs
+    `jobs.Scheduler` directly against a scratch database, which is explicit at the
+    call site and cannot be defaulted wrong.
     """
     cfg = ServeConfig(
         db_path=db_path,

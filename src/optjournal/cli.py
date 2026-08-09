@@ -712,6 +712,10 @@ def cmd_serve(args) -> int:
             assets=assets,
             host=args.host,
             port=args.port,
+            # OFF for the demo, unconditionally and regardless of the flag: the
+            # demo journal must never fetch anything, and a scheduler pointed at a
+            # synthetic archive would spend a real IBKR request to fill it.
+            scheduler=bool(args.scheduler) and not args.demo,
         )
     except ValueError as exc:
         print(f"\n{exc}", file=sys.stderr)
@@ -936,6 +940,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--demo", action="store_true",
                    help=f"serve the synthetic data from `optjournal demo`"
                         f" ({DEFAULT_DEMO_DB})")
+    # ON by default, because `serve` IS the application now: with the scheduler off
+    # the journal collects nothing unless a human presses a button, which is the
+    # arrangement this whole plan replaces. `--no-scheduler` exists for serving a
+    # copy of the journal to look at, where firing jobs would write to a database
+    # the reader does not intend to change.
+    p.add_argument("--no-scheduler", dest="scheduler", action="store_false",
+                   help="serve read-only: no jobs run on a schedule (they can "
+                        "still be run by hand from the page)")
     # serve declares its OWN path arguments, defaulting to None, instead of
     # inheriting the shared `archive`/`database` parents and overriding their
     # defaults. argparse's set_defaults mutates the *shared action objects*,

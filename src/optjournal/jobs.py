@@ -31,6 +31,8 @@ from __future__ import annotations
 import enum
 import logging
 import sqlite3
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -797,7 +799,7 @@ def due_jobs(
     claimed: dict[str, set[int]],
     last_success: dict[str, int],
     ever_ran: set[str],
-    registry: tuple[Job, ...] = JOBS,
+    registry: tuple[Job, ...] | None = None,
 ) -> list[Due]:
     """Which jobs should run at `now`. Pure: no clock, no database, no I/O.
 
@@ -825,8 +827,15 @@ def due_jobs(
     former ingests. That ordering is a real happens-before edge here, where today it
     is two wall-clock guesses plus MeshClaw's `random.uniform(0, 59*60)` jitter.
     """
+    # `None` rather than `= JOBS`, and this was a real bug rather than a style
+    # preference: a default argument is evaluated at DEFINITION time, so the tuple
+    # was captured once at import and `monkeypatch.setattr(jobs, "JOBS", ...)` never
+    # reached this function. Every test that replaced the registry was silently
+    # exercising the REAL one -- they passed because the real schedules happened to
+    # agree, which is the worst way for a test to pass. Found by running the loop
+    # against a stubbed one-job registry and watching zero runs happen.
     out: list[Due] = []
-    for job in registry:
+    for job in (JOBS if registry is None else registry):
         if job.catchup is Catchup.WINDOW:
             found = _window_due(job, now, last_success.get(job.name))
             if found is not None:
@@ -849,3 +858,247 @@ def due_jobs(
             continue                       # too old to be worth catching up
         out.append(Due(job, stamp, f"scheduled {instant.isoformat()}, {behind}s late"))
     return out
+
+
+# ---------------------------------------------------------------------------
+# The reconciler (SCHEDULER_PLAN.md step 6b).
+#
+# A WALL-CLOCK CATCH-UP RECONCILER, NEVER A SLEEPING TIMER, and that is forced by
+# measurement rather than chosen for elegance. On this machine:
+#
+#     monotonic impl: mach_absolute_time()
+#     monotonic        = 138522
+#     CLOCK_UPTIME_RAW = 138522     <-- identical: monotonic EXCLUDES sleep
+#     CLOCK_MONOTONIC  = 298925
+#     sleep excluded from monotonic: 44.6 hours
+#
+# So `event.wait(seconds_until_next_fire)` is not approximately right here, it is
+# 55% slow: 44.3 h asleep out of 80.7 h wall, across 292 sleep/wake cycles averaging
+# 7.5 minutes awake. A fixed 60 s tick is never accumulated into a deadline, so
+# oversleeping costs one tick of latency and nothing else -- a noon job on a laptop
+# asleep at noon runs within a minute of the lid opening.
+# ---------------------------------------------------------------------------
+
+#: How often the loop wakes. Not a schedule: due-ness is recomputed from the wall
+#: clock every tick, so this only bounds LATENCY. 60 s costs one pass over
+#: `job_runs` per minute (measured in microseconds on a 200-row-per-job table).
+TICK_S = 60
+
+#: Above this many consecutive failures a job stops being started by the
+#: reconciler. It stays runnable BY HAND from the page, which is the point: a job
+#: failing for a real reason should stop hammering the endpoint that is failing,
+#: without becoming invisible or requiring a restart to retry.
+FAILURE_BACKOFF = 5
+
+#: How far the wall clock must run ahead of `monotonic` within one tick before the
+#: run is stamped `slept`. Generous: a normal 60 s tick shows sub-millisecond drift,
+#: so anything at this scale is a genuine suspend.
+SLEPT_THRESHOLD_S = 90
+
+
+def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
+    dict[str, set[int]], dict[str, int], set[str], dict[str, int]
+]:
+    """(claimed, last_success, ever_ran, failures) in ONE pass over the ledger.
+
+    One query rather than four per job, because this runs every 60 seconds against
+    the same database a job may be writing. `fired_for IS NOT NULL` is the only
+    filter that matters: a NULL claim belongs to a WINDOW job, which is braked by
+    `last_success` instead.
+    """
+    claimed: dict[str, set[int]] = {}
+    last_success: dict[str, int] = {}
+    ever_ran: set[str] = set()
+    for row in conn.execute(
+        "SELECT job, fired_for, status, finished_at FROM job_runs"
+    ):
+        job = str(row["job"])
+        ever_ran.add(job)
+        if row["fired_for"] is not None:
+            claimed.setdefault(job, set()).add(int(row["fired_for"]))
+        if row["status"] == "ok" and row["finished_at"]:
+            stamp = _epoch_of(str(row["finished_at"]))
+            if stamp is not None:
+                last_success[job] = max(last_success.get(job, 0), stamp)
+    failures = {
+        str(r["job"]): int(r["consecutive_failures"] or 0)
+        for r in conn.execute("SELECT job, consecutive_failures FROM job_state")
+    }
+    return claimed, last_success, ever_ran, failures
+
+
+def _epoch_of(stamp: str) -> int | None:
+    """Epoch seconds from an ISO timestamp written by this package.
+
+    Tolerant of a missing offset: every stamp this module writes carries one, but a
+    row hand-inserted by a migration or a test may not, and a `ValueError` here
+    would kill the tick over a formatting detail.
+    """
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp())
+
+
+def reconcile(
+    conn: sqlite3.Connection,
+    *,
+    ctx: Context,
+    now: datetime | None = None,
+    slept: bool = False,
+) -> list[str]:
+    """Run whatever is due, once. Returns the names of the jobs started.
+
+    ONE PASS, SEQUENTIAL, IN REGISTRY ORDER, which is what turns "sync before
+    bars_daily" into a real happens-before edge rather than two wall-clock guesses.
+
+    EACH JOB IS CONTAINED. A due-check or a run that raises must not stop the tick,
+    because a daemon thread that dies leaves the HTTP server perfectly healthy and
+    the schedule dead -- the 40-hour outage this plan exists to fix, reproduced
+    inside its own fix. So every job is wrapped, and the failure is RECORDED rather
+    than logged and forgotten.
+
+    `now` is injectable for the same reason `due_jobs` is pure: the tick's behaviour
+    at a DST boundary is testable without waiting for October.
+    """
+    moment = now or datetime.now(UTC)
+    claimed, last_success, ever_ran, failures = _ledger_snapshot(conn)
+    started: list[str] = []
+    for due in due_jobs(moment, claimed=claimed, last_success=last_success,
+                        ever_ran=ever_ran):
+        if failures.get(due.job.name, 0) >= FAILURE_BACKOFF:
+            # Backed off, not disabled: still runnable by hand from the page, and
+            # the count resets on any healthy outcome.
+            log.warning("%s: backed off after %d consecutive failures",
+                        due.job.name, failures[due.job.name])
+            continue
+        log.info("%s is due (%s)", due.job.name, due.reason)
+        try:
+            run_id = run_job(conn, due.job.name, ctx=ctx, fired_for=due.fired_for)
+            started.append(due.job.name)
+            if slept and run_id:
+                # Why a noon job fired at 09:14 becomes a field rather than a
+                # mystery. Both clocks are already read, so this is free.
+                conn.execute("UPDATE job_runs SET slept = 1 WHERE id = ?", (run_id,))
+                conn.commit()
+        except JobBusy:
+            # Another runner has it -- the page, or a previous tick still working.
+            # Not an error: the flock and the unique index are doing their job.
+            log.info("%s is already running", due.job.name)
+        except Exception:                     # noqa: BLE001 - see the docstring
+            # `run_job` already recorded `failed` with the cause before re-raising.
+            # Swallowed HERE so one job cannot stop the others or kill the tick.
+            log.exception("%s failed", due.job.name)
+    return started
+
+
+def heartbeat(conn: sqlite3.Connection, *, now: datetime | None = None) -> None:
+    """Stamp the tick loop's own liveness onto every registered job.
+
+    WRITTEN BY THE LOOP, NOT BY A JOB, and that separation is the whole point of
+    having two signals. "Did the last run succeed" and "is anything driving the
+    schedule" are different questions, and `crons.json` answered the first with `ok`
+    for two days while the answer to the second was no. A heartbeat written by a job
+    would collapse them again.
+
+    On every registered job rather than one row, so `jobs_data` can take the
+    freshest value across jobs without a table of its own.
+    """
+    stamp = int((now or datetime.now(UTC)).timestamp())
+    try:
+        for job in JOBS:
+            conn.execute(
+                "INSERT INTO job_state (job, heartbeat_at, consecutive_failures)"
+                " VALUES (?,?,0) ON CONFLICT(job) DO UPDATE SET heartbeat_at = ?",
+                (job.name, stamp, stamp),
+            )
+        conn.commit()
+    except sqlite3.Error as exc:
+        # A heartbeat that cannot be written must not kill the loop that writes it.
+        log.warning("could not write the heartbeat: %s", exc)
+        if conn.in_transaction:
+            conn.rollback()
+
+
+class Scheduler:
+    """The tick loop, as an object so `serve` can stop it deterministically.
+
+    A `threading.Event` for the stop signal rather than a flag, so shutdown does
+    not wait out a 60-second sleep -- which matters more than it sounds: step 7 has
+    to make SIGTERM work, and a loop that ignores its stop signal for a minute is
+    indistinguishable from a hung one.
+
+    NOT a daemon thread that nobody joins. `stop()` waits, so a test cannot leave a
+    scheduler running against a database the next test is about to delete.
+    """
+
+    def __init__(self, *, ctx: Context, tick_s: int = TICK_S) -> None:
+        self.ctx = ctx
+        self.tick_s = tick_s
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        #: Ticks ATTEMPTED, not completed, and the distinction is this project's
+        #: whole subject. A loop counting only successes reads as dead while it is
+        #: alive and failing every tick -- which is `crons.json` reporting `ok` for
+        #: two days, inverted. "Is the loop alive" and "are its ticks working" are
+        #: two questions, so they are two counters.
+        self.ticks = 0
+        #: Ticks that raised. Nonzero with `ticks` climbing means alive but broken,
+        #: which is a different repair from either alone.
+        self.tick_failures = 0
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("this scheduler is already running")
+        self._thread = threading.Thread(
+            target=self._loop, name="optjournal-scheduler", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 10.0) -> None:
+        """Signal the loop and wait for it. Idempotent."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+            self._thread = None
+
+    def _loop(self) -> None:
+        """One connection for the loop's lifetime, and every tick contained.
+
+        Its OWN connection, not the handlers': `sqlite3` objects are not safe to
+        share across threads, and the server is threaded. Opened inside the thread
+        so the object is created where it is used.
+        """
+        from optjournal.db import connect, migrate  # noqa: PLC0415 - see below
+
+        conn = connect(self.ctx.db_path)
+        migrate(conn)
+        # Wall AND monotonic, so a suspend is detectable: monotonic excludes sleep
+        # on this platform (measured, 44.6 hours), so the two diverging by more than
+        # a tick means the machine was asleep.
+        wall = datetime.now(UTC)
+        mono = time.monotonic()
+        try:
+            while True:
+                self.ticks += 1               # ATTEMPTED: see the attribute's note
+                try:
+                    now = datetime.now(UTC)
+                    elapsed_wall = (now - wall).total_seconds()
+                    elapsed_mono = time.monotonic() - mono
+                    slept = elapsed_wall - elapsed_mono > SLEPT_THRESHOLD_S
+                    wall, mono = now, time.monotonic()
+                    heartbeat(conn, now=now)
+                    reconcile(conn, ctx=self.ctx, now=now, slept=slept)
+                except Exception:             # noqa: BLE001 - the point of the loop
+                    self.tick_failures += 1
+                    # A tick that raises must not end the schedule. Design 3 named
+                    # this exactly: a daemon thread that dies leaves the HTTP server
+                    # perfectly healthy and the schedule dead, which is the outage
+                    # this plan exists to fix.
+                    log.exception("scheduler tick failed")
+                if self._stop.wait(self.tick_s):
+                    return
+        finally:
+            conn.close()

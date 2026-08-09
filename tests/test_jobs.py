@@ -1348,3 +1348,405 @@ def test_a_claimed_instant_does_not_brake_the_live_poll():
         "the live poll is gated on claimed instants, which it never has -- it "
         "would poll once per session instead of once per window"
     )
+
+
+# ---------------------------------------------------------------------------
+# The reconciler thread (SCHEDULER_PLAN.md step 6b).
+#
+# Every test here drives a SCRATCH journal and a stubbed registry. Nothing in this
+# file may reach a network: the tick's whole job is to start work, and the work is
+# what spends IBKR requests.
+# ---------------------------------------------------------------------------
+
+
+def _registry(monkeypatch, *names, outcome="ok"):
+    """Replace JOBS with stubs of the named jobs, keeping their schedules.
+
+    The SCHEDULES are real -- the point is to exercise due-ness against the actual
+    zones and hours -- while the work is a stub, so a tick cannot reach a feed.
+    """
+    import dataclasses
+
+    from optjournal import jobs as mod
+
+    def stub(_c, _x, n=""):
+        return mod.Outcome(outcome, f"stubbed {n}", 1, 1)
+
+    kept = tuple(
+        dataclasses.replace(job, run=lambda c, x, n=job.name: stub(c, x, n))
+        for job in mod.JOBS if job.name in names
+    )
+    monkeypatch.setattr(mod, "JOBS", kept)
+    return kept
+
+
+def test_a_tick_runs_what_is_due_and_records_it(conn, ctx, monkeypatch):
+    """The whole loop in one call, with the clock passed in.
+
+    `reconcile` takes `now` for the same reason `due_jobs` is pure: the tick's
+    behaviour at a particular instant is testable without waiting for that instant
+    to arrive.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import reconcile
+
+    _registry(monkeypatch, "market")
+    # `market` fires at 11:00 Dublin; ask at 12:00 with history present.
+    conn.execute("INSERT INTO job_runs (job, started_at, status) VALUES"
+                 " ('market', '2026-08-11T11:00:00+00:00', 'ok')")
+    conn.commit()
+    now = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+
+    assert reconcile(conn, ctx=ctx, now=now) == ["market"]
+    row = conn.execute(
+        "SELECT job, status, detail, fired_for FROM job_runs"
+        " WHERE fired_for IS NOT NULL").fetchone()
+    assert (row["job"], row["status"]) == ("market", "ok")
+    assert row["fired_for"], "the run claimed no instant, so it can fire again"
+
+
+def test_a_second_tick_does_not_rerun_the_same_instant(conn, ctx, monkeypatch):
+    """Idempotency end to end, not just in the pure function.
+
+    A 60-second tick asks 60 times an hour. If the claim did not hold, `sync` would
+    spend 60 IBKR requests fetching one statement.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import reconcile
+
+    _registry(monkeypatch, "market")
+    conn.execute("INSERT INTO job_runs (job, started_at, status) VALUES"
+                 " ('market', '2026-08-11T11:00:00+00:00', 'ok')")
+    conn.commit()
+    now = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+
+    assert reconcile(conn, ctx=ctx, now=now) == ["market"]
+    assert reconcile(conn, ctx=ctx, now=now) == [], (
+        "the same instant ran twice, so a tick every 60s means 60 runs an hour"
+    )
+
+
+def test_one_jobs_failure_does_not_stop_the_others(conn, ctx, monkeypatch):
+    """CONTAINMENT, and the failure it prevents is the outage this plan exists for.
+
+    Design 3 named it exactly: a daemon thread that raises leaves the HTTP server
+    perfectly healthy and the schedule dead -- the 40-hour outage reproduced inside
+    its own fix. So a job that raises is recorded and the tick carries on.
+    """
+    import dataclasses
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal import jobs as mod
+
+    def boom(_c, _x):
+        raise RuntimeError("the keychain is locked")
+
+    def fine(_c, _x):
+        return mod.Outcome("ok", "still ran")
+
+    # `sync` fires at 12:00 Dublin and `bars_daily` at 12:30, in that order.
+    monkeypatch.setattr(mod, "JOBS", tuple(
+        dataclasses.replace(job, run=boom if job.name == "sync" else fine)
+        for job in mod.JOBS if job.name in ("sync", "bars_daily")
+    ))
+    for job in ("sync", "bars_daily"):
+        conn.execute("INSERT INTO job_runs (job, started_at, status) VALUES"
+                     " (?, '2026-08-11T12:00:00+00:00', 'ok')", (job,))
+    conn.commit()
+    now = datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+
+    started = mod.reconcile(conn, ctx=ctx, now=now)
+    assert started == ["bars_daily"], (
+        f"expected the failing sync to be contained and bars_daily to run; got "
+        f"{started}"
+    )
+    rows = {r["job"]: r["status"] for r in conn.execute(
+        "SELECT job, status FROM job_runs WHERE fired_for IS NOT NULL")}
+    assert rows == {"sync": "failed", "bars_daily": "ok"}, (
+        "the failure was not recorded, or it stopped the tick"
+    )
+
+
+def test_a_job_that_keeps_failing_is_backed_off_but_stays_runnable_by_hand(
+    conn, ctx, monkeypatch
+):
+    """A brake that does not become a black hole.
+
+    Five consecutive failures stops the RECONCILER starting it, because a job
+    failing for a real reason should not hammer the endpoint that is failing sixty
+    times an hour. It stays runnable from the page, and the count resets on any
+    healthy outcome -- so recovery needs no restart and no edit.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import FAILURE_BACKOFF, reconcile, run_job
+
+    _registry(monkeypatch, "market")
+    conn.execute("INSERT INTO job_runs (job, started_at, status) VALUES"
+                 " ('market', '2026-08-11T11:00:00+00:00', 'ok')")
+    conn.execute("INSERT OR REPLACE INTO job_state (job, last_status,"
+                 " consecutive_failures) VALUES ('market', 'failed', ?)",
+                 (FAILURE_BACKOFF,))
+    conn.commit()
+    now = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+
+    assert reconcile(conn, ctx=ctx, now=now) == [], (
+        "a job past the failure threshold was still started by the reconciler"
+    )
+    # By hand, though, it runs -- and succeeding clears the backoff.
+    run_job(conn, "market", ctx=ctx)
+    assert conn.execute(
+        "SELECT consecutive_failures FROM job_state WHERE job='market'"
+    ).fetchone()[0] == 0, "a successful manual run did not clear the backoff"
+
+
+def test_the_heartbeat_is_written_by_the_loop_not_by_a_job(conn):
+    """The two signals must stay separate, or they collapse the way crons.json did.
+
+    "Did the last run succeed" read `ok` for two days while "is anything driving the
+    schedule" was false. A heartbeat written by a job would make a manual run look
+    like a live scheduler; a heartbeat written by the loop cannot, because the loop
+    is the only thing that ticks.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.jobs import JOBS, heartbeat, record_run
+
+    record_run(conn, "market", status="ok", detail="a manual run")
+    beat = conn.execute(
+        "SELECT heartbeat_at FROM job_state WHERE job='market'").fetchone()[0]
+    assert beat is None, (
+        "a job outcome wrote a heartbeat, so a hand-run job would read as a "
+        "running scheduler"
+    )
+
+    now = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
+    heartbeat(conn, now=now)
+    beats = {r["job"]: r["heartbeat_at"] for r in conn.execute(
+        "SELECT job, heartbeat_at FROM job_state")}
+    for job in JOBS:
+        assert beats.get(job.name) == int(now.timestamp()), (
+            f"{job.name} has no heartbeat, so `jobs_data` cannot see the loop"
+        )
+
+
+def test_a_run_after_a_suspend_is_stamped_slept(conn, ctx, monkeypatch):
+    """Why a noon job fired at 09:14 becomes a field rather than a mystery.
+
+    `monotonic` EXCLUDES sleep on this platform -- measured, 44.6 hours of it -- so
+    the wall clock running ahead of it within one tick is a suspend. Both clocks are
+    already read, so the stamp is free.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import reconcile
+
+    _registry(monkeypatch, "market")
+    conn.execute("INSERT INTO job_runs (job, started_at, status) VALUES"
+                 " ('market', '2026-08-11T11:00:00+00:00', 'ok')")
+    conn.commit()
+    now = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+
+    reconcile(conn, ctx=ctx, now=now, slept=True)
+    assert conn.execute(
+        "SELECT slept FROM job_runs WHERE fired_for IS NOT NULL").fetchone()[0] == 1
+
+
+def test_the_loop_survives_a_tick_that_raises(ctx, tmp_path, monkeypatch):
+    """The containment that matters most, at the loop level rather than the job's.
+
+    A tick that raises must not end the schedule. Provoked by making the ledger
+    snapshot itself explode, which is upstream of every per-job guard.
+    """
+    import time
+
+    from optjournal import jobs as mod
+
+    calls = []
+
+    def explode(_conn):
+        calls.append(1)
+        raise sqlite3.OperationalError("no such table: job_runs")
+
+    monkeypatch.setattr(mod, "_ledger_snapshot", explode)
+    clock = mod.Scheduler(
+        ctx=mod.Context(archive_dir=tmp_path / "raw", db_path=tmp_path / "s.db"),
+        tick_s=0.05,
+    )
+    clock.start()
+    try:
+        deadline = time.monotonic() + 5
+        while clock.ticks < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        clock.stop()
+    assert clock.ticks >= 3, (
+        f"the loop stopped after {clock.ticks} ticks and {len(calls)} raises -- a "
+        "thread that dies leaves the server healthy and the schedule dead"
+    )
+    # `ticks` counts ATTEMPTS, so a loop that is alive and failing is visible as
+    # exactly that. Counting only successes would make this loop read as dead --
+    # which is `crons.json`'s two green days, inverted, and the first version of
+    # this test found it: 94 raises against a `ticks` of 0.
+    assert clock.tick_failures >= 3, (
+        "the failures were not counted, so an alive-but-broken loop is "
+        "indistinguishable from a healthy one"
+    )
+
+
+def test_the_scheduler_stops_when_asked_and_does_not_wait_out_its_tick(ctx, tmp_path):
+    """Shutdown must not take a full tick, and the thread must actually be joined.
+
+    A loop that ignores its stop signal for 60 seconds is indistinguishable from a
+    hung one, and step 7 has to make SIGTERM work. `threading.Event.wait` is what
+    makes the wait interruptible; a `time.sleep` would not be.
+    """
+    import time
+
+    from optjournal.jobs import Context, Scheduler
+
+    clock = Scheduler(
+        ctx=Context(archive_dir=tmp_path / "raw", db_path=tmp_path / "s.db"),
+        tick_s=30,                       # far longer than the test may take
+    )
+    clock.start()
+    thread = clock._thread               # captured before stop() clears it
+    assert thread is not None
+    time.sleep(0.2)                      # let it reach the wait
+    started = time.monotonic()
+    clock.stop(timeout=5)
+    elapsed = time.monotonic() - started
+    assert elapsed < 2, (
+        f"stop() took {elapsed:.1f}s, so it waited out the tick rather than "
+        "interrupting it -- SIGTERM would appear to hang"
+    )
+    # JOINED, not merely forgotten. Asserted on the THREAD rather than on the
+    # attribute: an ablation that dropped the `join` and only cleared
+    # `self._thread` passed a `_thread is None` check while leaving the loop
+    # running against a database the next test is about to delete.
+    assert not thread.is_alive(), (
+        "stop() returned while the loop thread was still running -- it was "
+        "abandoned rather than joined, so a tick can write to a journal the "
+        "caller believes it has finished with"
+    )
+
+
+def test_starting_a_running_scheduler_is_refused(tmp_path):
+    """Two loops on one journal would double every claim attempt.
+
+    Not fatal -- the flock and the unique index would refuse the duplicates -- but
+    it is a bug that presents as mysterious 409s, so it fails at the call.
+    """
+    from optjournal.jobs import Context, Scheduler
+
+    clock = Scheduler(
+        ctx=Context(archive_dir=tmp_path / "raw", db_path=tmp_path / "s.db"),
+        tick_s=30)
+    clock.start()
+    try:
+        with pytest.raises(RuntimeError, match="already running"):
+            clock.start()
+    finally:
+        clock.stop()
+
+
+def test_replacing_the_registry_actually_reaches_due_jobs(monkeypatch):
+    """A REAL BUG THIS FILE COULD NOT SEE, and the tests were the reason.
+
+    `due_jobs` was written `registry: tuple[Job, ...] = JOBS`, and a default
+    argument is evaluated at DEFINITION time -- so the tuple was captured once at
+    import and `monkeypatch.setattr(jobs, "JOBS", ...)` never reached the function.
+    Every test above that replaced the registry was silently exercising the REAL
+    one. They passed because the real schedules happened to agree with what the
+    stubs asserted, which is the worst way for a test to pass: green, and measuring
+    something else.
+
+    Found by running the actual `Scheduler` against a one-job stub registry and
+    watching zero runs happen across six ticks.
+    """
+    import dataclasses
+    from datetime import UTC, datetime
+
+    from optjournal import jobs as mod
+
+    only = dataclasses.replace(
+        mod.job_by_name("market"), name="market",
+        minute=0, hour=0, weekdays=(1, 2, 3, 4, 5, 6, 7), zone="Europe/Dublin",
+    )
+    monkeypatch.setattr(mod, "JOBS", (only,))
+    found = mod.due_jobs(datetime.now(UTC), claimed={}, last_success={},
+                         ever_ran={"market"})
+    assert [d.job.hour for d in found] == [0], (
+        f"due_jobs ignored the replaced registry and used the import-time one: "
+        f"{[(d.job.name, d.job.hour) for d in found]}"
+    )
+
+
+def test_the_loop_really_drives_a_job_once_and_then_stops(tmp_path, monkeypatch):
+    """The whole step, exercised by the REAL Scheduler rather than by reconcile().
+
+    Everything above tests `reconcile` with an injected clock, which is the right
+    way to test the policy and cannot see the loop's own wiring -- the registry bug
+    above lived exactly there. So this one starts the thread, lets it tick several
+    times, and asserts the shape that matters: it fires ONCE and the claim holds for
+    every subsequent tick.
+    """
+    import dataclasses
+    import time
+    from datetime import UTC, datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from optjournal import jobs as mod
+    from optjournal.db import connect, migrate
+
+    db = tmp_path / "loop.db"
+    conn = connect(db)
+    migrate(conn)
+
+    ran: list[str] = []
+    now = datetime.now(UTC).astimezone(ZoneInfo("Europe/Dublin"))
+    # Due at this very minute, every day, so a fast tick reaches it.
+    monkeypatch.setattr(mod, "JOBS", (dataclasses.replace(
+        mod.job_by_name("market"), name="market",
+        run=lambda _c, _x: (ran.append("market"), mod.Outcome("ok", "stub"))[1],
+        minute=now.minute, hour=now.hour, weekdays=(1, 2, 3, 4, 5, 6, 7),
+        zone="Europe/Dublin",
+    ),))
+    conn.execute("INSERT INTO job_runs (job, started_at, status) VALUES"
+                 " ('market', ?, 'ok')",
+                 ((now - timedelta(days=2)).isoformat(timespec="seconds"),))
+    conn.commit()
+    conn.close()
+
+    clock = mod.Scheduler(
+        ctx=mod.Context(archive_dir=tmp_path / "raw", db_path=db), tick_s=0.2)
+    clock.start()
+    try:
+        deadline = time.monotonic() + 15
+        while clock.ticks < 5 and time.monotonic() < deadline:
+            time.sleep(0.1)
+    finally:
+        clock.stop()
+
+    assert clock.ticks >= 5 and clock.tick_failures == 0, (
+        f"ticks={clock.ticks} failures={clock.tick_failures}"
+    )
+    assert ran == ["market"], (
+        f"the job ran {len(ran)} times across {clock.ticks} ticks; it must fire "
+        "once and then be held by its claim"
+    )
+    check = connect(db)
+    claimed = check.execute(
+        "SELECT COUNT(*) FROM job_runs WHERE fired_for IS NOT NULL").fetchone()[0]
+    beat = check.execute(
+        "SELECT heartbeat_at FROM job_state WHERE job='market'").fetchone()[0]
+    check.close()
+    assert claimed == 1, f"{claimed} claimed instants, expected exactly 1"
+    assert beat, "the loop never wrote a heartbeat, so the page reads it as dead"

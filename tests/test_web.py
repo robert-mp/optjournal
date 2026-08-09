@@ -3300,3 +3300,73 @@ def test_the_locked_database_guard_covers_every_post_route_not_just_one():
     assert "sqlite3.OperationalError" not in inspect.getsource(
         web._Handler._route_post
     ), "the guard is duplicated inside the router as well as around it"
+
+
+def test_serve_ephemeral_never_starts_a_scheduler():
+    """A SAFETY PROPERTY, not a preference, and it is about this test suite.
+
+    `tests/conftest.py` points `RAW_DIR` at the LIVE `raw/` directory, and six call
+    sites pass it to `serve_ephemeral` -- four here, one in `test_rendered.py`, one
+    in `sweep.py`. A scheduler started by default would let a `pytest` run fire real
+    IBKR fetches against the real archive and the real `.fetch-state.json`, spending
+    a rate-limited budget whose penalty is a lockout.
+
+    There is deliberately no parameter to turn it on: a test that wants the loop
+    constructs `jobs.Scheduler` directly against a scratch database, which is
+    explicit at the call site and cannot be defaulted wrong. So this asserts on the
+    SIGNATURE as well as the body -- adding the parameter is the mistake being
+    prevented, and it would otherwise pass a body-only check.
+    """
+    import inspect  # noqa: PLC0415 - local to this test
+
+    signature = inspect.signature(web.serve_ephemeral)
+    assert "scheduler" not in signature.parameters, (
+        "serve_ephemeral grew a `scheduler` parameter. The suite serves the LIVE "
+        "raw/ directory, so a test could then spend real IBKR requests -- build a "
+        "jobs.Scheduler against a scratch database instead."
+    )
+    body = inspect.getsource(web.serve_ephemeral)
+    assert "Scheduler(" not in body, (
+        "serve_ephemeral constructs a Scheduler, so every test that serves the "
+        "live archive now has a reconciler pointed at it"
+    )
+
+
+def test_serve_starts_the_scheduler_by_default_and_stops_it_on_the_way_out():
+    """The other direction: `serve` IS the application now.
+
+    Off by default would mean the journal collects nothing unless a human presses a
+    button, which is the arrangement this whole plan replaces. And it must be
+    STOPPED on exit rather than abandoned: a tick mid-write against a journal the
+    caller is about to move is the kind of race that shows up once.
+    """
+    import inspect  # noqa: PLC0415 - local to this test
+
+    assert web.serve.__kwdefaults__["scheduler"] is True, (
+        "the scheduler is off by default, so serve() is a viewer again"
+    )
+    body = inspect.getsource(web.serve)
+    assert "clock.start()" in body and "clock.stop()" in body, (
+        "the scheduler is started without being stopped, so shutdown races a tick"
+    )
+    assert body.index("clock.stop()") > body.index("serve_forever"), (
+        "the scheduler is stopped before the server starts serving"
+    )
+
+
+def test_the_demo_never_gets_a_scheduler_whatever_the_flag_says():
+    """`optjournal demo` must never write into the real archive, and a scheduler
+    pointed at a synthetic one would spend a real IBKR request to fill it.
+
+    Asserted on the CLI's wiring rather than by running the server, because the
+    invariant is the conjunction: `--demo` wins over the scheduler flag.
+    """
+    import inspect  # noqa: PLC0415 - local to this test
+
+    from optjournal.cli import cmd_serve  # noqa: PLC0415 - local to this test
+
+    wiring = inspect.getsource(cmd_serve).replace(" ", "")
+    assert "scheduler=bool(args.scheduler)andnotargs.demo" in wiring, (
+        "the demo can now start a scheduler, which would fetch real data into a "
+        "synthetic journal"
+    )
