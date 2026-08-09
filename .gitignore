@@ -77,3 +77,8 @@ build/
 *.jpeg
 *.gif
 *.webp
+
+# The rotating application log and launchd's stdout capture. Runtime artefacts of
+# a supervised `serve`, like journal.db and raw/ -- the plist that points at them
+# IS tracked, under launchd/.
+logs/

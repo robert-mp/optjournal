@@ -1053,6 +1053,17 @@ class Scheduler:
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("this scheduler is already running")
+        # ONE LINE AT STARTUP, so the log proves the loop exists.
+        #
+        # Found by running it: a `serve` with a live scheduler wrote a log file of
+        # ZERO BYTES, because `reconcile` only logs when something is due and
+        # nothing was. A log that is empty because all is well is indistinguishable
+        # from a log that is empty because the loop is dead -- which is this
+        # project's signature failure, and it would be absurd to reintroduce it in
+        # the logging added to prevent it. The heartbeat is the machine-readable
+        # answer; this is the human-readable one.
+        log.info("scheduler starting, %ss tick, %d job(s): %s",
+                 self.tick_s, len(JOBS), ", ".join(j.name for j in JOBS))
         self._thread = threading.Thread(
             target=self._loop, name="optjournal-scheduler", daemon=True)
         self._thread.start()
@@ -1061,6 +1072,8 @@ class Scheduler:
         """Signal the loop and wait for it. Idempotent."""
         self._stop.set()
         if self._thread is not None:
+            log.info("scheduler stopping after %d tick(s), %d failed",
+                     self.ticks, self.tick_failures)
             self._thread.join(timeout)
             self._thread = None
 

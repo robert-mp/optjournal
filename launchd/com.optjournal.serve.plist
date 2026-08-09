@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Supervision for `optjournal serve`, which is the application: it holds the
+  60-second reconciler and the job worker, so keeping the PROCESS alive is the
+  whole of the supervision story. launchd never runs a job here, that is the
+  point of moving the clock inside the app, and it is why there are no
+  StartCalendarInterval entries below.
+
+  A plist is data, not a dependency. Tracked in the repo so the arrangement is
+  reviewable and reproducible rather than living only in
+  ~/Library/LaunchAgents as something someone typed once.
+
+  TO INSTALL (paths are absolute by launchd's design, so edit them if the repo
+  moves, `tests/test_launchd.py` checks they match this checkout):
+
+      cp launchd/com.optjournal.serve.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.optjournal.serve.plist
+      launchctl print gui/$(id -u)/com.optjournal.serve     # state, exit code, PID
+
+  TO STOP:
+
+      launchctl bootout gui/$(id -u)/com.optjournal.serve
+
+  `bootout` sends SIGTERM, which is exactly the path `tests/test_shutdown.py`
+  exercises: serve exits in ~0.5s, stops its scheduler first, and releases the
+  port. Before that fix this hung and launchd escalated to SIGKILL, orphaning
+  the in-flight run's `running` row on every normal stop.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.optjournal.serve</string>
+
+  <!-- The installed console script, not `python -m`: the entry point is what
+       pyproject declares and what a human runs, so supervising anything else
+       would supervise a different program. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/robrtmar/optjournal/.venv/bin/optjournal</string>
+    <string>serve</string>
+    <string>--port</string>
+    <string>8765</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/robrtmar/optjournal</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Keep the PROCESS alive. `SuccessfulExit: false` means "restart only if it
+       exited badly", so a deliberate `launchctl bootout` (SIGTERM -> exit 0)
+       stays stopped instead of being respawned into. Without that distinction,
+       stopping the service by hand would be impossible. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- launchd's floor is 10s anyway; stating it makes the crash-loop budget
+       explicit. A bind failure exits non-zero and loudly (cli.cmd_serve), which
+       with this interval is one line every ten seconds in the log rather than a
+       silent respawn, two stale `serve` processes were found live during the
+       surveys that produced this arrangement. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- PYTHONUNBUFFERED IS LOAD-BEARING, not hygiene. `print()` to a FILE is
+       block-buffered, so without this the log stays empty while the service
+       runs: measured 0 bytes after 1.2s of output versus 32 bytes with it. A
+       supervised service whose log is empty is indistinguishable from one that
+       never started. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <!-- The startup banner and any traceback. The rotating application log is
+       separate and lives beside the journal (see `logs.configure`), because
+       launchd rotates NOTHING and these two files answer different questions:
+       this one is "did the process start", that one is "what did the jobs do". -->
+  <key>StandardOutPath</key>
+  <string>/Users/robrtmar/optjournal/logs/serve.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/robrtmar/optjournal/logs/serve.err.log</string>
+
+  <!-- No StartCalendarInterval, deliberately: the schedule is `jobs.JOBS`, in
+       code, where a test can read it. The four MeshClaw cron registrations this
+       replaces were an unversioned hand-typed side channel, and one of the jobs
+       that should have existed was simply never registered. -->
+</dict>
+</plist>

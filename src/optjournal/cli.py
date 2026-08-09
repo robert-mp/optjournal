@@ -21,7 +21,7 @@ from typing import Any
 
 from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 
-from optjournal import __version__, browser
+from optjournal import __version__, browser, logs
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import newest_statement, prune_archive
 from optjournal.bars import (
@@ -704,6 +704,13 @@ def cmd_serve(args) -> int:
             " trades into the synthetic database. Serve the demo without a query"
             " id, or serve the real journal without --demo."
         )
+    # A ROTATING LOG, FOR SERVE ONLY. This is the long-lived process -- the one
+    # whose reconciler logs every tick -- and macOS rotates nothing for a launchd
+    # agent's stdout, so a supervised `serve` would otherwise append to one file
+    # forever. A one-shot `optjournal bars` needs no such thing and should not
+    # leave a file behind.
+    logs.configure(ROOT)
+
     try:
         serve(
             db_path=db,
