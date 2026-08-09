@@ -596,7 +596,7 @@ reach the element, with the whole suite green. Three guards now cover the class 
 `tests/test_web.py`: every class the page names has rules, every rule is reachable,
 and no rule sets a layout property its display mode cannot use.
 
-### Step 5 — `jobs.py`: the registry and the runner, manual only, no thread yet
+### Step 5 — `jobs.py`: the registry and the runner, manual only, no thread yet — **DONE**
 
 <a id="step-5"></a>
 
@@ -730,6 +730,71 @@ row whose per-job `flock` is free (try to acquire with `timeout_s=0`) is
 `SIGKILL` because `flock` releases on process death. Four sub-millisecond
 attempts per page load. This is Design 1's best idea and it is the reason to
 prefer `flock` over a lock table.
+
+#### What step 5 shipped, and where the plan was wrong again
+
+Commits `eeefe23` (registry, runner, shared sync), `ae8768a` (endpoint, 503 guard,
+interrupted-run detection), `a32574b` (the Run buttons).
+
+**1. `sync.py` is a new module, and the layering test is why.** The plan said
+"`web -> jobs` keeps the import graph acyclic", which is true and insufficient: the
+`sync` job has to CALL the shared sync path, so `jobs -> web` appeared too. It
+worked through a deferred `from optjournal.web import sync_journal` inside a
+function, and `tests/test_layering.py` correctly reported `cli -> jobs -> web ->
+jobs`. A deferred import is a workaround for a wrong graph, and the README already
+calls that shape a design smell — so the honest fix was recognising that
+`sync_journal` was never a web concern. It needs `flex` and `ingest`, both below
+`jobs`. Now `sync -> {flex, ingest}`, everything imports downhill, and no deferred
+import remains on the path.
+
+**2. `jobs_data` read `job_state`, so a job that never ran was invisible.** No row,
+no button, no way to start it — and `market` has never run anywhere, so the job the
+registry exists to rescue would have been absent from the surface built to make it
+runnable. The payload now iterates the REGISTRY (what exists) and uses the table
+only for what has happened. A `job_state` row whose job left the registry is kept
+and flagged `retired` rather than dropped, because `bars_audit` is exactly that case
+and a row that vanishes reads as "this never happened".
+
+**3. `spends_broker_request` had to reach the page.** The plan listed it as a
+registry field for the reconciler's benefit. It is also what decides which Run
+button asks for confirmation, so it travels in the payload as
+`JobRow.spends_request`. The page holds no list of which jobs touch IBKR — the same
+rule that keeps "USD high-impact" out of the calendar's markup.
+
+**4. The 503 guard was needed exactly as predicted, and the measurement was
+worse than the plan's.** Verified before writing it: against a journal held by
+`BEGIN EXCLUSIVE`, `POST /api/watchlist` got `RemoteDisconnected` after **16.06 s**
+(one `BUSY_TIMEOUT_MS`) with no response at all, while `GET /api/state` answered in
+0.03 s because WAL lets readers through. The page could not name the cause or say
+that waiting would fix it.
+
+**Also not shipped: `BEGIN DEFERRED` around `build_state`, again.** Still deferred,
+still for the reason recorded under step 4 — the torn-payload probe read 0 of 5
+against a control that also read 0 of 5. It is now the only item in step 5's
+original scope that has not landed, and it should be argued on its merits or
+dropped rather than carried forward a third time.
+
+**Progress reporting did not ship either**, and that is a deliberate scope cut
+rather than an oversight: the runner is synchronous, so a POST returns after the
+work is done and there is nothing to report progress ABOUT until step 6 moves the
+runner to a thread. The plan's own honesty applies — a full run is ~1.4 s, and the
+justification was always the 600 s tail rather than the common case.
+
+**What building it cost, three lessons for step 6.**
+
+* Two source-level pins were reading the wrong function after the consolidation.
+  Both caught the move rather than the move breaking a consumer, which is what a
+  source-level pin is for — but it means a pin's TARGET is itself a thing that rots.
+* Two of my own ablations were invalid rather than uncaught: one renamed a method to
+  one that does not exist (a crash, not a silent defect), and one grepped for
+  `confirm(` while `window.confirm(` still contained the substring. An ablation that
+  cannot fail is worth as little as a test that cannot fail.
+* The first browser probe's stub never applied, because it rewrote `jobs.py` after
+  the module was imported — so a click that was supposed to be stubbed hit the real
+  calendar feed. Harmless here (a public endpoint, a scratch journal, no IBKR
+  request, live journal verified untouched) and it would not have been if the button
+  under test had been `sync`. Stub through the object the server will actually
+  consult.
 
 ### Step 6 — The reconciler thread
 
