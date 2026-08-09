@@ -16,6 +16,7 @@ other shape would have iterated an int or formatted a list into a Slack message.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -396,3 +397,305 @@ def test_an_empty_week_is_reported_because_the_feed_does_not_do_that(
     monkeypatch.setattr(market_cron.subprocess, "run", run)
     with pytest.raises(Report, match="no events"):
         market_cron.refresh(None)
+
+
+# ---------------------------------------------------------------------------
+# The delivery policy itself: every branch of sync() and the bars jobs.
+#
+# WHY THIS SECTION EXISTS. Everything above asserts constants, shim structure and
+# one formatter. Not one test in this file CALLED `sync()`, `live()`, `daily()`,
+# `audit()` or `_collect()` -- measured, zero call sites -- so the ~660 lines
+# deciding what is worth waking a human for were covered by nothing. Every branch
+# in them could have been deleted and the suite would have stayed green.
+#
+# That matters now because SCHEDULER_PLAN.md replaces these files with an in-app
+# scheduler, and a rewrite with no oracle silently inverts a decision. The
+# decisions are asymmetric on purpose: a wrong Skip loses an unrecoverable option
+# session in silence, while a wrong Report trains you to ignore the channel. This
+# section is the oracle `jobs.py` will be written against, which is why it is worth
+# adding to code that is scheduled for deletion.
+#
+# The shape is the market tests' proven one: point `CLI` at a real file (a
+# PosixPath's `exists` is read-only, so the module ATTRIBUTE is what moves),
+# monkeypatch `subprocess.run` to return a chosen CompletedProcess, and assert
+# which sentinel comes out.
+# ---------------------------------------------------------------------------
+
+
+class _Ctx:
+    """The MeshClaw context object, reduced to what these entry points read.
+
+    `sync` reads `ctx.message` for an override query id; the bars jobs ignore ctx
+    entirely. A SimpleNamespace would do, but a named class makes the coupling
+    visible -- and it is the coupling `jobs.py` removes.
+    """
+
+    message = ""
+
+
+def _proc(code: int, stdout: str = "", stderr: str = ""):
+    """A CompletedProcess as the cron's own `_run` would return it."""
+    import subprocess
+
+    return subprocess.CompletedProcess([], code, stdout, stderr)
+
+
+def _stub(module, monkeypatch, result):
+    """Point `module` at a real CLI and make its subprocess return `result`.
+
+    `result` may be a CompletedProcess or an exception INSTANCE to raise, which is
+    how the TimeoutExpired branches are reached without waiting for a timeout.
+    """
+    monkeypatch.setattr(module, "CLI", Path(__file__))
+
+    def run(*_a, **_k):
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+
+@pytest.fixture()
+def no_backup(sync_cron, monkeypatch):
+    """Neutralise the git backup so a sync test asserts the SYNC's decision.
+
+    The backup runs `git` against the real workspace repo, and its note or its
+    failure is appended to whatever the sync decides -- so without this, every
+    assertion here would depend on the state of a git repository. The backup's own
+    branches get their own test below.
+    """
+    monkeypatch.setattr(sync_cron, "_commit_raw_backup", lambda: None)
+
+
+def test_sync_skips_a_throttled_fetch(sync_cron, monkeypatch, no_backup):
+    """EXIT_THROTTLED is the local cooldown: nothing was sent, nothing is lost.
+
+    Silent because the guard did its job. An Activity statement is regenerated
+    once a day, so a refused second fetch cannot have returned new information.
+    """
+    from mesh_claw.cron_script import Skip
+
+    _stub(sync_cron, monkeypatch, _proc(sync_cron.EXIT_THROTTLED))
+    with pytest.raises(Skip):
+        sync_cron.sync(_Ctx())
+
+
+def test_sync_reports_a_timeout_because_the_request_was_already_spent(
+    sync_cron, monkeypatch, no_backup
+):
+    """The most expensive branch, and the reason it is Report and not Skip.
+
+    The request reached IBKR before we gave up, so it counted against the lockout
+    budget -- and `flex` records the cooldown only after `download` RETURNS, so a
+    timed-out run leaves no cooldown and the next invocation spends another
+    request. A Skip here would quietly burn the budget twice.
+    """
+    import subprocess
+
+    from mesh_claw.cron_script import Report
+
+    _stub(sync_cron, monkeypatch, subprocess.TimeoutExpired([], 1))
+    with pytest.raises(Report, match="counted against the IBKR"):
+        sync_cron.sync(_Ctx())
+
+
+def test_sync_is_silent_when_there_is_nothing_to_ingest(
+    sync_cron, monkeypatch, no_backup
+):
+    """EXIT_NO_DATA is not a failure: a weekend has no new statement."""
+    _stub(sync_cron, monkeypatch, _proc(sync_cron.EXIT_NO_DATA))
+    assert sync_cron.sync(_Ctx()) is None
+
+
+def test_sync_reports_a_configuration_problem_rather_than_raising(
+    sync_cron, monkeypatch, no_backup
+):
+    """A missing or locked token needs a human, and the message must reach one.
+
+    Report rather than raise, and the distinction is not cosmetic: MeshClaw's
+    script branch catches every exception and only logs it, so a raise reaches
+    nobody. Proven live -- the 2026-08-07 sync raised on a locked keychain and the
+    only trace was one log line. See SCHEDULER_PLAN.md step 8.
+    """
+    from mesh_claw.cron_script import Report
+
+    _stub(sync_cron, monkeypatch,
+          _proc(sync_cron.EXIT_CONFIG, stderr="no keyring entry"))
+    with pytest.raises(Report, match="configuration problem"):
+        sync_cron.sync(_Ctx())
+
+
+def test_sync_raises_on_an_unrecognised_exit_code(sync_cron, monkeypatch, no_backup):
+    """An exit code this policy does not model must not be swallowed."""
+    _stub(sync_cron, monkeypatch, _proc(99, stderr="something new"))
+    with pytest.raises(RuntimeError, match="exited 99"):
+        sync_cron.sync(_Ctx())
+
+
+def test_sync_raises_when_the_cli_contract_changes(sync_cron, monkeypatch, no_backup):
+    """Exit 0 with unparseable stdout means the CLI changed shape under us."""
+    _stub(sync_cron, monkeypatch, _proc(sync_cron.EXIT_OK, stdout="not json"))
+    with pytest.raises(RuntimeError, match="unparseable JSON"):
+        sync_cron.sync(_Ctx())
+
+
+def test_sync_reports_only_a_real_change(sync_cron, monkeypatch, no_backup):
+    """`changed` is the whole delivery rule: new rows speak, a no-op does not.
+
+    Both directions in one test because they are one decision. A daily job that
+    announced every silent run would be 365 notifications a year saying nothing,
+    which is the noise these 660 lines exist to avoid.
+    """
+    from mesh_claw.cron_script import Report
+
+    _stub(sync_cron, monkeypatch, _proc(sync_cron.EXIT_OK, stdout=json.dumps({
+        "changed": True, "new_trades": 2, "new_cash": 1,
+        "archive": "activity-20260808T184519Z.xml",
+    })))
+    with pytest.raises(Report):
+        sync_cron.sync(_Ctx())
+
+    _stub(sync_cron, monkeypatch, _proc(sync_cron.EXIT_OK, stdout=json.dumps({
+        "changed": False, "new_trades": 0, "new_cash": 0,
+    })))
+    assert sync_cron.sync(_Ctx()) is None, "a no-op sync must stay silent"
+
+
+def test_a_failed_backup_breaks_every_silence(sync_cron, monkeypatch):
+    """A backup that fails quietly is not a backup.
+
+    Asserted across all three otherwise-silent outcomes, because the rule is that
+    a backup failure OUTRANKS the sync's own quiet: nothing-to-ingest, no-change
+    and a real change all have to surface it. Three separate `if backup_error`
+    branches implement this, so there are three places it could be dropped.
+    """
+    from mesh_claw.cron_script import Report
+
+    def broken():
+        raise RuntimeError("git commit failed: nothing to commit")
+
+    monkeypatch.setattr(sync_cron, "_commit_raw_backup", broken)
+
+    for code, out in (
+        (sync_cron.EXIT_NO_DATA, ""),
+        (sync_cron.EXIT_OK, json.dumps({"changed": False})),
+        (sync_cron.EXIT_OK, json.dumps({"changed": True, "new_trades": 1})),
+    ):
+        _stub(sync_cron, monkeypatch, _proc(code, stdout=out))
+        with pytest.raises(Report, match="backup"):
+            sync_cron.sync(_Ctx())
+
+
+def test_sync_raises_when_the_cli_is_missing(sync_cron, monkeypatch):
+    """A registered job whose code is gone needs a human, not a retry."""
+    monkeypatch.setattr(sync_cron, "CLI", Path("/nonexistent/optjournal"))
+    with pytest.raises(RuntimeError, match="CLI not found"):
+        sync_cron.sync(_Ctx())
+
+
+# --- the bars jobs ---------------------------------------------------------
+
+
+def test_bars_skips_a_timeout_because_nothing_was_spent(bars_cron, monkeypatch):
+    """The opposite of sync's timeout, and the asymmetry IS the policy.
+
+    The price endpoint is keyless with no request budget, so a slow run is a retry
+    rather than an alert. Sync's identical timeout is a Report because its request
+    was already charged against a lockout allowance. Same event, opposite
+    delivery, and a rewrite that unified them would be wrong.
+    """
+    import subprocess
+
+    from mesh_claw.cron_script import Skip
+
+    _stub(bars_cron, monkeypatch, subprocess.TimeoutExpired([], 1))
+    with pytest.raises(Skip):
+        bars_cron.live(_Ctx())
+
+
+def test_bars_skips_a_per_window_failure(bars_cron, monkeypatch):
+    """EXIT_ERROR is a partial fetch, and the next poll re-collects it.
+
+    Safe ONLY because the intraday series is cumulative within a session: a 13:00
+    poll returns every completed bar since the open. That is what makes a Skip
+    here lose nothing a later poll cannot recover.
+    """
+    from mesh_claw.cron_script import Skip
+
+    _stub(bars_cron, monkeypatch, _proc(bars_cron.EXIT_ERROR))
+    with pytest.raises(Skip):
+        bars_cron.live(_Ctx())
+
+
+def test_bars_is_silent_outside_the_session(bars_cron, monkeypatch):
+    """EXIT_NO_DATA is the normal state for most of the seven daily polls."""
+    _stub(bars_cron, monkeypatch, _proc(bars_cron.EXIT_NO_DATA))
+    assert bars_cron.live(_Ctx()) is None
+    assert bars_cron.daily(_Ctx()) is None
+
+
+def test_bars_success_is_silent_but_still_parsed(bars_cron, monkeypatch):
+    """Seven quiet polls a session, and a shape change still surfaces.
+
+    Success is silent by design. The payload is parsed anyway, so a CLI contract
+    change raises rather than passing -- otherwise the one job collecting
+    unrecoverable data could break shape-wise and say nothing.
+    """
+    _stub(bars_cron, monkeypatch, _proc(bars_cron.EXIT_OK, stdout='{"fetched": 3}'))
+    assert bars_cron.live(_Ctx()) is None
+
+    _stub(bars_cron, monkeypatch, _proc(bars_cron.EXIT_OK, stdout="not json"))
+    with pytest.raises(RuntimeError, match="unparseable JSON"):
+        bars_cron.live(_Ctx())
+
+
+def test_bars_raises_on_an_unrecognised_exit_code(bars_cron, monkeypatch):
+    _stub(bars_cron, monkeypatch, _proc(42, stderr="new failure mode"))
+    with pytest.raises(RuntimeError, match="exited 42"):
+        bars_cron.daily(_Ctx())
+
+
+def test_the_audit_reports_a_lost_session_and_never_retries_it(bars_cron, monkeypatch):
+    """The single most consequential decision in these 660 lines.
+
+    Report, not Skip: no amount of retrying brings back an option's intraday
+    series, so a Skip would loop forever on something already lost. Report, not
+    raise: a missing session is a fact to be told once, and a raise reaches only
+    MeshClaw's log.
+
+    The message must NAME the contracts, because "some bars are missing" is not
+    actionable and this is the only notification that will ever mention them.
+    """
+    from mesh_claw.cron_script import Report
+
+    _stub(bars_cron, monkeypatch, _proc(bars_cron.EXIT_ERROR, stdout=json.dumps({
+        "day": "2026-08-07",
+        "missing": ["TSLA  270115C00700000"],
+        "covered": ["META  260918P00520000"],
+    })))
+    with pytest.raises(Report, match="TSLA  270115C00700000"):
+        bars_cron.audit(_Ctx())
+
+
+def test_the_audit_is_silent_when_the_session_landed(bars_cron, monkeypatch):
+    """Covered, or nothing eligible: both silent, and both are the normal case."""
+    for code in (bars_cron.EXIT_OK, bars_cron.EXIT_NO_DATA):
+        _stub(bars_cron, monkeypatch, _proc(code))
+        assert bars_cron.audit(_Ctx()) is None
+
+
+def test_the_audit_raises_rather_than_staying_quiet_when_it_cannot_run(
+    bars_cron, monkeypatch
+):
+    """The watchdog must not fail silently.
+
+    Unlike a fetch, this touches only the local database, so failing to complete
+    means the tooling is broken rather than the market being unreachable. Its
+    docstring says staying quiet "would leave the one thing watching for silent
+    loss silently broken itself" -- which is what then happened for real: three
+    bars jobs read `last_status: ok` for two days while collecting nothing.
+    """
+    _stub(bars_cron, monkeypatch, _proc(7, stderr="database is locked"))
+    with pytest.raises(RuntimeError, match="exited 7"):
+        bars_cron.audit(_Ctx())
