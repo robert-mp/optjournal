@@ -945,7 +945,7 @@ run, so it cannot regress anything), then `bars_daily`, then `bars_live`, then
 `sync` last — and disabling each MeshClaw cron one at a time, never in a batch.
 That is step 8's opening move rather than a loose end here.
 
-### Step 7 — Supervision, logs, and a shutdown that actually works
+### Step 7 — Supervision, logs, and a shutdown that actually works — **DONE**
 
 **What changes.** `launchd/com.optjournal.serve.plist`, tracked in the repo:
 `RunAtLoad`, `KeepAlive`, `StandardOutPath`/`StandardErrorPath`,
@@ -1008,6 +1008,46 @@ server's own sockets. The real fix is a `timeout` argument upstream in `py_ibkr`
 **Test.** A test that sends a real signal to a real server and asserts it exits.
 `grep signal tests/` currently finds nothing, which is why the deadlock was
 invisible.
+
+#### What step 7 shipped
+
+Commits `d2fee81` (the deadlock), `4903234` (plist and logs), `014d4c4` (the socket
+timeout).
+
+The deadlock was **reproduced before being fixed**, twice: from first principles
+with the bare stdlib (main thread: still alive 3s after SIGTERM; thread: exited in
+1.0s), then through the real CLI (the plan's prescribed shape sat alive 15s; the fix
+exits in 0.53s, code 0, port released). `tests/test_shutdown.py` is new and sends
+real signals to the installed console script.
+
+**The `py_ibkr` timeout could not be fixed upstream**, because it is a pinned
+third-party package. A subclass overriding `_get` -- the single choke point both
+Flex calls go through -- gets the same coverage without touching the dependency.
+
+**Three defects found by RUNNING each piece, none visible to a reading:**
+
+1. `plutil -lint` accepted a plist Python's expat parser rejected: my comments used
+   `--` as an em-dash substitute, which XML forbids inside a comment. The tool a
+   reader reaches for is more lenient than the one launchd uses.
+2. A real `serve` with a live scheduler wrote a log of **zero bytes**, because
+   `reconcile` logs only when something is due. A log empty because all is well
+   cannot be told from one empty because the loop is dead -- this project's
+   signature failure, reintroduced inside the logging added to prevent it. The
+   scheduler now logs one line at start and one at stop.
+3. A socket timeout raises a bare `TimeoutError`, not a `URLError`. My comment
+   asserted the opposite, so the timeout escaped unhandled rather than arriving as
+   a `FlexError`.
+
+**And one caused by the fix itself:** naming the new client class at the call site
+broke `tests/test_locks.py`'s network stub, which replaced `flex.FlexClient` -- a
+name nothing called any more -- so two subprocesses went to the real IBKR endpoint.
+There is now one seam, `flex._client_factory`, with a test asserting the fetch path
+goes through it. "The stub applies to a name nothing calls" is invisible by
+construction, which is why it needs a guard rather than care.
+
+**The plist is written and tested but NOT INSTALLED.** Loading it starts a service
+at login that spends IBKR requests on a schedule; that is the user's decision, and
+it is the first move of step 8 rather than a loose end here.
 
 ### Step 8 — Retire MeshClaw
 
