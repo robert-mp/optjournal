@@ -860,6 +860,84 @@ def test_delta_around_reports_none_before_a_position_existed(conn):
     assert delta_around([], 100) == (None, None)
 
 
+def test_delta_around_carries_an_absent_delta_rather_than_flattening_it(conn):
+    """A None in the marks must reach the card as None.
+
+    `modelled_marks` now reports delta as None on a bar holding nothing, and a
+    closing event's "after" is exactly such a bar. Flattening it to 0.0 here would
+    put the fabrication back one layer down: the card would read "0.32 -> 0.00",
+    which on a symmetric axis claims the position ended delta-neutral rather than
+    ended.
+    """
+    marks = [[100, 0.0, None], [200, 5.0, 0.32], [300, 9.0, None]]
+    assert delta_around(marks, 250) == (0.32, None), "a CLOSING event"
+    assert delta_around(marks, 150) == (None, 0.32), "an OPENING event"
+
+
+def test_delta_is_absent_off_position_while_pnl_keeps_reporting(conn):
+    """Delta is None before the entry and after the close; P&L is not.
+
+    The bug: `modelled_marks` used one flag for two questions -- "can this bar be
+    priced" and "is anything held here". They diverge exactly when quantity hits
+    zero, so `delta += 0 * bs_delta(...)` wrote an exact 0.0 and, on an axis that
+    is symmetric BECAUSE delta-neutral is a real state, that drew the centre line
+    for a position nobody held. Measured on this journal before the fix: a closed
+    short put reported +0.3171 and then 0.0000 for twelve further bars.
+
+    P&L keeps reporting through the same bars, and that asymmetry is the point:
+    cash flow to date with nothing left to mark IS the trade's result, so the
+    figure is true and frozen. Exposure has no such post-close value.
+    """
+    spot, strike, vol = 100.0, 90.0, 0.40
+    expiry = "2026-03-20"
+    days = [f"2026-01-{n:02d}" for n in (12, 13, 14, 15, 16, 19, 20)]
+    opens = [epoch_et(f"{day} 09:30:00") for day in days]
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(stamp, spot) for stamp in opens])
+    expiry_ts = _ts(expiry) + 16 * 3600
+    upsert_bars(
+        conn, conid="OPT1", symbol="AAA  260320P00090000", bar_size="1d",
+        source="yahoo",
+        bars=[
+            _bar(
+                epoch_et(f"{day} 00:00:00"),
+                bs_price(
+                    spot, strike,
+                    (expiry_ts - epoch_et(f"{day} 00:00:00")) / (365.0 * 86400),
+                    vol, "P",
+                ),
+            )
+            for day in days
+        ],
+    )
+    points = [(stamp, spot) for stamp in opens]
+    # Sold on the third bar, bought back on the fifth: two flat stretches, one at
+    # each end, which are the two real shapes (context before entry, and after a
+    # close) in a single series.
+    leg = ReplayLeg(
+        conid="OPT1", strike=strike, right="P", expiry=expiry,
+        fills=((opens[2], -1.0, 3.0), (opens[4], 1.0, 1.0)),
+    )
+    marks = modelled_marks(conn, [leg], points, underlying_conid="U1")
+    by_ts = {row[0]: row for row in marks}
+
+    for stamp in opens[:2]:
+        assert by_ts[stamp][2] is None, "delta before the opening fill"
+    for stamp in opens[2:4]:
+        assert by_ts[stamp][2], "delta must be reported while the position is held"
+    for stamp in opens[4:]:
+        assert by_ts[stamp][2] is None, "delta after the position went flat"
+
+    # P&L is present on EVERY bar, including the flat ones, and frozen after the
+    # close at what the trade made.
+    assert all(row[1] is not None for row in marks), "P&L went missing"
+    closed = [by_ts[stamp][1] for stamp in opens[4:]]
+    assert len(set(closed)) == 1, "the realised figure moved after the close"
+    assert closed[0] == pytest.approx((3.0 - 1.0) * 100.0), (
+        "the frozen figure is not the credit received less the cost to close"
+    )
+
+
 def test_the_band_accepts_both_expiry_formats_the_payload_carries(conn):
     """A leg states 2026-09-04 while a snapshot row keeps IBKR's 20260918.
     Handling one and rejecting the other produced a band for the LEAP and none

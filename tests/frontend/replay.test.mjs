@@ -14,6 +14,7 @@ import {
   clampIndex,
   clampPosition,
   deltaDomain,
+  deltaSegments,
   domainOf,
   frameAt,
   xAtPosition,
@@ -190,6 +191,50 @@ test("a flat delta series is not magnified into noise", () => {
 test("no marks means no delta axis", () => {
   assert.equal(deltaDomain([]), null);
   assert.equal(deltaDomain([[1, 5, null]]), null);
+});
+
+/* ------------------------------------------------------- delta, only when held
+ *
+ * `modelled_marks` reports delta as null on any bar holding nothing -- before the
+ * opening fill, and after a close goes flat -- because on a SYMMETRIC axis 0.0
+ * means delta-neutral, a real state, rather than absent. These pin the drawing
+ * half of that: the line must BREAK across those bars rather than glide over them.
+ */
+
+test("the delta line breaks where the position was not held", () => {
+  /* One polyline over a null stretch would run straight from the last real delta
+     to the first one after it, drawing exposure across bars that had none. */
+  const geo = geometry();
+  const marks = [[1000, 0, 0.4], [2000, 0, null], [3000, 0, 0.2]];
+  const segments = deltaSegments(marks, geo, (v) => v);
+  assert.equal(segments.length, 2, "the gap did not split the line");
+  assert.deepEqual(segments.map((s) => s.length), [1, 1]);
+});
+
+test("a continuous holding is one line, not one per bar", () => {
+  const geo = geometry();
+  const marks = [[1000, 0, 0.4], [2000, 0, 0.3], [3000, 0, 0.2]];
+  const segments = deltaSegments(marks, geo, (v) => v);
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].length, 3);
+});
+
+test("leading and trailing flat bars contribute no segment", () => {
+  // The two real shapes: context before entry, and every bar after a close.
+  const geo = geometry();
+  const marks = [[1000, 0, null], [2000, 0, 0.3], [3000, 0, null]];
+  const segments = deltaSegments(marks, geo, (v) => v);
+  assert.equal(segments.length, 1, "a flat edge became its own segment");
+  assert.equal(segments[0].length, 1);
+  assert.deepEqual(deltaSegments([[1000, 0, null]], geo, (v) => v), [],
+                   "a series holding nothing drew a line anyway");
+});
+
+test("the y mapping is applied to the delta, not to the row", () => {
+  const geo = geometry();
+  const segments = deltaSegments([[2000, 0, 0.5]], geo, (v) => v * 100);
+  assert.equal(segments[0][0][1], 50);
+  assert.equal(segments[0][0][0], geo.at(2000).x, "x did not come from the bar");
 });
 
 test("a strike held to the end of the chart runs to the right edge", () => {

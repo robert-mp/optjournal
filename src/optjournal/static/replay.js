@@ -204,6 +204,38 @@ export function deltaDomain(marks, floor = 0.05) {
   return { lo: -reach, hi: reach, reach };
 }
 
+/** The delta line as SEGMENTS, split wherever the position was not held.
+ *
+ * A gap is the statement. `modelled_marks` reports delta as null before the
+ * opening fill and after a close takes the position flat, because on a symmetric
+ * axis 0.0 means delta-neutral rather than absent. One polyline over those bars
+ * would draw a straight line from the last real delta to the first one after the
+ * gap -- inventing a smooth glide across a stretch holding nothing, which is the
+ * same fabrication in line form that 0.0 was in number form.
+ *
+ * Returns a list of point lists, one per continuous holding period, so a contract
+ * closed and later reopened draws two separate lines rather than one joined
+ * across the flat. A single held bar yields a one-point segment: the caller draws
+ * those as dots, since a polyline of one point renders nothing at all.
+ */
+export function deltaSegments(marks, geometry, yOf) {
+  const segments = [];
+  let run = [];
+  for (const row of marks) {
+    const value = row[2];
+    if (!Number.isFinite(value)) {
+      if (run.length) segments.push(run);
+      run = [];
+      continue;
+    }
+    const spot = geometry.at(row[0]);
+    if (!spot) continue;
+    run.push([spot.x, yOf(value)]);
+  }
+  if (run.length) segments.push(run);
+  return segments;
+}
+
 /** Pixel span of a strike's holding period, clamped to the plot.
  *
  * A null start or end means "beyond this chart": still held, or an entry date we

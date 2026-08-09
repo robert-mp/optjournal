@@ -1026,7 +1026,7 @@ def modelled_marks(
     *,
     underlying_conid: str | None,
     vols: dict[str, list[tuple[int, float]]] | None = None,
-) -> list[list[float]]:
+) -> list[list[float | None]]:
     """Modelled P&L and effective delta per bar: ``[ts, pnl, delta]``.
 
     P&L is cash flow to date plus the mark-to-market of whatever is still open --
@@ -1055,17 +1055,38 @@ def modelled_marks(
     Effective delta is ``sum(signed quantity * delta)``, without the multiplier,
     so a delta-neutral strangle reads 0.0 and a short put reads a positive
     fraction -- the scale the reference chart uses.
+
+    It is ``None`` on any bar where nothing is HELD: before the opening fill, and
+    after a close takes the position flat. 0.0 cannot serve there, because on a
+    symmetric axis 0.0 means delta-neutral -- a real state, and the one a strangle
+    is opened in -- so reporting it for an empty position states a position that
+    was never held. P&L keeps reporting through the same bars; see the note at
+    the append.
     """
     if vols is None:
         vols = _vol_series(conn, band_contracts(legs), points, underlying_conid)
     if not vols:
         return []
-    marks: list[list[float]] = []
+    marks: list[list[float | None]] = []
     for stamp, spot in points:
         cash = 0.0
         value = 0.0
         delta = 0.0
         priced = False
+        # Separate from `priced`, and that distinction is the whole point. A bar
+        # can be PRICEABLE (its contract has a solvable vol) while nothing is
+        # HELD -- before the opening fill, and after a close takes the position
+        # flat. Sharing one flag made those bars report `delta` as the sum of
+        # `0 * bs_delta(...)`, an exact 0.0, and on a SYMMETRIC axis 0.0 is not
+        # an absence: it is the centre line, the state a strangle is opened in.
+        # So a closed trade drew twelve bars of "we were delta-neutral" when the
+        # truth was "we were not in the trade" -- the same fabrication
+        # `delta_around` already refuses to make for an opening event, and the
+        # same rule `markAt` follows in returning null rather than a neighbour's
+        # figure. Measured on this journal: the TSLA short put reported +0.3171
+        # then 0.0000 for twelve bars after its buyback, and every replay with
+        # context before entry did the mirror image.
+        held = False
         for leg in legs:
             expiry = expiry_epoch(leg.expiry)
             series = vols.get(leg.conid)
@@ -1099,9 +1120,18 @@ def modelled_marks(
             value += quantity * unit * leg.multiplier
             delta += quantity * bs_delta(spot, leg.strike, years, vol, leg.right)
             priced = True
+            if quantity:
+                held = True
         if not priced:
             continue
-        marks.append([stamp, round(cash + value, 2), round(delta, 4)])
+        # P&L is still reported when nothing is held, and that asymmetry is
+        # deliberate rather than an oversight. Cash flow to date with no open leg
+        # left to mark IS the trade's result: it is frozen because the trade
+        # finished, so the figure is true. Exposure has no such post-close value
+        # -- there is nothing to be exposed by -- so it is absent instead.
+        marks.append([
+            stamp, round(cash + value, 2), round(delta, 4) if held else None,
+        ])
     return marks
 
 
@@ -1140,7 +1170,9 @@ def replay_model(
     return band, marks
 
 
-def delta_around(marks: list[list[float]], stamp: int) -> tuple[float | None, float | None]:
+def delta_around(
+    marks: list[list[float | None]], stamp: int
+) -> tuple[float | None, float | None]:
     """Effective delta immediately before and after an event, as ``(before, after)``.
 
     The pair a roll is judged by: the reference implementation this feature
@@ -1152,8 +1184,11 @@ def delta_around(marks: list[list[float]], stamp: int) -> tuple[float | None, fl
     was no position to have a delta, and inventing 0.0 there would read as
     "we were delta-neutral" rather than "we were not in the trade".
 
-    Either side may be None at a window edge, or when no bar in the window had a
-    solvable vol.
+    Either side may be None at a window edge, when no bar in the window had a
+    solvable vol, or because the neighbouring bar HELD nothing -- `modelled_marks`
+    reports delta as None off-position, and this carries that through rather than
+    flattening it to 0.0. A closing event therefore reads ``0.32 -> None``, which
+    is the honest shape: it had exposure, and now there is none to have.
     """
     before: float | None = None
     after: float | None = None

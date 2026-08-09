@@ -356,6 +356,9 @@ td.n,th.n{text-align:right}
    sensitivity, not something that traded, so it must not read as firmly as the
    price line. */
 .dline{fill:none;stroke:var(--dim);stroke-width:1.1;stroke-dasharray:1.5 3}
+/* A holding period only one bar long. A polyline of one point draws nothing, and
+   a position held for a single bar is not nothing -- so it gets a dot. */
+.ddot{fill:var(--dim);stroke:none}
 .dax{fill:var(--dim2)}
 .zero{stroke:var(--line2);stroke-width:1;stroke-dasharray:2 4;opacity:.7}
 .linkish{background:none;border:none;color:var(--dim);cursor:pointer;
@@ -440,8 +443,8 @@ td.n,th.n{text-align:right}
    page uses this", which is how the reader's map of what the page does drifts
    from what it does. test_frontend pins the list against the calls. */
 import {
-  MIN_POINTS, bandEdges, barsPerMs, deltaDomain, frameAt, indexOfTs, nextStop,
-  reachedEvents, plotGeometry, sessionBreaks, strikeSpan,
+  MIN_POINTS, bandEdges, barsPerMs, deltaDomain, deltaSegments, frameAt,
+  indexOfTs, nextStop, reachedEvents, plotGeometry, sessionBreaks, strikeSpan,
 } from '/static/replay.js';
 
 /* ===================== the payload contract =====================
@@ -1011,7 +1014,7 @@ import {
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
- * @local RGEO geo edges fr xy sks mks dd sp spot
+ * @local RGEO geo edges fr xy sks dd sp dsegs seg
  * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen withEvents ws opts thin
  * @local JSON Object ages input mine qb wf behind was
@@ -1707,10 +1710,18 @@ function replayChart(rp){
      sensitivity, not something that traded. */
   const dd=deltaDomain(mks);
   const y2=v=>T+ih/2-(v/dd.reach)*(ih/2);
-  const dline=!dd?'':mks.map(m=>{
-    const spot=geo.at(m[0]);
-    return spot?`${spot.x.toFixed(1)},${y2(m[2]).toFixed(1)}`:'';
-  }).filter(Boolean).join(' ');
+  /* One polyline PER HOLDING PERIOD, not one across the whole series. Delta is
+     null on any bar holding nothing, and a single line over those would glide
+     from the last real delta to the first one after the gap -- drawing exposure
+     across a stretch that had none. The split is deltaSegments', in the tested
+     module. A one-bar holding gets a dot, because a polyline of one point draws
+     nothing and a position held for a single bar is not nothing. */
+  const dsegs=!dd?[]:deltaSegments(mks,geo,y2);
+  const dline=dsegs.map(seg=>seg.length<2
+    ?`<circle class="ddot" cx="${seg[0][0].toFixed(1)}" cy="${
+      seg[0][1].toFixed(1)}" r="1.6"/>`
+    :`<polyline class="dline" points="${
+      seg.map(q=>`${q[0].toFixed(1)},${q[1].toFixed(1)}`).join(' ')}"/>`).join('');
   const dax=!dd?'':[dd.reach,0,-dd.reach].map(v=>
     `<text class="tk dax" x="${L+iw+6}" y="${(y2(v)+3.5).toFixed(1)}">${
       num(v,2)}</text>`).join('')
@@ -1765,8 +1776,8 @@ function replayChart(rp){
     <line class="ax" x1="${L}" y1="${T+ih}" x2="${L+iw}" y2="${T+ih}"/>
     <g clip-path="url(#rclip)">${band}${strikes}${
       edge(geo.at(rp.opened_ts),'edge in','entry')}${
-      edge(geo.at(rp.closed_ts),'edge out','exit')}${dline?`<polyline class="dline" points="${
-      dline}"/>`:''}<polyline class="pxline" points="${line}"/>${dots}</g>
+      edge(geo.at(rp.closed_ts),'edge out','exit')}${dline}<polyline class="pxline" points="${
+      line}"/>${dots}</g>
     <line id="rcross" class="cross" x1="${geo.xs[pts.length-1].toFixed(1)}" y1="${T}" x2="${
       geo.xs[pts.length-1].toFixed(1)}" y2="${T+ih}"/>
     ${xticks}</svg>
@@ -1815,10 +1826,15 @@ function replayEvents(rp,pts){
        is the first thing you want off a closing card. */
     const flow=!e.cash?'':`${Number(e.cash.native)<0?'debit':'credit'} ${
       moneyOf(e.cash)}`;
-    /* Δ before → after: for an opening event `before` is null because there was
-       no position, and printing 0.00 there would read as "we were neutral". */
-    const dl=e.delta_after==null?'':`Δ ${
-      e.delta_before==null?'':num(e.delta_before,2)+' → '}${num(e.delta_after,2)}`;
+    /* Δ before → after, where NULL on either side means "no position", not zero:
+       an opening event has no before, and a closing one has no after. Naming the
+       empty side "flat" rather than dropping the row is what makes a close state
+       the exposure it removed -- the row used to vanish entirely whenever `after`
+       was null, which is exactly the closing event whose delta matters most. */
+    const dnum=v=>v==null?'flat':num(v,2);
+    const dl=(e.delta_before==null&&e.delta_after==null)?''
+      :`Δ ${e.delta_before==null?'':dnum(e.delta_before)+' → '}${
+        dnum(e.delta_after)}`;
     const bits=[flow,
       e.commission?`comm ${moneyOf(e.commission)}`:'',
       e.realized?`realised <b class="${cls(e.realized.native)}">${
@@ -1847,7 +1863,7 @@ function replayEvents(rp,pts){
    Every figure is the strip card's, read off the same event object. Two
    renderers over one event could disagree about a roll's credit, and the panel
    would then contradict itself depending on where you looked. */
-function replayFocus(e){
+function replayFocus(e,resume){
   const host=$('#rfocus');
   if(!host) return;
   if(!e){host.innerHTML='';host.classList.remove('on');return;}
@@ -1860,10 +1876,14 @@ function replayFocus(e){
   const closed=legOf('C'), opened=legOf('O');
   const moved=closed&&opened?`${closed} <span class="fa">→</span> ${opened}`
     :(opened||closed);
+  /* Same rule as the strip card, and the same reason: null is "no position", so
+     it reads "flat" rather than dropping the row or printing 0.00. A closing
+     event's whole point is the exposure it removed. */
+  const dnum=v=>v==null?'flat':num(v,2);
   const rows=[
-    e.delta_after==null?null:['eff Δ', `${
-      e.delta_before==null?'':num(e.delta_before,2)+' <span class="fa">→</span> '
-      }${num(e.delta_after,2)}`],
+    (e.delta_before==null&&e.delta_after==null)?null:['eff Δ', `${
+      e.delta_before==null?'':dnum(e.delta_before)+' <span class="fa">→</span> '
+      }${dnum(e.delta_after)}`],
     moved?['strikes', moved]:null,
     /* Named, not signed: "−$780" is ambiguous about who paid whom, and that is
        the first thing wanted off a closing card. Matches the strip exactly. */
@@ -1880,13 +1900,22 @@ function replayFocus(e){
     <button class="fx" id="rfx" aria-label="dismiss and continue">×</button></div>
     <div class="fw mono">${esc(e.at||'')}</div>${rows}</div>`;
   host.classList.add('on');
-  /* Dismissing clears only the card. It does NOT resume playback: the reader
-     pressed nothing to play, and starting the timer from a close button would
-     move the chart out from under a deliberate pause. */
-  /* Not `x` -- that name is bound to an Episode in the payload contract, and one
-     name for two shapes blinds the binding guard to both. */
+  /* Dismissing RESUMES. The card is what playback stopped for, so closing it is
+     the reader saying "read it, carry on" -- and the aria-label has always said
+     "dismiss and continue". Leaving it merely cleared meant the only way onward
+     was the play button, which put the one control that matters at this moment
+     somewhere other than where the reader is already looking.
+
+     Guarded on `resume` so this stays true only of the parked-by-playback case:
+     a card raised by CLICKING an event in the strip is a lookup, not a pause, and
+     starting playback from it would march the chart away from the bar just asked
+     for. replayFocus(null) also passes no resume, so every programmatic clear
+     (a scrub, pressing play) still just hides the card.
+
+     Not `x` for the button -- that name is bound to an Episode in the payload
+     contract, and one name for two shapes blinds the binding guard to both. */
   const dismiss=$('#rfx');
-  if(dismiss) dismiss.onclick=()=>replayFocus(null);
+  if(dismiss) dismiss.onclick=()=>{replayFocus(null);if(resume) resume();};
 }
 
 /* The scrubbed bar in words. Shared by the initial render and every seek, so the
@@ -1899,8 +1928,13 @@ function replayReadout(fr,size,dp){
      model output through it would relabel dollars as euros without converting
      them -- the exact class of error the Money type exists to prevent, which is
      why this figure is never mixed into a base-currency total. */
+  /* "flat" rather than "Δ 0.00" off-position. Delta is null on a bar holding
+     nothing, and num(null) is null -- which would print the word "null" beside a
+     real P&L. Naming the state is also the more useful readout: the figure is
+     absent because there is no position, not because the exposure was zero. */
+  const dl=fr.delta==null?'<span class="dim2">flat</span>':`Δ ${num(fr.delta,2)}`;
   return `${when} · <b class="${cls(fr.pnl)}">${money(fr.pnl,'USD',2)}</b> `
-    +`<span class="dim2">est. P&L · Δ ${num(fr.delta,2)}</span>`;
+    +`<span class="dim2">est. P&L · </span>${dl}`;
 }
 
 /* Scrubber, playback and readout. These mutate the open panel IN PLACE rather
@@ -1991,7 +2025,12 @@ function bindReplayControls(){
            than the one highlighted below it. */
         const at=(RGEO.events||[]).filter(e=>
           indexOfTs(RGEO.points,e.ts)===halt);
-        replayFocus(at.length?at[at.length-1]:null);
+        /* Closing THIS card carries on, because playback is what raised it. The
+           resume is `play.onclick` itself rather than a copy of the loop: one
+           entry point, so dismissing a card and pressing play cannot diverge --
+           and the handler already re-derives the next stop from where we now
+           stand, which is what carries the replay to the following event. */
+        replayFocus(at.length?at[at.length-1]:null,()=>play.onclick());
         return;
       }
       if(position>=max){
