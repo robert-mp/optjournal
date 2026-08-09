@@ -737,80 +737,39 @@ def cmd_sync(args) -> int:
         )
         return EXIT_CONFIG
 
-    started = datetime.now(UTC).isoformat(timespec="seconds")
-    assets = _asset_filter(args.assets)
+    # ONE SYNC PATH, shared with `POST /api/sync` and the `sync` job. This used to
+    # be a second implementation of the same sequence, and the two had already
+    # drifted: `new_trades` held the row LIST here and a COUNT in web.py -- one
+    # name, two types, computed from the same table. Nothing broke only because
+    # each consumer had met just one producer.
+    #
+    # Imported here rather than at module scope, matching `cmd_serve`: `web` pulls
+    # in the whole payload layer, and `optjournal show` should not pay for it.
+    from optjournal.web import sync_journal  # noqa: PLC0415 - see above
 
-    result = fetch(
-        query_id,
+    data = sync_journal(
+        conn=_open_db(args),
         archive_dir=args.archive,
+        query_id=query_id,
+        assets=_asset_filter(args.assets),
         from_date=args.from_date,
         to_date=args.to_date,
         force=args.force,
     )
-    conn = _open_db(args)
-    ingested = ingest_file(conn, result.raw_path, assets=assets)
+    new_trade_rows = data["new_trade_rows"]
 
-    # `first_seen_at` is stamped per row at insert, so anything at or after this
-    # run's start timestamp is genuinely new to the journal rather than a row
-    # re-presented by an overlapping statement.
-    new_trade_rows = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT trade_date, symbol, buy_sell, open_close, quantity, trade_price,"
-            " ib_commission, currency FROM trades WHERE first_seen_at >= ?"
-            " ORDER BY COALESCE(date_time, trade_date)",
-            (started,),
-        )
-    ]
-    new_cash = conn.execute(
-        "SELECT COUNT(*) AS n FROM cash_transactions WHERE first_seen_at >= ?",
-        (started,),
-    ).fetchone()["n"]
-
-    data = {
-        "started_at": started,
-        "query_id": query_id,
-        "raw_path": str(result.raw_path),
-        "raw_bytes": result.raw_bytes,
-        "already_ingested": ingested.already_ingested,
-        # A COUNT under `new_trades`, matching `web._do_sync` and the page's
-        # SyncResponse typedef. This key used to hold the row LIST here and the
-        # count there -- one name, two types, across two sync implementations
-        # that compute the same figure from the same table. Nothing broke,
-        # because each consumer only ever met one producer (the cron reads this
-        # payload, the page reads web's), which is exactly what makes it a trap:
-        # the first reader to meet the other shape would have iterated an int or
-        # formatted a list.
-        "new_trades": len(new_trade_rows),
-        # The rows themselves, under a name that says it is a list. The cron
-        # prints one line per fill from these.
-        "new_trade_rows": new_trade_rows,
-        "new_cash": new_cash,
-        "positions_written": ingested.positions_written,
-        "warnings": ingested.warnings,
-        "changed": bool(new_trade_rows or new_cash),
-    }
-
-    lines = [f"sync {query_id}  {result.raw_bytes:,} bytes -> {result.raw_path.name}"]
-    if ingested.already_ingested:
-        lines.append("  statement byte-identical to a previous fetch, nothing to do")
-    elif not data["changed"]:
+    lines = [f"sync {query_id}  {data['raw_bytes']:,} bytes -> {data['archive']}"]
+    lines.append(f"  {data['summary']}")
+    for t in new_trade_rows:
         lines.append(
-            f"  no new activity  (positions refreshed:"
-            f" {ingested.positions_written})"
+            f"    {t['trade_date']}  {t['symbol']:<24}"
+            f" {t['open_close'] or '-'} {t['buy_sell'] or '-':<4}"
+            f" qty {t['quantity']:>5} @ {t['trade_price']}"
+            f"  comm {t['ib_commission']}  {t['currency']}"
         )
-    else:
-        lines.append(
-            f"  {len(new_trade_rows)} new trade(s), {new_cash} new cash row(s)"
-        )
-        for t in new_trade_rows:
-            lines.append(
-                f"    {t['trade_date']}  {t['symbol']:<24}"
-                f" {t['open_close'] or '-'} {t['buy_sell'] or '-':<4}"
-                f" qty {t['quantity']:>5} @ {t['trade_price']}"
-                f"  comm {t['ib_commission']}  {t['currency']}"
-            )
-    for w in ingested.warnings:
+    if data["snapshot"]:
+        lines.append(f"  snapshot {data['snapshot']}")
+    for w in data["warnings"]:
         lines.append(f"  ! {w}")
     _emit(data, "\n".join(lines), args.json)
     return EXIT_OK

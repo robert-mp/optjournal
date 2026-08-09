@@ -367,3 +367,477 @@ def test_a_journal_that_never_collected_is_not_a_stopped_collector(conn, populat
         "and the blackout still stands -- the two fields answer different questions"
     )
     other.close()
+
+
+# ---------------------------------------------------------------------------
+# The registry (SCHEDULER_PLAN.md step 5a).
+#
+# THE REGISTRY BEING CODE IS THE POINT. MeshClaw's registration was an
+# unversioned, hand-typed side channel, and the consequence is measurable: four
+# optjournal jobs are registered and none is the calendar refresh, so 143 lines of
+# tested, documented policy have never run on a schedule. Every test below is one
+# a `crons.json` could not have.
+# ---------------------------------------------------------------------------
+
+
+def test_the_registry_holds_every_job_the_ledger_accepts():
+    """`KNOWN_JOBS` and `JOBS` must name the same four things.
+
+    Two containers for one registry is how "exists" and "registered" drift apart
+    again -- a name in the ledger's set with no Job is a status nothing can ever
+    write, and a Job whose name the ledger refuses raises at the end of a run that
+    already did its work.
+    """
+    from optjournal.jobs import JOBS
+
+    assert {job.name for job in JOBS} == set(KNOWN_JOBS), (
+        "the registry and the ledger's accepted set disagree"
+    )
+
+
+def test_the_calendar_job_is_registered_here_because_it_never_was_anywhere_else():
+    """`market` exists in code for the first time.
+
+    Verified rather than assumed: `~/.meshclaw/crons.json` holds four optjournal
+    jobs -- daily-sync, bars-live, bars-daily, bars-audit -- and no market job, so
+    `market_events` holds a single fetch from the web UI rather than the daily
+    accumulation `events.py`'s docstring argues for.
+    """
+    from optjournal.jobs import job_by_name
+
+    job = job_by_name("market")
+    assert job.spends_broker_request is False, (
+        "the calendar feed is not IBKR; marking it as spending a broker request "
+        "would make the reconciler protect a budget it does not touch"
+    )
+
+
+def test_the_audit_is_not_a_job_any_more():
+    """It was `optjournal-bars-audit`; step 4 made it a field on every page load.
+
+    A watchdog that is itself scheduled stops when the thing it watches stops, and
+    did: bars-audit read `last_status: ok` for two days while nothing was
+    collected. Registering it again would undo that, so its absence is an
+    assertion rather than an omission.
+    """
+    from optjournal.jobs import JOBS
+
+    assert not [job for job in JOBS if "audit" in job.name], (
+        "the perishable audit is computed by serialize.audit_data on every page "
+        "load -- as a job it cannot notice the outage that stops it too"
+    )
+
+
+def test_only_the_sync_spends_a_broker_request():
+    """The flag the reconciler reads before retrying anything.
+
+    Bars and quotes come from a public chart endpoint and the calendar from its own
+    feed; only the Flex statement draws on IBKR's rate-limited budget, where the
+    penalty is a lockout rather than a slow response. A job wrongly flagged would
+    be needlessly throttled; one wrongly unflagged is how a retry loop spends the
+    budget.
+    """
+    from optjournal.jobs import JOBS
+
+    assert {job.name for job in JOBS if job.spends_broker_request} == {"sync"}
+
+
+def test_the_live_poll_is_a_window_and_the_rest_are_wall_clock():
+    """`bars_live` is the one job whose due-ness is not an instant.
+
+    Seven cron slots collapse into one predicate -- inside the session AND the last
+    success over 55 minutes old -- and it is sound only because the intraday series
+    is CUMULATIVE within a session: a 13:00 poll returns every completed bar since
+    the open. `Catchup.LATEST` on it would be wrong in the dangerous direction,
+    firing outside the session and recording an empty fetch as a success.
+    """
+    from optjournal.jobs import JOBS, Catchup, job_by_name
+
+    assert job_by_name("bars_live").catchup is Catchup.WINDOW
+    assert {j.name for j in JOBS if j.catchup is Catchup.WINDOW} == {"bars_live"}
+    # And nothing is NONE: a job that silently drops a missed instant would have
+    # to earn that, and none of the four has.
+    assert not [j for j in JOBS if j.catchup is Catchup.NONE]
+
+
+def test_a_catchup_window_is_bounded_by_the_schedules_own_period():
+    """A window may reach back to the previous fire, and no further.
+
+    HONEST ABOUT WHAT THIS DOES NOT GUARD. My first version asserted
+    `window_s < 24h` on the theory that a wider window makes two instants due at
+    once, and `market` at exactly 24 h failed it. The theory was wrong: `LATEST`
+    means the MOST RECENT missed instant only, and replay is prevented by the
+    partial unique index on `(job, fired_for)` -- a database constraint, not
+    arithmetic. So a wide window cannot spend two IBKR requests on one statement
+    however wide it is.
+
+    What a window wider than the period WOULD do is make a job due for an instant
+    whose successor has already passed, which for a daily job means running
+    yesterday's slot after today's was available. `<=` the period is the honest
+    bound, and it is what these four satisfy.
+    """
+    from optjournal.jobs import JOBS, Catchup
+
+    for job in JOBS:
+        if job.catchup is not Catchup.LATEST:
+            continue
+        # Every LATEST job here is daily on the days it runs at all.
+        assert job.window_s <= 24 * 3600, (
+            f"{job.name}'s {job.window_s}s window reaches back past the previous "
+            "fire, so it could run a slot two schedules old"
+        )
+        assert job.window_s > 0, f"{job.name} claims catch-up but has no window"
+
+
+def test_every_schedule_names_a_real_zone_and_a_real_time():
+    """A typo'd zone raises at reconcile time, in a thread, on a schedule.
+
+    `ZoneInfo('Europe/Dublín')` is a `ZoneInfoNotFoundError` -- and step 6 resolves
+    zones inside the tick loop, where the failure would be a thread dying quietly
+    rather than a startup error. Cheap to check here instead.
+    """
+    from optjournal.jobs import JOBS
+
+    for job in JOBS:
+        job.tz()                                   # raises on an unknown zone
+        assert 0 <= job.minute <= 59, f"{job.name}: minute {job.minute}"
+        assert 0 <= job.hour <= 23, f"{job.name}: hour {job.hour}"
+        assert job.weekdays, f"{job.name} runs on no day at all"
+        assert set(job.weekdays) <= set(range(1, 8)), (
+            f"{job.name}: {job.weekdays} is not ISO weekdays (Monday=1)"
+        )
+        assert job.timeout_s > 0
+
+
+def test_the_market_hours_poll_is_scheduled_in_market_time():
+    """Eastern, so it follows US DST without being edited twice a year.
+
+    The others are the reader's own zone, where "before breakfast" is the actual
+    requirement. Getting this backwards would put the live poll an hour off the
+    session for half the year -- which for perishable bars means a lost hour that
+    cannot be refetched.
+    """
+    from optjournal.jobs import job_by_name
+
+    assert job_by_name("bars_live").zone == "America/New_York"
+    assert job_by_name("sync").zone == "Europe/Dublin"
+
+
+def test_the_declaration_order_puts_sync_before_the_bars_it_feeds():
+    """Ordering is a real happens-before edge, not a wall-clock guess.
+
+    `bars_daily` derives its manifest from the positions `sync` ingests, so a
+    position opened yesterday is only in the manifest once the sync has landed.
+    Step 6's worker runs due jobs sequentially down this tuple, which is what
+    replaces today's arrangement: two cron expressions 30 minutes apart plus
+    MeshClaw's `_compute_jitter`, which returns `random.uniform(0, 59*60)` and was
+    observed putting a 538 ms job 25 minutes late.
+    """
+    from optjournal.jobs import JOBS
+
+    order = [job.name for job in JOBS]
+    assert order.index("sync") < order.index("bars_daily"), (
+        "bars_daily would derive its manifest from positions the sync has not "
+        "ingested yet"
+    )
+
+
+def test_an_unknown_job_name_raises_its_own_type():
+    """So the endpoint can answer 400 rather than 500."""
+    from optjournal.jobs import UnknownJob, job_by_name
+
+    with pytest.raises(UnknownJob):
+        job_by_name("bars-live")                   # hyphen, not underscore
+
+
+# ---------------------------------------------------------------------------
+# The runner (SCHEDULER_PLAN.md step 5a), and the two hazards the plan measured.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def ctx(tmp_path):
+    """A Context whose archive is a scratch directory, never the real `raw/`."""
+    from optjournal.jobs import Context
+
+    return Context(archive_dir=tmp_path / "raw", db_path=tmp_path / "j.db",
+                   query_id="1591754")
+
+
+def _stub(monkeypatch, name, outcome):
+    """Point one registry entry's `run` at a stub, leaving the rest alone.
+
+    Patches the Job's frozen field through `object.__setattr__` on a COPY placed
+    into a replacement tuple, so the real registry is restored by monkeypatch and
+    a test cannot leak a stub into another.
+    """
+    import dataclasses
+
+    from optjournal import jobs as mod
+
+    replaced = tuple(
+        dataclasses.replace(job, run=outcome) if job.name == name else job
+        for job in mod.JOBS
+    )
+    monkeypatch.setattr(mod, "JOBS", replaced)
+
+
+def test_the_claim_row_is_committed_before_the_work_starts(conn, ctx, monkeypatch):
+    """THE ordering decision in the runner, and the review refuted the alternative.
+
+    If the row were written on a terminal state instead, the window between "is
+    this slot claimed?" and "this slot is claimed" would span the whole job. A
+    SIGKILL mid-fetch -- which launchd `KeepAlive` makes routine, ~10s respawn --
+    then leaves no row AND no stamp, because `flex._record_fetch` runs only after a
+    successful download, so the next reconcile finds the slot unclaimed and spends
+    a SECOND IBKR request. Deterministically, with no concurrency involved.
+
+    Asserted from INSIDE the work: the job's own `run` reads the database through a
+    SEPARATE connection, which can only see a committed row. That is what makes
+    this a test of the commit rather than of the insert.
+    """
+    from optjournal.db import connect
+    from optjournal.jobs import Outcome, run_job
+
+    seen = {}
+
+    def work(_conn, _ctx):
+        other = connect(ctx.db_path)
+        row = other.execute(
+            "SELECT status, finished_at FROM job_runs WHERE job = 'market'"
+        ).fetchone()
+        seen["row"] = None if row is None else dict(row)
+        other.close()
+        return Outcome("ok", "did the thing")
+
+    _stub(monkeypatch, "market", work)
+    run_id = run_job(conn, "market", ctx=ctx)
+
+    assert seen["row"] is not None, (
+        "another connection could not see the claim, so it was not committed "
+        "before the work began -- a killed run would leave the slot unclaimed"
+    )
+    assert seen["row"]["status"] == "running"
+    assert seen["row"]["finished_at"] is None, (
+        "the claim was stamped finished before the work ran"
+    )
+    final = conn.execute(
+        "SELECT status, detail, finished_at FROM job_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    assert (final["status"], final["detail"]) == ("ok", "did the thing")
+    assert final["finished_at"], "the terminal state was never stamped"
+
+
+def test_a_second_runner_is_refused_rather_than_queued(conn, ctx, monkeypatch):
+    """`JobBusy`, not a wait. Two concurrent syncs would each spend a request.
+
+    The lock is taken with `timeout_s=0` deliberately: every job here is idempotent
+    and cheap to retry on the next tick, so refusing is better than queueing behind
+    something that spends IBKR requests. The 409 names the run to watch.
+
+    THE ELAPSED TIME IS PART OF THE ASSERTION, and it was added because the first
+    version of this test could not see the difference. `timeout_s=1` instead of 0
+    still raises `JobBusy` -- one second later -- so the ablation passed while the
+    behaviour was wrong. A refusal that takes a second is not a refusal, it is a
+    queue with a short patience: the browser holds a connection, and the `sync`
+    job's timeout is 900s.
+    """
+    import time
+
+    from optjournal.db import connect
+    from optjournal.jobs import JobBusy, Outcome, run_job
+
+    def reentrant(_conn, _ctx):
+        # A second runner, in this process, on its own connection -- the same
+        # situation as the page pressing Run twice.
+        other = connect(ctx.db_path)
+        try:
+            started = time.monotonic()
+            with pytest.raises(JobBusy) as caught:
+                run_job(other, "market", ctx=ctx)
+            waited = time.monotonic() - started
+            assert caught.value.run_id is not None, (
+                "a 409 must name the run already in flight, or the page has "
+                "nothing to poll"
+            )
+            # 100ms is two `locks._POLL_S` intervals: generous enough not to be
+            # flaky under load, tight enough that any real wait fails it.
+            assert waited < 0.1, (
+                f"the second runner WAITED {waited:.2f}s before being refused, so "
+                "the lock is blocking -- callers queue behind a job that can take "
+                "900s instead of getting an immediate 409"
+            )
+        finally:
+            other.close()
+        return Outcome("ok")
+
+    _stub(monkeypatch, "market", reentrant)
+    run_job(conn, "market", ctx=ctx)
+    assert conn.execute("SELECT COUNT(*) FROM job_runs").fetchone()[0] == 1, (
+        "the refused runner still wrote a row"
+    )
+
+
+def test_a_refused_claim_is_rolled_back_and_does_not_wedge_the_database(conn, ctx):
+    """(a) FROM THE PLAN, MEASURED: sqlite3 does NOT roll back on IntegrityError.
+
+    Losing the race for a `fired_for` is a DESIGNED outcome -- the partial unique
+    index is what makes catch-up idempotent -- so the loser must not leave the
+    connection in a transaction holding the write lock. Measured cost if it does:
+
+        refused: UNIQUE constraint failed: job_runs.job, job_runs.fired_for
+        in_transaction AFTER refusal: True        <-- write lock retained
+        other writer FAILED after 15.55s: database is locked
+        after rollback() other writer OK in 0.000s
+
+    So the scheduler would wedge its own database by losing a race it exists to
+    lose, and every other writer -- including the heartbeat -- would wait the full
+    BUSY_TIMEOUT_MS and fail.
+    """
+    from optjournal.jobs import JobBusy, run_job
+
+    instant = 1786310000
+    conn.execute(
+        "INSERT INTO job_runs (job, fired_for, started_at, status)"
+        " VALUES ('market', ?, '2026-08-09T11:00:00+00:00', 'running')", (instant,))
+    conn.commit()
+
+    with pytest.raises(JobBusy):
+        run_job(conn, "market", ctx=ctx, fired_for=instant)
+    assert not conn.in_transaction, (
+        "the refused claim left the write lock held; the next writer waits "
+        "BUSY_TIMEOUT_MS (15.5s measured) and then fails"
+    )
+    # And a real second writer proves it, rather than trusting the flag.
+    from optjournal.db import connect
+    other = connect(ctx.db_path)
+    other.execute("INSERT OR IGNORE INTO watchlist (symbol, note, added_at)"
+                  " VALUES ('ZZZ', NULL, '2026-08-09')")
+    other.commit()
+    other.close()
+
+
+def test_a_job_that_raises_is_recorded_failed_and_the_error_still_travels(
+    conn, ctx, monkeypatch
+):
+    """Both halves, and the second is the one the keychain failure needed.
+
+    Recording `failed` without re-raising is how the 2026-08-07 outage became a
+    message that reached nobody: a `KeyringLocked` is not `flex.TokenMissing`, so
+    it never mapped to exit 2, and a runner that swallowed it would leave the
+    caller believing the run merely returned nothing.
+    """
+    from optjournal.jobs import run_job
+
+    def boom(_conn, _ctx):
+        raise RuntimeError("the keychain is locked")
+
+    _stub(monkeypatch, "market", boom)
+    with pytest.raises(RuntimeError, match="keychain"):
+        run_job(conn, "market", ctx=ctx)
+
+    row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
+    assert row["status"] == "failed"
+    assert "RuntimeError" in row["detail"] and "keychain" in row["detail"], (
+        "the ledger must record the CAUSE, not just that something failed"
+    )
+    assert conn.execute(
+        "SELECT consecutive_failures FROM job_state").fetchone()[0] == 1
+
+
+def test_an_interrupted_run_is_resolved_by_the_kernel_not_by_a_timeout(conn, ctx):
+    """(b) A `running` row whose flock is free had its process killed.
+
+    `flock` releases on process death, including SIGKILL, so this needs no PID, no
+    heartbeat and no staleness threshold -- and it is correct across laptop sleep,
+    where every wall-clock rule is wrong: this machine measured 44.6 hours of sleep
+    excluded from `monotonic`.
+    """
+    from optjournal.jobs import interrupted_runs
+
+    conn.execute(
+        "INSERT INTO job_runs (job, started_at, status)"
+        " VALUES ('bars_live', '2026-08-09T14:00:00+00:00', 'running')")
+    conn.commit()
+
+    assert interrupted_runs(conn, archive_dir=ctx.archive_dir) == 1
+    row = conn.execute("SELECT status, finished_at, detail FROM job_runs").fetchone()
+    assert row["status"] == "interrupted"
+    assert row["finished_at"], "an interrupted run must be stamped finished"
+    assert row["detail"], "and must say why, or it reads as a mystery"
+
+
+def test_a_run_that_is_genuinely_in_flight_keeps_its_row(conn, ctx, monkeypatch):
+    """The other direction, or every live run would be declared dead on page load.
+
+    Probed from inside the work, while the runner holds the lock -- which is
+    exactly when a page load happens.
+    """
+    from optjournal.jobs import Outcome, interrupted_runs, run_job
+
+    seen = {}
+
+    def work(inner_conn, _ctx):
+        seen["resolved"] = interrupted_runs(inner_conn, archive_dir=ctx.archive_dir)
+        seen["status"] = inner_conn.execute(
+            "SELECT status FROM job_runs").fetchone()["status"]
+        return Outcome("ok")
+
+    _stub(monkeypatch, "market", work)
+    run_job(conn, "market", ctx=ctx)
+    assert seen["resolved"] == 0, (
+        "a running job's row was resolved as interrupted while it was still "
+        "holding its lock"
+    )
+    assert seen["status"] == "running"
+
+
+def test_resolving_interrupted_runs_is_safe_with_no_rows(conn, ctx):
+    """The common case: nothing running, nothing to do, no lock files needed."""
+    from optjournal.jobs import interrupted_runs
+
+    assert interrupted_runs(conn, archive_dir=ctx.archive_dir) == 0
+
+
+def test_the_sync_job_calls_the_shared_path_rather_than_reimplementing_it(ctx):
+    """THE NEGATIVE OBLIGATION from the plan, and it needs an assertion.
+
+    `flex.fetch` owns the cooldown, holds the fetch flock and stamps
+    `.fetch-state.json`. A job that reimplemented that sequence would be a second
+    thing to keep in step with a lockout budget -- and this project has already
+    paid for two implementations of sync drifting apart (`new_trades` was a COUNT
+    in one and a row LIST in the other).
+
+    Source-level because producing a real sync spends an IBKR request.
+    """
+    import inspect
+
+    from optjournal import jobs as mod
+
+    src = inspect.getsource(mod._sync)
+    assert "sync_journal(" in src, (
+        "the sync job no longer calls the shared path, so the cooldown, the fetch "
+        "lock and the snapshot are now its own problem"
+    )
+    for forbidden in ("fetch(", "ingest_file(", "_record_fetch", "cooldown_s"):
+        assert forbidden not in src, (
+            f"the sync job reaches for {forbidden!r} directly, which is the "
+            "second implementation this consolidation removed"
+        )
+
+
+def test_a_sync_with_no_credentials_reports_rather_than_raising(conn, tmp_path):
+    """A journal serving an ingested archive with no query id is a supported state.
+
+    It must record `failed` with a cause the page can show, not raise past the
+    ledger -- otherwise the one job that spends an IBKR request is also the one
+    whose misconfiguration leaves no trace.
+    """
+    from optjournal.jobs import Context, run_job
+
+    bare = Context(archive_dir=tmp_path / "raw", db_path=tmp_path / "j.db")
+    assert bare.query_id is None
+    run_job(conn, "sync", ctx=bare)
+    row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
+    assert row["status"] == "failed"
+    assert "query id" in row["detail"]

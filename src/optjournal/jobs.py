@@ -28,11 +28,34 @@ found.
 
 from __future__ import annotations
 
+import enum
 import logging
 import sqlite3
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
-__all__ = ["KNOWN_JOBS", "RUN_HISTORY", "prune_runs", "record_run"]
+from optjournal.bars import backfill_bars
+from optjournal.events import EventFetchError, EventRateLimited, fetch_events, store_events
+from optjournal.flex import FetchCooldown, TokenMissing
+from optjournal.locks import LockTimeout, locked
+
+__all__ = [
+    "JOBS",
+    "KNOWN_JOBS",
+    "RUN_HISTORY",
+    "Catchup",
+    "Job",
+    "JobBusy",
+    "Outcome",
+    "UnknownJob",
+    "job_by_name",
+    "prune_runs",
+    "record_run",
+    "run_job",
+]
 
 log = logging.getLogger(__name__)
 
@@ -102,18 +125,7 @@ def record_run(
             (job, fired_for, started_at or stamp, stamp, status, detail, done, total),
         )
         run_id = int(cursor.lastrowid or 0)
-        conn.execute(
-            "INSERT INTO job_state (job, last_fired_for, last_status,"
-            " consecutive_failures, heartbeat_at) VALUES (?,?,?,?,NULL)"
-            " ON CONFLICT(job) DO UPDATE SET"
-            "   last_fired_for = COALESCE(excluded.last_fired_for, last_fired_for),"
-            "   last_status = excluded.last_status,"
-            # Reset on anything that is not a failure, so the count means
-            # "consecutive", not "ever". `missed` is not a failure of the job.
-            "   consecutive_failures = CASE WHEN excluded.last_status = 'failed'"
-            "     THEN consecutive_failures + 1 ELSE 0 END",
-            (job, fired_for, status, 1 if status == "failed" else 0),
-        )
+        _upsert_state(conn, job, status, fired_for)
         prune_runs(conn, job)
         conn.commit()
         return run_id
@@ -126,6 +138,34 @@ def record_run(
         if conn.in_transaction:
             conn.rollback()
         return 0
+
+
+def _upsert_state(
+    conn: sqlite3.Connection, job: str, status: str, fired_for: int | None
+) -> None:
+    """Update the job's scheduling anchor. Does NOT commit; the caller owns that.
+
+    One function rather than the same UPSERT written at each of its three call
+    sites (`record_run`, `_finish`, `interrupted_runs`), because the
+    `consecutive_failures` rule is the subtle part: it must reset on anything that
+    is not a failure, or "consecutive" means "ever" and a transient failure backs
+    off forever. Three copies of that CASE is three chances for one to drift.
+
+    `heartbeat_at` is deliberately untouched. It belongs to the TICK LOOP, not to
+    a job outcome -- the whole point of the two signals being separate is that a
+    job succeeding says nothing about whether anything is driving the schedule.
+    Writing it here would make every manual run look like a live scheduler.
+    """
+    conn.execute(
+        "INSERT INTO job_state (job, last_fired_for, last_status,"
+        " consecutive_failures, heartbeat_at) VALUES (?,?,?,?,NULL)"
+        " ON CONFLICT(job) DO UPDATE SET"
+        "   last_fired_for = COALESCE(excluded.last_fired_for, last_fired_for),"
+        "   last_status = excluded.last_status,"
+        "   consecutive_failures = CASE WHEN excluded.last_status = 'failed'"
+        "     THEN consecutive_failures + 1 ELSE 0 END",
+        (job, fired_for, status, 1 if status == "failed" else 0),
+    )
 
 
 def prune_runs(conn: sqlite3.Connection, job: str, *, keep: int = RUN_HISTORY) -> int:
@@ -157,3 +197,475 @@ def prune_runs(conn: sqlite3.Connection, job: str, *, keep: int = RUN_HISTORY) -
         f"DELETE FROM job_runs WHERE job = ? AND id NOT IN ({placeholders})",
         (job, *keep_ids))
     return cursor.rowcount or 0
+
+
+# ---------------------------------------------------------------------------
+# The registry: what jobs exist, and when they should run.
+#
+# THE REGISTRY IS CODE, AND THAT IS THE FIX FOR A SPECIFIC FAILURE. MeshClaw's
+# `crons.json` holds four optjournal jobs and NONE of them is the calendar
+# refresh -- re-verified: `grep -c optjournal-market ~/.meshclaw/crons.json` is 0.
+# So 143 lines of reviewed, tested, README-documented calendar policy have never
+# run on a schedule, and `market_events` holds one fetch rather than the daily
+# accumulation its docstring's argument depends on. Registration was an
+# unversioned, hand-typed side channel that no test could see. Here, "exists" and
+# "registered" are one fact, and `tests/test_jobs.py` can read it.
+#
+# The schedules below are the ones MeshClaw is running TODAY, read from
+# crons.json rather than from the shims' docstrings (they disagree: the shim's
+# suggested `cron_add` for market says 11:00 Dublin, and no such job exists):
+#
+#     optjournal-daily-sync    0 12 * * 2-6      Europe/Dublin     900s
+#     optjournal-bars-live     5 10-16 * * 1-5   America/New_York  300s
+#     optjournal-bars-daily    30 12 * * 2-6     Europe/Dublin     600s
+#     optjournal-bars-audit    0 13 * * 2-6      Europe/Dublin     120s
+#
+# `bars-audit` is deliberately ABSENT from this registry: step 4 moved it from a
+# job to a field computed on every page load (`serialize.audit_data`), because a
+# watchdog that is itself a cron stops when the thing it watches stops -- and did.
+# `market` is present for the first time.
+# ---------------------------------------------------------------------------
+
+
+class Catchup(enum.Enum):
+    """What a job should do about an instant it slept through.
+
+    A three-valued enum on the spec rather than a boolean plus a comment, so
+    "run everything overdue" is impossible to write by accident and the one
+    genuinely dangerous case is in the type. Step 6's reconciler reads this; step
+    5 only records it, so that the schedule and its catch-up policy arrive
+    together rather than the schedule arriving first and being guessed at later.
+    """
+
+    #: Run the most recent missed instant once, if inside `window_s`. Never a
+    #: backlog: two noon syncs in a row would spend two IBKR requests to fetch
+    #: the same statement twice.
+    LATEST = "latest"
+    #: Not a wall-clock fire at all -- due while inside a window and the last
+    #: success is old enough. `bars_live` only, see its Job below.
+    WINDOW = "window"
+    #: A missed instant is simply missed.
+    NONE = "none"
+
+
+@dataclass(frozen=True)
+class Context:
+    """Everything a job's work needs that is not the connection.
+
+    A frozen object rather than a widening argument list, for the reason
+    `web.ServeConfig` exists: the alternative is module-level state that two
+    servers in one process silently share, which the test suite creates routinely.
+
+    `query_id` may be None -- a journal serving an already-ingested archive with no
+    credentials configured is a supported state, and `sync` then reports `failed`
+    with a cause rather than raising past the ledger.
+    """
+
+    archive_dir: Path
+    db_path: Path
+    query_id: str | None = None
+    assets: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Job:
+    """One schedulable unit of work.
+
+    Frozen because a registry entry that could be mutated at runtime is a
+    schedule nothing can be held to -- which is the `crons.json` failure in a
+    different shape.
+
+    `run` takes an open connection plus a `Context` and returns an `Outcome`. It
+    calls FUNCTIONS, never the CLI, and that is load-bearing rather than tidy:
+    shelling out means ~6 exit-code branches per job that flatten every cause into
+    an integer, and the 2026-08-07 sync failure proves the cost. It was a locked
+    keychain (`keyring.backends.macOS ... find_generic_password`), which is NOT
+    `flex.TokenMissing`, so it never mapped to exit 2 -- it arrived as an uncaught
+    traceback, exit 1, and a generic failure that reached nobody. A typed exception
+    cannot be flattened that way.
+    """
+
+    name: str
+    run: Callable[[sqlite3.Connection, Context], Outcome]
+    #: Minute and hour of the scheduled instant, in `zone`. Two integers rather
+    #: than a cron expression: every schedule here is "once at HH:MM on these
+    #: weekdays", and a parser would be code accepting expressions nothing writes.
+    minute: int
+    hour: int
+    #: ISO weekdays (Monday=1). `sync` runs Tue-Sat because a US Friday session
+    #: settles into a statement Saturday morning European time.
+    weekdays: tuple[int, ...]
+    #: The job's own zone. `bars_live` is Eastern because market hours ARE an
+    #: Eastern concept, so it follows US DST without being edited twice a year;
+    #: the rest are the reader's local zone, where "before breakfast" is the
+    #: actual requirement.
+    zone: str
+    catchup: Catchup
+    window_s: int
+    timeout_s: int
+    #: Whether a run consumes one of IBKR's rate-limited Flex requests. Read by
+    #: the reconciler before retrying anything, and the reason `sync` may not be
+    #: made due again by a mere failure (see the plan's step 6).
+    spends_broker_request: bool = False
+
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.zone)
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What one run did, in the ledger's own vocabulary.
+
+    `status` is constrained to `_STATUSES` by `record_run`, so a job cannot
+    invent one. The distinction that matters is `ok` versus `nothing`: an empty
+    run is not a success and not a failure, and collapsing the two is precisely
+    what let three cron jobs report health for two days while collecting nothing.
+    """
+
+    status: str
+    detail: str = ""
+    done: int = 0
+    total: int = 0
+
+
+class UnknownJob(KeyError):
+    """No job by that name. Its own type so the endpoint can answer 400."""
+
+
+class JobBusy(RuntimeError):
+    """This job is already running, in this process or another one.
+
+    Raised rather than queued: every job here is idempotent and cheap to retry
+    on the next tick, and a queue behind a job that spends IBKR requests is a way
+    to spend several at once.
+    """
+
+    def __init__(self, job: str, run_id: int | None = None) -> None:
+        super().__init__(f"{job} is already running")
+        self.job = job
+        self.run_id = run_id
+
+
+# ---------------------------------------------------------------------------
+# The work each job does.
+#
+# Thin on purpose: the policy lives in `flex`, `bars` and `events`, and these
+# translate a typed exception into a ledger status. A branch here that did real
+# work would be a second implementation of something already tested.
+# ---------------------------------------------------------------------------
+
+
+def _bars(conn: sqlite3.Connection, _ctx: Context, *, live: bool) -> Outcome:
+    """Fetch the manifest's windows. Shared by `bars_live` and `bars_daily`.
+
+    One function with a flag rather than two, because the two differ ONLY in what
+    they ask for -- which is also how `cron/optjournal_bars.py` is written, and
+    the reason it is one file.
+
+    Per-window failures are collected by `backfill_bars` rather than raised (one
+    unreachable contract must not abandon the book), so the status is derived from
+    the outcome rather than from an exception.
+    """
+    outcome = backfill_bars(conn, perishable_only=live)
+    if outcome.failures:
+        return Outcome("failed", "; ".join(outcome.failures)[:400],
+                       outcome.written, outcome.requested)
+    return Outcome(
+        "ok" if outcome.written else "nothing",
+        f"{outcome.written} bar(s), {outcome.skipped} empty",
+        outcome.written, outcome.requested,
+    )
+
+
+def _market(conn: sqlite3.Connection, _ctx: Context) -> Outcome:
+    """Refresh the economic calendar.
+
+    `EventRateLimited` is `nothing`, NOT `failed`: the feed pushed back, nothing
+    was lost, and the same week is served later. Counting that as a failure would
+    accumulate `consecutive_failures` for a working system and eventually back
+    off a job that was never broken.
+    """
+    try:
+        events = fetch_events()
+    except EventRateLimited as exc:
+        return Outcome("nothing", f"rate limited: {exc}")
+    except EventFetchError as exc:
+        return Outcome("failed", str(exc)[:400])
+    stored = store_events(conn, events)
+    return Outcome("ok" if stored else "nothing",
+                   f"{len(events)} fetched, {stored} stored", stored, len(events))
+
+
+def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:
+    """Fetch the newest statement and fold it in.
+
+    Deferred import, and it is the one in this module: `sync_journal` lives in
+    `web`, which imports `serialize` -> `bars` -> ... and would make this module's
+    import cost the whole payload layer for the two jobs that do not need it.
+    `tests/test_layering.py` proves the graph stays acyclic either way.
+
+    THE COOLDOWN IS NOT REIMPLEMENTED HERE. `flex.fetch` owns it, holds the fetch
+    flock, and stamps `.fetch-state.json`; a second copy of that sequence would be
+    a second thing to keep in step with the lockout budget.
+    """
+    if not ctx.query_id:
+        # A journal with no credentials configured is a supported state, not a
+        # crash: `failed` with the cause is what a reader can act on.
+        return Outcome("failed", "no Flex query id configured")
+
+    from optjournal.web import sync_journal  # noqa: PLC0415 - see docstring
+
+    try:
+        result = sync_journal(
+            conn=conn, archive_dir=ctx.archive_dir, query_id=ctx.query_id,
+            assets=ctx.assets,
+        )
+    except FetchCooldown as exc:
+        # `nothing`: the cooldown is the system working. Retrying is what it
+        # exists to prevent.
+        return Outcome("nothing", f"cooldown: {exc}")
+    except TokenMissing as exc:
+        return Outcome("failed", f"credentials: {exc}")
+    return Outcome(
+        "ok" if result["changed"] else "nothing",
+        result["summary"], result["new_trades"], result["new_trades"],
+    )
+
+
+#: Every job, in DECLARATION ORDER, and the order is load-bearing. Step 6's
+#: worker runs due jobs sequentially down this tuple, which turns "sync before
+#: bars_daily" into a real happens-before edge -- `bars_daily` derives its
+#: manifest from the positions the sync ingests. Today that ordering is two
+#: wall-clock guesses plus a coin flip: MeshClaw's `_compute_jitter` returns
+#: `random.uniform(0, 59*60)` for these expressions, and it was observed putting a
+#: 538 ms audit job 25 minutes late.
+JOBS: tuple[Job, ...] = (
+    Job(
+        name="sync",
+        run=_sync,
+        minute=0, hour=12, weekdays=(2, 3, 4, 5, 6), zone="Europe/Dublin",
+        # A missed noon is worth running at 18:00: the docstring records a
+        # badly-timed sync missing Monday's fills twice.
+        catchup=Catchup.LATEST, window_s=12 * 3600,
+        timeout_s=900,
+        spends_broker_request=True,
+    ),
+    Job(
+        name="bars_daily",
+        run=lambda conn, ctx: _bars(conn, ctx, live=False),
+        # 12:30, thirty minutes behind the sync: a position opened yesterday is
+        # only in the database once that sync has ingested it, and the manifest is
+        # derived from positions. The gap clears the sync's 900s worst case.
+        minute=30, hour=12, weekdays=(2, 3, 4, 5, 6), zone="Europe/Dublin",
+        catchup=Catchup.LATEST, window_s=20 * 3600,   # re-fetchable by definition
+        timeout_s=600,
+    ),
+    Job(
+        name="bars_live",
+        run=lambda conn, ctx: _bars(conn, ctx, live=True),
+        # NOT a wall-clock fire. The minute/hour are the session's own open in ET,
+        # kept so the schedule reads consistently, but `Catchup.WINDOW` means due-
+        # ness is "inside the session AND the last success is over 55 minutes old"
+        # -- one predicate replacing seven cron slots. Sound because the intraday
+        # series is CUMULATIVE within a session: a 13:00 poll returns every
+        # completed bar since the open, so one wake at 14:30 after sleeping since
+        # 10:00 collects the whole session.
+        minute=5, hour=10, weekdays=(1, 2, 3, 4, 5), zone="America/New_York",
+        catchup=Catchup.WINDOW, window_s=55 * 60,
+        timeout_s=300,
+    ),
+    Job(
+        name="market",
+        run=_market,
+        # NEVER REGISTERED WITH MESHCLAW. 11:00 rather than the shim's suggestion
+        # of the same hour as the sync: the calendar feed is independent of IBKR,
+        # so there is no reason for the two to contend, and an hour before the
+        # sync means the week's releases are on screen before the fills are.
+        minute=0, hour=11, weekdays=(1, 2, 3, 4, 5), zone="Europe/Dublin",
+        catchup=Catchup.LATEST, window_s=24 * 3600,   # the feed serves this week
+        timeout_s=120,
+    ),
+)
+
+
+def job_by_name(name: str) -> Job:
+    """The registry entry, or `UnknownJob`.
+
+    A linear scan over four entries rather than a dict built beside the tuple:
+    two containers holding the same registry is one more thing that can disagree,
+    and 4 comparisons is not a cost.
+    """
+    for job in JOBS:
+        if job.name == name:
+            return job
+    raise UnknownJob(name)
+
+
+#: Where a job's lock file lives, under the archive rather than beside the
+#: database: `raw/` is already the provenance root and is already excluded from
+#: anything that copies the journal.
+JOB_LOCK_DIR = "jobs"
+
+
+def job_lock_path(archive_dir: Path, name: str) -> Path:
+    return archive_dir / JOB_LOCK_DIR / f"{name}.lock"
+
+
+def run_job(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    ctx: Context,
+    fired_for: int | None = None,
+) -> int:
+    """Run one job under its own lock, recording before and after. Returns run id.
+
+    THE CLAIM IS WRITTEN AND COMMITTED BEFORE THE WORK STARTS, and this is the
+    one ordering decision in the module worth arguing with. The adversarial review
+    refuted the alternative precisely here: hold the run in memory and write the
+    row on a terminal state, and the window between "is this slot claimed?" and
+    "this slot is claimed" spans the entire job. A SIGKILL mid-fetch -- which
+    launchd `KeepAlive` makes routine, ~10s respawn -- then leaves no row and no
+    stamp, because `flex._record_fetch` runs only after a successful download. The
+    next reconcile finds the slot unclaimed and spends a SECOND IBKR request,
+    deterministically, with no concurrency involved. So: claim, commit, then work.
+
+    THE LOCK IS A `flock`, NOT A THREADING LOCK OR A TABLE, for one reason: the
+    kernel releases it when the process dies. That is what makes an interrupted
+    run detectable without a PID, a heartbeat or a staleness guess -- see
+    `interrupted_runs`. Non-blocking (`timeout_s=0`): every job here is idempotent
+    and cheap to retry on the next tick, so `JobBusy` is a better answer than a
+    queue behind something that spends IBKR requests.
+
+    Raises `UnknownJob` (no such name) or `JobBusy` (already running). Any other
+    exception is recorded as `failed` and re-raised, because a caller that asked
+    for a run is entitled to the traceback -- swallowing it here is what turned
+    the keychain failure into a message that reached nobody.
+    """
+    job = job_by_name(name)
+    lock = job_lock_path(ctx.archive_dir, job.name)
+    try:
+        with locked(lock, timeout_s=0):
+            return _run_locked(conn, job, ctx=ctx, fired_for=fired_for)
+    except LockTimeout:
+        # Held by another runner. The row it committed before starting is what
+        # tells the caller which run to watch.
+        raise JobBusy(job.name, _running_id(conn, job.name)) from None
+
+
+def _run_locked(
+    conn: sqlite3.Connection, job: Job, *, ctx: Context, fired_for: int | None
+) -> int:
+    """The body of `run_job`, with the lock held. See its docstring for the why."""
+    started = datetime.now(UTC).isoformat(timespec="seconds")
+    try:
+        cursor = conn.execute(
+            "INSERT INTO job_runs (job, fired_for, started_at, status, detail)"
+            " VALUES (?,?,?,'running',NULL)",
+            (job.name, fired_for, started),
+        )
+        run_id = int(cursor.lastrowid or 0)
+        conn.commit()          # COMMITTED before the work: see run_job's docstring
+    except sqlite3.IntegrityError:
+        # The partial unique index refused a duplicate `fired_for` -- another
+        # runner claimed this instant first. ROLLED BACK EXPLICITLY, because
+        # sqlite3 does NOT roll back on error and a connection left in a
+        # transaction holds the write lock for the whole BUSY_TIMEOUT_MS.
+        # Measured: the next writer waits 15.55s and then fails, which would mean
+        # the scheduler wedging its own database by losing a race it was DESIGNED
+        # to lose.
+        conn.rollback()
+        raise JobBusy(job.name, _running_id(conn, job.name)) from None
+
+    try:
+        outcome = job.run(conn, ctx)
+    except Exception as exc:                      # noqa: BLE001 - recorded, re-raised
+        _finish(conn, run_id, Outcome("failed", f"{type(exc).__name__}: {exc}"[:400]))
+        raise
+    _finish(conn, run_id, outcome)
+    return run_id
+
+
+def _finish(conn: sqlite3.Connection, run_id: int, outcome: Outcome) -> None:
+    """Stamp the terminal state onto the claim row, and update the anchor.
+
+    Two statements in one transaction: a run whose history says `ok` while the
+    anchor still says `running` would make the job look permanently in flight.
+    """
+    stamp = datetime.now(UTC).isoformat(timespec="seconds")
+    try:
+        conn.execute(
+            "UPDATE job_runs SET finished_at = ?, status = ?, detail = ?,"
+            " done = ?, total = ? WHERE id = ?",
+            (stamp, outcome.status, outcome.detail or None,
+             outcome.done, outcome.total, run_id),
+        )
+        row = conn.execute(
+            "SELECT job, fired_for FROM job_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is not None:
+            _upsert_state(conn, str(row["job"]), outcome.status, row["fired_for"])
+            prune_runs(conn, str(row["job"]))
+        conn.commit()
+    except sqlite3.Error as exc:
+        # Same policy as `record_run`: bookkeeping must not fail the work it
+        # describes, and must not hold the write lock on the way down.
+        log.warning("could not finish run %s: %s", run_id, exc)
+        if conn.in_transaction:
+            conn.rollback()
+
+
+def _running_id(conn: sqlite3.Connection, job: str) -> int | None:
+    """The newest `running` row for `job`, so a 409 can name what to watch."""
+    row = conn.execute(
+        "SELECT id FROM job_runs WHERE job = ? AND status = 'running'"
+        " ORDER BY id DESC LIMIT 1", (job,)).fetchone()
+    return None if row is None else int(row["id"])
+
+
+def interrupted_runs(conn: sqlite3.Connection, *, archive_dir: Path) -> int:
+    """Resolve `running` rows whose process is gone. Returns rows updated.
+
+    THE KERNEL ANSWERS THIS, NOT A HEURISTIC. A `running` row whose per-job
+    `flock` can be acquired has no live holder: `flock` releases on process death,
+    including `SIGKILL`, so there is no PID to check, no timeout to tune, and the
+    answer is correct across laptop sleep -- where every wall-clock staleness rule
+    is wrong, because this machine measured 44.6 hours of sleep excluded from
+    `monotonic`.
+
+    Called on page load rather than by a scheduled job, for the same reason the
+    perishable audit moved out of a cron: a watchdog that is itself scheduled stops
+    when the scheduler does.
+
+    Four sub-millisecond lock attempts. `LOCK_NB` never waits, so a job that IS
+    running costs one failed syscall and keeps its row.
+    """
+    stale = [
+        str(row["job"]) for row in conn.execute(
+            "SELECT DISTINCT job FROM job_runs WHERE status = 'running'")
+    ]
+    updated = 0
+    for name in stale:
+        try:
+            with locked(job_lock_path(archive_dir, name), timeout_s=0):
+                pass          # acquired, so nothing holds it: the runner is gone
+        except LockTimeout:
+            continue          # genuinely running
+        except OSError as exc:
+            # An unreadable lock directory must not blank a page load.
+            log.warning("could not probe %s's lock: %s", name, exc)
+            continue
+        try:
+            cursor = conn.execute(
+                "UPDATE job_runs SET status = 'interrupted', finished_at = ?,"
+                " detail = COALESCE(detail, 'the process died before finishing')"
+                " WHERE job = ? AND status = 'running'",
+                (datetime.now(UTC).isoformat(timespec="seconds"), name),
+            )
+            updated += cursor.rowcount or 0
+            _upsert_state(conn, name, "interrupted", None)
+            conn.commit()
+        except sqlite3.Error as exc:
+            log.warning("could not resolve %s's interrupted run: %s", name, exc)
+            if conn.in_transaction:
+                conn.rollback()
+    return updated

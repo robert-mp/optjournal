@@ -222,18 +222,35 @@ def test_the_timeout_ladder_is_ordered(sync_cron):
 
 
 def test_a_sync_payload_key_the_cron_reads_still_exists():
-    """Every key `_describe` reaches for, against `cmd_sync`'s real emit block.
+    """Every key `_describe` reaches for, against the code that really emits them.
 
     Source-level like test_web's /api/sync guard, and for the same reason:
     producing a genuine payload spends an IBKR request.
+
+    Reads `web.sync_journal`, not `cli.cmd_sync`. The keys moved there when the two
+    sync implementations collapsed into one -- `cmd_sync` now forwards the dict it
+    is handed -- and this test caught the move rather than the move breaking the
+    cron, which is what a source-level pin is for. It follows the PRODUCER, and it
+    also asserts the forwarding, because a pin on a function the CLI no longer
+    calls would be green and meaningless.
     """
     import inspect
 
     from optjournal.cli import cmd_sync
+    from optjournal.web import sync_journal
 
-    src = inspect.getsource(cmd_sync)
+    src = inspect.getsource(sync_journal)
     for key in ("new_trades", "new_trade_rows", "new_cash", "warnings", "changed"):
-        assert f'"{key}"' in src, f"cmd_sync no longer emits {key!r}"
+        assert f'"{key}"' in src, f"the sync payload no longer carries {key!r}"
+    forwards = inspect.getsource(cmd_sync)
+    assert "sync_journal(" in forwards, (
+        "cmd_sync no longer calls sync_journal, so the keys checked above are not "
+        "necessarily the ones the cron receives"
+    )
+    assert "_emit(data" in forwards, (
+        "cmd_sync no longer emits the payload it was handed, so the cron's JSON "
+        "may have a different shape from the one pinned here"
+    )
 
 
 def test_the_bars_cron_maps_every_outcome_to_a_delivery(bars_cron):
