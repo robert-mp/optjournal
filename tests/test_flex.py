@@ -287,3 +287,149 @@ def test_an_unparseable_timestamp_does_not_wedge_fetching(tmp_path):
     """
     flex._write_state(tmp_path, {"1591754": {"last_fetch": "not-a-timestamp"}})
     assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+
+
+# --------------------------------------------------------------------------
+# The socket timeout (SCHEDULER_PLAN.md step 7).
+#
+# `py_ibkr` calls `urlopen(req)` with NO timeout (py_ibkr/flex/client.py:109) and
+# `socket.getdefaulttimeout()` is None, so a connection that opens and then stalls
+# blocks forever. Verified both facts before writing the fix.
+#
+# Today the only thing that kills such a stall is the MeshClaw cron's 720s
+# subprocess timeout, and the scheduler plan DELETES the cron. In the app the same
+# stall would hold a job thread, its `flock` and its `running` row indefinitely --
+# and Python cannot interrupt a thread blocked in a syscall, so no amount of
+# `timeout_s` on the job spec would help. It has to be on the socket.
+# --------------------------------------------------------------------------
+
+
+def test_a_stalled_response_times_out_instead_of_hanging_forever():
+    """Against a REAL server that accepts and then says nothing.
+
+    The whole point is behaviour under a stall, which no assertion about an
+    attribute can show: `urlopen` with no timeout would sit in `recv` until the peer
+    gave up. A one-second timeout against a server that never replies is the
+    smallest honest reproduction.
+    """
+    import socket
+    import threading
+    import time
+
+    from optjournal.flex import FlexError, _TimeoutFlexClient
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    held: list[socket.socket] = []
+
+    def stall() -> None:
+        # Accept, then never write a response. The client is left waiting on recv,
+        # which is exactly the failure mode being bounded.
+        conn, _ = listener.accept()
+        held.append(conn)
+
+    thread = threading.Thread(target=stall, daemon=True)
+    thread.start()
+    try:
+        client = _TimeoutFlexClient(user_agent="test", timeout_s=1)
+        started = time.monotonic()
+        with pytest.raises(FlexError) as caught:
+            client._get(f"http://127.0.0.1:{port}/stalls")
+        elapsed = time.monotonic() - started
+    finally:
+        for conn in held:
+            conn.close()
+        listener.close()
+
+    assert elapsed < 10, (
+        f"the request took {elapsed:.1f}s against a 1s timeout, so the timeout is "
+        "not reaching urlopen -- a stalled Flex fetch would hold a job thread, its "
+        "flock and its `running` row forever"
+    )
+    # And it arrives as the same exception every other transport failure does, so
+    # `fetch`'s callers are unchanged.
+    assert "timed out" in str(caught.value).lower(), (
+        f"the timeout surfaced as {caught.value!r}, not a recognisable timeout"
+    )
+
+
+def test_the_timeout_is_not_installed_process_wide():
+    """`socket.setdefaulttimeout()` would have been the one-line version, and it
+    would have been wrong: it is PROCESS-GLOBAL, so it would also apply to the web
+    server's own accept and read sockets. A scheduler must not configure the HTTP
+    server by side effect.
+    """
+    import inspect
+    import socket
+
+    from optjournal import flex
+
+    assert socket.getdefaulttimeout() is None, (
+        "importing optjournal.flex set a process-wide socket timeout, which now "
+        "applies to the web server's sockets too"
+    )
+    # CODE, NOT PROSE, and this took two attempts. Grepping the whole source
+    # tripped on this test's own explanation of why the global is wrong; a
+    # line-prefix filter then tripped on `_TimeoutFlexClient`'s docstring, which
+    # says the same thing in the right place. `ast` is the only version that
+    # actually distinguishes the two: it walks real Call nodes, so a mention in
+    # any comment or docstring is invisible to it by construction.
+    import ast
+
+    calls = {
+        ast.unparse(node.func)
+        for node in ast.walk(ast.parse(inspect.getsource(flex)))
+        if isinstance(node, ast.Call)
+    }
+    assert not any("setdefaulttimeout" in call for call in calls), (
+        "flex CALLS the process-global default instead of passing a timeout to its "
+        f"own requests: {sorted(c for c in calls if 'timeout' in c)}"
+    )
+
+
+def test_the_real_client_is_the_one_with_the_timeout():
+    """The subclass has to be what `fetch` actually uses.
+
+    Worth pinning because the failure is silent: `FlexClient` and
+    `_TimeoutFlexClient` behave identically on a healthy link, so a revert to the
+    parent would pass every other test in this file and only show up as a hung
+    scheduler thread months later.
+    """
+    import inspect
+
+    from optjournal import flex
+
+    # Through the SEAM, not the class name. `fetch` constructs
+    # `_client_factory`, which exists because naming the class at the call site
+    # broke `tests/test_locks.py`'s network stub -- it kept replacing
+    # `flex.FlexClient`, a name nothing called any more, and two subprocesses went
+    # to the real IBKR endpoint. So the invariant is about what the factory IS.
+    assert flex._client_factory is flex._TimeoutFlexClient, (
+        f"the fetch path builds {flex._client_factory!r}, which is not the client "
+        "that carries a socket timeout"
+    )
+    body = inspect.getsource(flex._fetch_locked)
+    assert "_client_factory(" in body, (
+        "the fetch path no longer goes through the one stubbable seam, so a test "
+        "that stubs the network can silently miss and make real requests"
+    )
+    assert "= FlexClient(" not in body
+
+
+def test_the_socket_timeout_sits_below_the_polling_ceiling():
+    """Two different budgets, and confusing them is the mistake to avoid.
+
+    `POLL_WORST_CASE_S` (660s) is the wall clock for the whole two-stage fetch
+    INCLUDING the retry ladder that waits for IBKR to generate a statement. The
+    socket timeout bounds ONE request inside that. A socket timeout above the
+    ceiling could never fire; one at a few seconds would kill a legitimately slow
+    download.
+    """
+    from optjournal.flex import FETCH_SOCKET_TIMEOUT_S, POLL_WORST_CASE_S
+
+    assert 10 <= FETCH_SOCKET_TIMEOUT_S < POLL_WORST_CASE_S, (
+        f"the per-request timeout ({FETCH_SOCKET_TIMEOUT_S}s) is not inside the "
+        f"polling ceiling ({POLL_WORST_CASE_S}s)"
+    )

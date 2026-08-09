@@ -27,9 +27,11 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import keyring
-from py_ibkr import FlexClient, FlexQueryResponse
+from py_ibkr import FlexClient, FlexError, FlexQueryResponse
 from py_ibkr.flex.parser import parse_xml_file
 
 from optjournal.locks import locked
@@ -127,6 +129,69 @@ MAX_RETRY_INTERVAL = 120
 POLL_WORST_CASE_S = 2 * sum(
     min(RETRY_INTERVAL * (2**i), MAX_RETRY_INTERVAL) for i in range(MAX_RETRIES)
 )
+
+
+#: Per-HTTP-REQUEST socket timeout for the Flex calls. Not a budget for the whole
+#: fetch: `download` polls, so the wall-clock ceiling is `POLL_WORST_CASE_S` and
+#: this bounds each individual request inside it.
+#:
+#: IT EXISTS BECAUSE NOTHING ELSE BOUNDS A HUNG SOCKET. `py_ibkr` calls
+#: `urlopen(req)` with no timeout (py_ibkr/flex/client.py:109) and
+#: `socket.getdefaulttimeout()` is None -- both verified -- so a connection that
+#: opens and then stalls blocks forever. Today the only killer is the MeshClaw
+#: cron's 720s subprocess timeout, and SCHEDULER_PLAN.md deletes the cron. In the
+#: app the same stall would hold a job thread, its `flock` and its `running` row
+#: indefinitely, and Python cannot interrupt a thread blocked in a syscall -- so no
+#: `timeout_s` on a job spec could help. It has to be on the socket.
+#:
+#: 60s per request: an Activity statement download is seconds on a working link,
+#: and `download`'s own retry ladder handles a slow GENERATION. A request that has
+#: produced nothing in a minute is a stall, not slowness.
+FETCH_SOCKET_TIMEOUT_S = 60
+
+
+class _TimeoutFlexClient(FlexClient):
+    """`FlexClient` with a socket timeout on every request.
+
+    A SUBCLASS RATHER THAN `socket.setdefaulttimeout()`, and the distinction
+    matters: the default is PROCESS-GLOBAL, so it would also apply to the web
+    server's own accept and read sockets -- a scheduler configuring the HTTP server
+    by side effect. `_get` is the single choke point both Flex calls go through
+    (`send_request` and `get_statement` each call it), so overriding it covers the
+    whole protocol with one method.
+
+    Reimplements the body rather than calling `super()`, because the timeout has to
+    reach `urlopen` itself; the parent passes no `timeout` argument at all.
+    """
+
+    def __init__(self, *args: object, timeout_s: int = FETCH_SOCKET_TIMEOUT_S,
+                 **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.timeout_s = timeout_s
+
+    def _get(self, url: str) -> bytes:
+        request = Request(url, headers={"User-Agent": self.user_agent})  # noqa: S310
+        try:
+            with urlopen(request, timeout=self.timeout_s) as response:  # noqa: S310
+                return bytes(response.read())
+        except HTTPError as exc:
+            raise FlexError(f"HTTP Error {exc.code}: {exc.reason}") from exc
+        except URLError as exc:
+            raise FlexError(f"URL Error: {exc.reason}") from exc
+        except TimeoutError as exc:
+            # MEASURED, and my first version got it wrong: a socket timeout raises a
+            # BARE `TimeoutError`, which is an `OSError` and NOT a `URLError`
+            # (verified -- `isinstance(exc, URLError)` is False). Without this clause
+            # the timeout escaped unhandled instead of arriving as the `FlexError`
+            # every other transport failure does, so `sync_journal`'s callers would
+            # have seen a raw traceback -- exactly the shape of the 2026-08-07
+            # keychain failure this plan exists to stop.
+            raise FlexError(f"timed out after {self.timeout_s}s: {exc}") from exc
+
+
+#: What `fetch` constructs. A module-level indirection so there is exactly ONE name
+#: to replace when a test needs the network stubbed -- see `_fetch_locked`.
+_client_factory = _TimeoutFlexClient
 
 
 class TokenMissing(RuntimeError):
@@ -388,7 +453,14 @@ def _fetch_locked(
         _check_cooldown(archive_dir, query_id, cooldown_s)
 
     token = read_token(account)
-    client = FlexClient(user_agent=USER_AGENT)
+    # ONE SEAM NAME. `_client_factory` rather than naming the class here, because
+    # the class name IS the stub point: `tests/test_locks.py` replaces
+    # `flex.FlexClient` to keep the cross-process lock tests off the network, and
+    # introducing `_TimeoutFlexClient` at the call site silently broke that -- the
+    # stub still applied to a name nothing called, and two subprocesses went to the
+    # real IBKR endpoint. Caught by that test failing; it would otherwise have been
+    # a suite that quietly started making network calls.
+    client = _client_factory(user_agent=USER_AGENT)
 
     log.info("requesting Flex query %s", query_id)
     raw = client.download(

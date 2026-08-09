@@ -162,7 +162,11 @@ def test_two_processes_cannot_both_clear_the_fetch_cooldown(tmp_path):
                 return b"<FlexQueryResponse></FlexQueryResponse>"
 
         flex.read_token = lambda account=None: "token"
-        flex.FlexClient = _Client
+        # `_client_factory`, the module's single seam: `fetch` used to construct
+        # `FlexClient` directly, and when a socket-timeout subclass was introduced
+        # this stub kept applying to a name nothing called -- so both subprocesses
+        # went to the REAL IBKR endpoint. This test failing is what caught it.
+        flex._client_factory = _Client
         flex.parse_xml_file = lambda path: object()
 
         try:
