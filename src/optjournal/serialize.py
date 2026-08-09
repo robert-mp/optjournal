@@ -31,7 +31,9 @@ from optjournal.bars import MARKET_TZ, audit_perishable
 from optjournal.events import (
     DEFAULT_COUNTRIES,
     DEFAULT_IMPACTS,
+    IMPACT_ORDER,
     SOURCE,
+    default_scope,
     upcoming,
 )
 from optjournal.history import HistoryReport
@@ -482,6 +484,22 @@ def market_data(
     `impact` travels as the feed stated it, and `impact_source` names whose
     judgement it is. Same rule as the AutoFX markup: an assessment presented
     without attribution reads as a measurement.
+
+    TWO INDEPENDENT AXES, not one flag. This used to send `key` per event --
+    a single boolean meaning "USD and High" -- and the page could only offer that
+    or everything. Two axes are what the reader actually wants ("USD, but all
+    impacts") and, more to the point, an event carries its `country` and `impact`
+    already: a server-side boolean that ANDs them throws away which half failed,
+    so no finer question can be asked of the payload without a new field per
+    question. The page filters on the two values instead, and `countries` /
+    `impacts` here carry the VOCABULARY (what is present in this window, with
+    counts) plus the journal's defaults -- so the buttons are built from what was
+    stored rather than from a hard-coded list that would drift from the feed.
+
+    Per-day counts are NOT precomputed per axis combination: there are 2^n of
+    them, and the page already holds every event. `MarketDay.events` is the day's
+    total and the page counts its own filtered subset, which is the only way the
+    strip and the rows cannot disagree.
     """
     monday = (now.astimezone(MARKET_TZ)
               .replace(hour=0, minute=0, second=0, microsecond=0)
@@ -506,23 +524,11 @@ def market_data(
             "impact": row["impact"],
             "forecast": row["forecast"],
             "previous": row["previous"],
-            #: Whether this row survives the default view. Computed HERE, from
-            #: the same constants the CLI uses, so the page filters on a flag
-            #: rather than on its own copy of "USD high-impact" -- a second copy
-            #: in JavaScript would drift the moment either side gained a country.
-            "key": (row["country"] in DEFAULT_COUNTRIES
-                    and row["impact"] in DEFAULT_IMPACTS),
         })
 
     by_day: dict[str, int] = {}
-    high_by_day: dict[str, int] = {}
-    key_by_day: dict[str, int] = {}
     for event in events:
         by_day[event["day"]] = by_day.get(event["day"], 0) + 1
-        if event["impact"] == "High":
-            high_by_day[event["day"]] = high_by_day.get(event["day"], 0) + 1
-        if event["key"]:
-            key_by_day[event["day"]] = key_by_day.get(event["day"], 0) + 1
 
     today = now.astimezone(MARKET_TZ).date().isoformat()
     week = []
@@ -532,14 +538,38 @@ def market_data(
             "day": day,
             "label": (monday + timedelta(days=offset)).strftime("%a"),
             "dom": (monday + timedelta(days=offset)).day,
+            #: The day's TOTAL. The page counts the filtered subset itself from
+            #: `events`, so the strip cannot disagree with the rows it opens --
+            #: which a precomputed per-filter count could, and did.
             "events": by_day.get(day, 0),
-            "high": high_by_day.get(day, 0),
-            #: The count under the DEFAULT view, so the strip and the rows agree.
-            #: Without it a day would show three dots and then open empty, which
-            #: reads as a broken calendar rather than as a filtered one.
-            "key_events": key_by_day.get(day, 0),
             "today": day == today,
         })
+
+    #: The axis vocabularies, each ordered for the buttons that render them and
+    #: carrying the count so a choice states what it costs before it is pressed.
+    #: Built from what is STORED in the window rather than from the feed's full
+    #: alphabet: a country with no events this week is a button that does nothing.
+    countries = [
+        {"value": value,
+         "events": sum(1 for event in events if event["country"] == value),
+         "default": value in DEFAULT_COUNTRIES}
+        # Alphabetical, because no severity order exists for a currency and
+        # ordering by count would reshuffle the row as the week filled up.
+        # CASE-INSENSITIVELY: the feed's global rows use the country `All`, and a
+        # plain `sorted` puts it after every all-caps code (`AUD` < `All` by
+        # codepoint), so the one non-currency chip landed in the middle of the row.
+        for value in sorted({event["country"] for event in events},
+                            key=lambda value: value.casefold())
+    ]
+    impacts = [
+        {"value": value,
+         "events": sum(1 for event in events if event["impact"] == value),
+         "default": value in DEFAULT_IMPACTS}
+        # Severity order, from `events.IMPACT_ORDER`, so the page holds no copy
+        # of what "more important" means. Intersected with what is present.
+        for value in IMPACT_ORDER
+        if any(event["impact"] == value for event in events)
+    ]
 
     return {
         "week": week,
@@ -551,13 +581,21 @@ def market_data(
         #: the journal graded the event itself.
         "impact_source": SOURCE,
         "zone": str(MARKET_TZ),
-        #: What the default view narrows TO, named so the page can say it rather
-        #: than hard-coding the words beside a toggle that might mean something
-        #: else later.
-        "default_scope": " ".join(DEFAULT_COUNTRIES) + " "
-                         + "/".join(DEFAULT_IMPACTS).lower() + "-impact",
+        "countries": countries,
+        "impacts": impacts,
+        #: What the DEFAULT view narrows to, in words, so the page can say it
+        #: rather than assembling the sentence from the two lists itself. From
+        #: `events.default_scope` so the CLI and the page cannot describe the
+        #: default differently -- the drift that shipped once already.
+        "default_scope": default_scope(),
         "total_events": len(events),
-        "key_events": sum(1 for event in events if event["key"]),
+        #: How many rows the DEFAULT filter shows, so the page can report what
+        #: resetting would cost without recomputing the server's own defaults.
+        "default_events": sum(
+            1 for event in events
+            if event["country"] in DEFAULT_COUNTRIES
+            and event["impact"] in DEFAULT_IMPACTS
+        ),
     }
 
 
