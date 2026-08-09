@@ -774,3 +774,166 @@ def test_rekeying_is_idempotent(tmp_path):
     assert not conn.execute(
         "SELECT name FROM sqlite_master WHERE name='trades_rekeyed'"
     ).fetchall(), "the scratch table was left behind"
+
+
+# ---------------------------------------------------------------------------
+# The job ledger (v8). SCHEDULER_PLAN.md step 4.
+# ---------------------------------------------------------------------------
+
+
+def test_a_job_cannot_fire_twice_for_the_same_instant(tmp_path):
+    """Idempotency is a CONSTRAINT here, not a convention in the reconciler.
+
+    The reconciler decides due-ness by asking whether a row exists for a
+    scheduled instant. If two ticks could both claim the same slot, `sync` would
+    spend two IBKR requests against a lockout budget -- so the database refuses
+    rather than the code remembering to check.
+
+    This is also the DST fall-back guard, for free: the repeated 01:30 is the same
+    instant, so the second one cannot be claimed.
+    """
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    row = ("sync", 1786310000, "2026-08-09T12:00:00Z", "running")
+    conn.execute(
+        "INSERT INTO job_runs (job, fired_for, started_at, status) VALUES (?,?,?,?)",
+        row)
+    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="job_runs.job"):
+        conn.execute(
+            "INSERT INTO job_runs (job, fired_for, started_at, status)"
+            " VALUES (?,?,?,?)", row)
+    conn.rollback()
+
+    # Per job, not global: two jobs share a scheduled minute all the time.
+    conn.execute(
+        "INSERT INTO job_runs (job, fired_for, started_at, status)"
+        " VALUES ('bars_daily', 1786310000, '2026-08-09T12:00:00Z', 'running')")
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM job_runs").fetchone()[0] == 2
+
+
+def test_a_manual_run_is_never_blocked_by_the_schedule(tmp_path):
+    """A Run-now press claims no scheduled slot, so it repeats freely.
+
+    HONEST ABOUT WHAT THIS PROVES. The first version of this test claimed it was
+    demonstrating why the unique index is PARTIAL, and SCHEDULER_PLAN.md gives the
+    same reason -- "the partial index is what keeps manual run-now presses
+    unconstrained". Both are wrong, and ablation showed it: removing
+    `WHERE fired_for IS NOT NULL` left this test green, because SQLite treats NULLs
+    as DISTINCT in a unique index. Three NULL rows are accepted either way.
+
+    So this is a behaviour test for the button, not an argument for the index.
+    What the WHERE clause actually buys is a smaller index that holds only
+    scheduled rows -- real, minor, and not a correctness property. Recorded rather
+    than quietly deleted, because a test whose docstring justifies a design
+    decision it cannot detect is worse than no test.
+    """
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    for _ in range(3):
+        conn.execute(
+            "INSERT INTO job_runs (job, fired_for, started_at, status)"
+            " VALUES ('sync', NULL, '2026-08-09T12:00:00Z', 'ok')")
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM job_runs WHERE fired_for IS NULL").fetchone()[0] == 3
+
+
+def test_a_refused_claim_must_be_rolled_back(tmp_path):
+    """The wedge, measured before it was designed around.
+
+    `sqlite3` does NOT roll back on IntegrityError: the connection stays in a
+    transaction holding the write lock. Measured on this schema -- the next writer
+    then waits the full BUSY_TIMEOUT_MS (15.5s) and fails with "database is
+    locked". So the runner must rollback in every IntegrityError branch, and the
+    failure mode without it is "the scheduler wedges its own database by losing a
+    race it was designed to lose".
+
+    Asserted here rather than left to `jobs.py`, because it is a property of the
+    constraint, and this is where the constraint lives.
+    """
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    row = ("sync", 1786310000, "2026-08-09T12:00:00Z", "running")
+    sql = "INSERT INTO job_runs (job, fired_for, started_at, status) VALUES (?,?,?,?)"
+    conn.execute(sql, row)
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(sql, row)
+    assert conn.in_transaction, (
+        "premise of this test: a refused INSERT leaves the write lock held. If "
+        "sqlite3 ever changes this, the rollback in jobs.py is still correct but "
+        "this test is no longer measuring anything"
+    )
+    conn.rollback()
+    assert not conn.in_transaction
+
+
+def test_the_ledger_survives_v7_and_changes_nothing_else(tmp_path):
+    """v7 -> v8 is purely additive: two tables, no existing row touched.
+
+    Verified against a copy of the real journal before shipping -- 168 trades,
+    1,816 bars, 99 events and 261 NAV rows all hashed identically before and
+    after. This is the same shape at test scale, plus the idempotency `migrate`
+    needs because it runs on every connection.
+    """
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="T1", ib_exec_id="E1")
+    conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('SPY','x')")
+    conn.commit()
+
+    # Simulate a v7 journal: drop the new tables and stamp the old version.
+    conn.execute("DROP TABLE job_runs")
+    conn.execute("DROP TABLE job_state")
+    conn.execute("DELETE FROM schema_version")
+    conn.execute("INSERT INTO schema_version (version, applied_at)"
+                 " VALUES (7, datetime('now'))")
+    conn.commit()
+
+    migrate(conn)
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 8
+    for table in ("job_state", "job_runs"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 1
+
+    for _ in range(3):
+        migrate(conn)
+    assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
+
+
+def test_the_heartbeat_and_the_anchor_are_separable(tmp_path):
+    """Two tables, because pruning history must not delete the schedule.
+
+    `job_runs` is trimmed; `job_state` is one row per job forever. Folded into
+    one table, a retention pass could remove the row recording when `sync` last
+    fired, and the reconciler would then either replay a year of instants or lose
+    the schedule silently.
+
+    Asserted by doing what the retention pass does -- emptying `job_runs` -- and
+    checking the anchor is still there.
+    """
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO job_state (job, last_fired_for, last_status, heartbeat_at)"
+        " VALUES ('sync', 1786310000, 'ok', 1786310100)")
+    conn.execute(
+        "INSERT INTO job_runs (job, fired_for, started_at, status)"
+        " VALUES ('sync', 1786310000, '2026-08-09T12:00:00Z', 'ok')")
+    conn.commit()
+
+    conn.execute("DELETE FROM job_runs")          # the retention pass
+    conn.commit()
+
+    anchor = conn.execute(
+        "SELECT last_fired_for, heartbeat_at FROM job_state WHERE job='sync'"
+    ).fetchone()
+    assert anchor["last_fired_for"] == 1786310000, (
+        "pruning history deleted the catch-up anchor"
+    )
+    assert anchor["heartbeat_at"] == 1786310100

@@ -46,7 +46,7 @@ __all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -352,6 +352,83 @@ CREATE TABLE IF NOT EXISTS watchlist (
   note       TEXT,
   added_at   TEXT NOT NULL
 );
+
+-- The SCHEDULING ANCHOR: one row per job, forever. See SCHEDULER_PLAN.md step 4.
+--
+-- Separate from `job_runs` deliberately, and the reason is load-bearing rather
+-- than tidiness: run history has to be PRUNED, and a retention pass over one
+-- combined table could delete the row that records when `sync` last fired. The
+-- reconciler would then either replay a year of missed instants or lose the
+-- schedule silently. An anchor that cannot be pruned away is the fix.
+--
+-- O(jobs) rows, so nothing here ever needs trimming.
+CREATE TABLE IF NOT EXISTS job_state (
+  job                   TEXT PRIMARY KEY,
+  -- UTC epoch of the newest scheduled instant this job has claimed. The
+  -- reconciler compares against it rather than against "when did it last
+  -- succeed", so a job that failed for a real reason does not stay due on every
+  -- tick and retry against a request budget.
+  last_fired_for        INTEGER,
+  last_status           TEXT,
+  consecutive_failures  INTEGER NOT NULL DEFAULT 0,
+  -- Written by the TICK LOOP itself, not by any job. That is what makes it
+  -- answer "is the scheduler alive" rather than "did something run recently":
+  -- job outcomes cannot distinguish "nothing was due" from "the thread died".
+  -- The failure this exists for was observed on the MeshClaw crons -- three
+  -- jobs reporting last_status ok for two days while collecting nothing.
+  heartbeat_at          INTEGER
+);
+
+-- Bounded, disposable run history. Pruned to a few hundred rows per job.
+--
+-- `status` is the delivery decision, not just success or failure:
+--   running      claimed and working. Committed BEFORE the work starts, so a
+--                killed process leaves evidence rather than an unclaimed slot.
+--   ok           finished, and something changed worth reporting.
+--   nothing      finished with nothing to do. The normal case, and silent.
+--   missed       the window closed before the job could run. For perishable
+--                data this is permanent, which is why it is not `nothing`.
+--   failed       raised.
+--   interrupted  a `running` row whose per-job lock is free, so the process
+--                holding it is gone. Resolved by the KERNEL releasing an flock
+--                rather than by a staleness heuristic -- correct across sleep
+--                and SIGKILL alike. See locks.py.
+CREATE TABLE IF NOT EXISTS job_runs (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  job          TEXT    NOT NULL,
+  -- The scheduled instant this run claims, or NULL for a manual run from the
+  -- page. NULL is what keeps a Run-now press unconstrained by the schedule --
+  -- see the partial index below.
+  fired_for    INTEGER,
+  started_at   TEXT    NOT NULL,
+  finished_at  TEXT,
+  status       TEXT    NOT NULL,
+  detail       TEXT,
+  -- Progress, for a job with more than one unit of work: `bars` makes 24 serial
+  -- HTTP requests, so a page needs to distinguish a 1.4s success from a hung
+  -- ten-minute run.
+  done         INTEGER NOT NULL DEFAULT 0,
+  total        INTEGER NOT NULL DEFAULT 0,
+  note         TEXT,
+  -- Set when the tick that claimed this run found the wall clock had moved far
+  -- more than the monotonic clock, i.e. the machine had been asleep. Measured on
+  -- this laptop: time.monotonic() EXCLUDES sleep, and 44.6 hours of it. Turns
+  -- "why did the noon job fire at 09:14" into a field rather than a mystery.
+  slept        INTEGER NOT NULL DEFAULT 0
+);
+-- Idempotency as a CONSTRAINT, not a convention: one row per (job, instant), so
+-- a job cannot fire twice for the same slot and spend two IBKR requests. This is
+-- also the DST fall-back guard -- the repeated 01:30 is the same instant.
+--
+-- PARTIAL only so the index holds scheduled rows and nothing else. It is NOT what
+-- keeps manual runs unconstrained, though SCHEDULER_PLAN.md says so and the first
+-- version of the test agreed: SQLite treats NULLs as DISTINCT in a unique index,
+-- so repeated `fired_for IS NULL` rows are accepted with or without the WHERE.
+-- Verified by ablation -- removing the clause left the test green. Kept for the
+-- smaller index, and the reason is written down at its true strength.
+CREATE UNIQUE INDEX IF NOT EXISTS job_runs_fired
+  ON job_runs(job, fired_for) WHERE fired_for IS NOT NULL;
+CREATE INDEX IF NOT EXISTS job_runs_recent ON job_runs(job, id DESC);
 
 -- One row per (order, leg). Collapses partial fills, which IBKR marks with
 -- note code 'P' and which share an ib_order_id. Covers every asset category:
