@@ -11,7 +11,15 @@
 :root{
   --bg:#0a0806; --bg2:#0f0b08;
   --panel:#16110d; --panel2:#1b1410; --line:#2a1f17; --line2:#3a2b20;
-  --fg:#f5ead9; --dim:#9a8878; --dim2:#6f6055;
+  /* --dim2 was #6f6055, which measured 3.31:1 on --bg and 3.02:1 on --panel2:
+     a WCAG AA failure at the 12px it is mostly used at (4.5:1 required), and it
+     dressed the footer and every explanatory caption -- the prose a newcomer
+     reads first, set in the least readable colour on the page. #8f7c6d is the
+     first step up this hue that clears 4.5:1 against ALL THREE surfaces it
+     lands on -- 5.02 on --bg, 4.71 on --panel, 4.57 on --panel2 -- and it stays
+     clearly below --dim, so the three-tier hierarchy survives. A test recomputes
+     these rather than pinning the hex, so retuning is free; do not eyeball it. */
+  --fg:#f5ead9; --dim:#9a8878; --dim2:#8f7c6d;
   --kicker:#a98a6f;
   --leather1:#8a5a3b; --leather2:#5f3d27; --leatherfg:#f7e6d2;
   --ok:#4fd1a0; --bad:#f0899a;
@@ -22,9 +30,39 @@
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--fg);
   font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+
+/* ONE focus ring for every control, because there was none: `.tab` and `.icobtn`
+   both computed `outline-style:none`, so tabbing through the page left no way to
+   tell where you were, and <select> still wore Chrome's default blue -- the only
+   off-palette colour on the page. Declared once here rather than per control so
+   a button added later is reachable by default instead of by remembering.
+
+   `:focus-visible`, not `:focus`: the browser then shows the ring for keyboard
+   navigation and withholds it on mouse clicks, which is what stops a visible
+   ring from reading as a stuck selection. --leather1 matches `.tipped:focus`,
+   the one control that already had a ring. */
+:focus-visible{outline:2px solid var(--leather1);outline-offset:2px;
+  border-radius:4px}
+/* Inside the ring rather than outside it: these two sit flush against a panel
+   edge, where a 2px offset ring is clipped. */
+.tab:focus-visible,.icobtn:focus-visible{outline-offset:-2px}
+
 .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .dim{color:var(--dim)} .dim2{color:var(--dim2)}
+/* Sign is carried by a GLYPH as well as a hue, because hue alone does not
+   survive red-green colour blindness: measured, --ok against --bad separates by
+   ΔE 2.4 under deuteranopia, so a gain and a cost rendered in the two of them
+   are the same colour to ~8% of men. Confirmed by simulating it over this page,
+   where "Net P&L 1,451.99" and "Commissions 9.72" came out identical.
+
+   `.signed` is what `cls()` adds, and it is deliberately NOT every .pos/.neg:
+   the Commissions and Losing Trades cards are tinted --bad while holding a
+   POSITIVE number, where the red means "this is a cost" rather than "this is
+   below zero". Prefixing those with a minus would state something false, so
+   the glyph follows the arithmetic and the tint keeps carrying the emphasis.
+   `money()` already renders its own minus, hence `.pos.signed` only. */
 .pos{color:var(--ok)} .neg{color:var(--bad)}
+.pos.signed::before{content:"+"}
 .wrap{max-width:1480px;margin:0 auto;padding:22px}
 
 /* ---- branded header ---- */
@@ -1175,7 +1213,13 @@ const isNative=mo=>mo!=null&&isNativeCharge(mo.native,mo.ccy);
 const basisOf=m=>isNative(m)?'as charged'
   :DISP()===BASE()?`IBKR's figure in ${BASE()}`:`restated from ${BASE()}`;
 
-const cls=v=>v==null||Number(v)===0?'':Number(v)>0?'pos':'neg';
+/* Sign class for a value, plus `signed` so CSS can prefix the glyph -- see
+   `.pos.signed` in the stylesheet for why the glyph rather than the hue is the
+   thing that makes a gain legible. Zero and null stay unmarked: an unsigned
+   zero is the truth, and "+0.00" reads as a gain that did not happen.
+   Call sites that hardcode 'pos'/'neg' for emphasis rather than for arithmetic
+   (Commissions, Losing Trades) do not come through here and so get no glyph. */
+const cls=v=>v==null||Number(v)===0?'':Number(v)>0?'pos signed':'neg signed';
 /* A strike is an identifier as much as a number: 267.5 and 268 are different
    contracts. `num(v,0)` rounded, so a half-strike rendered as a contract that
    does not exist -- latent on this account only because every strike it has

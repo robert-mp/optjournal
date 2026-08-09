@@ -2268,3 +2268,101 @@ def test_the_open_pill_counts_positions_not_contracts():
         "the open pill is not reading the position count"
     )
     assert ">open<b>${s.open_episodes}</b>" not in dash
+
+
+def test_a_gain_carries_a_sign_glyph_and_not_only_a_hue():
+    """Colour alone does not survive red-green colour blindness.
+
+    Measured rather than assumed: --ok against --bad separates by ΔE 2.4 under
+    deuteranopia, so a gain and a cost rendered in the two of them are the same
+    colour to roughly 8% of men. Simulated over the real page, "Net P&L
+    +€1,451.99" and "Commissions €9.72" came out an identical lilac, which is
+    the whole reason the glyph exists.
+
+    Pinned at the two places that must agree: `cls()` has to emit the marker,
+    and the stylesheet has to turn it into a character.
+    """
+    js = _code_only(_js())
+    assert "'pos signed'" in js and "'neg signed'" in js, (
+        "cls() no longer marks signed values, so no gain gets a + and the sign "
+        "is carried by hue alone again"
+    )
+    css = _css().replace(" ", "").replace("\n", "")
+    assert '.pos.signed::before{content:"+"}' in css, (
+        "the + glyph is gone from the stylesheet"
+    )
+
+
+def test_a_cost_tint_is_never_given_a_minus_it_did_not_earn():
+    """The counterpart, and the reason the glyph is not simply `.neg::before`.
+
+    Commissions and Losing Trades are tinted --bad while holding a POSITIVE
+    number: there the red means "this is a cost", not "this is below zero".
+    A blanket rule over .neg would render €9.72 of commission as "−€9.72" and
+    assert something false. money() already emits its own minus for genuinely
+    negative values, so .neg must stay glyph-free on both counts.
+    """
+    css = _css().replace(" ", "").replace("\n", "")
+    assert ".neg.signed::before" not in css and ".neg::before{content" not in css, (
+        "a minus is being prefixed to .neg, which double-signs a real loss "
+        "(money() already renders one) and mislabels the cost cards as negative"
+    )
+    stats = _fn("statsPanel") if "function statsPanel(" in _code_only(_js()) else _js()
+    assert "'neg '+(String(moneyOf(s.commissions))" in stats.replace("\n", ""), (
+        "the Commissions card no longer hardcodes its tint; if it now routes "
+        "through cls() it will grow a + on a positive cost"
+    )
+
+
+def test_muted_text_meets_wcag_aa_on_every_surface_it_sits_on():
+    """--dim2 measured 3.31:1 on --bg and 3.02:1 on --panel2, against the 4.5:1
+    that 12px body text requires, and it dressed the footer and every
+    explanatory caption -- the prose a newcomer reads first.
+
+    Computed here rather than pinned to a hex, so re-tuning the palette is free
+    while regressing legibility is not.
+    """
+    css = _css()
+    def _var(name: str) -> str:
+        match = re.search(rf"--{name}:\s*(#[0-9a-fA-F]{{6}})", css)
+        assert match, f"--{name} is gone from the stylesheet"
+        return match.group(1)
+
+    def _lum(hex_colour: str) -> float:
+        parts = [int(hex_colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+        chan = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in parts]
+        return 0.2126 * chan[0] + 0.7152 * chan[1] + 0.0722 * chan[2]
+
+    def _ratio(fg: str, bg: str) -> float:
+        a, b = _lum(fg), _lum(bg)
+        hi, lo = max(a, b), min(a, b)
+        return (hi + 0.05) / (lo + 0.05)
+
+    fg = _var("dim2")
+    # Every surface muted text actually lands on.
+    for surface in ("bg", "panel", "panel2"):
+        ratio = _ratio(fg, _var(surface))
+        assert ratio >= 4.5, (
+            f"--dim2 ({fg}) is {ratio:.2f}:1 on --{surface} ({_var(surface)}), "
+            f"below the 4.5:1 WCAG AA needs for 12px text. Lighten --dim2."
+        )
+
+
+def test_every_control_has_a_visible_keyboard_focus_ring():
+    """There was none: .tab and .icobtn both computed outline-style:none, so
+    tabbing through the page left no way to see where you were, and <select>
+    wore Chrome's default blue -- the only off-palette colour on the page.
+
+    Declared once for `:focus-visible` rather than per control, so a button
+    added later is reachable by default instead of by remembering.
+    """
+    css = _css().replace(" ", "").replace("\n", "")
+    assert ":focus-visible{outline:2pxsolidvar(--leather1)" in css, (
+        "the global focus ring is gone, so keyboard users cannot see focus"
+    )
+    # :focus-visible, not :focus -- otherwise a mouse click leaves a ring that
+    # reads as a stuck selection.
+    assert ".tab:focus-visible,.icobtn:focus-visible{outline-offset:-2px}" in css, (
+        "the inset offset is gone; these two sit flush to a panel edge, where "
+        "an outset ring is clipped"
+    )
