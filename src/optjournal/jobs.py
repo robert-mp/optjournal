@@ -33,7 +33,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -48,10 +48,14 @@ __all__ = [
     "KNOWN_JOBS",
     "RUN_HISTORY",
     "Catchup",
+    "Context",
+    "Due",
     "Job",
     "JobBusy",
     "Outcome",
     "UnknownJob",
+    "due_jobs",
+    "interrupted_runs",
     "job_by_name",
     "prune_runs",
     "record_run",
@@ -663,3 +667,185 @@ def interrupted_runs(conn: sqlite3.Connection, *, archive_dir: Path) -> int:
             if conn.in_transaction:
                 conn.rollback()
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Due-ness (SCHEDULER_PLAN.md step 6a).
+#
+# A PURE FUNCTION over a clock and a ledger snapshot, which is the only reason the
+# whole catch-up policy is testable: every rule below is exercised by passing a
+# `datetime` rather than by waiting for one. Both DST boundaries, a rebuilt
+# journal, a laptop that slept through noon -- all of them are arguments here.
+#
+# THE STAKES. Getting this wrong in the permissive direction spends real IBKR
+# requests against a hard lockout budget; getting it wrong in the other direction
+# silently converts "missed, unrecoverable" into nothing at all, because an
+# option's intraday series exists only while its own session runs. So the rules are
+# stated as separate named predicates rather than folded into one condition.
+# ---------------------------------------------------------------------------
+
+#: The US session, in `America/New_York`, as the hours `bars_live` may poll in.
+#: 09:30-16:00 is the cash session; the poll runs from the first completed hourly
+#: bar (10:00) to one past the close (16:05 in the cron it replaces), so the window
+#: is expressed as hours-past-the-open rather than as a second set of clock times
+#: that could disagree with `bars.MARKET_TZ`.
+SESSION_OPEN_H = 9
+SESSION_OPEN_M = 30
+SESSION_CLOSE_H = 16
+#: Minutes past the close that a poll is still useful: the 16:00 bar is only on the
+#: grid once the hour has completed.
+SESSION_TAIL_M = 10
+
+
+@dataclass(frozen=True)
+class Due:
+    """One job that should run now, and the instant it stands for.
+
+    `fired_for` is what makes catch-up idempotent: it goes into `job_runs` under a
+    partial unique index, so two reconcilers racing the same instant cannot both
+    claim it. `None` for a `WINDOW` job, which claims no instant -- see `_window_due`.
+    """
+
+    job: Job
+    fired_for: int | None
+    #: Why it is due, for the log. A scheduler that fires without saying why is
+    #: the thing this whole plan is replacing.
+    reason: str
+
+
+def _last_instant(job: Job, now: datetime) -> datetime | None:
+    """The most recent scheduled instant at or before `now`, in the job's own zone.
+
+    Walks back a bounded number of days rather than computing, because the weekday
+    set makes closed-form arithmetic fiddly and eight comparisons cost nothing.
+
+    DST IS HANDLED BY `ZoneInfo`, not by us, and both edges matter:
+
+    * FALL BACK. 01:30 happens twice; `fold` defaults to 0, so this returns the
+      FIRST occurrence and `fired_for` is the same epoch either way -- which is why
+      the repeated hour cannot fire twice. The unique index is the actual guard.
+    * SPRING FORWARD. A 02:30 schedule does not exist on that day. `ZoneInfo`
+      normalises it to 03:30, so the job fires an hour late that once rather than
+      being skipped. No job here is scheduled in the missing hour, but a future one
+      might be, and silently skipping a day is worse than running late.
+    """
+    local = now.astimezone(job.tz())
+    # 8 days back covers any weekday set: a Monday-only job asked on a Sunday is
+    # six days behind its last fire.
+    for back in range(9):
+        day = (local - timedelta(days=back)).date()
+        if day.isoweekday() not in job.weekdays:
+            continue
+        instant = datetime(
+            day.year, day.month, day.day, job.hour, job.minute, tzinfo=job.tz()
+        )
+        if instant <= now:
+            return instant
+    return None
+
+
+def _in_session(now: datetime) -> bool:
+    """Whether `now` is inside the US cash session, in market time.
+
+    Weekday only, and deliberately calendar-free: a market holiday is not
+    distinguishable here, and the cost of polling on one is a request that returns
+    no bars and records `nothing`. That is the correct outcome anyway -- an empty
+    poll on a holiday is not a failure, and inventing a holiday calendar to avoid
+    it would be a second source of truth about what the market did, which
+    `bars.market_traded_on` already answers FROM THE DATA.
+    """
+    local = now.astimezone(ZoneInfo("America/New_York"))
+    if local.isoweekday() > 5:
+        return False
+    opens = local.replace(hour=SESSION_OPEN_H, minute=SESSION_OPEN_M,
+                          second=0, microsecond=0)
+    closes = local.replace(hour=SESSION_CLOSE_H, minute=SESSION_TAIL_M,
+                           second=0, microsecond=0)
+    return opens <= local <= closes
+
+
+def _window_due(job: Job, now: datetime, last_success: int | None) -> Due | None:
+    """`Catchup.WINDOW`: inside the session, and the last success is old enough.
+
+    SEVEN CRON SLOTS COLLAPSE INTO THIS ONE PREDICATE, and it is sound only because
+    the intraday series is CUMULATIVE within a session: a 13:00 poll returns every
+    completed bar since the open, so one wake at 14:30 after sleeping since 10:00
+    collects the whole session. That is launchd's coalescing expressed in the job
+    rather than begged from the substrate.
+
+    Outside the window it is NEVER due. A 20:00 wake must not fetch nothing and
+    record `ok` -- that is precisely the inversion the perishable audit exists to
+    catch, one layer down.
+
+    Claims NO `fired_for`, because there is no instant: the run is "this session, at
+    whatever moment we woke". The partial unique index accepts repeats of NULL,
+    which is what lets a session be polled several times.
+    """
+    if not _in_session(now):
+        return None
+    if last_success is not None:
+        age = int(now.timestamp()) - last_success
+        if age < job.window_s:
+            return None
+        return Due(job, None, f"in session, last success {age}s ago")
+    return Due(job, None, "in session, no successful poll yet today")
+
+
+def due_jobs(
+    now: datetime,
+    *,
+    claimed: dict[str, set[int]],
+    last_success: dict[str, int],
+    ever_ran: set[str],
+    registry: tuple[Job, ...] = JOBS,
+) -> list[Due]:
+    """Which jobs should run at `now`. Pure: no clock, no database, no I/O.
+
+    The three ledger arguments are snapshots the caller reads once, so a tick makes
+    one pass over `job_runs` rather than four queries per job:
+
+    * `claimed` -- `fired_for` instants already recorded per job. RECORDED, not
+      succeeded, and that distinction is the brake. Keying on `status='ok'` would
+      make a job that failed for a real reason (the locked keychain that actually
+      happened) due again on the very next tick and for its whole 12-hour window --
+      roughly 48 real IBKR requests in twelve hours against a lockout budget.
+      `consecutive_failures` on `job_state` is what a human reads instead.
+    * `last_success` -- newest `ok` epoch per job, for `WINDOW` jobs only.
+    * `ever_ran` -- jobs with ANY recorded run.
+
+    EMPTY LEDGER MEANS UNKNOWN, NOT OVERDUE. `job_runs` lives in `journal.db`,
+    which a `raw/` restore rebuilds from scratch, so a rebuilt journal has no runs
+    at all. Treating that as "everything is overdue" makes the first reconcile after
+    a restore spend an IBKR request plus 24 bar requests, unprompted, on a machine
+    whose owner was recovering from something. So a job with no recorded run waits
+    for its next natural slot: it is scheduled, never caught up.
+
+    Returned in REGISTRY ORDER, which the caller must preserve: `sync` before
+    `bars_daily`, because the latter derives its manifest from the positions the
+    former ingests. That ordering is a real happens-before edge here, where today it
+    is two wall-clock guesses plus MeshClaw's `random.uniform(0, 59*60)` jitter.
+    """
+    out: list[Due] = []
+    for job in registry:
+        if job.catchup is Catchup.WINDOW:
+            found = _window_due(job, now, last_success.get(job.name))
+            if found is not None:
+                out.append(found)
+            continue
+
+        instant = _last_instant(job, now)
+        if instant is None:
+            continue
+        stamp = int(instant.timestamp())
+        if stamp in claimed.get(job.name, set()):
+            continue                       # already recorded, by anyone
+        if job.name not in ever_ran:
+            # See the docstring: a journal with no history is UNKNOWN, not behind.
+            continue
+        if job.catchup is Catchup.NONE:
+            continue
+        behind = int(now.timestamp()) - stamp
+        if behind > job.window_s:
+            continue                       # too old to be worth catching up
+        out.append(Due(job, stamp, f"scheduled {instant.isoformat()}, {behind}s late"))
+    return out

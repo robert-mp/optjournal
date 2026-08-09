@@ -916,3 +916,435 @@ def test_a_job_that_left_the_registry_keeps_its_history_and_is_marked(conn):
     # And a registered job never carries the flag, or every row would render as
     # unrunnable.
     assert "retired" not in rows["sync"]
+
+
+# ---------------------------------------------------------------------------
+# Due-ness (SCHEDULER_PLAN.md step 6a).
+#
+# `due_jobs` is pure, so the whole catch-up and sleep policy is tested by passing a
+# clock rather than by waiting for one. That is the point of the shape: a scheduler
+# whose rules can only be observed by living through them is a scheduler nobody can
+# change safely.
+#
+# THE STAKES, both directions. Too permissive spends real IBKR requests against a
+# hard lockout budget. Too strict silently converts "missed, unrecoverable" into
+# nothing at all, because an option's intraday series exists only while its own
+# session runs. So the boundary tests here are not optional garnish.
+# ---------------------------------------------------------------------------
+
+_ET = "America/New_York"
+
+
+def _due(now, **kw):
+    """`due_jobs` with empty ledgers unless a test says otherwise.
+
+    `ever_ran` defaults to EVERY job, because the empty-ledger rule is so
+    aggressive (nothing is ever due) that a test forgetting it would pass
+    vacuously -- it would assert "not due" against a function that returns nothing
+    for any input. The one test that wants the rule asks for it explicitly.
+    """
+    from optjournal.jobs import JOBS, due_jobs
+
+    kw.setdefault("claimed", {})
+    kw.setdefault("last_success", {})
+    kw.setdefault("ever_ran", {job.name for job in JOBS})
+    return due_jobs(now, **kw)
+
+
+def _names(dues):
+    return sorted(d.job.name for d in dues)
+
+
+def test_an_empty_ledger_means_unknown_not_overdue():
+    """THE SHARPEST FOOT-GUN IN THE STEP, and it is about recovery.
+
+    `job_runs` lives in `journal.db`, which a `raw/` restore rebuilds from nothing,
+    so a rebuilt journal has no recorded runs at all. Read as "everything is
+    overdue", the first reconcile after a restore spends an IBKR request plus 24 bar
+    requests -- unprompted, on a machine whose owner was already recovering from
+    something.
+
+    So a job with no history waits for its next natural slot. Asserted with the
+    clock sitting AFTER every job's daily instant, which is exactly when the naive
+    rule would fire all of them.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    # A Wednesday, 22:00 Dublin = 17:00 ET: past sync (12:00), bars_daily (12:30)
+    # and market (11:00), and AFTER the US close so `bars_live` is out of the
+    # picture. 18:00 Dublin would be 13:00 ET -- mid-session -- and the first
+    # version of this test used it and failed on a live poll that was correctly
+    # due. See `test_the_live_poll_ignores_the_empty_ledger_rule` for why that is
+    # right rather than an exception to be suppressed.
+    now = datetime(2026, 8, 12, 22, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    assert _names(_due(now, ever_ran=set())) == [], (
+        "a journal with no recorded runs treated every job as overdue -- a restore "
+        "would spend an IBKR request and 24 bar requests unprompted"
+    )
+    # And the control: with history, the same clock IS due. Without this the test
+    # above passes against a function that returns nothing for every input.
+    assert "sync" in _names(_due(now)), (
+        "the fixture cannot distinguish the empty-ledger rule from a dead function"
+    )
+
+
+def test_a_claimed_instant_is_not_due_again():
+    """Idempotency is a database constraint, and this is the cheap check before it.
+
+    The partial unique index on `(job, fired_for)` is the real guard -- two
+    reconcilers racing cannot both claim an instant -- but re-deriving due-ness on
+    every tick means a job already run would otherwise be attempted 60 times an
+    hour, each attempt losing the race. `sync` losing that race 60 times is 60
+    refused claims; winning it once too often is a spent IBKR request.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    # After the US close, so only instant-claiming jobs are in play: a WINDOW job
+    # claims no instant at all and is braked by `last_success` instead.
+    now = datetime(2026, 8, 12, 22, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    first = _due(now)
+    assert first, "premise: something is due at this clock"
+    claimed = {d.job.name: {d.fired_for} for d in first if d.fired_for is not None}
+    assert _names(_due(now, claimed=claimed)) == [], (
+        "an instant already recorded came back as due, so every tick would "
+        "re-attempt work that has already happened"
+    )
+
+
+def test_due_ness_keys_on_recorded_not_on_succeeded():
+    """A FAILED run must not make the job due again on the next tick.
+
+    Overruling the tempting rule ("no row with status ok"). A sync that fails for a
+    real reason -- the locked keychain that actually happened on 2026-08-07 -- would
+    then be due again 60 seconds later and stay due for its whole 12-hour window,
+    leaving the 900s fetch cooldown as the only brake: roughly 48 real IBKR requests
+    in twelve hours against a budget whose penalty is a lockout.
+
+    `consecutive_failures` on `job_state` is what a human reads instead, and the
+    page renders it.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime(2026, 8, 12, 22, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    instant = next(d.fired_for for d in _due(now) if d.job.name == "sync")
+    # Recorded as FAILED -- `claimed` carries the instant regardless of outcome.
+    assert "sync" not in _names(_due(now, claimed={"sync": {instant}})), (
+        "a failed run left the job due again, which turns one failure into a "
+        "retry loop against a rate-limited endpoint"
+    )
+
+
+def test_a_job_too_far_behind_is_not_caught_up():
+    """The catch-up window is a bound, not a suggestion.
+
+    `sync`'s window is 12 h: a missed noon is worth running at 18:00, because the
+    docstring records a badly-timed sync missing Monday's fills twice. It is NOT
+    worth running at 04:00 the next morning against a statement that the next noon
+    run will fetch anyway.
+    """
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import job_by_name
+
+    job = job_by_name("sync")
+    noon = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    inside = noon + timedelta(seconds=job.window_s - 60)
+    outside = noon + timedelta(seconds=job.window_s + 60)
+    assert "sync" in _names(_due(inside)), "a job inside its window is not due"
+    assert "sync" not in _names(_due(outside)), (
+        "a job past its catch-up window was still caught up"
+    )
+
+
+def test_the_live_poll_is_due_inside_the_session_and_never_outside_it():
+    """Both halves, and the second is the one that protects the audit's meaning.
+
+    Outside the window `bars_live` must be NOT DUE rather than due-and-empty: a
+    20:00 wake that fetches nothing and records `ok` is the exact inversion the
+    perishable audit exists to catch. An empty poll recorded as success is how three
+    cron jobs reported health for two days.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo(_ET)
+    mid = datetime(2026, 8, 12, 13, 0, tzinfo=et)          # Wednesday, mid-session
+    assert "bars_live" in _names(_due(mid))
+    for label, when in (
+        ("pre-market", datetime(2026, 8, 12, 8, 0, tzinfo=et)),
+        ("after the close", datetime(2026, 8, 12, 20, 0, tzinfo=et)),
+        ("Saturday", datetime(2026, 8, 15, 13, 0, tzinfo=et)),
+        ("Sunday", datetime(2026, 8, 16, 13, 0, tzinfo=et)),
+    ):
+        assert "bars_live" not in _names(_due(when)), (
+            f"the live poll is due {label}, so it would fetch nothing and record "
+            "a success -- which is what the audit exists to catch"
+        )
+
+
+def test_the_live_poll_waits_out_its_window_after_a_success():
+    """Cumulative within a session, so one poll an hour is enough.
+
+    A 13:00 poll returns every completed bar since the open, which is what lets
+    seven cron slots collapse into one predicate -- and what makes polling again
+    four minutes later pure waste.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import job_by_name
+
+    et = ZoneInfo(_ET)
+    now = datetime(2026, 8, 12, 13, 0, tzinfo=et)
+    window = job_by_name("bars_live").window_s
+    fresh = int(now.timestamp()) - (window - 60)
+    stale = int(now.timestamp()) - (window + 60)
+    assert "bars_live" not in _names(_due(now, last_success={"bars_live": fresh})), (
+        "the live poll fired again inside its own window"
+    )
+    assert "bars_live" in _names(_due(now, last_success={"bars_live": stale})), (
+        "the live poll stopped firing once its window had elapsed"
+    )
+
+
+def test_the_live_poll_claims_no_instant():
+    """`fired_for` is None for a WINDOW job, and that is load-bearing.
+
+    The run stands for "this session, at whatever moment we woke", not for a
+    scheduled minute. The partial unique index accepts repeated NULLs, which is
+    exactly what lets one session be polled several times -- while a `LATEST` job's
+    instant is constrained to once.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo(_ET))
+    from optjournal.jobs import job_by_name
+
+    stale = int(now.timestamp()) - (job_by_name("bars_live").window_s + 60)
+    # BOTH branches of `_window_due`: no success recorded yet, and a success old
+    # enough to have expired. An ablation that made only the second claim an
+    # instant survived a version of this test that exercised the first alone.
+    for label, ledger in (("no success yet", {}),
+                          ("an expired success", {"bars_live": stale})):
+        live = next(d for d in _due(now, last_success=ledger)
+                    if d.job.name == "bars_live")
+        assert live.fired_for is None, (
+            f"with {label} the live poll claims a scheduled instant, so the unique "
+            "index would let it run once per session instead of once per window"
+        )
+
+
+def test_the_repeated_hour_at_the_dst_fall_back_cannot_fire_twice():
+    """01:30 happens twice on the fall-back day, and it must claim ONE instant.
+
+    Not hypothetical arithmetic: if the two occurrences produced different
+    `fired_for` values, a job scheduled in that hour would run twice -- and for
+    `sync` that is two IBKR requests fetching the same statement.
+
+    Ireland falls back at 02:00 on the last Sunday of October, so 2026-10-25.
+    Checked on a job placed INSIDE the repeated hour rather than on the real
+    registry, because no job here is scheduled at 01:30 today and the guard has to
+    survive one being added.
+    """
+    import dataclasses
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import due_jobs, job_by_name
+
+    dublin = ZoneInfo("Europe/Dublin")
+    nightly = dataclasses.replace(
+        job_by_name("market"), name="market",
+        minute=30, hour=1, weekdays=(1, 2, 3, 4, 5, 6, 7), zone="Europe/Dublin",
+    )
+    # The same wall-clock time, before and after the fold.
+    early = datetime(2026, 10, 25, 1, 30, tzinfo=dublin, fold=0)
+    late = datetime(2026, 10, 25, 1, 30, tzinfo=dublin, fold=1)
+    assert int(early.timestamp()) != int(late.timestamp()), (
+        "premise: this really is a repeated hour on this platform"
+    )
+
+    stamps = set()
+    for probe in (early, late, datetime(2026, 10, 25, 3, 0, tzinfo=dublin)):
+        found = due_jobs(probe, claimed={}, last_success={},
+                         ever_ran={"market"}, registry=(nightly,))
+        stamps |= {d.fired_for for d in found}
+    assert len(stamps) == 1, (
+        f"the repeated 01:30 produced {len(stamps)} distinct instants ({stamps}), "
+        "so a job scheduled in it would fire twice -- two IBKR requests for one "
+        "statement"
+    )
+
+
+def test_a_schedule_in_the_missing_spring_forward_hour_still_runs():
+    """02:30 does not exist on the spring-forward day. It must not be SKIPPED.
+
+    Ireland springs forward at 01:00 on the last Sunday of March, so 2026-03-29 has
+    no 01:30. `ZoneInfo` normalises a nonexistent local time rather than raising, so
+    the job fires late that once -- which is the right trade: running an hour late
+    one day a year beats silently missing a day, and a missed session cannot be
+    recollected at any price.
+    """
+    import dataclasses
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import due_jobs, job_by_name
+
+    dublin = ZoneInfo("Europe/Dublin")
+    nightly = dataclasses.replace(
+        job_by_name("market"), name="market",
+        minute=30, hour=1, weekdays=(1, 2, 3, 4, 5, 6, 7), zone="Europe/Dublin",
+    )
+    # Mid-morning on the spring-forward day: the 01:30 slot is behind us.
+    found = due_jobs(datetime(2026, 3, 29, 9, 0, tzinfo=dublin),
+                     claimed={}, last_success={}, ever_ran={"market"},
+                     registry=(nightly,))
+    assert found, (
+        "a schedule inside the missing hour produced no due instant, so that day "
+        "is silently skipped"
+    )
+    from datetime import UTC
+    fired = datetime.fromtimestamp(found[0].fired_for, UTC).astimezone(dublin)
+    assert fired.date().isoformat() == "2026-03-29", (
+        f"the instant landed on {fired.date()}, not the day it was scheduled for"
+    )
+
+
+def test_the_market_hours_poll_follows_us_dst_not_the_readers_clock():
+    """Which is why `bars_live` is scheduled in Eastern.
+
+    In March the US springs forward two weeks before Europe does, so for a fortnight
+    the offset between them is one hour smaller. A poll scheduled in the reader's
+    zone would sit an hour off the session for those two weeks -- and for perishable
+    bars an hour off is an hour lost.
+
+    Asserted at 09:45 ET on a day inside that fortnight: in-session in market time,
+    while the same wall-clock hour in Dublin is before the open.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    # 2026-03-16 is a Monday between the US (Mar 8) and EU (Mar 29) transitions.
+    inside = datetime(2026, 3, 16, 9, 45, tzinfo=ZoneInfo(_ET))
+    assert "bars_live" in _names(_due(inside)), (
+        "the live poll is not due at 09:45 ET during the US/EU DST gap, so it "
+        "would miss the first hour of the session for two weeks a year"
+    )
+    assert inside.utcoffset().total_seconds() == -4 * 3600, (
+        "premise: the US has already sprung forward on this date"
+    )
+
+    # THE DISCRIMINATOR, and the test needed it: an ablation reading the session
+    # hours in Europe/Dublin instead of America/New_York SURVIVED the assertion
+    # above, because 09:45 ET is 13:45 Dublin and both land inside a 09:30-16:10
+    # window. 15:45 ET is 20:45 Dublin -- in-session in market time and far outside
+    # it in the reader's -- so only this instant can tell the two apart.
+    late = datetime(2026, 8, 12, 15, 45, tzinfo=ZoneInfo(_ET))
+    assert late.astimezone(ZoneInfo("Europe/Dublin")).hour == 20, (
+        "premise: this instant is inside the US session and outside a same-clock "
+        "window in the reader's zone"
+    )
+    assert "bars_live" in _names(_due(late)), (
+        "the live poll is not due at 15:45 ET, so the session window is being read "
+        "in the wrong zone -- the last half hour of every session would be lost, "
+        "and those bars cannot be recollected at any price"
+    )
+
+
+def test_due_jobs_returns_registry_order_so_sync_precedes_the_bars_it_feeds():
+    """Ordering is a happens-before edge, and the caller must not sort it away.
+
+    `bars_daily` derives its manifest from the positions `sync` ingests, so a
+    position opened yesterday is only in the manifest once the sync has landed.
+    Today that ordering is two cron expressions 30 minutes apart plus MeshClaw's
+    `_compute_jitter`, which returns `random.uniform(0, 59*60)` and was observed
+    putting a 538 ms job 25 minutes late.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import JOBS
+
+    now = datetime(2026, 8, 12, 22, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    fired = [d.job.name for d in _due(now)]
+    expected = [job.name for job in JOBS if job.name in fired]
+    assert fired == expected, (
+        f"due_jobs returned {fired}, not registry order {expected} -- bars_daily "
+        "could run before the sync that feeds its manifest"
+    )
+
+
+def test_every_due_job_says_why():
+    """A scheduler that fires without saying why is what this plan replaces.
+
+    `crons.json` recorded `last_status: ok` and nothing about which instant a run
+    stood for, which is how three jobs looked healthy for two days. The reason
+    string goes into the log beside the claim.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    for now in (datetime(2026, 8, 12, 18, 0, tzinfo=ZoneInfo("Europe/Dublin")),
+                datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo(_ET))):
+        for found in _due(now):
+            assert found.reason and len(found.reason) > 10, (
+                f"{found.job.name} is due with no explanation: {found.reason!r}"
+            )
+
+
+def test_the_live_poll_ignores_the_empty_ledger_rule_and_that_is_correct():
+    """A WINDOW job is exempt from "empty ledger means unknown", deliberately.
+
+    The rule protects a RESTORE from catch-up: a rebuilt journal must not replay a
+    scheduled instant and spend an IBKR request unprompted. `bars_live` catches up
+    on nothing -- it asks "is the market open right now, and are my bars stale?" --
+    so there is no missed instant to replay, and the answer on a rebuilt journal at
+    13:00 ET is genuinely YES: that session's intraday bars are being lost while the
+    question is asked, and they cannot be recollected at any price.
+
+    It is also the cheapest job to be wrong about: a public chart endpoint, no IBKR
+    request, and an empty poll records `nothing` rather than a failure.
+
+    Worth its own test because it looks like a hole in the rule. Two tests above had
+    to change their clock because of it, which is precisely when an exemption should
+    be written down rather than left as behaviour someone rediscovers.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    mid = datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo(_ET))
+    assert "bars_live" in _names(_due(mid, ever_ran=set())), (
+        "the live poll waits for history on a rebuilt journal, so a restore during "
+        "market hours silently loses that session's perishable bars"
+    )
+    # And the instant-claiming jobs at the SAME clock are still held back.
+    assert _names(_due(mid, ever_ran=set())) == ["bars_live"], (
+        "a job that catches up fired on an empty ledger"
+    )
+
+
+def test_a_claimed_instant_does_not_brake_the_live_poll():
+    """The other half of the same exemption, and the reason it is safe.
+
+    `claimed` cannot hold a WINDOW job's instants because it has none, so if the
+    poll were braked by `claimed` it would be braked by nothing at all -- one poll
+    per session instead of one per window. Its brake is `last_success` plus
+    `window_s`, which `test_the_live_poll_waits_out_its_window_after_a_success`
+    pins from the other side.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    mid = datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo(_ET))
+    # A claim that could not have come from this job, plus a NULL-ish key: neither
+    # may hide the poll.
+    assert "bars_live" in _names(_due(mid, claimed={"bars_live": {0}})), (
+        "the live poll is gated on claimed instants, which it never has -- it "
+        "would poll once per session instead of once per window"
+    )
