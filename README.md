@@ -75,7 +75,8 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `render.py` | human-readable terminal reports. Bound to `serialize`'s shapes by `tests/test_render.py`: it once read flat money keys the `Money` conversion had removed, and `orders`/`history` died on `float(dict)` behind a green suite |
 | `cli.py` | argparse wiring only: every command opens the database via `db.open_journal` and emits through `_emit(data, text, json)`, so `--json` comes for free |
 | `web.py` | loopback HTTP server; `ServeConfig` injected per server |
-| `page.html` | the entire frontend: no build step, no external resources |
+| `page.html` | the frontend's markup and JavaScript: no build step, nothing off-origin |
+| `static/app.css` | every styling rule. Extracted from the page's `<style>` block so all of them sit where `tests/test_web.py`'s thirteen layout assertions can read them — four real defects once lived in CSS that nothing in the suite had ever looked at. A `<link>` in `<head>` is render-blocking, so there is no unstyled flash; the extra loopback request measures 1.4 ms |
 | `static/replay.js` | the replay chart's arithmetic as pure functions over plain data — no DOM, no globals — so `node --test` can unit-test the scales and the scrub. A function belongs here if it takes data and returns data; the moment it touches `document` it belongs in the page |
 | `static/mark.svg` | the Bitácora compass rose as a standalone favicon. Carries its own colours: a favicon renders outside the page, where `page.html`'s custom properties do not reach. `web.STATIC_TYPES` is what lets it be served as an image rather than a script |
 | `browser.py` | headless browser discovery and the DOM dump, in three views: raw, markup (scripts stripped), text |

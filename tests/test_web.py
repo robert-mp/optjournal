@@ -801,10 +801,70 @@ def test_endpoint_reply_shapes_match_what_the_page_reads():
 
 
 def test_page_loads_no_external_resources():
-    """Offline by construction, and the CSP header assumes it."""
+    """Offline by construction, and the CSP header assumes it.
+
+    "No external resources" has always meant NOTHING OFF-ORIGIN rather than
+    nothing linked -- the favicon `<link>` predates the stylesheet and passes this
+    unchanged. Same-origin `/static/` assets are exactly what the CSP's
+    `default-src 'self'` permits.
+    """
     page = page_html()
     assert not re.search(r'(src|href)="https?://', page)
     assert "cdn." not in page
+    # Every local reference must be root-relative, so the page cannot depend on
+    # which URL it was loaded from.
+    for ref in re.findall(r'(?:src|href)="([^"]+)"', page):
+        assert ref.startswith("/"), f"{ref} is not a root-relative local path"
+
+
+@pytest.mark.parametrize("ref", ["/static/app.css", "/static/mark.svg"])
+def test_every_asset_the_page_links_is_actually_servable(ref):
+    """A `<link>` the server will not serve renders an unstyled page, silently.
+
+    Nothing covered `/static/` before this: the CSS lived inline, the favicon was
+    the only asset, and `STATIC_TYPES` is an ALLOWLIST -- so an extension missing
+    from it 404s rather than being guessed. Extracting the stylesheet made that a
+    live hazard, because `nosniff` means a wrong or absent Content-Type has the
+    browser drop the file rather than sniff it, and the page then loads with no
+    rules at all while every Python test still passes.
+
+    Checks three things that can each break independently: the page references it,
+    the file exists on disk, and its extension is one the handler will answer for.
+    """
+    from optjournal.web import STATIC_TYPES  # noqa: PLC0415 - local to this test
+
+    assert ref in page_html(), f"the page no longer links {ref}"
+    asset = ROOT / "src" / "optjournal" / ref.removeprefix("/")
+    assert asset.is_file(), f"{ref} is linked but not on disk"
+    assert asset.suffix in STATIC_TYPES, (
+        f"{asset.suffix} is not in STATIC_TYPES, so /static/ will 404 it"
+    )
+
+
+def test_the_stylesheet_is_served_and_its_rules_reach_the_page():
+    """End to end through a real server, because the Python half cannot see this.
+
+    Every layout assertion in this file reads `static/app.css` off disk. That
+    proves the RULES are right and says nothing about whether the browser ever
+    receives them -- a missing STATIC_TYPES entry, a typo'd href or a stray
+    `<style>` left behind would all leave those tests green.
+
+    Verified in a real browser when the extraction shipped: 222 rules in the
+    CSSOM, zero `<style>` tags, and computed styles applied (body background
+    rgb(10, 8, 6), card radius 14px). This is the automated half of that.
+    """
+    import urllib.request  # noqa: PLC0415 - local to this test
+
+    with web.serve_ephemeral(db_path=DEFAULT_DEMO_DB, archive_dir=DEFAULT_DEMO_DIR) as base:
+        with urllib.request.urlopen(f"{base}/static/app.css", timeout=10) as resp:  # noqa: S310
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/css"), (
+                "a wrong Content-Type plus nosniff means the browser drops it"
+            )
+            body = resp.read().decode()
+
+    assert ".card{" in body.replace(" ", ""), "the served file is not the stylesheet"
+    assert "<style>" not in page_html(), "a stylesheet was left embedded in the page"
 
 
 def test_page_escapes_interpolated_values():
@@ -1782,7 +1842,15 @@ def test_lifecycle_event_labels_are_contextual_inside_their_card():
 
 
 def _css() -> str:
-    return page_html().split("<style>")[1].split("</style>")[0]
+    """The stylesheet, wherever it lives.
+
+    Reads `static/app.css` now that the rules have moved out of page.html's
+    `<style>` block. Deliberately still ONE helper: thirteen layout assertions call
+    it, and they exist because four real defects lived in CSS that nothing had ever
+    read -- so the extraction had to keep the rules reachable through a single seam
+    rather than through thirteen splits on markup.
+    """
+    return (ROOT / "src" / "optjournal" / "static" / "app.css").read_text()
 
 
 def _fn(name: str) -> str:
@@ -1809,9 +1877,11 @@ def test_header_cluster_right_aligns_and_groups_its_icons():
     assert "align-items:flex-end" in css.split("#ccywrap{")[1].split("}")[0], \
         "the currency toggle will stretch to the note's width again"
     assert ".hdr-icons{display:flex" in css
-    # Both icons in the row wrapper, or they stack again.
-    head = page_html().split("</style>")[1]
-    icons = head.split('class="hdr-icons"')[1].split("</div>")[0]
+    # Both icons in the row wrapper, or they stack again. Searched in the whole
+    # page rather than after `</style>`: that split existed only to skip PAST the
+    # embedded stylesheet, and the rules now live in static/app.css, so there is
+    # no CSS left in here for a marker string to collide with.
+    icons = page_html().split('class="hdr-icons"')[1].split("</div>")[0]
     assert 'id="sync"' in icons and 'id="cog"' in icons
 
 

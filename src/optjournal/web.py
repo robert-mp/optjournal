@@ -1101,6 +1101,10 @@ PAGE_PATH = Path(__file__).resolve().parent / "page.html"
 STATIC_TYPES = {
     ".js": "text/javascript; charset=utf-8",
     ".svg": "image/svg+xml",
+    # The stylesheet, extracted from page.html's <style> block. `nosniff` is set,
+    # so the type has to be right or the browser drops it and the page renders
+    # unstyled -- which is the loud failure this allowlist is for.
+    ".css": "text/css; charset=utf-8",
 }
 
 
