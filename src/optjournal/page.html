@@ -61,7 +61,16 @@
            rather than holding placeholder text, because a hardcoded day number
            flashing before the real one is a wrong figure on screen. -->
       <div class="kicker" id="kicker"></div>
-      <div class="title">Bitácora <span class="edition" id="edition">Leather Edition</span></div>
+      <!-- The edition chip is the THEME control, so it is a <button> rather than
+           the <span> it used to be: it was a decorative label reading "Leather
+           Edition" whatever the page looked like, and now it names the active
+           palette and switches it. A real button because a clickable span is
+           unreachable by keyboard and unannounced to a screen reader -- the
+           focus ring, the Enter key and the role all come free from the element.
+           Its text is written by `applyTheme`; the markup carries the default so
+           the chip is never momentarily blank. -->
+      <div class="title">Bitácora <button class="edition" id="edition"
+        title="Switch theme">Leather Edition</button></div>
       <div class="tabs" id="tabs"></div>
     </div>
     <div class="hdr-actions">
@@ -779,7 +788,7 @@ import {
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook
- * @local Math S TABS b sel m r el location window qs hs
+ * @local Math S TABS THEMES b sel m r el location window qs hs ids
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
@@ -800,6 +809,13 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      A future scrubber POSITION would not belong in the hash: that is an
      inspection inside an open panel, not which panel is open. */
   calday:null,replay:null,
+  /* The active theme id, IN the hash for the same reason the display currency
+     is: it is a presentation choice a reload should not silently discard, and a
+     link then carries the palette you were looking at. Deliberately not
+     localStorage -- this page persists no other preference that way, and one
+     setting stored somewhere the URL cannot express is a setting that
+     disagrees with a shared link. */
+  theme:null,
   /* Which market day is expanded. NOT in the hash, unlike calday:
      the market strip always has a sensible default (today, or the
      first day with events), so there is no state a reload could
@@ -951,6 +967,42 @@ function renderTabs(){
       >${esc(label)}</button>`).join('');
   document.querySelectorAll('.tab[data-tab]').forEach(b=>
     b.onclick=()=>{S.tab=b.dataset.tab;draw(true);});
+}
+
+/* ------------------------------------------------ themes
+
+   [id, label]. The id is the `data-theme` attribute value, and app.css holds one
+   block per id -- so adding a theme is a CSS block plus a line here, with no
+   JavaScript to touch. Leather is first because it is what `:root` carries: a
+   page whose attribute is absent or unrecognised is already fully styled in it,
+   which is why an unknown id in the URL can heal to nothing rather than needing
+   a fallback stylesheet.
+
+   The label is what the edition chip shows, so it reads "Leather Edition" --
+   which is what that chip claimed statically before any of this existed. It is
+   now true rather than decorative, and it is the control that changes it. */
+const THEMES=[
+  ['leather','Leather'],
+  ['admiralty','Admiralty'],
+  ['oxblood','Oxblood'],
+];
+const THEME_IDS=()=>THEMES.map(t=>t[0]);
+const themeLabel=id=>(THEMES.find(t=>t[0]===id)||THEMES[0])[1];
+/* On <html>, not <body>: `:root` is where the default block lives, so both the
+   default and every override then resolve against the same element and a theme
+   cannot half-apply to a page whose body has not parsed yet. */
+function applyTheme(){
+  document.documentElement.dataset.theme=S.theme||THEMES[0][0];
+  const chip=$('#edition');
+  if(chip) chip.textContent=themeLabel(S.theme||THEMES[0][0])+' Edition';
+}
+/* Cycles rather than opening a menu. Three themes is too few to earn a dropdown
+   -- and the chip is 10.5px, so a caret on it would be decoration rather than an
+   affordance. `title` says what it does, because a chip that reads as a label is
+   not obviously clickable. */
+function nextTheme(){
+  const ids=THEME_IDS();
+  return ids[(ids.indexOf(S.theme||ids[0])+1)%ids.length];
 }
 
 /* ------------------------------------------------ the log's dateline
@@ -2813,6 +2865,12 @@ function applyHash(){
      nothing in this one, and applyHash runs before the state it would check. */
   S.calday=hs.get('calday')||null;
   S.replay=hs.get('replay')||null;
+  /* Validated against the registry, like the tab: an unknown id would otherwise
+     put an unstyled `data-theme` on <html>, where the attribute matches no block
+     and the page silently falls back to `:root` while the chip claims the bogus
+     name. Healing to null instead means the chip and the palette agree. */
+  const th=(hs.get('theme')||'').toLowerCase();
+  S.theme=THEME_IDS().includes(th)?th:null;
 }
 function syncHash(push){
   const hs=new URLSearchParams();
@@ -2825,6 +2883,10 @@ function syncHash(push){
   if(S.ccy&&S.ccy!==BASE()) hs.set('ccy',S.ccy);
   if(S.calday) hs.set('calday',S.calday);
   if(S.replay) hs.set('replay',S.replay);
+  /* Leather is what `:root` already carries, so recording it would put a key in
+     every URL to say "the default" -- the same rule the display currency follows
+     for the account base. */
+  if(S.theme&&S.theme!==THEMES[0][0]) hs.set('theme',S.theme);
   const next=hs.toString()?'#'+hs:'';
   if(next===(location.hash||'')) return;
   /* A tab jump is a navigation, so it pushes and the back button walks tabs.
@@ -2860,6 +2922,9 @@ function draw(push){
   replayStop();
   syncHash(push);
   renderTabs();
+  /* Before the body renders, not after: the attribute drives every colour on the
+     page, so setting it later would paint one frame in the old palette. */
+  applyTheme();
   renderKicker();
   renderCcy();
   const views={dashboard,calendar,trades,positions,costs,annual,odte,market,
@@ -3166,6 +3231,11 @@ async function load(){
 }
 
 $('#cog').onclick=()=>{S.showCog=!S.showCog;draw();};
+/* The edition chip IS the theme control. `draw()` without a push, because
+   recolouring is an adjustment to the view you are on rather than a navigation --
+   the same rule the currency toggle and the filters follow, and pushing here
+   would bury the tab trail under one entry per click. */
+$('#edition').onclick=()=>{S.theme=nextTheme();draw();};
 $('#sync').onclick=async()=>{
   if(!confirm('Fetch from IBKR now?\n\nThis spends one request against your Flex '
     +'request budget. IBKR locks out clients that ask too often.')) return;

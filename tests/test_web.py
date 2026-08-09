@@ -2805,38 +2805,163 @@ def test_a_sign_tint_outranks_the_default_colour_of_the_element_it_lands_on():
     )
 
 
-def test_muted_text_meets_wcag_aa_on_every_surface_it_sits_on():
+def _themes() -> dict[str, dict[str, str]]:
+    """Every theme block in the stylesheet, as {selector: {name: hex}}.
+
+    Comments are stripped PER BLOCK, after splitting, and the closing brace is
+    matched as `\\n}` rather than the first `}` -- both learned by getting it
+    wrong. `--dim2` carries a long explanatory comment mid-block, so stripping
+    comments first swallowed the declaration after it, and a `}` inside that
+    comment truncated the block. Either way the key silently vanished and the
+    contrast check passed by measuring nothing.
+    """
+    return {
+        selector: {
+            # Keyed WITHOUT the leading dashes, so a caller asks for "dim2".
+            name.lstrip("-"): value
+            for name, value in re.findall(
+                r"(--[a-z0-9]+)\s*:\s*(#[0-9a-fA-F]{6})",
+                re.sub(r"/\*.*?\*/", "", body, flags=re.S),
+            )
+        }
+        for selector, body in re.findall(
+            r"^(:root[^{\n]*|\[data-theme=\"[a-z]+\"\])\{(.*?)\n\}",
+            _css(), flags=re.S | re.M,
+        )
+    }
+
+
+def _lum(hex_colour: str) -> float:
+    parts = [int(hex_colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+    chan = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in parts]
+    return 0.2126 * chan[0] + 0.7152 * chan[1] + 0.0722 * chan[2]
+
+
+def _ratio(fg: str, bg: str) -> float:
+    a, b = _lum(fg), _lum(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_muted_text_meets_wcag_aa_in_every_theme_on_every_surface():
     """--dim2 measured 3.31:1 on --bg and 3.02:1 on --panel2, against the 4.5:1
     that 12px body text requires, and it dressed the footer and every
     explanatory caption -- the prose a newcomer reads first.
 
-    Computed here rather than pinned to a hex, so re-tuning the palette is free
-    while regressing legibility is not.
+    Computed rather than pinned to a hex, so re-tuning a palette is free while
+    regressing legibility is not -- and run over EVERY theme, because the moment
+    a second palette existed this test's `re.search` was silently measuring only
+    the first block in the file. A theme is a whole new set of these ratios, so a
+    prettier ground that nobody can read must not be able to ship.
+    """
+    themes = _themes()
+    assert len(themes) >= 2, (
+        f"expected several theme blocks, found {sorted(themes)} -- the parser is "
+        f"probably matching the wrong brace again"
+    )
+    for selector, palette in themes.items():
+        for surface in ("bg", "panel", "panel2"):
+            ratio = _ratio(palette["dim2"], palette[surface])
+            assert ratio >= 4.5, (
+                f"{selector}: --dim2 ({palette['dim2']}) is {ratio:.2f}:1 on "
+                f"--{surface} ({palette[surface]}), below the 4.5:1 WCAG AA needs "
+                f"for 12px text. Lighten --dim2 for that theme."
+            )
+
+
+def test_text_on_an_accent_fill_is_readable_in_every_theme():
+    """A label sitting ON a filled control, which is not the same question as
+    text on a surface and had never been asked.
+
+    Asking it found two real failures the moment the palette became measurable:
+    --onaccent was 4.31:1 on Leather's --accentlit2 (a defect that predated the
+    themes entirely) and 4.18:1 on Oxblood's. The currency toggle's active label
+    is what wears that pair.
+
+    The gradient's DARKER stop is the binding case, since the label has to hold
+    up across the whole fill rather than at its lightest point.
+    """
+    for selector, palette in _themes().items():
+        for fg, bg in (("accentfg", "accent"), ("onaccent", "accentlit2"),
+                       ("edfg", "edbg")):
+            ratio = _ratio(palette[fg], palette[bg])
+            assert ratio >= 4.5, (
+                f"{selector}: --{fg} ({palette[fg]}) is {ratio:.2f}:1 on --{bg} "
+                f"({palette[bg]}), below 4.5:1 -- that label sits directly on "
+                f"that fill"
+            )
+
+
+def test_the_selected_tab_separates_from_an_unselected_one_in_every_theme():
+    """A tab strip where the current tab does not stand out is a navigation bar
+    that has stopped saying where you are.
+
+    `.tab` is --panel2 and `.tab.on` fills with --accent, so the separation IS
+    the ratio between those two. Found by SCREENSHOT, not by arithmetic: every
+    text-contrast figure passed while Admiralty's selected tab sat at 2.42:1
+    against its neighbours and read as barely selected. Leather manages 3.12, so
+    that is the bar the other themes are held to.
+
+    2.8 rather than 3.12 exactly, because this is a floor for a decorative
+    separation rather than a legibility threshold, and pinning a theme to another
+    theme's precise number would make retuning Leather fail everything else.
+    """
+    for selector, palette in _themes().items():
+        ratio = _ratio(palette["accent"], palette["panel2"])
+        assert ratio >= 2.8, (
+            f"{selector}: --accent ({palette['accent']}) is only {ratio:.2f}:1 "
+            f"against --panel2 ({palette['panel2']}), so a selected tab barely "
+            f"differs from an unselected one. Lighten --accent -- but check "
+            f"--accentfg still clears 4.5 on it, the two pull opposite ways"
+        )
+
+
+def test_every_theme_declares_the_same_palette():
+    """A theme is a SWAP, not a patch.
+
+    A block that declares only some of the names inherits the rest from `:root`,
+    so a half-written theme renders one palette's chrome on another's ground --
+    silently, and only on whichever panels happen to use the missing names. That
+    is exactly the bug the promotion pass fixed at the literal level, and it
+    would walk straight back in through an incomplete block.
+    """
+    themes = _themes()
+    base_selector = next(s for s in themes if s.startswith(":root"))
+    base = set(themes[base_selector])
+    assert len(base) > 30, f"the base palette looks truncated: {len(base)} names"
+    for selector, palette in themes.items():
+        if selector == base_selector:
+            continue
+        missing = base - set(palette)
+        assert not missing, (
+            f"{selector} does not declare {sorted(missing)}, so those names fall "
+            f"through to {base_selector} and this theme renders another theme's "
+            f"colours for them"
+        )
+
+
+def test_no_colour_literal_lives_outside_a_theme_block():
+    """The whole theme mechanism is "every colour is a variable", and 35 hex
+    literals scattered through the rules is what made a theme swap leave brown
+    chrome on a blue page: the logo facets, the edition pill, calendar day
+    borders, put/call, the impact dots, and every `rgba(255,255,255,...)` wash --
+    which is not a neutral hairline but a dark-theme assumption with no name.
+
+    So the rule is mechanical and this test is what makes it hold.
     """
     css = _css()
-    def _var(name: str) -> str:
-        match = re.search(rf"--{name}:\s*(#[0-9a-fA-F]{{6}})", css)
-        assert match, f"--{name} is gone from the stylesheet"
-        return match.group(1)
-
-    def _lum(hex_colour: str) -> float:
-        parts = [int(hex_colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
-        chan = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in parts]
-        return 0.2126 * chan[0] + 0.7152 * chan[1] + 0.0722 * chan[2]
-
-    def _ratio(fg: str, bg: str) -> float:
-        a, b = _lum(fg), _lum(bg)
-        hi, lo = max(a, b), min(a, b)
-        return (hi + 0.05) / (lo + 0.05)
-
-    fg = _var("dim2")
-    # Every surface muted text actually lands on.
-    for surface in ("bg", "panel", "panel2"):
-        ratio = _ratio(fg, _var(surface))
-        assert ratio >= 4.5, (
-            f"--dim2 ({fg}) is {ratio:.2f}:1 on --{surface} ({_var(surface)}), "
-            f"below the 4.5:1 WCAG AA needs for 12px text. Lighten --dim2."
-        )
+    # Everything except the theme blocks themselves.
+    rules = re.sub(
+        r"^(?::root[^{\n]*|\[data-theme=\"[a-z]+\"\])\{.*?\n\}", "",
+        css, flags=re.S | re.M,
+    )
+    rules = re.sub(r"/\*.*?\*/", "", rules, flags=re.S)
+    strays = re.findall(r"#[0-9a-fA-F]{3,8}\b|rgba?\([0-9.,\s]*\)", rules)
+    assert not strays, (
+        f"colour literals outside the theme blocks: {sorted(set(strays))} -- each "
+        f"one survives a theme swap unchanged. Give it a name in every theme "
+        f"block and use var()."
+    )
 
 
 def test_every_control_has_a_visible_keyboard_focus_ring():
@@ -2848,7 +2973,10 @@ def test_every_control_has_a_visible_keyboard_focus_ring():
     added later is reachable by default instead of by remembering.
     """
     css = _css().replace(" ", "").replace("\n", "")
-    assert ":focus-visible{outline:2pxsolidvar(--leather1)" in css, (
+    # --accent, formerly --leather1: the palette names say ROLE now that a theme
+    # can repaint them, and a ring hardcoded to one theme's brown would be
+    # invisible against another theme's ground.
+    assert ":focus-visible{outline:2pxsolidvar(--accent)" in css, (
         "the global focus ring is gone, so keyboard users cannot see focus"
     )
     # :focus-visible, not :focus -- otherwise a mouse click leaves a ring that

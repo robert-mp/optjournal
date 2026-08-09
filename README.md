@@ -78,7 +78,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `cli.py` | argparse wiring only: every command opens the database via `db.open_journal` and emits through `_emit(data, text, json)`, so `--json` comes for free |
 | `web.py` | loopback HTTP server; `ServeConfig` injected per server |
 | `page.html` | the frontend's markup and JavaScript: no build step, nothing off-origin |
-| `static/app.css` | every styling rule. Extracted from the page's `<style>` block so all of them sit where `tests/test_web.py`'s thirteen layout assertions can read them — four real defects once lived in CSS that nothing in the suite had ever looked at. A `<link>` in `<head>` is render-blocking, so there is no unstyled flash; the extra loopback request measures 1.4 ms |
+| `static/app.css` | every styling rule, and every colour. Extracted from the page's `<style>` block so all of them sit where `tests/test_web.py`'s layout assertions can read them — four real defects once lived in CSS that nothing in the suite had ever looked at. A `<link>` in `<head>` is render-blocking, so there is no unstyled flash; the extra loopback request measures 1.4 ms. Opens with one `[data-theme]` block per [theme](#themes) |
 | `static/replay.js` | the replay chart's arithmetic as pure functions over plain data — no DOM, no globals — so `node --test` can unit-test the scales and the scrub. A function belongs here if it takes data and returns data; the moment it touches `document` it belongs in the page |
 | `static/mark.svg` | the Bitácora compass rose as a standalone favicon. Carries its own colours: a favicon renders outside the page, where `page.html`'s custom properties do not reach. `web.STATIC_TYPES` is what lets it be served as an image rather than a script |
 | `browser.py` | headless browser discovery and the DOM dump, in three views: raw, markup (scripts stripped), text |
@@ -512,6 +512,49 @@ Figures that share a sentence must share a basis, so the rule is applied per
 *block*, not per figure: "as charged · $6.97" beside a €6.07 pill is a
 contradiction, not a rounding difference.
 
+## Themes
+
+Three palettes ship: **Leather** (the original), **Admiralty** (blue-black and
+brass, which is what the compass mark was always drawing), and **Oxblood**. The
+edition chip beside the title is the control — it names the active theme and
+cycles on click — and the choice rides in the URL hash, so a reload keeps it and
+a link carries it. No localStorage: this page persists no other preference that
+way, and a setting the URL cannot express is one that disagrees with a shared
+link.
+
+The whole mechanism is that **every colour is a custom property, and nothing
+outside the theme blocks holds a colour literal.** That had to be earned rather
+than declared: 35 hex literals were scattered through the rules — the logo
+facets, the edition pill, calendar day borders, put/call, the impact dots — so a
+theme swap left brown chrome sitting on a blue page. Promoting them is why the
+palette is 64 names long; that is the honest size of this page's colour
+vocabulary. `test_no_colour_literal_lives_outside_a_theme_block` keeps it that
+way, and `test_every_theme_declares_the_same_palette` keeps a theme a *swap*
+rather than a patch — a block missing a name inherits it from `:root`, which
+renders one theme's chrome on another's ground, silently and only on the panels
+that use it.
+
+**Usability is measured, not asserted.** The contrast tests recompute WCAG
+ratios from the stylesheet for every theme, so retuning a palette is free while
+regressing legibility is a red test. Adding the second theme immediately caught
+that the original `test_muted_text_...` had been silently checking only the first
+block in the file. Between them, the checks found four real defects that reading
+the CSS would not have: `--onaccent` failed AA on its own fill in two themes (one
+of which, Leather's 4.31:1, predated the themes entirely), and both new themes
+shipped a selected tab too close to its neighbours to read as selected — that one
+found by **screenshot**, since every text-contrast figure passed while the tab
+strip had stopped saying where you were.
+
+**Adding a theme**: one `[data-theme="yourname"]` block in `app.css` declaring
+every name `:root` declares → one entry in `page.html`'s `THEMES` table. No
+JavaScript to touch, and the tests will tell you which names you missed and which
+ratios you broke.
+
+A light theme is the obvious next one and is deliberately not here: it inverts
+the bevels (`--bevel*` and `--drop*` assume a lit-from-above dark surface) and
+needs every gain/loss hue re-derived, since mint-on-paper fails contrast badly.
+The variables it needs already exist, which was the point of naming them.
+
 ## Adding functionality
 
 **A new UI tab**: serializer in `serialize.py` → emit it in
@@ -523,6 +566,8 @@ key to `sweep.TABS` (a test holds it to `page.html`'s own list, because a tab
 missing there is never swept and the sweep still reports a pass) →
 tests asserting its figures reconcile with an existing independent number
 (see the Annual total-row tests).
+
+**A new theme**: see [Themes](#themes) — a CSS block plus a `THEMES` entry.
 
 **A new payload key on an existing shape**: emit it in the serializer and
 add one `@property` line to the shape's typedef — the drift test holds the

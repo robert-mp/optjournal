@@ -14,8 +14,26 @@
  * Measured cost of the extra request on loopback: 1.4 ms.
  *
  * Still no build step, no preprocessor, no framework. This is one plain file.
+ *
+ * THEMES. Every colour on this page is a custom property declared in the blocks
+ * below, and NOTHING outside them may hold a colour literal -- that is the whole
+ * mechanism, and a test enforces it. It had to be earned: 35 hex literals were
+ * scattered through the rules (the logo facets, the edition pill, calendar
+ * borders, put/call, the impact dots), so a theme swap left brown chrome sitting
+ * on a blue page. Those are now variables, which is why the palette below is
+ * long: it is the honest size of this page's colour vocabulary.
+ *
+ * A theme is one `[data-theme="..."]` block overriding those names. `:root`
+ * carries Leather so a page with no attribute set is still fully styled -- a
+ * theme is a swap, never a patch, and no block may declare only some of the
+ * names. Tested: every theme declares the same key set, and every theme's muted
+ * text is contrast-checked against every surface it lands on.
+ *
+ * Names say ROLE, not colour. They were `--leather1/2/fg`, which is why the
+ * rename came with the second theme: `--leather1` on a blue-black page is a lie
+ * a reader of this file would have to hold in their head.
  */
-:root{
+:root,[data-theme="leather"]{
   --bg:#0a0806; --bg2:#0f0b08;
   --panel:#16110d; --panel2:#1b1410; --line:#2a1f17; --line2:#3a2b20;
   /* --dim2 was #6f6055, which measured 3.31:1 on --bg and 3.02:1 on --panel2:
@@ -25,13 +43,167 @@
      first step up this hue that clears 4.5:1 against ALL THREE surfaces it
      lands on -- 5.02 on --bg, 4.71 on --panel, 4.57 on --panel2 -- and it stays
      clearly below --dim, so the three-tier hierarchy survives. A test recomputes
-     these rather than pinning the hex, so retuning is free; do not eyeball it. */
+     these rather than pinning the hex, so retuning is free; do not eyeball it.
+     The same test now runs over EVERY theme, so a new palette cannot ship a
+     prettier --dim2 that nobody can read. */
   --fg:#f5ead9; --dim:#9a8878; --dim2:#8f7c6d;
   --kicker:#a98a6f;
-  --leather1:#8a5a3b; --leather2:#5f3d27; --leatherfg:#f7e6d2;
+  /* The accent: tab selection, focus rings, the replay's expected-move band.
+     `--accentfg` is what sits ON --accent, so the pair travels together. */
+  --accent:#8a5a3b; --accent2:#5f3d27; --accentfg:#f7e6d2;
+  /* A lit accent, for the one control that must read as switched-on rather than
+     merely selected, and the calendar's selected-day outline.
+     --onaccent is the label ON that gradient, and the binding constraint is the
+     DARKER stop: at #1a1206 it measured 4.31:1 on --accentlit2, an AA failure
+     that predated the themes and was invisible until the palette became
+     measurable. #120d04 clears at 4.51 without lightening the gradient, which
+     is what keeps the control reading as lit. Do not eyeball it -- a test
+     recomputes this for every theme. */
+  --accentlit1:#c98a5c; --accentlit2:#a86c42; --onaccent:#120d04;
+  --accentedge:#a06840;
+  /* The header slab and the mark it seats. Three stops, because the brand plate
+     is a lit-from-upper-left gradient rather than a flat fill. */
+  --brand1:#231810; --brand2:#171008; --brand3:#120d09;
+  --logo1:#b3714a; --logo2:#7b4a2c; --logo3:#5d3720;
+  /* The compass rose's two facets. Near the palette's extremes on purpose: at
+     favicon size a subtle difference is no difference. */
+  --markhi:#fdf1e0; --marklo:#43230f;
+  --sheen:rgba(255,240,214,.34);
+  /* The edition chip, which now names the active theme. */
+  --edfg:#c9a888; --edbg:#2a1d14; --edline:#3d2a1c;
+  --seg1:#2d1f15; --seg2:#241a12;
+  --dayhover:#8a6a4e;
   --ok:#4fd1a0; --bad:#f0899a;
   --okfill1:#1c4a32; --okfill2:#13301f;
   --badfill1:#5e211f; --badfill2:#3a1614;
+  --okedge:#2c6a48; --badedge:#7c2f2b;
+  --badlit:#f0a0a8;
+  /* Buy/sell, and put/call. Deliberately NOT --ok/--bad: green-red means signed
+     money everywhere else here, so these are a cooler green and a warmer rose
+     that read as categories rather than as profit. */
+  --buy:#8fd6b4; --sell:#f0a9b5;
+  --buybg:#16281f; --sellbg:#2a1618;
+  --put:#d98f8f; --call:#7fbf9a;
+  --putwash:rgba(217,143,143,.16); --callwash:rgba(127,191,154,.16);
+  --rollwash:rgba(191,164,111,.18);
+  /* Economic-calendar impact. Read WITH the row's words: hue alone cannot tell
+     High from Low to a reader who does not separate these. */
+  --imphi:#c2553f; --implo:#6f7b6a;
+  /* Hairlines and washes, kept as variables because a light theme needs them
+     DARKENED rather than lightened -- `rgba(255,255,255,...)` is not neutral,
+     it is a dark-theme assumption with no name on it. */
+  --hairline:rgba(255,255,255,.035);
+  --gridline:rgba(255,255,255,.055);
+  --onfill:rgba(255,255,255,.62);
+  --overlay:rgba(22,17,13,.97);
+  --shadow:rgba(0,0,0,.55);
+  /* The bevels and drops that make the header slab and the mark read as PRESSED
+     rather than drawn. Named rather than left inline because a light theme
+     inverts the whole relationship: there the lit edge belongs below and the
+     shadow above, which no amount of `rgba(255,255,255,...)` can express. */
+  --bevelfaint:rgba(255,255,255,.03); --bevel:rgba(255,255,255,.18);
+  --bevelhi:rgba(255,255,255,.22); --bevelon:rgba(255,255,255,.16);
+  --drop:rgba(0,0,0,.5); --dropsoft:rgba(0,0,0,.4);
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+
+/* ADMIRALTY -- nautical night. Blue-black ground with brass, which is the theme
+   the mark was always drawing: a bitácora is a binnacle, and a brass compass
+   card on blue-black is what one looks like. The cool ground is also doing
+   legibility work rather than only mood -- --ok and --bad are warm-neutral
+   greens and roses, and on brown they sit close to their surroundings, while on
+   slate they separate hard. */
+[data-theme="admiralty"]{
+  --bg:#060910; --bg2:#0a0f18;
+  --panel:#0e1520; --panel2:#141d2b; --line:#1d2c3d; --line2:#2c405a;
+  /* Same rule as Leather's --dim2, recomputed for this ground: 5.34 on --bg,
+     4.79 on --panel, 4.52 on --panel2. Do not eyeball it; the test recomputes. */
+  --fg:#e9eff7; --dim:#8fa3bd; --dim2:#8b9fb8;
+  --kicker:#c9a05e;
+  /* --accent was #2f5c86, which SCREENSHOTS caught and the contrast numbers did
+     not: the selected tab separated from an unselected one by only 2.42:1
+     against --panel2, where Leather manages 3.12, so the active tab barely read
+     as active. #2f6ea8 brings it to 3.16 while keeping --accentfg on it at 4.75.
+     Both constraints are real and they pull opposite ways -- a lighter accent
+     shows the selection better and holds its label worse. */
+  --accent:#2f6ea8; --accent2:#1d3d5c; --accentfg:#eaf2fb;
+  --accentlit1:#d9a05b; --accentlit2:#b07f3f; --onaccent:#0b1220;
+  --accentedge:#3d6e9c;
+  --brand1:#16233a; --brand2:#0e1728; --brand3:#0a111d;
+  --logo1:#d9a05b; --logo2:#a97535; --logo3:#7d5423;
+  --markhi:#fff6e4; --marklo:#2a1a08;
+  --sheen:rgba(255,244,222,.38);
+  --edfg:#c9a05e; --edbg:#14202f; --edline:#25384f;
+  --seg1:#16243a; --seg2:#111c2c;
+  --dayhover:#4a6d94;
+  --ok:#4fd1a0; --bad:#f0899a;
+  --okfill1:#14453a; --okfill2:#0d2c26;
+  --badfill1:#54222c; --badfill2:#34161c;
+  --okedge:#2a6a5c; --badedge:#7a3040;
+  --badlit:#f0a0a8;
+  --buy:#8fd6b4; --sell:#f0a9b5;
+  --buybg:#122a26; --sellbg:#281820;
+  --put:#e0959b; --call:#7fc6a8;
+  --putwash:rgba(224,149,155,.16); --callwash:rgba(127,198,168,.16);
+  --rollwash:rgba(217,160,91,.18);
+  --imphi:#d0563f; --implo:#6f8296;
+  --hairline:rgba(255,255,255,.04);
+  --gridline:rgba(255,255,255,.06);
+  --onfill:rgba(255,255,255,.66);
+  --overlay:rgba(14,21,32,.97);
+  --shadow:rgba(0,0,0,.6);
+  --bevelfaint:rgba(255,255,255,.035); --bevel:rgba(255,255,255,.2);
+  --bevelhi:rgba(255,255,255,.24); --bevelon:rgba(255,255,255,.18);
+  --drop:rgba(0,0,0,.55); --dropsoft:rgba(0,0,0,.45);
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+
+/* OXBLOOD -- ledger leather. Nearest to Leather, and included as the control:
+   it changes the hue barely and the TONAL RANGE a lot. Leather's --bg through
+   --line2 span six near-identical browns, which is why its panels read as one
+   flat sheet; this pushes the ground darker and the panels warmer so a card has
+   an edge without needing a border to prove it. */
+[data-theme="oxblood"]{
+  --bg:#0a0607; --bg2:#100a0b;
+  --panel:#1a0f11; --panel2:#221518; --line:#33191c; --line2:#452429;
+  /* 5.11 on --bg, 4.72 on --panel, 4.55 on --panel2. */
+  --fg:#f4e8de; --dim:#a4867e; --dim2:#997c74;
+  --kicker:#b58a72;
+  /* #8e4a45 gave the selected tab only 2.71:1 against --panel2, the same defect
+     the screenshots found in Admiralty. #934c47 clears the 2.8 floor at 2.83 and
+     holds --accentfg at 5.24. */
+  --accent:#934c47; --accent2:#5f2f2d; --accentfg:#f9e8e0;
+  /* --accentlit2 lifted from #a06a3c to #a86f3f, rather than crushing --onaccent
+     to near-black: at 4.18:1 the label failed AA, and the darkening that fixed
+     it (#060302) was black in all but name. A 3% lighter gilt clears at 4.53. */
+  --accentlit1:#c08552; --accentlit2:#a86f3f; --onaccent:#1a0d08;
+  --accentedge:#a35a4c;
+  --brand1:#2a1517; --brand2:#1c0f11; --brand3:#140b0c;
+  --logo1:#c08552; --logo2:#8a5730; --logo3:#653c22;
+  --markhi:#fdf1e0; --marklo:#3d1a12;
+  --sheen:rgba(255,238,214,.34);
+  --edfg:#cfa287; --edbg:#2b1518; --edline:#412026;
+  --seg1:#2c1a1c; --seg2:#231415;
+  --dayhover:#8f5a52;
+  --ok:#5fc9a2; --bad:#e8798f;
+  --okfill1:#1a4636; --okfill2:#122e23;
+  --badfill1:#5c2029; --badfill2:#38151a;
+  --okedge:#2d6650; --badedge:#82303c;
+  --badlit:#f0a0a8;
+  --buy:#8fd6b4; --sell:#f0a9b5;
+  --buybg:#152720; --sellbg:#2b171b;
+  --put:#dd9294; --call:#7fc3a0;
+  --putwash:rgba(221,146,148,.16); --callwash:rgba(127,195,160,.16);
+  --rollwash:rgba(197,160,120,.18);
+  --imphi:#c8523c; --implo:#78776c;
+  --hairline:rgba(255,255,255,.038);
+  --gridline:rgba(255,255,255,.055);
+  --onfill:rgba(255,255,255,.64);
+  --overlay:rgba(26,15,17,.97);
+  --shadow:rgba(0,0,0,.58);
+  --bevelfaint:rgba(255,255,255,.032); --bevel:rgba(255,255,255,.19);
+  --bevelhi:rgba(255,255,255,.23); --bevelon:rgba(255,255,255,.17);
+  --drop:rgba(0,0,0,.52); --dropsoft:rgba(0,0,0,.42);
   --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 *{box-sizing:border-box}
@@ -48,7 +220,7 @@ html,body{margin:0;background:var(--bg);color:var(--fg);
    navigation and withholds it on mouse clicks, which is what stops a visible
    ring from reading as a stuck selection. --leather1 matches `.tipped:focus`,
    the one control that already had a ring. */
-:focus-visible{outline:2px solid var(--leather1);outline-offset:2px;
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;
   border-radius:4px}
 /* Inside the ring rather than outside it: these two sit flush against a panel
    edge, where a 2px offset ring is clipped. */
@@ -74,35 +246,35 @@ html,body{margin:0;background:var(--bg);color:var(--fg);
 
 /* ---- branded header ---- */
 .brand{display:flex;align-items:flex-start;gap:18px;padding:20px 22px;border-radius:16px;
-  background:linear-gradient(150deg,#231810 0%,#171008 55%,#120d09 100%);
-  border:1px solid var(--line2);box-shadow:0 1px 0 rgba(255,255,255,.03) inset}
+  background:linear-gradient(150deg,var(--brand1) 0%,var(--brand2) 55%,var(--brand3) 100%);
+  border:1px solid var(--line2);box-shadow:0 1px 0 var(--bevelfaint) inset}
 /* The mark is a compass rose seated in a binnacle ring -- a bitácora is the
    housing that held a ship's compass and its log. Inline SVG rather than an
    <img>: it inherits the palette below through currentColor and the CSS
    custom properties, so the logo cannot drift out of tune with the theme the
    way a flat exported asset would. */
 .logo{width:58px;height:58px;border-radius:14px;flex:0 0 auto;
-  background:linear-gradient(150deg,#b3714a,#7b4a2c 60%,#5d3720);
-  border:1px solid #a06840;display:grid;place-items:center;
-  box-shadow:0 2px 8px rgba(0,0,0,.5), 0 1px 0 rgba(255,255,255,.18) inset;
+  background:linear-gradient(150deg,var(--logo1),var(--logo2) 60%,var(--logo3));
+  border:1px solid var(--accentedge);display:grid;place-items:center;
+  box-shadow:0 2px 8px var(--drop), 0 1px 0 var(--bevel) inset;
   position:relative;overflow:hidden}
 .logo svg{width:38px;height:38px;display:block;
   /* Debossed: the dark drop sits ABOVE the light one, so the mark reads as
      pressed into the leather rather than resting on it. */
-  filter:drop-shadow(0 -1px 0 rgba(0,0,0,.55)) drop-shadow(0 1px 0 rgba(255,255,255,.22))}
-.logo .ring{fill:none;stroke:#f7e6d2;stroke-width:1.5;opacity:.5}
-.logo .ticks path{stroke:#f7e6d2;stroke-width:1.5;opacity:.42;stroke-linecap:round}
+  filter:drop-shadow(0 -1px 0 var(--shadow)) drop-shadow(0 1px 0 var(--bevelhi))}
+.logo .ring{fill:none;stroke:var(--accentfg);stroke-width:1.5;opacity:.5}
+.logo .ticks path{stroke:var(--accentfg);stroke-width:1.5;opacity:.42;stroke-linecap:round}
 /* The two facets of every arm. The contrast between them is the whole
    illusion, so they are near the extremes of the palette rather than
    tastefully close together -- at 16px a subtle difference is no difference. */
-.logo .star .fl{fill:#fdf1e0}
-.logo .star .fd{fill:#43230f;opacity:.92}
-.logo .pivot{fill:#fdf1e0;opacity:.75}
+.logo .star .fl{fill:var(--markhi)}
+.logo .star .fd{fill:var(--marklo);opacity:.92}
+.logo .pivot{fill:var(--markhi);opacity:.75}
 /* A brass sheen crosses the mark once on load, and again on hover. Purely
    decorative, so it is removed outright for anyone who asked for less
    motion rather than merely being slowed down. */
 .logo::after{content:"";position:absolute;inset:0;pointer-events:none;
-  background:linear-gradient(75deg,transparent 30%,rgba(255,240,214,.34) 48%,transparent 62%);
+  background:linear-gradient(75deg,transparent 30%,var(--sheen) 48%,transparent 62%);
   transform:translateX(-130%);animation:sheen 1100ms ease-out 220ms 1}
 .logo:hover::after{animation:sheen 900ms ease-out 1}
 @keyframes sheen{to{transform:translateX(130%)}}
@@ -113,15 +285,22 @@ html,body{margin:0;background:var(--bg);color:var(--fg);
   color:var(--kicker);font-weight:600;margin-bottom:2px}
 .title{font-size:30px;font-weight:800;letter-spacing:-.01em;line-height:1.1;
   display:flex;align-items:center;gap:10px}
-.edition{font-size:10.5px;font-weight:600;color:#c9a888;background:#2a1d14;
-  border:1px solid #3d2a1c;border-radius:999px;padding:3px 9px;letter-spacing:.02em}
+/* `font:inherit` and the cursor are what a <button> needs that the old <span>
+   did not: a button does not inherit the page's family or size, so without it
+   the chip rendered in the browser's default UI font beside a 30px title. */
+.edition{font:inherit;font-size:10.5px;font-weight:600;line-height:1.5;
+  color:var(--edfg);background:var(--edbg);cursor:pointer;
+  border:1px solid var(--edline);border-radius:999px;padding:3px 9px;letter-spacing:.02em}
+/* Hover states the chip is a control. The border is what moves, not the fill:
+   at 10.5px a background change reads as the label having been selected. */
+.edition:hover{border-color:var(--accentedge);color:var(--fg)}
 .tabs{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
 .tab{font:inherit;font-weight:600;font-size:13px;cursor:pointer;padding:8px 17px;
   border-radius:9px;background:var(--panel2);border:1px solid var(--line);color:var(--fg)}
 .tab:hover:not(:disabled){border-color:var(--line2)}
-.tab.on{background:linear-gradient(160deg,var(--leather1),var(--leather2));
-  border-color:#a06840;color:var(--leatherfg);
-  box-shadow:0 1px 0 rgba(255,255,255,.16) inset,0 2px 10px rgba(0,0,0,.4)}
+.tab.on{background:linear-gradient(160deg,var(--accent),var(--accent2));
+  border-color:var(--accentedge);color:var(--accentfg);
+  box-shadow:0 1px 0 var(--bevelon) inset,0 2px 10px var(--dropsoft)}
 /* `align-items` must be pinned on BOTH levels, and the reason differs at each.
    On the column itself, the default `stretch` is opted out of by .icobtn's
    explicit width -- and a definite cross-size lands the item at the cross-axis
@@ -140,7 +319,7 @@ html,body{margin:0;background:var(--bg);color:var(--fg);
 .ccytog{display:flex;gap:0;border:1px solid var(--line);border-radius:9px;overflow:hidden}
 .ccytog button{background:transparent;border:0;color:var(--dim);font:inherit;
   font-size:12px;font-weight:600;letter-spacing:.04em;padding:6px 11px;cursor:pointer}
-.ccytog button.on{background:linear-gradient(180deg,#c98a5c,#a86c42);color:#1a1206}
+.ccytog button.on{background:linear-gradient(180deg,var(--accentlit1),var(--accentlit2));color:var(--onaccent)}
 .ccytog button:disabled{opacity:.4;cursor:not-allowed}
 .calnav{display:inline-flex;gap:4px;margin-left:10px;vertical-align:2px}
 .calnav button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
@@ -170,7 +349,7 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
 .seg button{font:inherit;font-weight:600;font-size:13px;padding:9px 20px;cursor:pointer;
   background:var(--panel2);border:0;border-right:1px solid var(--line2);color:var(--dim)}
 .seg button:last-child{border-right:0}
-.seg button.on{background:linear-gradient(160deg,#2d1f15,#241a12);color:var(--fg)}
+.seg button.on{background:linear-gradient(160deg,var(--seg1),var(--seg2));color:var(--fg)}
 .seg button:disabled{opacity:.4;cursor:not-allowed}
 .center{text-align:center}
 
@@ -256,14 +435,14 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
      depending on which element opened it. */
   font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
   color:var(--dim);background:var(--panel2);border:1px solid var(--line2);
-  box-shadow:0 8px 22px rgba(0,0,0,.55);
+  box-shadow:0 8px 22px var(--shadow);
   opacity:0;visibility:hidden;transition:opacity .12s ease;pointer-events:none}
 /* `focus-within` as well as `focus`, so the card reveals whether the focus
    landed on it or on something inside it. */
 .tipped{cursor:help}
 .tipped:hover>.tip,.tipped:focus>.tip,.tipped:focus-within>.tip{
   opacity:1;visibility:visible}
-.tipped:focus{outline:1px solid var(--leather1);outline-offset:1px}
+.tipped:focus{outline:1px solid var(--accent);outline-offset:1px}
 /* A heading states its section's rule on hover. A dotted underline is the right
    affordance under an 11px label and the wrong one under a 19px bold heading --
    at that weight a 1px dotted line reads as a rendering artefact rather than an
@@ -273,7 +452,7 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
   background:var(--panel2);border:1px solid var(--line2);
   font-size:10px;font-weight:700;font-family:var(--mono);color:var(--dim);
   vertical-align:middle}
-.info:hover{border-color:var(--leather1);color:var(--fg)}
+.info:hover{border-color:var(--accent);color:var(--fg)}
 .stat .k.hint{border-bottom:1px dotted var(--line2);display:inline-block;
   padding-bottom:2px}
 .stat .v{font-size:25px;font-weight:700;font-family:var(--mono);
@@ -310,7 +489,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;color:var(--dim);font-weight:500;font-size:11.5px;
   letter-spacing:.04em;text-transform:uppercase;padding:0 10px 8px;
   border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.035)}
+td{padding:8px 10px;border-bottom:1px solid var(--hairline)}
 tr:last-child td{border-bottom:0}
 td.n,th.n{text-align:right}
 .empty{color:var(--dim2);font-style:italic;padding:16px 10px;text-align:center}
@@ -323,17 +502,17 @@ td.n,th.n{text-align:right}
   border:1px solid var(--line);display:flex;flex-direction:column;
   justify-content:space-between;font-size:12px}
 .day.void{background:transparent;border-color:transparent}
-.day.g{background:linear-gradient(160deg,var(--okfill1),var(--okfill2));border-color:#2c6a48}
-.day.r{background:linear-gradient(160deg,var(--badfill1),var(--badfill2));border-color:#7c2f2b}
+.day.g{background:linear-gradient(160deg,var(--okfill1),var(--okfill2));border-color:var(--okedge)}
+.day.r{background:linear-gradient(160deg,var(--badfill1),var(--badfill2));border-color:var(--badedge)}
 .day .top{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
 .day .dnum{font-weight:600}
 .day .dct{font-size:10.5px;color:var(--dim)}
 .day.clk{cursor:pointer}
-.day.clk:hover{border-color:#8a6a4e}
-.day.selected{outline:2px solid #c98a5c;outline-offset:-2px}
+.day.clk:hover{border-color:var(--dayhover)}
+.day.selected{outline:2px solid var(--accentlit1);outline-offset:-2px}
 /* Market strip. Reuses .cal/.day so the two calendars look like one idea; the
    difference is what a cell holds -- a P&L figure there, event titles here. */
-.mktoday{border-color:#a06840}
+.mktoday{border-color:var(--accentedge)}
 .mkdots{display:flex;flex-direction:column;gap:3px;margin-top:5px}
 .mkdot{font-size:10.5px;color:var(--dim);display:flex;align-items:center;gap:5px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -342,9 +521,9 @@ td.n,th.n{text-align:right}
    colour alone would make High indistinguishable from Low to a reader who
    cannot separate the hues. */
 .mkimp{width:6px;height:6px;border-radius:50%;flex:0 0 auto;background:var(--dim2)}
-.mkimp.hi{background:#c2553f}
-.mkimp.md{background:#c98a5c}
-.mkimp.lo{background:#6f7b6a}
+.mkimp.hi{background:var(--imphi)}
+.mkimp.md{background:var(--accentlit1)}
+.mkimp.lo{background:var(--implo)}
 .mksel{margin-top:16px}
 .mkrow{border:1px solid var(--line);border-radius:9px;padding:10px 12px;
   background:var(--bg2);margin-top:7px}
@@ -385,7 +564,7 @@ td.n,th.n{text-align:right}
    column, so a row of them makes a clean edge rather than a ragged one -- the
    detail column absorbs the width difference, which is why it is the `1fr`. */
 .jrun{padding:4px 10px;font-size:11.5px;min-width:64px;justify-self:end}
-.pill.neg{border-color:#7c2f2b}
+.pill.neg{border-color:var(--badedge)}
 @media(max-width:760px){
   /* The timestamp is the first thing to go: on a narrow screen the status and
      the detail are what answer the question. The BUTTON stays: it is the reason
@@ -419,7 +598,7 @@ td.n,th.n{text-align:right}
    the destructive act is confirmed rather than announced by colour. */
 .wrm{font:inherit;font-size:15px;line-height:1;cursor:pointer;padding:2px 7px;
   border-radius:7px;color:var(--dim2);background:none;border:1px solid transparent}
-.wrm:hover:not(:disabled){color:#f0a0a8;border-color:var(--line2)}
+.wrm:hover:not(:disabled){color:var(--badlit);border-color:var(--line2)}
 .wrm:disabled{opacity:.4;cursor:not-allowed}
 /* Marks a price as a stored close rather than a fetched quote. A glyph, not a
    colour: the distinction is factual, not good or bad. */
@@ -452,15 +631,15 @@ td.n,th.n{text-align:right}
    thin edges so it reads as a RANGE rather than a wash. Never as firm as the
    price line, because it is a level the market was pricing rather than one
    anything traded at, and equal weight would claim equal standing. */
-.emband{fill:var(--leather2);opacity:.17}
-.emedge{fill:none;stroke:var(--leather1);stroke-width:1;opacity:.5;stroke-dasharray:4 4}
+.emband{fill:var(--accent2);opacity:.17}
+.emedge{fill:none;stroke:var(--accent);stroke-width:1;opacity:.5;stroke-dasharray:4 4}
 .cross{stroke:var(--dim);stroke-width:1;opacity:.5}
 .rctl{display:flex;align-items:center;gap:12px;margin-top:8px;padding:0 2px}
 .rbtn{font:inherit;font-size:11.5px;font-weight:600;padding:5px 11px;
   border-radius:8px;cursor:pointer;white-space:nowrap;
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2)}
-.rbtn:hover{border-color:var(--leather1)}
-.rscrub{flex:1;accent-color:var(--leather1);cursor:pointer;min-width:80px}
+.rbtn:hover{border-color:var(--accent)}
+.rscrub{flex:1;accent-color:var(--accent);cursor:pointer;min-width:80px}
 /* width and flex are explicit because the page has a global `select{width:100%}`
    for the month picker, which as a flex item claimed the whole control row and
    squeezed the scrubber to a stub. */
@@ -473,7 +652,7 @@ td.n,th.n{text-align:right}
   display:flex;align-items:center;gap:4px}
 .rkey{font-size:10.5px;color:var(--dim);margin-top:8px;display:flex;
   flex-wrap:wrap;gap:2px;align-items:baseline}.lg{font-weight:700;margin-right:3px}
-.lg.put{color:#d98f8f} .lg.call{color:#7fbf9a}
+.lg.put{color:var(--put)} .lg.call{color:var(--call)}
 .lg.px{color:var(--fg)} .lg.dl{color:var(--dim)}
 /* Event annotation cards. One per DECISION, laid out along the timeline below
    the chart. They reveal as the replay reaches them rather than all at once:
@@ -486,8 +665,8 @@ td.n,th.n{text-align:right}
   border-radius:9px;background:var(--panel2);border:1px solid var(--line2);
   cursor:pointer;visibility:hidden;opacity:0;transition:opacity .18s ease}
 .evc.on{visibility:visible;opacity:1}
-.evc:hover{border-color:var(--leather1)}
-.evc.now{border-color:var(--leather1);background:var(--panel)}
+.evc:hover{border-color:var(--accent)}
+.evc.now{border-color:var(--accent);background:var(--panel)}
 /* The card for the event playback is PARKED on, centred over the chart. The
    wrapper is a non-interactive overlay so the chart stays visible around the
    card and nothing below it is blocked; only the card itself takes pointer
@@ -497,8 +676,8 @@ td.n,th.n{text-align:right}
   justify-content:center;pointer-events:none}
 .rfocus.on{display:flex}
 .fcard{pointer-events:auto;min-width:270px;max-width:340px;padding:14px 16px;
-  border-radius:12px;background:rgba(22,17,13,.97);border:1px solid var(--leather1);
-  box-shadow:0 8px 28px rgba(0,0,0,.55)}
+  border-radius:12px;background:var(--overlay);border:1px solid var(--accent);
+  box-shadow:0 8px 28px var(--shadow)}
 .fh{display:flex;align-items:baseline;gap:10px;justify-content:space-between}
 .ft{font-size:15px;font-weight:700;color:var(--fg)}
 .fx{background:none;border:0;color:var(--dim);cursor:pointer;font-size:16px;
@@ -515,27 +694,27 @@ td.n,th.n{text-align:right}
 .evh{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
 .evk{font-size:9px;letter-spacing:.09em;text-transform:uppercase;font-weight:700;
   padding:1px 5px;border-radius:5px;font-family:var(--mono)}
-.evk.open{background:rgba(127,191,154,.16);color:#7fbf9a}
-.evk.close{background:rgba(217,143,143,.16);color:#d98f8f}
+.evk.open{background:var(--callwash);color:var(--call)}
+.evk.close{background:var(--putwash);color:var(--put)}
 /* A roll is neither: it closes and opens in one act, and colouring it as either
    half would misreport which. Neutral, and the only kind that gets its own hue. */
-.evk.roll{background:rgba(191,164,111,.18);color:var(--leather1)}
+.evk.roll{background:var(--rollwash);color:var(--accent)}
 .evt{font-size:11.5px;font-weight:600}
 .evw{font-size:10px;color:var(--dim2)}
 .evl{font-size:10.5px;color:var(--dim);margin-top:4px;line-height:1.5}
 .evm{font-size:10.5px;color:var(--dim2);margin-top:3px;line-height:1.5}
-.lg.em{color:var(--leather1)}
+.lg.em{color:var(--accent)}
 /* Two independent readings of one line: HUE says put or call, DASH says short or
    long. Deliberately not the pos/neg palette -- green/red means signed money
    everywhere else on this page, so these are a cooler green and a warmer rose
    that read as categories rather than as profit. */
 .sk{stroke-width:1.6}
-.sk.put{stroke:#d98f8f}
-.sk.call{stroke:#7fbf9a}
+.sk.put{stroke:var(--put)}
+.sk.call{stroke:var(--call)}
 .sk.long{stroke-dasharray:5 4}
 .sklab{font-size:10.5px;font-family:var(--mono);letter-spacing:.02em}
-.sklab.put{fill:#d98f8f}
-.sklab.call{fill:#7fbf9a}
+.sklab.put{fill:var(--put)}
+.sklab.call{fill:var(--call)}
 /* Effective delta: dotted and dim, on its own right-hand scale. A derived
    sensitivity, not something that traded, so it must not read as firmly as the
    price line. */
@@ -549,7 +728,7 @@ td.n,th.n{text-align:right}
   font:inherit;font-size:11px;text-decoration:underline;padding:0}
 .linkish:hover{color:var(--fg)}
 .day .dpl{font-family:var(--mono);font-weight:600;font-size:13px}
-.day.g .dct,.day.r .dct{color:rgba(255,255,255,.62)}
+.day.g .dct,.day.r .dct{color:var(--onfill)}
 
 /* ---- legs / strategy ---- */
 .grp{margin-top:12px;border:1px solid var(--line);border-radius:11px;overflow:hidden}
@@ -559,7 +738,7 @@ td.n,th.n{text-align:right}
 .grp .gh .gl{font-family:var(--mono);color:var(--kicker);letter-spacing:.03em}
 .leg{display:grid;grid-template-columns:52px 1fr auto auto auto;gap:12px;
   align-items:center;padding:8px 13px;font-size:13px;
-  border-bottom:1px solid rgba(255,255,255,.035)}
+  border-bottom:1px solid var(--hairline)}
 /* The calendar drill-down wedges a strategy label in as a SIXTH child (legRow's
    `extra`), and a sixth child in a five-column grid wraps: the proceeds figure
    dropped to a second row and left-aligned under the 52px action column, so the
@@ -569,21 +748,21 @@ td.n,th.n{text-align:right}
 .leg.ctx{grid-template-columns:52px 1fr auto auto auto auto}
 .leg:last-child{border-bottom:0}
 .act{font-family:var(--mono);font-size:11px;font-weight:700;text-align:center;
-  padding:3px 0;border-radius:5px;background:#241a12;border:1px solid var(--line2);
+  padding:3px 0;border-radius:5px;background:var(--seg2);border:1px solid var(--line2);
   color:var(--kicker)}
 /* The Positions side cell wants the buy/sell HUE without the chip's box, and
    the only buy/sell rules were compound (.act.buy / .act.sell) -- so a bare
    <td class="sell"> matched nothing and Long/Short both rendered default white,
    silently losing the colour coding the markup was asking for. Scoped to .side
    rather than defining bare .buy/.sell, which would leak onto anything. */
-.side.buy{color:#8fd6b4}
-.side.sell{color:#f0a9b5}
-.act.buy{color:#8fd6b4;border-color:#2c6a48;background:#16281f}
-.act.sell{color:#f0a9b5;border-color:#7c2f2b;background:#2a1618}
+.side.buy{color:var(--buy)}
+.side.sell{color:var(--sell)}
+.act.buy{color:var(--buy);border-color:var(--okedge);background:var(--buybg)}
+.act.sell{color:var(--sell);border-color:var(--badedge);background:var(--sellbg)}
 
 /* ---- chart ---- */
 .chart{width:100%;height:230px;display:block}
-.chart .grid{stroke:rgba(255,255,255,.055);stroke-width:1}
+.chart .grid{stroke:var(--gridline);stroke-width:1}
 .chart .axis{fill:var(--dim2);font-size:10px;font-family:var(--mono)}
 /* Break-even outranks the decorative gridlines, because crossing it is the one
    event on this chart that changes what the line MEANS. Dashed so it reads as a
