@@ -51,6 +51,7 @@ from optjournal.events import (
 from optjournal.flex import FetchCooldown, TokenMissing, fetch, load
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
+from optjournal.jobs import record_run
 from optjournal.render import (
     render_history,
     render_orders,
@@ -450,14 +451,22 @@ def cmd_market(args) -> int:
             # draws, so a nightly cron stays silent on a back-off and alerts only
             # on something that actually changed.
             print(f"calendar: {exc}", file=sys.stderr)
+            # `nothing`, not `failed`: the feed pushed back, nothing was lost, and
+            # the same week is served later. A ledger that called this a failure
+            # would accumulate consecutive_failures for a working system.
+            record_run(conn, "market", status="nothing", detail=f"rate limited: {exc}")
             return EXIT_THROTTLED
         except EventFetchError as exc:
             print(f"calendar fetch failed: {exc}", file=sys.stderr)
+            record_run(conn, "market", status="failed", detail=str(exc)[:400])
             return EXIT_ERROR
         stored = store_events(conn, events)
         result["fetched"] = len(events)
         result["stored"] = stored
         lines.append(f"calendar {len(events)} event(s) -> {stored} stored")
+        record_run(conn, "market", status="ok" if stored else "nothing",
+                   detail=f"{len(events)} fetched, {stored} stored",
+                   done=stored, total=len(events))
 
     now = datetime.now(UTC)
     start = int(now.timestamp())
@@ -563,6 +572,23 @@ def cmd_bars(args) -> int:
     ]
     lines += [f"  FAILED: {failure}" for failure in outcome.failures]
     _emit(data, "\n".join(lines), args.json)
+    # Recorded HERE rather than in the cron, because a cron runs under MeshClaw's
+    # interpreter and cannot import this package at all -- `import py_ibkr` there
+    # is a ModuleNotFoundError, which is why the crons shell out in the first
+    # place. See jobs.py.
+    #
+    # Three statuses where the old ledger had one: `failed` when a window failed,
+    # `nothing` when the run was legitimately empty, `ok` when bars landed. That
+    # distinction is the whole point -- crons.json read `ok` for two days while
+    # this command wrote no bars at all.
+    record_run(
+        conn, "bars_live" if live else "bars_daily",
+        status=("failed" if outcome.failures
+                else "ok" if outcome.written else "nothing"),
+        detail=("; ".join(outcome.failures)[:400] if outcome.failures
+                else f"{outcome.written} bar(s), {outcome.skipped} empty"),
+        done=outcome.written, total=outcome.requested,
+    )
     if outcome.failures:
         return EXIT_ERROR
     return EXIT_OK if outcome.written else EXIT_NO_DATA
