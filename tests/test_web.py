@@ -2614,6 +2614,63 @@ def test_a_cost_tint_is_never_given_a_minus_it_did_not_earn():
     )
 
 
+def test_a_sign_tint_outranks_the_default_colour_of_the_element_it_lands_on():
+    """A tint that loses the cascade is a silent no-op, and four had shipped.
+
+    `.pill b{color:var(--fg)}` is specificity (0,1,1); `.pos`/`.neg` are (0,1,0).
+    So every pill rendering `<b class="${cls(v)}">` came out --fg with no hue --
+    open premium, Month P/L, book value and best month, all four of them.
+    Measured in a browser rather than reasoned about: the `<b>` computed
+    rgb(245,234,217) instead of rgb(79,209,160), while the `+` glyph from
+    `.pos.signed::before` still appeared, so the number carried a sign with no
+    colour beside unsigned neighbours.
+
+    Same class of defect as the dead grid rules: a well-formed declaration under
+    a selector that cannot reach the element. Nothing was broken enough to
+    notice.
+
+    The check is structural, not a hex comparison. For every element whose class
+    is composed by `cls()`, find any rule that sets `color` on that element via a
+    DESCENDANT selector, and require the stylesheet to qualify `.pos`/`.neg` at
+    least as specifically. Only `color` matters -- `.pill b`'s font-weight is
+    meant to be unconditional, and a tint should not change the weight.
+
+    Does NOT use `_css().replace(" ","")`, the idiom the other layout tests use,
+    and that is the point: stripping whitespace destroys the descendant
+    combinator, so `.tab` and `.ta b` become one string. The first version of
+    this test did exactly that and reported three rules that do not exist
+    (`.ta b`, `.su b`, `.rscru b` -- slices of `.tab`, `.sub`, `.rscrub`) while
+    it could not have seen a real `.pill b` either.
+    """
+    tags = {
+        match.group(1)
+        for match in re.finditer(r"<([a-z]+) class=\"\$\{cls\(", page_html())
+    }
+    assert tags, "no element composes its class from cls() any more"
+
+    rules = _css_rules()
+    problems = []
+    for selector, body in rules:
+        if not re.search(r"(?<![-a-z])color\s*:", body):
+            continue
+        for one in (s.strip() for s in selector.split(",")):
+            # `.pill b` -- a class, whitespace, then a bare tag the page tints.
+            ancestor = re.fullmatch(r"(\.[a-z0-9_-]+)\s+([a-z]+)", one)
+            if not ancestor or ancestor.group(2) not in tags:
+                continue
+            parent, tag = ancestor.group(1), ancestor.group(2)
+            for sign in ("pos", "neg"):
+                qualified = rf"{re.escape(parent)}\s+{tag}\.{sign}\b"
+                if not any(re.search(qualified, sel) for sel, _ in rules):
+                    problems.append(
+                        f"`{parent} {tag}` sets color, so `.{sign}` on that {tag} "
+                        f"loses the cascade -- add `{parent} {tag}.{sign}`"
+                    )
+    assert not problems, (
+        "these sign tints render with no hue at all: " + "; ".join(problems)
+    )
+
+
 def test_muted_text_meets_wcag_aa_on_every_surface_it_sits_on():
     """--dim2 measured 3.31:1 on --bg and 3.02:1 on --panel2, against the 4.5:1
     that 12px body text requires, and it dressed the footer and every

@@ -282,7 +282,18 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
 
 .pill{font-size:12px;padding:6px 12px;border-radius:999px;background:var(--panel2);
   border:1px solid var(--line2);color:var(--dim);white-space:nowrap}
+/* `.pill b` is the DEFAULT weight and colour for an emphasised figure in a pill,
+   so it must not outrank the sign tint. It did: `.pill b` is specificity (0,1,1)
+   and `.pos`/`.neg` are (0,1,0), so all four pills that render a tinted figure
+   -- open premium, Month P/L, book value, best month -- came out --fg. Measured
+   in a browser: `<b class="pos signed">` computed rgb(245,234,217) instead of
+   rgb(79,209,160), while the `+` glyph from `.pos.signed::before` still
+   appeared. A signed number with no hue beside its unsigned neighbours, which is
+   the same silent-no-op class as the dead grid rules.
+   Only the COLOUR is qualified; the weight stays unconditional, since a tint
+   should not also change the weight. */
 .pill b{color:var(--fg);font-weight:600}
+.pill b.pos{color:var(--ok)} .pill b.neg{color:var(--bad)}
 /* `flex:0 0 auto` is load-bearing. Without it the pill strip is a shrinkable
    flex item, so a long caption beside it squeezed the strip to its narrowest
    content width and every pill wrapped onto its own line -- a three-row column
