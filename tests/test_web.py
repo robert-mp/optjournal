@@ -867,6 +867,53 @@ def test_the_stylesheet_is_served_and_its_rules_reach_the_page():
     assert "<style>" not in page_html(), "a stylesheet was left embedded in the page"
 
 
+def test_no_element_carries_two_class_attributes():
+    """HTML keeps the FIRST `class` and silently drops the rest.
+
+    Written because I did exactly this while converting the 20 `style="..."`
+    attributes to classes: an element that already had `class="v mono ${...}"`
+    gained a second `class="big"`, so the 22px headline figure quietly rendered at
+    the inherited size. The suite passed, the page looked almost right, and only a
+    computed-style check in a browser found it.
+
+    The failure mode is the dangerous kind -- no error, no warning, just a rule
+    that never applies. One regex is cheaper than noticing by eye.
+    """
+    duplicates = [
+        tag.group(0).replace("\n", " ")[:90]
+        for tag in re.finditer(r"<[a-zA-Z][^>]*>", page_html(), re.S)
+        if tag.group(0).count("class=") > 1
+    ]
+    assert not duplicates, (
+        f"these elements declare `class` twice, so all but the first are ignored: "
+        f"{duplicates}"
+    )
+
+
+def test_styling_lives_in_the_stylesheet_not_in_the_markup():
+    """No `style="..."` attributes, so every rule is somewhere a test can read it.
+
+    The layout assertions in this file reach CSS through `_css()`, which reads
+    `static/app.css`. An inline attribute is invisible to them -- and four real
+    layout defects have already shipped in CSS that nothing looked at, which is why
+    that section exists at all.
+
+    All 20 attributes were converted. Four were DEAD: `.stats` is `display:flex`
+    (app.css), so `grid-template-columns` on it never did anything -- confirmed in a
+    browser, `INERT: true` on the computed value. Those were deleted rather than
+    translated, including the one dynamic declaration
+    (`repeat(${jrows.length},1fr)`), which means nothing here needs an escape
+    hatch for a computed value today. If one is ever genuinely needed, add it with
+    a comment saying why and this test will need an allowlist -- deliberately not
+    pre-built, because an unused exemption invites use.
+    """
+    attrs = re.findall(r'style="([^"]*)"', page_html())
+    assert not attrs, (
+        f"styling belongs in static/app.css, where the layout tests can see it: "
+        f"{attrs}"
+    )
+
+
 def test_page_escapes_interpolated_values():
     """Statement filenames and symbols come from IBKR, so they are untrusted.
 

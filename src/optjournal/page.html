@@ -1135,8 +1135,8 @@ function dashboard(){
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Performance</h2>
       <div class="sub">Cumulative realised P&L with daily fill count.</div></div>
-      <div class="v mono ${cls(s.net_pnl.base)}"
-        style="font-size:22px;font-weight:700">${moneyOf(s.net_pnl)}</div>
+      <div class="v mono big ${cls(s.net_pnl.base)}"
+        >${moneyOf(s.net_pnl)}</div>
     </div>
     ${chart(s.days)}
   </div>`;
@@ -1304,7 +1304,7 @@ function calendar(){
       chevrons or the month selector to walk the rest.</div>`:''}
     <div class="cal">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
       .map(d=>`<div class="dow">${d}</div>`).join('')}</div>
-    <div class="cal" style="margin-top:2px">${cells.join('')}</div>
+    <div class="cal mt-1">${cells.join('')}</div>
     ${dayDetail(by)}
   </div>`;
 }
@@ -1327,11 +1327,11 @@ function dayDetail(by){
   })));
   if(!rows.length) return `<div class="note">No leg detail for ${esc(key)} —
     fills exist but their orders are outside the current filter.</div>`;
-  return `<div class="grp" style="margin-top:14px">
+  return `<div class="grp mt-3">
     <div class="gh"><span class="gl">${esc(key)} — ${rows.length} fill(s)</span>
       <button class="linkish" data-calday-clear="1">clear</button></div>
     ${rows.map(({g,l})=>legRow(l,
-      `<span class="dim" style="font-size:11px">${esc(g.label)}</span>`)).join('')}
+      `<span class="dim lbl-sm">${esc(g.label)}</span>`)).join('')}
   </div>`;
 }
 
@@ -1870,15 +1870,15 @@ function trades(){
     return `<div class="card">
       <div class="crow${rp?' rk':''}"${rp?` data-replay="${esc(lc.replay_key)}"`:''}><div><h2>${
         esc(lc.underlying||'?')}
-        <span class="dim" style="font-size:14px;font-weight:500">${esc(lc.label)}</span>
-        <span class="pill" style="margin-left:8px;font-size:11px"
+        <span class="dim lbl">${esc(lc.label)}</span>
+        <span class="pill gap"
           >${openLc?'OPEN':'CLOSED'}</span></h2>
         <div class="sub mono">${when} · ${lc.fills} fill(s) · ${evs.length} event(s)</div></div>
         ${rp?`<div class="rhint">${shown?'hide replay':'replay'
           } <span class="caret${shown?' open':''}">▸</span></div>`:''}
       </div>
       ${shown&&rp?replayPanel(rp,score[0],score[1]):''}
-      <div class="stats" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stats">
         ${statCard('Proceeds', moneyOf(lc.proceeds),
           nat&&nat!==DISP()?`${money(legs.reduce((a,l)=>a+(l.proceeds||0),0),nat)} as filled`:'',
           'sm '+cls(lc.proceeds.base))}
@@ -2062,12 +2062,12 @@ function costs(){
       <div class="pills"><span class="pill">${esc(scope)} <b>${
         moneyOf(T.journal_friction)}</b></span></div>
     </div>
-    <h2 style="font-size:15px;margin-top:4px">${esc(scope)} — attributable to this journal</h2>
-    <div class="stats" style="grid-template-columns:repeat(${jrows.length},1fr)">
+    <h2 class="sub2 mt-2">${esc(scope)} — attributable to this journal</h2>
+    <div class="stats">
       ${jrows.map(r=>statCard(r[0],r[1],r[2],'sm')).join('')}
     </div>
-    <div class="card" style="margin-top:16px;background:var(--bg2)">
-      <h2 style="font-size:15px">FX conversions</h2>
+    <div class="card inner">
+      <h2 class="sub2">FX conversions</h2>
       <table><thead><tr><th>pair</th><th class="n">n</th><th class="n">notional</th>
         <th class="n">AutoFX</th><th class="n">markup @3bps</th></tr></thead><tbody>
         ${c.fx.map(f=>`<tr><td class="mono">${esc(f.symbol)}</td>
@@ -2163,7 +2163,7 @@ function monthlyTable(){
       out.push(`<tr class="grp"><td class="mono dim" colspan="10">${esc(y)}</td></tr>`);}
     out.push(statsRow(s,{label:monthLabel(s.month)}));
   });
-  return `<h2 style="font-size:15px;margin-top:20px">Month by month</h2>
+  return `<h2 class="sub2 mt-6">Month by month</h2>
     <div class="note">Grouped under the year each month belongs to, so the rows
       above them can be checked by adding these up. A month with fills but nothing
       closed shows no win rate rather than 0%.</div>
@@ -2406,9 +2406,9 @@ function odte(){
      option opened and closed in one afternoon is a day trade at 45 DTE. The
      two coincide often enough that deriving this from the holding period would
      look right on most data and be wrong on exactly the trades that matter. */
-  const block=(co,klass)=>`<div class="card" style="background:var(--bg2);flex:1">
-    <h2 style="font-size:15px">${esc(co.label)}</h2>
-    <div class="stats" style="grid-template-columns:repeat(4,1fr)">
+  const block=(co,klass)=>`<div class="card">
+    <h2 class="sub2">${esc(co.label)}</h2>
+    <div class="stats">
       ${statCard('Round trips',co.episodes,`${co.contracts} contracts`,'sm')}
       ${statCard('Win rate',pct(co.win_rate),`${co.wins}W / ${co.losses}L`,'sm')}
       ${statCard('Net P&L',moneyOf(co.net_pnl),'realised, net of commission',
@@ -2450,10 +2450,10 @@ function odte(){
       ${od.cohort.episodes} 0DTE against ${od.rest.episodes} other — a difference in
       win rate across samples this small is noise, not evidence. The threshold is a
       rule of thumb, not a significance test.</div>`:''}
-    <div style="display:flex;gap:12px;align-items:stretch">
+    <div class="duo">
       ${block(od.cohort)}${block(od.rest)}
     </div>
-    ${odtes.length?`<h2 style="font-size:15px;margin-top:16px">0DTE round trips</h2>
+    ${odtes.length?`<h2 class="sub2 mt-4">0DTE round trips</h2>
     <table><thead><tr><th>contract</th><th>opened</th><th>closed</th>
       <th class="n">qty</th><th class="n">realised</th><th class="n">commission</th>
       <th>how</th></tr></thead><tbody>
@@ -2465,7 +2465,7 @@ function odte(){
         <td class="n mono">${moneyOf(ep.commission)}</td>
         <td class="dim2">${esc(ep.status)}</td></tr>`).join('')}
     </tbody></table>`
-    :`<div class="empty" style="margin-top:16px">none of the ${closedTotal} closed
+    :`<div class="empty mt-4">none of the ${closedTotal} closed
       round trips was opened on its own expiry date</div>`}
     ${od.unknown_dte?`<div class="note">${od.unknown_dte} closed round trip(s) carry no
       expiry, so their DTE is unknown rather than non-zero. They are excluded from both
@@ -2477,7 +2477,7 @@ function odte(){
 function cog(){
   const st=S.state;
   return `<div class="card">
-    <h2 style="font-size:16px">Journal details</h2>
+    <h2 class="sub3">Journal details</h2>
     <table><tbody>
       <tr><td class="dim">version</td><td class="mono">${esc(st.version)}</td></tr>
       <tr><td class="dim">database</td><td class="mono">${esc(st.db)}</td></tr>
@@ -2488,7 +2488,7 @@ function cog(){
         (${st.sync.cooldown_remaining_s}s remaining)</td></tr>
       <tr><td class="dim">generated</td><td class="mono">${esc(st.generated_at)}</td></tr>
     </tbody></table>
-    <h2 style="font-size:16px;margin-top:18px">Archive</h2>
+    <h2 class="sub3 mt-5">Archive</h2>
     <table><thead><tr><th>file</th><th>period</th><th class="n">bytes</th>
       <th>ingested</th><th>assets</th></tr></thead><tbody>
       ${(st.statements||[]).map(stm=>`<tr><td class="mono">${esc(stm.file)}</td>

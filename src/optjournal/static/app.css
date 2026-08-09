@@ -209,6 +209,33 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
 @media(max-width:1180px){.stats{--sw:30%}}
 @media(max-width:760px){.stats{--sw:46%}
   .filters{grid-template-columns:1fr}}
+/* Sub-headings inside a card. `.card h2` is the panel title at 19px; a card that
+   carries several sections needs a smaller one, and these were 7 separate
+   `style="font-size:15px"` attributes -- invisible to the layout assertions in
+   tests/test_web.py, which can only read this file. `.sub2` is the section heading,
+   `.sub3` the slightly larger variant two panels use. `mt-*` carry the spacing that
+   travelled with them, kept as separate utilities because the size and the gap were
+   independently chosen at each site. */
+.card h2.sub2{font-size:15px}
+.card h2.sub3{font-size:16px}
+.mt-1{margin-top:2px}
+.mt-2{margin-top:4px}
+.mt-3{margin-top:14px}
+.mt-4{margin-top:16px}
+.mt-5{margin-top:18px}
+.mt-6{margin-top:20px}
+/* A headline figure: the dashboard's net P&L, which is deliberately larger than
+   every other number on the page. */
+.big{font-size:22px;font-weight:700}
+/* The two smaller inline labels beside a lifecycle heading. */
+.lbl{font-size:14px;font-weight:500}
+.lbl-sm{font-size:11px}
+.pill.gap{margin-left:8px;font-size:11px}
+/* Two cards side by side, each taking half the row: the 0DTE panel's pair. */
+.duo{display:flex;gap:12px;align-items:stretch}
+.duo>.card{background:var(--bg2);flex:1}
+/* A nested card, tinted to sit inside another one. */
+.card.inner{margin-top:16px;background:var(--bg2)}
 .stat{padding:13px 15px;border-radius:11px;background:var(--bg2);
   border:1px solid var(--line);position:relative}
 /* "no losses yet" is not a missing number, so it does not wear the figure's
