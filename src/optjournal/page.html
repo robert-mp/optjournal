@@ -178,12 +178,37 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
 .crow{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;
   flex-wrap:wrap}
 
-.stats{display:grid;gap:13px;grid-template-columns:repeat(5,1fr)}
-@media(max-width:1180px){.stats{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}
+/* Flex, not grid, and the reason is arithmetic rather than taste. The dashboard
+   renders EXACTLY nine cards -- both of its conditionals are either/or, so the
+   count is structural -- and nine divides evenly into none of the column counts
+   this page uses: 9/5 leaves one orphan, 9/2 leaves one, and no card count is
+   gapless across 5, 3 and 2 at once. A fixed grid therefore always has a hole
+   somewhere, and it lands in the wide view, which is the one most people see.
+
+   The two obvious fixes are both worse, measured: four columns leaves THREE
+   gaps, and promoting Net P&L to a two-cell hero closes the wide row but opens
+   two gaps at the 1180px breakpoint -- it moves the hole rather than removing
+   it. So the row is asked to distribute its remainder instead: `flex:1 1 <base>`
+   lets the last row's cards absorb the leftover width and end flush with the
+   row above. A trailing card is then WIDER than its neighbours rather than
+   missing, which reads as a layout instead of as a failed render.
+
+   `--sw` is the basis width per breakpoint, and it is what picks the wrap
+   point: five per row while each card can hold 18% of the line, then three,
+   then two. Sized just under the true fraction (18 < 20, 30 < 33.3) so rounding
+   can never overflow a row and drop one card to a line of its own. */
+.stats{display:flex;flex-wrap:wrap;gap:13px;--sw:18%}
+.stats>*{flex:1 1 var(--sw);min-width:0}
+@media(max-width:1180px){.stats{--sw:30%}}
+@media(max-width:760px){.stats{--sw:46%}
   .filters{grid-template-columns:1fr}}
 .stat{padding:13px 15px;border-radius:11px;background:var(--bg2);
   border:1px solid var(--line);position:relative}
+/* "no losses yet" is not a missing number, so it does not wear the figure's
+   size or a sign colour: at 19px in --ok it read as a value, which is what an
+   em-dash was already failing to communicate. Sized down to sit as prose in
+   the slot a number would occupy. */
+.stat .v .nil{font-size:14px;font-weight:600;color:var(--dim)}
 .stat .k{font-size:11.5px;color:var(--dim);margin-bottom:7px}
 /* Instant, styled tooltip. NOT a `title` attribute: a native tooltip waits one
    to two seconds, is easily missed and does not exist on touch, so hiding
@@ -446,6 +471,12 @@ td.n,th.n{text-align:right}
 .chart{width:100%;height:230px;display:block}
 .chart .grid{stroke:rgba(255,255,255,.055);stroke-width:1}
 .chart .axis{fill:var(--dim2);font-size:10px;font-family:var(--mono)}
+/* Break-even outranks the decorative gridlines, because crossing it is the one
+   event on this chart that changes what the line MEANS. Dashed so it reads as a
+   reference rather than as data, and only drawn when the series crosses. */
+.chart .zero{stroke:var(--kicker);stroke-width:1;stroke-dasharray:5 4;opacity:.75}
+.chart .zerolab{fill:var(--kicker);font-size:9px;font-family:var(--mono);
+  letter-spacing:.11em;text-transform:uppercase;opacity:.85}
 
 #msg{margin-top:14px;padding:11px 15px;border-radius:10px;font-size:13px;display:none}
 #msg.show{display:block}
@@ -489,7 +520,11 @@ td.n,th.n{text-align:right}
       </svg>
     </div>
     <div>
-      <div class="kicker">Cuaderno de Bitácora</div>
+      <!-- Not "Cuaderno de Bitácora": a kicker that translates the title
+           directly beneath it spends the page's most prominent small slot
+           saying what the next line already says. This states what the journal
+           is made of instead, in the vocabulary the tabs use. -->
+      <div class="kicker">Strikes · Fills · Round trips</div>
       <div class="title">Bitácora <span class="edition" id="edition">Leather Edition</span></div>
       <div class="tabs" id="tabs"></div>
     </div>
@@ -1463,7 +1498,18 @@ function dashboard(){
       s.closed_episodes?`${s.closed_episodes} decided`:'nothing closed yet'),
     statCard('Avg Win', moneyOf(s.avg_win), 'per closed round trip',
       cls(s.avg_win?.base)),
-    statCard('Avg Loss', moneyOf(s.avg_loss), 'per closed round trip',
+    /* An em-dash on a card whose figure is genuinely absent reads as "this
+       failed to load". `none yet` says the same thing as data: there have been
+       no losses, which on this card is a fact rather than a gap. Only when the
+       population is EMPTY -- no loss has happened -- so a real average loss
+       still renders as the number it is, and the `—` remains for the case the
+       payload truly has nothing to say. */
+    statCard('Avg Loss',
+      s.losses===0&&s.closed_episodes>0?'<span class="nil">none yet</span>'
+        :moneyOf(s.avg_loss),
+      s.losses===0&&s.closed_episodes>0
+        ?`${s.closed_episodes} closed, none at a loss`
+        :'per closed round trip',
       cls(s.avg_loss?.base)),
     nl!=null
       ? statCard('Gain % of Net Liq', pct(s.gain_pct_of_net_liq,2),
@@ -1547,20 +1593,58 @@ function chart(days){
   const ticks=[hi,(hi+lo)/2,lo].map(v=>
     `<line class="grid" x1="${PL}" y1="${sy(v).toFixed(1)}" x2="${W-PR}" y2="${sy(v).toFixed(1)}"/>
      <text class="axis" x="${PL-7}" y="${(sy(v)+3).toFixed(1)}" text-anchor="end">${cash(v,0)}</text>`).join('');
-  const zero=(lo<0&&hi>0)?`<line class="grid" style="stroke:rgba(255,255,255,.14)"
-     x1="${PL}" y1="${sy(0).toFixed(1)}" x2="${W-PR}" y2="${sy(0).toFixed(1)}"/>`:'';
+  /* Zero is the one line on this chart that means something -- above it the
+     account is up, below it down -- so when the series actually crosses, it
+     stops being a grid line and becomes a labelled dashed rule. Drawn as a grid
+     line at .14 opacity it was indistinguishable from the two decorative
+     gridlines either side of it, which is how a drawdown came to look like
+     ordinary variation. */
+  const crosses=lo<0&&hi>0;
+  const zero=crosses?`<line class="zero" x1="${PL}" y1="${sy(0).toFixed(1)}"
+     x2="${W-PR}" y2="${sy(0).toFixed(1)}"/>
+   <text class="zerolab" x="${W-PR}" y="${(sy(0)-6).toFixed(1)}"
+     text-anchor="end">break even</text>`:'';
+  /* A dot below break-even takes the loss colour too, so a single day's marker
+     states which side of zero it sits on without the reader tracing it back to
+     the axis. */
   const dots=pts.map((pt,i)=>`<circle cx="${sx(i).toFixed(1)}" cy="${sy(pt.y).toFixed(1)}" r="3.5"
-     fill="#c98a5c" stroke="#0a0806" stroke-width="1.5"><title>${esc(pt.x)} — cum ${cash(pt.y)} (${pt.n} fill(s))</title></circle>`).join('');
+     fill="${pt.y<0?'#f0899a':'#c98a5c'}" stroke="#0a0806" stroke-width="1.5"><title>${esc(pt.x)} — cum ${cash(pt.y)} (${pt.n} fill(s))</title></circle>`).join('');
   const labels=pts.map((pt,i)=>i===0||i===pts.length-1
     ? `<text class="axis" x="${sx(i).toFixed(1)}" y="${H-8}" text-anchor="${i?'end':'start'}">${esc(pt.x)}</text>`:'').join('');
+  /* Sign is encoded in the FILL, and the trick is that the area path is not cut
+     up to do it. The one path is painted twice, each time clipped to a
+     half-plane split at the zero line: brass above, red below. So the geometry
+     stays a single expression -- no hunting for zero crossings, no interpolated
+     junction points, and a series that dives and recovers three times needs no
+     extra code. `y2` on the gradients is the zero line rather than the viewBox
+     edge, so each fade is measured from break-even instead of being cropped
+     mid-ramp.
+
+     Both halves collapse harmlessly when the series stays one side of zero: the
+     clip rect gets zero height and paints nothing, which is why this needs no
+     `crosses` branch of its own. */
+  const z=sy(0).toFixed(1);
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-    <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#c98a5c" stop-opacity=".28"/>
-      <stop offset="100%" stop-color="#c98a5c" stop-opacity="0"/></linearGradient></defs>
+    <defs>
+      <linearGradient id="gpos" gradientUnits="userSpaceOnUse"
+        x1="0" x2="0" y1="${PT}" y2="${z}">
+        <stop offset="0%" stop-color="#c98a5c" stop-opacity=".28"/>
+        <stop offset="100%" stop-color="#c98a5c" stop-opacity="0"/></linearGradient>
+      <linearGradient id="gneg" gradientUnits="userSpaceOnUse"
+        x1="0" x2="0" y1="${z}" y2="${H-PB}">
+        <stop offset="0%" stop-color="#f0899a" stop-opacity="0"/>
+        <stop offset="100%" stop-color="#f0899a" stop-opacity=".26"/></linearGradient>
+      <clipPath id="cabove"><rect x="0" y="0" width="${W}" height="${z}"/></clipPath>
+      <clipPath id="cbelow"><rect x="0" y="${z}" width="${W}"
+        height="${(H-Number(z)).toFixed(1)}"/></clipPath>
+    </defs>
     ${ticks}${zero}
-    ${area?`<path d="${area}" fill="url(#g)"/>`:''}
+    ${area?`<path d="${area}" fill="url(#gpos)" clip-path="url(#cabove)"/>
+      <path d="${area}" fill="url(#gneg)" clip-path="url(#cbelow)"/>`:''}
     <path d="${line}" fill="none" stroke="#e0a877" stroke-width="2"
-      stroke-linejoin="round" stroke-linecap="round"/>
+      stroke-linejoin="round" stroke-linecap="round" clip-path="url(#cabove)"/>
+    <path d="${line}" fill="none" stroke="#f0899a" stroke-width="2"
+      stroke-linejoin="round" stroke-linecap="round" clip-path="url(#cbelow)"/>
     ${dots}${labels}</svg>`;
 }
 

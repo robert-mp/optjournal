@@ -2366,3 +2366,129 @@ def test_every_control_has_a_visible_keyboard_focus_ring():
         "the inset offset is gone; these two sit flush to a panel edge, where "
         "an outset ring is clipped"
     )
+
+
+def test_the_stat_row_distributes_its_remainder_instead_of_leaving_a_hole():
+    """The dashboard renders exactly nine cards and nine divides evenly into
+    none of this page's column counts, so a fixed grid always orphans one.
+
+    Arithmetic, not preference: 9 into 5 leaves one empty cell and 9 into 2
+    leaves one, and no card count is gapless across 5, 3 and 2 at once. The two
+    obvious fixes measured worse -- four columns leaves THREE gaps, and a
+    two-cell hero for Net P&L closes the wide row while opening two at the
+    1180px breakpoint, moving the hole rather than removing it.
+
+    So the cards flex and the last row absorbs the leftover width. Verified in a
+    browser at three widths: every row ends flush with the container.
+    """
+    css = _css().replace(" ", "").replace("\n", "")
+    assert ".stats{display:flex;flex-wrap:wrap" in css, (
+        "the stat row is back to a fixed grid, which orphans a card at 5 and 2 "
+        "columns because the dashboard always renders nine"
+    )
+    assert ".stats>*{flex:11var(--sw)" in css, (
+        "cards no longer grow, so the last row stops short of the row above"
+    )
+    # The basis must stay UNDER the true fraction at every breakpoint, or
+    # rounding overflows a row and drops one card onto a line of its own.
+    for basis, cols in ((18, 5), (30, 3), (46, 2)):
+        assert basis * cols < 100, (
+            f"--sw:{basis}% x {cols} exceeds the line, so a row will wrap early"
+        )
+        assert f"--sw:{basis}%" in css, f"the {cols}-per-row basis is gone"
+
+
+def test_the_dashboard_renders_exactly_nine_stat_cards(state):
+    """The premise the flex row rests on. Both of the dashboard's conditionals
+    are either/or -- options-or-not, net-liq-or-not -- so the count is
+    structural. If a tenth card lands, the basis widths above want rechecking.
+    """
+    body = _fn("dashboard")
+    # Count the cards the function can emit, minus the alternates that can
+    # never both render.
+    emitted = body.count("statCard(")
+    alternates = body.count("? statCard(")
+    assert emitted - alternates == 9, (
+        f"the dashboard now renders {emitted - alternates} cards, not 9. The "
+        f"flex basis in `.stats` was chosen for nine; recheck it wraps cleanly."
+    )
+
+
+def test_a_zero_crossing_chart_marks_break_even_and_colours_the_loss_side():
+    """Cumulative P&L above zero and below it mean opposite things, and the
+    chart used to render both in the same warm brass with a zero line drawn at
+    the same .055 opacity as the decorative gridlines either side of it. A
+    drawdown therefore looked like ordinary variation.
+
+    The fill is split WITHOUT cutting the geometry: one area path painted twice,
+    each pass clipped to a half-plane at the zero line. No zero-crossing search,
+    no interpolated junctions, and a series that dives and recovers repeatedly
+    needs no extra code -- confirmed in a browser on a series that crosses
+    twice, which produced three red dots and three brass ones.
+    """
+    js = _code_only(_js())
+    chart = _fn("chart")
+    assert 'clip-path="url(#cabove)"' in chart and 'clip-path="url(#cbelow)"' in chart, (
+        "the fill is no longer clipped per side, so loss and gain share a colour"
+    )
+    assert 'id="gneg"' in chart and 'id="gpos"' in chart, (
+        "the two sign gradients are gone"
+    )
+    # Both halves must be driven off the SAME area expression; two hand-built
+    # paths would reintroduce the crossing arithmetic this avoids.
+    assert chart.count('d="${area}"') == 2, (
+        "the two fills no longer share one area path, which is what keeps the "
+        "geometry free of zero-crossing special cases"
+    )
+    assert 'class="zero"' in chart and "break even" in chart, (
+        "break-even is no longer labelled when the series crosses it"
+    )
+    # Drawn only when it means something.
+    assert "const crosses=lo<0&&hi>0" in js, (
+        "the zero rule is no longer conditional on an actual crossing"
+    )
+    css = _css().replace(" ", "").replace("\n", "")
+    assert ".chart.zero{" in css and "stroke-dasharray:54" in css, (
+        "the break-even rule lost the dash that distinguishes it from data"
+    )
+
+
+def test_an_empty_loss_population_reads_as_a_fact_not_a_missing_number():
+    """`—` on Avg Loss with zero losing trades reads as "failed to load". There
+    have been no losses, which is information; the card should say so.
+
+    Only when the population is genuinely empty AND something has closed, so a
+    real average loss still renders as a number and a journal with nothing
+    closed still shows the em-dash it should.
+    """
+    body = _fn("dashboard")
+    assert "s.losses===0&&s.closed_episodes>0" in body.replace(" ", ""), (
+        "the empty-population case is gone, so Avg Loss shows a bare em-dash "
+        "again when there are no losses"
+    )
+    assert "none yet" in body, "the replacement text is gone"
+    css = _css().replace(" ", "").replace("\n", "")
+    assert ".stat.v.nil{" in css, (
+        "the nil styling is gone, so prose renders at a figure's size and reads "
+        "as a value"
+    )
+
+
+def test_the_kicker_does_not_merely_translate_the_title():
+    """`Cuaderno de Bitácora` above a title reading `Bitácora` spent the page's
+    most prominent small slot restating the next line. The kicker now names what
+    the journal is made of, in the vocabulary its own tabs use.
+    """
+    # The rendered element, not the whole file: the comment beside it names the
+    # rejected string on purpose, to say why it was rejected.
+    match = re.search(r'<div class="kicker">([^<]*)</div>', page_html())
+    assert match, "the header kicker is gone"
+    kicker = match.group(1).strip()
+    assert kicker == "Strikes · Fills · Round trips", (
+        f"unexpected kicker {kicker!r}"
+    )
+    title = re.search(r'<div class="title">([^<]*)', page_html()).group(1).strip()
+    assert title.lower() not in kicker.lower(), (
+        f"the kicker {kicker!r} restates the title {title!r}, which spends the "
+        f"page's most prominent small slot saying the next line over again"
+    )
