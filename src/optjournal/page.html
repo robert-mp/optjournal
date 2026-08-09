@@ -304,6 +304,30 @@ td.n,th.n{text-align:right}
 .evc.on{visibility:visible;opacity:1}
 .evc:hover{border-color:var(--leather1)}
 .evc.now{border-color:var(--leather1);background:var(--panel)}
+/* The card for the event playback is PARKED on, centred over the chart. The
+   wrapper is a non-interactive overlay so the chart stays visible around the
+   card and nothing below it is blocked; only the card itself takes pointer
+   events, which is what keeps the scrubber usable while a card is up. */
+.rwrap{position:relative}
+.rfocus{position:absolute;inset:0;display:none;align-items:center;
+  justify-content:center;pointer-events:none}
+.rfocus.on{display:flex}
+.fcard{pointer-events:auto;min-width:270px;max-width:340px;padding:14px 16px;
+  border-radius:12px;background:rgba(22,17,13,.97);border:1px solid var(--leather1);
+  box-shadow:0 8px 28px rgba(0,0,0,.55)}
+.fh{display:flex;align-items:baseline;gap:10px;justify-content:space-between}
+.ft{font-size:15px;font-weight:700;color:var(--fg)}
+.fx{background:none;border:0;color:var(--dim);cursor:pointer;font-size:16px;
+  line-height:1;padding:0 2px}
+.fx:hover{color:var(--fg)}
+.fw{font-size:10px;color:var(--dim2);margin-top:2px;margin-bottom:8px}
+/* Label left, figure right: the reader scans the right column for the numbers,
+   which is why they are monospace and the labels are not. */
+.fr{display:flex;justify-content:space-between;align-items:baseline;gap:14px;
+  padding:3px 0;font-size:11.5px}
+.fk{color:var(--dim);text-transform:uppercase;letter-spacing:.07em;font-size:9.5px}
+.fv{color:var(--fg)}
+.fa{color:var(--dim2)}
 .evh{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
 .evk{font-size:9px;letter-spacing:.09em;text-transform:uppercase;font-weight:700;
   padding:1px 5px;border-radius:5px;font-family:var(--mono)}
@@ -416,8 +440,8 @@ td.n,th.n{text-align:right}
    page uses this", which is how the reader's map of what the page does drifts
    from what it does. test_frontend pins the list against the calls. */
 import {
-  MIN_POINTS, bandEdges, deltaDomain, frameAt, indexOfTs, reachedEvents,
-  plotGeometry, sessionBreaks, strikeSpan,
+  MIN_POINTS, bandEdges, barsPerMs, deltaDomain, frameAt, indexOfTs, nextStop,
+  reachedEvents, plotGeometry, sessionBreaks, strikeSpan,
 } from '/static/replay.js';
 
 /* ===================== the payload contract =====================
@@ -988,7 +1012,7 @@ import {
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks mks dd sp spot
- * @local play scrub speed loop ev reached
+ * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen withEvents ws opts thin
  * @local JSON Object ages input mine qb wf behind was
  */
@@ -1621,6 +1645,13 @@ let RGEO=null, RTIMER=null;
    `isFinite("")` is true, so a blank stamp used to pass as a timestamp. */
 const timedEvents=rp=>(rp.events||[]).filter(e=>e&&Number.isFinite(e.ts));
 
+/* Wall-clock a whole replay takes at 1x, whatever its length -- the constant the
+   speed control is a multiplier OF. What a reader asks for is "watch this trade",
+   so the duration is the thing to fix and the bars-per-second is what follows;
+   see barsPerMs. 20s is long enough to follow a 24-bar strangle bar by bar and
+   short enough that 10x (2s) is still a glance rather than a jump. */
+const REPLAY_SECONDS=20;
+
 /* cancelAnimationFrame, since playback is a rAF loop rather than an interval --
    it used to step one whole bar per setInterval tick, which is what made the
    marker jump between data points. RTIMER is nulled BEFORE the cancel so a frame
@@ -1723,6 +1754,7 @@ function replayChart(rp){
     edges.upper.length?'<span class="lg em">▬</span> expected move (1 SD)':'',
   ].filter(Boolean).join('<span class="dim2"> · </span>');
   return `<div class="rkey">${key}</div>
+  <div class="rwrap">
   <svg viewBox="0 0 ${W} ${H}" role="img" preserveAspectRatio="xMidYMid meet"
     ><title>${esc(rp.underlying||'')} ${num(pts[0][1],dp)} → ${
       num(pts[pts.length-1][1],dp)} across ${pts.length} ${
@@ -1738,17 +1770,28 @@ function replayChart(rp){
     <line id="rcross" class="cross" x1="${geo.xs[pts.length-1].toFixed(1)}" y1="${T}" x2="${
       geo.xs[pts.length-1].toFixed(1)}" y2="${T+ih}"/>
     ${xticks}</svg>
+  <div class="rfocus" id="rfocus"></div></div>
   <div class="rctl">
     <button class="rbtn" data-rseek="0" title="to the start">|◀</button>
     <button class="rbtn" data-rplay="1">▶ play</button>
     <button class="rbtn" data-rseek="${pts.length-1}" title="to the end">▶|</button>
     <input class="rscrub" id="rscrub" type="range" min="0" max="${pts.length-1}"
       value="${pts.length-1}" step="1" aria-label="replay position">
+    <!-- A MULTIPLIER of the whole replay's duration, not milliseconds per bar.
+         The old values were ms/bar, which made one setting mean a different
+         promise on every trade: at "1x" a 24-bar strangle took 6s and a 461-bar
+         LEAP took nearly two minutes. Now 1x is REPLAY_SECONDS end to end
+         whatever the length, and the multiplier divides it -- see barsPerMs. -->
     <select class="rspeed" id="rspeed" aria-label="playback speed">
-      <option value="240">1×</option><option value="120">2×</option>
-      <option value="60">4×</option><option value="24">10×</option>
+      <option value="1">1×</option><option value="2">2×</option>
+      <option value="4">4×</option><option value="10">10×</option>
     </select>
     <label class="rauto"><input type="checkbox" id="rloop"> loop</label>
+    <!-- Halting at each decision is the DEFAULT: the cards exist to be read, and
+         at 4x an event card used to be lit for a third of a second. Unchecking
+         it plays the trade straight through. -->
+    <label class="rauto" title="halt at each decision so its card can be read"
+      ><input type="checkbox" id="rstops" checked> stop on events</label>
     <span class="rread mono" id="rread">${replayReadout(opening,rp.bar_size,dp)}</span>
   </div>${replayEvents(rp,pts)}`;
 }
@@ -1788,6 +1831,62 @@ function replayEvents(rp,pts){
       esc(e.label||'')}</span><span class="evw mono">${esc(e.at||'')}</span></div>
       <div class="evl mono">${legs}</div><div class="evm">${bits}</div></div>`;
   }).join('')}</div>`;
+}
+
+/* The event the replay is PARKED on, over the chart.
+
+   An overlay rather than only the strip below, because playback now halts here:
+   a stop the reader has to look away from the chart to understand is a stop that
+   reads as a stall. It states what changed at this instant and waits.
+
+   One node, rewritten per stop, rather than one per event kept in the DOM. The
+   strip is already the full table of contents; this is the single card for the
+   single moment playback is holding, so there is nothing to toggle and no set to
+   keep in sync -- and the reader dismisses it to see the chart underneath.
+
+   Every figure is the strip card's, read off the same event object. Two
+   renderers over one event could disagree about a roll's credit, and the panel
+   would then contradict itself depending on where you looked. */
+function replayFocus(e){
+  const host=$('#rfocus');
+  if(!host) return;
+  if(!e){host.innerHTML='';host.classList.remove('on');return;}
+  /* Strikes as the roll itself reads: what closed, then what opened. A roll's
+     whole content is that substitution, and naming both sides is what makes the
+     card answer "why did that line move" without the reader inferring it. */
+  const legOf=m=>(e.legs||[]).filter(l=>
+    String(l.open_close||'').toUpperCase()===m)
+    .map(l=>`${strike(l.strike)}${esc(l.put_call||'')}`).join(' + ');
+  const closed=legOf('C'), opened=legOf('O');
+  const moved=closed&&opened?`${closed} <span class="fa">→</span> ${opened}`
+    :(opened||closed);
+  const rows=[
+    e.delta_after==null?null:['eff Δ', `${
+      e.delta_before==null?'':num(e.delta_before,2)+' <span class="fa">→</span> '
+      }${num(e.delta_after,2)}`],
+    moved?['strikes', moved]:null,
+    /* Named, not signed: "−$780" is ambiguous about who paid whom, and that is
+       the first thing wanted off a closing card. Matches the strip exactly. */
+    !e.cash?null:[Number(e.cash.native)<0?'debit':'credit',
+      `<b class="${Number(e.cash.native)<0?'neg':'pos'}">${moneyOf(e.cash)}</b>`],
+    !e.realized?null:['realised',
+      `<b class="${cls(e.realized.native)}">${moneyOf(e.realized)}</b>`],
+    !e.commission?null:['commission', moneyOf(e.commission)],
+  ].filter(Boolean).map(([k,v])=>
+    `<div class="fr"><span class="fk">${k}</span><span class="fv mono">${v}</span></div>`
+  ).join('');
+  host.innerHTML=`<div class="fcard" role="dialog" aria-label="${
+    esc(e.label||'event')}"><div class="fh"><span class="ft">${esc(e.label||'')}</span>
+    <button class="fx" id="rfx" aria-label="dismiss and continue">×</button></div>
+    <div class="fw mono">${esc(e.at||'')}</div>${rows}</div>`;
+  host.classList.add('on');
+  /* Dismissing clears only the card. It does NOT resume playback: the reader
+     pressed nothing to play, and starting the timer from a close button would
+     move the chart out from under a deliberate pause. */
+  /* Not `x` -- that name is bound to an Episode in the payload contract, and one
+     name for two shapes blinds the binding guard to both. */
+  const dismiss=$('#rfx');
+  if(dismiss) dismiss.onclick=()=>replayFocus(null);
 }
 
 /* The scrubbed bar in words. Shared by the initial render and every seek, so the
@@ -1841,28 +1940,60 @@ function bindReplayControls(){
      though the scrubber already sits at the end with everything reached. One
      source of truth for "what is revealed at frame i" rather than two. */
   replaySeek(Number(scrub.value));
+  /* Dragging dismisses the parked card: the reader has taken the timeline back
+     into their own hands, and a card naming the instant they scrubbed away from
+     would be describing somewhere the chart no longer is. */
   scrub.oninput=()=>{replayStop();if(play)play.textContent='▶ play';
-    replaySeek(Number(scrub.value));};
+    replayFocus(null);replaySeek(Number(scrub.value));};
   if(play) play.onclick=()=>{
     if(RTIMER!==null){replayStop();play.textContent='▶ play';return;}
     /* Restart from the beginning when the cursor is already at the end,
        otherwise pressing play on a finished replay does nothing visible. */
     if(Number(scrub.value)>=Number(scrub.max)) scrub.value='0';
     play.textContent='❚❚ pause';
-    /* requestAnimationFrame, not setInterval stepping whole bars. The speed
-       control still means "milliseconds per bar", so the same setting plays at
-       the same rate -- but the position advances by elapsed/step per frame, a
-       FRACTION of a bar, which is what makes the marker glide instead of jumping
-       between data points. frameAt interpolates only the geometry from that
-       fraction; every value it reports still comes from a real bar. */
-    const perBar=Number((speed&&speed.value)||240);
+    /* Pressing play dismisses the parked card. It is the answer to "I have read
+       this, continue" -- leaving it up would have it hang over a moving chart
+       and describe an instant the replay has left. */
+    replayFocus(null);
     const max=Number(scrub.max);
     let position=Number(scrub.value), last=null;
+    /* Bars per millisecond from the LENGTH, so the setting means "this replay in
+       REPLAY_SECONDS/speed" rather than "this many ms per bar". A fixed ms/bar
+       made 1x take 6s on a strangle and nearly two minutes on the LEAP. */
+    const rate=barsPerMs(RGEO?RGEO.points.length:max+1,
+                         REPLAY_SECONDS, Number((speed&&speed.value)||1));
+    /* The bar to halt on, decided once per play rather than tested per frame:
+       nextStop is exclusive of where we stand, so re-deriving it mid-flight
+       would keep finding the same stop and never move. null means run to the
+       end. Unchecking the box opts out entirely.
+
+       `from` is the CURRENT bar, not one behind it. nextStop is already
+       exclusive, so passing position-1 asked "what comes after the bar before
+       this one" and got back the stop we are parked ON -- play halted instantly
+       at the same bar and the replay could never be resumed past its first
+       event. Caught by driving the real page, which is why this is the value the
+       test now pins. */
+    const stops=$('#rstops');
+    const halt=(stops&&stops.checked)&&RGEO
+      ?nextStop(RGEO.events||[],RGEO.points,Math.round(position)):null;
     const tick=(now)=>{
       if(RTIMER===null) return;                    /* stopped mid-frame */
       if(last===null) last=now;
-      position+=(now-last)/perBar;
+      position+=(now-last)*rate;
       last=now;
+      /* A stop is honoured BEFORE the end check, so an event on the last bar
+         parks on its card instead of being overtaken by the finish. */
+      if(halt!==null&&position>=halt){
+        scrub.value=String(halt);replaySeek(halt);
+        replayStop();play.textContent='▶ play';
+        /* The card for the bar just landed on, by the same timestamp the strip
+           uses -- one lookup, so the overlay cannot describe a different event
+           than the one highlighted below it. */
+        const at=(RGEO.events||[]).filter(e=>
+          indexOfTs(RGEO.points,e.ts)===halt);
+        replayFocus(at.length?at[at.length-1]:null);
+        return;
+      }
       if(position>=max){
         /* Loop rather than stop, when asked. A short trade is 20-odd bars, which
            is over in a few seconds -- watching it twice is often how the shape
@@ -1887,7 +2018,14 @@ function bindReplayControls(){
      contents -- and since they are role=button, Enter and Space have to work. */
   document.querySelectorAll('[data-rseek]').forEach(el=>{
     const seek=()=>{replayStop();if(play)play.textContent='▶ play';
-      scrub.value=el.dataset.rseek;replaySeek(Number(scrub.value));};
+      scrub.value=el.dataset.rseek;replaySeek(Number(scrub.value));
+      /* Clicking an event's own card raises the overlay for it; the end/start
+         buttons carry no timestamp and simply clear it. Same lookup as the
+         playback halt, so both routes to a card show the identical one. */
+      const ts=Number(el.dataset.rts);
+      const at=(RGEO&&Number.isFinite(ts))
+        ?(RGEO.events||[]).filter(e=>e.ts===ts):[];
+      replayFocus(at.length?at[0]:null);};
     el.onclick=seek;
     if(el.getAttribute('role')==='button')
       el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();seek();}};
@@ -2034,8 +2172,22 @@ function positions(){
   const rkeyOf=pos=>{const lc=lcByConid[String(pos.conid)];
     const key=(lc&&lc.replay_key)||('pos:'+pos.conid);
     return (S.state.replays||{})[key]?key:null;};
+  /* Which row OWNS the open panel, when several share one replay. A strangle is
+     two position rows pointing at ONE trade, so both used to render the panel and
+     the page emitted two charts of the same position -- and with them two
+     #rscrub, two #rfocus and two #rclipr. `$()` takes the first, so the second
+     chart was inert: dragging its scrubber moved the first one's crosshair.
+     Panels are addressed by fixed id precisely because only one is ever open, so
+     the guard belongs here at the only place that can open two.
+
+     The FIRST row in table order claims it, which is also the one whose subtotal
+     the reader is reading down from. */
+  const owner={};
+  ps.forEach(pos=>{const k=rkeyOf(pos);
+    if(k&&owner[k]===undefined) owner[k]=String(pos.conid);});
   const row=pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
-    const key=rkeyOf(pos); const shown=key&&S.replay===key;
+    const key=rkeyOf(pos);
+    const shown=key&&S.replay===key&&owner[key]===String(pos.conid);
     return `<tr${key?` class="rk" data-replay="${esc(key)}"`:''}><td class="mono">${
       esc(pos.symbol)}</td>
     <td class="side ${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
