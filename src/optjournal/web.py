@@ -62,7 +62,7 @@ from optjournal.bars import (
     replay_bars,
     replay_model,
 )
-from optjournal.db import open_journal
+from optjournal.db import connect, open_journal
 from optjournal.events import (
     EventFetchError,
     EventRateLimited,
@@ -74,12 +74,21 @@ from optjournal.flex import (
     FetchCooldown,
     TokenMissing,
     cooldown_remaining,
-    fetch,
     last_fetch,
     load,
 )
 from optjournal.history import build_history
-from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
+from optjournal.ingest import DEFAULT_ASSET_FILTER
+from optjournal.jobs import (
+    JOBS,
+    JobBusy,
+    UnknownJob,
+    interrupted_runs,
+    run_job,
+)
+from optjournal.jobs import (
+    Context as JobContext,
+)
 from optjournal.marketdata import BarFetchError, fetch_quote
 from optjournal.serialize import (
     audit_data,
@@ -111,6 +120,7 @@ from optjournal.strategies import (
     position_groups,
     strategy_groups,
 )
+from optjournal.sync import sync_journal
 
 __all__ = ["build_state", "serve", "serve_ephemeral"]
 
@@ -508,6 +518,21 @@ def build_state(
     displays.
     """
     with open_journal(db_path) as conn:
+        # RESOLVE ABANDONED RUNS FIRST, before anything reads `job_runs`.
+        #
+        # On page load rather than from a scheduled job, for the same reason the
+        # perishable audit moved out of a cron: a watchdog that is itself scheduled
+        # stops when the scheduler does, and this project has already watched three
+        # cron jobs report health for two days while collecting nothing.
+        #
+        # The KERNEL answers it -- a `running` row whose per-job flock can be
+        # acquired has no live holder, because flock releases on process death
+        # including SIGKILL. No PID, no staleness threshold, and correct across
+        # laptop sleep, where every wall-clock rule is wrong (44.6 hours of sleep
+        # measured as excluded from `monotonic` on this machine). Four
+        # sub-millisecond `LOCK_NB` attempts in the common case, and zero when no
+        # row says `running`.
+        interrupted_runs(conn, archive_dir=archive_dir)
         # One history pass over the home category, reused by the scope, the
         # cohorts and every period row below.
         report = build_history(conn, asset_category=asset_category)
@@ -677,167 +702,6 @@ def build_state(
     return state
 
 
-#: Snapshots kept beside the journal. Enough to reach back past a bad sync
-#: without unbounded growth: the journal is ~2 MB, so eight is ~16 MB.
-SNAPSHOTS_KEPT = 8
-
-#: Where `VACUUM INTO` writes. Beside the database rather than inside `raw/`,
-#: because `raw/` is the provenance root for BROKER-SUPPLIED files and a snapshot
-#: is derived data.
-SNAPSHOT_DIR = "snapshots"
-
-
-def sync_journal(
-    *,
-    conn: sqlite3.Connection,
-    archive_dir: Path,
-    query_id: str,
-    assets: tuple[str, ...] = DEFAULT_ASSET_FILTER,
-    from_date: str | None = None,
-    to_date: str | None = None,
-    force: bool = False,
-) -> dict[str, Any]:
-    """Fetch the newest statement, fold it in, snapshot. THE one sync path.
-
-    ONE FUNCTION, THREE CALLERS: `POST /api/sync`, `optjournal sync`, and the
-    `sync` job. They previously did different things, which is this project's
-    recurring bug shape rather than an inconvenience -- `new_trades` held a COUNT
-    in one and the row LIST in the other, one name and two types, and nothing
-    broke only because each consumer had met just one producer.
-
-    RAISES rather than returning an error dict, unlike the `_do_sync` it replaces.
-    That is the point of the rewrite: `FetchCooldown` and `TokenMissing` are the
-    two outcomes callers must distinguish, and each caller wants a different
-    shape for them -- an HTTP body, an exit code, a ledger status. Flattening them
-    into a dict here forced every caller to re-derive the distinction from a
-    string, which is how the 2026-08-07 keychain failure became exit 1.
-
-    Takes an open CONNECTION rather than a path, so the job can run inside the
-    transaction that already holds its `running` claim.
-
-    It ends with a snapshot, and the placement is deliberate: beside the write it
-    protects, so it cannot be the thing that silently stopped running. Same
-    argument that turned `bars-audit` from a cron into a page-load field. What it
-    captures is what CANNOT be refetched -- 1,816 `price_bars` rows of which 329
-    are hourly option bars the README says cannot be backfilled at any price, plus
-    `market_events` and `watchlist`. A `raw/` backup would protect none of that:
-    the Flex query is `Last30CalendarDays`, so every statement comes back for the
-    cost of a request.
-    """
-    started = _now()
-    result = fetch(
-        query_id, archive_dir=archive_dir,
-        from_date=from_date, to_date=to_date, force=force,
-    )
-    ingested = ingest_file(conn, result.raw_path, assets=assets)
-    # `first_seen_at` is stamped per row at insert, so anything at or after this
-    # run's start is genuinely new rather than a row re-presented by an
-    # overlapping statement.
-    new_trade_rows = [
-        dict(row) for row in conn.execute(
-            "SELECT trade_date, symbol, buy_sell, open_close, quantity,"
-            " trade_price, ib_commission, currency FROM trades"
-            " WHERE first_seen_at >= ? ORDER BY COALESCE(date_time, trade_date)",
-            (started,),
-        )
-    ]
-    new_cash = conn.execute(
-        "SELECT COUNT(*) AS n FROM cash_transactions WHERE first_seen_at >= ?",
-        (started,),
-    ).fetchone()["n"]
-    changed = bool(new_trade_rows or new_cash)
-
-    snapshot = None
-    if changed:
-        # Only when something changed: a snapshot per no-op sync would be seven
-        # identical copies a week, and the retention would then evict the one
-        # taken before the change that mattered.
-        snapshot = _snapshot(conn)
-
-    summary = (
-        "statement byte-identical to a previous fetch, nothing to do"
-        if ingested.already_ingested
-        else f"{len(new_trade_rows)} new trade(s), {new_cash} new cash row(s)"
-        if changed
-        else f"no new activity (positions refreshed: {ingested.positions_written})"
-    )
-    return {
-        "ok": True,
-        "kind": "synced",
-        "started_at": started,
-        "query_id": query_id,
-        "archive": result.raw_path.name,
-        "raw_path": str(result.raw_path),
-        "raw_bytes": result.raw_bytes,
-        "reused_archive": result.is_duplicate,
-        "already_ingested": ingested.already_ingested,
-        "duplicate_of": ingested.duplicate_of,
-        #: A COUNT. `new_trade_rows` is the list, under a name that says so.
-        "new_trades": len(new_trade_rows),
-        "new_trade_rows": new_trade_rows,
-        "new_cash": new_cash,
-        "positions_written": ingested.positions_written,
-        "warnings": ingested.warnings,
-        "changed": changed,
-        "snapshot": None if snapshot is None else snapshot.name,
-        "summary": summary,
-    }
-
-
-def _snapshot(conn: sqlite3.Connection) -> Path | None:
-    """`VACUUM INTO` a timestamped copy beside the journal. Returns its path.
-
-    One stdlib call: no git, no configurable repo root that could point at the
-    wrong repository, and unlike a file copy it is consistent without stopping
-    writers -- `VACUUM INTO` reads through one transaction.
-
-    Failures are LOGGED AND SWALLOWED for the same reason `record_run`'s are: a
-    backup that fails must not fail the sync it is protecting. The sync's return
-    value carries `snapshot: null` when it did, so the page can say so rather than
-    the absence being invisible.
-    """
-    row = conn.execute("PRAGMA database_list").fetchone()
-    if row is None or not row["file"]:
-        return None                       # in-memory journal: nothing to snapshot
-    live = Path(row["file"])
-    out = live.parent / SNAPSHOT_DIR
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    target = out / f"{live.stem}-{stamp}.db"
-    try:
-        out.mkdir(parents=True, exist_ok=True)
-        # Parameter binding is not available to VACUUM INTO, so the path is
-        # quoted as an SQL string literal. It is derived from the journal's own
-        # filename plus a strftime stamp -- no user input reaches it -- and a
-        # single quote in a directory name would still be escaped correctly.
-        conn.execute(f"VACUUM INTO '{str(target).replace(chr(39), chr(39) * 2)}'")
-    except (sqlite3.Error, OSError) as exc:
-        log.warning("could not snapshot the journal: %s", exc)
-        return None
-    _prune_snapshots(out, live.stem)
-    return target
-
-
-def _prune_snapshots(directory: Path, stem: str) -> int:
-    """Keep the newest `SNAPSHOTS_KEPT`. Returns how many were deleted.
-
-    Sorted by NAME, not mtime: the stamp is in the filename in a format that
-    sorts chronologically, and a name cannot be changed by a file copy the way an
-    mtime can.
-    """
-    try:
-        existing = sorted(directory.glob(f"{stem}-*.db"))
-    except OSError:
-        return 0
-    deleted = 0
-    for stale in existing[:-SNAPSHOTS_KEPT] if len(existing) > SNAPSHOTS_KEPT else []:
-        try:
-            stale.unlink()
-            deleted += 1
-        except OSError as exc:
-            log.warning("could not remove old snapshot %s: %s", stale.name, exc)
-    return deleted
-
-
 def _do_sync(
     *, db_path: Path, archive_dir: Path, query_id: str, assets: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -951,6 +815,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._json(500, {"error": f"database not readable: {exc}"})
         elif path == "/api/quotes":
             self._json(*self._quotes())
+        elif path == "/api/jobs/run":
+            self._json(*self._job_status(params))
         else:
             self._json(404, {"error": "not found"})
 
@@ -1095,6 +961,72 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return 200, {"ok": True, "kind": "watchlist", "action": action,
                      "symbol": symbol, "changed": changed}
 
+    def _job_run(self) -> tuple[int, dict[str, Any]]:
+        """Run one registered job now. The page's only write to the scheduler.
+
+        The target is in the request BODY, not the path, matching `/api/watchlist`.
+        That is what keeps `do_POST`'s routing to exact string comparisons, which is
+        in turn what makes the `Origin` guard's position ahead of the router a
+        STRUCTURAL guarantee for every endpoint added later rather than something
+        each new route has to remember. A path like `/api/jobs/run/sync` would need
+        prefix matching, and a prefix match is where an unguarded route hides.
+
+        Returns 202, not 200: the run has completed by the time this returns (there
+        is no worker thread until step 6), but the status the caller wants is in the
+        ledger row, and `GET /api/jobs/run?id=` is where it lives. Answering 200
+        with a body would invite the page to read an outcome from the wrong place.
+        """
+        body = self._body()
+        name = str(body.get("job") or "").strip()
+        try:
+            with open_journal(self.cfg.db_path) as conn:
+                run_id = run_job(
+                    conn, name,
+                    ctx=JobContext(
+                        archive_dir=self.cfg.archive_dir,
+                        db_path=self.cfg.db_path,
+                        query_id=self.cfg.query_id,
+                        assets=self.cfg.assets,
+                    ),
+                )
+        except UnknownJob:
+            return 400, {
+                "ok": False, "kind": "unknown",
+                "message": f"no job named {name or '(empty)'}",
+                "jobs": [job.name for job in JOBS],
+            }
+        except JobBusy as exc:
+            # 409 with the run to watch, so the page polls the run already in
+            # flight instead of showing an error for a working system.
+            return 409, {"ok": False, "kind": "busy", "job": exc.job,
+                         "run_id": exc.run_id,
+                         "message": f"{exc.job} is already running"}
+        return 202, {"ok": True, "kind": "queued", "job": name, "run_id": run_id}
+
+    def _job_status(self, params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+        """One ledger row by id. Read-only, no migrate, ~1 ms.
+
+        NO MIGRATE, deliberately: this is polled every second or two while a job
+        runs, and `migrate` takes the cross-process flock the job's own writes need.
+        `open_journal` is not used for the same reason.
+        """
+        try:
+            run_id = int((params.get("id") or ["0"])[0])
+        except ValueError:
+            return 400, {"ok": False, "kind": "id", "message": "id must be an integer"}
+        conn = connect(self.cfg.db_path)
+        try:
+            row = conn.execute(
+                "SELECT id, job, fired_for, started_at, finished_at, status,"
+                " detail, done, total FROM job_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return 404, {"ok": False, "kind": "missing",
+                         "message": f"no run {run_id}"}
+        return 200, {"ok": True, "kind": "run", **dict(row)}
+
     def do_POST(self) -> None:  # noqa: N802 - stdlib naming
         path, _, _q = self.path.partition("?")
         # BEFORE the route check, so every write endpoint added later is covered
@@ -1108,11 +1040,40 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                            "otherwise spend your IBKR request budget.",
             })
             return
+        try:
+            self._route_post(path)
+        except sqlite3.OperationalError as exc:
+            # A LOCKED DATABASE OTHERWISE ANSWERS NOTHING AT ALL, and that was
+            # measured rather than assumed: `do_POST` caught nothing, and
+            # `BaseHTTPRequestHandler` has no error handler, so the exception
+            # escaped the handler and the connection was dropped. A real request
+            # against a journal held by `BEGIN EXCLUSIVE` got
+            # `RemoteDisconnected: Remote end closed connection without response`
+            # after 16.06s -- one BUSY_TIMEOUT_MS -- while the same journal
+            # answered `GET /api/state` in 0.03s, because WAL lets readers through.
+            # The page then shows a browser network error, which names neither the
+            # cause nor the fact that waiting would fix it.
+            #
+            # Guarded HERE, before routing, for the same reason as the `Origin`
+            # check: every endpoint added later inherits it instead of remembering.
+            log.warning("POST %s hit a locked database: %s", path, exc)
+            self._json(503, {
+                "ok": False, "kind": "busy",
+                "message": "the journal is locked by another writer; try again in "
+                           "a moment.",
+            })
+            return
+
+    def _route_post(self, path: str) -> None:
+        """The routing itself, so `do_POST` can wrap all of it in one guard."""
         if path == "/api/market/fetch":
             self._json(*self._market_fetch())
             return
         if path == "/api/watchlist":
             self._json(*self._watchlist_write())
+            return
+        if path == "/api/jobs/run":
+            self._json(*self._job_run())
             return
         if path != "/api/sync":
             self._json(404, {"error": "not found"})

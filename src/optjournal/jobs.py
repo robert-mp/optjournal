@@ -41,6 +41,7 @@ from optjournal.bars import backfill_bars
 from optjournal.events import EventFetchError, EventRateLimited, fetch_events, store_events
 from optjournal.flex import FetchCooldown, TokenMissing
 from optjournal.locks import LockTimeout, locked
+from optjournal.sync import sync_journal
 
 __all__ = [
     "JOBS",
@@ -399,11 +400,6 @@ def _market(conn: sqlite3.Connection, _ctx: Context) -> Outcome:
 def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     """Fetch the newest statement and fold it in.
 
-    Deferred import, and it is the one in this module: `sync_journal` lives in
-    `web`, which imports `serialize` -> `bars` -> ... and would make this module's
-    import cost the whole payload layer for the two jobs that do not need it.
-    `tests/test_layering.py` proves the graph stays acyclic either way.
-
     THE COOLDOWN IS NOT REIMPLEMENTED HERE. `flex.fetch` owns it, holds the fetch
     flock, and stamps `.fetch-state.json`; a second copy of that sequence would be
     a second thing to keep in step with the lockout budget.
@@ -412,8 +408,6 @@ def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:
         # A journal with no credentials configured is a supported state, not a
         # crash: `failed` with the cause is what a reader can act on.
         return Outcome("failed", "no Flex query id configured")
-
-    from optjournal.web import sync_journal  # noqa: PLC0415 - see docstring
 
     try:
         result = sync_journal(

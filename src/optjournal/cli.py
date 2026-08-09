@@ -69,6 +69,7 @@ from optjournal.serialize import (
     summary_data,
     watchlist_data,
 )
+from optjournal.sync import sync_journal
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -742,11 +743,6 @@ def cmd_sync(args) -> int:
     # drifted: `new_trades` held the row LIST here and a COUNT in web.py -- one
     # name, two types, computed from the same table. Nothing broke only because
     # each consumer had met just one producer.
-    #
-    # Imported here rather than at module scope, matching `cmd_serve`: `web` pulls
-    # in the whole payload layer, and `optjournal show` should not pay for it.
-    from optjournal.web import sync_journal  # noqa: PLC0415 - see above
-
     data = sync_journal(
         conn=_open_db(args),
         archive_dir=args.archive,
