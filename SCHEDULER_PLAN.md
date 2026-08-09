@@ -1,12 +1,56 @@
 # Scheduling plan: move the clock into the application, and make the page the console
 
 Working document, not a design doc. Every number below was measured against this
-repo at `03ab000`, and the command or the `file:line` is given so a reader can
-re-check rather than trust it. Steps are ordered so each is shippable alone, green
-on its own, and none requires the next.
+repo, and the command or the `file:line` is given so a reader can re-check rather
+than trust it. Steps are ordered so each is shippable alone, green on its own, and
+none requires the next.
 
-Baseline at the time of writing: **766 passed, 2 skipped, ruff clean**
-(`.venv/bin/python -m pytest -q`; `.venv/bin/ruff check .`).
+Baseline: **769 passed, 2 skipped, ruff clean** at `d43ba26`.
+
+## Revisions after review
+
+The first draft of this document was reviewed against the live machine, and three
+things changed. They are recorded here rather than silently edited in, because two
+of them are corrections to *this file*.
+
+**1. Step 1 is DONE, but not as written.** `d43ba26`. The draft proposed an early
+return from `migrate` when the version stamp and the five views looked current.
+`tests/test_db.py` refused it, correctly: three tests require that merely OPENING a
+journal heals it (an ALTER for a column added after ship, two row-level backfills),
+and an early return disabled all of that silently. The draft even anticipated the
+trap -- "a journal stamped at the current version but missing a *column* would be
+skipped" -- and the suite caught it anyway. The shipped fix is narrower and lands
+where the damage was: `_stale_views` compares each view's STORED sql to the shipped
+sql, and only a mismatch is dropped. Steady state drops nothing, so a reader has
+nothing to miss, and every healing step still runs. 4,941 failures -> 0.
+
+**2. Step 2 (the raw/ backup) is CUT.** The draft argued this was second-most
+urgent. It is not, and the reasoning was wrong in a way worth stating: it treated
+"`raw/` is the provenance root" as "`raw/` is irreplaceable". Measured -- the daily
+Flex query is **`Last30CalendarDays`**, a rolling window, and two archived
+statements are full-year pulls (`20250801->20260731`, `20250810->20260803`). So
+every one of the 168 trades, 101 cash rows, 63 snapshots, 15 securities and 261 NAV
+rows comes back from IBKR for the cost of a request. Committing that XML to a git
+repo protects the cheapest artefact in the project.
+
+What the draft got RIGHT is buried in the same paragraph: the unrecoverable data is
+**not in `raw/` at all**, so a `raw/` backup would never have saved it either.
+`price_bars` 1,816 rows, of which **329 are hourly** spanning 2026-07-20 to
+2026-08-08, plus `market_events` 99 and `watchlist` 6. The README already says why
+those are different in kind: "an option's intraday series exists only while its
+session is running, so it cannot be backfilled at any price". A `git add raw/*.xml`
+does nothing for any of it.
+
+So the 100 lines of `backup.py` become **one `VACUUM INTO` on the sync path**, as a
+footnote to step 5 rather than a step. It captures the whole journal, perishable
+bars included, with one stdlib call, no git, and no configurable repo root to point
+at the wrong repository. The genuine finding underneath the draft's step 2 survives
+and is promoted: `web._do_sync` and `cli.cmd_sync` do different things, and the plan
+makes the web path primary. Two paths that claim to be the same and are not is this
+project's recurring bug shape.
+
+**3. Where the app lives is now an explicit step.** The draft never said, and the
+answer matters more than it looks. See the next section.
 
 ## The one-paragraph answer
 
@@ -43,6 +87,59 @@ machinery was outgrowing the job:
 - **No `backup`/`snapshot` as scheduled jobs.** They belong in the shared sync
   path, beside the thing they protect.
 - **No cancel in v1.** See [What is not worth doing](#what-is-not-worth-doing).
+
+---
+
+## Where the app lives
+
+The draft did not answer this and it is load-bearing, because the answer today is:
+**inside the thing being migrated away from.**
+
+```
+/Users/robrtmar/.meshclaw/workspace/optjournal
+```
+
+Code, `journal.db`, `raw/`, `demo/` and `.venv` all sit in MeshClaw's workspace
+directory. Three cron implementations hardcode
+`Path.home() / ".meshclaw" / "workspace" / "optjournal"`, and the editable install
+pins `/Users/robrtmar/.meshclaw/workspace/optjournal/src` in a `.pth`.
+
+**The good news, measured: `src/` has ZERO references to meshclaw.** All 13 live in
+`cron/` (7), `tests/` (2), and the README (2) -- and `cron/` is deleted by step 8
+anyway. `config.ROOT` is `Path(__file__).resolve().parent.parent.parent`, so the
+database and the archive follow the code wherever it goes. `journal.db`, `raw/` and
+`demo/` are already gitignored, so code and data are separable without a migration.
+
+So this is a MOVE, not a refactor. The only thing that breaks is the venv's
+absolute `.pth`, and `uv sync` regenerates it.
+
+### The recommendation: `~/optjournal`, and keep data beside code
+
+Move the repo to `~/optjournal` (or anywhere outside `~/.meshclaw`). Do NOT split
+data into `~/Library/Application Support/optjournal` or `~/.local/share`:
+
+* `config.py`'s own comment states the rule -- "data next to code keeps the whole
+  journal one directory to back up" -- and that is still right for a one-user tool.
+* An XDG-style split trades one directory for two, and buys nothing here: there is
+  no package manager installing this, no multi-user case, no read-only prefix.
+* It would make the `VACUUM INTO` snapshot land somewhere different from the thing
+  it snapshots, which is how a backup gets forgotten.
+
+**Why the move is not merely tidiness.** While the app lives under
+`~/.meshclaw/workspace`, retiring MeshClaw means either leaving the journal in the
+directory of a retired tool, or moving it later under a launchd plist that has the
+old path baked in. Doing it BEFORE step 7 means the plist is written once against
+the final location. It also removes the last reason anyone would think MeshClaw's
+lifecycle owns the journal's data.
+
+**Cost, measured rather than estimated:** 13 grep hits, of which 7 die with
+`cron/`; one `uv sync`; one `git mv`-equivalent (`mv` plus re-running `uv sync`);
+and the three MeshClaw shims need their `IMPL` path updated, which is one line each
+and is exactly the indirection the shim pattern was built to make cheap.
+
+**Where this lands in the sequence: a new step 2**, replacing the cut backup step.
+It is small, it is reversible, and everything after it -- the plist, the log paths,
+the snapshot destination -- wants to be written against the final location once.
 
 ---
 
@@ -113,10 +210,35 @@ look like the cause.
 
 ## The sequence
 
-### Step 1 — Make the read path stop writing DDL
+### Step 1 — Make the read path stop writing DDL — **DONE at `d43ba26`**
 
 **Highest value, lowest risk, and it is a bug fix that stands alone with no
 scheduler anywhere near it.**
+
+**What shipped, and why it is not what this step proposed.** The proposal below was
+an early return when the schema looked current. `tests/test_db.py` rejected it:
+`migrate` HEALS a journal whose version stamp is already right, via
+`_ADDED_COLUMNS` ALTERs and two row-level backfills, and three tests assert that
+merely opening a journal repairs it. An early return disabled all of it silently.
+
+The shipped fix narrows the DROP instead of skipping the migration. `_stale_views`
+compares each view's stored `sql` in `sqlite_master` against the definition parsed
+out of `_SCHEMA`, and only a mismatch is dropped -- so the steady state drops
+nothing, a concurrent reader has nothing to miss, and every healing step still runs.
+Existence alone would not have done: `CREATE VIEW IF NOT EXISTS` never updates, so a
+view can exist and be WRONG, which `test_db` pins by planting a garbage definition.
+
+Result, on the reader-vs-migrator shape that exposed the bug: **4,941 failures ->
+0**, with read throughput up from 60k to 89k in the same two seconds. Over HTTP,
+16 concurrent `/api/state` went from 10 failures in 160 to 0.
+
+Two bugs found while writing it, both by running it: the `_SCHEMA` view parser
+initially found 1 view of 5 (the others are preceded by `--` comments) and a
+`.get(name, stored[name])` fallback made that invisible, so view refreshing would
+have been silently dead with a green suite; and `schema_is_current` raised
+`no such table: schema_version` on a brand-new file. An unparseable view now raises.
+
+<details><summary>The original proposal, kept for the reasoning</summary>
 
 **What changes.** An early return at the top of `db._migrate_unlocked`: if
 `MAX(version) == SCHEMA_VERSION` **and** all five `_VIEWS` are present in
@@ -154,7 +276,49 @@ path for any journal not already at `SCHEMA_VERSION`. A journal stamped at the
 current version but missing a *column* would be skipped — so the test must include
 "stamp the version, drop a column, assert migrate still repairs it".
 
-### Step 2 — Move the raw-statement backup into the shared sync path
+*(That last sentence is what the suite went on to enforce, and what killed the
+proposal. The prediction was right and the mitigation was not enough: the views
+condition does not cover a missing column, and `_ADDED_COLUMNS` spans six tables.)*
+
+</details>
+
+### Step 2 — Move the app out of `~/.meshclaw/workspace`
+
+**Small, reversible, and it must precede step 7 so the launchd plist is written
+once against the final path.**
+
+**What changes.** `mv ~/.meshclaw/workspace/optjournal ~/optjournal`, then
+`uv sync` to regenerate the editable-install `.pth` (which pins an absolute path).
+Update `IMPL` in the three MeshClaw shims -- one line each, and precisely the
+indirection the shim pattern exists to make cheap. Update `PROJECT`/`WORKSPACE` in
+`cron/*.py`, `DEPLOYED` in `tests/test_cron.py`, and the two README mentions.
+
+**Why it is a move and not a refactor.** `src/` has zero references to meshclaw;
+all 13 are in `cron/` (7, deleted by step 8), `tests/` (2), README (2).
+`config.ROOT` is derived from `config.py`'s own location, so the database and
+archive follow the code with no migration. Verified.
+
+**Data stays beside code.** No XDG split -- see [Where the app
+lives](#where-the-app-lives). One directory to back up is the property that makes
+the `VACUUM INTO` snapshot land next to the thing it snapshots.
+
+**Test.** Nothing new: `tests/test_cron.py` already asserts every deployed shim
+resolves to real code, so a shim left pointing at the old path fails there. That is
+the test earning its keep rather than a test written for the move.
+
+**What could go wrong.** The old path still exists with a stale `.venv`, and a
+forgotten shell or a `launchctl` entry keeps using it -- two live journals, one of
+them silently not being updated. Mitigation: move rather than copy, and after
+`uv sync` assert `optjournal.config.ROOT` reports the new location before deleting
+anything.
+
+<details><summary>CUT: the original step 2, the raw-statement backup</summary>
+
+**Cut after review. The reasoning is in [Revisions](#revisions-after-review):
+`Last30CalendarDays` makes every row in `raw/` refetchable, and the data that is
+genuinely unrecoverable is not in `raw/` at all. What survives is one
+`VACUUM INTO` on the sync path, folded into step 5, plus the real finding that
+`web._do_sync` and `cli.cmd_sync` diverge.**
 
 **Second because it is durability of the one artefact that cannot be regenerated,
 and the web UI already bypasses it.**
@@ -194,6 +358,13 @@ new XML tracked, and one that `-f` does not stage `.fetch-state.json`.
 **What could go wrong.** `git add -f` in a repo whose root is now configurable
 could commit into the wrong repository. The pinned pathspec limits it, and the
 test should assert the commit touches only `raw/*.xml`.
+
+*(Note how this risk reads in hindsight: the mitigation for "might commit to the
+wrong repo" was a pathspec and a test, when the correct answer was that the commit
+buys nothing. The 1,816 `price_bars` rows in the paragraph above are the actual
+asset, and no amount of care around `git add` would have protected one of them.)*
+
+</details>
 
 ### Step 3 — A regression net for the 21 delivery decisions, against the existing cron files
 
@@ -277,12 +448,38 @@ it did. That validates the ledger shape against real runs before anything depend
 on it.
 
 **Three staleness signals, because "did it run at all" is a different question
-from "did it succeed"**, and it is the question that actually failed. The last
-recorded run of any optjournal cron was 2026-08-07 15:05, ~40 hours before the
-survey, while every MeshClaw surface read `last_status:"ok"`,
-`consecutive_failures: 0` — and two sessions of unrecoverable intraday option bars
-were lost. Corroborated in the data: hourly OPT bars 28 rows for 08-06, 4 for
-08-07, none for 08-08.
+from "did it succeed"**, and it is the question that actually failed.
+
+RE-MEASURED at review, because the draft's figures here were wrong and the
+conclusion survives anyway. The draft said 08-08 had no hourly OPT bars; it has 20.
+The honest evidence is `price_bars.fetched_at`, which records when a row was
+WRITTEN rather than which session it covers:
+
+```
+written 2026-08-08T23   1d: 1481   1h: 299   <- a MANUAL run during the review
+written 2026-08-07T14   1h: 2
+written 2026-08-06T20   1h: 28
+written 2026-08-06T11   1d: 1
+```
+
+So the bars jobs wrote 28 hourly rows on 08-06, two on 08-07, and nothing after
+until a human ran the command by hand. And `~/.meshclaw/crons.json` at that moment:
+
+```
+optjournal-bars-live    last_status: ok      consecutive_failures: 0
+optjournal-bars-daily   last_status: ok      consecutive_failures: 0
+optjournal-bars-audit   last_status: ok      consecutive_failures: 0
+optjournal-daily-sync   last_status: error   consecutive_failures: 1
+```
+
+**Three jobs reporting `ok` while collecting nothing, including the audit job whose
+entire purpose is to notice that.** The sync's own `last_error` names the cause and
+proves the typed-exception argument in step 5: a locked keychain
+(`keyring.backends.macOS ... find_generic_password`), which is not `TokenMissing`,
+so it never mapped to exit 2 and arrived as a traceback that reached nobody.
+
+That is the failure this step exists for. A green `last_status` is not evidence of
+anything, and no amount of backup would have recovered the sessions it hid.
 
 1. **`heartbeat_at`, written by the tick loop itself** (grafted from Design 3, and
    I side with all three judges against Design 1 here — Design 1 derives staleness
@@ -323,11 +520,12 @@ a pinned reader blocks WAL checkpointing.
   while unconditionally keeping the newest `fired_for` row.
 
 **The registry is code, and that is the fix for a specific failure.**
-`crons.json` holds 7 jobs and **none** is `optjournal-market` (verified:
-`grep -c optjournal-market ~/.meshclaw/crons.json` → 0). So 143 lines of reviewed,
-tested, README-documented calendar policy have **never run on a schedule** —
-corroborated in the data: `market_events` holds 99 rows from a single fetch, not
-the daily accumulation its docstring's argument depends on. Registration was an
+`crons.json` holds 7 jobs and **none** is `optjournal-market` (re-verified at
+review: `grep -c optjournal-market ~/.meshclaw/crons.json` → 0). So 143 lines of
+reviewed, tested, README-documented calendar policy have **never run on a
+schedule** — corroborated in the data: `market_events` holds 99 rows all stamped
+`fetched_at 2026-08-08`, a single fetch from the web UI during the review, not the
+daily accumulation its docstring's argument depends on. Registration was an
 unversioned, hand-typed side channel that no test could see. In `jobs.py`,
 "exists" and "registered" become one fact. Treat `optjournal_market.py` as a spec
 for a job being switched on, not as working code to port faithfully.
@@ -341,6 +539,23 @@ per job and lets the runner match on typed exceptions. That is not cosmetic: the
 exit 1 → a generic `RuntimeError` that reached nobody. And today `bars` treats a
 DB-locked exit 1 as a routine `Skip` and would silently retry a lock seven times a
 session.
+
+**One shared sync path, and one `VACUUM INTO`. (Absorbed from the cut step 2.)**
+`web._do_sync` and `cli.cmd_sync` currently do different things, and this plan makes
+the web path the primary one -- two paths claiming to be the same and diverging is
+the bug shape this project keeps finding. The sync job calls one function, and both
+entry points call it too.
+
+That function ends with `VACUUM INTO` a timestamped file beside the journal. One
+stdlib call, no git, no configurable repo root to aim at the wrong repository, and
+unlike a `raw/` commit it captures **the data that cannot be refetched**: 1,816
+`price_bars` rows of which 329 are hourly option bars the README says "cannot be
+backfilled at any price", plus `market_events` and `watchlist`. Keep the last N and
+delete older ones, so it cannot grow without bound.
+
+Deliberately NOT a scheduled job of its own: it belongs beside the write it
+protects, so it cannot be the thing that silently stopped running. That is the same
+argument that turns `bars-audit` from a job into a page-load field.
 
 **Endpoints.** `POST /api/jobs/run` `{job}` → 202 `{ok, run_id}` | 409
 `{kind:"busy", run_id}` | 400 `{kind:"unknown"}`. `GET /api/jobs/run?id=<id>` →
