@@ -46,11 +46,21 @@
       </svg>
     </div>
     <div>
-      <!-- Not "Cuaderno de Bitácora": a kicker that translates the title
-           directly beneath it spends the page's most prominent small slot
-           saying what the next line already says. This states what the journal
-           is made of instead, in the vocabulary the tabs use. -->
-      <div class="kicker">Strikes · Fills · Round trips</div>
+      <!-- The dateline of a ship's log, which is what a bitácora is.
+           Two rejected strings sat here before it, and both failed the same
+           way. "Cuaderno de Bitácora" translated the title directly beneath
+           it. "Strikes · Fills · Round trips" then named the journal's
+           contents -- but that is identical for every reader on every load,
+           and the tab strip two lines down already says Trades, Positions and
+           Costs. A fixed string in the page's most prominent small slot is
+           read once and then permanently ignored.
+
+           So this slot now carries the one thing only THIS journal can say:
+           which day of the log it is, since when, and what the book is
+           carrying. Filled by `renderKicker` from the payload -- empty here
+           rather than holding placeholder text, because a hardcoded day number
+           flashing before the real one is a wrong figure on screen. -->
+      <div class="kicker" id="kicker"></div>
       <div class="title">Bitácora <span class="edition" id="edition">Leather Edition</span></div>
       <div class="tabs" id="tabs"></div>
     </div>
@@ -139,6 +149,8 @@ import {
  * @property {Audit} audit -- did the last session's perishable bars land
  *   (serialize.audit_data). Computed on EVERY load, because when this was a cron
  *   the watchdog and the thing it watched stopped together
+ * @property {Logbook} logbook -- the header dateline (serialize.logbook_data).
+ *   Whole-journal, so it moves with neither the month nor the trade-type filter
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
  * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
@@ -507,6 +519,19 @@ import {
  *   byte-identical payloads. Same distinction `Scheduler.ever_ran` draws
  */
 
+/** @typedef {Object} Logbook -- the header dateline (serialize.logbook_data)
+ *
+ *  How long this log has been kept, which is the one thing the header's top slot
+ *  can say that no other surface does. Carries no position count on purpose: an
+ *  episode is per contract, so a strangle would read as two bets and contradict
+ *  the Positions tab. `logbookLine` names underlyings off `State.positions`
+ *  instead -- see `strategies.open_position_count` for why the count is the trap.
+ * @property {string|null} opened -- ISO day of first activity, a fill or a cash
+ *   row. Null on a journal where nothing has happened yet
+ * @property {number|null} day -- which day of the log today is, counting the
+ *   opening day as 1. Null exactly when `opened` is
+ */
+
 /** @typedef {Object} JobReply -- POST/GET /api/jobs/run (web._job_run,
  *  web._job_status)
  *
@@ -753,6 +778,7 @@ import {
  * @payload w:Watch wo:WatchOption
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
+ * @payload lb:Logbook
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
@@ -760,7 +786,7 @@ import {
  * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen withEvents ws opts thin
  * @local JSON Object ages input mine qb wf behind was
- * @local when button
+ * @local when button parts names
  */
 
 const $=s=>document.querySelector(s);
@@ -925,6 +951,55 @@ function renderTabs(){
       >${esc(label)}</button>`).join('');
   document.querySelectorAll('.tab[data-tab]').forEach(b=>
     b.onclick=()=>{S.tab=b.dataset.tab;draw(true);});
+}
+
+/* ------------------------------------------------ the log's dateline
+
+   What the header's kicker says, and the reason it is computed rather than
+   written: see the note on #kicker in the markup. Three clauses, each dropped
+   rather than faked when its fact is absent, so the line never states something
+   the journal cannot back:
+
+     LOG DAY 348 · SINCE 28 AUG 2025 · CARRYING TSLA GOOG META PLTR
+     LOG DAY 348 · SINCE 28 AUG 2025 · FLAT          <- nothing open
+     BITÁCORA                                        <- empty journal
+
+   `CARRYING` names UNDERLYINGS, not contracts and not a count. A strangle is
+   two contracts on one name, so "6" here would have contradicted the Positions
+   tab's three cards -- the exact disagreement `open_position_count` was written
+   to end. Names sidestep the question: two legs on GOOG are one GOOG either
+   way. Read from `state.positions`, the same snapshot rows the Positions tab
+   renders, so the header cannot drift from the tab. */
+const KICKER_NAMES=4;
+function logbookLine(){
+  const st=S.state||{}, lb=st.logbook||{};
+  /* No first day means nothing has happened in this account, so there is no
+     log to be on day N of. The title alone carries the header. */
+  if(!lb.day) return 'Bitácora';
+  const parts=['Log day '+lb.day];
+  if(lb.opened){
+    const[y,m,d]=String(lb.opened).split('-');
+    if(y&&m&&d) parts.push('since '+(+d)+' '+MONTHS[+m-1]+' '+y);
+  }
+  /* Distinct, in first-appearance order. `positions_data` sorts its rows by
+     expiry then strike, so the name holding the nearest expiry lands first and
+     the soonest thing to need a decision leads the line. A Set preserves
+     insertion order, which is what makes that free rather than a second sort. */
+  const names=[...new Set((st.positions||[])
+    .map(pos=>pos.underlying_symbol||pos.symbol||'')
+    .filter(Boolean))];
+  /* Truncated rather than allowed to wrap under the title: this is a 10.5px
+     letterspaced line in a fixed header, and a book of a dozen names would
+     push the title down the page. The overflow is counted, not silently
+     dropped -- "+3 more" is honest about what is not shown. */
+  if(!names.length) parts.push('flat');
+  else parts.push('carrying '+names.slice(0,KICKER_NAMES).join(' ')
+    +(names.length>KICKER_NAMES?' +'+(names.length-KICKER_NAMES)+' more':''));
+  return parts.join(' · ');
+}
+function renderKicker(){
+  const el=$('#kicker'); if(!el)return;
+  el.textContent=logbookLine();
 }
 
 /* ------------------------------------------------ display-currency toggle */
@@ -2785,6 +2860,7 @@ function draw(push){
   replayStop();
   syncHash(push);
   renderTabs();
+  renderKicker();
   renderCcy();
   const views={dashboard,calendar,trades,positions,costs,annual,odte,market,
     watchlist};

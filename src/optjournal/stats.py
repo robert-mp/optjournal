@@ -176,6 +176,24 @@ def fx_quotes(conn: sqlite3.Connection, base: str) -> list[dict[str, Any]]:
     return list(quotes.values())
 
 
+def first_activity(conn: sqlite3.Connection) -> str | None:
+    """The day this account first did anything, or None for an empty journal.
+
+    Any activity at all -- a fill or a cash row -- so an account that funded in
+    one month and traded in the next dates from the funding. Both callers need
+    the same instant and would drift if each asked separately: `month_range`
+    walks forward from it, and `logbook_data` counts days since it.
+
+    Normalised through `_day_of`, because the raw columns mix ISO
+    `2025-01-14 14:30:05` with IBKR's compact `20250114`.
+    """
+    row = conn.execute(
+        "SELECT MIN(d) FROM (SELECT MIN(trade_date) AS d FROM trades"
+        " UNION ALL SELECT MIN(date_time) FROM cash_transactions)"
+    ).fetchone()
+    return _day_of(str(row[0])) if row and row[0] else None
+
+
 def month_range(conn: sqlite3.Connection) -> list[str]:
     """Every calendar month from the account's first activity to today, newest first.
 
@@ -187,11 +205,7 @@ def month_range(conn: sqlite3.Connection) -> list[str]:
     activity at all -- trades or cash rows -- so a fills-free account start
     still counts.
     """
-    row = conn.execute(
-        "SELECT MIN(d) FROM (SELECT MIN(trade_date) AS d FROM trades"
-        " UNION ALL SELECT MIN(date_time) FROM cash_transactions)"
-    ).fetchone()
-    first = str(row[0] or "")[:7]
+    first = (first_activity(conn) or "")[:7]
     if len(first) != 7:
         return []
     y, m = int(first[:4]), int(first[5:7])

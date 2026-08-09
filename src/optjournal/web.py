@@ -49,7 +49,7 @@ import urllib.parse
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -98,6 +98,7 @@ from optjournal.serialize import (
     costs_data,
     history_data,
     jobs_data,
+    logbook_data,
     market_data,
     orders_data,
     positions_data,
@@ -630,6 +631,12 @@ def build_state(
             # while three jobs reported `ok`. 2.95 ms measured on the real
             # journal, against a payload that already issues ~142 statements.
             "audit": audit_data(conn, now=datetime.now(UTC)),
+            # The header's dateline. Deliberately outside `stats`/`all_time`:
+            # how long the log has been kept is a fact about the JOURNAL, not
+            # about a selected month or a trade-type scope, and a header figure
+            # that moved with a filter the header does not display is the same
+            # defect the Annual total was fixed for.
+            "logbook": logbook_data(conn, today=date.today()),
         }
         # How many POSITIONS the open contracts form, which needs the lifecycle
         # grouping and so cannot be computed inside month_stats. Set on both

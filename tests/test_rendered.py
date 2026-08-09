@@ -99,3 +99,28 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     # The stat-card grid actually populated.
     assert "Trades" in text
     assert "Commissions" in text
+
+    # The header dateline, which SHIPS EMPTY in the markup and is filled by JS.
+    # That is precisely the shape source analysis cannot check: a renderKicker
+    # that never runs, or throws, leaves the page's most prominent small line
+    # blank and every other assertion here still passes. Oracle-driven from the
+    # payload the page itself fetched.
+    kicker = re.search(r'<div class="kicker" id="kicker">(.*?)</div>', dom, re.S)
+    assert kicker, "the kicker slot is gone from the header"
+    line = kicker.group(1).strip()
+    assert line, "the kicker rendered EMPTY -- nothing filled the slot"
+    day = payload["logbook"]["day"]
+    assert day, "the demo journal has no first activity, so this proves nothing"
+    assert f"Log day {day}" in line, (
+        f"the header says {line!r}, which does not carry the payload's day {day}"
+    )
+    # The open book, named by UNDERLYING. A count here would contradict the
+    # Positions tab for a multi-leg position, which is why the line names symbols.
+    names = {p["underlying_symbol"] or p["symbol"] for p in payload["positions"]}
+    if names:
+        assert "carrying" in line.lower(), f"{line!r} omits the open book"
+        assert any(n in line for n in names), (
+            f"the header names none of the open underlyings {sorted(names)}"
+        )
+    else:
+        assert "flat" in line.lower(), f"{line!r} does not say the book is flat"

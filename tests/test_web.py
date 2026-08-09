@@ -346,6 +346,11 @@ def _shape_samples(state: dict) -> dict[str, dict]:
             row["last_run"] for row in state["scheduler"]["jobs"] if row["last_run"]
         ]),
         "Audit": state["audit"],
+        # The header dateline. Anchored to the real payload rather than exempted,
+        # even though it is two keys: the page slices `opened` apart to format a
+        # date, so a rename there renders the header's most prominent line wrong
+        # rather than merely blank.
+        "Logbook": state["logbook"],
         "FxBlock": state["fx"],
         "FxQuote": first(state["fx"]["quotes"]),
         "OdteBlock": state["odte"],
@@ -536,6 +541,41 @@ def test_month_range_spans_account_life_and_contains_months(state):
         if m == 0:
             y, m = y - 1, 12
         assert older == f"{y:04d}-{m:02d}", f"gap between {newer} and {older}"
+
+
+def test_the_browsable_range_survives_a_compact_ibkr_date(conn):
+    """A journal whose earliest row is stored compact browses from the right month.
+
+    `trades.trade_date` mixes ISO `2025-01-14 14:30:05` with IBKR's compact
+    `20250114`. `month_range` used to slice the raw value to seven characters,
+    which turns the compact form into `2025011` -- and that is the trap, because
+    it does NOT fail the length check. It parses as month ELEVEN, so an account
+    whose first fill was in January silently began browsing in November, and the
+    calendar walked ten months the account never lived. Measured on the old
+    implementation, which returned `2025-11` as its oldest month.
+
+    Both readings now go through `_day_of`, shared with `logbook_data` so the
+    header counts days from the same instant the calendar starts at, and the
+    stored form cannot change either answer.
+    """
+    columns = ["broker", "trade_id", "ib_exec_id", "transaction_id", "account_id",
+               "trade_date", "asset_category", "symbol", "quantity", "currency",
+               "fx_rate_to_base", "raw", "source_file", "first_seen_at"]
+    values = ["IBKR", "t1", "e1", "x1", "U1", "20250114", "OPT", "SPY", 1,
+              "USD", 1.0, "{}", "f.xml", "2025-01-14T00:00:00Z"]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        f"INSERT INTO trades ({','.join(columns)})"  # noqa: S608 - fixed names
+        f" VALUES ({','.join('?' * len(columns))})",
+        values,
+    )
+    conn.commit()
+    from optjournal.stats import first_activity, month_range
+
+    assert first_activity(conn) == "2025-01-14"
+    months = month_range(conn)
+    assert months, "a compact earliest date left the account with no months"
+    assert months[-1] == "2025-01"
 
 
 def test_a_fill_free_month_is_an_honest_zero_not_all_time(populated):
@@ -1633,7 +1673,63 @@ def test_build_state_survives_an_empty_database(tmp_path):
     state = build_state(db_path=db, archive_dir=tmp_path, query_id=None)
     assert state["positions"] == []
     assert state["costs"] == []
+    # A journal where nothing has happened has no first day, so there is no day
+    # to be the Nth of. Null rather than 1: the header drops the dateline
+    # entirely, which is honest, where "log day 1" would date a log that was
+    # never opened.
+    assert state["logbook"] == {"opened": None, "day": None}
     json.dumps(state)
+
+
+def test_the_logbook_dates_from_first_activity_counting_inclusively(populated):
+    """The header's dateline, against the real archive.
+
+    Two things are worth pinning. The opening day is day ONE, not day zero -- a
+    log's first page is page one, and an off-by-one here is visible on the page's
+    most prominent small line. And `opened` is normalised to ISO, because the
+    stored columns mix `2025-01-14 14:30:05` with IBKR's compact `20250114` and
+    the page slices it apart to format the date.
+    """
+    from datetime import date, timedelta
+
+    from optjournal.serialize import logbook_data
+
+    conn = connect(populated)
+    try:
+        opened = logbook_data(conn, today=date(2030, 1, 1))["opened"]
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", opened or ""), (
+            f"opened is not an ISO day: {opened!r} -- the page splits it on '-' "
+            f"to format the dateline, so a compact IBKR date renders as nonsense"
+        )
+        start = date.fromisoformat(opened)
+        # Read on its own opening day, the log is on day 1.
+        assert logbook_data(conn, today=start)["day"] == 1
+        assert logbook_data(conn, today=start + timedelta(days=1))["day"] == 2
+        # And a clock BEHIND the archive cannot produce day 0 or a negative day.
+        # Not hypothetical: statements carry exchange-local timestamps, so a
+        # reader west of the exchange can hold a fill dated tomorrow.
+        assert logbook_data(conn, today=start - timedelta(days=5))["day"] == 1
+    finally:
+        conn.close()
+
+
+def test_the_logbook_ignores_both_filters(populated, tmp_path):
+    """How long the log has been kept is a fact about the JOURNAL.
+
+    The header displays no filter bar, and a figure that moves with a control its
+    own surface does not show leaves the reader nothing to explain the change
+    with -- the defect the Annual total row was fixed for. So the dateline must be
+    identical under a month selection and under a trade-type scope.
+    """
+    plain = build_state(db_path=populated, archive_dir=tmp_path, query_id=None)
+    scoped = build_state(
+        db_path=populated, archive_dir=tmp_path, query_id=None,
+        month=plain["month_range"][0], trade_type="odte",
+    )
+    assert plain["logbook"] == scoped["logbook"], (
+        "the header dateline moved with a filter the header does not display"
+    )
+    assert plain["logbook"]["day"] >= 1
 
 
 def test_fx_offers_the_base_and_at_least_one_quote(state):
@@ -2869,23 +2965,57 @@ def test_an_empty_loss_population_reads_as_a_fact_not_a_missing_number():
     )
 
 
-def test_the_kicker_does_not_merely_translate_the_title():
-    """`Cuaderno de Bitácora` above a title reading `Bitácora` spent the page's
-    most prominent small slot restating the next line. The kicker now names what
-    the journal is made of, in the vocabulary its own tabs use.
+def test_the_kicker_carries_no_hardcoded_line():
+    """The header's most prominent small slot must say something only THIS
+    journal can say, and two static strings failed that in turn.
+
+    `Cuaderno de Bitácora` restated the title directly beneath it. `Strikes ·
+    Fills · Round trips` then named the journal's contents -- true, but identical
+    for every reader on every load, and already said by the tab strip two lines
+    down. It is now a dateline computed from the payload (`serialize.logbook_data`
+    plus the open book), so the assertion is that the slot ships EMPTY: any text
+    baked in here is either a placeholder that flashes before the real line, or a
+    regression to a fixed string.
     """
-    # The rendered element, not the whole file: the comment beside it names the
-    # rejected string on purpose, to say why it was rejected.
-    match = re.search(r'<div class="kicker">([^<]*)</div>', page_html())
-    assert match, "the header kicker is gone"
-    kicker = match.group(1).strip()
-    assert kicker == "Strikes · Fills · Round trips", (
-        f"unexpected kicker {kicker!r}"
+    # The rendered element, not the whole file: the comment beside it names both
+    # rejected strings on purpose, to say why each was rejected.
+    match = re.search(r'<div class="kicker" id="kicker">([^<]*)</div>', page_html())
+    assert match, "the header kicker slot is gone"
+    assert not match.group(1).strip(), (
+        f"the kicker ships with hardcoded text {match.group(1)!r}; it is filled "
+        f"from the payload, and baked-in text either flashes before the real "
+        f"line or is a fixed string nobody reads twice"
     )
-    title = re.search(r'<div class="title">([^<]*)', page_html()).group(1).strip()
-    assert title.lower() not in kicker.lower(), (
-        f"the kicker {kicker!r} restates the title {title!r}, which spends the "
-        f"page's most prominent small slot saying the next line over again"
+    body = code_only(page_html()).replace(" ", "")
+    assert "renderKicker()" in body, (
+        "nothing fills the kicker slot, so the header's top line renders blank"
+    )
+
+
+def test_the_kicker_names_underlyings_rather_than_counting_contracts():
+    """A count here would contradict the Positions tab.
+
+    An episode is per CONTRACT, so a strangle is two of them against one card on
+    Positions -- the disagreement `strategies.open_position_count` exists to end.
+    The header sidesteps it by naming UNDERLYINGS: two legs on GOOG are one GOOG
+    however they are grouped. This pins that it reads `underlying_symbol` from
+    the same snapshot rows that tab renders, and that it de-duplicates them.
+    """
+    body = code_only(page_html())
+    line = re.search(r"function logbookLine\(\)\{(.*?)\n\}", body, re.S)
+    assert line, "logbookLine is gone"
+    src = line.group(1)
+    assert "underlying_symbol" in src, (
+        "the kicker no longer names underlyings, so a two-leg strangle can read "
+        "as two positions and disagree with the Positions tab"
+    )
+    assert "new Set(" in src, (
+        "the names are no longer de-duplicated, so both legs of a strangle print "
+        "the same symbol twice"
+    )
+    assert "state.positions" in src.replace("st.", "state."), (
+        "the names come from somewhere other than the snapshot rows the "
+        "Positions tab renders, so the two surfaces can drift"
     )
 
 
