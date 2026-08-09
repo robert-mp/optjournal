@@ -73,12 +73,24 @@ from pathlib import Path
 
 from mesh_claw.cron_script import Report, Skip
 
-PROJECT = Path.home() / ".meshclaw" / "workspace" / "optjournal"
+#: Moved out of ~/.meshclaw/workspace by SCHEDULER_PLAN.md step 2: the journal
+#: should not live inside the directory of the tool being retired.
+PROJECT = Path.home() / "optjournal"
 CLI = PROJECT / ".venv" / "bin" / "optjournal"
 
-#: The workspace repo is the backup home for raw statements; the project repo
-#: deliberately excludes them (they carry the account number and belong in a
-#: backup, not next to source that might grow a remote).
+#: The workspace repo WAS the backup home for raw statements, and the move broke
+#: it: it still tracks nine XMLs at `optjournal/raw/`, which are now somewhere
+#: else, so `git status` there shows nine deletions. The history still holds those
+#: files, so nothing is lost -- but this backup cannot take a new statement, and
+#: `_commit_raw_backup` below will fail against it.
+#:
+#: NOT repointed, deliberately. SCHEDULER_PLAN.md cuts this backup entirely: the
+#: daily Flex query is `Last30CalendarDays` and two archived statements are
+#: full-year pulls, so every row in `raw/` is refetchable from IBKR, and the data
+#: that genuinely cannot be recovered (1,816 price_bars rows, 329 of them hourly
+#: option bars) was never in `raw/` for this to protect. It is replaced by a
+#: `VACUUM INTO` on the shared sync path. Repointing it here would spend effort
+#: preserving the cheapest artefact in the project.
 WORKSPACE = Path.home() / ".meshclaw" / "workspace"
 RAW_DIR = PROJECT / "raw"
 

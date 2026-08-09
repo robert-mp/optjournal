@@ -282,10 +282,45 @@ condition does not cover a missing column, and `_ADDED_COLUMNS` spans six tables
 
 </details>
 
-### Step 2 — Move the app out of `~/.meshclaw/workspace`
+### Step 2 — Move the app out of `~/.meshclaw/workspace` — **DONE**
 
 **Small, reversible, and it must precede step 7 so the launchd plist is written
 once against the final path.**
+
+**What actually happened, because two things differed from the plan.**
+
+**`uv sync` was NOT enough.** The plan said regenerating the `.pth` would do it, and
+it did rewrite the path correctly -- `uv run python -c "import optjournal"` worked.
+But `uv run pytest` still raised `ModuleNotFoundError: No module named 'optjournal'`
+while `.venv/bin/python -m pytest` passed 15/15 on the same tree. Neither
+`uv sync`, nor `uv sync --reinstall-package optjournal`, nor appending the missing
+trailing newline to the `.pth` fixed it. `rm -rf .venv && uv sync` did. So a venv
+CREATED at the old path carries state that survives a resync, and the honest
+instruction is REBUILD it rather than repoint it. Recorded as observed behaviour
+rather than diagnosed further: the fix is cheap and the failure is loud. Side effect
+worth knowing -- the rebuild installed pytest 8.4.2, which is what `uv.lock` pins;
+the old venv had drifted to 9.0.2.
+
+**The workspace backup repo is now broken, and that is accepted.**
+`~/.meshclaw/workspace` is still a git repo tracking nine XMLs at
+`optjournal/raw/`, and those files moved out from under it, so `git status` there
+shows nine deletions. The history still holds them, so nothing is lost -- but it
+cannot back up a new statement. NOT repointed, deliberately: see
+[Revisions](#revisions-after-review). Every row in `raw/` is refetchable from a
+`Last30CalendarDays` query, and the data that genuinely cannot be recovered was
+never in `raw/` for this to protect. `cron/optjournal_sync.py` records that in
+place, where the next reader of `WORKSPACE` will find it.
+
+Also removed the three git worktrees first (`delta-holding-only`, `rebrand-logo`,
+`replay-event-cards`) -- all merged into main with nothing ahead and one stray
+screenshot between them. Their `.git` files hold absolute gitdir paths, so a move
+would have broken all three; `git worktree repair` exists, but repairing worktrees
+whose work is already merged is effort spent on nothing.
+
+Verified: `config.ROOT` reports `/Users/robrtmar/optjournal`, schema still v8, every
+row count unchanged and the trades content hash identical (`c70a06e6c8f281a4`), 10
+XMLs present, 803 tests pass, ruff clean, and all three MeshClaw shims load and
+resolve their `IMPL` to the new path.
 
 **What changes.** `mv ~/.meshclaw/workspace/optjournal ~/optjournal`, then
 `uv sync` to regenerate the editable-install `.pth` (which pins an absolute path).

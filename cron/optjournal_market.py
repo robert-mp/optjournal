@@ -62,7 +62,9 @@ from pathlib import Path
 
 from mesh_claw.cron_script import Report, Skip
 
-PROJECT = Path.home() / ".meshclaw" / "workspace" / "optjournal"
+#: Moved out of ~/.meshclaw/workspace by SCHEDULER_PLAN.md step 2: the journal
+#: should not live inside the directory of the tool being retired.
+PROJECT = Path.home() / "optjournal"
 CLI = PROJECT / ".venv" / "bin" / "optjournal"
 
 #: Mirrors optjournal.cli. Explicit so a CLI change that renumbers exit codes
