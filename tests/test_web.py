@@ -331,6 +331,14 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         # journal where no job has ever run -- which is every fresh journal, and
         # would quietly exempt the shape.
         "JobRow": first(state["scheduler"]["jobs"]),
+        # The nested ledger row. Anchored to a REAL run rather than exempted,
+        # because the strip reads four of its keys and an untyped `Object` (what
+        # `last_run` was) exempts every one of them -- so a rename in `job_runs`
+        # would blank the cells silently. The fixture's job_state row has a
+        # matching job_runs row for exactly this.
+        "JobRun": first([
+            row["last_run"] for row in state["scheduler"]["jobs"] if row["last_run"]
+        ]),
         "Audit": state["audit"],
         "FxBlock": state["fx"],
         "FxQuote": first(state["fx"]["quotes"]),
@@ -2848,4 +2856,152 @@ def test_the_kicker_does_not_merely_translate_the_title():
     assert title.lower() not in kicker.lower(), (
         f"the kicker {kicker!r} restates the title {title!r}, which spends the "
         f"page's most prominent small slot saying the next line over again"
+    )
+
+
+# --------------------------------------------------------------------------
+# The collection strip (SCHEDULER_PLAN.md step 4c).
+#
+# The one panel whose job is to say whether this journal is still being fed.
+# Every assertion here exists because the FIRST version of this surface -- the
+# MeshClaw crons -- answered that question wrongly for two days: `last_status`
+# read `ok` for bars-live, bars-daily and bars-audit while `price_bars` gained
+# nothing. So the tests are about which signal the page reads, not about layout.
+# --------------------------------------------------------------------------
+
+
+def test_the_collection_strip_reads_witnesses_and_blackout_never_ok():
+    """`audit.ok` IS GREEN IN A TOTAL BLACKOUT, and the page must not show it.
+
+    `ok` is `not market_traded or not missing`, and `market_traded` is answered by
+    "does any underlying have hourly bars that day" -- an oracle that fails the
+    same way as the thing it certifies. Reproduced on three copies of the real
+    journal: delete every hourly bar, as a fully dead collector would, and `ok`
+    goes green because "no bars for anyone" reads as a holiday.
+
+    So this pins the NEGATIVE too. A reader of the payload would reasonably reach
+    for `au.ok` -- it is right there, it is a boolean, and it is named for exactly
+    this question. That is what makes it worth a test rather than a comment.
+    """
+    strip = _fn("collection")
+    assert "au.witnesses" in strip and "au.blackout" in strip, (
+        "the strip no longer reads the two fields that survive a blackout"
+    )
+    assert "au.ok" not in strip, (
+        "the strip is reading audit.ok, which is GREEN in a total collection "
+        "blackout -- read witnesses/blackout instead (serialize.audit_data says why)"
+    )
+
+
+def test_a_journal_that_never_collected_is_not_shown_as_a_failure():
+    """Two absences that look identical in the payload and need opposite responses.
+
+    `ever_ran:false` (no scheduler has written a heartbeat here) and
+    `ever_collected:false` (no bar has ever been stored) are the NORMAL state of a
+    CLI-driven journal, and the demo journal is in both. Tinting either red would
+    make the page cry wolf on a first run, which is the noise that teaches a reader
+    to ignore the panel -- and then it cannot do its job when something is really
+    wrong.
+
+    Verified in a browser at both states: `bars none collected` and `scheduler not
+    running` render with no tinted `<b>` at all, while `stale` and `blackout`
+    render rgb(240,137,154).
+    """
+    strip = _fn("collection").replace(" ", "").replace("\n", "")
+    assert "!au.ever_collected" in strip, (
+        "the strip no longer distinguishes a journal that never collected from a "
+        "collector that died -- measured identical in the payload without it"
+    )
+    assert "!sc.ever_ran" in strip, "the never-scheduled case is gone"
+    # The untinted branches come FIRST, so a red one cannot shadow them.
+    never_bars = strip.index("!au.ever_collected")
+    blackout = strip.index("au.blackout?")
+    assert never_bars < blackout, (
+        "the blackout branch is evaluated before the never-collected one, so a "
+        "fresh journal shows a red alarm for bars it never had"
+    )
+    # And neither untinted branch may carry a tint class. Matched on the ELEMENT
+    # in the raw source rather than searched for in a window of the space-stripped
+    # text: stripping turns `<b class="neg">` into `<bclass="neg">`, so the first
+    # version of this assertion could not have matched whatever the code said --
+    # and the ablation proved it, passing with the pill tinted red.
+    raw = _fn("collection")
+    for label in ("none collected", "not running"):
+        element = re.search(rf"<b([^>]*)>{re.escape(label)}</b>", raw)
+        assert element, f"the {label!r} pill is gone from the strip"
+        assert "class" not in element.group(1), (
+            f"the {label!r} pill carries {element.group(1).strip()!r}, tinting it "
+            "as a failure -- it is the normal state of a CLI-driven journal"
+        )
+
+
+def test_the_job_status_word_is_rendered_not_collapsed_to_a_colour():
+    """`ok` and `nothing` are BOTH healthy and must stay distinguishable.
+
+    A run that fetched no bars is not a success and not a failure -- outside the
+    session it is the normal outcome six times in seven. Collapsing the two is
+    precisely what let three cron jobs report health while collecting nothing, so
+    the status travels as a word. A hue can then add emphasis; it cannot be the
+    only carrier, because it cannot say WHICH healthy outcome this was.
+    """
+    strip = _fn("collection")
+    # NOT space-stripped, unlike most pins in this file: the fallback string holds
+    # a space, and stripping turns `'never run'` into `'neverrun'`, so the
+    # assertion could never match whatever the code said.
+    assert "esc(j.last_status||'never run')" in strip, (
+        "the status word is gone, so the row carries only a colour"
+    )
+    # `nothing` must not be tinted as either success or failure.
+    tint = re.search(r"const tint=(.*?);", strip.replace("\n", " "), re.S)
+    assert tint, "the row's tint expression is gone"
+    assert "'nothing'" not in tint.group(1), (
+        "`nothing` is being tinted, which makes an empty run look like an "
+        "outcome rather than the normal state it is outside the session"
+    )
+
+
+def test_the_strip_is_read_only_until_the_runner_exists():
+    """No trigger, no form, no POST. Step 5 adds the runner; this is step 4c.
+
+    Worth pinning rather than trusting: the page already has three write paths
+    (sync, market fetch, watchlist), so adding a fourth here is one copied line --
+    and a button that posts to an endpoint the server does not implement fails
+    silently in the console, on the one panel whose purpose is to be trusted.
+    """
+    strip = _fn("collection")
+    for forbidden in ("<button", "<form", "<input", "fetch(", "data-job"):
+        assert forbidden not in strip, (
+            f"the collection strip contains {forbidden!r}, but it is read-only "
+            "until jobs.py grows a runner (SCHEDULER_PLAN.md step 5)"
+        )
+
+
+def test_the_strip_survives_a_payload_without_a_scheduler_block():
+    """An older server, or a build_state that raised past those two keys.
+
+    The panel is appended to the dashboard, which every other tab's data shares --
+    so an exception here does not blank one card, it blanks the whole view. Two
+    guarded reads are cheaper than that.
+    """
+    strip = _fn("collection").replace(" ", "").replace("\n", "")
+    assert "if(!sc||!au)return''" in strip, (
+        "the strip no longer guards a missing scheduler/audit block, so a payload "
+        "without them throws and takes the entire dashboard down with it"
+    )
+
+
+def test_the_age_wording_matches_the_other_freshness_readout():
+    """Two clocks on one page must not describe time differently.
+
+    `quoteNote()` already says "just now" / "3m ago" / "5h ago" for quote age. A
+    second vocabulary for heartbeat age would make the reader learn two, and the
+    difference would read as significant when it is not.
+    """
+    ago = _fn("ago")
+    quote = _fn("quoteNote")
+    for phrase in ("just now", "m ago", "h ago"):
+        assert phrase in ago, f"ago() lost the {phrase!r} wording"
+        assert phrase in quote, f"quoteNote() no longer says {phrase!r}"
+    assert "'never'" in ago.replace('"', "'"), (
+        "a null age must read as `never`, not as `NaN ago`"
     )

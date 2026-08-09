@@ -731,6 +731,16 @@ def audit_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
     * `blackout` -- no underlying traded across `last_traded_day`'s whole 10-day
       lookback. Nine US market holidays a year do not fall in a ten-day row, so
       this cannot be a quiet December: it means collection itself has stopped.
+    * `ever_collected` -- whether this journal holds ANY bar at all. Without it
+      `blackout` cannot tell "collection stopped" from "collection never started",
+      and those need opposite responses. MEASURED, not assumed: with `price_bars`
+      emptied out of a copy of the real journal and again on a fresh one, the two
+      payloads were byte-identical (`market_traded` False, `witnesses` 0,
+      `blackout` True, `ok` True). So the demo journal, and any journal before its
+      first `optjournal bars`, rendered a red collection alarm for the absence of
+      a thing that had never been there. Exactly the distinction the heartbeat
+      already draws with `ever_ran`, which is what makes its omission here an
+      oversight rather than a judgement.
 
     `ok` is kept, unchanged, because `optjournal bars --audit` and the cron's
     delivery policy both key on it and this is not the commit to move that.
@@ -739,6 +749,9 @@ def audit_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
     # `day` is None only when last_traded_day found no session in ten days, which
     # is the blackout: the audit could not even choose a day to examine.
     blackout = not audit.market_traded and not audit.covered and not audit.missing
+    # LIMIT 1, not COUNT(*): the question is existence, and price_bars holds
+    # thousands of rows on a working journal.
+    ever = conn.execute("SELECT 1 FROM price_bars LIMIT 1").fetchone() is not None
     return {
         "day": audit.day,
         "market_traded": audit.market_traded,
@@ -748,5 +761,10 @@ def audit_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
         #: What the check actually looked at. Zero means it proved nothing.
         "witnesses": len(audit.covered) + len(audit.missing),
         #: Nothing traded anywhere in the lookback -- not a holiday, a dead poll.
+        #: Read WITH `ever_collected`: a blackout on a journal that never collected
+        #: is not a fault, and the page must not tint it as one.
         "blackout": blackout,
+        #: Whether any bar has ever been stored here. Distinguishes a stopped
+        #: collector from one that was never started.
+        "ever_collected": ever,
     }

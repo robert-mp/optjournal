@@ -317,3 +317,53 @@ def test_witnesses_counts_what_was_examined_not_what_passed(conn):
 
     data = audit_data(conn, now=datetime(2026, 8, 10, 12, tzinfo=UTC))
     assert data["witnesses"] == len(data["covered"]) + len(data["missing"])
+
+
+def test_a_journal_that_never_collected_is_not_a_stopped_collector(conn, populated_db):
+    """The second hole in the blackout signal, and it made the page cry wolf.
+
+    `blackout` says "nothing traded in the whole ten-day lookback", which on a
+    working journal means the collector died. On a journal that has NEVER stored a
+    bar it means nothing at all -- and the two produce identical payloads. Measured
+    rather than reasoned about: `price_bars` emptied out of a copy of the real
+    journal, versus a fresh journal, gave byte-identical results.
+
+        collection STOPPED   market_traded=False  witnesses=0  blackout=True
+        NEVER collected      market_traded=False  witnesses=0  blackout=True
+
+    So the demo journal -- and any real journal before its first `optjournal bars`
+    -- rendered a red collection alarm for the absence of something that was never
+    there. `ever_collected` separates them, exactly as `Scheduler.ever_ran`
+    separates "the loop is dead" from "no loop has ever run here". That the
+    heartbeat already drew this distinction is what makes its absence here an
+    oversight rather than a decision.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.db import connect
+    from optjournal.serialize import audit_data
+
+    now = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    fresh = audit_data(conn, now=now)
+    assert fresh["blackout"] is True, "premise: an empty journal reads as a blackout"
+    assert fresh["ever_collected"] is False, (
+        "a journal with no bars at all must not look like a stopped collector"
+    )
+
+    # The other direction, on the real archive: a stored bar flips it, and it stays
+    # flipped for a bar that is far too old to help the audit -- the field answers
+    # "has this ever worked", not "is it working now", which is what makes it safe
+    # to gate an alarm on.
+    other = connect(populated_db)
+    other.execute(
+        "INSERT OR REPLACE INTO price_bars (conid, symbol, bar_size, ts, close,"
+        " source, fetched_at) VALUES ('1','X','1h',946684800,1.0,'yahoo','2000-01-01')")
+    other.commit()
+    aged = audit_data(other, now=now)
+    assert aged["ever_collected"] is True, (
+        "a bar exists, so this journal has demonstrably collected before"
+    )
+    assert aged["blackout"] is True, (
+        "and the blackout still stands -- the two fields answer different questions"
+    )
+    other.close()

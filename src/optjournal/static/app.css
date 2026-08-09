@@ -352,6 +352,42 @@ td.n,th.n{text-align:right}
 .mkfig{font-size:11.5px;margin-top:4px}
 .mkattr{font-size:11px;margin-top:14px}
 .wnote{font-size:10.5px;margin-top:2px}
+
+/* ---- collection health (the Jobs strip) ----
+   One row per registered job. GRID, not flex, and the columns are fixed rather
+   than content-sized on purpose: a job whose detail is "3 windows" and one whose
+   detail is "0 bar(s), 4 empty" must put their status in the same place, or the
+   eye cannot scan the column that matters. `1fr` on the detail is what absorbs
+   the difference.
+   `min-width:0` on the detail cell lets it shrink below its content and ellipse;
+   a grid item defaults to min-content, which would otherwise widen the whole
+   row and push the timestamp off.
+
+   The separator is `.jrow+.jrow`, NOT `border-top` plus `.jrow:first-child{border-
+   top:0}`. That was the first attempt and it was DEAD: the first `.jrow` is not the
+   card's first child -- the header `.crow` is -- so `:first-child` matched nothing
+   and the strip wore a rule above its top row. Measured in the browser
+   (`borderTopWidth` 1px on row one, where it should have been 0), which is the
+   third rule of this exact shape found today. A sibling combinator states the
+   intent directly and cannot be wrong about its position. */
+.jrow{display:grid;grid-template-columns:96px 74px 1fr auto auto;gap:10px;
+  align-items:baseline;padding:8px 2px}
+.jrow+.jrow{border-top:1px solid var(--line)}
+.jname{font-size:12.5px;font-weight:600}
+/* The status word, not a dot: `ok` and `nothing` are both healthy and must stay
+   distinguishable, and a hue cannot say which is which. Untinted by default --
+   `never run` and `nothing` are facts, not alarms. */
+.jstat{font-size:11.5px;font-weight:600;letter-spacing:.02em}
+.jdet{font-size:11.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.jwhen{font-size:11px}
+.pill.neg{border-color:#7c2f2b}
+@media(max-width:760px){
+  /* The timestamp is the first thing to go: on a narrow screen the status and
+     the detail are what answer the question. */
+  .jrow{grid-template-columns:88px 70px 1fr auto}
+  .jwhen{display:none}
+}
 /* Actions inside a card header. Borrowed from .seg's palette rather than given a
    new one, so a Refresh beside a segmented toggle reads as the same family of
    control. `sm` is the only size, kept as a modifier because a bare `.btn` would

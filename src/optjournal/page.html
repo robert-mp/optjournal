@@ -453,7 +453,29 @@ import {
  * @property {string|null} last_status
  * @property {number|null} last_fired_for -- the newest scheduled instant claimed
  * @property {number} consecutive_failures
- * @property {Object|null} last_run -- the newest job_runs row, or null
+ * @property {JobRun|null} last_run -- the newest job_runs row, or null
+ */
+
+/** @typedef {Object} JobRun -- one row of the run ledger (serialize.jobs_data)
+ *
+ *  Typed rather than left as a bare `Object`, which is what it was: the page reads
+ *  four of these keys and an untyped shape exempts every one of them from the
+ *  contract, so a rename in `job_runs` would have blanked the cells silently. That
+ *  is the failure mode this whole contract exists to prevent, so the strip that
+ *  reports on collection health should not be the panel that skips it.
+ * @property {number} id
+ * @property {string} job
+ * @property {number|null} fired_for -- the scheduled instant claimed; null for a
+ *   manual or cron-driven run, which is every run today
+ * @property {string} started_at
+ * @property {string|null} finished_at -- null while a run is still in flight, which
+ *   is why the strip prefers it and falls back to started_at
+ * @property {string} status -- running|ok|nothing|missed|failed|interrupted
+ * @property {string|null} detail
+ * @property {number} done
+ * @property {number} total
+ * @property {string|null} note
+ * @property {number} slept
  */
 
 /** @typedef {Object} Audit -- the perishable-bar check (serialize.audit_data)
@@ -471,7 +493,12 @@ import {
  * @property {number} witnesses -- contracts actually checked. Zero means the audit
  *   proved nothing, which a boolean cannot say
  * @property {boolean} blackout -- nothing traded anywhere in the 10-day lookback.
- *   Nine US holidays a year do not fall in a ten-day row, so this is a dead poll
+ *   Nine US holidays a year do not fall in a ten-day row, so this is a dead poll.
+ *   Only an ALARM when `ever_collected` -- read the two together
+ * @property {boolean} ever_collected -- any bar ever stored here. A blackout on a
+ *   journal that never collected is not a fault, and measured identical without
+ *   this: emptying price_bars out of the real journal and a fresh journal produced
+ *   byte-identical payloads. Same distinction `Scheduler.ever_ran` draws
  */
 
 /** @typedef {Object} Watch -- one watched symbol (serialize.watchlist_data)
@@ -700,6 +727,7 @@ import {
  * @payload mk:Market d:MarketDay mev:MarketEvent
  * @payload w:Watch wo:WatchOption
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
+ * @payload sc:Scheduler j:JobRow run:JobRun au:Audit
  * @local Math S TABS b sel m r el location window qs hs
  * @local cells days buckets evs glegs jrows lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
@@ -707,6 +735,7 @@ import {
  * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen withEvents ws opts thin
  * @local JSON Object ages input mine qb wf behind was
+ * @local when
  */
 
 const $=s=>document.querySelector(s);
@@ -1139,7 +1168,133 @@ function dashboard(){
         >${moneyOf(s.net_pnl)}</div>
     </div>
     ${chart(s.days)}
+  </div>
+  ${collection()}`;
+}
+
+/* ------------------------------------------------ collection health
+ *
+ * WHY THIS IS ON THE DASHBOARD AND NOT A TAB. It answers one question -- "is this
+ * journal still being fed?" -- and the answer is worthless if you have to go
+ * looking for it. The whole failure this surface exists for is a system that
+ * looked fine from the outside: `~/.meshclaw/crons.json` read `last_status: "ok"`
+ * for bars-live, bars-daily AND bars-audit while `price_bars.fetched_at` shows 28
+ * hourly rows written on 08-06, two on 08-07, and nothing after until a human ran
+ * the command by hand. Three jobs green for two days, including the audit job
+ * whose only purpose was to notice.
+ *
+ * READ-ONLY, deliberately. Nothing here schedules or triggers anything; the
+ * runner and the run-now button arrive in step 5. Shipping the status surface
+ * BEFORE the scheduler is the one point all three design reviews agreed on -- a
+ * scheduler without a status surface makes the system quieter AND less
+ * trustworthy in the same change.
+ */
+function collection(){
+  const sc=S.state.scheduler, au=S.state.audit;
+  if(!sc||!au) return '';
+
+  /* THE HEARTBEAT PILL, and its three states are three different situations.
+     `ever_ran:false` is NOT an alarm: no scheduler has ever written a heartbeat
+     here, which is the normal state of a journal driven by the CLI or by a cron,
+     and tinting it red would be the noise this project avoids. Stale IS an alarm.
+     Fresh is fine. `running` already encodes fresh-vs-stale server-side, so the
+     page does not hold its own copy of the 5-minute threshold. */
+  const beat=!sc.ever_ran
+    ? `<span class="pill" title="No scheduler has ever recorded a heartbeat in
+        this journal. Jobs are being run by the CLI or by a cron, which is the
+        current arrangement -- this is not a fault.">scheduler <b>not running</b></span>`
+    : sc.running
+    ? `<span class="pill" title="The tick loop wrote a heartbeat ${
+        ago(sc.heartbeat_age_s)}, within the ${sc.stale_after_s}s freshness
+        window.">scheduler <b class="pos">alive</b> · ${esc(ago(sc.heartbeat_age_s))}</span>`
+    : `<span class="pill" title="The last heartbeat is older than ${
+        sc.stale_after_s}s, so the loop is not ticking. Jobs are NOT running, no
+        matter what the rows below say about their last outcome."
+        >scheduler <b class="neg">stale</b> · ${esc(ago(sc.heartbeat_age_s))}</span>`;
+
+  /* THE AUDIT PILL READS `witnesses` AND `blackout`, NEVER `ok`.
+     `ok` is `not market_traded or not missing`, and `market_traded` is answered
+     by "does any underlying have hourly bars for that day" -- an oracle that
+     fails the same way as the thing it certifies. Reproduced on three copies of
+     the real journal: delete every hourly bar, as a fully dead collector would,
+     and `ok` goes GREEN because "no bars for anyone" reads as a holiday. So the
+     page renders what was actually examined. */
+  const audit=!au.ever_collected
+    /* NOT AN ALARM, and this branch has to come first. A journal that has never
+       stored a bar produces a payload byte-identical to one whose collector died
+       -- measured on a copy of the real journal with `price_bars` emptied -- so
+       without `ever_collected` the demo journal, and every journal before its
+       first `optjournal bars`, showed a red blackout for the absence of something
+       that was never there. Same distinction `ever_ran` draws for the heartbeat. */
+    ? `<span class="pill" title="No price bars have ever been stored in this
+        journal, so there is nothing to audit yet. Run optjournal bars to start
+        collecting -- this is not a fault.">bars <b>none collected</b></span>`
+    : au.blackout
+    ? `<span class="pill" title="No underlying traded anywhere in the last ten
+        days, and this journal HAS collected bars before. Nine US market holidays a
+        year do not fall in a ten-day row, so this is not a quiet December -- bar
+        collection has stopped."
+        >bars <b class="neg">blackout</b></span>`
+    : au.witnesses===0
+    ? `<span class="pill" title="The audit examined no contracts, so it proved
+        nothing either way. Not a failure -- there is simply no open option whose
+        intraday series could have been checked."
+        >bars <b>nothing to check</b></span>`
+    : au.missing.length
+    ? `<span class="pill" title="${au.missing.length} of ${au.witnesses} open
+        contract(s) have no hourly bars for ${esc(au.day)}. An option's intraday
+        series exists only while its own session runs, so this cannot be
+        backfilled later."
+        >bars <b class="neg">${au.missing.length} missed</b> of ${au.witnesses}</span>`
+    : `<span class="pill" title="All ${au.witnesses} open contract(s) have hourly
+        bars for ${esc(au.day)} — the session was captured."
+        >bars <b class="pos">${au.witnesses}/${au.witnesses}</b> · ${esc(au.day)}</span>`;
+
+  /* One row per registered job. `last_status` is rendered as itself rather than
+     collapsed to a colour: `nothing` (a legitimately empty run) and `ok` are both
+     healthy and must stay distinguishable, because conflating them is exactly what
+     let three cron jobs report health while collecting nothing. */
+  const rows=(sc.jobs||[]).map(j=>{
+    const run=j.last_run;
+    const tint=j.last_status==='failed'||j.last_status==='interrupted'?'neg'
+      :j.last_status==='ok'?'pos':'';
+    const detail=run&&run.detail?run.detail:'';
+    /* `finished_at` over `started_at`: for a job that is still running the
+       former is null, and "started 3m ago" is the honest thing to say then. */
+    const when=run?(run.finished_at||run.started_at||''):'';
+    return `<div class="jrow">
+      <span class="jname mono">${esc(j.job)}</span>
+      <span class="jstat ${tint}">${esc(j.last_status||'never run')}</span>
+      <span class="dim jdet">${esc(detail)}</span>
+      <span class="dim2 jwhen mono">${esc(when.slice(0,16).replace('T',' '))}</span>
+      ${j.consecutive_failures>1?`<span class="pill gap neg"
+        title="Consecutive failures since the last healthy run."
+        >×${j.consecutive_failures}</span>`:''}
+    </div>`;
+  }).join('');
+
+  return `<div class="card">
+    <div class="crow"><div><h2>Collection</h2>
+      <div class="sub">Whether this journal is still being fed — and by what.</div></div>
+      <div class="pills">${beat}${audit}</div></div>
+    ${rows||`<div class="empty">no job has recorded a run in this journal yet —
+      today the bars and sync commands are driven by cron, and they write here
+      from now on</div>`}
+    <div class="dim mkattr">a green status means the last run succeeded, which is a
+      different question from whether anything is running at all — the two were
+      conflated for two days while nothing was collected</div>
   </div>`;
+}
+
+/* Seconds, in words. Small enough to inline, and the wording matters: an age with
+   no unit reads as a timestamp. Mirrors the vocabulary quoteNote() uses so two
+   freshness readouts on the same page do not describe time differently. */
+function ago(secs){
+  if(secs==null) return 'never';
+  if(secs<90) return 'just now';
+  if(secs<3600) return Math.round(secs/60)+'m ago';
+  if(secs<48*3600) return Math.round(secs/3600)+'h ago';
+  return Math.round(secs/86400)+'d ago';
 }
 
 /* ------------------------------------------------ chart (inline SVG) */
