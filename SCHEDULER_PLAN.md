@@ -1049,6 +1049,39 @@ construction, which is why it needs a guard rather than care.
 at login that spends IBKR requests on a schedule; that is the user's decision, and
 it is the first move of step 8 rather than a loose end here.
 
+#### FIRST REAL RUN against the live journal, 2026-08-09 21:54 UTC
+
+`serve` restarted onto current code with the scheduler live (heartbeat 6s), and
+`POST /api/jobs/run {"job":"market"}` was pressed by hand:
+
+```
+reply   202 {"ok":true,"kind":"queued","job":"market","run_id":1}
+status  GET ?id=1 -> status ok, detail "73 fetched, 73 stored", done 73, total 73
+data    market_events 99 -> 172, newest fetched_at 2026-08-09T21:54:57+00:00
+ledger  job_runs row 1, fired_for NULL (a manual run claims no instant)
+```
+
+**This is the job that had never run on a schedule anywhere** -- the 143 lines of
+calendar policy whose absence from `crons.json` is the reason the registry became
+code. It has now run once, from the page, with no terminal involved.
+
+Due-ness re-derived from the real ledger afterwards, which is the part worth
+recording because it is what tomorrow depends on:
+
+```
+Sun 22:5x         -> nothing          (empty-ledger rule; a restart cannot surprise)
+Mon 11:05 Dublin  -> market           claims instant 1786356000 = Mon 11:00 +01:00
+Mon 12:05 Dublin  -> market           the SAME instant, so it collapses
+Mon 15:00 ET      -> bars_live, market
+after that claim  -> nothing at 11:05, 12:05; bars_live only at 18:05
+```
+
+So `market` fires once tomorrow at 11:00 and the claim holds for the rest of the
+day. `bars_live` becomes due inside the US session, and `sync`/`bars_daily` stay
+held by the empty-ledger rule until each has one recorded run -- which is the
+parallel-run order the step below prescribes, arrived at by the code rather than by
+remembering to follow it.
+
 ### Step 8 — Retire MeshClaw
 
 Once the in-app ledger shows a full week matching the crons run for run:
