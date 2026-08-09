@@ -796,7 +796,7 @@ justification was always the 600 s tail rather than the common case.
   under test had been `sync`. Stub through the object the server will actually
   consult.
 
-### Step 6 — The reconciler thread
+### Step 6 — The reconciler thread — **DONE**
 
 **What changes.** A `threading.Thread` started by `serve()` unless
 `--no-scheduler`: `while not stop.wait(60): reconcile()`.
@@ -897,6 +897,53 @@ that `bars_live` outside the window records `missed`, not `ok`.
 **What could go wrong.** A wrong zone or a DST edge silently converts "missed,
 unrecoverable" into "ran, ok" — the exact inversion the audit exists to catch,
 which is why the boundary tests are not optional.
+
+#### What step 6 shipped, and the two bugs only RUNNING it found
+
+Commits `c81fe83` (`due_jobs`), `454c8f4` (the thread).
+
+Everything above shipped as written, including both DST boundary tests and the
+empty-ledger rule. Two additions the plan did not name:
+
+**`FAILURE_BACKOFF = 5`.** The plan's due-ness rule ("recorded, not succeeded")
+stops a failed job being retried for its *own* instant, but nothing stopped a job
+whose every instant fails from being started once per instant forever. Five
+consecutive failures now stops the RECONCILER starting it, while leaving it
+runnable by hand from the page — a brake, not a black hole, and the count clears on
+any healthy outcome so recovery needs no restart.
+
+**`tick_failures` beside `ticks`.** A test forced this: the first version counted
+only COMPLETED ticks, so a loop that was alive and failing every tick read as dead
+— 94 raises against a `ticks` of 0. That is `crons.json`'s two green days inverted,
+and the fix is the same one this whole plan applies elsewhere: "is the loop alive"
+and "are its ticks working" are two questions, so they are two counters.
+
+**THE BUG THAT ONLY RUNNING IT COULD FIND, and it is the most instructive thing in
+this step.** `due_jobs` was written `registry: tuple[Job, ...] = JOBS`. A default
+argument is evaluated at DEFINITION time, so the tuple was captured once at import
+and `monkeypatch.setattr(jobs, "JOBS", ...)` never reached the function. **Every
+test that replaced the registry was silently exercising the real one**, and they
+passed because the real schedules happened to agree with what the stubs asserted.
+Green, and measuring something else.
+
+Nothing in a source-reading or unit-level test could see it. It surfaced when the
+actual `Scheduler` ran six ticks against a one-job stub registry and did nothing at
+all. The lesson for step 7 is direct: the plan's step-6 test list was entirely
+about `due_jobs`, a pure function — and the defect was in how the caller reached
+it. **Test the wiring by running the wiring.**
+
+Two of my ablations were also wrong in ways worth recording, because both patterns
+will recur: one was behaviourally identical to the correct code (`registry or JOBS`
+versus `registry is None`), and one asserted "the thread was joined" by checking an
+attribute the ablation cleared anyway. An ablation that cannot fail is worth as
+little as a test that cannot fail.
+
+**Not yet done, and it is the remaining risk in this step:** the parallel-run
+rollout. The reconciler is written and tested but has never run beside MeshClaw
+against the live journal. The plan's own order stands — `market` first (it has never
+run, so it cannot regress anything), then `bars_daily`, then `bars_live`, then
+`sync` last — and disabling each MeshClaw cron one at a time, never in a batch.
+That is step 8's opening move rather than a loose end here.
 
 ### Step 7 — Supervision, logs, and a shutdown that actually works
 
