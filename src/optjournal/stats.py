@@ -19,12 +19,19 @@ is wrong in both cases:
   close date. Premium collected on an open short is therefore never P&L --
   it is a liability until the position closes.
 
-* **Win/loss counts come from episodes, not fills.** A round trip closed by
-  two partial fills is one outcome, not two, so counting fills would inflate
-  both the trade count and the win rate. `total_trades` counts fills because
-  that is what "how many executions" means; the win/loss block counts
-  episodes because that is what "did it work" means. The dashboard labels
-  which is which rather than blurring them.
+* **Win/loss counts come from campaigns, not fills and not episodes.** A round
+  trip closed by two partial fills is one outcome, not two, so counting fills
+  would inflate both the trade count and the win rate. Counting EPISODES
+  inflates them too, one level up: an episode is per contract, so a roll ended
+  one and opened another and scored a single continuing decision as two closed
+  trades and two wins, while a two-conid vertical scored one win plus one loss
+  on a spread that netted +562.33. `campaigns.py` owns that unit and states the
+  evidence. `total_trades` counts fills because that is what "how many
+  executions" means; `closed_episodes` counts contract round trips because that
+  is the money's unit; the win/loss block counts campaigns because that is what
+  "did it work" means. The dashboard labels which is which rather than blurring
+  them, and `wins + losses == decided_campaigns` is the invariant that lets a
+  reader reconcile the three.
 
 Other asset categories keep the per-fill sum: IBKR's per-fill realised P&L
 is the correct realisation rule for share lots (each lot sold is realised,
@@ -274,9 +281,16 @@ class MonthStats:
     #: same charges.
     fees: Money = Money.restated(0.0)
 
-    #: Episode-derived, so a two-fill close counts once.
+    #: Episode-derived, so a two-fill close counts once. Still the MONEY's unit:
+    #: `net_pnl` and `commissions` are attributed by the episode's close date.
     closed_episodes: int = 0
     open_episodes: int = 0
+    #: Campaigns decided in the period: the scoreboard's unit, and the headline
+    #: trade count. Always equals `wins + losses`, which is what lets a reader
+    #: reconcile it against `closed_episodes` -- the two differ exactly when a
+    #: roll carried a decision across the period boundary, or is still in
+    #: flight. See `campaigns.py` for why this is not the episode count.
+    decided_campaigns: int = 0
     wins: int = 0
     losses: int = 0
     #: None -- not zero -- when nothing won or lost: an average of no outcomes
@@ -531,27 +545,54 @@ def available_years(
     return sorted(years, reverse=True)
 
 
+def _campaign_pnl(campaign: list[Any]) -> Money:
+    """One campaign's realised outcome: the SUM of its episodes.
+
+    A sum, not the final episode, which is the whole reason the campaign unit
+    exists. Roll a short put that is down 1200 and scratch the last leg at +50
+    and this reads -1150; the last leg alone would read +50 and score a win.
+    """
+    return Money.charged(
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in campaign
+    )
+
+
 def _period_stats(
     conn: sqlite3.Connection,
     periods: list[str],
     *,
     asset_category: str | None,
     base_currency: str,
+    report: Any = None,
+    campaigns: list[Any] | None = None,
 ) -> list[MonthStats]:
     """`month_stats` over several periods, sharing one episode history pass.
 
     The Annual tab asks for every month, every year and an all-time row at
     once. Each `month_stats` call otherwise rebuilds the whole episode history,
     so a thirteen-month archive did that fifteen times per page load for
-    identical results.
+    identical results. `campaigns` rides along for the same reason: it is
+    derived from that one report, so building it per period would repeat the
+    linkage fifteen times too.
+
+    `report` and `campaigns` travel together or not at all: a campaign holds
+    INDICES into its report's episode list, so pairing them with a different
+    report would silently read the wrong episodes. Enforced rather than
+    documented, because the failure is quiet.
     """
-    report = build_history(
-        conn, asset_category=asset_category, base_currency=base_currency
-    )
+    if campaigns is not None and report is None:
+        raise ValueError(
+            "campaigns index into a specific report's episodes, so pass the "
+            "report they were built from or neither"
+        )
+    if report is None:
+        report = build_history(
+            conn, asset_category=asset_category, base_currency=base_currency
+        )
     return [
         month_stats(
             conn, period, asset_category=asset_category,
-            base_currency=base_currency, report=report,
+            base_currency=base_currency, report=report, campaigns=campaigns,
         )
         for period in periods
     ]
@@ -562,6 +603,8 @@ def annual_stats(
     *,
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
+    report: Any = None,
+    campaigns: list[Any] | None = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar year, newest first.
 
@@ -579,6 +622,7 @@ def annual_stats(
     return _period_stats(
         conn, available_years(conn, asset_category),
         asset_category=asset_category, base_currency=base_currency,
+        report=report, campaigns=campaigns,
     )
 
 
@@ -587,6 +631,8 @@ def monthly_stats(
     *,
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
+    report: Any = None,
+    campaigns: list[Any] | None = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar month, newest first.
 
@@ -600,6 +646,7 @@ def monthly_stats(
     return _period_stats(
         conn, available_months(conn, asset_category),
         asset_category=asset_category, base_currency=base_currency,
+        report=report, campaigns=campaigns,
     )
 
 
@@ -793,6 +840,7 @@ def month_stats(
     base_currency: str = "EUR",
     scope: TradeScope = ALL_TRADES,
     report: Any = None,
+    campaigns: list[Any] | None = None,
 ) -> MonthStats:
     """Statistics for one period, or for everything when `period` is None.
 
@@ -804,6 +852,13 @@ def month_stats(
     lets a caller building many periods reuse one `build_history` pass -- the
     Annual tab asks for a dozen months, two years and an all-time row on every
     page load, and rebuilding the episode history for each was the whole cost.
+
+    `campaigns` is `campaigns.link`'s output over `report.episodes`, and it is
+    what the win/loss block counts. Passed in rather than built here because
+    building it needs the ORDERS, which `serialize.py` reads and which imports
+    this module: the composing layer hands both down. Omit it and each closed
+    episode stands alone, which is the pre-campaign reading and is wrong for a
+    roll -- see the counting block.
     """
     stats = MonthStats(
         month=period or "ALL",
@@ -866,6 +921,11 @@ def month_stats(
         fee_rows.append((row["amount_base"], row["amount"], row["currency"]))
     stats.fees = Money.charged(fee_rows)
 
+    if campaigns is not None and report is None:
+        raise ValueError(
+            "campaigns index into a specific report's episodes, so pass the "
+            "report they were built from or neither"
+        )
     if report is None:
         report = build_history(
             conn, asset_category=asset_category, base_currency=base_currency
@@ -911,17 +971,43 @@ def month_stats(
         (e.proceeds_base, e.proceeds, e.currency)
         for e in report.open if scope.has_episode(e)
     )
-    wins = [e for e in closed if e.realized_pnl_base > 0]
-    losses = [e for e in closed if e.realized_pnl_base < 0]
-    stats.wins, stats.losses = len(wins), len(losses)
+    # The scoreboard's unit is the CAMPAIGN, not the episode. A roll is one
+    # continuing decision, so it is decided only when every episode in it is
+    # closed, and its outcome is the SUM of them: counting only the final leg
+    # would let any loser be rolled out and scratched into a win. Attributed to
+    # the period its LAST episode closed, while the money above stays split by
+    # episode across months -- which is why `wins + losses` need not equal
+    # `closed_episodes`, and why the page shows both.
+    #
+    # `campaigns=None` means the caller has none to offer, and then each closed
+    # episode stands alone. That is the degenerate grouping rather than a second
+    # rule, and it is the same fallback `open_position_count` always stated: the
+    # episode itself, where no grouping exists.
+    units: list[list[Any]] = (
+        [[report.episodes[i] for i in c.episode_indices] for c in campaigns]
+        if campaigns is not None else [[e] for e in report.closed]
+    )
+    decided = [
+        scoped for scoped in ([e for e in u if scope.has_episode(e)] for u in units)
+        if scoped
+        and all(e.is_closed for e in scoped)
+        and _in_period(max(str(e.closed_at or "") for e in scoped), period)
+    ]
+    stats.decided_campaigns = len(decided)
+    won = [c for c in decided if _campaign_pnl(c).base > 0]
+    lost = [c for c in decided if _campaign_pnl(c).base < 0]
+    stats.wins, stats.losses = len(won), len(lost)
     # `Money.per` divides base and native by the same count, so an average can
-    # never be an exact numerator over a restated one.
+    # never be an exact numerator over a restated one. Gated against the
+    # contributing EPISODES' currencies rather than by re-gating campaign
+    # totals: a sum of already-gated figures cannot tell a native withheld for
+    # being mixed from one that was never there.
     stats.avg_win = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in wins
-    ).per(len(wins))
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for c in won for e in c
+    ).per(len(won))
     stats.avg_loss = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in losses
-    ).per(len(losses))
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for c in lost for e in c
+    ).per(len(lost))
     stats.net_liq_base, stats.net_liq_date = _net_liq_for(conn, period)
 
     stats.days = daily_series(conn, period, asset_category, scope, report=report)
@@ -947,6 +1033,7 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "fees": stats.fees.payload(),
         "closed_episodes": stats.closed_episodes,
         "open_episodes": stats.open_episodes,
+        "decided_campaigns": stats.decided_campaigns,
         "wins": stats.wins,
         "losses": stats.losses,
         "win_rate": stats.win_rate,

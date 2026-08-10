@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import pytest
 
+from optjournal.campaigns import WINDOW_S, cluster_orders, link, position_count
 from optjournal.strategies import (
-    WINDOW_S,
     classify,
-    open_position_count,
     position_groups,
     strategy_groups,
 )
@@ -159,6 +158,47 @@ class _Ep:
         self.currency = "USD"
 
 
+def _camps(orders, episodes, trade_to_order=None):
+    """The campaign linkage `web.py` builds, over hand-built orders.
+
+    One fill per leg by default (`t1`, `t2`, ... in order), which is what the
+    counting tests want; pass `trade_to_order` where the mapping is the point.
+    """
+    if trade_to_order is None:
+        trade_to_order = {
+            f"t{i}": str(o["ib_order_id"])
+            for i, o in enumerate(orders, start=1)
+        }
+    first: dict[str, tuple[str, str | None]] = {}
+    for order in orders:
+        oid = str(order["ib_order_id"])
+        under = next(
+            (leg.get("underlying_symbol") for leg in order["legs"]), None
+        )
+        first[oid] = (str(order["first_fill_at"]), under)
+    return link(
+        episodes,
+        order_groups=cluster_orders(
+            (oid, at, under) for oid, (at, under) in first.items()
+        ),
+        order_of_trade=trade_to_order,
+    )
+
+
+def _lifecycles(orders, *, episodes, trade_to_order):
+    """`position_groups` with the campaign linkage `web.py` builds for it.
+
+    The linkage is `campaigns.py`'s now, so a lifecycle test has to go through
+    it -- which is the point: these assertions cover the two layers together,
+    the way the page does.
+    """
+    return position_groups(
+        orders,
+        episodes=episodes,
+        campaign_list=_camps(orders, episodes, trade_to_order),
+    )
+
+
 def test_open_and_close_events_link_into_one_closed_lifecycle():
     """The naked-put case: sold in July, bought back in August -- one
     position across its lifecycle, linked by the shared episode, with the
@@ -170,7 +210,7 @@ def test_open_and_close_events_link_into_one_closed_lifecycle():
                            buy_sell="BUY", open_close="C")])
     ep = _Ep("C1", ["t1", "t2"], closed=True,
              closed_at="2026-08-03 09:55:23", pnl=684.59, comm=-3.62)
-    lifecycles = position_groups(
+    lifecycles = _lifecycles(
         [opening, closing], episodes=[ep],
         trade_to_order={"t1": "10", "t2": "11"},
     )
@@ -188,8 +228,8 @@ def test_an_open_lifecycle_reports_no_realised_pnl():
     """Same rule as the Dashboard: nothing counts until the position is flat."""
     opening = _order("10", "2026-08-03 11:11:19", [_leg()])
     ep = _Ep("C1", ["t1"], closed=False)
-    (lc,) = position_groups([opening], episodes=[ep],
-                            trade_to_order={"t1": "10"})
+    (lc,) = _lifecycles([opening], episodes=[ep],
+                        trade_to_order={"t1": "10"})
     assert lc["status"] == "open"
     assert lc["realized_pnl"] is None
     assert lc["commission"] is None
@@ -199,8 +239,8 @@ def test_unrelated_contracts_never_share_a_lifecycle():
     a = _order("10", "2026-07-24 10:35:01", [_leg(underlying_symbol="TSLA")])
     b = _order("11", "2026-08-03 11:11:19", [_leg(underlying_symbol="META")])
     eps = [_Ep("C1", ["t1"]), _Ep("C2", ["t2"])]
-    got = position_groups([a, b], episodes=eps,
-                          trade_to_order={"t1": "10", "t2": "11"})
+    got = _lifecycles([a, b], episodes=eps,
+                      trade_to_order={"t1": "10", "t2": "11"})
     assert len(got) == 2
 
 
@@ -217,8 +257,8 @@ def test_a_roll_event_chains_lifecycles_into_one_campaign():
             pnl=100.0),
         _Ep("C2", ["t3"], closed=False),
     ]
-    got = position_groups([opening, roll], episodes=eps,
-                          trade_to_order={"t1": "10", "t2": "11", "t3": "11"})
+    got = _lifecycles([opening, roll], episodes=eps,
+                      trade_to_order={"t1": "10", "t2": "11", "t3": "11"})
     assert len(got) == 1, "the campaign is one lifecycle"
     lc = got[0]
     assert lc["status"] == "open", "the rolled-into leg is still open"
@@ -242,7 +282,7 @@ def test_grouping_layers_do_not_mutate_the_orders_they_receive():
     before = copy.deepcopy(orders)
 
     strategy_groups(orders)
-    position_groups(
+    _lifecycles(
         orders,
         episodes=[_Ep("C1", ["t1"], closed=False)],
         trade_to_order={"t1": "1"},
@@ -347,40 +387,38 @@ def test_a_strangle_is_one_open_position_not_two():
         _leg(underlying_symbol="META", strike=675.0, put_call="C"),
     ])
     put, call = _Ep("P1", ["t1"]), _Ep("C1", ["t2"])
-    lifecycles = position_groups(
-        [order], episodes=[put, call],
+    episodes = [put, call]
+    lifecycles = _lifecycles(
+        [order], episodes=episodes,
         trade_to_order={"t1": "10", "t2": "10"},
     )
     assert len(lifecycles) == 1 and lifecycles[0]["status"] == "open"
-    assert open_position_count(lifecycles, [put, call]) == 1
+    both = {"t1": "10", "t2": "10"}
+    assert position_count(_camps([order], episodes, both), episodes) == 1
     assert len(lifecycles[0]["conids"]) == 2, (
         "the control: the position really does hold two contracts, so the "
         "count of 1 is a grouping and not a dropped leg"
     )
 
 
-def test_a_contract_with_no_lifecycle_still_counts_as_a_position():
+def test_a_contract_with_no_campaign_still_counts_as_a_position():
     """The LEAP: bought before the archive begins, so it has no fills to group
-    and appears only as a snapshot-only episode. Counting lifecycles alone would
-    omit exactly the position with the most history in it.
+    and appears only as a snapshot-only episode. Counting only the campaigns
+    orders reached would omit exactly the position with the most history in it.
     """
     order = _order("10", "2026-08-03 11:11:00", [_leg(underlying_symbol="META")])
-    traded, snapshot = _Ep("P1", ["t1"]), _Ep("LEAP", [])
-    lifecycles = position_groups(
-        [order], episodes=[traded], trade_to_order={"t1": "10"},
-    )
-    assert open_position_count(lifecycles, [traded, snapshot]) == 2
+    episodes = [_Ep("P1", ["t1"]), _Ep("LEAP", [])]
+    assert position_count(_camps([order], episodes), episodes) == 2
 
 
-def test_the_count_follows_the_episodes_it_is_given():
-    """Counted from the episodes rather than by tallying open lifecycles, so a
-    caller's trade-type scope survives: a lifecycle whose episodes were all
-    filtered out must contribute nothing rather than count itself in.
+def test_the_count_follows_the_scope_it_is_given():
+    """A trade-type scope must survive: a position whose episodes were all
+    filtered out contributes nothing rather than counting itself in. Applied as
+    a predicate, because a campaign holds INDICES into the episode list and
+    dropping elements would shift what they point at.
     """
     order = _order("10", "2026-08-03 11:11:00", [_leg(underlying_symbol="META")])
-    ep = _Ep("P1", ["t1"])
-    lifecycles = position_groups(
-        [order], episodes=[ep], trade_to_order={"t1": "10"},
-    )
-    assert open_position_count(lifecycles, [ep]) == 1, "the control"
-    assert open_position_count(lifecycles, []) == 0
+    episodes = [_Ep("P1", ["t1"])]
+    camps = _camps([order], episodes)
+    assert position_count(camps, episodes) == 1, "the control"
+    assert position_count(camps, episodes, in_scope=lambda e: False) == 0

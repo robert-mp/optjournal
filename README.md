@@ -91,7 +91,8 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `blackscholes.py` | option pricing and the implied vol backed out of a market price. A leaf: pure float maths, `math.erf` for the normal CDF, so no numpy or scipy |
 | `analysis.py` | cost/friction report from the raw statement (whole account); pure statement mathematics — holds leaves (`notes.py`) and nothing that reads a database |
 | `costs.py` | the same costs read from SQLite instead: the account's whole life, narrowed to any set of asset categories, with measured cost kept structurally apart from the estimated AutoFX markup. Reconciled against `analysis.py` statement by statement — see `tests/test_costs.py` |
-| `strategies.py` | orders folded into the strategies they were placed as (a strangle sold as two same-second orders is one group), then linked into position lifecycles via episode trade ids |
+| `campaigns.py` | which episodes were ONE decision, and what that decision earned. A roll continues a position rather than closing it, and a spread's legs are separate contracts, so the scoreboard's unit is the campaign while the money's stays the episode. A leaf holder (`money.py` only), because its two readers — `strategies.py` for the Trades tab cards and `stats.py` for the win rate — cannot import each other, and the rule living in one of them is how the Dashboard came to count a roll as two wins while the tab drew one card |
+| `strategies.py` | orders folded into the strategies they were placed as (a strangle sold as two same-second orders is one group), then linked into position lifecycles. The grouping RULE is `campaigns.py`'s; what lives here is naming the shape and aggregating the legs |
 | `serialize.py` | the JSON payload the page renders and `--json` emits; wraps `analysis`'s per-currency ledgers into `Money` |
 | `render.py` | human-readable terminal reports. Bound to `serialize`'s shapes by `tests/test_render.py`: it once read flat money keys the `Money` conversion had removed, and `orders`/`history` died on `float(dict)` behind a green suite |
 | `cli.py` | argparse wiring only: every command opens the database via `db.open_journal` and emits through `_emit(data, text, json)`, so `--json` comes for free |
@@ -330,6 +331,25 @@ Four invariants worth knowing before changing the UI:
   `Gain % of Net Liq` divides that P&L by the NAV from the statement's
   Equity Summary section (enable it on the Flex query template; the demo
   carries synthetic NAV rows).
+* **The money counts contracts; the scoreboard counts positions.** Three
+  units, narrowing: `fills` are executions, `closed` are contract round
+  trips (an *episode*, and what net P&L is attributed by), `decided` are
+  positions (a *campaign*, and what W/L/win rate measure). They differ
+  because a roll closes one contract and opens the next: on the episode
+  unit that scored one continuing decision as two closed trades and two
+  wins, and a two-conid put vertical as one win PLUS one loss on a spread
+  that netted +562.33. Measured on the demo: 9 closed / 7W / 2L / 77.8%
+  by contract against 7 / 6W / 1L / 85.7% by position, with net P&L
+  identical at 3695.08 — the money does not move, only the counting.
+  A campaign is decided only when every contract in it is closed, and its
+  outcome is the SUM of them, so a loser rolled out and scratched on its
+  final leg is still a loss. `wins + losses == decided` always; against
+  `closed` it need not, and both columns are on screen with a note
+  wherever they differ. See `campaigns.py`, which owns the rule.
+
+  Two surfaces deliberately keep the contract unit and say so: `optjournal
+  history` (it lists episodes) and the 0DTE cohort (a cohort is defined by
+  a contract's expiry, and a rolled position spans several).
 * **The payload contract lives in the page, and the suite derives its
   guards from it.** `page.html` opens with `@typedef` blocks declaring
   every shape the page reads and a `@payload`/`@local` table saying which
@@ -351,7 +371,17 @@ unguarded invariant — that is how a `_flat` epsilon wide enough to book a
 0.4-share residual as a closed round trip was found, having passed 579 tests, and
 how `_snapshot_leg` silently taking `abs()` of a short position was found. A
 defect caught by **fifteen** tests suggests fourteen are coupled to something they
-are not about. Measured over all 31 mutants: 31 caught, median 1, maximum 19.
+are not about. There are 36 mutants; the two newest guard the campaign unit (a
+roll counted as decided while a leg is still open, and a campaign scored by its
+final contract rather than the sum), and both are caught.
+
+`mutate` currently reports `dirty-baseline` and measures nothing: it runs the
+suite in a `copytree` clone, and `test_launchd`'s plist assertion pins the
+ORIGINAL checkout's path by design, so it fails wherever the tree is copied.
+That is a harness gap, not a suite failure — the same two tests
+(`test_launchd`, and `test_flex`'s `raw/` guard) fail in a git worktree for the
+same reason. Fix by skipping the checkout-pinned tests when the tree is a clone
+before trusting a mutation number again.
 
 The two high counts say different things, which is the point of reading the names
 rather than the number. At 8 is the Money currency gate — a rule that genuinely

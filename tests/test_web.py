@@ -550,7 +550,8 @@ def test_stats_panel_keys_present(state):
     for key in (
         "total_trades", "orders", "net_pnl", "commissions", "fees",
         "wins", "losses", "win_rate", "avg_win", "avg_loss",
-        "closed_episodes", "open_episodes", "green_days", "red_days", "days",
+        "closed_episodes", "open_episodes", "decided_campaigns",
+        "green_days", "red_days", "days",
         "total_friction_base", "net_liq_base", "gain_pct_of_net_liq",
     ):
         assert key in s, f"stats.{key} missing"
@@ -687,7 +688,13 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
     assert opened["net_pnl"]["base"] == pytest.approx(
         sum(e.realized_pnl_base for e in closed_in(open_month))
     ), "the spanning episode's outcome must not leak into the month that opened it"
-    assert opened["wins"] + opened["losses"] == opened["closed_episodes"]
+    # The scoreboard's own unit is the campaign, and it always accounts for
+    # itself. Against `closed_episodes` it need NOT agree: a roll closes one
+    # contract and opens another, so a month can close a contract whose decision
+    # finishes later. `closed_episodes` is never below it, which is the
+    # reconciliation the page prints when the two differ.
+    assert opened["wins"] + opened["losses"] == opened["decided_campaigns"]
+    assert opened["closed_episodes"] >= opened["decided_campaigns"]
     # Commission rides the same rule: IBKR's episode P&L is already net of
     # every leg's commission, so fill-date commission showed the same euros
     # twice -- once in the open month's card, again inside the close month's
@@ -796,15 +803,21 @@ def test_a_lifecycle_spans_open_and_close_and_matches_the_dashboard(populated):
         assert open_lc["realized_pnl"] is None
 
 
-def test_dashboard_headline_counts_closed_round_trips_for_options():
+def test_dashboard_headline_counts_decided_positions_for_options():
     """'Total Trades' as a fill count let a month claim trades whose outcome
     belonged to a later month -- open in July, close in August, and July's card
     said '3 trades' while its P&L, wins and losses all correctly read zero. For
-    options the headline is closed round trips, the same population every other
-    card on the row measures; fills survive in the sub-note, named as fills."""
+    options the headline is DECIDED POSITIONS, the same population the wins,
+    losses and averages measure: an episode is per contract, so counting those
+    scored a roll as two trades for one decision. Fills and contract round trips
+    both survive in the sub-note, named as what they are."""
     js = _js()
-    assert "statCard('Trades', s.closed_episodes," in js
+    assert "statCard('Trades', s.decided_campaigns," in js
     assert "fill(s), ${s.orders} order(s)" in js, "fills stay visible as activity"
+    assert "${s.closed_episodes} contract round trip(s)" in js, (
+        "the money's unit stays visible: net P&L is attributed by it, so a "
+        "reader adding up the P&L needs to see it"
+    )
     # The fill-count headline remains only as the non-options branch.
     assert js.count("statCard('Total Trades', s.total_trades,") == 1
 
@@ -3498,7 +3511,7 @@ def test_an_empty_loss_population_reads_as_a_fact_not_a_missing_number():
     closed still shows the em-dash it should.
     """
     body = _fn("dashboard")
-    assert "s.losses===0&&s.closed_episodes>0" in body.replace(" ", ""), (
+    assert "s.losses===0&&s.decided_campaigns>0" in body.replace(" ", ""), (
         "the empty-population case is gone, so Avg Loss shows a bare em-dash "
         "again when there are no losses"
     )

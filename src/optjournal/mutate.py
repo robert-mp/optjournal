@@ -147,6 +147,23 @@ MUTANTS: tuple[Mutant, ...] = (
         breaks="0.4 shares still held would book a partial close as a closed round trip",
     ),
     Mutant(
+        key="roll-continues",
+        module="campaigns.py",
+        find="        decided = bool(eps) and all(e.is_closed for e in eps)",
+        replace="        decided = bool(eps) and any(e.is_closed for e in eps)",
+        breaks="a roll would be decided while its rolled-into leg is still open, "
+               "scoring an in-flight position and counting the chain twice",
+    ),
+    Mutant(
+        key="campaign-sum",
+        module="stats.py",
+        find="    won = [c for c in decided if _campaign_pnl(c).base > 0]",
+        replace="    won = [c for c in decided if c[-1].realized_pnl_base > 0]",
+        breaks="a loser rolled out and scratched on its final leg would score a "
+               "win, because the outcome would be the last contract's and not "
+               "the whole decision's",
+    ),
+    Mutant(
         key="episode-attrib",
         module="stats.py",
         find="        if _in_period(e.closed_at, period) and scope.has_episode(e)",
@@ -255,11 +272,15 @@ MUTANTS: tuple[Mutant, ...] = (
         key="annual-filter",
         module="web.py",
         find='        state["annual"] = [\n'
-             "            stats_data(s) for s in annual_stats(conn, "
-             "asset_category=asset_category)\n        ]",
+             "            stats_data(s) for s in annual_stats(\n"
+             "                conn, asset_category=asset_category,\n"
+             "                report=report, campaigns=home_campaigns,\n"
+             "            )\n        ]",
         replace='        state["annual"] = [\n'
-                "            stats_data(s) for s in annual_stats(conn, "
-                "asset_category=asset_category)\n"
+                "            stats_data(s) for s in annual_stats(\n"
+                "                conn, asset_category=asset_category,\n"
+                "                report=report, campaigns=home_campaigns,\n"
+                "            )\n"
                 "            if selected is None or s.month.startswith(selected[:4])\n"
                 "        ]",
         breaks="the Annual tab would follow a month control it does not display",

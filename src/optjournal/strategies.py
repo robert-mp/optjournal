@@ -21,31 +21,21 @@ whether it arrived as one combo order or two singles. Mixed open/close legs
 are a roll (one leg closes an expiry, another opens the next), which is a
 statement about the *fills*, not about position lineage: the episode model in
 `history.py` still ends one episode and starts another, unlinked.
+
+The grouping RULE itself lives in `campaigns.py`, not here. It has a second
+consumer -- the Dashboard's scoreboard, which must count a roll as one decision
+rather than two wins -- and `stats.py` cannot import this module. What stays
+here is naming the shape and aggregating the legs.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
+from optjournal import campaigns
 from optjournal.money import FILL_MONEY_FIELDS, Money
 
 Row = dict[str, Any]
-
-#: Orders on the same underlying with first fills inside this window are one
-#: strategy. Same-second for the real strangle; 90s tolerates a combo split
-#: into legs that fill as the market moves, without swallowing a deliberate
-#: second trade placed minutes later.
-WINDOW_S = 90
-
-
-def _dt(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value))
-    except ValueError:
-        return None
 
 
 def _underlying(order: Row) -> str | None:
@@ -136,29 +126,18 @@ def strategy_groups(orders: list[Row]) -> list[Row]:
     keep every order intact under `orders` so the view can show the strategy
     as one position with its constituent legs beneath. Totals are sums of the
     member orders' totals, so a group of one is exactly its order.
-    """
-    def sort_key(o: Row):
-        return (_underlying(o) or f"\uffff{o.get('ib_order_id')}",
-                str(o.get("first_fill_at") or ""))
 
-    groups: list[list[Row]] = []
-    for order in sorted(orders, key=sort_key):
-        last = groups[-1][-1] if groups else None
-        same = False
-        if last is not None:
-            u_now, u_prev = _underlying(order), _underlying(last)
-            t_now, t_prev = _dt(order.get("first_fill_at")), _dt(last.get("first_fill_at"))
-            same = (
-                u_now is not None
-                and u_now == u_prev
-                and t_now is not None
-                and t_prev is not None
-                and abs((t_now - t_prev).total_seconds()) <= WINDOW_S
-            )
-        if same:
-            groups[-1].append(order)
-        else:
-            groups.append([order])
+    The window rule is `campaigns.cluster_orders`, so the Trades tab and the
+    scoreboard group the same fills the same way by construction.
+    """
+    by_id = {str(o.get("ib_order_id")): o for o in orders}
+    groups = [
+        [by_id[oid] for oid in ids]
+        for ids in campaigns.cluster_orders(
+            (str(o.get("ib_order_id")), o.get("first_fill_at"), _underlying(o))
+            for o in orders
+        )
+    ]
 
     out: list[Row] = []
     for members in groups:
@@ -186,76 +165,73 @@ def position_groups(
     orders: list[Row],
     *,
     episodes: list[Any],
-    trade_to_order: dict[str, str],
+    campaign_list: list[campaigns.Campaign],
 ) -> list[Row]:
     """Strategy events linked into position lifecycles, newest first.
 
     An opened-then-closed single leg is one position, not two trades -- and
     the accounting layer already knows it: `history.py` FIFO-matches fills
-    into per-conid episodes, so the open and the close share an episode. The
-    linkage here is exact, not heuristic: episode.trade_ids -> the fills'
-    ib_order_id (via `trade_to_order`) -> the strategy event that order
-    belongs to. Events sharing any episode are one lifecycle.
+    into per-conid episodes, so the open and the close share an episode.
 
-    Two deliberate consequences:
+    The union itself is `campaigns.link`'s, handed in rather than recomputed,
+    which is what makes this card and the Dashboard's win rate the same reading
+    of the same fills. Before, the rule was written here and the scoreboard
+    counted episodes, so a roll drew ONE card while the headline said two wins.
+
+    Two deliberate consequences, both `campaigns.py`'s:
 
     * A re-opened contract later is a NEW episode, so it starts a new
       lifecycle rather than reviving the old card.
-    * A roll event (mixed open/close legs) shares an episode with the old
-      lifecycle AND opens a new episode -- the union links the whole chain
-      into one campaign card. That is the intended reading of a roll: one
-      continuing decision, with each episode's P&L still landing in its own
-      close month underneath.
+    * A roll shares an episode with the old lifecycle AND opens a new one --
+      the union links the whole chain into one campaign card. That is the
+      intended reading of a roll: one continuing decision, with each episode's
+      P&L still landing in its own close month underneath.
 
     Events whose orders map to no episode (nothing but snapshots, or an
     unmatched category) stay as singleton lifecycles.
     """
     events = strategy_groups(orders)
 
-    order_to_eps: dict[str, set[int]] = {}
-    for idx, ep in enumerate(episodes):
-        for tid in getattr(ep, "trade_ids", ()) or ():
-            oid = trade_to_order.get(str(tid))
-            if oid is not None:
-                order_to_eps.setdefault(oid, set()).add(idx)
+    #: Which campaign each order filled, so an event is placed by its own
+    #: orders. The campaign carries them because the leg views aggregate per
+    #: contract and so carry no fill id for an event to join on.
+    campaign_of_order: dict[str, int] = {
+        oid: index
+        for index, camp in enumerate(campaign_list)
+        for oid in camp.order_ids
+    }
 
-    def event_eps(event: Row) -> set[int]:
-        eps: set[int] = set()
+    def campaign_of(event: Row) -> int | None:
         for oid in event.get("order_ids", ()):
-            eps |= order_to_eps.get(str(oid), set())
-        return eps
+            index = campaign_of_order.get(str(oid))
+            if index is not None:
+                return index
+        return None
 
-    # Union events sharing episodes. Tiny n, so the quadratic sweep is
-    # clearer than a union-find and costs nothing.
-    clusters: list[tuple[set[int], list[Row]]] = []
-    for event in events:
-        eps = event_eps(event)
-        merged: tuple[set[int], list[Row]] | None = None
-        for cluster in clusters:
-            if eps and cluster[0] & eps:
-                cluster[0].update(eps)
-                cluster[1].append(event)
-                merged = cluster
-                break
-        if merged is None:
-            clusters.append((set(eps), [event]))
+    # Keyed by campaign index, or by the event's own position when no campaign
+    # claims it -- a unique key, so an unlinked event stays a card of its own
+    # rather than pooling every orphan into one.
+    grouped: dict[tuple[bool, int], list[Row]] = {}
+    for position, event in enumerate(events):
+        index = campaign_of(event)
+        key = (True, index) if index is not None else (False, position)
+        grouped.setdefault(key, []).append(event)
 
     out: list[Row] = []
-    for ep_idxs, members in clusters:
+    for (linked, index), members in grouped.items():
         members.sort(key=lambda e: str(e.get("first_fill_at") or ""))
         opening = members[0]
-        eps = [episodes[i] for i in sorted(ep_idxs)]
-        closed = bool(eps) and all(e.is_closed for e in eps)
+        camp = campaign_list[index] if linked else None
+        eps = [episodes[i] for i in camp.episode_indices] if camp else []
         out.append({
             "underlying": opening.get("underlying"),
             # The shape it was OPENED as names the position; later events
             # (closes, rolls) are its history, not its identity.
             "label": opening.get("label"),
-            "status": "closed" if closed else "open",
+            "status": "closed" if camp and camp.is_decided else "open",
             "opened_at": opening.get("first_fill_at"),
-            "closed_at": max((str(e.closed_at) for e in eps if e.closed_at),
-                             default=None) if closed else None,
-            "conids": sorted({str(e.conid) for e in eps}),
+            "closed_at": camp.closed_at if camp else None,
+            "conids": list(camp.conids) if camp else [],
             "episodes": len(eps),
             "fills": sum(e.get("fills") or 0 for e in members),
             # Down to the same leaf rows again, through every event's orders.
@@ -264,54 +240,17 @@ def position_groups(
                  for lg in o.get("legs", ())),
                 "proceeds",
             ).payload(),
-            # Episode-sourced, so these equal the Dashboard's accounting
-            # exactly -- populated only when the lifecycle is closed, same
+            # Campaign-sourced, so these equal the Dashboard's accounting
+            # exactly -- populated only when the position is decided, same
             # rule. Episodes carry the native and the currency, so the figure
             # is exact wherever one currency closed the whole position.
             "realized_pnl": (
-                Money.charged(
-                    (e.realized_pnl_base, e.realized_pnl, e.currency) for e in eps
-                ).payload() if closed else None
+                camp.realized.payload() if camp and camp.realized else None
             ),
             "commission": (
-                Money.charged(
-                    (e.commission_base, e.commission, e.currency) for e in eps
-                ).payload() if closed else None
+                camp.commission.payload() if camp and camp.commission else None
             ),
             "events": members,
         })
     out.sort(key=lambda p: str(p["opened_at"] or ""), reverse=True)
     return out
-
-
-def open_position_count(lifecycles: list[Row], episodes: list[Any]) -> int:
-    """How many POSITIONS the given open episodes form.
-
-    An episode is per CONTRACT, so a strangle is two of them and a headline
-    "open 5" counted a two-leg strangle twice and read as five separate bets.
-    Five is a true number -- it is the count of open contracts -- but it is not
-    the number of positions, and the Positions tab already groups the same book
-    into three cards, so the two disagreed on screen.
-
-    A position is a lifecycle where one exists, and the episode itself where one
-    does not. That second case is not an edge: a contract held from before the
-    archive begins has no fills to group, so it appears only as a snapshot-only
-    episode -- this journal's LEAP -- and dropping it would undercount the book
-    by exactly the position with the most history in it.
-
-    Counted from the EPISODES rather than by tallying open lifecycles, so the
-    caller's scope survives: only positions with a passed-in open episode are
-    counted, and a lifecycle filtered out by a trade-type scope contributes
-    nothing rather than being counted from its own status field.
-    """
-    owner: dict[str, int] = {}
-    for index, lifecycle in enumerate(lifecycles):
-        if lifecycle.get("status") != "open":
-            continue
-        for conid in lifecycle.get("conids") or ():
-            owner[str(conid)] = index
-    positions: set[tuple[str, object]] = set()
-    for episode in episodes:
-        conid = str(getattr(episode, "conid", "") or "")
-        positions.add(("lc", owner[conid]) if conid in owner else ("ep", conid))
-    return len(positions)

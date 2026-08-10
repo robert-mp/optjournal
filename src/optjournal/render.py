@@ -241,6 +241,13 @@ def render_history(data: Row) -> str:
         out.append(f"  win / loss{t['wins']:>21} / {t['losses']}   win rate {rate}")
         out.append("  realized P&L is already net of commission, so the two")
         out.append("  lines above must not be added together.")
+        # This report lists EPISODES, so its win rate counts contracts, and the
+        # dashboard's counts positions. A roll closes one contract and opens the
+        # next, so the two figures legitimately differ and a reader comparing
+        # them needs to know which is which rather than suspecting one is stale.
+        out.append("  counted per contract round trip, the rows above. The")
+        out.append("  dashboard counts POSITIONS, where a roll is one decision")
+        out.append("  rather than two, so its win rate differs by design.")
     else:
         out.append("  (none)")
 

@@ -64,6 +64,7 @@ from optjournal.bars import (
     replay_bars,
     replay_model,
 )
+from optjournal.campaigns import Campaign, cluster_orders, link, position_count
 from optjournal.costs import CostScope, build_costs
 from optjournal.db import connect, open_journal
 from optjournal.events import (
@@ -123,7 +124,6 @@ from optjournal.stats import (
     stats_data,
 )
 from optjournal.strategies import (
-    open_position_count,
     position_groups,
     strategy_groups,
 )
@@ -559,6 +559,45 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     state["replays"] = replays
 
 
+def _campaigns_for(
+    conn: sqlite3.Connection, asset_category: str | None, episodes: list[Any]
+) -> list[Campaign]:
+    """The campaign linkage for one category's episodes.
+
+    Reads the fill-to-order map and each order's first fill straight from
+    `trades`, which is the one query the linkage needs and the reason this lives
+    here rather than in `campaigns.py`: that module is a leaf and opens no
+    database. `campaigns.cluster_orders` then applies the window rule, and
+    `campaigns.link` unions the episodes those orders filled.
+
+    The window is what makes this work on real data. Every multi-leg event in
+    the real journal arrives as separate order ids filled in the same second, so
+    order-id union alone links nothing at all -- see `campaigns.py`.
+    """
+    where, params = ("", ()) if not asset_category else (
+        " AND asset_category = ?", (asset_category,)
+    )
+    order_of_trade: dict[str, str] = {}
+    first_fill: dict[str, tuple[str, str | None]] = {}
+    for row in conn.execute(
+        "SELECT trade_id, ib_order_id, date_time, trade_date, underlying_symbol,"
+        f" symbol FROM trades WHERE ib_order_id IS NOT NULL{where}", params
+    ):
+        oid = str(row["ib_order_id"])
+        order_of_trade[str(row["trade_id"])] = oid
+        at = str(row["date_time"] or row["trade_date"] or "")
+        under = row["underlying_symbol"] or row["symbol"]
+        if oid not in first_fill or at < first_fill[oid][0]:
+            first_fill[oid] = (at, under)
+    return link(
+        episodes,
+        order_groups=cluster_orders(
+            (oid, at, under) for oid, (at, under) in first_fill.items()
+        ),
+        order_of_trade=order_of_trade,
+    )
+
+
 def build_state(
     *,
     db_path: Path,
@@ -637,6 +676,23 @@ def build_state(
         # what it receives (pinned in test_strategies), so fetching per
         # consumer was three times the queries buying nothing.
         orders = orders_data(conn, scope.order_ids, view_category)
+        # The campaign linkage, built ONCE per report and handed to everything
+        # that counts a decision: the lifecycle cards, the scoreboard, and the
+        # open-position headline. One structure rather than three readings, which
+        # is the point -- the Dashboard used to count a roll as two wins while
+        # the Trades tab drew it as one card.
+        #
+        # Indexed against `report.episodes` verbatim, never a reordering of it: a
+        # campaign holds positions into that exact list, and `month_stats`
+        # resolves them the same way.
+        view_episodes = view_report.episodes
+        view_campaigns = _campaigns_for(conn, view_category, view_episodes)
+        # The Annual tab is unscoped and runs over the HOME category, so it needs
+        # its own linkage whenever the view has been switched to equities.
+        home_campaigns = (
+            view_campaigns if view_category == asset_category
+            else _campaigns_for(conn, asset_category, report.episodes)
+        )
         state: dict[str, Any] = {
             "version": __version__,
             "generated_at": _now(),
@@ -651,11 +707,13 @@ def build_state(
             "trade_type_label": scope.label,
             "stats": stats_data(
                 month_stats(conn, selected, asset_category=view_category,
-                            scope=scope, report=view_report)
+                            scope=scope, report=view_report,
+                            campaigns=view_campaigns)
             ),
             "all_time": stats_data(
                 month_stats(conn, None, asset_category=view_category,
-                            scope=scope, report=view_report)
+                            scope=scope, report=view_report,
+                            campaigns=view_campaigns)
             ),
             "positions": positions_data(conn),
             "orders": orders,
@@ -664,17 +722,11 @@ def build_state(
             "strategies": strategy_groups(orders),
             # ... and further linked into position lifecycles: the open and
             # the close of one position share an episode, so they are one
-            # card. Exact linkage via episode trade ids, not a time window.
+            # card. The union is `campaigns.link`'s, shared with the scoreboard.
             "lifecycles": position_groups(
                 orders,
-                episodes=[*view_report.closed, *view_report.open],
-                trade_to_order={
-                    str(r["trade_id"]): str(r["ib_order_id"])
-                    for r in conn.execute(
-                        "SELECT trade_id, ib_order_id FROM trades"
-                        " WHERE ib_order_id IS NOT NULL"
-                    )
-                },
+                episodes=view_episodes,
+                campaign_list=view_campaigns,
             ),
             "history": history_data(report),
             "statements": statements_data(archive_dir, conn),
@@ -702,13 +754,12 @@ def build_state(
             # defect the Annual total was fixed for.
             "logbook": logbook_data(conn, today=date.today()),
         }
-        # How many POSITIONS the open contracts form, which needs the lifecycle
+        # How many POSITIONS the open contracts form, which needs the campaign
         # grouping and so cannot be computed inside month_stats. Set on both
         # blocks because they share the Stats shape, and it is period-invariant
         # either way: the open book is the open book whatever month is selected.
-        open_positions = open_position_count(
-            state["lifecycles"],
-            [e for e in view_report.open if scope.has_episode(e)],
+        open_positions = position_count(
+            view_campaigns, view_episodes, in_scope=scope.has_episode,
         )
         for block in ("stats", "all_time"):
             state[block]["open_positions"] = open_positions
@@ -719,17 +770,24 @@ def build_state(
         # gives the reader nothing to explain the change with, which is the same
         # failure as a total that silently spans a wider scope than its label.
         state["annual"] = [
-            stats_data(s) for s in annual_stats(conn, asset_category=asset_category)
+            stats_data(s) for s in annual_stats(
+                conn, asset_category=asset_category,
+                report=report, campaigns=home_campaigns,
+            )
         ]
         state["monthly"] = [
-            stats_data(s) for s in monthly_stats(conn, asset_category=asset_category)
+            stats_data(s) for s in monthly_stats(
+                conn, asset_category=asset_category,
+                report=report, campaigns=home_campaigns,
+            )
         ]
         # The Annual table's total row. Deliberately not `all_time`, which is the
         # Dashboard's figure and therefore scoped: under an active filter the
         # year rows stayed whole while that total shrank, so the table stopped
         # adding up -- destroying the one reconciliation it exists to show.
         state["annual_total"] = stats_data(
-            month_stats(conn, None, asset_category=asset_category, report=report)
+            month_stats(conn, None, asset_category=asset_category, report=report,
+                        campaigns=home_campaigns)
         )
         # Cohorts are the whole book by definition -- they exist to compare the
         # 0DTE subset against everything else, so scoping them to 0DTE would

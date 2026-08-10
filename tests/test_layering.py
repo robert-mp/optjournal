@@ -53,7 +53,13 @@ LEAVES = {"money", "notes", "blackscholes", "config", "marketdata", "compat",
 #: everything it imports is a value type. The specific temptation is `stats`,
 #: whose single-currency gate it would like for its per-currency ledgers --
 #: `serialize` applies that instead, being the layer that already holds both.
-IMPORTS_LEAVES_ONLY = {"analysis"}
+#:
+#: `campaigns` is here rather than in `LEAVES` because a campaign's outcome IS a
+#: `Money` -- it cannot answer "did this decision win" without one. It holds no
+#: episode type either: everything it reads off an episode is duck-typed, which
+#: is what keeps every case in it testable against a literal instead of a
+#: database, and what stops the win rate's own rule from depending on `history`.
+IMPORTS_LEAVES_ONLY = {"analysis", "campaigns"}
 
 
 def _internal_imports(path: Path) -> set[str]:

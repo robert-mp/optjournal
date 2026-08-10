@@ -296,14 +296,19 @@ import {
  * @property {Money} net_pnl -- options: closed round trips only, net of commission
  * @property {Money} commissions -- options: commission of round trips CLOSED here
  * @property {Money} fees -- account-level, not attributable to the journal
- * @property {number} closed_episodes -- the headline trade count for options
+ * @property {number} closed_episodes -- contract round trips closed here: the
+ *   MONEY's unit, since net_pnl and commissions are attributed by it
  * @property {number} open_episodes -- open CONTRACTS; a strangle is two
  * @property {number} open_positions -- open positions, grouping a multi-leg
  *   strategy into one. Attached by web.build_state, not month_stats: it needs
- *   the lifecycle grouping, which is built after the stats are
- * @property {number} wins
+ *   the campaign grouping, which is built after the stats are
+ * @property {number} decided_campaigns -- the headline trade count for options,
+ *   and the scoreboard's unit: positions whose every contract is closed. A roll
+ *   continues a position, so this is below closed_episodes while one is in
+ *   flight. Always equals wins + losses
+ * @property {number} wins -- decided POSITIONS that netted up, not contracts
  * @property {number} losses
- * @property {number|null} win_rate -- null until anything closed
+ * @property {number|null} win_rate -- null until anything was decided
  * @property {Money|null} avg_win -- null without wins; an average of no
  *   outcomes is undefined, and zero would read as break-even
  * @property {Money|null} avg_loss -- null without losses
@@ -1371,17 +1376,24 @@ function dashboard(){
   const pnlNote=opt?'closed round trips only, net of commission'
                :'realised per fill, net of commission';
   const nl=s.net_liq_base;
-  /* For options, the headline trade count is CLOSED ROUND TRIPS -- the same
-     population every other card on this row measures. Counting fills here
+  /* For options, the headline trade count is DECIDED POSITIONS -- the same
+     population the wins, losses and averages measure. Counting fills here
      made a month claim trades it had no outcome for: open the position in
      July, close it in August, and July's card said "3 trades" while its P&L,
      wins and losses all correctly said the outcome was August's. A trade
      counts in the month it closed, full stop. Fills stay visible in the
-     sub-note as what they are -- activity, not trades. */
+     sub-note as what they are -- activity, not trades.
+
+     Decided POSITIONS, not closed contract round trips, and the two differ:
+     a roll continues one position across two contracts, so the episode count
+     scored a single decision twice. The contract count stays in the sub-note
+     because it is the money's unit -- Net P&L and Commissions below are
+     attributed by it -- and a reader who adds up the P&L needs to see it. */
   const cards=[
     opt
-      ? statCard('Trades', s.closed_episodes,
-          `closed round trips · ${s.total_trades} fill(s), ${s.orders} order(s)`)
+      ? statCard('Trades', s.decided_campaigns,
+          `decided position(s) · ${s.closed_episodes} contract round trip(s) · ${
+          s.total_trades} fill(s), ${s.orders} order(s)`)
       : statCard('Total Trades', s.total_trades,
           s.orders?`${s.orders} order(s)`:''),
     statCard('Net P&L', moneyOf(s.net_pnl), pnlNote,
@@ -1416,11 +1428,14 @@ function dashboard(){
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
-    statCard('Winning Trades', s.wins, 'closed round trips', s.wins?'pos':''),
-    statCard('Losing Trades', s.losses, 'closed round trips', s.losses?'neg':''),
+    /* Judged on the POSITION, so a roll is one decision and its outcome is the
+       sum of every contract in the chain. Counting the final leg alone would
+       let a loser be rolled out and scratched into a win. */
+    statCard('Winning Trades', s.wins, 'decided positions', s.wins?'pos':''),
+    statCard('Losing Trades', s.losses, 'decided positions', s.losses?'neg':''),
     statCard('Win Rate', pct(s.win_rate),
-      s.closed_episodes?`${s.closed_episodes} decided`:'nothing closed yet'),
-    statCard('Avg Win', moneyOf(s.avg_win), 'per closed round trip',
+      s.decided_campaigns?`${s.decided_campaigns} decided`:'nothing decided yet'),
+    statCard('Avg Win', moneyOf(s.avg_win), 'per decided position',
       cls(s.avg_win?.base)),
     /* An em-dash on a card whose figure is genuinely absent reads as "this
        failed to load". `none yet` says the same thing as data: there have been
@@ -1429,11 +1444,11 @@ function dashboard(){
        still renders as the number it is, and the `—` remains for the case the
        payload truly has nothing to say. */
     statCard('Avg Loss',
-      s.losses===0&&s.closed_episodes>0?'<span class="nil">none yet</span>'
+      s.losses===0&&s.decided_campaigns>0?'<span class="nil">none yet</span>'
         :moneyOf(s.avg_loss),
-      s.losses===0&&s.closed_episodes>0
-        ?`${s.closed_episodes} closed, none at a loss`
-        :'per closed round trip',
+      s.losses===0&&s.decided_campaigns>0
+        ?`${s.decided_campaigns} decided, none at a loss`
+        :'per decided position',
       cls(s.avg_loss?.base)),
     nl!=null
       ? statCard('Gain % of Net Liq', pct(s.gain_pct_of_net_liq,2),
@@ -1479,6 +1494,15 @@ function dashboard(){
       net premium in the ${s.open_positions} open position(s) is not profit until
       they close.`:`The ${s.open_positions} open position(s) are under
       <b>Positions</b>.`}</div>`:''}
+    ${opt&&s.closed_episodes!==s.decided_campaigns?`<div class="note">${
+      s.closed_episodes} contract round trip(s) closed here against ${
+      s.decided_campaigns} decided position(s). A roll closes one contract and
+      opens the next, so the contracts differ from the decisions: the extra
+      round trip(s) belong to a position still in flight, or to one that
+      finished in another month. Their P&amp;L is inside <b>Net P&L</b> above, on
+      the day it landed; the outcome is scored where the position finished. The
+      scoreboard cards always agree among themselves — wins plus losses equals
+      the ${s.decided_campaigns} decided.</div>`:''}
   </div>
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Performance</h2>
@@ -2846,9 +2870,16 @@ function costAside(bc){
    heading, which no test and no glance catches.
 
    `wide` adds the avg pair to both the header and the row together, which is
-   what makes them impossible to disagree about. */
+   what makes them impossible to disagree about.
+
+   `closed` and `decided` are both here, side by side, because they are two
+   units and the reader has to be able to reconcile them: `closed` counts
+   contract round trips (what net P&L is attributed by), `decided` counts
+   positions (what W, L and win rate are). `closed` is never below `decided`,
+   and a row where they differ is a row where a roll was in flight. */
 const statsHead=(first,wide)=>`<tr><th>${first}</th><th class="n">fills</th>
-  <th class="n">orders</th><th class="n">closed</th><th class="n">W</th>
+  <th class="n">orders</th><th class="n">closed</th><th class="n">decided</th>
+  <th class="n">W</th>
   <th class="n">L</th><th class="n">win rate</th><th class="n">net P&amp;L</th>
   ${wide?`<th class="n">avg win</th><th class="n">avg loss</th>`:''}
   <th class="n">commission</th><th class="n">green/red</th></tr>`;
@@ -2858,6 +2889,7 @@ function statsRow(s,{label,wide=false,klass=''}={}){ return `<tr${klass?` class=
   <td class="n mono">${s.total_trades}</td>
   <td class="n mono">${s.orders}</td>
   <td class="n mono">${s.closed_episodes}</td>
+  <td class="n mono">${s.decided_campaigns}</td>
   <td class="n mono pos">${s.wins}</td>
   <td class="n mono neg">${s.losses}</td>
   <td class="n mono">${pct(s.win_rate)}</td>
@@ -2896,10 +2928,15 @@ function annual(){
       ${yrs.map(s=>row(s)).join('')}
       ${row(tot,'grp')}
     </tbody></table>
-    <div class="note"><b>fills</b> counts executions and <b>closed</b> counts round
-      trips, which is why they differ: an order filled in two parts is two fills but
-      one outcome. Win rate is computed over closed round trips only, so a year that
-      traded without closing anything shows a row with no rate rather than 0%.</div>
+    <div class="note">Three units, narrowing left to right. <b>fills</b> counts
+      executions: an order filled in two parts is two fills but one outcome.
+      <b>closed</b> counts contract round trips, and is what <b>net P&amp;L</b> is
+      attributed by. <b>decided</b> counts POSITIONS, and is what W, L and win
+      rate measure — a roll closes one contract and opens the next, so one
+      continuing decision would otherwise be scored twice. <b>closed</b> is
+      never below <b>decided</b>, and a row where they differ is a row where a
+      roll was in flight or finished in another period. A year that traded
+      without deciding anything shows no rate rather than 0%.</div>
     ${monthlyTable()}
   </div>`;
 }
@@ -3253,7 +3290,10 @@ function odte(){
     <div class="note">A high 0DTE win rate means nothing on its own, so the rest of
       the book is shown beside it. <b>Avg per trip</b> is the figure that decides
       whether the cohort is worth trading: a better win rate with a worse average is
-      a losing strategy.</div>
+      a losing strategy. Counted per contract ROUND TRIP here, not per position as
+      on the Dashboard — a 0DTE cohort is defined by a contract's expiry, and a
+      rolled position spans several, so it has no single DTE to sort it by. The two
+      win rates are therefore different questions and need not match.</div>
     ${thin?`<div class="note"><b>Too few round trips to conclude anything.</b>
       ${od.cohort.episodes} 0DTE against ${od.rest.episodes} other — a difference in
       win rate across samples this small is noise, not evidence. The threshold is a

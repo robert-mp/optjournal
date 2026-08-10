@@ -44,6 +44,7 @@ from optjournal.stats import (
     odte_scope,
     scope_for,
 )
+from optjournal.web import _campaigns_for
 
 MULTIPLIER = Decimal("100")
 
@@ -173,6 +174,72 @@ def test_has_closed_round_trips_with_wins_and_losses(conn):
     assert s.avg_win is not None and s.avg_loss is not None
     assert s.avg_win.base > 0 > s.avg_loss.base
     assert 0 < s.win_rate < 100
+
+
+def test_the_scoreboard_counts_positions_where_episodes_double_counted(conn):
+    """The roll and the vertical, measured end to end through the real path.
+
+    The generator holds both defects on purpose: a SPY roll (Nov -> Dec, one
+    order closing 560P and opening 555P) and an NVDA put vertical whose two legs
+    closed at +1150.86 and -588.54. On the episode unit that is 9 closed round
+    trips, 7 wins and 2 losses (77.8%): the roll scores one decision twice, and
+    the vertical scores a +562.33 spread as one win PLUS one loss. On the
+    campaign unit it is 7 decided, 6 wins, 1 loss (85.7%).
+
+    Net P&L is identical either way, which is the whole point of the split: the
+    money did not move, only the counting. Asserted here rather than trusted,
+    because the fallback path (`campaigns=None`) still produces the old numbers
+    and would otherwise be what the demo tests measure.
+    """
+    report = build_history(conn, asset_category="OPT")
+    campaigns = _campaigns_for(conn, "OPT", report.episodes)
+
+    episode_unit = month_stats(conn, None, report=report)
+    campaign_unit = month_stats(
+        conn, None, report=report, campaigns=campaigns
+    )
+
+    assert (episode_unit.wins, episode_unit.losses) == (7, 2)
+    assert episode_unit.win_rate == pytest.approx(77.777, abs=1e-2)
+
+    assert campaign_unit.decided_campaigns == 7
+    assert (campaign_unit.wins, campaign_unit.losses) == (6, 1)
+    assert campaign_unit.win_rate == pytest.approx(85.714, abs=1e-2)
+    assert campaign_unit.wins + campaign_unit.losses == \
+        campaign_unit.decided_campaigns, "the scoreboard accounts for itself"
+
+    assert campaign_unit.closed_episodes == episode_unit.closed_episodes == 9, (
+        "the money's unit is untouched"
+    )
+    assert campaign_unit.net_pnl.base == pytest.approx(episode_unit.net_pnl.base)
+    assert campaign_unit.commissions.base == pytest.approx(
+        episode_unit.commissions.base
+    )
+
+
+def test_a_rolled_position_scores_where_it_finished_not_where_cash_landed(conn):
+    """The SPY roll spans November into December, and the two units part company.
+
+    November closed the 560P for +585.82 and that cash is November's, but the
+    decision was still running: nothing is decided there. December's expiry ends
+    it, so the whole +1630.58 chain scores as one win in December against
+    December's own P&L of +1044.76. That is the mismatch the dashboard prints a
+    note for, pinned here so it stays deliberate.
+    """
+    report = build_history(conn, asset_category="OPT")
+    campaigns = _campaigns_for(conn, "OPT", report.episodes)
+    nov = month_stats(conn, "2025-11", report=report, campaigns=campaigns)
+    dec = month_stats(conn, "2025-12", report=report, campaigns=campaigns)
+
+    assert nov.closed_episodes == 1, "a contract really did close in November"
+    assert nov.net_pnl.base == pytest.approx(585.82, abs=1e-2)
+    assert nov.decided_campaigns == 0, "the decision was still running"
+    assert nov.wins == nov.losses == 0 and nov.win_rate is None
+
+    assert dec.decided_campaigns == 1 and dec.wins == 1
+    assert dec.net_pnl.base == pytest.approx(1044.76, abs=1e-2), (
+        "December's money is December's, not the whole chain's"
+    )
 
 
 def test_has_a_multi_leg_order(conn):
