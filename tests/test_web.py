@@ -68,10 +68,16 @@ def state(populated) -> dict:
     """
     from datetime import UTC, datetime, timedelta
 
+    from optjournal.bars import MARKET_TZ
     from optjournal.db import connect
     from optjournal.events import parse_events, store_events
 
-    today = datetime.now(UTC).date()
+    # MARKET_TZ, not UTC. `market_data` anchors its week in market time, so a
+    # fixture dating "today" in UTC seeds an event outside the window for the
+    # hours when the two calendars disagree -- every day between UTC midnight and
+    # market midnight. The shape then had no sample and the contract guard failed,
+    # on a clock rather than on a change. Same timeline as the code under test.
+    today = datetime.now(MARKET_TZ).date()
     conn = connect(populated)
     store_events(conn, parse_events([
         {"title": "Non-Farm Employment Change", "country": "USD",
@@ -105,6 +111,25 @@ def state(populated) -> dict:
     conn.commit()
     conn.close()
     return build_state(db_path=populated, archive_dir=RAW_DIR, query_id="1591754")
+
+
+@pytest.fixture
+def widest_costs(populated) -> dict:
+    """The cost payload under the widest possible scope.
+
+    The Costs tab defaults to options only, so `state["broker_costs"]` carries no
+    conversion pair, no fee group and no withholding line -- and the contract guard
+    anchors those shapes to real rows, so sampling the default alone would leave
+    four of them unanchored and quietly exempt from the drift test.
+
+    A separate fixture rather than a second payload key: the page never asks for
+    two scopes at once, so the payload should not carry two. This is the same
+    serializer the page gets, just asked a wider question.
+    """
+    return build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None,
+        cost_scope=["OPT", "STK", "CASH"],
+    )["broker_costs"]
 
 
 def _js() -> str:
@@ -278,7 +303,7 @@ _UNSAMPLED = frozenset({
 })
 
 
-def _shape_samples(state: dict) -> dict[str, dict]:
+def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
     """One real instance of every sampled shape, from the live payload.
 
     Keyed per SHAPE, not per binding: this map changes when a new payload
@@ -291,6 +316,12 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         return rows[0] if rows else None
 
     costs = first(state["costs"])
+    # The cost payload under the WIDEST scope. The tab defaults to options only,
+    # so a conversion pair, a fee group and a withholding line do not appear in
+    # `state["broker_costs"]` -- and sampling only that would leave those shapes
+    # unanchored, which silently exempts them from the drift test. Built here from
+    # the same serializer rather than added to the payload: the page never asks for
+    # two scopes at once, so the payload should not carry two.
     orders = state["orders"]
     history = state["history"]
     replays = list(state["replays"].values())
@@ -351,7 +382,31 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         "JobRun": first([
             row["last_run"] for row in state["scheduler"]["jobs"] if row["last_run"]
         ]),
+        # The DB-backed cost report. Every shape is anchored to a real row rather
+        # than exempted, and the default scope is options-only -- so the samples
+        # that only exist under a WIDER scope (a conversion pair, a fee group) are
+        # taken from an account-wide report built alongside. Sampling only the
+        # default would leave four shapes unanchored and quietly exempt from the
+        # drift test, which is the failure this map exists to prevent.
+        "BrokerCosts": state["broker_costs"],
+        "CostSelection": state["broker_costs"]["scope"],
+        "CostTotals": state["broker_costs"]["totals"],
+        "AutoFx": state["broker_costs"]["totals"]["autofx"],
+        "FrictionTotals": state["broker_costs"]["totals"]["friction"],
+        # The ledger-carrying money shape, anchored to a figure that HAS a ledger.
+        "Charge": state["broker_costs"]["totals"]["attributable"],
+        "CategoryCost": first(widest["by_category"]),
+        "FxPairCost": first(widest["fx"]),
+        "FxLeg": first(widest["fx"])["auto"],
+        "FxLegManual": first(widest["fx"])["manual"],
+        "FeeGroup": first(widest["fees"]),
+        "Withholding": first(widest["withholding"]),
         "Audit": state["audit"],
+        # The header dateline. Anchored to the real payload rather than exempted,
+        # even though it is two keys: the page slices `opened` apart to format a
+        # date, so a rename there renders the header's most prominent line wrong
+        # rather than merely blank.
+        "Logbook": state["logbook"],
         "FxBlock": state["fx"],
         "FxQuote": first(state["fx"]["quotes"]),
         "OdteBlock": state["odte"],
@@ -371,7 +426,7 @@ def _shape_samples(state: dict) -> dict[str, dict]:
     return samples
 
 
-def test_contract_is_coherent(state):
+def test_contract_is_coherent(state, widest_costs):
     """Meta-guard: a typo anywhere in the contract machinery is itself red.
 
     Every binding must name a declared shape, no name may be both payload
@@ -388,7 +443,7 @@ def test_contract_is_coherent(state):
     both = sorted(set(bindings) & locals_)
     assert not both, f"declared both @payload and @local: {both}"
 
-    samples = _shape_samples(state)
+    samples = _shape_samples(state, widest_costs)
     assert set(samples) <= set(shapes), (
         f"sample map names undeclared shapes: {sorted(set(samples) - set(shapes))}"
     )
@@ -401,7 +456,7 @@ def test_contract_is_coherent(state):
     assert not _UNSAMPLED & set(samples), "an exempted shape has a sample after all"
 
 
-def test_contract_matches_the_payload_both_ways(state):
+def test_contract_matches_the_payload_both_ways(state, widest_costs):
     """The typedefs in page.html are held to a real payload in BOTH
     directions: a required key the API stopped sending fails (the contract
     cannot rot optimistic), and a key the API sends that the contract omits
@@ -410,7 +465,7 @@ def test_contract_matches_the_payload_both_ways(state):
     only."""
     shapes, _, _ = _parse_contract(_js())
     problems = []
-    for name, sample in _shape_samples(state).items():
+    for name, sample in _shape_samples(state, widest_costs).items():
         declared = shapes[name]
         sent = set(sample)
         required = {key for key, optional in declared.items() if not optional}
@@ -542,6 +597,41 @@ def test_month_range_spans_account_life_and_contains_months(state):
         if m == 0:
             y, m = y - 1, 12
         assert older == f"{y:04d}-{m:02d}", f"gap between {newer} and {older}"
+
+
+def test_the_browsable_range_survives_a_compact_ibkr_date(conn):
+    """A journal whose earliest row is stored compact browses from the right month.
+
+    `trades.trade_date` mixes ISO `2025-01-14 14:30:05` with IBKR's compact
+    `20250114`. `month_range` used to slice the raw value to seven characters,
+    which turns the compact form into `2025011` -- and that is the trap, because
+    it does NOT fail the length check. It parses as month ELEVEN, so an account
+    whose first fill was in January silently began browsing in November, and the
+    calendar walked ten months the account never lived. Measured on the old
+    implementation, which returned `2025-11` as its oldest month.
+
+    Both readings now go through `_day_of`, shared with `logbook_data` so the
+    header counts days from the same instant the calendar starts at, and the
+    stored form cannot change either answer.
+    """
+    columns = ["broker", "trade_id", "ib_exec_id", "transaction_id", "account_id",
+               "trade_date", "asset_category", "symbol", "quantity", "currency",
+               "fx_rate_to_base", "raw", "source_file", "first_seen_at"]
+    values = ["IBKR", "t1", "e1", "x1", "U1", "20250114", "OPT", "SPY", 1,
+              "USD", 1.0, "{}", "f.xml", "2025-01-14T00:00:00Z"]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        f"INSERT INTO trades ({','.join(columns)})"  # noqa: S608 - fixed names
+        f" VALUES ({','.join('?' * len(columns))})",
+        values,
+    )
+    conn.commit()
+    from optjournal.stats import first_activity, month_range
+
+    assert first_activity(conn) == "2025-01-14"
+    months = month_range(conn)
+    assert months, "a compact earliest date left the account with no months"
+    assert months[-1] == "2025-01"
 
 
 def test_a_fill_free_month_is_an_honest_zero_not_all_time(populated):
@@ -1639,7 +1729,188 @@ def test_build_state_survives_an_empty_database(tmp_path):
     state = build_state(db_path=db, archive_dir=tmp_path, query_id=None)
     assert state["positions"] == []
     assert state["costs"] == []
+    # A journal where nothing has happened has no first day, so there is no day
+    # to be the Nth of. Null rather than 1: the header drops the dateline
+    # entirely, which is honest, where "log day 1" would date a log that was
+    # never opened.
+    assert state["logbook"] == {"opened": None, "day": None}
     json.dumps(state)
+
+
+def test_the_logbook_dates_from_first_activity_counting_inclusively(populated):
+    """The header's dateline, against the real archive.
+
+    Two things are worth pinning. The opening day is day ONE, not day zero -- a
+    log's first page is page one, and an off-by-one here is visible on the page's
+    most prominent small line. And `opened` is normalised to ISO, because the
+    stored columns mix `2025-01-14 14:30:05` with IBKR's compact `20250114` and
+    the page slices it apart to format the date.
+    """
+    from datetime import date, timedelta
+
+    from optjournal.serialize import logbook_data
+
+    conn = connect(populated)
+    try:
+        opened = logbook_data(conn, today=date(2030, 1, 1))["opened"]
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", opened or ""), (
+            f"opened is not an ISO day: {opened!r} -- the page splits it on '-' "
+            f"to format the dateline, so a compact IBKR date renders as nonsense"
+        )
+        start = date.fromisoformat(opened)
+        # Read on its own opening day, the log is on day 1.
+        assert logbook_data(conn, today=start)["day"] == 1
+        assert logbook_data(conn, today=start + timedelta(days=1))["day"] == 2
+        # And a clock BEHIND the archive cannot produce day 0 or a negative day.
+        # Not hypothetical: statements carry exchange-local timestamps, so a
+        # reader west of the exchange can hold a fill dated tomorrow.
+        assert logbook_data(conn, today=start - timedelta(days=5))["day"] == 1
+    finally:
+        conn.close()
+
+
+def test_the_logbook_ignores_both_filters(populated, tmp_path):
+    """How long the log has been kept is a fact about the JOURNAL.
+
+    The header displays no filter bar, and a figure that moves with a control its
+    own surface does not show leaves the reader nothing to explain the change
+    with -- the defect the Annual total row was fixed for. So the dateline must be
+    identical under a month selection and under a trade-type scope.
+    """
+    plain = build_state(db_path=populated, archive_dir=tmp_path, query_id=None)
+    scoped = build_state(
+        db_path=populated, archive_dir=tmp_path, query_id=None,
+        month=plain["month_range"][0], trade_type="odte",
+    )
+    assert plain["logbook"] == scoped["logbook"], (
+        "the header dateline moved with a filter the header does not display"
+    )
+    assert plain["logbook"]["day"] >= 1
+
+
+# --- the Costs tab's scope selection -----------------------------------------
+#
+# Four peer options on the wire, two different kinds of narrowing underneath:
+# OPT/STK/CASH are asset categories, 0DTE is a subset of options resolved to
+# fills. `_broker_costs` is the seam that reconciles them, so these pin the
+# translation rather than the arithmetic (which `test_costs.py` owns).
+
+
+def _costs(populated, selection=None):
+    return build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None,
+        cost_scope=selection,
+    )["broker_costs"]
+
+
+def test_costs_default_to_the_journals_own_category(populated):
+    """So the tab opens agreeing with every other tab.
+
+    The account-wide figure is roughly four times larger on this journal, and a
+    tab that opened on it would look like the others were wrong.
+    """
+    for empty in (None, [], ["", "  "]):
+        assert _costs(populated, empty)["scope"]["categories"] == ["OPT"], empty
+
+
+def test_costs_span_the_journal_not_the_newest_statement(populated):
+    """The reason this engine replaced the statement-backed one.
+
+    The newest archive covers 30 calendar days (2026-07-09 onward); the journal
+    holds a year of activity. Asserted over the whole account rather than over
+    options alone, because this account's options all happen to fall inside that
+    window -- which is exactly why the old tab's narrowing was invisible, and why
+    a test scoped to options would prove nothing.
+
+    The dates come from the rows in scope, so this also pins that they are not
+    the statement's own `fromDate`/`toDate`.
+    """
+    costs = _costs(populated, ["OPT", "STK", "CASH"])
+    assert costs["from_date"] < "2026-07-09", (
+        "still reading the 30-day window rather than the journal's history"
+    )
+    # And the old statement-backed payload is still sent, still scoped to its own
+    # window: the two coexist, which is what makes the comparison meaningful.
+    statement = build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None
+    )["costs"][0]
+    assert statement["from_date"] >= "2026-07-09"
+    assert costs["from_date"] < statement["from_date"]
+
+
+def test_a_repeated_parameter_is_a_multi_select(populated):
+    """`?cost=OPT&cost=CASH`, so neither layer invents a delimiter."""
+    costs = _costs(populated, ["OPT", "CASH"])
+    assert costs["scope"]["categories"] == ["CASH", "OPT"]
+    assert costs["totals"]["attributable"]["base"] > 0
+
+
+def test_selected_categories_add_up(populated):
+    """Disjoint categories, so a multi-select is a sum -- the property that makes
+    ticking two boxes meaningful."""
+    opt = _costs(populated, ["OPT"])["totals"]["attributable"]["base"]
+    stk = _costs(populated, ["STK"])["totals"]["attributable"]["base"]
+    both = _costs(populated, ["OPT", "STK"])["totals"]["attributable"]["base"]
+    assert both == pytest.approx(opt + stk)
+
+
+def test_a_mixed_selection_keeps_every_billing_currency(populated):
+    """Widening the scope adds columns rather than deleting exactness."""
+    charged = _costs(populated, ["OPT", "STK"])["totals"]["attributable"]["charged"]
+    assert len(charged) > 1, "a multi-currency scope reported one currency"
+    assert _costs(populated, ["OPT"])["totals"]["attributable"]["ccy"] == "USD"
+
+
+def test_the_case_of_a_selection_does_not_matter(populated):
+    """A hand-edited `#cost=opt` is the same selection as `#cost=OPT`."""
+    assert (_costs(populated, ["opt", "cash"])["scope"]["categories"]
+            == _costs(populated, ["OPT", "CASH"])["scope"]["categories"])
+
+
+def test_selecting_0dte_alone_implies_options(populated):
+    """Asking for a subset of options is asking about options.
+
+    A fill set with no category would also admit a stock fill that happened to
+    share an id -- and 0DTE is defined only for contracts with an expiry.
+    """
+    scope = _costs(populated, ["0DTE"])["scope"]
+    assert scope["categories"] == ["OPT"]
+    assert scope["subset"] == "0DTE"
+    assert scope["is_subset"] is True
+
+
+def test_0dte_narrows_options_rather_than_widening_them(populated):
+    """It is a subset, not a peer, so ticking both cannot exceed Options alone.
+
+    This account has no 0DTE round trips, so the honest answer here is zero --
+    `test_costs.py` asserts the proper-narrowing case against a journal that has
+    some.
+    """
+    options = _costs(populated, ["OPT"])["totals"]
+    odte = _costs(populated, ["OPT", "0DTE"])["totals"]
+    assert odte["attributable"]["base"] <= options["attributable"]["base"]
+    assert odte["fills"] <= options["fills"]
+
+
+def test_account_fees_survive_every_selection(populated):
+    """They carry no asset attribution, so no selection can narrow them -- and a
+    total that hid them would measure less than the tab claims."""
+    figures = {
+        str(sel): _costs(populated, sel)["totals"]["unattributable"]["base"]
+        for sel in (None, ["OPT"], ["STK"], ["CASH"], ["OPT", "0DTE"])
+    }
+    assert len(set(figures.values())) == 1, figures
+    assert next(iter(figures.values())) > 0
+
+
+def test_the_estimate_appears_only_when_conversions_are_selected(populated):
+    """The markup is a cost of converting, so charging it to a contract scope
+    would attribute a currency cost to an option."""
+    assert not _costs(populated, ["OPT"])["totals"]["friction"]["is_estimated"]
+    with_fx = _costs(populated, ["OPT", "CASH"])["totals"]["friction"]
+    assert with_fx["is_estimated"]
+    assert (with_fx["total_low_base"] < with_fx["total_mid_base"]
+            < with_fx["total_high_base"])
 
 
 def test_fx_offers_the_base_and_at_least_one_quote(state):
@@ -2360,10 +2631,23 @@ def test_journal_taxes_is_a_money_and_the_gate_reaches_it():
     assert mixed["journal_taxes"]["ccy"] is None
     assert mixed["journal_taxes"]["base"] == pytest.approx(0.25 + 3.00 * 0.09)
 
-    # And the page reads it through the one rule, not a second `cash()` call.
+    # The serializer half of the rule, which is what this test is really about:
+    # the figure is a Money and the gate reaches it.
+    #
+    # The page-side assertion that used to live here named `moneyOf(T.journal_taxes)`
+    # -- a read in the statement-backed Costs view, which no longer exists. The Costs
+    # tab now reads the DB-backed payload, where the same rule is enforced more
+    # broadly and structurally: `chargeFig` is the single display path for every
+    # `Charge`, it delegates to `moneyOf`, and the payload contract guard checks
+    # every key the page reads against the typedefs. So the narrow assertion was
+    # retired rather than repointed at an arbitrary new call site.
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
-    assert "moneyOf(T.journal_taxes)" in js
     assert "cash(T.journal_taxes" not in js, "a display site bypasses the rule"
+    # `chargeFig` is that single path, and it must go through `moneyOf`.
+    assert "moneyOf(ch)" in js, (
+        "chargeFig no longer delegates to moneyOf, so a Charge is displayed by a "
+        "second rule that can disagree with every other cash figure on the page"
+    )
 
 
 def test_the_page_has_exactly_one_native_first_rule():
@@ -2715,38 +2999,163 @@ def test_a_sign_tint_outranks_the_default_colour_of_the_element_it_lands_on():
     )
 
 
-def test_muted_text_meets_wcag_aa_on_every_surface_it_sits_on():
+def _themes() -> dict[str, dict[str, str]]:
+    """Every theme block in the stylesheet, as {selector: {name: hex}}.
+
+    Comments are stripped PER BLOCK, after splitting, and the closing brace is
+    matched as `\\n}` rather than the first `}` -- both learned by getting it
+    wrong. `--dim2` carries a long explanatory comment mid-block, so stripping
+    comments first swallowed the declaration after it, and a `}` inside that
+    comment truncated the block. Either way the key silently vanished and the
+    contrast check passed by measuring nothing.
+    """
+    return {
+        selector: {
+            # Keyed WITHOUT the leading dashes, so a caller asks for "dim2".
+            name.lstrip("-"): value
+            for name, value in re.findall(
+                r"(--[a-z0-9]+)\s*:\s*(#[0-9a-fA-F]{6})",
+                re.sub(r"/\*.*?\*/", "", body, flags=re.S),
+            )
+        }
+        for selector, body in re.findall(
+            r"^(:root[^{\n]*|\[data-theme=\"[a-z]+\"\])\{(.*?)\n\}",
+            _css(), flags=re.S | re.M,
+        )
+    }
+
+
+def _lum(hex_colour: str) -> float:
+    parts = [int(hex_colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+    chan = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in parts]
+    return 0.2126 * chan[0] + 0.7152 * chan[1] + 0.0722 * chan[2]
+
+
+def _ratio(fg: str, bg: str) -> float:
+    a, b = _lum(fg), _lum(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_muted_text_meets_wcag_aa_in_every_theme_on_every_surface():
     """--dim2 measured 3.31:1 on --bg and 3.02:1 on --panel2, against the 4.5:1
     that 12px body text requires, and it dressed the footer and every
     explanatory caption -- the prose a newcomer reads first.
 
-    Computed here rather than pinned to a hex, so re-tuning the palette is free
-    while regressing legibility is not.
+    Computed rather than pinned to a hex, so re-tuning a palette is free while
+    regressing legibility is not -- and run over EVERY theme, because the moment
+    a second palette existed this test's `re.search` was silently measuring only
+    the first block in the file. A theme is a whole new set of these ratios, so a
+    prettier ground that nobody can read must not be able to ship.
+    """
+    themes = _themes()
+    assert len(themes) >= 2, (
+        f"expected several theme blocks, found {sorted(themes)} -- the parser is "
+        f"probably matching the wrong brace again"
+    )
+    for selector, palette in themes.items():
+        for surface in ("bg", "panel", "panel2"):
+            ratio = _ratio(palette["dim2"], palette[surface])
+            assert ratio >= 4.5, (
+                f"{selector}: --dim2 ({palette['dim2']}) is {ratio:.2f}:1 on "
+                f"--{surface} ({palette[surface]}), below the 4.5:1 WCAG AA needs "
+                f"for 12px text. Lighten --dim2 for that theme."
+            )
+
+
+def test_text_on_an_accent_fill_is_readable_in_every_theme():
+    """A label sitting ON a filled control, which is not the same question as
+    text on a surface and had never been asked.
+
+    Asking it found two real failures the moment the palette became measurable:
+    --onaccent was 4.31:1 on Leather's --accentlit2 (a defect that predated the
+    themes entirely) and 4.18:1 on Oxblood's. The currency toggle's active label
+    is what wears that pair.
+
+    The gradient's DARKER stop is the binding case, since the label has to hold
+    up across the whole fill rather than at its lightest point.
+    """
+    for selector, palette in _themes().items():
+        for fg, bg in (("accentfg", "accent"), ("onaccent", "accentlit2"),
+                       ("edfg", "edbg")):
+            ratio = _ratio(palette[fg], palette[bg])
+            assert ratio >= 4.5, (
+                f"{selector}: --{fg} ({palette[fg]}) is {ratio:.2f}:1 on --{bg} "
+                f"({palette[bg]}), below 4.5:1 -- that label sits directly on "
+                f"that fill"
+            )
+
+
+def test_the_selected_tab_separates_from_an_unselected_one_in_every_theme():
+    """A tab strip where the current tab does not stand out is a navigation bar
+    that has stopped saying where you are.
+
+    `.tab` is --panel2 and `.tab.on` fills with --accent, so the separation IS
+    the ratio between those two. Found by SCREENSHOT, not by arithmetic: every
+    text-contrast figure passed while Admiralty's selected tab sat at 2.42:1
+    against its neighbours and read as barely selected. Leather manages 3.12, so
+    that is the bar the other themes are held to.
+
+    2.8 rather than 3.12 exactly, because this is a floor for a decorative
+    separation rather than a legibility threshold, and pinning a theme to another
+    theme's precise number would make retuning Leather fail everything else.
+    """
+    for selector, palette in _themes().items():
+        ratio = _ratio(palette["accent"], palette["panel2"])
+        assert ratio >= 2.8, (
+            f"{selector}: --accent ({palette['accent']}) is only {ratio:.2f}:1 "
+            f"against --panel2 ({palette['panel2']}), so a selected tab barely "
+            f"differs from an unselected one. Lighten --accent -- but check "
+            f"--accentfg still clears 4.5 on it, the two pull opposite ways"
+        )
+
+
+def test_every_theme_declares_the_same_palette():
+    """A theme is a SWAP, not a patch.
+
+    A block that declares only some of the names inherits the rest from `:root`,
+    so a half-written theme renders one palette's chrome on another's ground --
+    silently, and only on whichever panels happen to use the missing names. That
+    is exactly the bug the promotion pass fixed at the literal level, and it
+    would walk straight back in through an incomplete block.
+    """
+    themes = _themes()
+    base_selector = next(s for s in themes if s.startswith(":root"))
+    base = set(themes[base_selector])
+    assert len(base) > 30, f"the base palette looks truncated: {len(base)} names"
+    for selector, palette in themes.items():
+        if selector == base_selector:
+            continue
+        missing = base - set(palette)
+        assert not missing, (
+            f"{selector} does not declare {sorted(missing)}, so those names fall "
+            f"through to {base_selector} and this theme renders another theme's "
+            f"colours for them"
+        )
+
+
+def test_no_colour_literal_lives_outside_a_theme_block():
+    """The whole theme mechanism is "every colour is a variable", and 35 hex
+    literals scattered through the rules is what made a theme swap leave brown
+    chrome on a blue page: the logo facets, the edition pill, calendar day
+    borders, put/call, the impact dots, and every `rgba(255,255,255,...)` wash --
+    which is not a neutral hairline but a dark-theme assumption with no name.
+
+    So the rule is mechanical and this test is what makes it hold.
     """
     css = _css()
-    def _var(name: str) -> str:
-        match = re.search(rf"--{name}:\s*(#[0-9a-fA-F]{{6}})", css)
-        assert match, f"--{name} is gone from the stylesheet"
-        return match.group(1)
-
-    def _lum(hex_colour: str) -> float:
-        parts = [int(hex_colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
-        chan = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in parts]
-        return 0.2126 * chan[0] + 0.7152 * chan[1] + 0.0722 * chan[2]
-
-    def _ratio(fg: str, bg: str) -> float:
-        a, b = _lum(fg), _lum(bg)
-        hi, lo = max(a, b), min(a, b)
-        return (hi + 0.05) / (lo + 0.05)
-
-    fg = _var("dim2")
-    # Every surface muted text actually lands on.
-    for surface in ("bg", "panel", "panel2"):
-        ratio = _ratio(fg, _var(surface))
-        assert ratio >= 4.5, (
-            f"--dim2 ({fg}) is {ratio:.2f}:1 on --{surface} ({_var(surface)}), "
-            f"below the 4.5:1 WCAG AA needs for 12px text. Lighten --dim2."
-        )
+    # Everything except the theme blocks themselves.
+    rules = re.sub(
+        r"^(?::root[^{\n]*|\[data-theme=\"[a-z]+\"\])\{.*?\n\}", "",
+        css, flags=re.S | re.M,
+    )
+    rules = re.sub(r"/\*.*?\*/", "", rules, flags=re.S)
+    strays = re.findall(r"#[0-9a-fA-F]{3,8}\b|rgba?\([0-9.,\s]*\)", rules)
+    assert not strays, (
+        f"colour literals outside the theme blocks: {sorted(set(strays))} -- each "
+        f"one survives a theme swap unchanged. Give it a name in every theme "
+        f"block and use var()."
+    )
 
 
 def test_every_control_has_a_visible_keyboard_focus_ring():
@@ -2758,7 +3167,10 @@ def test_every_control_has_a_visible_keyboard_focus_ring():
     added later is reachable by default instead of by remembering.
     """
     css = _css().replace(" ", "").replace("\n", "")
-    assert ":focus-visible{outline:2pxsolidvar(--leather1)" in css, (
+    # --accent, formerly --leather1: the palette names say ROLE now that a theme
+    # can repaint them, and a ring hardcoded to one theme's brown would be
+    # invisible against another theme's ground.
+    assert ":focus-visible{outline:2pxsolidvar(--accent)" in css, (
         "the global focus ring is gone, so keyboard users cannot see focus"
     )
     # :focus-visible, not :focus -- otherwise a mouse click leaves a ring that
@@ -2875,23 +3287,57 @@ def test_an_empty_loss_population_reads_as_a_fact_not_a_missing_number():
     )
 
 
-def test_the_kicker_does_not_merely_translate_the_title():
-    """`Cuaderno de Bitácora` above a title reading `Bitácora` spent the page's
-    most prominent small slot restating the next line. The kicker now names what
-    the journal is made of, in the vocabulary its own tabs use.
+def test_the_kicker_carries_no_hardcoded_line():
+    """The header's most prominent small slot must say something only THIS
+    journal can say, and two static strings failed that in turn.
+
+    `Cuaderno de Bitácora` restated the title directly beneath it. `Strikes ·
+    Fills · Round trips` then named the journal's contents -- true, but identical
+    for every reader on every load, and already said by the tab strip two lines
+    down. It is now a dateline computed from the payload (`serialize.logbook_data`
+    plus the open book), so the assertion is that the slot ships EMPTY: any text
+    baked in here is either a placeholder that flashes before the real line, or a
+    regression to a fixed string.
     """
-    # The rendered element, not the whole file: the comment beside it names the
-    # rejected string on purpose, to say why it was rejected.
-    match = re.search(r'<div class="kicker">([^<]*)</div>', page_html())
-    assert match, "the header kicker is gone"
-    kicker = match.group(1).strip()
-    assert kicker == "Strikes · Fills · Round trips", (
-        f"unexpected kicker {kicker!r}"
+    # The rendered element, not the whole file: the comment beside it names both
+    # rejected strings on purpose, to say why each was rejected.
+    match = re.search(r'<div class="kicker" id="kicker">([^<]*)</div>', page_html())
+    assert match, "the header kicker slot is gone"
+    assert not match.group(1).strip(), (
+        f"the kicker ships with hardcoded text {match.group(1)!r}; it is filled "
+        f"from the payload, and baked-in text either flashes before the real "
+        f"line or is a fixed string nobody reads twice"
     )
-    title = re.search(r'<div class="title">([^<]*)', page_html()).group(1).strip()
-    assert title.lower() not in kicker.lower(), (
-        f"the kicker {kicker!r} restates the title {title!r}, which spends the "
-        f"page's most prominent small slot saying the next line over again"
+    body = code_only(page_html()).replace(" ", "")
+    assert "renderKicker()" in body, (
+        "nothing fills the kicker slot, so the header's top line renders blank"
+    )
+
+
+def test_the_kicker_names_underlyings_rather_than_counting_contracts():
+    """A count here would contradict the Positions tab.
+
+    An episode is per CONTRACT, so a strangle is two of them against one card on
+    Positions -- the disagreement `strategies.open_position_count` exists to end.
+    The header sidesteps it by naming UNDERLYINGS: two legs on GOOG are one GOOG
+    however they are grouped. This pins that it reads `underlying_symbol` from
+    the same snapshot rows that tab renders, and that it de-duplicates them.
+    """
+    body = code_only(page_html())
+    line = re.search(r"function logbookLine\(\)\{(.*?)\n\}", body, re.S)
+    assert line, "logbookLine is gone"
+    src = line.group(1)
+    assert "underlying_symbol" in src, (
+        "the kicker no longer names underlyings, so a two-leg strangle can read "
+        "as two positions and disagree with the Positions tab"
+    )
+    assert "new Set(" in src, (
+        "the names are no longer de-duplicated, so both legs of a strangle print "
+        "the same symbol twice"
+    )
+    assert "state.positions" in src.replace("st.", "state."), (
+        "the names come from somewhere other than the snapshot rows the "
+        "Positions tab renders, so the two surfaces can drift"
     )
 
 

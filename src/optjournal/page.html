@@ -46,12 +46,31 @@
       </svg>
     </div>
     <div>
-      <!-- Not "Cuaderno de Bitácora": a kicker that translates the title
-           directly beneath it spends the page's most prominent small slot
-           saying what the next line already says. This states what the journal
-           is made of instead, in the vocabulary the tabs use. -->
-      <div class="kicker">Strikes · Fills · Round trips</div>
-      <div class="title">Bitácora <span class="edition" id="edition">Leather Edition</span></div>
+      <!-- The dateline of a ship's log, which is what a bitácora is.
+           Two rejected strings sat here before it, and both failed the same
+           way. "Cuaderno de Bitácora" translated the title directly beneath
+           it. "Strikes · Fills · Round trips" then named the journal's
+           contents -- but that is identical for every reader on every load,
+           and the tab strip two lines down already says Trades, Positions and
+           Costs. A fixed string in the page's most prominent small slot is
+           read once and then permanently ignored.
+
+           So this slot now carries the one thing only THIS journal can say:
+           which day of the log it is, since when, and what the book is
+           carrying. Filled by `renderKicker` from the payload -- empty here
+           rather than holding placeholder text, because a hardcoded day number
+           flashing before the real one is a wrong figure on screen. -->
+      <div class="kicker" id="kicker"></div>
+      <!-- The edition chip is the THEME control, so it is a <button> rather than
+           the <span> it used to be: it was a decorative label reading "Leather
+           Edition" whatever the page looked like, and now it names the active
+           palette and switches it. A real button because a clickable span is
+           unreachable by keyboard and unannounced to a screen reader -- the
+           focus ring, the Enter key and the role all come free from the element.
+           Its text is written by `applyTheme`; the markup carries the default so
+           the chip is never momentarily blank. -->
+      <div class="title">Bitácora <button class="edition" id="edition"
+        title="Switch theme">Leather Edition</button></div>
       <div class="tabs" id="tabs"></div>
     </div>
     <div class="hdr-actions">
@@ -139,6 +158,8 @@ import {
  * @property {Audit} audit -- did the last session's perishable bars land
  *   (serialize.audit_data). Computed on EVERY load, because when this was a cron
  *   the watchdog and the thing it watched stopped together
+ * @property {Logbook} logbook -- the header dateline (serialize.logbook_data).
+ *   Whole-journal, so it moves with neither the month nor the trade-type filter
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
  * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
@@ -148,7 +169,121 @@ import {
  * @property {Array} costs -- Costs per statement section, may be empty
  * @property {string} [costs_source] -- only when an archive statement was readable
  * @property {string} [costs_error] -- only when reading it failed
+ * @property {BrokerCosts} broker_costs -- what the broker cost, from the DATABASE:
+ *   the journal's whole history, narrowed to the reader's selection. Distinct from
+ *   `costs`, which is one statement's own 30-day window (serialize.broker_costs_data)
  * @property {Sync} sync
+ */
+
+/** @typedef {Object} BrokerCosts -- the Costs tab's whole payload
+ * @property {string} base_currency
+ * @property {string|null} from_date -- first and last fill IN SCOPE, not a
+ *   statement's window: with nothing in scope both are null
+ * @property {string|null} to_date
+ * @property {CostSelection} scope -- echoed back, so a caption names the scope the
+ *   figures were measured over rather than whatever the page's state says now
+ * @property {Array<CategoryCost>} by_category
+ * @property {Array<FxPairCost>} fx
+ * @property {Array<FeeGroup>} fees
+ * @property {Array<Withholding>} withholding
+ * @property {CostTotals} totals
+ */
+
+/** @typedef {Object} CostSelection
+ * @property {Array<string>} categories -- asset categories in scope, sorted
+ * @property {boolean} is_everything -- no narrowing asked for
+ * @property {string} subset -- "0DTE" when a fill-level subset is in force, else ""
+ * @property {boolean} is_subset
+ */
+
+/** @typedef {Object} CategoryCost -- execution cost for one asset category
+ * @property {string} category
+ * @property {number} fills
+ * @property {number} orders
+ * @property {number} quantity -- contracts or shares; 0 for conversions
+ * @property {Charge} commission
+ * @property {Charge} taxes
+ * @property {Charge} total
+ * @property {Charge|null} per_unit -- null where a per-unit cost is not a rate
+ *   anyone charges: a conversion's quantity is an amount of money
+ * @property {number} credit_fills
+ */
+
+/** @typedef {Object} FxPairCost -- one pair, split manual against automatic
+ * @property {string} symbol
+ * @property {number} conversions
+ * @property {number} notional_base
+ * @property {Charge} commission -- STATED commission, both legs
+ * @property {number|null} commission_bps -- comparable with totals.autofx.bps
+ * @property {FxLeg} auto -- IBKR's auto-conversion service: no commission, a
+ *   markup embedded in the rate instead
+ * @property {FxLegManual} manual
+ */
+
+/** @typedef {Object} FxLeg
+ * @property {number} conversions
+ * @property {number} notional_base
+ * @property {number} markup_base -- ESTIMATED at the published bps. A bare
+ *   number, not a Charge: no currency was ever billed for it
+ * @property {number} markup_high_base -- the same estimate at the measured bps
+ */
+
+/** @typedef {Object} FxLegManual
+ * @property {number} conversions
+ * @property {number} notional_base
+ * @property {Charge} commission
+ */
+
+/** @typedef {Object} FeeGroup -- account-level fees. NO asset attribution, ever
+ * @property {string} name
+ * @property {number} count
+ * @property {Charge} total
+ * @property {Array<string>} examples
+ */
+
+/** @typedef {Object} Withholding
+ * @property {string} symbol
+ * @property {string} currency
+ * @property {Charge} gross
+ * @property {Charge} withheld
+ * @property {number|null} effective_rate -- null with no matching dividend
+ */
+
+/** @typedef {Object} CostTotals -- the three-way split the tab is built on
+ * @property {Charge} attributable -- narrows with the scope
+ * @property {Charge} unattributable -- cannot be attributed at all, so never narrows
+ * @property {number} fills
+ * @property {number} credit_fills
+ * @property {AutoFx} autofx
+ * @property {FrictionTotals} friction
+ */
+
+/** @typedef {Object} AutoFx
+ * @property {number} conversions
+ * @property {number} notional_base
+ * @property {number} bps -- IBKR's published markup
+ * @property {number} measured_bps -- what a year of real conversions implied
+ */
+
+/** @typedef {Object} FrictionTotals -- measured and estimated, kept apart
+ * @property {Charge} stated -- what IBKR billed
+ * @property {number} estimated_low_base -- at the published bps
+ * @property {number} estimated_mid_base -- what the headline prints
+ * @property {number} estimated_high_base -- at the measured bps
+ * @property {number} total_low_base
+ * @property {number} total_mid_base
+ * @property {number} total_high_base
+ * @property {boolean} is_estimated -- whether any part was never billed
+ */
+
+/** @typedef {Object} Charge -- a cost, and the currencies it was BILLED in
+ *   (money.Charge). Money's three keys, plus the ledger behind them: `charged`
+ *   survives a mixed-currency scope where `native` must be withheld, which is
+ *   what lets the tab lead with one figure and dissect it without a request.
+ * @property {number} base
+ * @property {number|null} native -- as charged, when one currency accounts for all
+ * @property {string|null} ccy
+ * @property {Object<string,number>} charged -- amount per billing currency
  */
 
 /** @typedef {Object} Stats -- one period's numbers (stats.month_stats via stats_data)
@@ -514,6 +649,19 @@ import {
  *   byte-identical payloads. Same distinction `Scheduler.ever_ran` draws
  */
 
+/** @typedef {Object} Logbook -- the header dateline (serialize.logbook_data)
+ *
+ *  How long this log has been kept, which is the one thing the header's top slot
+ *  can say that no other surface does. Carries no position count on purpose: an
+ *  episode is per contract, so a strangle would read as two bets and contradict
+ *  the Positions tab. `logbookLine` names underlyings off `State.positions`
+ *  instead -- see `strategies.open_position_count` for why the count is the trap.
+ * @property {string|null} opened -- ISO day of first activity, a fill or a cash
+ *   row. Null on a journal where nothing has happened yet
+ * @property {number|null} day -- which day of the log today is, counting the
+ *   opening day as 1. Null exactly when `opened` is
+ */
+
 /** @typedef {Object} JobReply -- POST/GET /api/jobs/run (web._job_run,
  *  web._job_status)
  *
@@ -750,9 +898,12 @@ import {
  *  the guard to both. Declared here, in the file being edited, in the same
  *  diff as the code that introduces the name.
  * @payload st:State s:Stats best:Stats x:Episode ep:Episode dy:Day
- * @payload pos:Position o:Order l:Leg h:History c:Costs T:CostsTotals
- * @payload f:FxRow stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
+ * @payload pos:Position o:Order l:Leg h:History
+ * @payload stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
  * @payload mo:Money
+ * @payload bc:BrokerCosts CT:CostTotals F:FrictionTotals A:AutoFx ch:Charge
+ * @payload csc:CostSelection cc:CategoryCost fxr:FxPairCost fee:FeeGroup
+ * @payload whr:Withholding
  * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle
  * @payload res:SyncResponse pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
  * @payload e:Annotation
@@ -760,15 +911,17 @@ import {
  * @payload w:Watch wo:WatchOption
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
- * @local Math S TABS b sel m r el location window qs hs
- * @local cells days buckets evs glegs jrows lcs legs mons month months
+ * @payload lb:Logbook
+ * @local Math S TABS THEMES b sel m r el location window qs hs ids
+ * @local cells days buckets evs glegs lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
  * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen withEvents ws opts thin
  * @local countries impacts shownByDay next want picked
  * @local JSON Object ages input mine qb wf behind was
- * @local when button
+ * @local when button parts names
+ * @local COST_OPTIONS bits cost fees on wh
  */
 
 const $=s=>document.querySelector(s);
@@ -782,6 +935,21 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      A future scrubber POSITION would not belong in the hash: that is an
      inspection inside an open panel, not which panel is open. */
   calday:null,replay:null,
+  /* The Costs tab's scope: an ARRAY, because it is a multi-select and the four
+     options are not mutually exclusive. Null means "not chosen", which the
+     server answers with its own default (the journal's own category) -- so the
+     page does not carry a duplicate of that decision and cannot disagree with
+     it. Kept out of `type`, which is the single-select filter the other tabs
+     share: one control that means "pick one" and another that means "pick any"
+     cannot share a state key without one of them lying about the other. */
+  cost:null,
+  /* The active theme id, IN the hash for the same reason the display currency
+     is: it is a presentation choice a reload should not silently discard, and a
+     link then carries the palette you were looking at. Deliberately not
+     localStorage -- this page persists no other preference that way, and one
+     setting stored somewhere the URL cannot express is a setting that
+     disagrees with a shared link. */
+  theme:null,
   /* Which market day is expanded. NOT in the hash, unlike calday:
      the market strip always has a sensible default (today, or the
      first day with events), so there is no state a reload could
@@ -941,6 +1109,91 @@ function renderTabs(){
       >${esc(label)}</button>`).join('');
   document.querySelectorAll('.tab[data-tab]').forEach(b=>
     b.onclick=()=>{S.tab=b.dataset.tab;draw(true);});
+}
+
+/* ------------------------------------------------ themes
+
+   [id, label]. The id is the `data-theme` attribute value, and app.css holds one
+   block per id -- so adding a theme is a CSS block plus a line here, with no
+   JavaScript to touch. Leather is first because it is what `:root` carries: a
+   page whose attribute is absent or unrecognised is already fully styled in it,
+   which is why an unknown id in the URL can heal to nothing rather than needing
+   a fallback stylesheet.
+
+   The label is what the edition chip shows, so it reads "Leather Edition" --
+   which is what that chip claimed statically before any of this existed. It is
+   now true rather than decorative, and it is the control that changes it. */
+const THEMES=[
+  ['leather','Leather'],
+  ['admiralty','Admiralty'],
+  ['oxblood','Oxblood'],
+];
+const THEME_IDS=()=>THEMES.map(t=>t[0]);
+const themeLabel=id=>(THEMES.find(t=>t[0]===id)||THEMES[0])[1];
+/* On <html>, not <body>: `:root` is where the default block lives, so both the
+   default and every override then resolve against the same element and a theme
+   cannot half-apply to a page whose body has not parsed yet. */
+function applyTheme(){
+  document.documentElement.dataset.theme=S.theme||THEMES[0][0];
+  const chip=$('#edition');
+  if(chip) chip.textContent=themeLabel(S.theme||THEMES[0][0])+' Edition';
+}
+/* Cycles rather than opening a menu. Three themes is too few to earn a dropdown
+   -- and the chip is 10.5px, so a caret on it would be decoration rather than an
+   affordance. `title` says what it does, because a chip that reads as a label is
+   not obviously clickable. */
+function nextTheme(){
+  const ids=THEME_IDS();
+  return ids[(ids.indexOf(S.theme||ids[0])+1)%ids.length];
+}
+
+/* ------------------------------------------------ the log's dateline
+
+   What the header's kicker says, and the reason it is computed rather than
+   written: see the note on #kicker in the markup. Three clauses, each dropped
+   rather than faked when its fact is absent, so the line never states something
+   the journal cannot back:
+
+     LOG DAY 348 · SINCE 28 AUG 2025 · CARRYING TSLA GOOG META PLTR
+     LOG DAY 348 · SINCE 28 AUG 2025 · FLAT          <- nothing open
+     BITÁCORA                                        <- empty journal
+
+   `CARRYING` names UNDERLYINGS, not contracts and not a count. A strangle is
+   two contracts on one name, so "6" here would have contradicted the Positions
+   tab's three cards -- the exact disagreement `open_position_count` was written
+   to end. Names sidestep the question: two legs on GOOG are one GOOG either
+   way. Read from `state.positions`, the same snapshot rows the Positions tab
+   renders, so the header cannot drift from the tab. */
+const KICKER_NAMES=4;
+function logbookLine(){
+  const st=S.state||{}, lb=st.logbook||{};
+  /* No first day means nothing has happened in this account, so there is no
+     log to be on day N of. The title alone carries the header. */
+  if(!lb.day) return 'Bitácora';
+  const parts=['Log day '+lb.day];
+  if(lb.opened){
+    const[y,m,d]=String(lb.opened).split('-');
+    if(y&&m&&d) parts.push('since '+(+d)+' '+MONTHS[+m-1]+' '+y);
+  }
+  /* Distinct, in first-appearance order. `positions_data` sorts its rows by
+     expiry then strike, so the name holding the nearest expiry lands first and
+     the soonest thing to need a decision leads the line. A Set preserves
+     insertion order, which is what makes that free rather than a second sort. */
+  const names=[...new Set((st.positions||[])
+    .map(pos=>pos.underlying_symbol||pos.symbol||'')
+    .filter(Boolean))];
+  /* Truncated rather than allowed to wrap under the title: this is a 10.5px
+     letterspaced line in a fixed header, and a book of a dozen names would
+     push the title down the page. The overflow is counted, not silently
+     dropped -- "+3 more" is honest about what is not shown. */
+  if(!names.length) parts.push('flat');
+  else parts.push('carrying '+names.slice(0,KICKER_NAMES).join(' ')
+    +(names.length>KICKER_NAMES?' +'+(names.length-KICKER_NAMES)+' more':''));
+  return parts.join(' · ');
+}
+function renderKicker(){
+  const el=$('#kicker'); if(!el)return;
+  el.textContent=logbookLine();
 }
 
 /* ------------------------------------------------ display-currency toggle */
@@ -2241,59 +2494,279 @@ function positions(){
 }
 
 /* ------------------------------------------------ costs */
+/* This tab answers one question -- what has the broker cost me -- and its whole
+   design is about not overstating the answer. Three rules run through it:
+
+   1. THE SCOPE IS THE READER'S. Four selectable options, and they are not
+      mutually exclusive, so the control is a multi-select (`.multi`) rather than
+      the segmented `.seg` every other tab uses. The server owns the default and
+      echoes back the scope it measured, so a caption can never name a scope the
+      figures did not come from.
+   2. CHARGED AND ESTIMATED NEVER MERGE SILENTLY. Roughly a quarter of this
+      account's friction is the AutoFX rate markup, which IBKR never itemised in
+      any currency. The headline prints the midpoint of its range because a
+      headline has to print something, and the range sits immediately beneath it.
+   3. A COST IS SHOWN IN THE CURRENCY IT WAS BILLED IN. `Charge` carries the whole
+      per-currency ledger, so widening the scope adds columns instead of
+      collapsing four exact charges into one restatement. The base total is
+      labelled as the translation it is. */
+
+/** The scope selector. Options that ARE asset categories, plus 0DTE, which is
+ * not -- it is a subset of options, so it renders as a modifier (dashed) and
+ * narrows whatever categories are in scope rather than adding a fifth. */
+const COST_OPTIONS=[
+  ['OPT','Options',false],
+  ['STK','Stocks',false],
+  ['CASH','FX conversions',false],
+  ['0DTE','0DTE',true],
+];
+function costScope(){
+  /* The SERVER's answer, not S.cost: with nothing chosen S.cost is null and the
+     server applied its own default, so reading local state would leave every
+     chip unlit on first load while the figures below described a real scope. */
+  const csc=(S.state.broker_costs||{}).scope||{};
+  const on=new Set(csc.categories||[]);
+  if(csc.subset) on.add(csc.subset);
+  return `<div class="filters">
+    <div><div class="flabel">Costs to include</div>
+      <div class="multi">${COST_OPTIONS.map(([key,label,sub])=>{
+        const sel=on.has(key);
+        const n=(S.state.asset_counts||{})[key];
+        /* 0DTE is offerable exactly when the journal HAS 0DTE round trips,
+           derived from the payload the 0DTE tab already reads -- not asserted
+           here, which is the defect its own tab's disabled reason once carried. */
+        const live=key==='0DTE'?odteSelectable():(key==='OPT'||n>0);
+        return `<button data-cost="${esc(key)}" class="${sel?'on':''}${
+          sub?' subset':''}" ${live?'':'disabled'} title="${esc(
+          costOptionNote(key,label,sub,live))}">${esc(label)}</button>`;
+      }).join('')}</div></div>
+  </div>${costScopeNote(csc)}`;
+}
+function costOptionNote(key,label,sub,live){
+  if(!live) return key==='0DTE'
+    ? 'Nothing in the archive was opened on its own expiry date.'
+    : `No ${label.toLowerCase()} in the journal.`;
+  if(sub) return 'A subset of options, not a fourth category: narrows whichever '
+    +'categories are selected to the round trips opened on their own expiry date.';
+  if(key==='CASH') return 'Currency conversions. Includes the AutoFX rate markup, '
+    +'which IBKR never itemises -- an estimate, shown as a range.';
+  return `Commission and taxes on ${label.toLowerCase()}, as billed.`;
+}
+/* Says what a selection did NOT change, which is the honest half. Fees carry no
+   asset category, so no selection narrows them; a reader who ticks Options and
+   sees the total move but the fee block stand still deserves to know why here
+   rather than by inferring it. */
+function costScopeNote(csc){
+  const bits=[];
+  if(csc.is_subset) bits.push(`<b>${esc(csc.subset)} only.</b> Commission and taxes
+    are restricted to those round trips.`);
+  bits.push(`Account fees and withholding carry no asset category, so they are
+    shown whole at every selection and never narrow with it.`);
+  return `<div class="note">${bits.join(' ')}</div>`;
+}
+
+/** One line per currency a cost was actually billed in, plus the base
+ * translation labelled as derived. This is what `Charge` buys over `Money`:
+ * under a mixed scope the ledger survives where a single figure cannot. */
+function ledger(ch,{calc=true}={}){
+  const rows=Object.entries((ch&&ch.charged)||{})
+    .sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]));
+  if(!rows.length) return '';
+  /* One charge in the display currency needs no reconciliation line: the charge
+     IS the figure, and adding "= €15.16" beside "$17.46" when the reader asked
+     for dollars would restate the very number they came for. */
+  const single=rows.length===1&&rows[0][0]===DISP();
+  return `<div class="ledger">
+    ${rows.map(([c,a])=>`<span class="amt"><span class="c">${esc(c)}</span>${
+      esc(num(Math.abs(a),dp(a)))}</span>`).join('')}
+    ${calc&&!single?`<span class="amt calc tipped" tabindex="0">= ${
+      cash(Math.abs(ch.base))}<span class="tip">The base-currency translation:
+      each charge converted at IBKR's own rate for its own date, then summed.
+      Addable, and never exactly what left the account.</span></span>`:''}
+  </div>`;
+}
+
 function costs(){
-  const c=(S.state.costs||[])[0];
-  if(!c) return `<div class="card"><div class="empty">no statement to analyse</div></div>`;
-  const T=c.totals;
-  const scope=c.journal_asset||'OPT';
-  /* Two blocks, not one. T.commission_base spans the whole IBKR account, so
-     showing it as "Commission" under a journal scoped to options presented
-     stock cost as this journal's. journal_* is the attributable figure. */
-  /* Same as-charged rule the Dashboard uses: the figure IBKR billed, when the
-     reader is already in that currency. Costs is where this matters most --
-     the tab exists to answer what trading actually cost. */
-  const jrows=[[scope+' commission', moneyOf(T.journal_commission),
-    isNative(T.journal_commission)?'as charged':'stated']];
-  if(T.journal_taxes.base) jrows.push([scope+' taxes',moneyOf(T.journal_taxes),
-    isNative(T.journal_taxes)?'as charged':'stated']);
-  /* Per contract, not a repeat of the total. With commission as the only
-     component, a "journal friction" card would restate the figure beside
-     itself; the per-unit rate is the one that predicts cost at volume. */
-  /* One Money, so the per-unit figure cannot be as-charged over a restated
-     divisor -- serialize divides both halves by the same quantity. */
-  if(T.journal_per_unit!=null)
-    jrows.push(['Per contract',
-      isNative(T.journal_per_unit)
-        ? money(T.journal_per_unit.native,T.journal_per_unit.ccy,4)
-        : cash(T.journal_per_unit.base,4),
-      'charged per unit, not per euro']);
-  else jrows.push(['Journal friction',moneyOf(T.journal_friction),'stated only']);
-  /* No account-level block by request: commission on other instruments and
-     account fees are not options information. The FX table below stays — AutoFX
-     markup is a cost of converting to trade at all, not a stock cost. */
-  return `<div class="card">
-    <div class="crow"><div><h2>Cost &amp; friction</h2>
-      <div class="sub">${esc(c.from_date)} → ${esc(c.to_date)} ·
-        ${esc(S.state.costs_source||'')} · ${esc(scope)}-attributable costs and FX only</div></div>
-      <div class="pills"><span class="pill">${esc(scope)} <b>${
-        moneyOf(T.journal_friction)}</b></span></div>
+  const bc=S.state.broker_costs;
+  if(!bc) return costScope()
+    +`<div class="card"><div class="empty">no cost data</div></div>`;
+  const CT=bc.totals, F=CT.friction;
+  const nothing=!CT.fills&&!CT.unattributable.base;
+  if(nothing) return costScope()
+    +`<div class="card"><div class="empty">nothing in this selection</div></div>`;
+  /* The headline is ONE figure, and it is the midpoint when any of it is
+     estimated. Its range and its composition are both one hover away, and the
+     line under it states the split unconditionally -- so the number can be read
+     quickly and cannot be mistaken for a measurement. */
+  const headline=F.is_estimated?F.total_mid_base:F.total_low_base;
+  const est=F.estimated_mid_base;
+  return `${costScope()}
+  <div class="card">
+    <div class="crow"><div><h2>Broker cost${F.is_estimated?`<span
+      class="info tipped" tabindex="0"><span class="tip">Part of this total was
+      never itemised by IBKR. The AutoFX rate markup is estimated from a
+      published rate, so the figure shown is the midpoint of
+      ${cash(F.total_low_base)}–${cash(F.total_high_base)}.</span>i</span>`:''}</h2>
+      <div class="sub">${esc(costPeriod(bc))} ·
+        ${CT.fills} fill(s) · ${esc(costScopeLabel(bc.scope))} · ${esc(ccyNote())}</div></div>
+      <div class="pills">
+        <span class="pill tipped" tabindex="0">charged <b>${
+          cash(F.stated.base)}</b><span class="tip">What IBKR billed, summed from
+          the per-currency charges below. A measurement, not an estimate.</span></span>
+        ${F.is_estimated?`<span class="pill tipped" tabindex="0">estimated <b>${
+          cash(est)}</b><span class="tip">The AutoFX rate markup on ${
+          num(CT.autofx.notional_base,0)} ${esc(BASE())} converted across ${
+          CT.autofx.conversions} auto-conversion(s). IBKR publishes ${
+          CT.autofx.bps} bps and describes it as typical and at its discretion; a
+          year of this account's conversions implied ${CT.autofx.measured_bps} bps.
+          Shown here as the midpoint of ${cash(F.estimated_low_base)}–${
+          cash(F.estimated_high_base)}.</span></span>`:''}
+      </div>
     </div>
-    <h2 class="sub2 mt-2">${esc(scope)} — attributable to this journal</h2>
-    <div class="stats">
-      ${jrows.map(r=>statCard(r[0],r[1],r[2],'sm')).join('')}
+    <div class="hero">
+      <div class="fig${F.is_estimated?' est':''}">${cash(headline)}</div>
+      <div class="split">${cash(F.stated.base)} charged${F.is_estimated
+        ?` · ${cash(F.estimated_low_base)}–${cash(F.estimated_high_base)} estimated`
+        :` · nothing estimated`}</div>
     </div>
-    <div class="card inner">
-      <h2 class="sub2">FX conversions</h2>
-      <table><thead><tr><th>pair</th><th class="n">n</th><th class="n">notional</th>
-        <th class="n">AutoFX</th><th class="n">markup @3bps</th></tr></thead><tbody>
-        ${c.fx.map(f=>`<tr><td class="mono">${esc(f.symbol)}</td>
-          <td class="n mono">${f.conversions}</td>
-          <td class="n mono">${cash(f.notional_base)}</td>
-          <td class="n mono">${f.autofx_conversions}</td>
-          <td class="n mono">${cash(f.autofx_spread_base)}</td></tr>`).join('')}
-      </tbody></table>
-      <div class="note">${esc(c.fx_caveat||'')}</div>
-    </div>
+    ${ledger(F.stated)}
+    ${costCategories(bc)}
+    ${costFx(bc)}
+    ${costAside(bc)}
+  </div>`;
+}
+/* The span the figures cover, from the first and last fill IN SCOPE. With
+   nothing in scope there are no dates, and "→" alone read as a range that failed
+   to load rather than as a selection matching no trade -- the fees below it are
+   real, so the caption has to say which of the two it is. */
+function costPeriod(bc){
+  return bc.from_date&&bc.to_date
+    ? `${bc.from_date} → ${bc.to_date}`
+    : 'no trades in this selection';
+}
+/* Names the scope in the same vocabulary the chips use, from the payload's own
+   echo -- so the caption and the figures cannot describe different selections. */
+function costScopeLabel(csc){
+  const names=(csc.categories||[]).map(c=>{
+    const found=COST_OPTIONS.find(o=>o[0]===c);
+    return found?found[1]:c;
+  });
+  const base=names.length?names.join(' + '):'everything';
+  return csc.subset?`${base}, ${csc.subset} only`:base;
+}
+
+/** Per category: what it was billed, and what that is per contract or share.
+ * A table rather than stat cards because the interesting reading is a COMPARISON
+ * down the per-unit column, and cards put the figures on separate lines. */
+function costCategories(bc){
+  const rows=bc.by_category||[];
+  if(!rows.length) return '';
+  const anyQty=rows.some(cc=>cc.per_unit!=null);
+  return `<div class="card inner">
+    <h2 class="sub2">Charged per category</h2>
+    <table><thead><tr><th>category</th><th class="n">fills</th>
+      <th class="n">orders</th><th class="n">quantity</th>
+      <th class="n">commission</th><th class="n">taxes</th>
+      ${anyQty?`<th class="n">per unit</th>`:''}</tr></thead><tbody>
+      ${rows.map(cc=>`<tr><td class="mono">${esc(cc.category)}</td>
+        <td class="n mono">${cc.fills}</td>
+        <td class="n mono">${cc.orders}</td>
+        <td class="n mono">${cc.quantity?num(cc.quantity,cc.quantity%1?4:0):'—'}</td>
+        <td class="n mono">${chargeFig(cc.commission)}</td>
+        <td class="n mono">${cc.taxes.base?chargeFig(cc.taxes):'—'}</td>
+        ${anyQty?`<td class="n mono">${cc.per_unit==null
+          /* Not a gap: a conversion's quantity is an amount of money, so cost
+             per unit would be commission per euro. The dash says "not a rate". */
+          ?`<span class="nil tipped" tabindex="0">n/a<span class="tip">A
+            conversion's quantity is an amount of money, so a per-unit cost would
+            be commission per euro -- not a rate anyone charges.</span></span>`
+          :chargeFig(cc.per_unit,4)}</td>`:''}</tr>`).join('')}
+    </tbody></table>
+    ${bc.totals.credit_fills?`<div class="note">${bc.totals.credit_fills} fill(s)
+      carried a commission CREDIT, netted off rather than added — IBKR issues one
+      when it adjusts a per-order minimum across a split order.</div>`:''}
+  </div>`;
+}
+/* A charge as one figure: the amount as billed when one currency accounts for
+   it, else the base translation. Same rule as `moneyOf`, which it delegates to --
+   a Charge payload carries Money's three keys precisely so this can. */
+const chargeFig=(ch,places)=>ch==null?'—'
+  :(places!=null&&isNative(ch)?money(Math.abs(ch.native),ch.ccy,places)
+   :places!=null?cash(Math.abs(ch.base),places):moneyOf(ch));
+
+/** Conversions, with the two legs kept apart: a manual conversion pays a stated
+ * commission, an auto-conversion pays a markup buried in the rate. Both in bps,
+ * because that is the only way to see that the "free" one is not cheaper. */
+function costFx(bc){
+  const rows=bc.fx||[];
+  if(!rows.length) return '';
+  const A=bc.totals.autofx;
+  return `<div class="card inner">
+    <h2 class="sub2">Currency conversions</h2>
+    <div class="sub">A manual conversion pays commission; an auto-conversion pays
+      a rate markup instead, which IBKR does not itemise. Both shown in bps so
+      they are comparable.</div>
+    <table><thead><tr><th>pair</th><th class="n">n</th>
+      <th class="n">notional</th><th class="n">commission</th><th class="n">bps</th>
+      <th class="n">auto n</th><th class="n">auto notional</th>
+      <th class="n">markup @${A.bps}bps</th></tr></thead><tbody>
+      ${rows.map(fxr=>`<tr><td class="mono">${esc(fxr.symbol)}</td>
+        <td class="n mono">${fxr.conversions}</td>
+        <td class="n mono">${cash(fxr.notional_base)}</td>
+        <td class="n mono">${fxr.commission.base?chargeFig(fxr.commission):'—'}</td>
+        <td class="n mono">${fxr.commission_bps==null?'—':num(fxr.commission_bps,2)}</td>
+        <td class="n mono">${fxr.auto.conversions||'—'}</td>
+        <td class="n mono">${fxr.auto.notional_base?cash(fxr.auto.notional_base):'—'}</td>
+        <td class="n mono ${fxr.auto.markup_base?'dim':''}">${
+          fxr.auto.markup_base?'≈'+cash(fxr.auto.markup_base):'—'}</td></tr>`).join('')}
+    </tbody></table>
+    ${A.notional_base?`<div class="note">The markup column is an ESTIMATE: IBKR
+      reports no commission on an auto-conversion because the cost is in the rate
+      it gave you. ${A.bps} bps is the published figure and this account's own year
+      of conversions implied ${A.measured_bps}, so the true total sits near ${
+      cash(A.notional_base*A.bps/10000)}–${
+      cash(A.notional_base*A.measured_bps/10000)}.</div>`
+      :`<div class="note">No conversion carries the AutoFX flag, so no rate markup
+        is estimated; the commission shown is what IBKR reported.</div>`}
+  </div>`;
+}
+
+/** Fees and withholding: real money, attributable to nothing. Always shown,
+ * because a total that hid them under a narrow scope would be measuring less
+ * than the tab claims -- and set apart, because they are a different KIND of
+ * figure rather than a warning about the ones above. */
+function costAside(bc){
+  const fees=bc.fees||[], wh=(bc.withholding||[]).filter(whr=>whr.withheld.base);
+  if(!fees.length&&!wh.length) return '';
+  const U=bc.totals.unattributable;
+  return `<div class="aside">
+    <h2>Account-level — attributable to nothing</h2>
+    <div class="sub">Levied on the account, not on a trade: no fee row carries a
+      contract or trade id, so these cannot be split across instruments and do
+      not narrow with the selection above.</div>
+    ${fees.length?`<table><thead><tr><th>fee</th><th class="n">n</th>
+      <th class="n">total</th><th>example</th></tr></thead><tbody>
+      ${fees.map(fee=>`<tr><td>${esc(fee.name)}</td>
+        <td class="n mono">${fee.count}</td>
+        <td class="n mono">${chargeFig(fee.total)}</td>
+        <td class="dim2">${esc((fee.examples||[])[0]||'')}</td></tr>`).join('')}
+    </tbody></table>
+    ${ledger(U)}`:''}
+    ${wh.length?`<h2 class="mt-2">Dividend withholding</h2>
+    <div class="sub">Not a broker charge — the broker forwards it — but a
+      recurring loss, and the effective rate is how a non-treaty rate shows up.</div>
+    <table><thead><tr><th>symbol</th><th>ccy</th><th class="n">gross</th>
+      <th class="n">withheld</th><th class="n">effective</th></tr></thead><tbody>
+      ${wh.map(whr=>`<tr><td class="mono">${esc(whr.symbol||'—')}</td>
+        <td class="mono">${esc(whr.currency||'')}</td>
+        <td class="n mono">${whr.gross.base?chargeFig(whr.gross):'—'}</td>
+        <td class="n mono">${chargeFig(whr.withheld)}</td>
+        <td class="n mono">${whr.effective_rate==null
+          ?`<span class="nil tipped" tabindex="0">n/a<span class="tip">No matching
+            dividend, so there is no gross to take a percentage of — withholding
+            on credit interest arrives without one.</span></span>`
+          :pct(whr.effective_rate)}</td></tr>`).join('')}
+    </tbody></table>`:''}
   </div>`;
 }
 
@@ -2806,6 +3279,19 @@ function applyHash(){
      nothing in this one, and applyHash runs before the state it would check. */
   S.calday=hs.get('calday')||null;
   S.replay=hs.get('replay')||null;
+  /* Validated against the registry, like the tab: an unknown id would otherwise
+     put an unstyled `data-theme` on <html>, where the attribute matches no block
+     and the page silently falls back to `:root` while the chip claims the bogus
+     name. Healing to null instead means the chip and the palette agree. */
+  const th=(hs.get('theme')||'').toLowerCase();
+  S.theme=THEME_IDS().includes(th)?th:null;
+  /* Repeated key, not a delimited string: `#cost=OPT&cost=CASH`. URLSearchParams
+     already models a repeated key, and `getAll` is the whole parser -- inventing
+     a separator would mean the page and the server each carrying a split rule
+     that has to agree. Empty stays null ("not chosen") rather than becoming an
+     empty array, which the server would read as a selection of nothing. */
+  const cost=hs.getAll('cost').filter(Boolean);
+  S.cost=cost.length?cost:null;
 }
 function syncHash(push){
   const hs=new URLSearchParams();
@@ -2818,6 +3304,14 @@ function syncHash(push){
   if(S.ccy&&S.ccy!==BASE()) hs.set('ccy',S.ccy);
   if(S.calday) hs.set('calday',S.calday);
   if(S.replay) hs.set('replay',S.replay);
+  /* Leather is what `:root` already carries, so recording it would put a key in
+     every URL to say "the default" -- the same rule the display currency follows
+     for the account base. */
+  if(S.theme&&S.theme!==THEMES[0][0]) hs.set('theme',S.theme);
+  /* `append`, so the multi-select round-trips as the repeated key applyHash
+     reads. `set` would keep only the last one and silently narrow a four-way
+     selection to one on the next reload. */
+  (S.cost||[]).forEach(c=>hs.append('cost',c));
   const next=hs.toString()?'#'+hs:'';
   if(next===(location.hash||'')) return;
   /* A tab jump is a navigation, so it pushes and the back button walks tabs.
@@ -2853,6 +3347,10 @@ function draw(push){
   replayStop();
   syncHash(push);
   renderTabs();
+  /* Before the body renders, not after: the attribute drives every colour on the
+     page, so setting it later would paint one frame in the old palette. */
+  applyTheme();
+  renderKicker();
   renderCcy();
   const views={dashboard,calendar,trades,positions,costs,annual,odte,market,
     watchlist};
@@ -2907,8 +3405,30 @@ function draw(push){
   document.querySelectorAll('.seg button[data-type]').forEach(b=>
     b.onclick=()=>{const t=b.dataset.type||null;
       if(t===S.type)return; S.type=t; load();});
+  /* The cost scope TOGGLES rather than selects: this is a multi-select, so a
+     click flips one option and leaves the rest alone. Seeded from the scope the
+     server reported rather than from S.cost, which is null until the reader has
+     touched anything -- reading it would make the first click discard the default
+     selection instead of adding to it.
+
+     Deselecting the last option leaves an EMPTY array, not null: "nothing
+     selected" is a real answer and shows an empty state, where null would silently
+     restore the default and make the click look ignored. A reload costs a request
+     because commission is summed server-side under the new predicate. */
+  document.querySelectorAll('.multi button[data-cost]').forEach(b=>
+    b.onclick=()=>{
+      const csc=(S.state.broker_costs||{}).scope||{};
+      const on=new Set(csc.categories||[]);
+      if(csc.subset) on.add(csc.subset);
+      const key=b.dataset.cost;
+      if(on.has(key)) on.delete(key); else on.add(key);
+      S.cost=[...on];
+      load();
+    });
   /* The calendar's filter chips are a PURE REDRAW: every event is already in the
      payload and both axes are filtered client-side, so narrowing costs no request.
+     Unlike the cost scope above, which reloads: that predicate is summed
+     server-side, whereas every calendar event is already here.
      Clearing the day selection is the point -- the chosen day may hold nothing
      under the new filter, and a stale selection would open an empty panel.
 
@@ -3171,6 +3691,9 @@ async function load(){
   const qs=new URLSearchParams();
   if(S.month) qs.set('month',S.month);
   if(S.type) qs.set('type',S.type);
+  /* Same repeated key on the wire as in the hash, so one vocabulary spans URL,
+     request and payload -- `parse_qs` hands the server the list directly. */
+  (S.cost||[]).forEach(c=>qs.append('cost',c));
   const r=await fetch('/api/state'+(qs.toString()?'?'+qs:''));
   if(!r.ok){note('Could not read state: HTTP '+r.status,'bad');return;}
   S.state=await r.json();
@@ -3188,6 +3711,11 @@ async function load(){
 }
 
 $('#cog').onclick=()=>{S.showCog=!S.showCog;draw();};
+/* The edition chip IS the theme control. `draw()` without a push, because
+   recolouring is an adjustment to the view you are on rather than a navigation --
+   the same rule the currency toggle and the filters follow, and pushing here
+   would bury the tab trail under one entry per click. */
+$('#edition').onclick=()=>{S.theme=nextTheme();draw();};
 $('#sync').onclick=async()=>{
   if(!confirm('Fetch from IBKR now?\n\nThis spends one request against your Flex '
     +'request budget. IBKR locks out clients that ask too often.')) return;

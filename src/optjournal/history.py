@@ -28,9 +28,10 @@ Three properties of IBKR's data drive the design:
   snapshot: absent from the snapshot means flat, present means still open.
   This is the second place snapshots carry information trades cannot.
 
-Note codes arrive semicolon-joined ('AFx;P'), so tokens are split and matched
-exactly. Substring matching would read 'AFx' (AutoFX) as 'A' (Assignment),
-and 'SL' is a tax lot-matching method, not a closure type.
+Note codes are read through `notes.py`, which owns that rule for both readers of
+them: tokens are split and matched exactly, because substring matching would read
+'AFx' (AutoFX) as 'A' (Assignment). 'SL' is a tax lot-matching method, not a
+closure type. `split_notes` is re-exported here, where its callers already look.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from datetime import datetime
 from typing import Any
 
 from optjournal.money import win_rate
+from optjournal.notes import split_notes
 
 __all__ = [
     "Episode",
@@ -76,13 +78,6 @@ def _flat(qty: int | float) -> bool:
 #: Ordering of dispositions when a multi-fill close carries several codes.
 #: Assignment and exercise are more specific outcomes than expiry.
 _DISPOSITION_RANK = {"ASSIGNED": 3, "EXERCISED": 2, "EXPIRED": 1}
-
-
-def split_notes(notes: str | None) -> tuple[str, ...]:
-    """Split a stored notes field into exact code tokens."""
-    if not notes:
-        return ()
-    return tuple(tok for tok in (p.strip() for p in notes.split(";")) if tok)
 
 
 def disposition_of(notes: str | None) -> str | None:

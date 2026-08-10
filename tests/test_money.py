@@ -7,7 +7,7 @@ therefore drifted. See money.py's docstring for the defects that motivated it.
 
 import pytest
 
-from optjournal.money import Money, one_currency
+from optjournal.money import Charge, Money, one_currency
 
 
 def test_one_currency_answers_only_for_a_single_currency_scope():
@@ -154,6 +154,98 @@ def test_the_payload_shape_is_stable_so_the_page_tests_for_null():
         "base": 9.16, "native": None, "ccy": None,
     }
     assert set(Money.restated(0.0).payload()) == {"base", "native", "ccy"}
+
+
+# --- Charge: a cost that keeps every currency it was billed in ---------------
+#
+# `Money` withholds the native figure the moment a scope spans currencies, which
+# is right for any figure and wrong for a cost report the reader scopes: the
+# charges are all still known, so widening from options to the whole account
+# should add columns, not delete exactness. These pin that difference.
+
+
+def test_a_charge_keeps_every_billing_currency():
+    """The property `Money.gated` cannot express: four charges, none discarded."""
+    c = Charge.of([
+        (15.16, 17.46, "USD"),
+        (1.66, 1.66, "EUR"),
+        (18.90, 208.41, "SEK"),
+    ])
+    assert c.by_ccy == {"USD": 17.46, "EUR": 1.66, "SEK": 208.41}
+    assert c.base == pytest.approx(35.72)
+
+
+def test_a_single_currency_charge_still_answers_as_money():
+    """Where the two types overlap they must agree, or a reader checking one
+    surface against another finds two different figures for one cost."""
+    c = Charge.of([(15.16, 17.46, "USD")])
+    assert c.money == Money(base=15.16, native=17.46, currency="USD")
+    assert c.money.is_exact
+
+
+def test_a_mixed_charge_withholds_the_single_figure_but_not_the_ledger():
+    """The whole point: the headline falls back to base, the detail survives.
+
+    `Money.gated`'s rule is delegated to rather than reimplemented, so the
+    fallback can never disagree with the rest of the payload.
+    """
+    c = Charge.of([(15.16, 17.46, "USD"), (18.90, 208.41, "SEK")])
+    assert not c.money.is_exact
+    assert c.money.base == pytest.approx(34.06)
+    assert c.by_ccy == {"USD": 17.46, "SEK": 208.41}
+
+
+def test_charges_add_by_merging_their_ledgers():
+    """Addition is what makes the tab scopeable: the page sums the categories
+    the reader ticked, and each currency stays its own column through the sum."""
+    opt = Charge.of([(15.16, 17.46, "USD")])
+    stk = Charge.of([(1.66, 1.66, "EUR"), (4.46, 5.16, "USD")])
+    total = opt + stk
+    assert total.by_ccy == {"USD": pytest.approx(22.62), "EUR": 1.66}
+    assert total.base == pytest.approx(21.28)
+    # Addition does not mutate either operand -- both are frozen.
+    assert opt.by_ccy == {"USD": 17.46}
+
+
+def test_a_zero_amount_currency_is_not_a_currency():
+    """Same rule as `one_currency`, applied at construction.
+
+    A USD option scope plus a zero-commission EUR conversion row is a USD
+    charge; carrying `EUR: 0.0` would make it mixed and cost it its exactness.
+    """
+    c = Charge.of([(15.16, 17.46, "USD"), (0.0, 0.0, "EUR")])
+    assert c.by_ccy == {"USD": 17.46}
+    assert c.money.is_exact
+
+
+def test_nothing_charged_is_distinct_from_an_estimated_cost():
+    """Two different zeros, and the AutoFX markup is the reason it matters.
+
+    An empty ledger with a zero base is "no cost". An empty ledger with a
+    non-zero base is a cost IBKR never itemised in any currency -- the rate
+    markup -- and it must never render as an as-charged figure.
+    """
+    assert Charge.of([]).is_free
+    estimated = Charge(base=12.83)
+    assert not estimated.is_free
+    assert not estimated.money.is_exact
+    assert estimated.by_ccy == {}
+
+
+def test_charge_payload_carries_moneys_keys_plus_the_ledger():
+    """A consumer already reading a money-shaped payload needs no new branch."""
+    p = Charge.of([(15.16, 17.46, "USD")]).payload()
+    assert p == {"base": 15.16, "native": 17.46, "ccy": "USD",
+                 "charged": {"USD": 17.46}}
+    assert set(Charge.of([]).payload()) == {"base", "native", "ccy", "charged"}
+
+
+def test_charge_magnitude_carries_every_currency():
+    """Cost is presented positive, and taking the magnitude of the total while
+    leaving the ledger signed would make the breakdown disagree with it."""
+    c = abs(Charge.of([(-15.16, -17.46, "USD"), (-18.90, -208.41, "SEK")]))
+    assert c.base == pytest.approx(34.06)
+    assert c.by_ccy == {"USD": 17.46, "SEK": 208.41}
 
 
 def test_money_stays_a_leaf_module():

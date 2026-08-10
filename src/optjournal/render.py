@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from typing import Any
 
 __all__ = [
+    "render_friction",
     "render_history",
     "render_orders",
     "render_positions",
@@ -322,6 +323,126 @@ def render_statements(data: list[Row], *, limit: int = 0) -> str:
     )
 
 
+
+
+def render_friction(data: Row) -> str:
+    """The DB-backed cost report as plain text.
+
+    Same three-part shape the web tab uses, for the same reason: what narrows with
+    the scope, what cannot be attributed at all, and what was never billed. The
+    estimate is printed as a RANGE rather than a single figure -- a terminal report
+    that collapsed it would be the one surface where the uncertainty disappears.
+    """
+    cur = data["base_currency"]
+    scope = data["scope"]
+    totals = data["totals"]
+    friction = totals["friction"]
+    out: list[str] = []
+
+    label = " + ".join(scope["categories"]) if scope["categories"] else "everything"
+    if scope["subset"]:
+        label += f", {scope['subset']} only"
+    span = (
+        f"{data['from_date']} .. {data['to_date']}"
+        if data["from_date"]
+        else "no trades in this selection"
+    )
+    out.append(f"Broker cost  {span}  ({label}, base {cur})")
+
+    low, high = friction["total_low_base"], friction["total_high_base"]
+    if friction["is_estimated"]:
+        out.append(
+            f"  total{_money(friction['total_mid_base']):>16}"
+            f"   range {_money(low)} .. {_money(high)}"
+        )
+    else:
+        out.append(f"  total{_money(low):>16}")
+    out.append(f"  charged{_money(friction['stated']['base']):>14}   as billed:")
+    for code, amount in sorted(
+        (friction["stated"].get("charged") or {}).items(),
+        key=lambda kv: -abs(kv[1]),
+    ):
+        out.append(f"    {code:<5}{_money(amount):>16}")
+    if friction["is_estimated"]:
+        out.append(
+            f"  estimated{_money(friction['estimated_mid_base']):>12}"
+            f"   never itemised by IBKR -- see below"
+        )
+
+    if data["by_category"]:
+        out.append("\nCharged per category")
+        out.append(
+            f"  {'category':<10}{'fills':>7}{'orders':>7}{'quantity':>13}"
+            f"{'commission':>13}{'taxes':>10}{'per unit':>11}"
+        )
+        for row in data["by_category"]:
+            qty = _money(row["quantity"], 4) if row["quantity"] else "-"
+            per = "-" if row["per_unit"] is None else _base(row["per_unit"], 4)
+            out.append(
+                f"  {row['category']:<10}{row['fills']:>7}{row['orders']:>7}"
+                f"{qty:>13}{_base(row['commission']):>13}"
+                f"{_base(row['taxes']):>10}{per:>11}"
+            )
+
+    if data["fx"]:
+        out.append("\nCurrency conversions")
+        autofx = totals["autofx"]
+        markup_head = f"@{autofx['bps']}bps"
+        out.append(
+            f"  {'pair':<10}{'n':>5}{'notional':>14}{'comm':>9}{'bps':>7}"
+            f"{'auto n':>8}{'auto notional':>15}{markup_head:>10}"
+        )
+        for pair in data["fx"]:
+            bps = pair["commission_bps"]
+            out.append(
+                f"  {pair['symbol']:<10}{pair['conversions']:>5}"
+                f"{_money(pair['notional_base']):>14}"
+                f"{_base(pair['commission']):>9}"
+                f"{('-' if bps is None else f'{bps:,.2f}'):>7}"
+                f"{pair['auto']['conversions']:>8}"
+                f"{_money(pair['auto']['notional_base']):>15}"
+                f"{_money(pair['auto']['markup_base']):>10}"
+            )
+        if autofx["notional_base"]:
+            out.append(
+                f"  note: the markup column is an ESTIMATE. IBKR publishes "
+                f"{autofx['bps']} bps and this account's own year of conversions "
+                f"implied {autofx['measured_bps']}, so the total sits near "
+                f"{_money(friction['estimated_low_base'])} .. "
+                f"{_money(friction['estimated_high_base'])}."
+            )
+
+    if data["fees"]:
+        out.append("\nAccount-level -- attributable to nothing")
+        out.append(f"  {'fee':<18}{'n':>5}{'total':>12}")
+        for fee in data["fees"]:
+            out.append(f"  {fee['name']:<18}{fee['count']:>5}{_base(fee['total']):>12}")
+        out.append(
+            f"  {'TOTAL':<18}{'':>5}{_money(totals['unattributable']['base']):>12}"
+        )
+        out.append(
+            "  note: no fee row carries a contract or trade id, so these cannot be "
+            "split across instruments and do not narrow with the selection."
+        )
+
+    withheld = [w for w in data["withholding"] if (w["withheld"] or {}).get("base")]
+    if withheld:
+        out.append("\nDividend withholding")
+        out.append(f"  {'symbol':<16}{'ccy':>5}{'gross':>10}{'withheld':>11}{'eff':>8}")
+        for line in withheld:
+            rate = line["effective_rate"]
+            out.append(
+                f"  {line['symbol'] or '-':<16}{line['currency']:>5}"
+                f"{_base(line['gross']):>10}{_base(line['withheld']):>11}"
+                f"{('-' if rate is None else f'{rate:,.1f}%'):>8}"
+            )
+
+    if totals["credit_fills"]:
+        out.append(
+            f"\n  note: {totals['credit_fills']} fill(s) carried a commission "
+            "credit, netted off rather than added."
+        )
+    return "\n".join(out)
 
 
 def render_watchlist(rows: list[dict]) -> str:

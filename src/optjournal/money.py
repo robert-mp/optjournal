@@ -10,6 +10,15 @@ defect this type exists to prevent:
   Exact, but unaddable: USD, SEK and KRW commission cannot share a number.
   Offered only when one currency accounts for the whole figure.
 
+Two types, one distinction. `Money` is any figure: it offers the as-charged
+amount when one currency accounts for the whole thing and withholds it when the
+scope is mixed, because USD, SEK and KRW cannot share a number. `Charge` is a
+*cost*, and keeps the whole per-currency ledger instead of collapsing it -- the
+cost report is scoped by the reader, and widening from options to the account
+should not turn every exact figure into a restatement when each charge is still
+known. A `Charge` yields its `Money` on request, so the two agree where they
+overlap.
+
 Before this type the pair was spelled as three parallel fields per figure
 (`x_base`, `x_native`, `x_native_ccy`) plus a five-line ledger accumulation at
 each producer and a two-call unpack at each consumer. Nine fields carried three
@@ -25,7 +34,7 @@ layer may hold one without acquiring a dependency direction.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 #: The money figures every fill row in this journal carries -- each with a
@@ -226,3 +235,103 @@ class Money:
         value and never for a missing property.
         """
         return {"base": self.base, "native": self.native, "ccy": self.currency}
+
+
+@dataclass(frozen=True, slots=True)
+class Charge:
+    """A cost, kept as the set of amounts actually billed, plus the translation.
+
+    `Money` answers "what is this figure, and can one currency speak for it?".
+    Under a scope spanning asset categories the answer to the second half is no,
+    and `Money.gated` then withholds the native entirely -- correctly, because
+    USD, SEK and KRW cannot share a number. But a *cost* report is the one place
+    that withholding loses the thing the reader came for: widening the scope from
+    options to the whole account should not turn every as-charged figure into a
+    restatement, because the charges are all still known individually.
+
+    So this keeps the ledger. `base` is the addable translation, `by_ccy` is what
+    IBKR actually billed, per currency, and no information is discarded at any
+    scope. A single-currency `Charge` still answers `money` for the surfaces that
+    want one figure, so the two types agree where they overlap and this one is
+    strictly more informative where they do not.
+
+    Frozen and normalised on construction: zero-amount currencies are dropped, so
+    a USD option scope plus a zero-commission EUR conversion row is a USD charge
+    rather than one claiming two currencies. Build with `of`, which does the
+    normalising -- the constructor is for callers that already hold a clean
+    ledger.
+    """
+
+    #: Defaults to zero so `Charge()` is the empty cost -- the identity for `+`,
+    #: and what a category with no charges yet honestly holds. `Money` takes no
+    #: such default on purpose: a figure with no amount says nothing, where a
+    #: cost of nothing is a fact.
+    base: float = 0.0
+    #: Amount billed per currency, non-zero entries only. Empty when nothing was
+    #: charged, which is different from an unknown charge -- see `is_free`.
+    by_ccy: Mapping[str, float] = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, rows: Iterable[tuple[float | None, float | None, str | None]]) -> Charge:
+        """Accumulate `(base, native, currency)` rows into one charge.
+
+        The same row shape `Money.charged` takes, deliberately: a caller that
+        has rows for one can hand them to the other without reshaping, and the
+        two stay comparable when a surface shows both.
+        """
+        base = 0.0
+        ledger: dict[str, float] = {}
+        for row_base, row_native, row_ccy in rows:
+            base += row_base or 0.0
+            if row_native and row_ccy:
+                ledger[row_ccy] = ledger.get(row_ccy, 0.0) + row_native
+        return cls(base=base, by_ccy={c: a for c, a in ledger.items() if a})
+
+    @property
+    def money(self) -> Money:
+        """This charge as a `Money`, gating the native the way every other figure does.
+
+        The bridge to surfaces that show one figure. A single-currency charge
+        keeps its as-charged amount; a mixed one falls back to the base, which is
+        exactly `Money.gated`'s rule -- stated here by delegation rather than
+        reimplemented, so the two can never disagree.
+        """
+        return Money.gated(self.base, dict(self.by_ccy))
+
+    @property
+    def is_free(self) -> bool:
+        """Whether nothing was charged at all.
+
+        Distinct from an empty ledger with a non-zero base, which is how an
+        *estimated* cost arrives: the AutoFX markup has a base and no billing
+        currency, because IBKR never itemised it in one. See `Money.restated`.
+        """
+        return not self.base and not self.by_ccy
+
+    def __add__(self, other: Charge) -> Charge:
+        """Sum two charges, merging their ledgers.
+
+        Addition is the whole reason a cost report can be scoped: the page adds
+        the categories the reader selected, and each currency stays its own
+        column through the sum.
+        """
+        merged = dict(self.by_ccy)
+        for ccy, amount in other.by_ccy.items():
+            merged[ccy] = merged.get(ccy, 0.0) + amount
+        return Charge(base=self.base + other.base,
+                      by_ccy={c: a for c, a in merged.items() if a})
+
+    def __abs__(self) -> Charge:
+        """Magnitude of every component. Cost is presented positive."""
+        return Charge(base=abs(self.base),
+                      by_ccy={c: abs(a) for c, a in self.by_ccy.items()})
+
+    def payload(self) -> dict[str, Any]:
+        """The JSON shape: the gated figure, plus the ledger that produced it.
+
+        Carries `Money`'s three keys verbatim so a consumer already reading a
+        money-shaped payload needs no new branch, and adds `charged` as the
+        per-currency detail. A page can lead with the single number and dissect
+        it without a second request.
+        """
+        return {**self.money.payload(), "charged": dict(self.by_ccy)}

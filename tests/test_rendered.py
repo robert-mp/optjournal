@@ -99,3 +99,73 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     # The stat-card grid actually populated.
     assert "Trades" in text
     assert "Commissions" in text
+
+    # The header dateline, which SHIPS EMPTY in the markup and is filled by JS.
+    # That is precisely the shape source analysis cannot check: a renderKicker
+    # that never runs, or throws, leaves the page's most prominent small line
+    # blank and every other assertion here still passes. Oracle-driven from the
+    # payload the page itself fetched.
+    kicker = re.search(r'<div class="kicker" id="kicker">(.*?)</div>', dom, re.S)
+    assert kicker, "the kicker slot is gone from the header"
+    line = kicker.group(1).strip()
+    assert line, "the kicker rendered EMPTY -- nothing filled the slot"
+    day = payload["logbook"]["day"]
+    assert day, "the demo journal has no first activity, so this proves nothing"
+    assert f"Log day {day}" in line, (
+        f"the header says {line!r}, which does not carry the payload's day {day}"
+    )
+    # The open book, named by UNDERLYING. A count here would contradict the
+    # Positions tab for a multi-leg position, which is why the line names symbols.
+    names = {p["underlying_symbol"] or p["symbol"] for p in payload["positions"]}
+    if names:
+        assert "carrying" in line.lower(), f"{line!r} omits the open book"
+        assert any(n in line for n in names), (
+            f"the header names none of the open underlyings {sorted(names)}"
+        )
+    else:
+        assert "flat" in line.lower(), f"{line!r} does not say the book is flat"
+
+    # The default theme is applied by JS on load, so an un-themed URL must still
+    # come back with the attribute set -- if `applyTheme` never ran, `:root` would
+    # still style the page and every colour assertion would pass while the chip
+    # and the switcher were dead.
+    assert 'data-theme="leather"' in dom, (
+        "the default theme was never applied to <html>, so the edition chip and "
+        "the palette can disagree"
+    )
+    assert re.search(r'<button class="edition" id="edition"', dom), (
+        "the edition chip is not a <button>, so switching themes is unreachable "
+        "by keyboard"
+    )
+    assert "Leather Edition" in text
+
+
+def test_a_themed_url_repaints_the_whole_page(served, tmp_path):
+    """A theme in the hash must survive the load, which is the one thing the
+    stylesheet alone cannot demonstrate.
+
+    Checks the ATTRIBUTE and the CHIP together: the attribute is what selects the
+    palette and the chip is what claims which palette is active, so a page where
+    they disagree is lying to the reader. An unknown id is checked too -- it must
+    heal to the default rather than leaving `data-theme="nope"` on <html>, where
+    no block matches and the page silently renders Leather while the chip says
+    otherwise.
+    """
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    for requested, expected, label in (
+        ("admiralty", "admiralty", "Admiralty Edition"),
+        ("oxblood", "oxblood", "Oxblood Edition"),
+        ("nope", "leather", "Leather Edition"),
+    ):
+        dom = browser.dump_dom(f"{served}/#theme={requested}",
+                               tmp_path / f"profile-{requested}")
+        if dom is None:
+            pytest.skip("no browser produced a DOM (environment, not the page)")
+        assert f'data-theme="{expected}"' in dom, (
+            f"#theme={requested} did not put data-theme={expected} on <html>"
+        )
+        assert label in browser.rendered_text(dom), (
+            f"#theme={requested} left the edition chip claiming something other "
+            f"than {label!r}, so the chip and the palette disagree"
+        )

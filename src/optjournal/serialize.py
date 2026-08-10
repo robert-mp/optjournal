@@ -22,12 +22,18 @@ from __future__ import annotations
 
 import sqlite3
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from optjournal.analysis import CostReport
 from optjournal.bars import MARKET_TZ, audit_perishable
+from optjournal.costs import (
+    AUTOFX_MARKUP_BPS,
+    AUTOFX_MARKUP_MEASURED_BPS,
+    Friction,
+)
+from optjournal.costs import CostReport as DbCostReport
 from optjournal.events import (
     DEFAULT_COUNTRIES,
     DEFAULT_IMPACTS,
@@ -39,6 +45,7 @@ from optjournal.events import (
 from optjournal.history import HistoryReport
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
+from optjournal.stats import first_activity
 from optjournal.vol import expected_move, realised_vol
 
 Row = dict[str, Any]
@@ -371,6 +378,137 @@ def costs_data(report: CostReport) -> Row:
             "credit_fills": sum(g.credit_fills for g in report.commissions),
         },
     }
+
+
+def broker_costs_data(report: DbCostReport) -> Row:
+    """The DB-backed cost report as a JSON-safe structure.
+
+    Distinct from `costs_data`, which serialises the statement-derived
+    `analysis.CostReport`. Both exist on purpose: the CLI reports one statement's
+    own costs and the page reports the journal's, and a single serializer would
+    have to blur two different scopes into one shape.
+
+    Every cost is a `Charge`, so each figure carries the ledger it was billed in
+    alongside the gated single figure -- `{base, native, ccy, charged}`. A
+    consumer already reading a money-shaped payload needs no new branch; one that
+    wants to dissect a mixed-currency total reads `charged`.
+    """
+    return {
+        "base_currency": report.base_currency,
+        "from_date": report.from_date,
+        "to_date": report.to_date,
+        # What the reader selected, echoed back so the page labels its own scope
+        # from the payload rather than from its local state -- the two drifting is
+        # how a total comes to be captioned with the wrong scope.
+        "scope": {
+            "categories": sorted(report.scope.categories),
+            "is_everything": report.scope.is_everything,
+            "subset": report.scope.subset,
+            "is_subset": report.scope.is_subset,
+        },
+        "by_category": [
+            {
+                "category": c.category,
+                "fills": c.fills,
+                "orders": c.orders,
+                "quantity": _num(c.quantity),
+                "commission": c.commission.payload(),
+                "taxes": c.taxes.payload(),
+                "total": c.total.payload(),
+                # None where a per-unit figure is not a rate anyone charges --
+                # a conversion's quantity is an amount of money.
+                "per_unit": None if c.per_unit is None else c.per_unit.payload(),
+                "credit_fills": c.credit_fills,
+            }
+            for c in report.by_category
+        ],
+        "fx": [
+            {
+                "symbol": p.symbol,
+                "conversions": p.conversions,
+                "notional_base": _num(p.notional),
+                "commission": p.commission.payload(),
+                "commission_bps": _num(p.commission_bps),
+                "auto": {
+                    "conversions": p.auto.conversions,
+                    "notional_base": _num(p.auto.notional),
+                    # A bare float, not a Charge: no currency was ever billed.
+                    "markup_base": _num(p.markup_at(AUTOFX_MARKUP_BPS)),
+                    "markup_high_base": _num(
+                        p.markup_at(AUTOFX_MARKUP_MEASURED_BPS)
+                    ),
+                },
+                "manual": {
+                    "conversions": p.manual.conversions,
+                    "notional_base": _num(p.manual.notional),
+                    "commission": p.manual.commission.payload(),
+                },
+            }
+            for p in report.fx
+        ],
+        "fees": [
+            {
+                "name": f.name,
+                "count": f.count,
+                "total": f.total.payload(),
+                "examples": list(f.examples),
+            }
+            for f in report.fees
+        ],
+        "withholding": [
+            {
+                "symbol": w.symbol,
+                "currency": w.currency,
+                "gross": w.gross.payload(),
+                "withheld": w.withheld.payload(),
+                "effective_rate": _num(w.effective_rate),
+            }
+            for w in report.withholding
+        ],
+        "totals": {
+            # The three-way split the tab is built on: what narrows with the
+            # scope, what cannot be attributed at all, and what was never billed.
+            "attributable": report.attributable.payload(),
+            "unattributable": report.unattributable.payload(),
+            "fills": report.fills,
+            "credit_fills": report.credit_fills,
+            "autofx": {
+                "conversions": report.autofx_conversions,
+                "notional_base": _num(report.autofx_notional),
+                "bps": AUTOFX_MARKUP_BPS,
+                "measured_bps": AUTOFX_MARKUP_MEASURED_BPS,
+            },
+            "friction": _friction_payload(report.friction),
+        },
+    }
+
+
+def _friction_payload(friction: Friction) -> Row:
+    """Measured and estimated, kept apart in the payload as they are in the type.
+
+    `stated` is a Charge -- billed, per currency. The estimate is a RANGE of bare
+    floats, because IBKR publishes the markup as "typically" 3 bps and a year of
+    real conversions implied 3.2: around a quarter of account friction is this
+    figure, so sending only a point estimate would invite the page to render it
+    as a measurement. The midpoint is sent too, because a headline has to print
+    one number -- but it arrives beside the ends it came from, never instead of
+    them. `total_*` are precomputed so no consumer has to know the estimate is
+    additive.
+    """
+    return {
+        "stated": friction.stated.payload(),
+        "estimated_low_base": _num(friction.estimated_low),
+        "estimated_mid_base": _num(friction.estimated_mid),
+        "estimated_high_base": _num(friction.estimated_high),
+        "total_low_base": _num(friction.total_low),
+        # What the headline prints. Sent rather than derived in the page so the
+        # figure on screen and the figure in `--json` cannot drift, and so the
+        # midpoint rule lives in one place.
+        "total_mid_base": _num(friction.total_mid),
+        "total_high_base": _num(friction.total_high),
+        "is_estimated": friction.is_estimated,
+    }
+
 
 def history_data(report: HistoryReport) -> Row:
     """Closed-position history as a JSON-safe structure."""
@@ -842,4 +980,50 @@ def audit_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
         #: Whether any bar has ever been stored here. Distinguishes a stopped
         #: collector from one that was never started.
         "ever_collected": ever,
+    }
+
+
+def logbook_data(conn: sqlite3.Connection, *, today: date) -> Row:
+    """The header's dateline: how long this log has been kept, and since when.
+
+    A *bitácora* is a ship's log -- a dated, sequential record. The header used
+    to spend its most prominent small slot on a fixed string naming the journal's
+    contents ("Strikes · Fills · Round trips"), which is identical for every
+    reader on every load and is already said by the tab strip directly beneath
+    it. This is the same slot answering something only this journal can: it is
+    day N of a log opened on a specific date.
+
+    `day` counts INCLUSIVELY from first activity, so the day the account opened
+    is day 1 and not day 0. A log's first page is page one.
+
+    No count of open positions travels with it, deliberately. An episode is per
+    CONTRACT, so a strangle is two of them -- `strategies.open_position_count`
+    exists precisely because a naive tally read a two-leg strangle as two bets
+    and disagreed with the Positions tab on screen. The page derives the header's
+    names from `state.positions`, the same snapshot rows that tab renders, so the
+    two cannot drift apart. What is period-invariant and unambiguous travels
+    here; what needs grouping is left to the layer that already groups it.
+    """
+    opened = first_activity(conn)
+    if not opened:
+        # A journal with no fills and no cash rows has no first day, so there is
+        # no day to be. The page falls back to the title alone rather than
+        # rendering "day 1" for an account that has not started -- an honest
+        # absence beats a figure counting from nothing.
+        return {"opened": None, "day": None}
+    try:
+        start = date.fromisoformat(opened)
+    except ValueError:  # pragma: no cover - defensive
+        # `_day_of` normalises both stored forms, so this is unreachable for data
+        # this package wrote. It must not blank the page if a hand-edited row
+        # ever gets past it.
+        return {"opened": None, "day": None}
+    return {
+        "opened": opened,
+        #: Inclusive, so the opening day is day 1. Clamped at 1 because a
+        #: statement timestamped ahead of the reader's clock (a timezone away
+        #: from UTC, or a laptop with a wrong date) would otherwise render day 0
+        #: or a negative day -- nonsense a reader cannot interpret, where "day 1"
+        #: is merely uninteresting.
+        "day": max(1, (today - start).days + 1),
     }

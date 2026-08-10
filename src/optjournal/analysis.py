@@ -27,6 +27,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from optjournal.notes import AUTOFX, has_code
+
 __all__ = [
     "AUTOFX_MARKUP_BPS",
     "CommissionGroup",
@@ -67,12 +69,6 @@ AUTOFX_MARKUP_BPS = Decimal("3")
 #: silently blended stock commission into a figure labelled as this journal's.
 DEFAULT_JOURNAL_ASSET = "OPT"
 
-#: IBKR trade-note code marking a conversion as executed by the auto currency
-#: conversion service. py_ibkr models this as `Code.AUTOFX`; the wire value is
-#: compared directly so an ad-hoc member minted by `compat` still matches.
-AUTOFX_CODE = "AFx"
-
-
 def _is_autofx(trade) -> bool:
     """True when IBKR flagged this conversion as an auto-conversion.
 
@@ -82,11 +78,15 @@ def _is_autofx(trade) -> bool:
     ID and no order type. A manual IDEALPRO conversion would also be
     unflagged, and would carry a real `ibCommission` instead -- so applying
     the markup to everything would double-count it.
+
+    Delegates the reading to `notes.has_code`, which matches whole tokens and
+    takes either shape a note field arrives in. This compared the WHOLE field to
+    `"AFx"`, which passed only because py_ibkr hands the statement path a
+    pre-split list: against the `;`-joined string `sources.py` stores, `AFx;P`
+    -- auto-conversion plus partial fill, 2 real conversions in this archive --
+    compared unequal and its markup went unestimated.
     """
-    return any(
-        str(getattr(note, "value", note)) == AUTOFX_CODE
-        for note in trade.notes or ()
-    )
+    return has_code(trade.notes, AUTOFX)
 
 #: Fee description patterns, most specific first. IBKR fee descriptions are
 #: free text, so this is heuristic by necessity; `OTHER` is the honest
