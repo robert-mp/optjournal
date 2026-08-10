@@ -667,8 +667,11 @@ td.n,th.n{text-align:right}
   cursor:pointer;border-radius:999px;color:var(--dim);background:var(--panel2);
   border:1px solid var(--line2)}
 .chip:hover{color:var(--fg);border-color:var(--dim2)}
-.chip.on{color:var(--fg);background:linear-gradient(160deg,#2d1f15,#241a12);
-  border-color:#a06840}
+/* The same gradient and edge `.seg button.on` and the selected calendar day use,
+   through their names rather than by repeating the values -- a literal here would
+   have survived a theme swap and left brown chips on the Admiralty page. */
+.chip.on{color:var(--fg);background:linear-gradient(160deg,var(--seg1),var(--seg2));
+  border-color:var(--accentedge)}
 /* The count is secondary to the value, and stays legible when the chip is on. */
 .chip .dim{font-weight:500;font-size:10.5px}
 .chip.on .dim{color:var(--dim)}
