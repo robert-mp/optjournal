@@ -64,7 +64,7 @@ from optjournal.bars import (
     replay_bars,
     replay_model,
 )
-from optjournal.campaigns import Campaign, cluster_orders, link, position_count
+from optjournal.campaigns import position_count
 from optjournal.costs import CostScope, build_costs
 from optjournal.db import connect, open_journal
 from optjournal.events import (
@@ -113,6 +113,7 @@ from optjournal.stats import (
     EQUITY_TRADES,
     annual_stats,
     available_months,
+    campaigns_for,
     cohort_data,
     fx_quotes,
     month_range,
@@ -559,45 +560,6 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     state["replays"] = replays
 
 
-def _campaigns_for(
-    conn: sqlite3.Connection, asset_category: str | None, episodes: list[Any]
-) -> list[Campaign]:
-    """The campaign linkage for one category's episodes.
-
-    Reads the fill-to-order map and each order's first fill straight from
-    `trades`, which is the one query the linkage needs and the reason this lives
-    here rather than in `campaigns.py`: that module is a leaf and opens no
-    database. `campaigns.cluster_orders` then applies the window rule, and
-    `campaigns.link` unions the episodes those orders filled.
-
-    The window is what makes this work on real data. Every multi-leg event in
-    the real journal arrives as separate order ids filled in the same second, so
-    order-id union alone links nothing at all -- see `campaigns.py`.
-    """
-    where, params = ("", ()) if not asset_category else (
-        " AND asset_category = ?", (asset_category,)
-    )
-    order_of_trade: dict[str, str] = {}
-    first_fill: dict[str, tuple[str, str | None]] = {}
-    for row in conn.execute(
-        "SELECT trade_id, ib_order_id, date_time, trade_date, underlying_symbol,"
-        f" symbol FROM trades WHERE ib_order_id IS NOT NULL{where}", params
-    ):
-        oid = str(row["ib_order_id"])
-        order_of_trade[str(row["trade_id"])] = oid
-        at = str(row["date_time"] or row["trade_date"] or "")
-        under = row["underlying_symbol"] or row["symbol"]
-        if oid not in first_fill or at < first_fill[oid][0]:
-            first_fill[oid] = (at, under)
-    return link(
-        episodes,
-        order_groups=cluster_orders(
-            (oid, at, under) for oid, (at, under) in first_fill.items()
-        ),
-        order_of_trade=order_of_trade,
-    )
-
-
 def build_state(
     *,
     db_path: Path,
@@ -686,12 +648,12 @@ def build_state(
         # campaign holds positions into that exact list, and `month_stats`
         # resolves them the same way.
         view_episodes = view_report.episodes
-        view_campaigns = _campaigns_for(conn, view_category, view_episodes)
+        view_campaigns = campaigns_for(conn, view_category, view_episodes)
         # The Annual tab is unscoped and runs over the HOME category, so it needs
         # its own linkage whenever the view has been switched to equities.
         home_campaigns = (
             view_campaigns if view_category == asset_category
-            else _campaigns_for(conn, asset_category, report.episodes)
+            else campaigns_for(conn, asset_category, report.episodes)
         )
         state: dict[str, Any] = {
             "version": __version__,
@@ -708,12 +670,12 @@ def build_state(
             "stats": stats_data(
                 month_stats(conn, selected, asset_category=view_category,
                             scope=scope, report=view_report,
-                            campaigns=view_campaigns)
+                            campaign_list=view_campaigns)
             ),
             "all_time": stats_data(
                 month_stats(conn, None, asset_category=view_category,
                             scope=scope, report=view_report,
-                            campaigns=view_campaigns)
+                            campaign_list=view_campaigns)
             ),
             "positions": positions_data(conn),
             "orders": orders,
@@ -772,13 +734,13 @@ def build_state(
         state["annual"] = [
             stats_data(s) for s in annual_stats(
                 conn, asset_category=asset_category,
-                report=report, campaigns=home_campaigns,
+                report=report, campaign_list=home_campaigns,
             )
         ]
         state["monthly"] = [
             stats_data(s) for s in monthly_stats(
                 conn, asset_category=asset_category,
-                report=report, campaigns=home_campaigns,
+                report=report, campaign_list=home_campaigns,
             )
         ]
         # The Annual table's total row. Deliberately not `all_time`, which is the
@@ -787,7 +749,7 @@ def build_state(
         # adding up -- destroying the one reconciliation it exists to show.
         state["annual_total"] = stats_data(
             month_stats(conn, None, asset_category=asset_category, report=report,
-                        campaigns=home_campaigns)
+                        campaign_list=home_campaigns)
         )
         # Cohorts are the whole book by definition -- they exist to compare the
         # 0DTE subset against everything else, so scoping them to 0DTE would

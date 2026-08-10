@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
+from optjournal import campaigns
 from optjournal.history import build_history
 from optjournal.money import Money, win_rate
 
@@ -131,6 +132,57 @@ def _category_where(asset_category: str | None) -> tuple[str, tuple[Any, ...]]:
     if not asset_category:
         return "", ()
     return "WHERE asset_category = ?", (asset_category,)
+
+
+def campaigns_for(
+    conn: sqlite3.Connection,
+    asset_category: str | None,
+    episodes: list[Any],
+) -> list[campaigns.Campaign]:
+    """The campaign linkage for one category's episodes.
+
+    Reads the fill-to-order map and each order's first fill from `trades`, which
+    is the one query the linkage needs and the reason it is here rather than in
+    `campaigns.py`: that module is a leaf and opens no database.
+    `campaigns.cluster_orders` applies the window rule, `campaigns.link` unions
+    the episodes those orders filled.
+
+    The window is what makes this work on real data. Every multi-leg event in the
+    real journal arrives as separate order ids filled in the SAME SECOND, so
+    order-id union alone links nothing at all -- see `campaigns.py`.
+
+    Lives in this module, beside the only figures that must not be computed
+    without it, so `month_stats` can build its own default rather than trusting
+    every caller to pass one. It was briefly `web._campaigns_for`, which worked
+    but meant a caller who forgot the argument silently got the pre-campaign
+    reading: a roll scored twice, with nothing raised and no test failing.
+
+    `episodes` must be the list the returned campaigns will be resolved against,
+    because a `Campaign` holds INDICES into it.
+    """
+    where, params = _category_where(asset_category)
+    clause = f"{where} AND ib_order_id IS NOT NULL" if where else (
+        "WHERE ib_order_id IS NOT NULL"
+    )
+    order_of_trade: dict[str, str] = {}
+    first_fill: dict[str, tuple[str, str | None]] = {}
+    for row in conn.execute(
+        "SELECT trade_id, ib_order_id, date_time, trade_date, underlying_symbol,"
+        f" symbol FROM trades {clause}", params
+    ):
+        oid = str(row["ib_order_id"])
+        order_of_trade[str(row["trade_id"])] = oid
+        at = str(row["date_time"] or row["trade_date"] or "")
+        under = row["underlying_symbol"] or row["symbol"]
+        if oid not in first_fill or at < first_fill[oid][0]:
+            first_fill[oid] = (at, under)
+    return campaigns.link(
+        episodes,
+        order_groups=campaigns.cluster_orders(
+            (oid, at, under) for oid, (at, under) in first_fill.items()
+        ),
+        order_of_trade=order_of_trade,
+    )
 
 
 def fx_quotes(conn: sqlite3.Connection, base: str) -> list[dict[str, Any]]:
@@ -564,23 +616,24 @@ def _period_stats(
     asset_category: str | None,
     base_currency: str,
     report: Any = None,
-    campaigns: list[Any] | None = None,
+    campaign_list: list[campaigns.Campaign] | None = None,
 ) -> list[MonthStats]:
     """`month_stats` over several periods, sharing one episode history pass.
 
     The Annual tab asks for every month, every year and an all-time row at
     once. Each `month_stats` call otherwise rebuilds the whole episode history,
     so a thirteen-month archive did that fifteen times per page load for
-    identical results. `campaigns` rides along for the same reason: it is
-    derived from that one report, so building it per period would repeat the
-    linkage fifteen times too.
+    identical results. The campaign linkage rides along for the same reason: it
+    is derived from that one report, so leaving each period to build its own
+    would repeat the query fifteen times -- which is what `month_stats` does when
+    called alone, correctly but not cheaply.
 
-    `report` and `campaigns` travel together or not at all: a campaign holds
+    `report` and `campaign_list` travel together or not at all: a campaign holds
     INDICES into its report's episode list, so pairing them with a different
     report would silently read the wrong episodes. Enforced rather than
     documented, because the failure is quiet.
     """
-    if campaigns is not None and report is None:
+    if campaign_list is not None and report is None:
         raise ValueError(
             "campaigns index into a specific report's episodes, so pass the "
             "report they were built from or neither"
@@ -589,10 +642,12 @@ def _period_stats(
         report = build_history(
             conn, asset_category=asset_category, base_currency=base_currency
         )
+    if campaign_list is None:
+        campaign_list = campaigns_for(conn, asset_category, report.episodes)
     return [
         month_stats(
             conn, period, asset_category=asset_category,
-            base_currency=base_currency, report=report, campaigns=campaigns,
+            base_currency=base_currency, report=report, campaign_list=campaign_list,
         )
         for period in periods
     ]
@@ -604,7 +659,7 @@ def annual_stats(
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
     report: Any = None,
-    campaigns: list[Any] | None = None,
+    campaign_list: list[campaigns.Campaign] | None = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar year, newest first.
 
@@ -622,7 +677,7 @@ def annual_stats(
     return _period_stats(
         conn, available_years(conn, asset_category),
         asset_category=asset_category, base_currency=base_currency,
-        report=report, campaigns=campaigns,
+        report=report, campaign_list=campaign_list,
     )
 
 
@@ -632,7 +687,7 @@ def monthly_stats(
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
     report: Any = None,
-    campaigns: list[Any] | None = None,
+    campaign_list: list[campaigns.Campaign] | None = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar month, newest first.
 
@@ -646,7 +701,7 @@ def monthly_stats(
     return _period_stats(
         conn, available_months(conn, asset_category),
         asset_category=asset_category, base_currency=base_currency,
-        report=report, campaigns=campaigns,
+        report=report, campaign_list=campaign_list,
     )
 
 
@@ -840,7 +895,7 @@ def month_stats(
     base_currency: str = "EUR",
     scope: TradeScope = ALL_TRADES,
     report: Any = None,
-    campaigns: list[Any] | None = None,
+    campaign_list: list[campaigns.Campaign] | None = None,
 ) -> MonthStats:
     """Statistics for one period, or for everything when `period` is None.
 
@@ -853,12 +908,12 @@ def month_stats(
     Annual tab asks for a dozen months, two years and an all-time row on every
     page load, and rebuilding the episode history for each was the whole cost.
 
-    `campaigns` is `campaigns.link`'s output over `report.episodes`, and it is
-    what the win/loss block counts. Passed in rather than built here because
-    building it needs the ORDERS, which `serialize.py` reads and which imports
-    this module: the composing layer hands both down. Omit it and each closed
-    episode stands alone, which is the pre-campaign reading and is wrong for a
-    roll -- see the counting block.
+    `campaign_list` is `campaigns.link`'s output over `report.episodes`, and it is
+    what the win/loss block counts. Optional for COST, never for correctness:
+    omit it and this builds its own via `campaigns_for`, so the figures are the
+    same either way and only the query is repeated. It used to fall back to one
+    campaign per episode, which made a forgotten keyword score a roll twice with
+    nothing raised -- the kind of default that is wrong in silence.
     """
     stats = MonthStats(
         month=period or "ALL",
@@ -921,7 +976,7 @@ def month_stats(
         fee_rows.append((row["amount_base"], row["amount"], row["currency"]))
     stats.fees = Money.charged(fee_rows)
 
-    if campaigns is not None and report is None:
+    if campaign_list is not None and report is None:
         raise ValueError(
             "campaigns index into a specific report's episodes, so pass the "
             "report they were built from or neither"
@@ -979,14 +1034,18 @@ def month_stats(
     # episode across months -- which is why `wins + losses` need not equal
     # `closed_episodes`, and why the page shows both.
     #
-    # `campaigns=None` means the caller has none to offer, and then each closed
-    # episode stands alone. That is the degenerate grouping rather than a second
-    # rule, and it is the same fallback `open_position_count` always stated: the
-    # episode itself, where no grouping exists.
-    units: list[list[Any]] = (
-        [[report.episodes[i] for i in c.episode_indices] for c in campaigns]
-        if campaigns is not None else [[e] for e in report.closed]
-    )
+    # Built here when the caller offers none, rather than falling back to one
+    # episode per campaign. That fallback was this function answering the same
+    # question two ways depending on an argument, and the wrong way was the
+    # SILENT one: a forgotten keyword scored a roll twice with nothing raised and
+    # no test failing. A caller with many periods still passes its own, because
+    # the linkage is per report and rebuilding it fifteen times is the cost
+    # `_period_stats` exists to avoid.
+    if campaign_list is None:
+        campaign_list = campaigns_for(conn, asset_category, report.episodes)
+    units: list[list[Any]] = [
+        [report.episodes[i] for i in c.episode_indices] for c in campaign_list
+    ]
     decided = [
         scoped for scoped in ([e for e in u if scope.has_episode(e)] for u in units)
         if scoped

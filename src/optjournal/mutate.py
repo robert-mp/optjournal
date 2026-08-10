@@ -274,12 +274,12 @@ MUTANTS: tuple[Mutant, ...] = (
         find='        state["annual"] = [\n'
              "            stats_data(s) for s in annual_stats(\n"
              "                conn, asset_category=asset_category,\n"
-             "                report=report, campaigns=home_campaigns,\n"
+             "                report=report, campaign_list=home_campaigns,\n"
              "            )\n        ]",
         replace='        state["annual"] = [\n'
                 "            stats_data(s) for s in annual_stats(\n"
                 "                conn, asset_category=asset_category,\n"
-                "                report=report, campaigns=home_campaigns,\n"
+                "                report=report, campaign_list=home_campaigns,\n"
                 "            )\n"
                 "            if selected is None or s.month.startswith(selected[:4])\n"
                 "        ]",

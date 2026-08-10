@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from conftest import RAW_DIR, ROOT, add_statement, connect_migrated
 
+from optjournal.campaigns import Campaign
 from optjournal.demo import (
     FROM_DATE,
     TO_DATE,
@@ -32,19 +33,20 @@ from optjournal.demo import (
 from optjournal.flex import load
 from optjournal.history import build_history
 from optjournal.ingest import ingest_file
+from optjournal.money import Money
 from optjournal.stats import (
     ALL_TRADES,
     _day_of,
     _in_period,
     annual_stats,
     available_months,
+    campaigns_for,
     month_stats,
     monthly_stats,
     odte_cohorts,
     odte_scope,
     scope_for,
 )
-from optjournal.web import _campaigns_for
 
 MULTIPLIER = Decimal("100")
 
@@ -176,6 +178,44 @@ def test_has_closed_round_trips_with_wins_and_losses(conn):
     assert 0 < s.win_rate < 100
 
 
+def test_the_campaign_unit_is_the_default_not_an_opt_in(conn):
+    """A caller who passes no linkage must still get the corrected figures.
+
+    This is the whole point of `month_stats` building its own: the argument used
+    to be the only way to get the campaign unit, and omitting it fell back to one
+    campaign per episode. So every call site that forgot it -- which was most of
+    this suite -- silently measured the pre-campaign reading, scoring the demo's
+    roll twice and its vertical as a win plus a loss. A default that is wrong in
+    silence is worse than a required argument, and this pins that it is gone.
+    """
+    bare = month_stats(conn, None)
+    assert (bare.decided_campaigns, bare.wins, bare.losses) == (7, 6, 1)
+    assert bare.win_rate == pytest.approx(85.714, abs=1e-2)
+    assert bare.wins + bare.losses == bare.decided_campaigns
+
+    # And identical to the figures an explicit linkage produces, since the only
+    # difference is who ran the query.
+    report = build_history(conn, asset_category="OPT")
+    explicit = month_stats(
+        conn, None, report=report,
+        campaign_list=campaigns_for(conn, "OPT", report.episodes),
+    )
+    assert bare.decided_campaigns == explicit.decided_campaigns
+    assert (bare.wins, bare.losses) == (explicit.wins, explicit.losses)
+
+
+def test_pairing_campaigns_with_a_foreign_report_is_refused(conn):
+    """A campaign holds INDICES into its report's episode list, so pairing it
+    with another report would read the wrong episodes and score the wrong
+    outcomes -- quietly, since the indices are all in range. Raised rather than
+    documented, because a silent wrong answer is the failure mode this whole
+    change exists to remove."""
+    report = build_history(conn, asset_category="OPT")
+    campaigns = campaigns_for(conn, "OPT", report.episodes)
+    with pytest.raises(ValueError, match="report they were built from"):
+        month_stats(conn, None, campaign_list=campaigns)
+
+
 def test_the_scoreboard_counts_positions_where_episodes_double_counted(conn):
     """The roll and the vertical, measured end to end through the real path.
 
@@ -187,16 +227,38 @@ def test_the_scoreboard_counts_positions_where_episodes_double_counted(conn):
     campaign unit it is 7 decided, 6 wins, 1 loss (85.7%).
 
     Net P&L is identical either way, which is the whole point of the split: the
-    money did not move, only the counting. Asserted here rather than trusted,
-    because the fallback path (`campaigns=None`) still produces the old numbers
-    and would otherwise be what the demo tests measure.
+    money did not move, only the counting.
+
+    The episode unit is reached by handing `month_stats` one campaign per closed
+    episode, which is what it used to build for itself when a caller passed
+    nothing. It no longer does -- omitting the argument now builds the real
+    linkage -- so the old reading has to be constructed deliberately here, and
+    that is the point: the wrong answer is no longer the default.
     """
     report = build_history(conn, asset_category="OPT")
-    campaigns = _campaigns_for(conn, "OPT", report.episodes)
+    campaigns = campaigns_for(conn, "OPT", report.episodes)
+    per_episode = [
+        Campaign(
+            episode_indices=(index,),
+            conids=(str(e.conid),),
+            order_ids=frozenset(),
+            is_decided=True,
+            closed_at=e.closed_at,
+            realized=Money.charged(
+                [(e.realized_pnl_base, e.realized_pnl, e.currency)]
+            ),
+            commission=Money.charged(
+                [(e.commission_base, e.commission, e.currency)]
+            ),
+        )
+        for index, e in enumerate(report.episodes) if e.is_closed
+    ]
 
-    episode_unit = month_stats(conn, None, report=report)
+    episode_unit = month_stats(
+        conn, None, report=report, campaign_list=per_episode
+    )
     campaign_unit = month_stats(
-        conn, None, report=report, campaigns=campaigns
+        conn, None, report=report, campaign_list=campaigns
     )
 
     assert (episode_unit.wins, episode_unit.losses) == (7, 2)
@@ -227,9 +289,9 @@ def test_a_rolled_position_scores_where_it_finished_not_where_cash_landed(conn):
     note for, pinned here so it stays deliberate.
     """
     report = build_history(conn, asset_category="OPT")
-    campaigns = _campaigns_for(conn, "OPT", report.episodes)
-    nov = month_stats(conn, "2025-11", report=report, campaigns=campaigns)
-    dec = month_stats(conn, "2025-12", report=report, campaigns=campaigns)
+    campaigns = campaigns_for(conn, "OPT", report.episodes)
+    nov = month_stats(conn, "2025-11", report=report, campaign_list=campaigns)
+    dec = month_stats(conn, "2025-12", report=report, campaign_list=campaigns)
 
     assert nov.closed_episodes == 1, "a contract really did close in November"
     assert nov.net_pnl.base == pytest.approx(585.82, abs=1e-2)
