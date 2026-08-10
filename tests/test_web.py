@@ -113,6 +113,25 @@ def state(populated) -> dict:
     return build_state(db_path=populated, archive_dir=RAW_DIR, query_id="1591754")
 
 
+@pytest.fixture
+def widest_costs(populated) -> dict:
+    """The cost payload under the widest possible scope.
+
+    The Costs tab defaults to options only, so `state["broker_costs"]` carries no
+    conversion pair, no fee group and no withholding line -- and the contract guard
+    anchors those shapes to real rows, so sampling the default alone would leave
+    four of them unanchored and quietly exempt from the drift test.
+
+    A separate fixture rather than a second payload key: the page never asks for
+    two scopes at once, so the payload should not carry two. This is the same
+    serializer the page gets, just asked a wider question.
+    """
+    return build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None,
+        cost_scope=["OPT", "STK", "CASH"],
+    )["broker_costs"]
+
+
 def _js() -> str:
     """The page's inline script, whatever attributes its tag carries.
 
@@ -284,7 +303,7 @@ _UNSAMPLED = frozenset({
 })
 
 
-def _shape_samples(state: dict) -> dict[str, dict]:
+def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
     """One real instance of every sampled shape, from the live payload.
 
     Keyed per SHAPE, not per binding: this map changes when a new payload
@@ -297,6 +316,12 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         return rows[0] if rows else None
 
     costs = first(state["costs"])
+    # The cost payload under the WIDEST scope. The tab defaults to options only,
+    # so a conversion pair, a fee group and a withholding line do not appear in
+    # `state["broker_costs"]` -- and sampling only that would leave those shapes
+    # unanchored, which silently exempts them from the drift test. Built here from
+    # the same serializer rather than added to the payload: the page never asks for
+    # two scopes at once, so the payload should not carry two.
     orders = state["orders"]
     history = state["history"]
     replays = list(state["replays"].values())
@@ -351,6 +376,25 @@ def _shape_samples(state: dict) -> dict[str, dict]:
         "JobRun": first([
             row["last_run"] for row in state["scheduler"]["jobs"] if row["last_run"]
         ]),
+        # The DB-backed cost report. Every shape is anchored to a real row rather
+        # than exempted, and the default scope is options-only -- so the samples
+        # that only exist under a WIDER scope (a conversion pair, a fee group) are
+        # taken from an account-wide report built alongside. Sampling only the
+        # default would leave four shapes unanchored and quietly exempt from the
+        # drift test, which is the failure this map exists to prevent.
+        "BrokerCosts": state["broker_costs"],
+        "CostSelection": state["broker_costs"]["scope"],
+        "CostTotals": state["broker_costs"]["totals"],
+        "AutoFx": state["broker_costs"]["totals"]["autofx"],
+        "FrictionTotals": state["broker_costs"]["totals"]["friction"],
+        # The ledger-carrying money shape, anchored to a figure that HAS a ledger.
+        "Charge": state["broker_costs"]["totals"]["attributable"],
+        "CategoryCost": first(widest["by_category"]),
+        "FxPairCost": first(widest["fx"]),
+        "FxLeg": first(widest["fx"])["auto"],
+        "FxLegManual": first(widest["fx"])["manual"],
+        "FeeGroup": first(widest["fees"]),
+        "Withholding": first(widest["withholding"]),
         "Audit": state["audit"],
         "FxBlock": state["fx"],
         "FxQuote": first(state["fx"]["quotes"]),
@@ -371,7 +415,7 @@ def _shape_samples(state: dict) -> dict[str, dict]:
     return samples
 
 
-def test_contract_is_coherent(state):
+def test_contract_is_coherent(state, widest_costs):
     """Meta-guard: a typo anywhere in the contract machinery is itself red.
 
     Every binding must name a declared shape, no name may be both payload
@@ -388,7 +432,7 @@ def test_contract_is_coherent(state):
     both = sorted(set(bindings) & locals_)
     assert not both, f"declared both @payload and @local: {both}"
 
-    samples = _shape_samples(state)
+    samples = _shape_samples(state, widest_costs)
     assert set(samples) <= set(shapes), (
         f"sample map names undeclared shapes: {sorted(set(samples) - set(shapes))}"
     )
@@ -401,7 +445,7 @@ def test_contract_is_coherent(state):
     assert not _UNSAMPLED & set(samples), "an exempted shape has a sample after all"
 
 
-def test_contract_matches_the_payload_both_ways(state):
+def test_contract_matches_the_payload_both_ways(state, widest_costs):
     """The typedefs in page.html are held to a real payload in BOTH
     directions: a required key the API stopped sending fails (the contract
     cannot rot optimistic), and a key the API sends that the contract omits
@@ -410,7 +454,7 @@ def test_contract_matches_the_payload_both_ways(state):
     only."""
     shapes, _, _ = _parse_contract(_js())
     problems = []
-    for name, sample in _shape_samples(state).items():
+    for name, sample in _shape_samples(state, widest_costs).items():
         declared = shapes[name]
         sent = set(sample)
         required = {key for key, optional in declared.items() if not optional}
@@ -1642,6 +1686,131 @@ def test_build_state_survives_an_empty_database(tmp_path):
     json.dumps(state)
 
 
+# --- the Costs tab's scope selection -----------------------------------------
+#
+# Four peer options on the wire, two different kinds of narrowing underneath:
+# OPT/STK/CASH are asset categories, 0DTE is a subset of options resolved to
+# fills. `_broker_costs` is the seam that reconciles them, so these pin the
+# translation rather than the arithmetic (which `test_costs.py` owns).
+
+
+def _costs(populated, selection=None):
+    return build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None,
+        cost_scope=selection,
+    )["broker_costs"]
+
+
+def test_costs_default_to_the_journals_own_category(populated):
+    """So the tab opens agreeing with every other tab.
+
+    The account-wide figure is roughly four times larger on this journal, and a
+    tab that opened on it would look like the others were wrong.
+    """
+    for empty in (None, [], ["", "  "]):
+        assert _costs(populated, empty)["scope"]["categories"] == ["OPT"], empty
+
+
+def test_costs_span_the_journal_not_the_newest_statement(populated):
+    """The reason this engine replaced the statement-backed one.
+
+    The newest archive covers 30 calendar days (2026-07-09 onward); the journal
+    holds a year of activity. Asserted over the whole account rather than over
+    options alone, because this account's options all happen to fall inside that
+    window -- which is exactly why the old tab's narrowing was invisible, and why
+    a test scoped to options would prove nothing.
+
+    The dates come from the rows in scope, so this also pins that they are not
+    the statement's own `fromDate`/`toDate`.
+    """
+    costs = _costs(populated, ["OPT", "STK", "CASH"])
+    assert costs["from_date"] < "2026-07-09", (
+        "still reading the 30-day window rather than the journal's history"
+    )
+    # And the old statement-backed payload is still sent, still scoped to its own
+    # window: the two coexist, which is what makes the comparison meaningful.
+    statement = build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None
+    )["costs"][0]
+    assert statement["from_date"] >= "2026-07-09"
+    assert costs["from_date"] < statement["from_date"]
+
+
+def test_a_repeated_parameter_is_a_multi_select(populated):
+    """`?cost=OPT&cost=CASH`, so neither layer invents a delimiter."""
+    costs = _costs(populated, ["OPT", "CASH"])
+    assert costs["scope"]["categories"] == ["CASH", "OPT"]
+    assert costs["totals"]["attributable"]["base"] > 0
+
+
+def test_selected_categories_add_up(populated):
+    """Disjoint categories, so a multi-select is a sum -- the property that makes
+    ticking two boxes meaningful."""
+    opt = _costs(populated, ["OPT"])["totals"]["attributable"]["base"]
+    stk = _costs(populated, ["STK"])["totals"]["attributable"]["base"]
+    both = _costs(populated, ["OPT", "STK"])["totals"]["attributable"]["base"]
+    assert both == pytest.approx(opt + stk)
+
+
+def test_a_mixed_selection_keeps_every_billing_currency(populated):
+    """Widening the scope adds columns rather than deleting exactness."""
+    charged = _costs(populated, ["OPT", "STK"])["totals"]["attributable"]["charged"]
+    assert len(charged) > 1, "a multi-currency scope reported one currency"
+    assert _costs(populated, ["OPT"])["totals"]["attributable"]["ccy"] == "USD"
+
+
+def test_the_case_of_a_selection_does_not_matter(populated):
+    """A hand-edited `#cost=opt` is the same selection as `#cost=OPT`."""
+    assert (_costs(populated, ["opt", "cash"])["scope"]["categories"]
+            == _costs(populated, ["OPT", "CASH"])["scope"]["categories"])
+
+
+def test_selecting_0dte_alone_implies_options(populated):
+    """Asking for a subset of options is asking about options.
+
+    A fill set with no category would also admit a stock fill that happened to
+    share an id -- and 0DTE is defined only for contracts with an expiry.
+    """
+    scope = _costs(populated, ["0DTE"])["scope"]
+    assert scope["categories"] == ["OPT"]
+    assert scope["subset"] == "0DTE"
+    assert scope["is_subset"] is True
+
+
+def test_0dte_narrows_options_rather_than_widening_them(populated):
+    """It is a subset, not a peer, so ticking both cannot exceed Options alone.
+
+    This account has no 0DTE round trips, so the honest answer here is zero --
+    `test_costs.py` asserts the proper-narrowing case against a journal that has
+    some.
+    """
+    options = _costs(populated, ["OPT"])["totals"]
+    odte = _costs(populated, ["OPT", "0DTE"])["totals"]
+    assert odte["attributable"]["base"] <= options["attributable"]["base"]
+    assert odte["fills"] <= options["fills"]
+
+
+def test_account_fees_survive_every_selection(populated):
+    """They carry no asset attribution, so no selection can narrow them -- and a
+    total that hid them would measure less than the tab claims."""
+    figures = {
+        str(sel): _costs(populated, sel)["totals"]["unattributable"]["base"]
+        for sel in (None, ["OPT"], ["STK"], ["CASH"], ["OPT", "0DTE"])
+    }
+    assert len(set(figures.values())) == 1, figures
+    assert next(iter(figures.values())) > 0
+
+
+def test_the_estimate_appears_only_when_conversions_are_selected(populated):
+    """The markup is a cost of converting, so charging it to a contract scope
+    would attribute a currency cost to an option."""
+    assert not _costs(populated, ["OPT"])["totals"]["friction"]["is_estimated"]
+    with_fx = _costs(populated, ["OPT", "CASH"])["totals"]["friction"]
+    assert with_fx["is_estimated"]
+    assert (with_fx["total_low_base"] < with_fx["total_mid_base"]
+            < with_fx["total_high_base"])
+
+
 def test_fx_offers_the_base_and_at_least_one_quote(state):
     """The toggle needs a base and something to switch to.
 
@@ -2360,10 +2529,23 @@ def test_journal_taxes_is_a_money_and_the_gate_reaches_it():
     assert mixed["journal_taxes"]["ccy"] is None
     assert mixed["journal_taxes"]["base"] == pytest.approx(0.25 + 3.00 * 0.09)
 
-    # And the page reads it through the one rule, not a second `cash()` call.
+    # The serializer half of the rule, which is what this test is really about:
+    # the figure is a Money and the gate reaches it.
+    #
+    # The page-side assertion that used to live here named `moneyOf(T.journal_taxes)`
+    # -- a read in the statement-backed Costs view, which no longer exists. The Costs
+    # tab now reads the DB-backed payload, where the same rule is enforced more
+    # broadly and structurally: `chargeFig` is the single display path for every
+    # `Charge`, it delegates to `moneyOf`, and the payload contract guard checks
+    # every key the page reads against the typedefs. So the narrow assertion was
+    # retired rather than repointed at an arbitrary new call site.
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
-    assert "moneyOf(T.journal_taxes)" in js
     assert "cash(T.journal_taxes" not in js, "a display site bypasses the rule"
+    # `chargeFig` is that single path, and it must go through `moneyOf`.
+    assert "moneyOf(ch)" in js, (
+        "chargeFig no longer delegates to moneyOf, so a Charge is displayed by a "
+        "second rule that can disagree with every other cash figure on the page"
+    )
 
 
 def test_the_page_has_exactly_one_native_first_rule():

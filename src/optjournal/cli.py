@@ -38,6 +38,7 @@ from optjournal.config import (
     DEFAULT_DEMO_DIR,
     ROOT,
 )
+from optjournal.costs import CostScope, build_costs
 from optjournal.db import connect, migrate, open_journal
 from optjournal.events import (
     DEFAULT_COUNTRIES,
@@ -53,6 +54,7 @@ from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal.jobs import record_run
 from optjournal.render import (
+    render_friction,
     render_history,
     render_orders,
     render_positions,
@@ -61,6 +63,7 @@ from optjournal.render import (
     render_watchlist,
 )
 from optjournal.serialize import (
+    broker_costs_data,
     costs_data,
     history_data,
     orders_data,
@@ -90,7 +93,9 @@ examples:
   optjournal orders                        option orders, partial fills collapsed
   optjournal positions                     current option book
   optjournal history                       closed-position P&L, round trip by round trip
-  optjournal costs --json                  cost report as JSON
+  optjournal costs --json                  one statement's cost report as JSON
+  optjournal friction                      what the broker cost, whole journal
+  optjournal friction --assets OPT CASH    options and conversions only
   optjournal serve --query-id 1591754      local web UI with a Sync now button
   optjournal demo                          synthetic data in a scratch archive and DB
   optjournal serve --demo                  serve that synthetic data instead
@@ -394,6 +399,26 @@ def cmd_history(args) -> int:
     data = history_data(report)
     _emit(data, render_history(data), args.json)
     return EXIT_OK if report.episodes else EXIT_NO_DATA
+
+
+def cmd_friction(args) -> int:
+    """What the broker cost, from the DATABASE rather than one statement.
+
+    The sibling of `costs`, and the difference is the question each answers.
+    `costs` reports one statement's own costs -- the right thing when the question
+    is about a statement, and the only way to read a section no column carries.
+    This reports the JOURNAL's: every ingested fill, narrowable to a set of asset
+    categories, which is what the web page shows.
+
+    Emits JSON through the same serializer the page reads, so `--json` here and
+    the tab cannot disagree about a figure.
+    """
+    scope = CostScope.of(args.assets)
+    with open_journal(args.db) as conn:
+        report = build_costs(conn, scope=scope, period=args.month)
+    data = broker_costs_data(report)
+    _emit(data, render_friction(data), args.json)
+    return EXIT_OK if report.fills or report.unattributable.base else EXIT_NO_DATA
 
 
 def cmd_watch(args) -> int:
@@ -857,6 +882,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="fee, FX and withholding cost report")
     p.add_argument("path", type=Path, nargs="?", help="defaults to newest")
     p.set_defaults(func=cmd_costs)
+
+    p = sub.add_parser("friction", parents=[common, database],
+                       help="what the broker cost, from the journal (any scope)")
+    p.add_argument("--assets", nargs="*", metavar="CAT",
+                   help="asset categories to include (default: every category)")
+    p.add_argument("--month", metavar="YYYY-MM",
+                   help="narrow to one month or year (default: the whole journal)")
+    p.set_defaults(func=cmd_friction)
 
     p = sub.add_parser("ingest", parents=[common, archive, database],
                        help="fold archived statements into the database")

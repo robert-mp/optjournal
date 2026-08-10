@@ -25,8 +25,20 @@ uv run optjournal serve --demo        # browse it
 ```
 
 `optjournal --help` lists the rest: `fetch`, `ingest`, `orders`,
-`positions`, `history`, `costs`, `statements`, `prune`, `sweep`. Every
-reporting command takes `--json`.
+`positions`, `history`, `costs`, `friction`, `statements`, `prune`, `sweep`.
+Every reporting command takes `--json`.
+
+Two cost commands, answering two questions. `costs` reads one statement — the
+newest archive covers 30 calendar days — and is the only way to see a section no
+database column carries. `friction` reads the journal: every ingested fill, over
+the account's whole history, narrowable to any set of asset categories.
+
+```
+optjournal friction                      the whole account
+optjournal friction --assets OPT          options only
+optjournal friction --assets OPT CASH     options and the conversions to trade them
+optjournal friction --month 2026-08       one month (or a year: 2026)
+```
 
 ## Architecture
 
@@ -294,7 +306,39 @@ Four invariants worth knowing before changing the UI:
   displays.** The Trade Types control drives Dashboard/Calendar/Trades
   (which render the filter bar) and nothing else. "0DTE" is a fill-level
   scope within options; "Equities" switches the asset category those three
-  tabs run over. Positions, Costs, Annual and 0DTE stay pinned to options.
+  tabs run over. Positions, Annual and 0DTE stay pinned to options.
+
+  Costs carries its own control, because it answers a different question. It is a
+  MULTI-select — costs on disjoint asset categories add up, so "options plus the
+  conversions I make to trade them" is a real question — and it is styled as
+  chips rather than as the segmented `.seg`, since that shape means "pick one"
+  everywhere else in the UI. 0DTE appears among the four options but is not a
+  category: it is a subset of options, resolved to fills by `stats.odte_scope`,
+  so ticking it narrows rather than widens and the chip is dashed to say so.
+
+  What that control deliberately cannot do is narrow a cost that carries no
+  attribution. Account fees and withholding are levied on the account — no fee
+  row in this archive carries a contract or trade id — so they are shown whole at
+  every selection, in their own block, labelled as attributable to nothing.
+  Hiding them under a narrow scope would make a tab captioned "broker cost"
+  quietly measure less than it claims.
+* **Options P&L counts fully closed round trips only, attributed to the
+  close date.** A partial close (sold 3, bought back 1) contributes
+  nothing until the position is flat, and premium collected on an open
+  short is a liability, not profit — it is shown separately as "open
+  premium". Other asset categories keep IBKR's per-fill realisation.
+  `Gain % of Net Liq` divides that P&L by the NAV from the statement's
+  Equity Summary section (enable it on the Flex query template; the demo
+  carries synthetic NAV rows).
+* **The payload contract lives in the page, and the suite derives its
+  guards from it.** `page.html` opens with `@typedef` blocks declaring
+  every shape the page reads and a `@payload`/`@local` table saying which
+  binding holds which shape. `tests/test_web.py` parses those blocks and
+  enforces the chain in every direction: reads must resolve against the
+  typedefs, the typedefs must match a real payload both ways (a required
+  key the API stops sending fails, and a key it sends undeclared fails),
+  and the binding table may be neither incomplete nor stale. A typo'd key
+  fails a test instead of rendering a blank cell.
 
 ## Measuring the suite
 
