@@ -931,6 +931,7 @@ import {
  * @local JSON Object ages input mine qb wf behind was
  * @local when button parts names y
  * @local COST_OPTIONS bits cost fees on wh
+ * @local STATS_KEYS_REQUIRED missing state
  */
 
 const $=s=>document.querySelector(s);
@@ -3846,6 +3847,38 @@ async function loadQuotes(announce){
   draw();
 }
 
+/* Keys this page reads off `stats` that a SERVER TOO OLD to send them would omit.
+   Deliberately a short hand-picked list rather than every Stats key: the point is
+   to catch a stale process, and one key per payload change is enough to do that.
+   Held to the typedef by `test_web`, so a name here that stops existing fails a
+   test rather than silently guarding nothing.
+
+   `decided_campaigns` and `inflight_realized` are the two most recent additions.
+   Both produced the exact failure this exists for: the server re-reads page.html
+   on every request but loads its PYTHON at import, so a process left running
+   across a merge serves NEW markup against an OLD payload. The Trades card read
+   `undefined` on a headline figure, which reads as data loss rather than as a
+   process that needs restarting -- and the fix is a restart, which nothing on
+   screen said. */
+const STATS_KEYS_REQUIRED=['decided_campaigns','inflight_realized'];
+
+/* Says so, in the banner that already exists for things the reader must act on.
+   Not a console warning (nobody has devtools open on their own journal) and not a
+   thrown error (the rest of the page is fine and still worth reading): the
+   numbers that DO arrive are correct, so the page renders and says which figures
+   cannot be trusted and what to do about it. */
+function staleServerCheck(state){
+  const s=state&&state.stats;
+  if(!s) return;
+  const missing=STATS_KEYS_REQUIRED.filter(k=>!(k in s));
+  if(!missing.length) return;
+  note('This page is newer than the server process it is talking to, so some '
+    +'figures will read <b>undefined</b>. The server re-reads the page on every '
+    +'request but loads its Python once, at startup — so restart it: '
+    +'<code>optjournal serve</code>. '
+    +`(missing: ${missing.map(esc).join(', ')})`,'bad');
+}
+
 async function load(){
   /* Not `q` -- that name is the FX quote everywhere else in this page, and one
      name for two shapes is what makes the payload guard unable to check either. */
@@ -3858,6 +3891,7 @@ async function load(){
   const r=await fetch('/api/state'+(qs.toString()?'?'+qs:''));
   if(!r.ok){note('Could not read state: HTTP '+r.status,'bad');return;}
   S.state=await r.json();
+  staleServerCheck(S.state);
   if(S.month===null && S.state.selected_month) S.month=S.state.selected_month;
   /* A month outside the account's lifetime heals away (the server answers with
      selected_month null rather than inventing one). Months WITH no fills are

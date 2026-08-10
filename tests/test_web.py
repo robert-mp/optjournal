@@ -481,6 +481,56 @@ def test_contract_matches_the_payload_both_ways(state, widest_costs):
     assert not problems, "\n".join(problems)
 
 
+def test_the_stale_server_guard_names_keys_that_exist(state):
+    """The runtime guard must check keys the payload really has.
+
+    `STATS_KEYS_REQUIRED` is the page's own list of `stats` keys whose absence
+    means the server process predates the markup. A name that stops existing --
+    renamed, or dropped from the serializer -- would leave the guard passing
+    unconditionally: it would look like protection while checking nothing, which
+    is the same silent-no-op failure `test_every_mutant_pattern_still_matches`
+    exists for.
+
+    Both directions matter, so this asserts the names are declared in the Stats
+    typedef AND present in a real payload.
+    """
+    js = _js()
+    match = re.search(r"const STATS_KEYS_REQUIRED=\[([^\]]*)\]", js)
+    assert match, "the stale-server guard's key list is gone"
+    keys = re.findall(r"'([a-z_]+)'", match.group(1))
+    assert keys, "the guard checks nothing, so it can never fire"
+
+    shapes, _, _ = _parse_contract(js)
+    undeclared = sorted(set(keys) - set(shapes["Stats"]))
+    assert not undeclared, (
+        f"the guard watches {undeclared}, which the Stats typedef does not "
+        "declare -- so it guards a key that may not exist"
+    )
+    absent = sorted(k for k in keys if k not in state["stats"])
+    assert not absent, (
+        f"the guard watches {absent}, which a real payload does not contain -- "
+        "the banner would fire on every load"
+    )
+
+
+def test_the_stale_server_guard_runs_before_anything_renders(state):
+    """It must be called where the payload ARRIVES, not from a render path.
+
+    Called from `draw()` it would fire once per redraw and be re-armed by every
+    tab click; called after `draw()` the undefined figures would already be on
+    screen when the explanation appeared. `load()` right after the assignment to
+    `S.state` is the one place it sees each payload exactly once, before a single
+    card is built.
+    """
+    js = _js()
+    assign = js.index("S.state=await r.json();")
+    check = js.index("staleServerCheck(S.state);")
+    drawn = js.index("draw();", assign)
+    assert assign < check < drawn, (
+        "the guard must run after the payload lands and before the first draw"
+    )
+
+
 def test_every_js_property_read_resolves():
     """Guard one: a read on a payload binding must be a key its declared
     shape carries. Catches a wrong KEY on a known binding -- `o.symbol` when

@@ -393,6 +393,21 @@ Four invariants worth knowing before changing the UI:
   and the binding table may be neither incomplete nor stale. A typo'd key
   fails a test instead of rendering a blank cell.
 
+  That chain holds at TEST time. At RUNTIME the two halves reload
+  differently: `page_html()` re-reads the file on every request (so editing
+  markup needs no restart), while the Python is loaded once at import. A
+  server left running across a merge therefore serves NEW markup against an
+  OLD payload, and a card reading `undefined` looks like data loss rather
+  than a process needing a restart. Happened twice while the campaign unit
+  was being built. `staleServerCheck` closes it: `STATS_KEYS_REQUIRED` names
+  the newest `stats` keys, and their absence raises the banner the page
+  already has for things the reader must act on, naming the missing keys and
+  the fix. Two tests hold the list to the typedef and to a real payload (a
+  guard watching a renamed key would pass unconditionally while protecting
+  nothing) and pin that it runs between the payload landing and the first
+  draw. Verified against a server serving current markup over a stale
+  payload: banner fires, cards still render, no console errors.
+
 ## Measuring the suite
 
 `optjournal mutate` injects a known defect and reports which tests notice. It
