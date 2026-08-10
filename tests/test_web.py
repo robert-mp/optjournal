@@ -68,10 +68,16 @@ def state(populated) -> dict:
     """
     from datetime import UTC, datetime, timedelta
 
+    from optjournal.bars import MARKET_TZ
     from optjournal.db import connect
     from optjournal.events import parse_events, store_events
 
-    today = datetime.now(UTC).date()
+    # MARKET_TZ, not UTC. `market_data` anchors its week in market time, so a
+    # fixture dating "today" in UTC seeds an event outside the window for the
+    # hours when the two calendars disagree -- every day between UTC midnight and
+    # market midnight. The shape then had no sample and the contract guard failed,
+    # on a clock rather than on a change. Same timeline as the code under test.
+    today = datetime.now(MARKET_TZ).date()
     conn = connect(populated)
     store_events(conn, parse_events([
         {"title": "Non-Farm Employment Change", "country": "USD",
