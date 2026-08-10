@@ -38,8 +38,22 @@ MAY_MODEL = {"bars", "demo"}
 
 #: Modules that must import nothing from the package. Each is a value type or
 #: pure arithmetic that any layer may hold without acquiring a direction.
-LEAVES = {"money", "analysis", "blackscholes", "config", "marketdata", "compat",
+#:
+#: `analysis` is not here: it holds `notes`, which is itself a leaf. That is the
+#: point of a leaf -- any layer may hold one without acquiring a direction -- and
+#: the rule it needs, reading IBKR note codes as whole tokens, is shared with
+#: `history` on the far side of the graph. `IMPORTS_LEAVES_ONLY` states the
+#: weaker property that still holds: it depends on nothing that reads a database.
+LEAVES = {"money", "notes", "blackscholes", "config", "marketdata", "compat",
           "fills", "events", "vol", "locks", "logs"}
+
+#: Modules that may import leaves and nothing else. Weaker than `LEAVES` and
+#: load-bearing for the same reason: `analysis.py` is pure statement mathematics,
+#: testable against a hand-built statement, and it stays that way only while
+#: everything it imports is a value type. The specific temptation is `stats`,
+#: whose single-currency gate it would like for its per-currency ledgers --
+#: `serialize` applies that instead, being the layer that already holds both.
+IMPORTS_LEAVES_ONLY = {"analysis"}
 
 
 def _internal_imports(path: Path) -> set[str]:
@@ -98,7 +112,25 @@ def test_a_leaf_imports_nothing_from_the_package(module):
     assert not deps, (
         f"{module}.py imports {deps}, but it is a leaf: every layer holds one, so "
         "it can depend on nothing. Apply the shared rule in whichever module "
-        "already imports both."
+        "already imports both, or extract it into a leaf they can both hold."
+    )
+
+
+@pytest.mark.parametrize("module", sorted(IMPORTS_LEAVES_ONLY))
+def test_a_leaf_holder_imports_only_leaves(module):
+    """Pure arithmetic may hold value types, and nothing that reads a database.
+
+    The property being defended is testability against a hand-built input: the
+    moment one of these imports a layer that opens SQLite or parses XML, a test
+    for it needs a fixture rather than a literal, and that is how a module of
+    plain mathematics acquires a runtime.
+    """
+    held = sorted(_internal_imports(PACKAGE / f"{module}.py"))
+    assert set(held) <= LEAVES, (
+        f"{module}.py imports {sorted(set(held) - LEAVES)}, which are not leaves. "
+        "It may hold value types only -- anything else gives it a dependency on a "
+        "layer that reads a database, and costs it the property that it can be "
+        "tested against a literal."
     )
 
 

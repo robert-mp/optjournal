@@ -193,6 +193,15 @@ MUTANTS: tuple[Mutant, ...] = (
                "commission column silently shows a dash",
     ),
     Mutant(
+        key="note-token",
+        module="notes.py",
+        find="    return code in split_notes(notes)",
+        replace="    return bool(notes) and code in str(notes)",
+        breaks="a fill flagged `A` (assignment) would read as `AFx` (auto-conversion) "
+               "and be charged a 3bps markup it never incurred -- and the inverse, "
+               "which shipped: whole-field equality missed the stored `AFx;P`",
+    ),
+    Mutant(
         key="snapshot-sign",
         module="web.py",
         find='        seed_quantity=float(row.get("position") or 0.0),',

@@ -44,6 +44,8 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
                      render.py    (terminal reports)
                           ▲
                      money.py (Money: held by every layer above, depends on none)
+                     notes.py (IBKR note codes: read by history and analysis,
+                               which cannot import each other)
                                       │
                             ┌─────────┴─────────┐
                             ▼                   ▼
@@ -65,13 +67,14 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `sync.py` | the ONE sync path — fetch, ingest, snapshot — called by `POST /api/sync`, `optjournal sync` and the `sync` job. Its own module because of the import graph, not for tidiness: it briefly lived in `web.py` and `jobs.py` reached it through a deferred import, which `tests/test_layering.py` correctly called a cycle. It raises rather than returning an error dict, because each caller needs a different shape for a cooldown (HTTP body, exit code, ledger status) and flattening them into a string is how a locked keychain became a bare exit 1 |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
 | `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one. See [The Money model](#the-money-model) |
+| `notes.py` | IBKR trade note codes (`AFx`, `Ep`, `A`) and the one rule for reading them: whole-token matching, over either the stored `AFx;P` string or py_ibkr's parsed list. A leaf, because its two readers — `history.py` (database) and `analysis.py` (statement) — sit on opposite sides of the graph and cannot import each other |
 | `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts. **Never reads `blackscholes.py`** — see [Modelled numbers](#modelled-numbers) |
 | `marketdata.py` | price-bar fetch and parse for one contract over one window. A leaf: no DB, no journal shapes |
 | `vol.py` | realised volatility from closes, and the move it implies. A leaf, and deliberately NOT `blackscholes` — see [Modelled numbers](#modelled-numbers) |
 | `events.py` | economic calendar: fetch, parse and store this week's releases. A leaf. One feed, no Protocol — see [Adding a calendar feed](#a-new-calendar-feed) |
 | `bars.py` | the journal-shaped half of price bars — which contract over which window (from episodes), the idempotent write, the series a chart reads, and the expected-move band |
 | `blackscholes.py` | option pricing and the implied vol backed out of a market price. A leaf: pure float maths, `math.erf` for the normal CDF, so no numpy or scipy |
-| `analysis.py` | cost/friction report from the raw statement (whole account); a leaf — imports nothing internal |
+| `analysis.py` | cost/friction report from the raw statement (whole account); pure statement mathematics — holds leaves (`notes.py`) and nothing that reads a database |
 | `strategies.py` | orders folded into the strategies they were placed as (a strangle sold as two same-second orders is one group), then linked into position lifecycles via episode trade ids |
 | `serialize.py` | the JSON payload the page renders and `--json` emits; wraps `analysis`'s per-currency ledgers into `Money` |
 | `render.py` | human-readable terminal reports. Bound to `serialize`'s shapes by `tests/test_render.py`: it once read flat money keys the `Money` conversion had removed, and `orders`/`history` died on `float(dict)` behind a green suite |
@@ -251,6 +254,13 @@ Layering rules (import direction only goes down this list):
    (it is a leaf, so it costs no dependency direction), and the split is
    kept anyway: a report that measures cost has nothing to say about how
    a reader's display currency should be chosen.
+
+   A leaf is the escape hatch when two domain modules need one rule and
+   neither may hold the other. `history.py` reads note codes out of SQLite
+   and `analysis.py` reads them off a statement, so neither can own the
+   rule for both; `notes.py` does, and each imports it. The alternative
+   was what stood there before — the rule written twice, once per reader,
+   agreeing until one input shape changed.
 5. A quantity and its unit travel together. `Money` carries an amount,
    the currency it was charged in and the base translation as one frozen
    value, because the three-field spelling it replaced (`x_base`,

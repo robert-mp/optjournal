@@ -217,6 +217,9 @@ class _Note:
 
 
 def _conv(symbol, proceeds, notes=(), commission="0", rate="1"):
+    # `notes` is passed through as given, NOT list()-ed: a note field legitimately
+    # arrives as the `;`-joined string as well as as a sequence, and list("AFx;P")
+    # would silently make a test of the string form a test of six characters.
     return SimpleNamespace(
         assetCategory=SimpleNamespace(value="CASH"),
         symbol=symbol,
@@ -225,7 +228,7 @@ def _conv(symbol, proceeds, notes=(), commission="0", rate="1"):
         taxes=Decimal("0"),
         fxRateToBase=Decimal(rate),
         quantity=None,
-        notes=list(notes),
+        notes=notes if isinstance(notes, str) else list(notes),
     )
 
 
@@ -290,6 +293,38 @@ def test_autofx_flag_matches_plain_string_note():
     """compat may mint an ad-hoc member; wire-value comparison must still work."""
     r = analyse(_stmt([_conv("EUR.USD", "-10000", notes=["AFx"])]))
     assert r.fx[0].autofx_conversions == 1
+
+
+@pytest.mark.parametrize("notes", ["AFx", "AFx;P", "P;AFx", " AFx ; P "])
+def test_autofx_flag_read_from_the_joined_string_form(notes):
+    """The shape `sources.py` STORES, not the list py_ibkr happens to hand over.
+
+    Every other test here builds the pre-split list, which is why comparing the
+    whole field to "AFx" passed for as long as it did: on the statement path
+    py_ibkr always splits first. The database path stores `";".join(...)`, so a
+    reader of it sees "AFx;P" -- unequal to "AFx", and its markup silently
+    unestimated. Two real conversions in this archive carry exactly that.
+
+    Parametrized over the orderings and the whitespace because the rule is
+    token equality, and each of these breaks a different shortcut: a prefix
+    comparison passes "AFx;P" and fails "P;AFx", and neither survives padding.
+    """
+    r = analyse(_stmt([_conv("EUR.USD", "-10000", notes=notes)]))
+    assert r.fx[0].autofx_conversions == 1
+    assert r.fx[0].autofx_spread_base == Decimal("3")
+
+
+def test_a_note_code_is_not_matched_as_a_substring():
+    """`A` is assignment, and it is a substring of `AFx`.
+
+    The inverse of the defect above, and the reason the shared rule splits
+    rather than searches: a conversion flagged only `A` must not be read as an
+    auto-conversion and charged a markup it never incurred.
+    """
+    r = analyse(_stmt([_conv("EUR.USD", "-10000", notes="A", commission="-2")]))
+    assert r.fx[0].autofx_conversions == 0
+    assert r.total_autofx_spread_base == ZERO
+    assert r.total_commission_base == Decimal("2")
 
 
 def test_friction_splits_stated_from_estimated():
@@ -896,31 +931,10 @@ def test_friction_keeps_commission_and_taxes_apart_when_billed_differently():
         "EUR": Decimal("1.00"), "SEK": Decimal("3.00")}
 
 
-def test_analysis_stays_a_leaf_module():
-    """analysis.py must import nothing from optjournal.
-
-    It is pure statement mathematics, and the README's layering rule says
-    imports only point down. The temptation is real and specific: the
-    single-currency gate it needs for its per-currency ledgers lives in stats,
-    and importing it would be one line. That line would point an import upward
-    -- stats reads the database, analysis does not -- and cost this module the
-    property that makes it trivially testable against a hand-built statement.
-    The gate is applied by serialize instead, which already holds both.
-    """
-    import ast
-    import pathlib
-
-    src = pathlib.Path(__file__).resolve().parent.parent / "src" / "optjournal" / "analysis.py"
-    tree = ast.parse(src.read_text())
-    internal = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("optjournal"):
-            internal.append(node.module)
-        if isinstance(node, ast.ImportFrom) and node.level:
-            internal.append("." * node.level + (node.module or ""))
-        if isinstance(node, ast.Import):
-            internal += [a.name for a in node.names if a.name.startswith("optjournal")]
-    assert not internal, (
-        f"analysis.py now imports {internal}; it is a leaf by design. If it needs"
-        " a shared rule, apply that rule in serialize, which already imports both."
-    )
+#: analysis.py's import rule is asserted in `test_layering.py`, which walks the
+#: real graph: `IMPORTS_LEAVES_ONLY` there says it may hold value types and
+#: nothing that reads a database. A hand-rolled copy of that check lived here and
+#: said something slightly stronger -- import NOTHING internal -- which stopped
+#: being true when the note-code rule became the `notes` leaf. Two statements of
+#: one rule, disagreeing, is how a rule gets weakened at the wrong site: the
+#: honest edit is to the rule, in the one place it is written.
