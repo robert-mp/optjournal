@@ -78,6 +78,13 @@
   --badfill1:#5e211f; --badfill2:#3a1614;
   --okedge:#2c6a48; --badedge:#7c2f2b;
   --badlit:#f0a0a8;
+  /* The performance chart's rising line and the fill beneath it. Its own name,
+     not --accent: the line should read as the journal's brass whatever the accent
+     is doing on tabs, and on Admiralty those are deliberately different hues. */
+  --chartline:#e0a877;
+  /* The message banner's third state. `ok` and `bad` reuse the P&L fills; only
+     the warning needed colours of its own. */
+  --warnfill:#3a3122; --warnfg:#e8cd85; --msgline:rgba(255,255,255,.07);
   /* Buy/sell, and put/call. Deliberately NOT --ok/--bad: green-red means signed
      money everywhere else here, so these are a cooler green and a warmer rose
      that read as categories rather than as profit. */
@@ -127,26 +134,43 @@
      Both constraints are real and they pull opposite ways -- a lighter accent
      shows the selection better and holds its label worse. */
   --accent:#2f6ea8; --accent2:#1d3d5c; --accentfg:#eaf2fb;
-  --accentlit1:#d9a05b; --accentlit2:#b07f3f; --onaccent:#0b1220;
+  /* The CURRENCY PILL, and it had to move a long way. At #d9a05b/#b07f3f this
+     was within 22/255 of Leather's brown per channel -- wired to the right
+     variable and still visibly unchanged, which is exactly the complaint that
+     found it. Signal-lamp cyan instead: unmistakably not Leather, and it reads
+     as an instrument lamp rather than a second brass object competing with the
+     mark. */
+  --accentlit1:#4fc3d9; --accentlit2:#2b93ad; --onaccent:#04161c;
   --accentedge:#3d6e9c;
   --brand1:#16233a; --brand2:#0e1728; --brand3:#0a111d;
-  --logo1:#d9a05b; --logo2:#a97535; --logo3:#7d5423;
-  --markhi:#fff6e4; --marklo:#2a1a08;
-  --sheen:rgba(255,244,222,.38);
+  /* THE MARK. Also barely moved before (20/255) -- the binnacle plate stayed
+     brown, which is the first thing anyone notices. Pushed to real polished
+     brass, much lighter and more saturated, so the compass reads as metal
+     seated in a blue-black housing rather than as leather that changed hue. */
+  --logo1:#f0c46a; --logo2:#c08c33; --logo3:#8a6220;
+  --markhi:#fffaf0; --marklo:#241503;
+  --sheen:rgba(255,248,230,.42);
   --edfg:#c9a05e; --edbg:#14202f; --edline:#25384f;
   --seg1:#16243a; --seg2:#111c2c;
   --dayhover:#4a6d94;
-  --ok:#4fd1a0; --bad:#f0899a;
-  --okfill1:#14453a; --okfill2:#0d2c26;
-  --badfill1:#54222c; --badfill2:#34161c;
-  --okedge:#2a6a5c; --badedge:#7a3040;
-  --badlit:#f0a0a8;
-  --buy:#8fd6b4; --sell:#f0a9b5;
-  --buybg:#122a26; --sellbg:#281820;
-  --put:#e0959b; --call:#7fc6a8;
-  --putwash:rgba(224,149,155,.16); --callwash:rgba(127,198,168,.16);
-  --rollwash:rgba(217,160,91,.18);
-  --imphi:#d0563f; --implo:#6f8296;
+  /* Gains cooled toward the sea-green end and losses toward signal red, so the
+     P&L pair belongs to this ground instead of being Leather's mint and rose
+     dropped onto slate. Contrast is recomputed by the tests, not eyeballed. */
+  --ok:#3fd6b0; --bad:#ff7d92;
+  --okfill1:#0f4a42; --okfill2:#092e2a;
+  --badfill1:#5c1f30; --badfill2:#38131e;
+  --okedge:#1f7566; --badedge:#8a2f45;
+  --badlit:#ff9aa8;
+  --buy:#7fe0c0; --sell:#ff9fb0;
+  --buybg:#0e2c28; --sellbg:#2c1620;
+  --put:#e8949f; --call:#6fcfae;
+  --putwash:rgba(232,148,159,.16); --callwash:rgba(111,207,174,.16);
+  --rollwash:rgba(240,196,106,.18);
+  /* The chart's rising line: brass, matching the mark rather than the blue
+     accent, so the series reads as the journal's own colour on any theme. */
+  --chartline:#f0c46a;
+  --warnfill:#33301c; --warnfg:#e8cd85; --msgline:rgba(255,255,255,.08);
+  --imphi:#e05a3f; --implo:#6f8296;
   --hairline:rgba(255,255,255,.04);
   --gridline:rgba(255,255,255,.06);
   --onfill:rgba(255,255,255,.66);
@@ -158,48 +182,66 @@
   --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 
-/* OXBLOOD -- ledger leather. Nearest to Leather, and included as the control:
-   it changes the hue barely and the TONAL RANGE a lot. Leather's --bg through
-   --line2 span six near-identical browns, which is why its panels read as one
-   flat sheet; this pushes the ground darker and the panels warmer so a card has
-   an edge without needing a border to prove it. */
-[data-theme="oxblood"]{
-  --bg:#0a0607; --bg2:#100a0b;
-  --panel:#1a0f11; --panel2:#221518; --line:#33191c; --line2:#452429;
-  /* 5.11 on --bg, 4.72 on --panel, 4.55 on --panel2. */
-  --fg:#f4e8de; --dim:#a4867e; --dim2:#997c74;
-  --kicker:#b58a72;
-  /* #8e4a45 gave the selected tab only 2.71:1 against --panel2, the same defect
-     the screenshots found in Admiralty. #934c47 clears the 2.8 floor at 2.83 and
-     holds --accentfg at 5.24. */
-  --accent:#934c47; --accent2:#5f2f2d; --accentfg:#f9e8e0;
-  /* --accentlit2 lifted from #a06a3c to #a86f3f, rather than crushing --onaccent
-     to near-black: at 4.18:1 the label failed AA, and the darkening that fixed
-     it (#060302) was black in all but name. A 3% lighter gilt clears at 4.53. */
-  --accentlit1:#c08552; --accentlit2:#a86f3f; --onaccent:#1a0d08;
-  --accentedge:#a35a4c;
-  --brand1:#2a1517; --brand2:#1c0f11; --brand3:#140b0c;
-  --logo1:#c08552; --logo2:#8a5730; --logo3:#653c22;
-  --markhi:#fdf1e0; --marklo:#3d1a12;
-  --sheen:rgba(255,238,214,.34);
-  --edfg:#cfa287; --edbg:#2b1518; --edline:#412026;
-  --seg1:#2c1a1c; --seg2:#231415;
-  --dayhover:#8f5a52;
-  --ok:#5fc9a2; --bad:#e8798f;
-  --okfill1:#1a4636; --okfill2:#122e23;
-  --badfill1:#5c2029; --badfill2:#38151a;
-  --okedge:#2d6650; --badedge:#82303c;
-  --badlit:#f0a0a8;
-  --buy:#8fd6b4; --sell:#f0a9b5;
-  --buybg:#152720; --sellbg:#2b171b;
-  --put:#dd9294; --call:#7fc3a0;
-  --putwash:rgba(221,146,148,.16); --callwash:rgba(127,195,160,.16);
-  --rollwash:rgba(197,160,120,.18);
-  --imphi:#c8523c; --implo:#78776c;
+/* LEDGER -- deep green buckram and aged gilt, the other classic accounts-book
+   binding. This REPLACED an "Oxblood" that was Leather with noise on it:
+   measured, ZERO of its 48 names moved more than 24/255 per channel from
+   Leather's, so it was wired perfectly and looked like nothing had happened.
+   That is the failure mode a variable-parity test cannot see -- a theme can
+   declare every name and still say nothing -- so the distance is now measured
+   too (`test_each_theme_is_visibly_distinct`).
+
+   Green also earns its place rather than being a third option for its own sake:
+   it is the one hue that leaves the P&L pair alone. --ok is a green, so a green
+   GROUND has to hold a gain that does not merge into it, which is why the fills
+   here are the coolest of the three themes and the gains push toward mint. */
+[data-theme="ledger"]{
+  --bg:#050a08; --bg2:#08110d;
+  --panel:#0c1813; --panel2:#12211a; --line:#1c3228; --line2:#2b4a3b;
+  /* Recomputed for this ground: 5.29 on --bg, 4.81 on --panel, 4.56 on --panel2. */
+  --fg:#eaf2ea; --dim:#93ab9d; --dim2:#8ea698;
+  --kicker:#c9a961;
+  --accent:#2f7d5c; --accent2:#1b4d38; --accentfg:#eafaf1;
+  /* The pill, in the same verdigris-gold family as the plate. #d9b866 was the
+     first attempt and the distinctness test rejected it for sharing Leather's
+     red-leading cast -- the same reason the plate moved. Green-dominant keeps the
+     lit control unmistakably this theme's, and it differs from Admiralty's cyan
+     as well, so no two themes light that control the same way. */
+  --accentlit1:#a8e08a; --accentlit2:#74ab55; --onaccent:#0d1408;
+  --accentedge:#3f9470;
+  --brand1:#123024; --brand2:#0c1f18; --brand3:#081410;
+  /* Verdigris-gold, GREEN-dominant rather than red: at #d9b866 the plate had the
+     same channel ordering as Leather's brown, and the distinctness test was right
+     to reject it -- aged gilt and tan leather are the same hue at different
+     brightnesses, which is exactly the "it still looks leather" complaint. */
+  --logo1:#cfe08a; --logo2:#93a852; --logo3:#5f7030;
+  --markhi:#fbffe8; --marklo:#1e2410;
+  --sheen:rgba(255,250,224,.36);
+  --edfg:#c9a961; --edbg:#122019; --edline:#24382c;
+  --seg1:#143024; --seg2:#0f241b;
+  --dayhover:#4f8a68;
+  /* Gains pushed to mint and losses to a clear rose: on a green ground a
+     sea-green gain would sink into the panel, which is the one thing this
+     theme's hue makes harder rather than easier. */
+  --ok:#6ee7b0; --bad:#f58ba0;
+  --okfill1:#124a35; --okfill2:#0b2e22;
+  --badfill1:#5a2130; --badfill2:#36141d;
+  --okedge:#22785a; --badedge:#853242;
+  --badlit:#f7a3b0;
+  --buy:#8fe6bc; --sell:#f7a8b8;
+  --buybg:#0f2c22; --sellbg:#2a1620;
+  --put:#e59aa0; --call:#7ed4ac;
+  --putwash:rgba(229,154,160,.16); --callwash:rgba(126,212,172,.16);
+  --rollwash:rgba(217,184,102,.18);
+  /* Brighter and greener than the gilt of the mark: at #d9b866 this was 17/255
+     from Leather's brass, so the one line the eye follows across the Performance
+     card looked identical between the two themes. */
+  --chartline:#8fe0a8;
+  --warnfill:#332e1a; --warnfg:#e8cd85; --msgline:rgba(255,255,255,.075);
+  --imphi:#d8543c; --implo:#6f8272;
   --hairline:rgba(255,255,255,.038);
   --gridline:rgba(255,255,255,.055);
   --onfill:rgba(255,255,255,.64);
-  --overlay:rgba(26,15,17,.97);
+  --overlay:rgba(12,24,19,.97);
   --shadow:rgba(0,0,0,.58);
   --bevelfaint:rgba(255,255,255,.032); --bevel:rgba(255,255,255,.19);
   --bevelhi:rgba(255,255,255,.23); --bevelon:rgba(255,255,255,.17);
@@ -207,7 +249,16 @@
   --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 *{box-sizing:border-box}
-html,body{margin:0;background:var(--bg);color:var(--fg);
+/* `color-scheme:dark` is not decoration and was MISSING, which is a gap no
+   variable could close: the parts of a native control the OS draws -- an open
+   <select>'s option list, the scrollbars, a date picker -- take their colours
+   from this declaration and from nothing in this file. Without it the month
+   dropdown could open a LIGHT popup list over a black page, and the only fix is
+   the keyword. Declared on both, because the scrollbar follows the root while
+   the controls follow their own subtree.
+   All three themes are dark, so this is unconditional today; a light theme would
+   move it into the theme blocks as `--scheme` and read it here. */
+html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
   font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
 
 /* ONE focus ring for every control, because there was none: `.tab` and `.icobtn`
@@ -834,7 +885,33 @@ td.n,th.n{text-align:right}
 .chart .zero{stroke:var(--kicker);stroke-width:1;stroke-dasharray:5 4;opacity:.75}
 .chart .zerolab{fill:var(--kicker);font-size:9px;font-family:var(--mono);
   letter-spacing:.11em;text-transform:uppercase;opacity:.85}
+/* The performance series. These were SVG presentation attributes carrying
+   literal hexes -- `stroke="#e0a877"` for the line, and a `stroke="#0a0806"`
+   halo on each dot that was Leather's own background, so on Admiralty the dots
+   were ringed in a brown the page no longer contains. An attribute is also
+   invisible to this file, which is why the whole chart sat out the theme swap.
+   `--chartline` is its own name rather than reusing --accent: the rising line
+   wants to read as the journal's own brass/gilt regardless of what the accent
+   is doing on tabs, and on Admiralty those are deliberately different hues. */
+.cline{stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.cline.pos{stroke:var(--chartline)}
+.cline.neg{stroke:var(--bad)}
+/* `stop-color` on the gradient stops, so the fill under the curve follows too. */
+stop.gpos{stop-color:var(--chartline)}
+stop.gneg{stop-color:var(--bad)}
+/* The halo is the SURFACE the chart sits on, named -- that is what makes a dot
+   read as separated from the line rather than ringed in an arbitrary colour. */
+.cdot{stroke:var(--panel);stroke-width:1.5}
+.cdot.pos{fill:var(--chartline)}
+.cdot.neg{fill:var(--bad)}
 
-#msg{margin-top:14px;padding:11px 15px;border-radius:10px;font-size:13px;display:none}
+/* The message banner. Was three inline `style.background`/`style.color` pairs
+   set from a literal table in `note()`, which no theme could repaint and no rule
+   could override -- inline styles win. Now a class per kind. */
+#msg{margin-top:14px;padding:11px 15px;border-radius:10px;font-size:13px;
+  display:none;border:1px solid var(--msgline)}
 #msg.show{display:block}
+#msg.ok{background:var(--okfill2);color:var(--ok)}
+#msg.warn{background:var(--warnfill);color:var(--warnfg)}
+#msg.bad{background:var(--badfill2);color:var(--badlit)}
 .note{margin-top:12px;font-size:12px;color:var(--dim2);line-height:1.6}

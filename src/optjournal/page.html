@@ -1110,7 +1110,7 @@ function renderTabs(){
 const THEMES=[
   ['leather','Leather'],
   ['admiralty','Admiralty'],
-  ['oxblood','Oxblood'],
+  ['ledger','Ledger'],
 ];
 const THEME_IDS=()=>THEMES.map(t=>t[0]);
 const themeLabel=id=>(THEMES.find(t=>t[0]===id)||THEMES[0])[1];
@@ -1636,8 +1636,14 @@ function chart(days){
   /* A dot below break-even takes the loss colour too, so a single day's marker
      states which side of zero it sits on without the reader tracing it back to
      the axis. */
-  const dots=pts.map((pt,i)=>`<circle cx="${sx(i).toFixed(1)}" cy="${sy(pt.y).toFixed(1)}" r="3.5"
-     fill="${pt.y<0?'#f0899a':'#c98a5c'}" stroke="#0a0806" stroke-width="1.5"><title>${esc(pt.x)} — cum ${cash(pt.y)} (${pt.n} fill(s))</title></circle>`).join('');
+  /* CLASSES, not literal fills. These were `#f0899a`/`#c98a5c` with a
+     `stroke="#0a0806"` halo -- Leather's own background, hardcoded into an SVG
+     attribute, so on any other theme the dots were ringed in a colour the page
+     no longer uses. An SVG presentation attribute is also unreachable from the
+     stylesheet, which is why the whole chart sat out the theme swap. */
+  const dots=pts.map((pt,i)=>`<circle class="cdot ${pt.y<0?'neg':'pos'}"
+     cx="${sx(i).toFixed(1)}" cy="${sy(pt.y).toFixed(1)}" r="3.5"
+     ><title>${esc(pt.x)} — cum ${cash(pt.y)} (${pt.n} fill(s))</title></circle>`).join('');
   const labels=pts.map((pt,i)=>i===0||i===pts.length-1
     ? `<text class="axis" x="${sx(i).toFixed(1)}" y="${H-8}" text-anchor="${i?'end':'start'}">${esc(pt.x)}</text>`:'').join('');
   /* Sign is encoded in the FILL, and the trick is that the area path is not cut
@@ -1657,12 +1663,12 @@ function chart(days){
     <defs>
       <linearGradient id="gpos" gradientUnits="userSpaceOnUse"
         x1="0" x2="0" y1="${PT}" y2="${z}">
-        <stop offset="0%" stop-color="#c98a5c" stop-opacity=".28"/>
-        <stop offset="100%" stop-color="#c98a5c" stop-opacity="0"/></linearGradient>
+        <stop class="gpos" offset="0%" stop-opacity=".28"/>
+        <stop class="gpos" offset="100%" stop-opacity="0"/></linearGradient>
       <linearGradient id="gneg" gradientUnits="userSpaceOnUse"
         x1="0" x2="0" y1="${z}" y2="${H-PB}">
-        <stop offset="0%" stop-color="#f0899a" stop-opacity="0"/>
-        <stop offset="100%" stop-color="#f0899a" stop-opacity=".26"/></linearGradient>
+        <stop class="gneg" offset="0%" stop-opacity="0"/>
+        <stop class="gneg" offset="100%" stop-opacity=".26"/></linearGradient>
       <clipPath id="cabove"><rect x="0" y="0" width="${W}" height="${z}"/></clipPath>
       <clipPath id="cbelow"><rect x="0" y="${z}" width="${W}"
         height="${(H-Number(z)).toFixed(1)}"/></clipPath>
@@ -1670,10 +1676,10 @@ function chart(days){
     ${ticks}${zero}
     ${area?`<path d="${area}" fill="url(#gpos)" clip-path="url(#cabove)"/>
       <path d="${area}" fill="url(#gneg)" clip-path="url(#cbelow)"/>`:''}
-    <path d="${line}" fill="none" stroke="#e0a877" stroke-width="2"
-      stroke-linejoin="round" stroke-linecap="round" clip-path="url(#cabove)"/>
-    <path d="${line}" fill="none" stroke="#f0899a" stroke-width="2"
-      stroke-linejoin="round" stroke-linecap="round" clip-path="url(#cbelow)"/>
+    <path class="cline pos" d="${line}" fill="none"
+      clip-path="url(#cabove)"/>
+    <path class="cline neg" d="${line}" fill="none"
+      clip-path="url(#cbelow)"/>
     ${dots}${labels}</svg>`;
 }
 
@@ -3415,10 +3421,15 @@ function restoreInputs(keep){
   });
 }
 
+/* A CLASS, not three inline colour pairs. This used to set `style.background`,
+   `style.color` and `style.border` from a literal table -- six hex values and an
+   rgba border that no stylesheet could see and no theme could repaint, so every
+   banner stayed Leather-coloured on every theme. Inline styles also outrank any
+   rule, which is what made this unfixable from app.css.
+   The kind is now a class and the colours live in the theme blocks. */
 function note(text,kind){
-  const m=$('#msg'); m.innerHTML=text; m.className='show';
-  const c={bad:['#3a1f22','#f0a0a8'],warn:['#3a3122','#e8cd85'],ok:['#183328','#9fe3c4']}[kind||'ok'];
-  m.style.background=c[0]; m.style.color=c[1]; m.style.border='1px solid rgba(255,255,255,.07)';
+  const m=$('#msg'); m.innerHTML=text;
+  m.className='show '+(['bad','warn','ok'].includes(kind)?kind:'ok');
 }
 
 /* Run a registered job from the page. The reason the strip exists.

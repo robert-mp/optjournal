@@ -3128,6 +3128,93 @@ def test_every_theme_declares_the_same_palette():
         )
 
 
+def test_each_theme_is_visibly_distinct_from_the_default():
+    """A THEME CAN BE WIRED PERFECTLY AND STILL SAY NOTHING, which every other
+    check here is blind to.
+
+    Measured after the first release: the theme then called "Oxblood" moved ZERO
+    of its 48 colours more than 24/255 per channel away from Leather's. Parity
+    passed (it declared every name), contrast passed, no literal escaped -- and it
+    looked like clicking the chip had done nothing. Admiralty had the same defect
+    in the two places a reader looks first: `--logo*` (the mark) and
+    `--accentlit*` (the currency pill) were within 22/255 of Leather's brown, so
+    the plate and the toggle stayed brown on a blue-black page. Both reported from
+    the running app.
+
+    So distinctness is a measured property now. The threshold is per-channel
+    distance rather than a perceptual metric on purpose: it is crude, it needs no
+    colour-science dependency, and it is enough to separate "a different palette"
+    from "the same palette with rounding on it".
+
+    KEY NAMES, not just an average: a theme could shift its ground and leave every
+    control alone, which is precisely what happened. The ones checked here are the
+    ones a reader identifies a theme by.
+    """
+    themes = _themes()
+    base_selector = next(s for s in themes if s.startswith(":root"))
+    base = themes[base_selector]
+
+    def apart(a: str, b: str) -> int:
+        return max(abs(int(a[i : i + 2], 16) - int(b[i : i + 2], 16))
+                   for i in (1, 3, 5))
+
+    def channel_order(colour: str) -> tuple[int, ...]:
+        """Which channel dominates, as a rank. This is the HUE question.
+
+        Absolute distance is the wrong test for a near-black ground: every --bg
+        here sits within a few points of zero, so Leather's brown `#0a0806` and
+        Admiralty's blue `#060910` are 10/255 apart while being obviously
+        different colours. What separates them is WHICH channel leads -- red for
+        the brown, blue for the slate. Measured on the ordering, so a dark surface
+        is judged by its cast rather than by a distance it cannot reach.
+        """
+        chans = [int(colour[i : i + 2], 16) for i in (1, 3, 5)]
+        return tuple(sorted(range(3), key=lambda i: -chans[i]))
+
+    def spread(colour: str) -> int:
+        """How far the leading channel sits above the trailing one.
+
+        The saturation question, needed because DISTANCE ALONE IS NOT ENOUGH and
+        the first version of this test proved it: the old Admiralty `--logo1`
+        (#d9a05b) is 47/255 from Leather's #b3714a and passed comfortably, while
+        the reported complaint was that the logo plate still looked brown. Both
+        are brown -- one is a brighter brown. So a landmark must differ in hue or
+        in saturation, not merely in brightness.
+        """
+        chans = [int(colour[i : i + 2], 16) for i in (1, 3, 5)]
+        return max(chans) - min(chans)
+
+    # The landmarks a reader identifies a theme by. Each must differ in CAST --
+    # which channel leads -- or in how saturated it is. `--logo1` is the plate
+    # behind the mark, `--accentlit1` the currency pill, `--chartline` the one
+    # line the eye follows on the Performance card. All three were reported as
+    # unchanged after the first release.
+    landmarks = ("logo1", "accentlit1", "accent", "chartline",
+                 "bg", "panel", "panel2")
+    for selector, palette in themes.items():
+        if selector == base_selector:
+            continue
+        for name in landmarks:
+            mine, theirs = palette[name], base[name]
+            recast = channel_order(mine) != channel_order(theirs)
+            resaturated = abs(spread(mine) - spread(theirs)) > 24
+            assert recast or resaturated, (
+                f"{selector}: --{name} ({mine}) has the same colour cast as "
+                f"Leather's {theirs} and a similar saturation, so it reads as the "
+                f"same colour at a different brightness. This is a landmark a "
+                f"reader identifies the theme by -- distance alone is not enough, "
+                f"which is how a brown logo plate shipped on a blue-black page"
+            )
+        # And the palette as a whole has to move, not only the landmarks.
+        shared = [n for n in palette if n in base]
+        moved = sum(1 for n in shared if apart(base[n], palette[n]) > 24)
+        assert moved >= len(shared) // 3, (
+            f"{selector}: only {moved} of {len(shared)} colours differ from "
+            f"Leather by more than 24/255 -- this reads as Leather with noise on "
+            f"it rather than as a separate theme"
+        )
+
+
 def test_no_colour_literal_lives_outside_a_theme_block():
     """The whole theme mechanism is "every colour is a variable", and 35 hex
     literals scattered through the rules is what made a theme swap leave brown
@@ -3149,6 +3236,34 @@ def test_no_colour_literal_lives_outside_a_theme_block():
         f"colour literals outside the theme blocks: {sorted(set(strays))} -- each "
         f"one survives a theme swap unchanged. Give it a name in every theme "
         f"block and use var()."
+    )
+
+
+def test_no_colour_literal_lives_in_the_page_either():
+    """THE STYLESHEET IS NOT THE ONLY PLACE A COLOUR CAN HIDE, and checking only
+    `app.css` is why three visible things sat out the first theme release.
+
+    Reported from the running app, not found by a test: the performance chart
+    never changed colour, and its dots were ringed in `#0a0806` -- Leather's own
+    BACKGROUND, hardcoded into an SVG `stroke` attribute. `note()` set
+    `style.background` and `style.color` from a literal table, and an inline style
+    outranks every rule, so no theme could have repainted the banner even with the
+    right variable in place.
+
+    Both are invisible to the CSS check by construction: an SVG presentation
+    attribute and a `style.foo =` assignment are colours the stylesheet cannot
+    see. So the page is scanned too, and the fix in each case was to move the
+    decision into a class.
+
+    `url(#gpos)` and `fill="none"` are not colours and stay; the pattern only
+    matches hex and rgb().
+    """
+    page = _code_only(page_html())
+    strays = re.findall(r"#[0-9a-fA-F]{6}\b|rgba?\([0-9.,\s]+\)", page)
+    assert not strays, (
+        f"colour literals in page.html: {sorted(set(strays))} -- a hex in an SVG "
+        f"attribute or an inline style cannot be themed, and an inline style "
+        f"cannot even be overridden from app.css. Move it to a class."
     )
 
 

@@ -155,7 +155,7 @@ def test_a_themed_url_repaints_the_whole_page(served, tmp_path):
         pytest.skip("no Chrome/Chromium on this machine")
     for requested, expected, label in (
         ("admiralty", "admiralty", "Admiralty Edition"),
-        ("oxblood", "oxblood", "Oxblood Edition"),
+        ("ledger", "ledger", "Ledger Edition"),
         ("nope", "leather", "Leather Edition"),
     ):
         dom = browser.dump_dom(f"{served}/#theme={requested}",
