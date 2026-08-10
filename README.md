@@ -37,13 +37,16 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
                        ▼              ▼               ▼
                   history.py      stats.py       analysis.py ◀── raw XML
                   (episodes)   (periods, scopes)  (cost report)
+                       │              │           costs.py ◀── the same costs,
+                       │              │           (scoped, whole history)  from SQL
                        └──────────────┼───────────────┘
                                       ▼
                      serialize.py (JSON payload contract; wraps analysis's
                                    per-currency ledgers into Money)
                      render.py    (terminal reports)
                           ▲
-                     money.py (Money: held by every layer above, depends on none)
+                     money.py (Money, Charge: held by every layer above,
+                               depends on none)
                      notes.py (IBKR note codes: read by history and analysis,
                                which cannot import each other)
                                       │
@@ -75,6 +78,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `bars.py` | the journal-shaped half of price bars — which contract over which window (from episodes), the idempotent write, the series a chart reads, and the expected-move band |
 | `blackscholes.py` | option pricing and the implied vol backed out of a market price. A leaf: pure float maths, `math.erf` for the normal CDF, so no numpy or scipy |
 | `analysis.py` | cost/friction report from the raw statement (whole account); pure statement mathematics — holds leaves (`notes.py`) and nothing that reads a database |
+| `costs.py` | the same costs read from SQLite instead: the account's whole life, narrowed to any set of asset categories, with measured cost kept structurally apart from the estimated AutoFX markup. Reconciled against `analysis.py` statement by statement — see `tests/test_costs.py` |
 | `strategies.py` | orders folded into the strategies they were placed as (a strangle sold as two same-second orders is one group), then linked into position lifecycles via episode trade ids |
 | `serialize.py` | the JSON payload the page renders and `--json` emits; wraps `analysis`'s per-currency ledgers into `Money` |
 | `render.py` | human-readable terminal reports. Bound to `serialize`'s shapes by `tests/test_render.py`: it once read flat money keys the `Money` conversion had removed, and `orders`/`history` died on `float(dict)` behind a green suite |
@@ -291,23 +295,6 @@ Four invariants worth knowing before changing the UI:
   (which render the filter bar) and nothing else. "0DTE" is a fill-level
   scope within options; "Equities" switches the asset category those three
   tabs run over. Positions, Costs, Annual and 0DTE stay pinned to options.
-* **Options P&L counts fully closed round trips only, attributed to the
-  close date.** A partial close (sold 3, bought back 1) contributes
-  nothing until the position is flat, and premium collected on an open
-  short is a liability, not profit — it is shown separately as "open
-  premium". Other asset categories keep IBKR's per-fill realisation.
-  `Gain % of Net Liq` divides that P&L by the NAV from the statement's
-  Equity Summary section (enable it on the Flex query template; the demo
-  carries synthetic NAV rows).
-* **The payload contract lives in the page, and the suite derives its
-  guards from it.** `page.html` opens with `@typedef` blocks declaring
-  every shape the page reads and a `@payload`/`@local` table saying which
-  binding holds which shape. `tests/test_web.py` parses those blocks and
-  enforces the chain in every direction: reads must resolve against the
-  typedefs, the typedefs must match a real payload both ways (a required
-  key the API stops sending fails, and a key it sends undeclared fails),
-  and the binding table may be neither incomplete nor stale. A typo'd key
-  fails a test instead of rendering a blank cell.
 
 ## Measuring the suite
 
@@ -422,6 +409,43 @@ float, because it contains the AutoFX markup estimate.
 two. **The shape itself carries meaning**: a nested object says "an as-charged
 figure could exist here"; a flat `_base` float says it cannot. The sweep
 asserts that directly, in both directions.
+
+### `Charge`: when withholding the native is the wrong answer
+
+`Money` withholds the as-charged figure the moment a scope spans currencies,
+which is right for any figure and wrong for exactly one surface. The Costs tab
+is scoped by the reader, and widening from options to the whole account should
+*add columns, not delete exactness* — each charge is still known individually;
+only the claim that one currency speaks for the total became false.
+
+So a cost is a `Charge`: a base translation plus the whole per-currency ledger,
+never collapsed. It adds (that is what makes a multi-select scope possible, each
+currency staying its own column through the sum) and it yields its `Money` on
+request, so the two types agree where they overlap and the single-figure
+surfaces need no special case.
+
+```json
+broker_costs.totals.attributable
+  { "base": 42.15, "native": null, "ccy": null,
+    "charged": { "USD": 21.92, "SEK": 208.41, "EUR": 1.67, "KRW": 4000.0 } }
+```
+
+The reader leads with `base`, then dissects into `charged`. Note what `Money`
+alone would have said here: `42.15` and nothing else.
+
+The same figure under a single-currency scope keeps its exact reading, so the two
+types agree where they overlap and the page needs no special case:
+
+```json
+broker_costs.totals.attributable      (scope: options only)
+  { "base": 15.16, "native": 17.46, "ccy": "USD", "charged": { "USD": 17.46 } }
+```
+
+One case the ledger deliberately cannot express: the AutoFX rate markup has a
+base and **no** billing currency, because IBKR never itemised it in one. An
+empty ledger with a non-zero base is therefore an *estimate*, distinct from
+`is_free` (nothing charged at all), and `costs.Friction` keeps the two apart as
+a type rather than as a caption.
 
 ### Six constructors, six provenances
 
