@@ -1622,17 +1622,15 @@ function chart(days){
   const ticks=[hi,(hi+lo)/2,lo].map(v=>
     `<line class="grid" x1="${PL}" y1="${sy(v).toFixed(1)}" x2="${W-PR}" y2="${sy(v).toFixed(1)}"/>
      <text class="axis" x="${PL-7}" y="${(sy(v)+3).toFixed(1)}" text-anchor="end">${cash(v,0)}</text>`).join('');
-  /* Zero is the one line on this chart that means something -- above it the
-     account is up, below it down -- so when the series actually crosses, it
-     stops being a grid line and becomes a labelled dashed rule. Drawn as a grid
-     line at .14 opacity it was indistinguishable from the two decorative
-     gridlines either side of it, which is how a drawdown came to look like
-     ordinary variation. */
-  const crosses=lo<0&&hi>0;
-  const zero=crosses?`<line class="zero" x1="${PL}" y1="${sy(0).toFixed(1)}"
-     x2="${W-PR}" y2="${sy(0).toFixed(1)}"/>
-   <text class="zerolab" x="${W-PR}" y="${(sy(0)-6).toFixed(1)}"
-     text-anchor="end">break even</text>`:'';
+  /* NO BREAK-EVEN RULE. There was a labelled dashed line at zero whenever the
+     series crossed it, on the argument that a drawdown should not read as
+     ordinary variation. Removed by request, and the argument it rested on was
+     already carried twice over: the area fill is clipped at zero and painted in
+     the LOSS colour below it, and every dot below zero takes that colour too. So
+     the sign of the series is stated by the two things a reader is already
+     looking at, and a third dashed rule with a caption was the only element on
+     this card competing with the line itself.
+     The axis still labels its lowest tick, so the scale remains readable. */
   /* A dot below break-even takes the loss colour too, so a single day's marker
      states which side of zero it sits on without the reader tracing it back to
      the axis. */
@@ -1673,7 +1671,7 @@ function chart(days){
       <clipPath id="cbelow"><rect x="0" y="${z}" width="${W}"
         height="${(H-Number(z)).toFixed(1)}"/></clipPath>
     </defs>
-    ${ticks}${zero}
+    ${ticks}
     ${area?`<path d="${area}" fill="url(#gpos)" clip-path="url(#cabove)"/>
       <path d="${area}" fill="url(#gneg)" clip-path="url(#cbelow)"/>`:''}
     <path class="cline pos" d="${line}" fill="none"
@@ -3427,9 +3425,39 @@ function restoreInputs(keep){
    banner stayed Leather-coloured on every theme. Inline styles also outrank any
    rule, which is what made this unfixable from app.css.
    The kind is now a class and the colours live in the theme blocks. */
+/* How long a SUCCESS stays up. `ok` is the only kind that self-dismisses, and
+   that asymmetry is the whole design: "market ok -- 74 fetched, 74 stored" has
+   been read the moment it appears and then sits there claiming the page's
+   attention forever, but a failure the reader looked away from must still be
+   there when they look back. A dismissed error is an error nobody saw. */
+const NOTE_MS=6000;
+let noteTimer=null;
 function note(text,kind){
   const m=$('#msg'); m.innerHTML=text;
-  m.className='show '+(['bad','warn','ok'].includes(kind)?kind:'ok');
+  const k=['bad','warn','ok'].includes(kind)?kind:'ok';
+  /* No `fading`: a new note always arrives fully opaque, including one that
+     lands while a previous banner is mid-fade. */
+  m.className='show '+k;
+  /* Cleared unconditionally, BEFORE the branch: without this, an `ok` followed
+     by a `bad` inside the window leaves the first banner's timer running, and it
+     hides the error mid-read. The bug is in the sequence, not in either call. */
+  if(noteTimer){clearTimeout(noteTimer);noteTimer=null;}
+  if(k!=='ok') return;
+  noteTimer=setTimeout(()=>{
+    noteTimer=null;
+    /* Re-read the element rather than closing over `m`, and check it is still
+       showing THIS kind: a redraw can replace #msg, and a later `bad` that
+       arrives after the timer was cleared must not be wiped by a stale closure. */
+    const el=$('#msg');
+    if(!el||!el.classList.contains('ok')) return;
+    el.classList.add('fading');
+    /* Hidden only after the fade has run, so the element leaves the layout
+       instead of holding an invisible gap above the panels below it. `once`, so
+       repeated notes cannot stack listeners on one element. */
+    el.addEventListener('transitionend',()=>{
+      if(el.classList.contains('fading')) el.className='';
+    },{once:true});
+  },NOTE_MS);
 }
 
 /* Run a registered job from the page. The reason the strip exists.

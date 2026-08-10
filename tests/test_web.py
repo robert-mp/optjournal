@@ -3348,7 +3348,6 @@ def test_a_zero_crossing_chart_marks_break_even_and_colours_the_loss_side():
     needs no extra code -- confirmed in a browser on a series that crosses
     twice, which produced three red dots and three brass ones.
     """
-    js = _code_only(_js())
     chart = _fn("chart")
     assert 'clip-path="url(#cabove)"' in chart and 'clip-path="url(#cbelow)"' in chart, (
         "the fill is no longer clipped per side, so loss and gain share a colour"
@@ -3362,16 +3361,48 @@ def test_a_zero_crossing_chart_marks_break_even_and_colours_the_loss_side():
         "the two fills no longer share one area path, which is what keeps the "
         "geometry free of zero-crossing special cases"
     )
-    assert 'class="zero"' in chart and "break even" in chart, (
-        "break-even is no longer labelled when the series crosses it"
+    # NO break-even rule. It was a labelled dashed line at zero, removed by
+    # request -- and the sign information it carried is stated twice over by the
+    # things already on the card: the fill is clipped at zero and painted in the
+    # loss colour below it, and a dot below zero takes that colour too. Asserted
+    # as an absence so it cannot drift back in alongside those.
+    assert "break even" not in chart, (
+        "the break-even rule is back on the performance chart; the clipped fill "
+        "and the per-dot sign colour already say which side of zero the series is"
     )
-    # Drawn only when it means something.
-    assert "const crosses=lo<0&&hi>0" in js, (
-        "the zero rule is no longer conditional on an actual crossing"
+    assert 'class="zero"' not in chart, "the zero rule is back"
+
+
+def test_only_a_success_banner_dismisses_itself():
+    """A success has been read the instant it appears; a failure has not.
+
+    "market ok -- 74 fetched, 74 stored" used to sit above the calendar until the
+    next note replaced it or the page reloaded, claiming the reader's attention
+    forever for something already absorbed. Reported from the running app.
+
+    THE ASYMMETRY IS THE POINT AND MUST NOT BE FLATTENED. An error that
+    disappears on a timer is an error nobody saw -- the reader who looked away is
+    exactly the reader who needed it -- so `bad` and `warn` stay until something
+    replaces them.
+    """
+    note = _fn("note")
+    assert "if(k!=='ok')return" in note.replace(" ", ""), (
+        "every kind now self-dismisses, so a failure can vanish before it is "
+        "read -- only `ok` may be on a timer"
+    )
+    # The timer is cleared on EVERY call, before the branch: an ok followed by a
+    # bad inside the window would otherwise let the first note's timer fire and
+    # hide the error mid-read.
+    body = note.replace(" ", "").replace("\n", "")
+    assert body.index("clearTimeout") < body.index("if(k!=='ok')return"), (
+        "the pending timer is not cleared before the kind is checked, so an `ok` "
+        "followed by a `bad` lets the stale timer hide the error"
     )
     css = _css().replace(" ", "").replace("\n", "")
-    assert ".chart.zero{" in css and "stroke-dasharray:54" in css, (
-        "the break-even rule lost the dash that distinguishes it from data"
+    # The fade needs the element to STAY displayed while opacity animates.
+    assert "#msg.show.fading{opacity:0}" in css, (
+        "the fade-out state is gone; dropping `.show` instead sets display:none "
+        "in the same frame and the transition never runs"
     )
 
 

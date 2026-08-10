@@ -879,12 +879,13 @@ td.n,th.n{text-align:right}
 .chart{width:100%;height:230px;display:block}
 .chart .grid{stroke:var(--gridline);stroke-width:1}
 .chart .axis{fill:var(--dim2);font-size:10px;font-family:var(--mono)}
-/* Break-even outranks the decorative gridlines, because crossing it is the one
-   event on this chart that changes what the line MEANS. Dashed so it reads as a
-   reference rather than as data, and only drawn when the series crosses. */
-.chart .zero{stroke:var(--kicker);stroke-width:1;stroke-dasharray:5 4;opacity:.75}
-.chart .zerolab{fill:var(--kicker);font-size:9px;font-family:var(--mono);
-  letter-spacing:.11em;text-transform:uppercase;opacity:.85}
+/* `.chart .zero` and `.chart .zerolab` lived here: a dashed rule at break-even
+   with an uppercase caption. Removed with the markup that drew them rather than
+   left behind -- `test_every_rule_in_the_stylesheet_is_reachable_from_the_page`
+   caught `zerolab` the moment the element went, which is the check that keeps
+   this file from accumulating rules for elements that no longer exist. The `.zero`
+   rule further up is a DIFFERENT element (the replay panel's delta baseline) and
+   stays. */
 /* The performance series. These were SVG presentation attributes carrying
    literal hexes -- `stroke="#e0a877"` for the line, and a `stroke="#0a0806"`
    halo on each dot that was Leather's own background, so on Admiralty the dots
@@ -908,9 +909,21 @@ stop.gneg{stop-color:var(--bad)}
 /* The message banner. Was three inline `style.background`/`style.color` pairs
    set from a literal table in `note()`, which no theme could repaint and no rule
    could override -- inline styles win. Now a class per kind. */
+/* `opacity` carries the dismissal, not `display`: a success banner fades out
+   after NOTE_MS rather than blinking away, and fading is what tells a reader who
+   glanced up that the message LEFT rather than that they imagined it. `display`
+   still does the showing, so the element takes no layout space when idle and the
+   panels below do not shift. Only the fade is transitioned. */
 #msg{margin-top:14px;padding:11px 15px;border-radius:10px;font-size:13px;
-  display:none;border:1px solid var(--msgline)}
+  display:none;border:1px solid var(--msgline);opacity:1;
+  transition:opacity .45s ease}
 #msg.show{display:block}
+/* The fade-out state. It must keep `display:block` -- dropping `.show` instead
+   would set `display:none` in the same frame and the transition would never run,
+   which is exactly what the first attempt did. `.fading` is removed with `.show`
+   once the fade has finished. */
+#msg.show.fading{opacity:0}
+@media (prefers-reduced-motion:reduce){#msg{transition:none}}
 #msg.ok{background:var(--okfill2);color:var(--ok)}
 #msg.warn{background:var(--warnfill);color:var(--warnfg)}
 #msg.bad{background:var(--badfill2);color:var(--badlit)}
