@@ -34,6 +34,7 @@ from optjournal.config import (
 )
 from optjournal.db import connect, migrate
 from optjournal.history import build_history
+from optjournal.stats import campaigns_for
 from optjournal.web import _origin_is_same, build_state, page_html, serve
 
 
@@ -713,6 +714,55 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
         sum(e.commission_base for e in closed_in(close_month))
     )
     assert abs(closed["commissions"]["base"]) > abs(opened["commissions"]["base"])
+
+
+def test_inflight_realised_explains_the_gap_between_p_and_l_and_the_scoreboard(
+    populated,
+):
+    """The card's note, checked against an independent recount of the archive.
+
+    Net P&L sums contract round trips; the scoreboard counts decided positions. A
+    roll settles its near contract for real cash while the decision carries on, so
+    the two legitimately differ and `inflight_realized` is what the note uses to
+    say by how much. On the real archive that is the GOOG chain: rolled in August,
+    still open, its 420C leg already settled.
+
+    Recounted here from the episodes rather than compared against another payload
+    figure, so a bug that moved both in step would still fail. Three properties,
+    each a way the note could lie:
+
+    * it is a SUBSET of the P&L it qualifies ("of this figure"),
+    * it is exactly the closed episodes sitting in an unfinished position,
+    * it is zero when every position has finished, rather than merely small.
+    """
+    conn = connect(populated)
+    try:
+        report = build_history(conn, asset_category="OPT")
+        campaigns = campaigns_for(conn, "OPT", report.episodes)
+    finally:
+        conn.close()
+
+    expected = 0.0
+    for campaign in campaigns:
+        episodes = [report.episodes[i] for i in campaign.episode_indices]
+        if all(e.is_closed for e in episodes):
+            continue
+        expected += sum(e.realized_pnl_base for e in episodes if e.is_closed)
+
+    stats = build_state(
+        db_path=populated, archive_dir=RAW_DIR, query_id=None
+    )["stats"]
+    got = stats["inflight_realized"]["base"]
+
+    assert got == pytest.approx(expected)
+    assert abs(got) <= abs(stats["net_pnl"]["base"]) + 1e-9, (
+        "the note says 'of this figure', so the part cannot exceed the whole"
+    )
+    if not expected:
+        pytest.skip("archive has no unfinished position holding settled cash")
+    # Strictness, so the assertions above cannot pass on an all-zero payload: the
+    # gap the note exists for is genuinely open on this archive.
+    assert stats["closed_episodes"] > stats["decided_campaigns"]
 
 
 def test_options_commission_reconciles_and_open_commission_is_separate(populated):

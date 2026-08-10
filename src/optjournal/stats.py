@@ -370,6 +370,26 @@ class MonthStats:
     #: easily be single-currency in one and mixed in the other.
     open_commission: Money = Money.restated(0.0)
 
+    #: How much of `net_pnl` closed inside a position that is STILL RUNNING.
+    #:
+    #: A roll closes one contract and opens the next, so its near leg settles
+    #: real cash while the decision carries on. That cash belongs in `net_pnl` --
+    #: it left the broker, it is on the tax return, and removing it would stop
+    #: this panel reconciling against the statement. But it is not part of any
+    #: outcome yet, so the scoreboard excludes it, and the two figures then
+    #: disagree on screen with nothing to explain why: the real journal shows
+    #: 2 decided positions beside a P&L containing three positions' cash.
+    #:
+    #: The third member of a family: `open_premium` is cash collected with no
+    #: outcome yet, `open_commission` is cash paid with no outcome yet, and this
+    #: is cash SETTLED with no outcome yet. Reported rather than netted out, for
+    #: the same reason as both of those.
+    #:
+    #: Provenance, never a forecast. It can fall as well as rise -- roll a winner
+    #: into a loser and the finished campaign is worth less than this suggests --
+    #: so nothing that displays it may call it an unrealised gain.
+    inflight_realized: Money = Money.restated(0.0)
+
     #: Net Asset Value at the period's end, from the newest equity summary on
     #: or before it. None when the Flex query template does not have the
     #: "Equity Summary in Base" section enabled -- unavailable, not zero.
@@ -1067,6 +1087,19 @@ def month_stats(
     stats.avg_loss = Money.charged(
         (e.realized_pnl_base, e.realized_pnl, e.currency) for c in lost for e in c
     ).per(len(lost))
+    # The part of `net_pnl` whose position has not finished: episodes this period
+    # counted as closed that sit in a campaign still running. Taken from the SAME
+    # `units` the scoreboard uses, so the figure that explains the gap cannot
+    # disagree with the gap. Scoped and period-filtered exactly like `closed`
+    # above, because it is a subset of it -- the note it feeds claims "of this
+    # figure", and a differently-scoped subset could exceed its own total.
+    stats.inflight_realized = Money.charged(
+        (e.realized_pnl_base, e.realized_pnl, e.currency)
+        for unit in units
+        if not all(e.is_closed for e in unit)
+        for e in unit
+        if e.is_closed and _in_period(e.closed_at, period) and scope.has_episode(e)
+    )
     stats.net_liq_base, stats.net_liq_date = _net_liq_for(conn, period)
 
     stats.days = daily_series(conn, period, asset_category, scope, report=report)
@@ -1098,6 +1131,7 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "win_rate": stats.win_rate,
         "avg_win": None if stats.avg_win is None else stats.avg_win.payload(),
         "avg_loss": None if stats.avg_loss is None else stats.avg_loss.payload(),
+        "inflight_realized": stats.inflight_realized.payload(),
         "open_premium": stats.open_premium.payload(),
         "open_commission": stats.open_commission.payload(),
         "net_liq_base": stats.net_liq_base,

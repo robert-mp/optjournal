@@ -360,6 +360,29 @@ Four invariants worth knowing before changing the UI:
   fall back to one campaign per episode, which meant a forgotten keyword
   silently produced the pre-campaign reading — a default that is wrong in
   silence, and the reason most of the suite was measuring the old rule.
+
+  The two units part company in exactly one place, and the Net P&L card
+  names it: a roll settles its near contract for real cash while the
+  decision carries on, so that money is in the P&L and out of the
+  scoreboard. `inflight_realized` is how much — €270.47 on this account,
+  the GOOG 420C closed when the strangle was rolled — and the note reads
+  "of this closed inside a position still running". It is NOT netted out of
+  Net P&L: the cash left the broker and is on the tax return, so removing
+  it would stop the panel reconciling against the statement and break
+  monthly rows summing to annual ones. It is the third member of a family —
+  `open_premium` is cash collected with no outcome yet, `open_commission`
+  is cash paid with no outcome yet, this is cash *settled* with no outcome
+  yet. Provenance, never a forecast: it can fall, since rolling a winner
+  into a loser leaves the finished campaign worth less.
+
+  A toggle was considered and rejected. Every control on this page exists
+  because two readers want different DATA (`type` filters the population,
+  `ccy` restates it, the calendar filter has two axes because one could not
+  express "USD, every impact"). Nobody wants a Net P&L that IBKR never
+  reported, so the gap is a labelling problem, not a choice — and a
+  presentation toggle would have to live in the hash like `theme` and
+  `ccy`, which would let a shared link carry a non-broker-stated P&L with
+  nothing on screen saying which mode produced it.
 * **The payload contract lives in the page, and the suite derives its
   guards from it.** `page.html` opens with `@typedef` blocks declaring
   every shape the page reads and a `@payload`/`@local` table saying which

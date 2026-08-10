@@ -279,6 +279,53 @@ def test_the_scoreboard_counts_positions_where_episodes_double_counted(conn):
     )
 
 
+def test_inflight_realised_counts_only_positions_that_never_finished(conn):
+    """IN FLIGHT means the position is still running, not merely that its cash
+    landed in another period. Two different reasons a month can show P&L with no
+    decided position, and only one of them is this figure's business.
+
+    The demo's SPY roll is the OTHER one: November settles the 560P for +585.82
+    and December's expiry ends the chain, so by any period's reckoning that
+    campaign finished. November's cash is attributed elsewhere, which the `closed`
+    versus `decided` columns already show, and nothing about it is unfinished.
+    Every demo campaign completes, so this figure is zero for every period --
+    including November, where an earlier draft of this test wrongly expected
+    585.82 and the code was right.
+
+    The real journal is where it is non-zero: see the GOOG chain, rolled and still
+    open, in the README's counting section.
+    """
+    report = build_history(conn, asset_category="OPT")
+    campaigns = campaigns_for(conn, "OPT", report.episodes)
+
+    nov = month_stats(conn, "2025-11", report=report, campaign_list=campaigns)
+    assert nov.net_pnl.base == pytest.approx(585.82, abs=1e-2)
+    assert nov.decided_campaigns == 0, "the outcome landed in December"
+    assert nov.inflight_realized.base == 0.0, (
+        "the position DID finish, so its cash is attributed elsewhere rather "
+        "than sitting in flight"
+    )
+
+    everything = month_stats(conn, None, report=report, campaign_list=campaigns)
+    assert everything.inflight_realized.base == 0.0
+    assert everything.decided_campaigns == 7, "the control: things did finish"
+
+
+def test_inflight_realised_is_a_subset_of_the_p_and_l_it_qualifies(conn):
+    """The note reads "of this figure", so the part may never exceed the whole.
+
+    Scoped and period-filtered identically to the episodes `net_pnl` sums, which
+    is the only thing that keeps that true. Asserted over every period the demo
+    has, because a mismatch would show up in exactly one month rather than in the
+    all-time row.
+    """
+    report = build_history(conn, asset_category="OPT")
+    campaigns = campaigns_for(conn, "OPT", report.episodes)
+    for period in [None, *available_months(conn), "2025", "2026"]:
+        s = month_stats(conn, period, report=report, campaign_list=campaigns)
+        assert abs(s.inflight_realized.base) <= abs(s.net_pnl.base) + 1e-9, period
+
+
 def test_a_rolled_position_scores_where_it_finished_not_where_cash_landed(conn):
     """The SPY roll spans November into December, and the two units part company.
 

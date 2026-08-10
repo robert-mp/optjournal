@@ -312,6 +312,9 @@ import {
  * @property {Money|null} avg_win -- null without wins; an average of no
  *   outcomes is undefined, and zero would read as break-even
  * @property {Money|null} avg_loss -- null without losses
+ * @property {Money} inflight_realized -- the part of net_pnl that closed inside a
+ *   position still running (a roll's near contract). In the money, out of the
+ *   scoreboard; provenance, not a forecast, since it can fall
  * @property {Money} open_premium -- excluded from P&L until positions close
  * @property {Money} open_commission -- excluded the same way
  * @property {number|null} net_liq_base -- null until equity summaries exist
@@ -1372,9 +1375,25 @@ function dashboard(){
   /* Options P&L counts fully closed round trips only, landing on the close
      date; premium on an open short is a liability, not profit. Stock P&L is
      IBKR's per-fill realisation. The note under the card says which rule the
-     number obeys rather than letting two definitions share one label. */
-  const pnlNote=opt?'closed round trips only, net of commission'
-               :'realised per fill, net of commission';
+     number obeys rather than letting two definitions share one label.
+
+     The in-flight clause names the one place this figure and the scoreboard
+     part company. A roll settles its near contract for real cash while the
+     DECISION carries on, so that money is in Net P&L (it left the broker, and
+     dropping it would stop this panel reconciling with the statement) and out
+     of the wins, losses and averages, which wait for the position to finish.
+     Without the clause the reader gets 2 decided positions beside a P&L holding
+     three positions' cash and nothing to explain it -- the question this note
+     exists to answer, asked out loud before it was written.
+
+     Says "closed inside a position still running", never "unrealised": the
+     figure can FALL, since rolling a winner into a loser leaves the finished
+     campaign worth less than this. It is provenance, not a forecast. */
+  const inflight=opt&&s.inflight_realized&&s.inflight_realized.base
+    ?` · ${moneyOf(s.inflight_realized)} of this closed inside a position still running`
+    :'';
+  const pnlNote=(opt?'closed round trips only, net of commission'
+               :'realised per fill, net of commission')+inflight;
   const nl=s.net_liq_base;
   /* For options, the headline trade count is DECIDED POSITIONS -- the same
      population the wins, losses and averages measure. Counting fills here
