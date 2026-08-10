@@ -82,22 +82,58 @@ def page(tab="dashboard", body="", ccy=None, kind=None, calday=None, replay=None
     )
 
 
-def _costs(pill, commission, per_unit):
-    """The journal cost block, plus an FX table that must be out of scope.
+def _costs(figure, split, *, est=True, ledger=("USD", "SEK"), aside=True):
+    """The Costs tab: headline, split line, charged ledger, unattributable block.
 
-    The FX section is included on purpose: it lists conversion pairs and so
-    legitimately shows other currencies. A check that read the whole page
-    counted those as a contradiction and failed a correct render.
+    The FX table is included on purpose. It lists conversion pairs and so
+    legitimately shows other currencies -- an earlier glyph-counting check read
+    the whole page and failed a correct render because of it, which is the failure
+    mode that gets a check deleted rather than trusted.
     """
-    return (
-        f'<div class="pills"><span class="pill">OPT <b>{pill}</b></span></div>'
-        '<h2>OPT — attributable to this journal</h2>'
-        f'<div class="stats"><div class="card">OPT commission {commission}'
-        f' as charged</div><div class="card">Per contract {per_unit}</div></div>'
-        '<div class="card"><h2>FX conversions</h2><table><tbody>'
-        '<tr><td>EUR.SEK</td><td>kr1,200</td><td>€1.73</td></tr>'
-        '</tbody></table></div>'
+    amounts = "".join(
+        f'<span class="amt"><span class="c">{code}</span>17.46</span>'
+        for code in ledger
     )
+    return (
+        f'<div class="hero"><div class="fig{" est" if est else ""}">{figure}</div>'
+        f'<div class="split">{split}</div></div>'
+        + (f'<div class="ledger">{amounts}</div>' if ledger else "")
+        + '<div class="card"><h2>Currency conversions</h2><table><tbody>'
+          '<tr><td>EUR.SEK</td><td>kr1,200</td><td>€1.73</td></tr>'
+          "</tbody></table></div>"
+        + (
+            '<div class="aside"><h2>Account-level — attributable to nothing</h2>'
+            "</div>"
+            if aside
+            else ""
+        )
+    )
+
+
+#: A friction payload whose total contains an estimate, and one that does not.
+#: The check reads `is_estimated` and requires the page to agree, in both
+#: directions -- a page that always showed a range would imply uncertainty in a
+#: figure IBKR billed exactly.
+def _cost_payload(*, estimated=True, charged=None, unattributable=3.97):
+    return {
+        "stats": {},
+        "broker_costs": {
+            "totals": {
+                "unattributable": {"base": unattributable},
+                "friction": {
+                    "is_estimated": estimated,
+                    "stated": {
+                        "base": 47.85,
+                        "charged": (
+                            {"USD": 21.92, "SEK": 208.41}
+                            if charged is None
+                            else charged
+                        ),
+                    },
+                },
+            }
+        },
+    }
 
 
 def _bare(dom, tab, payload=None):
@@ -281,12 +317,39 @@ CASES: list[tuple[str, sweep.Check, Page, Page]] = [
      sweep.check_money_keys_are_shaped,
      page(payload=_MONEY_OK),
      page(payload=_MONEY_INVENTED)),
-    ("costs block shares a basis",
-     sweep.check_costs_block_shares_one_basis,
-     page(tab="costs", body=_costs("$6.97", "$6.97", "$0.6965")),
-     # The contradiction the model exists to prevent: a restated pill beside an
-     # as-charged card, in one sentence.
-     page(tab="costs", body=_costs("€6.07", "$6.97", "$0.6965"))),
+    ("an estimated headline shows its range",
+     sweep.check_costs_headline_states_its_basis,
+     page(tab="costs", payload=_cost_payload(),
+          body=_costs("€61.11", "€47.85 charged · €12.83–€13.68 estimated")),
+     # A midpoint printed alone. The figure is right and the page has stopped
+     # saying it is an estimate, which is the reading this tab exists to prevent.
+     page(tab="costs", payload=_cost_payload(),
+          body=_costs("€61.11", "€47.85 charged"))),
+    ("an exact headline claims no estimate",
+     sweep.check_costs_headline_states_its_basis,
+     page(tab="costs", payload=_cost_payload(estimated=False),
+          body=_costs("€19.13", "€19.13 charged · nothing estimated", est=False)),
+     # The inverse failure: a range on a scope IBKR billed exactly, which invents
+     # uncertainty rather than hiding it.
+     page(tab="costs", payload=_cost_payload(estimated=False),
+          body=_costs("€19.13", "€19.13 charged · €12.83–€13.68 estimated",
+                      est=False))),
+    ("the ledger shows every charged currency",
+     sweep.check_costs_ledger_shows_every_charged_currency,
+     page(tab="costs", payload=_cost_payload(),
+          body=_costs("€61.11", "x", ledger=("USD", "SEK"))),
+     # SEK was billed and is not on screen: a charge the reader silently stopped
+     # being shown, which is exactly what `Money`'s gate would have done to it.
+     page(tab="costs", payload=_cost_payload(),
+          body=_costs("€61.11", "x", ledger=("USD",)))),
+    ("unattributable cost reaches the screen",
+     sweep.check_costs_shows_what_it_cannot_attribute,
+     page(tab="costs", payload=_cost_payload(),
+          body=_costs("€61.11", "x", aside=True)),
+     # Fees in the payload, no block on the page: a tab captioned "broker cost"
+     # measuring less than it claims.
+     page(tab="costs", payload=_cost_payload(),
+          body=_costs("€61.11", "x", aside=False))),
     ("calendar pills match grid",
      sweep.check_calendar_pills_match_grid,
      page(tab="calendar", body=_CALENDAR_OK),

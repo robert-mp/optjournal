@@ -221,33 +221,112 @@ def _currency_glyphs() -> dict[str, str]:
 _CURRENCY_GLYPH_FALLBACK = {"EUR": "€", "USD": "$", "GBP": "£", "KRW": "₩"}
 
 
-def check_costs_block_shares_one_basis(p: Page) -> Verdict:
-    """Pill, card and per-unit on the Costs tab agree on a currency.
+#: The Costs headline: the figure, then the split line beneath it. Matched on the
+#: rendered classes rather than on prose, so rewording the caption cannot silently
+#: disable the checks below.
+_HERO = re.compile(
+    r'class="fig(?P<est>[^"]*)">(?P<figure>[^<]*)</div>\s*'
+    r'<div class="split">(?P<split>.*?)</div>',
+    re.S,
+)
 
-    They sit in one sentence, so "as charged · $6.97" beside a €6.07 pill is a
-    contradiction rather than a rounding difference. This is the display half of
-    the Money model: one rule applied to every figure in a block, not per
-    figure.
 
-    Scoped to the journal cost block, NOT the whole page. Two things outside it
-    legitimately carry other currencies: the header's currency toggle labels
-    every option with its own glyph (`€EUR $USD`), and the FX table below lists
-    conversion pairs. A page-wide glyph count reported both as contradictions --
-    it failed on a correct page, which is the failure mode that gets a check
-    deleted rather than trusted.
+def check_costs_headline_states_its_basis(p: Page) -> Verdict:
+    """An estimated headline never appears without the range it came from.
+
+    This tab leads with ONE figure, and roughly a quarter of this account's
+    friction is the AutoFX rate markup -- a published constant applied to real
+    notional, not a measurement. The midpoint is printed because a headline has to
+    print something, so the guarantee that keeps it honest is structural: whenever
+    the total contains an estimate, the split line beneath it must show the band.
+
+    Checked against the PAYLOAD's own `is_estimated`, so a scope with nothing
+    estimated is required NOT to show a range -- a check that only looked for the
+    range would pass a page that showed one unconditionally, which would imply
+    uncertainty in a figure IBKR billed exactly.
     """
     if p.tab != "costs":
         return skip("not the costs tab")
-    start = p.markup.find('class="pills"')
+    hero = _HERO.search(p.markup)
+    if hero is None:
+        return skip("no cost headline rendered")
+    friction = (
+        ((p.payload.get("broker_costs") or {}).get("totals") or {}).get("friction")
+        or {}
+    )
+    if not friction:
+        return skip("no friction in the payload")
+    estimated = bool(friction.get("is_estimated"))
+    split = hero.group("split")
+    if estimated and "estimated" not in split:
+        return bad(
+            "the headline includes an estimate but the line beneath it does not "
+            "say so, so a midpoint reads as a measured total"
+        )
+    if estimated and "–" not in split:
+        return bad("an estimated headline shows no range, only a point estimate")
+    if not estimated and "estimated" in split.replace("nothing estimated", ""):
+        return bad(
+            "nothing in this scope was estimated, yet the headline claims part of "
+            "it was -- that implies uncertainty in a figure IBKR billed exactly"
+        )
+    if estimated and "est" not in hero.group("est"):
+        return bad("an estimated figure carries no marker, so it reads as exact")
+    return ok()
+
+
+def check_costs_ledger_shows_every_charged_currency(p: Page) -> Verdict:
+    """Every currency the payload says was billed appears in the ledger.
+
+    The reason costs are `Charge` rather than `Money`: under a scope spanning
+    asset categories no single currency can speak for the total, and `Money`
+    withholds the native entirely at that point. The ledger keeps all of them, so
+    widening the scope adds columns instead of deleting exactness -- and a missing
+    column is a charge the reader silently stopped being shown.
+
+    The FX table and the currency toggle also carry other currencies, so this
+    reads the LEDGER block only, matched by class.
+    """
+    if p.tab != "costs":
+        return skip("not the costs tab")
+    totals = (p.payload.get("broker_costs") or {}).get("totals") or {}
+    charged = ((totals.get("friction") or {}).get("stated") or {}).get("charged") or {}
+    if not charged:
+        return skip("nothing charged in this scope")
+    start = p.markup.find('class="ledger"')
     if start < 0:
-        return skip("no cost pill rendered")
-    end = p.markup.find("FX conversions", start)
-    block = p.markup[start:] if end < 0 else p.markup[start:end]
-    glyphs = {g for g in _currency_glyphs().values() if g in block}
-    if len(glyphs) > 1:
-        return bad(f"the costs block mixes currency symbols {sorted(glyphs)} in one sentence")
-    if not glyphs:
-        return skip("no monetary figure rendered in the costs block")
+        return bad(
+            f"the payload reports charges in {sorted(charged)} but no ledger "
+            "was rendered, so the as-charged figures are not on screen"
+        )
+    block = p.markup[start:p.markup.find("</div>", start) + 6]
+    missing = sorted(code for code in charged if code not in block)
+    if missing:
+        return bad(f"charged currencies missing from the ledger: {missing}")
+    return ok()
+
+
+def check_costs_shows_what_it_cannot_attribute(p: Page) -> Verdict:
+    """Fees reach the screen at every scope, or the total is overstated nothing.
+
+    Account fees carry no asset category -- no fee row in this archive carries a
+    contract or trade id -- so they cannot narrow with the reader's selection and
+    are reported whole. The failure this guards is the tempting one: hiding them
+    under a narrow scope, which makes a tab captioned "broker cost" quietly
+    measure less than it claims.
+    """
+    if p.tab != "costs":
+        return skip("not the costs tab")
+    totals = (p.payload.get("broker_costs") or {}).get("totals") or {}
+    unattributable = (totals.get("unattributable") or {}).get("base") or 0.0
+    if not unattributable:
+        return skip("nothing unattributable in this journal")
+    if "attributable to nothing" not in p.text:
+        return bad(
+            f"{unattributable:.2f} of account-level cost is in the payload but the "
+            "page renders no unattributable block, so the reader sees a total "
+            "without the charges that make it up"
+        )
     return ok()
 
 
@@ -634,7 +713,9 @@ CHECKS: tuple[Check, ...] = (
     check_selected_tab_matches_hash,
     check_header_icons_grouped,
     check_money_keys_are_shaped,
-    check_costs_block_shares_one_basis,
+    check_costs_headline_states_its_basis,
+    check_costs_ledger_shows_every_charged_currency,
+    check_costs_shows_what_it_cannot_attribute,
     check_calendar_pills_match_grid,
     check_positions_subtotal_column,
     check_positions_side_is_colourable,

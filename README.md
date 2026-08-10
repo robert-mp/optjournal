@@ -25,8 +25,20 @@ uv run optjournal serve --demo        # browse it
 ```
 
 `optjournal --help` lists the rest: `fetch`, `ingest`, `orders`,
-`positions`, `history`, `costs`, `statements`, `prune`, `sweep`. Every
-reporting command takes `--json`.
+`positions`, `history`, `costs`, `friction`, `statements`, `prune`, `sweep`.
+Every reporting command takes `--json`.
+
+Two cost commands, answering two questions. `costs` reads one statement — the
+newest archive covers 30 calendar days — and is the only way to see a section no
+database column carries. `friction` reads the journal: every ingested fill, over
+the account's whole history, narrowable to any set of asset categories.
+
+```
+optjournal friction                      the whole account
+optjournal friction --assets OPT          options only
+optjournal friction --assets OPT CASH     options and the conversions to trade them
+optjournal friction --month 2026-08       one month (or a year: 2026)
+```
 
 ## Architecture
 
@@ -37,13 +49,18 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
                        ▼              ▼               ▼
                   history.py      stats.py       analysis.py ◀── raw XML
                   (episodes)   (periods, scopes)  (cost report)
+                       │              │           costs.py ◀── the same costs,
+                       │              │           (scoped, whole history)  from SQL
                        └──────────────┼───────────────┘
                                       ▼
                      serialize.py (JSON payload contract; wraps analysis's
                                    per-currency ledgers into Money)
                      render.py    (terminal reports)
                           ▲
-                     money.py (Money: held by every layer above, depends on none)
+                     money.py (Money, Charge: held by every layer above,
+                               depends on none)
+                     notes.py (IBKR note codes: read by history and analysis,
+                               which cannot import each other)
                                       │
                             ┌─────────┴─────────┐
                             ▼                   ▼
@@ -65,13 +82,15 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `sync.py` | the ONE sync path — fetch, ingest, snapshot — called by `POST /api/sync`, `optjournal sync` and the `sync` job. Its own module because of the import graph, not for tidiness: it briefly lived in `web.py` and `jobs.py` reached it through a deferred import, which `tests/test_layering.py` correctly called a cycle. It raises rather than returning an error dict, because each caller needs a different shape for a cooldown (HTTP body, exit code, ledger status) and flattening them into a string is how a locked keychain became a bare exit 1 |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
 | `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one. See [The Money model](#the-money-model) |
+| `notes.py` | IBKR trade note codes (`AFx`, `Ep`, `A`) and the one rule for reading them: whole-token matching, over either the stored `AFx;P` string or py_ibkr's parsed list. A leaf, because its two readers — `history.py` (database) and `analysis.py` (statement) — sit on opposite sides of the graph and cannot import each other |
 | `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts. **Never reads `blackscholes.py`** — see [Modelled numbers](#modelled-numbers) |
 | `marketdata.py` | price-bar fetch and parse for one contract over one window. A leaf: no DB, no journal shapes |
 | `vol.py` | realised volatility from closes, and the move it implies. A leaf, and deliberately NOT `blackscholes` — see [Modelled numbers](#modelled-numbers) |
 | `events.py` | economic calendar: fetch, parse and store this week's releases. A leaf. One feed, no Protocol — see [Adding a calendar feed](#a-new-calendar-feed) |
 | `bars.py` | the journal-shaped half of price bars — which contract over which window (from episodes), the idempotent write, the series a chart reads, and the expected-move band |
 | `blackscholes.py` | option pricing and the implied vol backed out of a market price. A leaf: pure float maths, `math.erf` for the normal CDF, so no numpy or scipy |
-| `analysis.py` | cost/friction report from the raw statement (whole account); a leaf — imports nothing internal |
+| `analysis.py` | cost/friction report from the raw statement (whole account); pure statement mathematics — holds leaves (`notes.py`) and nothing that reads a database |
+| `costs.py` | the same costs read from SQLite instead: the account's whole life, narrowed to any set of asset categories, with measured cost kept structurally apart from the estimated AutoFX markup. Reconciled against `analysis.py` statement by statement — see `tests/test_costs.py` |
 | `strategies.py` | orders folded into the strategies they were placed as (a strangle sold as two same-second orders is one group), then linked into position lifecycles via episode trade ids |
 | `serialize.py` | the JSON payload the page renders and `--json` emits; wraps `analysis`'s per-currency ledgers into `Money` |
 | `render.py` | human-readable terminal reports. Bound to `serialize`'s shapes by `tests/test_render.py`: it once read flat money keys the `Money` conversion had removed, and `orders`/`history` died on `float(dict)` behind a green suite |
@@ -251,6 +270,13 @@ Layering rules (import direction only goes down this list):
    (it is a leaf, so it costs no dependency direction), and the split is
    kept anyway: a report that measures cost has nothing to say about how
    a reader's display currency should be chosen.
+
+   A leaf is the escape hatch when two domain modules need one rule and
+   neither may hold the other. `history.py` reads note codes out of SQLite
+   and `analysis.py` reads them off a statement, so neither can own the
+   rule for both; `notes.py` does, and each imports it. The alternative
+   was what stood there before — the rule written twice, once per reader,
+   agreeing until one input shape changed.
 5. A quantity and its unit travel together. `Money` carries an amount,
    the currency it was charged in and the base translation as one frozen
    value, because the three-field spelling it replaced (`x_base`,
@@ -280,7 +306,22 @@ Four invariants worth knowing before changing the UI:
   displays.** The Trade Types control drives Dashboard/Calendar/Trades
   (which render the filter bar) and nothing else. "0DTE" is a fill-level
   scope within options; "Equities" switches the asset category those three
-  tabs run over. Positions, Costs, Annual and 0DTE stay pinned to options.
+  tabs run over. Positions, Annual and 0DTE stay pinned to options.
+
+  Costs carries its own control, because it answers a different question. It is a
+  MULTI-select — costs on disjoint asset categories add up, so "options plus the
+  conversions I make to trade them" is a real question — and it is styled as
+  chips rather than as the segmented `.seg`, since that shape means "pick one"
+  everywhere else in the UI. 0DTE appears among the four options but is not a
+  category: it is a subset of options, resolved to fills by `stats.odte_scope`,
+  so ticking it narrows rather than widens and the chip is dashed to say so.
+
+  What that control deliberately cannot do is narrow a cost that carries no
+  attribution. Account fees and withholding are levied on the account — no fee
+  row in this archive carries a contract or trade id — so they are shown whole at
+  every selection, in their own block, labelled as attributable to nothing.
+  Hiding them under a narrow scope would make a tab captioned "broker cost"
+  quietly measure less than it claims.
 * **Options P&L counts fully closed round trips only, attributed to the
   close date.** A partial close (sold 3, bought back 1) contributes
   nothing until the position is flat, and premium collected on an open
@@ -412,6 +453,43 @@ float, because it contains the AutoFX markup estimate.
 two. **The shape itself carries meaning**: a nested object says "an as-charged
 figure could exist here"; a flat `_base` float says it cannot. The sweep
 asserts that directly, in both directions.
+
+### `Charge`: when withholding the native is the wrong answer
+
+`Money` withholds the as-charged figure the moment a scope spans currencies,
+which is right for any figure and wrong for exactly one surface. The Costs tab
+is scoped by the reader, and widening from options to the whole account should
+*add columns, not delete exactness* — each charge is still known individually;
+only the claim that one currency speaks for the total became false.
+
+So a cost is a `Charge`: a base translation plus the whole per-currency ledger,
+never collapsed. It adds (that is what makes a multi-select scope possible, each
+currency staying its own column through the sum) and it yields its `Money` on
+request, so the two types agree where they overlap and the single-figure
+surfaces need no special case.
+
+```json
+broker_costs.totals.attributable
+  { "base": 42.15, "native": null, "ccy": null,
+    "charged": { "USD": 21.92, "SEK": 208.41, "EUR": 1.67, "KRW": 4000.0 } }
+```
+
+The reader leads with `base`, then dissects into `charged`. Note what `Money`
+alone would have said here: `42.15` and nothing else.
+
+The same figure under a single-currency scope keeps its exact reading, so the two
+types agree where they overlap and the page needs no special case:
+
+```json
+broker_costs.totals.attributable      (scope: options only)
+  { "base": 15.16, "native": 17.46, "ccy": "USD", "charged": { "USD": 17.46 } }
+```
+
+One case the ledger deliberately cannot express: the AutoFX rate markup has a
+base and **no** billing currency, because IBKR never itemised it in one. An
+empty ledger with a non-zero base is therefore an *estimate*, distinct from
+`is_free` (nothing charged at all), and `costs.Friction` keeps the two apart as
+a type rather than as a caption.
 
 ### Six constructors, six provenances
 

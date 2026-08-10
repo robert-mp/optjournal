@@ -173,3 +173,73 @@ def test_a_value_less_enum_falls_back_to_its_last_component():
     # An undotted string passes through, and None is the dash the reports show.
     assert _wire("STK") == "STK"
     assert _wire(None) == "-"
+
+
+# --- friction: the journal's costs, from the database -------------------------
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_friction_reports_the_journal_not_one_statement(tmp_path, capsys):
+    """The command exists because `costs` answers a different question.
+
+    `costs` reads one statement -- the newest archive covers 30 calendar days --
+    while this reads every ingested fill. Asserted as a SPAN comparison rather
+    than against a literal, so it stays true as the archive grows.
+    """
+    db = tmp_path / "friction.db"
+    assert main(["ingest", "--archive", str(STATEMENTS[0].parent), "--db", str(db)]) == 0
+    capsys.readouterr()
+    assert main(["friction", "--db", str(db), "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["from_date"] and out["to_date"]
+    assert out["from_date"] <= out["to_date"]
+    assert out["totals"]["fills"] > 0
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_friction_scopes_to_the_categories_asked_for(tmp_path, capsys):
+    """`--assets` is a multi-select, and it must really narrow.
+
+    Both directions, because a decoder that ignored the flag would pass a test
+    that only checked the wide case: options alone must be less than options plus
+    stock, and the payload must echo what it measured.
+    """
+    db = tmp_path / "scope.db"
+    assert main(["ingest", "--archive", str(STATEMENTS[0].parent), "--db", str(db)]) == 0
+
+    def friction(*assets):
+        argv = ["friction", "--db", str(db), "--json"]
+        if assets:
+            argv += ["--assets", *assets]
+        capsys.readouterr()
+        assert main(argv) == 0
+        return json.loads(capsys.readouterr().out)
+
+    opt = friction("OPT")
+    both = friction("OPT", "STK")
+    assert opt["scope"]["categories"] == ["OPT"]
+    assert both["scope"]["categories"] == ["OPT", "STK"]
+    assert (opt["totals"]["attributable"]["base"]
+            < both["totals"]["attributable"]["base"])
+    # And an unscoped run is the widest of the three.
+    assert (both["totals"]["attributable"]["base"]
+            <= friction()["totals"]["attributable"]["base"])
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_friction_prints_the_estimate_as_a_range(tmp_path, capsys):
+    """A terminal report that collapsed the range would be the one surface where
+    the AutoFX uncertainty disappears -- roughly a quarter of this account's
+    friction, from a constant IBKR itself hedges."""
+    db = tmp_path / "range.db"
+    assert main(["ingest", "--archive", str(STATEMENTS[0].parent), "--db", str(db)]) == 0
+    capsys.readouterr()
+    assert main(["friction", "--db", str(db), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    if not data["totals"]["friction"]["is_estimated"]:
+        pytest.skip("no auto-conversions in this archive")
+    capsys.readouterr()
+    assert main(["friction", "--db", str(db)]) == 0
+    text = capsys.readouterr().out
+    assert "range" in text, "the human report hides the estimate's range"
+    assert "ESTIMATE" in text, "the markup column is not labelled as estimated"

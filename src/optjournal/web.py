@@ -64,6 +64,7 @@ from optjournal.bars import (
     replay_bars,
     replay_model,
 )
+from optjournal.costs import CostScope, build_costs
 from optjournal.db import connect, open_journal
 from optjournal.events import (
     EventFetchError,
@@ -95,6 +96,7 @@ from optjournal.jobs import (
 from optjournal.marketdata import BarFetchError, fetch_quote
 from optjournal.serialize import (
     audit_data,
+    broker_costs_data,
     costs_data,
     history_data,
     jobs_data,
@@ -116,6 +118,7 @@ from optjournal.stats import (
     month_stats,
     monthly_stats,
     odte_cohorts,
+    odte_scope,
     scope_for,
     stats_data,
 )
@@ -371,6 +374,66 @@ def _annotations(
     return sorted(out, key=lambda row: row["ts"])
 
 
+#: What the Costs tab selects when the reader has not chosen. The journal's own
+#: category, so the tab opens agreeing with every other tab rather than jumping to
+#: an account-wide figure four times larger. Widening is one click, and the
+#: unattributable fees are on screen at every scope, so nothing is hidden by it.
+DEFAULT_COST_SCOPE = ("OPT",)
+
+#: The Costs selector's fourth option. Not an asset category -- it is a subset of
+#: options, classified per round trip -- so it resolves to fills rather than to a
+#: `WHERE` on a column. Named here because the page, the query parameter and this
+#: resolution must share one spelling.
+ODTE_SELECTION = "0DTE"
+
+
+def _broker_costs(
+    conn: sqlite3.Connection,
+    *,
+    selection: list[str] | None,
+    base_currency: str,
+    report: Any,
+    asset_category: str,
+) -> dict[str, Any]:
+    """The Costs tab's payload for one reader selection.
+
+    Translates the wire vocabulary (a repeated `?cost=` parameter, four peer
+    options) into the two independent narrowings `CostScope` models: asset
+    categories, and an explicit fill set for 0DTE. They are different kinds of
+    thing -- 0DTE is a subset of options rather than a sibling of them -- and
+    this is the seam where that is reconciled, so neither the page nor the cost
+    engine has to know both vocabularies.
+
+    Selecting 0DTE alone means the 0DTE options, so the options category is
+    implied: a fill set with no category would also admit a stock fill that
+    happened to share an id, and asking for a subset of options is asking about
+    options.
+    """
+    chosen = [str(c).upper() for c in (selection or ()) if str(c).strip()]
+    if not chosen:
+        chosen = list(DEFAULT_COST_SCOPE)
+    wants_odte = ODTE_SELECTION in chosen
+    categories = [c for c in chosen if c != ODTE_SELECTION]
+    fill_ids = None
+    if wants_odte:
+        # Resolved by the episode layer, which owns the definition -- entry date
+        # against expiry, per round trip. Recomputing it here would give the page
+        # a second answer to the same question.
+        fill_ids = odte_scope(
+            conn, asset_category=asset_category, report=report
+        ).trade_ids or frozenset()
+        if not categories:
+            categories = [asset_category]
+    scope = CostScope.of(
+        categories,
+        fill_ids=fill_ids,
+        subset=ODTE_SELECTION if wants_odte else "",
+    )
+    return broker_costs_data(
+        build_costs(conn, scope=scope, base_currency=base_currency)
+    )
+
+
 def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     """Build one replay per trade and point rows at it by key.
 
@@ -504,6 +567,7 @@ def build_state(
     asset_category: str = "OPT",
     month: str | None = None,
     trade_type: str | None = None,
+    cost_scope: list[str] | None = None,
 ) -> dict[str, Any]:
     """Everything the page renders, in one JSON-safe payload.
 
@@ -684,6 +748,13 @@ def build_state(
         base_ccy = str(state["stats"].get("base_currency") or "")
         state["fx"] = {"base": base_ccy, "quotes": fx_quotes(conn, base_ccy)}
         _attach_replays(conn, state)
+        state["broker_costs"] = _broker_costs(
+            conn,
+            selection=cost_scope,
+            base_currency=base_ccy or "EUR",
+            report=report,
+            asset_category=asset_category,
+        )
 
     newest = newest_statement(archive_dir)
     if newest is not None:
@@ -820,6 +891,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     query_id=self.cfg.query_id,
                     month=(params.get("month") or [None])[0],
                     trade_type=(params.get("type") or [None])[0],
+                    # Repeatable, so `?cost=OPT&cost=CASH` is a multi-select
+                    # rather than a delimiter this layer has to invent and the
+                    # page has to match. parse_qs already hands us the list.
+                    cost_scope=params.get("cost"),
                 ))
             except sqlite3.OperationalError as exc:
                 self._json(500, {"error": f"database not readable: {exc}"})

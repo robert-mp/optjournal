@@ -193,6 +193,36 @@ MUTANTS: tuple[Mutant, ...] = (
                "commission column silently shows a dash",
     ),
     Mutant(
+        key="note-token",
+        module="notes.py",
+        find="    return code in split_notes(notes)",
+        replace="    return bool(notes) and code in str(notes)",
+        breaks="a fill flagged `A` (assignment) would read as `AFx` (auto-conversion) "
+               "and be charged a 3bps markup it never incurred -- and the inverse, "
+               "which shipped: whole-field equality missed the stored `AFx;P`",
+    ),
+    Mutant(
+        key="cost-scope",
+        module="costs.py",
+        find="    trade_where, trade_params = _where(\n"
+             '        scope.condition(), _within(period, "trade_date")\n'
+             "    )",
+        replace='    trade_where, trade_params = _where(_within(period, "trade_date"))',
+        breaks="every scope would report the whole account's commission, so an "
+               "options-only reader would be shown stock and FX costs as theirs "
+               "-- and would be charged the FX rate markup on a contract scope",
+    ),
+    Mutant(
+        key="fee-scope",
+        module="costs.py",
+        find="    where, params = _where(_within(period, \"date_time\"))",
+        replace="    where, params = _where(_within(period, \"date_time\"),\n"
+                "                           report.scope.condition())",
+        breaks="account fees would narrow with the reader's category selection, "
+               "so an options-only scope would report a total quietly missing the "
+               "market-data and custody charges the account still pays",
+    ),
+    Mutant(
         key="snapshot-sign",
         module="web.py",
         find='        seed_quantity=float(row.get("position") or 0.0),',
