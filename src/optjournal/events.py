@@ -45,10 +45,12 @@ __all__ = [
     "DEFAULT_COUNTRIES",
     "DEFAULT_IMPACTS",
     "IMPACTS",
+    "IMPACT_ORDER",
     "SOURCE",
     "EventFetchError",
     "EventRateLimited",
     "MarketEvent",
+    "default_scope",
     "fetch_events",
     "parse_events",
     "store_events",
@@ -65,18 +67,48 @@ _URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 #: raises instead of defaulting.
 IMPACTS = frozenset({"High", "Medium", "Low", "Holiday"})
 
+#: The same values, ordered by how much they move a book. A `frozenset` cannot
+#: state that, and severity is the order a reader wants the choices offered in --
+#: sorting by count instead would reshuffle the buttons as the week filled up.
+#: `Holiday` sits last because it is a category rather than a grade: a closed
+#: session is worth knowing about, but it is not "more than Low".
+IMPACT_ORDER = ("High", "Medium", "Low", "Holiday")
+
 #: The default VIEW: what an options book actually reacts to. Measured over a
 #: real stored week -- 99 events, of which 82 are Low impact and 25 are EUR rows
-#: that are all Low. This slice is 4 of the 99.
+#: that are all Low.
 #:
-#: Here rather than in `cli.py` (where it was first written) because the page now
-#: needs the same default, and two copies of "USD high-impact" would drift the
-#: moment one of them gained a country. Narrowing the VIEW only -- `store_events`
-#: keeps every country and impact the feed sends, which is the rule `ingest`
-#: learned the hard way: a filter applied on the way IN cannot be undone without
-#: a refetch, and the feed will not serve a past week.
-DEFAULT_COUNTRIES = ("USD",)
-DEFAULT_IMPACTS = ("High",)
+#: `Medium` is included and `High` alone is not enough: High-only was 4 of that
+#: 99, which is too quiet to consult -- the whole table holds 10 USD High rows
+#: against 11 USD Medium, so excluding Medium discarded half the releases that
+#: move a US book. `All` is a COUNTRY the feed really sends (its global rows --
+#: OPEC meetings and the like), so a USD-only default that omitted it would
+#: silently drop oil from an oil-sensitive book.
+#:
+#: Here rather than in `cli.py` (where it was first written) because the page and
+#: the CLI both need the same default, and two copies would drift the moment one
+#: of them gained a country. Narrowing the VIEW only -- `store_events` keeps
+#: every country and impact the feed sends, which is the rule `ingest` learned
+#: the hard way: a filter applied on the way IN cannot be undone without a
+#: refetch, and the feed will not serve a past week.
+DEFAULT_COUNTRIES = ("USD", "All")
+DEFAULT_IMPACTS = ("High", "Medium")
+
+
+def default_scope() -> str:
+    """The default filter in words, for whoever is about to label it.
+
+    Here rather than in each caller because the CLI and the web view both name
+    this slice, and the CLI's copy had already drifted -- it printed "USD
+    high-impact" while `DEFAULT_IMPACTS` held two grades. A label that narrates a
+    filter it does not apply is worse than no label, so there is one of these.
+
+    Countries are comma-separated: space-separated, "USD All high-impact" reads as
+    a currency called "USD All" rather than as two choices, and `All` really is a
+    country value here (the feed's global rows) rather than a wildcard.
+    """
+    return (", ".join(DEFAULT_COUNTRIES) + " "
+            + "/".join(impact.lower() for impact in DEFAULT_IMPACTS) + "-impact")
 
 #: Matching `marketdata`, whose Yahoo calls have the same shape and constraints.
 _TIMEOUT_S = 20
@@ -279,9 +311,10 @@ def upcoming(
     """Stored events in `[start, end]`, oldest first.
 
     Filtering is the caller's to state rather than this function's to assume: the
-    Market tab wants USD high-impact by default, but the table holds ten
-    countries and a reader may want all of them. An empty filter means no filter,
-    the same convention `ingest.ASSET_FILTER_ALL` uses.
+    Market tab defaults to `DEFAULT_COUNTRIES` / `DEFAULT_IMPACTS`, but the table
+    holds ten countries and a reader may want any slice of them. An empty filter
+    means no filter, the same convention `ingest.ASSET_FILTER_ALL` uses -- and the
+    same one the web view's two filter axes use for an empty selection.
     """
     where = ["starts_at BETWEEN ? AND ?"]
     params: list[object] = [start, end]

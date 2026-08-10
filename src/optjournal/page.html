@@ -530,21 +530,31 @@ import {
  * @property {string} impact_source -- WHOSE judgement `impact` is. Shown, not
  *   implied: an assessment without attribution reads as a measurement
  * @property {string} zone -- the zone `day`/`at` are already rendered in
- * @property {string} default_scope -- what the Key view narrows to, in words,
- *   so the toggle's label comes from the server that applied it
+ * @property {Array} countries -- MarketFacet rows, alphabetical: the currency
+ *   axis, built from what is STORED in the window rather than the feed's alphabet
+ * @property {Array} impacts -- MarketFacet rows in severity order, from
+ *   `events.IMPACT_ORDER`, so the page holds no copy of what "important" means
+ * @property {string} default_scope -- what the DEFAULT filter narrows to, in
+ *   words, so the label comes from the server that applied it
  * @property {number} total_events -- every row in the window
- * @property {number} key_events -- of those, how many survive the Key view
+ * @property {number} default_events -- how many the default filter shows, so
+ *   Reset can state what it costs without the page recomputing the defaults
+ */
+
+/** @typedef {Object} MarketFacet -- one choice on one filter axis
+ * @property {string} value -- the country or impact, the feed's own word
+ * @property {number} events -- how many rows carry it, so a button states what
+ *   it costs before it is pressed
+ * @property {boolean} default -- whether the journal's default filter includes it
  */
 
 /** @typedef {Object} MarketDay -- one cell of the week strip
  * @property {string} day
  * @property {string} label -- Mon..Sun
  * @property {number} dom -- day of month
- * @property {number} events
- * @property {number} high -- of those, how many the feed calls High
- * @property {number} key_events -- of those, how many survive the Key view. The
- *   strip counts what the rows will show, so a day cannot display three dots
- *   and then open empty -- which reads as broken rather than as filtered
+ * @property {number} events -- the day's TOTAL. The page counts its own filtered
+ *   subset from `Market.events`, which is the only way the strip cannot disagree
+ *   with the rows it opens
  * @property {boolean} today
  */
 
@@ -559,9 +569,6 @@ import {
  * @property {string} impact -- High|Medium|Low|Holiday, the FEED's word
  * @property {string|null} forecast -- null when unpublished, which is not zero
  * @property {string|null} previous
- * @property {boolean} key -- survives the default view. Decided server-side from
- *   the same constants the CLI uses, so the page never holds its own copy of
- *   "USD high-impact" to drift from
  */
 
 /** @typedef {Object} Scheduler -- the scheduler's own state (serialize.jobs_data)
@@ -900,7 +907,7 @@ import {
  * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle
  * @payload res:SyncResponse pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
  * @payload e:Annotation
- * @payload mk:Market d:MarketDay mev:MarketEvent
+ * @payload mk:Market d:MarketDay mev:MarketEvent mf:MarketFacet
  * @payload w:Watch wo:WatchOption
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
@@ -911,6 +918,7 @@ import {
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
  * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen withEvents ws opts thin
+ * @local countries impacts shownByDay next want picked
  * @local JSON Object ages input mine qb wf behind was
  * @local when button parts names
  * @local COST_OPTIONS bits cost fees on wh
@@ -948,11 +956,19 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      silently lose -- and a link to "the calendar" means the week,
      not one cell of it. */
   marketday:null,
-  /* Calendar filter: false (the default) shows `Market.default_scope`, true shows
-     everything stored. Not in the hash for the same reason as marketday -- and
-     deliberately DEFAULT-OFF rather than remembered, because "why is my calendar
-     empty" is a worse first impression than one extra click. */
-  mktall:false,
+  /* Calendar filter, TWO INDEPENDENT AXES: a Set of countries and a Set of
+     impacts, each holding the values currently shown.
+
+     NULL means "whatever the server calls default" -- not an empty Set, which
+     means "nothing selected, show nothing". The distinction matters because the
+     page cannot name the defaults itself (they live in `events.py` and arrive as
+     `MarketFacet.default`), so it stays null until the payload can seed it. An
+     empty Set is a legitimate state a reader can reach by deselecting, and it
+     must not silently spring back to the default.
+
+     Not in the hash, for the same reason as marketday: a link to "the calendar"
+     means the week, not one reading of it. */
+  mkcountries:null,mkimpacts:null,
   /* Live quotes, keyed by symbol, and the server clock when they were asked for.
      NOT part of `state`: they come from their own endpoint because each one costs
      an HTTP request, so they must not ride along on every payload reload. Null
@@ -2863,14 +2879,43 @@ function market(){
   const mk=S.state.market;
   if(!mk) return `<div class="card"><div class="empty">no calendar data</div></div>`;
 
-  /* THE FILTER. 82 of a real week's 99 events are Low impact and 25 are EUR rows
-     that are all Low, so showing everything buries the four releases an options
-     book reacts to. `mev.key` and `d.key_events` are decided SERVER-SIDE from the
-     same constants the CLI uses -- the page holds no copy of "USD high-impact" to
-     drift from, and the toggle's label comes from `default_scope`. */
-  const all=S.mktall===true;
-  const evs=(mk.events||[]).filter(mev=>all||mev.key);
-  const countOf=d=>all?d.events:d.key_events;
+  /* THE FILTER, on two independent axes. 82 of a real week's 99 events are Low
+     impact and 25 are EUR rows that are all Low, so showing everything buries the
+     releases an options book reacts to -- but a single "key or all" toggle could
+     not express "USD, every impact", which is the question a USD book actually
+     asks. Currency and impact are filtered separately.
+
+     The VOCABULARY and the defaults are the server's (`mk.countries`,
+     `mk.impacts`, each row carrying `default`), so the page holds no copy of
+     which currencies exist or which ones matter -- both would drift from the feed
+     the moment either side changed. `seed()` takes those defaults on first draw
+     and respects an empty Set thereafter; see `S.mkcountries`. */
+  const seed=(chosen,facets)=>chosen instanceof Set?chosen
+    :new Set((facets||[]).filter(mf=>mf.default).map(mf=>mf.value));
+  const countries=seed(S.mkcountries,mk.countries);
+  const impacts=seed(S.mkimpacts,mk.impacts);
+  /* An axis with nothing selected filters nothing OUT, rather than emptying the
+     calendar: "no currency chosen" reads as a question not yet asked, and a blank
+     panel with every button dark looks broken. Same convention as
+     `events.upcoming`, where an empty filter tuple means no filter. */
+  const passes=mev=>(countries.size===0||countries.has(mev.country))
+    &&(impacts.size===0||impacts.has(mev.impact));
+  const evs=(mk.events||[]).filter(passes);
+  /* Counted from the FILTERED events rather than from a per-filter total the
+     server precomputed. There are 2^n filter combinations and the page already
+     holds every row, so counting here is both cheaper and the only way the strip
+     cannot disagree with the rows a day opens. */
+  const shownByDay=new Map();
+  evs.forEach(mev=>shownByDay.set(mev.day,(shownByDay.get(mev.day)||0)+1));
+  const countOf=d=>shownByDay.get(d.day)||0;
+  /* Whether this is still the server's default view, so the reset control can be
+     disabled rather than offered as a no-op. Compared by value: same size, same
+     members, on both axes. */
+  const isDefault=(chosen,facets)=>{
+    const want=(facets||[]).filter(mf=>mf.default).map(mf=>mf.value);
+    return chosen.size===want.length&&want.every(v=>chosen.has(v));
+  };
+  const atDefault=isDefault(countries,mk.countries)&&isDefault(impacts,mk.impacts);
 
   /* Which day is expanded, chosen from the days that have events UNDER THE
      CURRENT FILTER -- otherwise switching to Key could leave a day selected that
@@ -2923,33 +2968,56 @@ function market(){
       </div>${figs?`<div class="dim mkfig">${figs}</div>`:''}</div>`;
   }).join('');
 
-  /* How many rows the other view would show, so the toggle states what it costs
-     rather than making you press it to find out. */
-  const hidden=(mk.total_events||0)-(mk.key_events||0);
-  const seg=`<div class="seg mktoggle">
-    <button data-mktall="0" class="${all?'':'on'}">${esc(mk.default_scope)}</button>
-    <button data-mktall="1" class="${all?'on':''}">all ${mk.total_events||0}</button>
-  </div>`;
+  /* How many rows the filter is holding back, so the reader knows the calendar is
+     narrowed rather than quiet. */
+  const hidden=(mk.total_events||0)-evs.length;
 
-  /* The empty state distinguishes "nothing stored" from "nothing MATCHED", which
-     are different problems: the first needs a fetch, the second needs the toggle.
-     Conflating them is how a working calendar reads as broken. */
+  /* One row of chips per axis. Each states its own count, so choosing is not a
+     guess -- and each is `aria-pressed`, because a chip that only signals
+     selection by colour says nothing to a screen reader. */
+  const chips=(facets,axis,picked)=>(facets||[]).map(mf=>{
+    const on=picked.has(mf.value);
+    return `<button class="chip${on?' on':''}" data-mkaxis="${axis}"
+      data-mkvalue="${esc(mf.value)}" aria-pressed="${on?'true':'false'}"
+      >${esc(mf.value)} <span class="dim">${mf.events}</span></button>`;
+  }).join('');
+
+  const filters=`<div class="mkfilter">
+    <div class="mkaxis"><span class="dim mkaxlabel">currency</span>
+      <div class="chips">${chips(mk.countries,'country',countries)}</div></div>
+    <div class="mkaxis"><span class="dim mkaxlabel">impact</span>
+      <div class="chips">${chips(mk.impacts,'impact',impacts)}</div></div>
+    <div class="mkaxis"><span class="dim mkaxlabel">show</span>
+      <div class="mkbtns">
+        <button class="btn sm" data-mkreset="1" ${atDefault?'disabled':''}
+          >Default (${mk.default_events||0})</button>
+        <button class="btn sm" data-mkall="1" ${hidden===0?'disabled':''}
+          >All ${mk.total_events||0}</button>
+      </div></div></div>`;
+
+  /* Three distinguishable empty states, not one, because they need different
+     actions: nothing stored needs a FETCH, nothing matching the filter needs a
+     WIDER filter, and a quiet day under a filter that does match elsewhere needs
+     nothing at all. Conflating any two is how a working calendar reads as
+     broken -- which is what the old single message did. */
   const empty=(mk.total_events||0)===0
     ? `<div class="empty">no events stored for this week —
         <b>Refresh</b> above, or run <code>optjournal market --fetch</code></div>`
-    : `<div class="empty">no ${esc(mk.default_scope)} events this week.
-        ${hidden} other event(s) are stored — switch to
-        <b>all ${mk.total_events||0}</b> to see them.</div>`;
+    : evs.length===0
+    ? `<div class="empty">no events match this filter.
+        ${hidden} of ${mk.total_events||0} stored event(s) are hidden — widen a row
+        above, or press <b>All ${mk.total_events||0}</b>.</div>`
+    : `<div class="empty">no events on this day under the current filter.</div>`;
 
   return `<div class="card">
     <div class="crow"><h3>Economic Calendar</h3>
       <span class="pill">${esc(mk.from_day)} – ${esc(mk.to_day)}</span>
-      ${seg}
       <button id="mkfetch" class="btn sm">Refresh</button></div>
+    ${filters}
     <div class="cal">${cells}</div>
     ${sel?`<div class="crow mksel"><h3>${esc(sel)}</h3>
       <span class="dim">${chosen.length} event(s)${
-        all?'':` · ${hidden} hidden`}</span></div>${rows}`
+        hidden?` · ${hidden} hidden by the filter`:''}</span></div>${rows}`
       :empty}
     <div class="dim mkattr">impact is ${esc(mk.impact_source)}'s assessment, not
       this journal's · times in ${esc(mk.zone)}</div>
@@ -3361,13 +3429,45 @@ function draw(push){
       S.cost=[...on];
       load();
     });
-  /* The calendar's Key/all toggle is a PURE REDRAW: every event is already in the
-     payload, and `mev.key` was decided server-side, so filtering costs no request.
+  /* The calendar's filter chips are a PURE REDRAW: every event is already in the
+     payload and both axes are filtered client-side, so narrowing costs no request.
+     Unlike the cost scope above, which reloads: that predicate is summed
+     server-side, whereas every calendar event is already here.
      Clearing the day selection is the point -- the chosen day may hold nothing
-     under the other filter, and a stale selection would open an empty panel. */
-  document.querySelectorAll('.mktoggle button[data-mktall]').forEach(b=>
-    b.onclick=()=>{const want=b.dataset.mktall==='1';
-      if(want===(S.mktall===true))return; S.mktall=want; S.marketday=null; draw();});
+     under the new filter, and a stale selection would open an empty panel.
+
+     The Set is REBUILT rather than mutated in place, because `S.mkcountries` may
+     still be null (meaning "the server's default"), and mutating the Set that
+     `market()` derived from the payload would edit a value the state does not own
+     yet. `mkFacet` reads the current selection back out of the same payload the
+     view did, so the two cannot disagree about what was showing. */
+  const mkFacet=axis=>{
+    const mk=S.state.market||{};
+    const held=axis==='country'?S.mkcountries:S.mkimpacts;
+    if(held instanceof Set) return new Set(held);
+    const facets=axis==='country'?mk.countries:mk.impacts;
+    return new Set((facets||[]).filter(mf=>mf.default).map(mf=>mf.value));
+  };
+  const mkPut=(axis,next)=>{
+    if(axis==='country') S.mkcountries=next; else S.mkimpacts=next;
+    S.marketday=null; draw();
+  };
+  document.querySelectorAll('[data-mkaxis]').forEach(b=>
+    b.onclick=()=>{const axis=b.dataset.mkaxis, value=b.dataset.mkvalue;
+      const next=mkFacet(axis);
+      if(next.has(value)) next.delete(value); else next.add(value);
+      mkPut(axis,next);});
+  /* Reset goes back to NULL rather than to a copy of the defaults, so the page
+     keeps deferring to the server on what "default" means -- a copied Set would
+     silently stop tracking a change to `events.DEFAULT_COUNTRIES`. */
+  document.querySelectorAll('[data-mkreset]').forEach(b=>
+    b.onclick=()=>{S.mkcountries=null; S.mkimpacts=null; S.marketday=null; draw();});
+  /* All is an EMPTY Set on both axes, which filters nothing out -- see `passes` in
+     `market()`. Not "every value selected": a new country arriving in the feed
+     would then be excluded until the reader noticed. */
+  document.querySelectorAll('[data-mkall]').forEach(b=>
+    b.onclick=()=>{S.mkcountries=new Set(); S.mkimpacts=new Set();
+      S.marketday=null; draw();});
   bindMarketFetch();
   bindWatchlist();
   bindJobRuns();
@@ -3465,8 +3565,8 @@ function note(text,kind){
  * WHICH BUTTON ASKS FOR CONFIRMATION IS DECIDED SERVER-SIDE, by
  * `JobRow.spends_request`, which comes from the registry's
  * `spends_broker_request`. The page holds no list of which jobs touch the broker,
- * for the same reason it holds no copy of "USD high-impact": a second copy of a
- * fact is a copy that drifts. Only `sync` spends one of IBKR's rate-limited
+ * for the same reason it holds no copy of the calendar's default filter: a second
+ * copy of a fact is a copy that drifts. Only `sync` spends one of IBKR's rate-limited
  * requests today; the others hit a public chart endpoint or a calendar feed where
  * an extra call costs nothing, and a dialogue on all four would train you to click
  * through the one that matters.

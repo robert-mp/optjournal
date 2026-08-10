@@ -18,6 +18,9 @@ import pytest
 from conftest import connect_migrated
 
 from optjournal.events import (
+    DEFAULT_COUNTRIES,
+    DEFAULT_IMPACTS,
+    IMPACT_ORDER,
     IMPACTS,
     SOURCE,
     EventFetchError,
@@ -194,8 +197,9 @@ def test_stored_events_outlive_the_week_the_feed_serves(conn):
 def test_upcoming_filters_are_the_callers_to_state(conn):
     """An empty filter means everything, matching ASSET_FILTER_ALL's convention.
 
-    The Market tab wants USD high-impact, but the table holds ten countries and a
-    reader may want all of them -- so the default is not to narrow.
+    The Market tab narrows to DEFAULT_COUNTRIES/DEFAULT_IMPACTS, but the table
+    holds ten countries and a reader may want all of them -- so the default here
+    is not to narrow.
     """
     store_events(conn, parse_events(FEED))
     lo, hi = 0, 2 ** 31
@@ -208,6 +212,168 @@ def test_upcoming_filters_are_the_callers_to_state(conn):
     }
     # And the window really windows: nothing before the first event.
     assert upcoming(conn, start=lo, end=1) == []
+
+
+def test_the_two_axes_are_independent_not_one_conjunction(conn):
+    """Each axis narrows alone, which a single "key" flag could not express.
+
+    The web view used to receive one server-side boolean meaning "USD AND High",
+    so "USD, every impact" -- the question a US book actually asks -- was
+    unaskable without a new field. Filtering on one axis at a time is the
+    behaviour that made two axes worth having, so it is asserted rather than
+    assumed from the fact that both parameters exist.
+    """
+    store_events(conn, parse_events(FEED))
+    lo, hi = 0, 2 ** 31
+
+    usd_any = upcoming(conn, start=lo, end=hi, countries=("USD",))
+    assert {e["impact"] for e in usd_any} == {"High"}, "the fixture's USD rows"
+    assert len(usd_any) == 2
+
+    any_medium = upcoming(conn, start=lo, end=hi, impacts=("Medium",))
+    assert [e["country"] for e in any_medium] == ["All"], (
+        "impact alone must not imply a country -- the feed's global rows are a "
+        "country value ('All'), and dropping them would lose OPEC from an "
+        "oil-sensitive book"
+    )
+
+
+def test_the_default_slice_keeps_the_feeds_global_rows(conn):
+    """DEFAULT_COUNTRIES includes 'All', which is a country the feed really sends.
+
+    Verified against the live table rather than reasoned about: `All` carries rows
+    like OPEC-JMMC Meetings. A default of ("USD",) alone reads as "US only" but
+    silently discards them, which is exactly the well-formed-but-wrong output this
+    module's docstring is about.
+    """
+    store_events(conn, parse_events(FEED))
+    rows = upcoming(conn, start=0, end=2 ** 31,
+                    countries=DEFAULT_COUNTRIES, impacts=DEFAULT_IMPACTS)
+    assert "OPEC-JMMC Meetings" in {e["title"] for e in rows}
+    # And Medium is in the default at all: High-only was 4 of a real week's 99,
+    # against 10 USD High and 11 USD Medium in the whole table.
+    assert "Medium" in DEFAULT_IMPACTS
+
+
+def test_the_impact_order_is_severity_and_covers_the_vocabulary():
+    """IMPACT_ORDER ranks IMPACTS, and must not drift from it.
+
+    The page renders the impact axis in this order and holds no copy of what
+    "more important" means. A value in IMPACTS but missing here would silently
+    vanish from the filter row -- a chip that cannot be pressed for events that
+    are stored.
+    """
+    assert set(IMPACT_ORDER) == set(IMPACTS), (
+        "IMPACT_ORDER and IMPACTS disagree -- a stored impact with no place in "
+        "the order would have no filter chip"
+    )
+    assert IMPACT_ORDER[0] == "High", "severity order, most important first"
+    assert IMPACT_ORDER[-1] == "Holiday", (
+        "Holiday is a category, not a grade above Low -- see IMPACT_ORDER"
+    )
+
+
+# ------------------------------------------------------- the view's filter axes
+#
+# `serialize.market_data` builds what the Market tab filters ON: two vocabularies
+# with counts, plus the journal's defaults marked. Tested here rather than in a
+# web test because it is calendar behaviour -- the same reason `upcoming` is here.
+#
+# The failure these guard is specific and has a history: the payload used to carry
+# ONE precomputed boolean per event and one precomputed count per day, so a filter
+# the page applied and a count the server derived could disagree, and a day showed
+# three dots then opened empty.
+
+
+def _market(conn):
+    """`market_data` over a window that contains the whole fixture.
+
+    Anchored on the fixture's own first event rather than on `now`, so the shape
+    under test does not depend on the day the suite runs -- the trap a hard-coded
+    date is, one layer up.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.serialize import market_data
+
+    store_events(conn, parse_events(FEED))
+    first = min(parse_events(FEED), key=lambda e: e.starts_at)
+    # A Wednesday inside the fixture's week, so the Monday-anchored strip covers it.
+    return market_data(conn, now=datetime.fromtimestamp(first.starts_at, UTC),
+                       days=14)
+
+
+def test_the_filter_axes_carry_their_vocabulary_with_counts(conn):
+    """Each axis lists what is STORED in the window, with a count and a default.
+
+    Built from the stored rows rather than from the feed's full alphabet: a
+    currency with no events this week would be a chip that does nothing. The count
+    is what lets a chip state its cost before it is pressed.
+    """
+    payload = _market(conn)
+
+    countries = {row["value"]: row["events"] for row in payload["countries"]}
+    assert countries == {"All": 1, "AUD": 1, "NZD": 1, "USD": 2}
+    # Case-insensitively alphabetical: a plain `sorted` ranks "AUD" before "All"
+    # by codepoint, which dropped the feed's one non-currency chip into the middle
+    # of the row. Asserted because it is a choice, not an accident of `sorted`.
+    assert [row["value"] for row in payload["countries"]] == ["All", "AUD", "NZD",
+                                                             "USD"]
+
+    impacts = {row["value"]: row["events"] for row in payload["impacts"]}
+    assert impacts == {"High": 2, "Medium": 1, "Low": 1, "Holiday": 1}
+    assert [row["value"] for row in payload["impacts"]] == list(IMPACT_ORDER), (
+        "the impact axis renders in severity order, from IMPACT_ORDER"
+    )
+
+    # The defaults are marked so the page need not know them.
+    assert {row["value"] for row in payload["countries"] if row["default"]} == {
+        "USD", "All"}
+    assert {row["value"] for row in payload["impacts"] if row["default"]} == {
+        "High", "Medium"}
+
+
+def test_a_day_count_is_the_total_so_the_strip_cannot_lie(conn):
+    """`MarketDay.events` is the day's TOTAL, and the events are all sent.
+
+    The page counts its own filtered subset from `events`, which is the only way
+    the strip and the rows it opens cannot disagree. A per-filter count computed
+    here would need one field per filter combination -- 2^n of them -- and the old
+    single `key_events` field was exactly the version of that which drifted.
+    """
+    payload = _market(conn)
+
+    assert sum(day["events"] for day in payload["week"]) <= payload["total_events"]
+    assert payload["total_events"] == len(FEED)
+
+    # Every event is present with the two values the page filters on, so no
+    # narrowing needs a new request or a new server-side flag.
+    for event in payload["events"]:
+        assert event["country"] and event["impact"]
+    # And the day totals really are totals: the fixture's Sunday holds one event
+    # (the OPEC row and the AUD holiday are both 2026-08-02 in MARKET_TZ terms),
+    # so a day with events is never reported as empty.
+    by_day: dict[str, int] = {}
+    for event in payload["events"]:
+        by_day[event["day"]] = by_day.get(event["day"], 0) + 1
+    for day in payload["week"]:
+        assert day["events"] == by_day.get(day["day"], 0), (
+            f"{day['day']}: strip count disagrees with the events sent"
+        )
+
+
+def test_the_default_scope_is_named_by_the_server_that_applies_it(conn):
+    """The label comes from the constants, so it cannot describe a stale filter.
+
+    This is the bug the CLI had: a hard-coded "USD high-impact" beside defaults
+    that had grown to two impacts. A label narrating a filter it does not apply is
+    worse than no label.
+    """
+    payload = _market(conn)
+    assert payload["default_scope"] == "USD, All high/medium-impact"
+    assert payload["default_events"] == 3, (
+        "USD High x2 plus the 'All' Medium row -- the slice the label describes"
+    )
 
 
 def test_events_are_stamped_with_the_source_that_issued_them(conn):

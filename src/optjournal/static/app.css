@@ -699,9 +699,33 @@ td.n,th.n{text-align:right}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .btn.busy{opacity:.6}
 .btn.sm{font-size:12px;padding:7px 12px}
-/* The toggle sits between the date range and Refresh, so it needs to not grow. */
-.mktoggle{flex:0 0 auto}
-.mktoggle button{padding:7px 13px;font-size:12px}
+/* Calendar filter: one labelled row per axis, currency above impact, with the
+   reset controls last. GRID with a fixed label column so the two chip rows start
+   at the same x -- ragged starts made the axes read as unrelated controls. */
+.mkfilter{display:grid;gap:8px;margin:14px 0 4px}
+.mkaxis{display:grid;grid-template-columns:64px 1fr;gap:10px;align-items:center}
+.mkaxlabel{font-size:11px;text-transform:lowercase}
+.mkaxis .chips{display:flex;gap:6px;flex-wrap:wrap}
+/* The actions are a third labelled axis row ("show"), so they inherit the same
+   label column as the chip rows and line up under the chips they act on -- no
+   grid-column override, and one less way for the layout to drift. */
+.mkbtns{display:flex;gap:7px;flex-wrap:wrap}
+/* A chip is a TOGGLE, so it must not look like the pills beside it, which are
+   inert labels. Selection is border plus background plus weight, never colour
+   alone: `aria-pressed` carries it for a screen reader, and a reader who cannot
+   separate the hues still sees the border change. */
+.chip{font:inherit;font-size:11.5px;font-weight:600;padding:6px 11px;
+  cursor:pointer;border-radius:999px;color:var(--dim);background:var(--panel2);
+  border:1px solid var(--line2)}
+.chip:hover{color:var(--fg);border-color:var(--dim2)}
+/* The same gradient and edge `.seg button.on` and the selected calendar day use,
+   through their names rather than by repeating the values -- a literal here would
+   have survived a theme swap and left brown chips on the Admiralty page. */
+.chip.on{color:var(--fg);background:linear-gradient(160deg,var(--seg1),var(--seg2));
+  border-color:var(--accentedge)}
+/* The count is secondary to the value, and stays legible when the chip is on. */
+.chip .dim{font-weight:500;font-size:10.5px}
+.chip.on .dim{color:var(--dim)}
 /* Add field: an input and its button as one unit, so they cannot wrap apart. */
 .wadd{display:flex;gap:7px;align-items:center;flex:0 0 auto}
 .wadd input{font:inherit;font-size:12.5px;padding:7px 11px;width:132px;

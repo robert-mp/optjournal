@@ -355,6 +355,12 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         # `market` fixture), so in practice this anchors a real row.
         "MarketDay": first(state["market"]["week"]),
         "MarketEvent": first(state["market"]["events"]),
+        # One filter chip. Sampled from `impacts` rather than `countries` because
+        # both axes carry the SAME shape, and the impact axis is the one whose
+        # order is asserted elsewhere -- so a drift in either is caught here once.
+        # Non-empty for the same reason MarketEvent is: the fixture stores events,
+        # and a facet list is built from what those events carry.
+        "MarketFacet": first(state["market"]["impacts"]),
         "Watch": first(state["watchlist"]),
         # A watched symbol that actually HOLDS an option, so WatchOption is
         # anchored to a real row. Sampling the first watch row would anchor it to

@@ -45,6 +45,7 @@ from optjournal.events import (
     DEFAULT_IMPACTS,
     EventFetchError,
     EventRateLimited,
+    default_scope,
     fetch_events,
     store_events,
     upcoming,
@@ -460,10 +461,13 @@ def cmd_market(args) -> int:
     network. `--fetch` is what the nightly cron runs; a bare `market` is what a
     reader runs, and it works offline.
 
-    Defaults to USD high-impact, which is the 4-of-99 slice that moves an options
-    book -- verified against a real week. `--all` is there because the table holds
-    ten countries and the default should narrow the VIEW, never the STORE (the
-    same rule ingest learned the hard way).
+    Defaults to `events.DEFAULT_COUNTRIES` / `DEFAULT_IMPACTS` -- USD plus the
+    feed's global rows, High and Medium -- which is the slice that moves an
+    options book, measured against a real week. Named from those constants rather
+    than spelled out here, so this and the web view cannot describe different
+    filters. `--all` is there because the table holds ten countries and the
+    default should narrow the VIEW, never the STORE (the same rule ingest learned
+    the hard way).
     """
     conn = _open_db(args)
     result: dict[str, object] = {}
@@ -503,7 +507,10 @@ def cmd_market(args) -> int:
                       countries=countries, impacts=impacts)
     result["events"] = events
 
-    scope = "all" if args.all_events else "USD high-impact"
+    # From the shared helper rather than spelled out, because this line said
+    # "USD high-impact" while DEFAULT_IMPACTS held two grades -- a label that
+    # narrates a filter it no longer applies is worse than no label.
+    scope = "all" if args.all_events else default_scope()
     lines.append(f"\nNext {args.days} day(s), {scope}: {len(events)} event(s)")
     if not events:
         lines.append("  (none stored -- run `optjournal market --fetch`)")
@@ -938,7 +945,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days", type=int, default=7, metavar="N",
                    help="window to show, from today (default: 7)")
     p.add_argument("--all", dest="all_events", action="store_true",
-                   help="every country and impact, not just USD high-impact")
+                   help="every country and impact, not just the default slice")
     p.set_defaults(func=cmd_market)
 
     p = sub.add_parser("bars", parents=[common, database],
