@@ -381,9 +381,11 @@ unguarded invariant — that is how a `_flat` epsilon wide enough to book a
 0.4-share residual as a closed round trip was found, having passed 579 tests, and
 how `_snapshot_leg` silently taking `abs()` of a short position was found. A
 defect caught by **fifteen** tests suggests fourteen are coupled to something they
-are not about. There are 36 mutants; the two newest guard the campaign unit (a
-roll counted as decided while a leg is still open, and a campaign scored by its
-final contract rather than the sum), and both are caught.
+are not about. There are 36 mutants. The two newest guard the campaign unit and
+were measured after the harness was repaired below: `roll-continues` (a roll
+counted as decided while a leg is still open) is caught by 2 tests, and
+`campaign-sum` (a campaign scored by its final contract rather than the sum of
+them) by 1 — the demo case where a loser is rolled out and scratched.
 
 **The harness needs the suite to be green in a COPY of the checkout**, because it
 runs each mutant in a `copytree` clone and refuses to measure against a baseline
