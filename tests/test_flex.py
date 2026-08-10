@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from conftest import RAW_DIR
+from conftest import RAW_DIR, skip_if_copy
 from py_ibkr import Trade
 
 from optjournal import flex
@@ -50,7 +50,17 @@ def statement(request) -> Path:
     return request.param
 
 
+@skip_if_copy
 def test_raw_dir_is_populated():
+    """The suite's fixture corpus must be present.
+
+    Skipped in a COPY of the checkout: a fresh git worktree has no `raw/`, and
+    the archive is deliberately not version controlled. Every test that actually
+    READS a statement is already parametrized over `statements()` and so skips
+    itself when the corpus is absent -- this one exists to say why the rest went
+    quiet, which is only meaningful in the real checkout. See
+    `conftest.skip_if_copy`.
+    """
     assert statements(), (
         f"no archived statements in {RAW_DIR}; run `uv run optjournal fetch <id>`"
     )

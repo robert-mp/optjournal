@@ -17,7 +17,7 @@ import plistlib
 from pathlib import Path
 
 import pytest
-from conftest import ROOT
+from conftest import ROOT, skip_if_copy
 
 PLIST = ROOT / "launchd" / "com.optjournal.serve.plist"
 
@@ -45,12 +45,19 @@ def test_the_plist_is_valid_and_labelled(agent):
     assert agent["Label"] == "com.optjournal.serve"
 
 
+@skip_if_copy
 def test_every_path_in_the_plist_points_at_this_checkout(agent):
     """THE reason this file exists: absolute paths rot when the repo moves.
 
     Checked against `conftest.ROOT`, so the test travels with the checkout. The
     log directory is exempt from "must exist" because launchd creates neither -- it
     is asserted to be INSIDE the checkout instead, which is what makes it findable.
+
+    Skipped in a COPY of the checkout, where it cannot hold and would be wrong to:
+    the plist still points at the original, which is correct -- launchd supervises
+    the real install, not a worktree or a mutation clone. Without the skip this was
+    the test that made `optjournal mutate` unable to get a green baseline, so every
+    mutant came back uncounted. See `conftest.skip_if_copy`.
     """
     program = agent["ProgramArguments"][0]
     assert Path(program) == ROOT / ".venv" / "bin" / "optjournal", (

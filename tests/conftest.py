@@ -39,6 +39,41 @@ STATEMENTS = sorted(RAW_DIR.glob("activity-*.xml"))
 #: The project root, for tests reaching source files rather than data.
 ROOT = Path(__file__).resolve().parent.parent
 
+def _is_copy() -> bool:
+    """Whether this tree is a COPY of the checkout rather than the checkout itself.
+
+    Two copies exist in practice: a git worktree under `.claude/worktrees/`, and
+    the `copytree` clone `optjournal mutate` builds. Detected from what git leaves
+    behind rather than by matching path names, so it holds wherever a copy is made:
+    in a worktree `.git` is a FILE holding a `gitdir:` pointer, and in a clone made
+    by copying a subtree it is absent. The real checkout is the only tree with a
+    `.git` DIRECTORY.
+    """
+    dot_git = ROOT / ".git"
+    return dot_git.is_file() or not dot_git.exists()
+
+
+#: Skip marker for assertions that pin the ORIGINAL checkout's absolute paths.
+#:
+#: Two tests do, and both are correct to: `test_launchd` asserts the plist execs
+#: THIS checkout's console script (launchd stores absolute paths, so a moved repo
+#: is exactly the failure it guards), and `test_flex.test_raw_dir_is_populated`
+#: asserts the real archive is present. Neither can hold in a copy: the plist
+#: still points at the original, which is right, and a fresh worktree has no
+#: `raw/`.
+#:
+#: They were the reason `optjournal mutate` reported `dirty-baseline` and measured
+#: NOTHING -- it runs the suite in a `copytree` clone, so the baseline could never
+#: be green, and every mutant came back uncounted while the tool still printed a
+#: reassuring summary line. A harness that looks like it is working is worse than
+#: one that is visibly broken, which is why this is a skip rather than a note in
+#: the README.
+skip_if_copy = pytest.mark.skipif(
+    _is_copy(),
+    reason="pins the original checkout's absolute paths; this tree is a copy "
+           "(git worktree or mutation clone), where they cannot hold",
+)
+
 
 @pytest.fixture
 def conn(tmp_path) -> sqlite3.Connection:

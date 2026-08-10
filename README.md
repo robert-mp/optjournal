@@ -350,6 +350,16 @@ Four invariants worth knowing before changing the UI:
   Two surfaces deliberately keep the contract unit and say so: `optjournal
   history` (it lists episodes) and the 0DTE cohort (a cohort is defined by
   a contract's expiry, and a rolled position spans several).
+
+  `month_stats` builds its own linkage via `stats.campaigns_for` when a
+  caller passes none, so the corrected figures are the default and not an
+  opt-in. The `campaign_list=` argument is a COST optimisation only: the
+  Annual tab asks for a dozen months, two years and a total from one
+  report, and `_period_stats` builds the linkage once for all of them.
+  Passing nothing is always correct, just one query per period. It used to
+  fall back to one campaign per episode, which meant a forgotten keyword
+  silently produced the pre-campaign reading — a default that is wrong in
+  silence, and the reason most of the suite was measuring the old rule.
 * **The payload contract lives in the page, and the suite derives its
   guards from it.** `page.html` opens with `@typedef` blocks declaring
   every shape the page reads and a `@payload`/`@local` table saying which
@@ -375,13 +385,22 @@ are not about. There are 36 mutants; the two newest guard the campaign unit (a
 roll counted as decided while a leg is still open, and a campaign scored by its
 final contract rather than the sum), and both are caught.
 
-`mutate` currently reports `dirty-baseline` and measures nothing: it runs the
-suite in a `copytree` clone, and `test_launchd`'s plist assertion pins the
-ORIGINAL checkout's path by design, so it fails wherever the tree is copied.
-That is a harness gap, not a suite failure — the same two tests
-(`test_launchd`, and `test_flex`'s `raw/` guard) fail in a git worktree for the
-same reason. Fix by skipping the checkout-pinned tests when the tree is a clone
-before trusting a mutation number again.
+**The harness needs the suite to be green in a COPY of the checkout**, because it
+runs each mutant in a `copytree` clone and refuses to measure against a baseline
+that already fails (`dirty-baseline`). Two tests could never satisfy that, both
+correctly: `test_launchd` asserts the plist execs *this* checkout's console script
+(launchd stores absolute paths, so a moved repo is the failure it exists to
+catch), and `test_flex.test_raw_dir_is_populated` asserts the real archive is
+present, which a fresh worktree has no copy of. So every mutant came back
+uncounted while the tool still printed a summary line — a survey that looks like
+it ran is worse than one that visibly did not.
+
+Both now carry `conftest.skip_if_copy`, which detects a copy from what git leaves
+behind (`.git` is a FILE in a worktree, absent in a clone, and a DIRECTORY only in
+the real checkout) rather than from path names. The guards still guard where they
+mean something, and the harness gets its green baseline. The same skip is why
+`uv run pytest` is clean inside a git worktree, which is where most of this
+project's changes are written.
 
 The two high counts say different things, which is the point of reading the names
 rather than the number. At 8 is the Money currency gate — a rule that genuinely
