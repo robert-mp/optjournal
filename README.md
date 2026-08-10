@@ -381,11 +381,19 @@ unguarded invariant — that is how a `_flat` epsilon wide enough to book a
 0.4-share residual as a closed round trip was found, having passed 579 tests, and
 how `_snapshot_leg` silently taking `abs()` of a short position was found. A
 defect caught by **fifteen** tests suggests fourteen are coupled to something they
-are not about. There are 36 mutants. The two newest guard the campaign unit and
-were measured after the harness was repaired below: `roll-continues` (a roll
-counted as decided while a leg is still open) is caught by 2 tests, and
-`campaign-sum` (a campaign scored by its final contract rather than the sum of
-them) by 1 — the demo case where a loser is rolled out and scratched.
+are not about.
+
+Measured over all 36 mutants, after the harness repair described below: **31
+caught, 5 uncaught**, median 1 test, maximum 20. The two newest guard the campaign
+unit — `roll-continues` (a roll counted as decided while a leg is still open) is
+caught by 2 tests, and `campaign-sum` (a campaign scored by its final contract
+rather than the sum of them) by 1, the demo case where a loser is rolled out and
+scratched.
+
+At the top end, `fee-scope` is caught by 20 tests and `cost-scope` by 6. That is
+the "fourteen coupled tests" signal above, and it is worth a look: account fees
+appear in so many assertions that a change to how they are scoped fails most of
+the suite, which tells you little about where the rule actually lives.
 
 **The harness needs the suite to be green in a COPY of the checkout**, because it
 runs each mutant in a `copytree` clone and refuses to measure against a baseline
@@ -397,7 +405,25 @@ present, which a fresh worktree has no copy of. So every mutant came back
 uncounted while the tool still printed a summary line — a survey that looks like
 it ran is worse than one that visibly did not.
 
-Both now carry `conftest.skip_if_copy`, which detects a copy from what git leaves
+The first full survey after the repair found **five mutants caught by zero
+tests**, every one of them pre-dating the repair and none of them noticed while
+the harness was silently measuring nothing:
+
+| mutant | what would break |
+|---|---|
+| `wire-enum` | the payload would carry `AssetClass.STOCK` where the page reads `STK` |
+| `broker-stamp` | `ingest --broker X` would read X's statement and file every row under `ibkr`, making the argument decorative |
+| `legs-merge` | two brokers' fills for one order id would SUM, reporting a position of -3 as -6 |
+| `current-book` | whichever broker filed most recently would decide what counts as current for all of them |
+| `held-scope` | a lagging broker's held positions would be invisible to the open/closed decision, so a position still open reads as CLOSED |
+
+Four of the five are the multi-broker seam, which is exactly the area with no real
+second-broker data to test against — the gap the mutants were written for, left
+unmeasured because nothing was running them. They are unguarded invariants, not
+known-good behaviour, and each wants a sentinel test.
+
+Both blocking tests now carry `conftest.skip_if_copy`, which detects a copy from
+what git leaves
 behind (`.git` is a FILE in a worktree, absent in a clone, and a DIRECTORY only in
 the real checkout) rather than from path names. The guards still guard where they
 mean something, and the harness gets its green baseline. The same skip is why
