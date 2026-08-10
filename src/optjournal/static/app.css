@@ -900,9 +900,23 @@ td.n,th.n{text-align:right}
 .act.sell{color:var(--sell);border-color:var(--badedge);background:var(--sellbg)}
 
 /* ---- chart ---- */
-.chart{width:100%;height:230px;display:block}
+/* NO `height`, and no fixed `width`. Both were set (`width:100%;height:230px`),
+   which combined with `preserveAspectRatio="none"` stretched the 1000x230 viewBox
+   to the card's ~1400px and made every glyph 40% wider than tall -- the blur.
+   `width:100%` with `height:auto` lets the viewBox's own ratio decide, so the
+   scale is uniform at any card width and the type stays the shape it was drawn.
+   `max-width` in viewBox units keeps it from scaling ABOVE 1:1 on a very wide
+   window, where a 230-unit-tall chart would otherwise grow into a banner. */
+.chart{display:block;width:100%;height:auto;max-width:1400px;margin:0 auto}
 .chart .grid{stroke:var(--gridline);stroke-width:1}
-.chart .axis{fill:var(--dim2);font-size:10px;font-family:var(--mono)}
+/* 13px IN VIEWBOX UNITS, not on screen. Uniform scaling means the whole chart
+   shrinks to fit the card, so the type shrinks with it: at 10px the labels
+   rendered 7.9px on an 1100px card, which is smaller than anything else on the
+   page. 13px lands at 10.2-13px across the widths this card actually gets, which
+   is the range the rest of the small text occupies.
+   This is the trade uniform scaling asks for -- it was free before only because
+   `preserveAspectRatio="none"` was stretching the glyphs instead. */
+.chart .axis{fill:var(--dim2);font-size:13px;font-family:var(--mono)}
 /* `.chart .zero` and `.chart .zerolab` lived here: a dashed rule at break-even
    with an uppercase caption. Removed with the markup that drew them rather than
    left behind -- `test_every_rule_in_the_stylesheet_is_reachable_from_the_page`

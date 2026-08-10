@@ -341,3 +341,48 @@ export function barsPerMs(length, secondsFor, speed = 1) {
   const ms = (Math.max(0.001, secondsFor) * 1000) / Math.max(0.001, speed);
   return bars / ms;
 }
+
+/** Round axis values inside a domain: the "nice number" rule every charting
+ * library uses, and the one this chart was missing.
+ *
+ * The performance chart labelled `[hi, (hi+lo)/2, lo]` -- the data's own padded
+ * extremes -- so a reader got "€1,626 / €726 / −€174". Those are three numbers
+ * nobody chose, they change on every fill, and none of them is the one value that
+ * matters on a cumulative P&L chart: zero.
+ *
+ * The step comes from {1, 2, 2.5, 5, 10} x 10^n, so a label is always a figure a
+ * person would say out loud. Ticks are then the multiples of that step which fall
+ * INSIDE the domain -- the domain is NOT extended to whole steps, which is the
+ * other common approach and costs real plot height here: rounding [-174, 1626]
+ * out to [-500, 2000] would leave the series using 69% of the card and read as a
+ * smaller move than happened. So the line keeps the full height and the labels
+ * are still round; the top gridline simply need not be flush with the frame.
+ *
+ * Zero lands on a gridline whenever it is in range, which is free: it is a
+ * multiple of every step.
+ *
+ * @param {number} lo domain minimum
+ * @param {number} hi domain maximum
+ * @param {number} target roughly how many ticks are wanted
+ * @returns {number[]} ascending round values within [lo, hi]
+ */
+export function niceTicks(lo, hi, target = 4) {
+  if (!isFinite(lo) || !isFinite(hi) || hi <= lo || target < 1) return [];
+  const raw = (hi - lo) / target;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  // The first multiple that covers `raw`. 2.5 is in the list because a 250 step
+  // is a figure people read fluently and a 200 or 300 step is not.
+  const step = [1, 2, 2.5, 5, 10].find((m) => raw <= m * mag) * mag;
+  const out = [];
+  // `Math.round(v / step) * step` rather than accumulating `v += step`: adding a
+  // float repeatedly drifts, and a tick at 1499.9999999999998 formats as a round
+  // number while sitting a hair off its own gridline.
+  for (let k = Math.ceil(lo / step); k * step <= hi; k += 1) {
+    // `+ 0` normalises NEGATIVE ZERO. `Math.ceil(-174 / 500)` is -0, and -0 *
+    // step stays -0, which `toLocaleString` renders with a minus sign: the axis
+    // would have labelled break-even "−€0". Caught by the unit test, not by
+    // reading the arithmetic.
+    out.push(Math.round(k * step * 1e6) / 1e6 + 0);
+  }
+  return out;
+}

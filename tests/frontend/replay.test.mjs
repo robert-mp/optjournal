@@ -20,6 +20,7 @@ import {
   xAtPosition,
   indexOfTs,
   markAt,
+  niceTicks,
   nextStop,
   plotGeometry,
   reachedEvents,
@@ -472,4 +473,69 @@ test("a degenerate series has a finite pace", () => {
   assert.ok(Number.isFinite(barsPerMs(1, 20)));
   assert.ok(Number.isFinite(barsPerMs(0, 20)));
   assert.ok(barsPerMs(2, 0) > 0, "a zero duration must not stall playback");
+});
+
+/* ---------------------------------------------------------------- niceTicks
+   The performance axis used to label the data's own padded extremes, so a reader
+   got "€1,626 / €726 / −€174" -- three numbers nobody chose, all of which move on
+   every fill. */
+
+test("every tick is a round multiple a person would say out loud", () => {
+  // The reported chart's own domain, and the demo journal's.
+  assert.deepEqual(niceTicks(-174, 1626), [0, 500, 1000, 1500]);
+  assert.deepEqual(niceTicks(-443, 4138), [0, 2000, 4000]);
+  assert.deepEqual(niceTicks(0, 37), [0, 10, 20, 30]);
+});
+
+test("zero lands on a gridline whenever it is in range", () => {
+  // Not special-cased in the implementation -- zero is a multiple of every step
+  // -- but it is the value that matters most on a cumulative P&L chart, so it is
+  // worth pinning that the rule actually delivers it.
+  for (const [lo, hi] of [[-174, 1626], [-45, 62], [-1, 1], [-12000, 184000]]) {
+    assert.ok(niceTicks(lo, hi).includes(0), `zero missing for ${lo}..${hi}`);
+  }
+});
+
+test("ticks stay inside the domain, so none is drawn off the plot", () => {
+  // The domain is deliberately NOT extended to whole steps: rounding
+  // [-174, 1626] out to [-500, 2000] would leave the series using 69% of the
+  // card's height and read as a smaller move than happened.
+  for (const [lo, hi] of [[-174, 1626], [-820, -12], [-0.4, 2.1], [3, 9]]) {
+    for (const t of niceTicks(lo, hi)) {
+      assert.ok(t >= lo && t <= hi, `${t} outside ${lo}..${hi}`);
+    }
+  }
+});
+
+test("an all-negative range is labelled without inventing a positive tick", () => {
+  const got = niceTicks(-820, -12);
+  assert.ok(got.length > 0, "a losing account still needs an axis");
+  assert.ok(got.every((t) => t <= 0));
+});
+
+test("a tick is exactly its own round value, not a float that drifts", () => {
+  // Accumulating `v += step` drifts: a tick at 1499.9999999999998 formats as a
+  // round number while sitting a hair off its own gridline.
+  for (const t of niceTicks(0, 3)) {
+    assert.equal(t, Math.round(t * 1e6) / 1e6);
+  }
+  assert.deepEqual(niceTicks(0, 1.2), [0, 0.5, 1]);
+});
+
+test("a degenerate domain yields no ticks rather than throwing", () => {
+  // The chart pads a flat series before calling this, so these are guards rather
+  // than live cases -- but an axis that throws blanks the whole card.
+  assert.deepEqual(niceTicks(5, 5), []);
+  assert.deepEqual(niceTicks(10, 1), []);
+  assert.deepEqual(niceTicks(NaN, 10), []);
+  assert.deepEqual(niceTicks(0, Infinity), []);
+});
+
+test("the tick count stays near the target across six orders of magnitude", () => {
+  // A round step is worth little if it yields one tick on one chart and eleven on
+  // the next; the axis has to look like the same axis at every scale.
+  for (const hi of [1, 10, 100, 1000, 10000, 100000, 1e6]) {
+    const n = niceTicks(0, hi).length;
+    assert.ok(n >= 2 && n <= 7, `${n} ticks for 0..${hi}`);
+  }
 });

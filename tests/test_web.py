@@ -3379,6 +3379,83 @@ def test_a_zero_crossing_chart_marks_break_even_and_colours_the_loss_side():
     assert 'class="zero"' not in chart, "the zero rule is back"
 
 
+def test_the_performance_chart_scales_uniformly():
+    """A non-uniform SVG scale stretches every GLYPH, and that is what made this
+    axis look blurry.
+
+    The chart was authored at `viewBox="0 0 1000 230"` with
+    `preserveAspectRatio="none"` and `width:100%;height:230px`. The card is about
+    1400px wide, so the box was scaled 1.40x horizontally and 1.00x vertically:
+    measured, every digit came out 40% wider than tall, and strokes landed on
+    fractional pixels. Not a font problem, a geometry one -- which is why no
+    amount of font tuning would have fixed it.
+
+    The replay panel next door always used `xMidYMid meet`, which is why its
+    labels were crisp while these were not.
+    """
+    chart = _fn("chart")
+    assert 'preserveAspectRatio="none"' not in chart, (
+        "the performance chart is scaling non-uniformly again, which stretches "
+        "its type -- the axis will look blurry at any card width but 1000px"
+    )
+    css = _css().replace(" ", "").replace("\n", "")
+    assert "height:auto" in css.split(".chart{")[1].split("}")[0], (
+        "`.chart` pins a height again; with width:100% that forces a non-uniform "
+        "scale unless the viewBox happens to match the card exactly"
+    )
+
+
+def test_the_performance_axis_labels_round_numbers_in_display_currency():
+    """Two decisions, and the ORDER of them is what makes it correct.
+
+    The ticks were `[hi, (hi+lo)/2, lo]` -- the data's own padded extremes -- so
+    the axis read "€1,626 / €726 / −€174": numbers nobody chose, moving on every
+    fill, and never including zero. `niceTicks` (unit-tested in
+    tests/frontend/replay.test.mjs) picks round multiples instead.
+
+    AND THE ROUNDING HAPPENS IN DISPLAY SPACE. Choosing round BASE values and
+    labelling them through `cash` would have rounded the wrong quantity: at 1.13
+    USD per EUR a tidy €500 tick renders "$568.63", so under a non-base toggle
+    the axis would have looked exactly as arbitrary as before. So the domain is
+    converted, ticks are chosen there, and `unconv` maps them back to position.
+    """
+    chart = _fn("chart")
+    assert "niceTicks(conv(lo),conv(hi))" in chart.replace(" ", ""), (
+        "the axis no longer picks round ticks from the CONVERTED domain, so a "
+        "round tick under one currency is an arbitrary one under another"
+    )
+    assert "unconv(" in chart, (
+        "the display-space ticks are not mapped back to base, so they are "
+        "positioned on the wrong scale"
+    )
+    js = _code_only(_js()).replace(" ", "")
+    assert "constunconv=" in js, "the inverse of conv is gone"
+
+
+def test_the_chart_axis_dates_are_short_and_unambiguous():
+    """`2026-07-24` is ten characters, four of them punctuation and four a year
+    the card's own title already establishes.
+
+    Day-then-month rather than DD/MM/YY: a purely numeric date reads two ways
+    (07/08 is August 7th to half the world), and the header dateline and month
+    picker already spell the month, so this reuses the page's vocabulary instead
+    of introducing a fourth date format.
+
+    The year returns only when the span crosses one -- noise on a two-week chart,
+    load-bearing on one running from December into January.
+    """
+    js = _code_only(_js()).replace(" ", "")
+    assert "constdayLabel=" in js, "the short date formatter is gone"
+    chart = _fn("chart").replace(" ", "")
+    assert "dayLabel(pt.x,spansYears)" in chart, (
+        "the axis is not using the short date formatter"
+    )
+    assert "spansYears=" in chart, (
+        "the year is now unconditional -- either always noise or always missing, "
+        "and one of those makes a December-to-January axis lie about its own order"
+    )
+
+
 def test_only_a_success_banner_dismisses_itself():
     """A success has been read the instant it appears; a failure has not.
 

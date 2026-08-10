@@ -102,7 +102,8 @@
    from what it does. test_frontend pins the list against the calls. */
 import {
   MIN_POINTS, bandEdges, barsPerMs, deltaDomain, deltaSegments, frameAt,
-  indexOfTs, nextStop, reachedEvents, plotGeometry, sessionBreaks, strikeSpan,
+  indexOfTs, niceTicks, nextStop, reachedEvents, plotGeometry, sessionBreaks,
+  strikeSpan,
 } from '/static/replay.js';
 
 /* ===================== the payload contract =====================
@@ -920,7 +921,7 @@ import {
  * @local chosen withEvents ws opts thin
  * @local countries impacts shownByDay next want picked
  * @local JSON Object ages input mine qb wf behind was
- * @local when button parts names
+ * @local when button parts names y
  * @local COST_OPTIONS bits cost fees on wh
  */
 
@@ -1020,6 +1021,14 @@ const QUOTE=()=>QUOTES().find(q=>q.code===DISP())||null;
 /* Restate a base-currency amount into the display currency. */
 const conv=v=>{if(v==null)return null;const q=QUOTE();
   return q?Number(v)*q.per_base:Number(v);};
+/* The inverse of `conv`: a display-currency amount back into base. Needed
+   because the chart CHOOSES its axis ticks in the currency the reader sees -- a
+   round number has to be round in display space, or a tidy €500 tick renders
+   "$568.63" under a USD toggle -- and then has to position them on a scale built
+   from base-currency values. Same rate, same direction of travel, so it round
+   trips exactly rather than through a second quote. */
+const unconv=v=>{if(v==null)return null;const q=QUOTE();
+  return q&&q.per_base?Number(v)/q.per_base:Number(v);};
 /* An amount already in base currency: restate and symbol in one step. */
 const cash=(v,d)=>money(conv(v),DISP(),d);
 
@@ -1081,6 +1090,22 @@ const pct=(v,d=1)=>v==null?'—':num(v,d)+'%';
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const monthLabel=m=>{if(!m||m==='ALL')return 'All time';
   const[y,mm]=m.split('-');return MONTHS[+mm-1]+' '+y;};
+/* A stored ISO day as a chart axis reads it: "24 Jul", or "24 Jul '25" when the
+   year is worth stating. The axis used to print the raw `2026-07-24`, which is
+   ten characters of which four are punctuation and four are a year the card's own
+   title already establishes.
+   Day-then-month rather than DD/MM/YY, because a purely numeric date is read two
+   ways -- 07/08 is August 7th to half the world -- and because the header dateline
+   and the month picker already spell the month ("SINCE 28 AUG 2025", "Aug 2026"),
+   so this is the page's existing vocabulary rather than a fourth date format.
+   `withYear` is passed by the caller, which knows whether its span crosses one:
+   the year is noise on a two-week chart and load-bearing on one that straddles
+   December. */
+const dayLabel=(iso,withYear)=>{
+  const[y,m,d]=String(iso||'').split('-');
+  if(!y||!m||!d) return String(iso||'');
+  return (+d)+' '+MONTHS[+m-1]+(withYear?" '"+y.slice(2):'');
+};
 
 /* ------------------------------------------------ tabs */
 /* [id, label]. There used to be a third slot carrying a per-tab "disabled
@@ -1614,9 +1639,22 @@ function ago(secs){
 /* ------------------------------------------------ chart (inline SVG) */
 function chart(days){
   if(!days||!days.length) return `<div class="empty">no fills in this period</div>`;
-  /* PL leaves room for a tick label that now carries a currency symbol as well
-     as digits; at 54px "€4,138" collided with the plot area. */
-  const W=1000,H=230,PL=68,PR=14,PT=14,PB=26;
+  /* W MATCHES THE CSS HEIGHT'S ASPECT, and the SVG scales UNIFORMLY. This was
+     `viewBox="0 0 1000 230"` with `preserveAspectRatio="none"` and `width:100%`,
+     which is why the axis read blurry and the digits looked stretched: the card
+     is ~1400px wide, so a 1000-unit viewBox was scaled 1.40x horizontally and
+     1.00x vertically. Every glyph came out 40% wider than tall -- not a font
+     problem, a geometry one -- and strokes landed on fractional pixels.
+     Measured, not guessed: 1400/1000 against 230/230.
+
+     Fixed by letting the SVG scale as a unit (`.chart` sets no width, so the
+     viewBox's own ratio governs) and by declaring the box at the width the card
+     actually gets. The replay panel already did this -- `xMidYMid meet` -- which
+     is why its labels were always crisp and these were not.
+
+     PL leaves room for a tick label carrying a currency symbol as well as
+     digits; at 54px "€4,138" collided with the plot area. */
+  const W=1400,H=230,PL=76,PR=18,PT=16,PB=28;
   let run=0; const pts=days.map(dy=>({x:dy.day,y:(run+=dy.realized.base),n:dy.trades}));
   const ys=pts.map(pt=>pt.y).concat([0]);
   let lo=Math.min(...ys), hi=Math.max(...ys);
@@ -1628,16 +1666,33 @@ function chart(days){
   const area=pts.length>1
     ? `${line}L${sx(pts.length-1).toFixed(1)},${sy(0).toFixed(1)}L${sx(0).toFixed(1)},${sy(0).toFixed(1)}Z`
     : '';
-  /* `cash`, not `num`: the tick VALUES are base-currency (they come from
-     realized_base), so labelling them raw left the axis in EUR while the
-     headline, the cards and every dot tooltip on the same chart restated to
-     USD -- the axis was the one figure on the page that ignored the toggle,
-     and it carried no symbol to admit which currency it meant. The plotted
-     shape is unaffected either way: conv() is a uniform scale factor, so it
-     cancels out of sy()'s normalisation. */
-  const ticks=[hi,(hi+lo)/2,lo].map(v=>
-    `<line class="grid" x1="${PL}" y1="${sy(v).toFixed(1)}" x2="${W-PR}" y2="${sy(v).toFixed(1)}"/>
-     <text class="axis" x="${PL-7}" y="${(sy(v)+3).toFixed(1)}" text-anchor="end">${cash(v,0)}</text>`).join('');
+  /* ROUND TICKS, CHOSEN IN DISPLAY SPACE. Two decisions here, and the order of
+     them is the whole point.
+
+     The values used to be `[hi, (hi+lo)/2, lo]` -- the data's own padded extremes
+     -- so the axis read "€1,626 / €726 / −€174": three numbers nobody chose, all
+     of which move on every fill. `niceTicks` picks round multiples instead (see
+     replay.js), which is what every charting platform does, and it puts zero on a
+     gridline for free whenever zero is in range.
+
+     And the ticks are picked from the CONVERTED domain, then mapped back through
+     `unconv` to position them. Choosing them in base and labelling with `cash`
+     would have rounded the wrong quantity: at 1.13 USD per EUR a round €500 tick
+     renders "$568.63", so under a non-base toggle the axis would have looked
+     exactly as arbitrary as before. Rounding has to happen in the space the
+     reader is actually reading.
+
+     `cash`, not `num`, for the label: the values are base-currency, so labelling
+     them raw left the axis in EUR while the headline and every dot tooltip on the
+     same chart restated to USD -- the axis was the one figure on the page that
+     ignored the toggle. The plotted SHAPE is unaffected either way, since conv()
+     is a uniform scale factor and cancels out of sy()'s normalisation. */
+  const ticks=niceTicks(conv(lo),conv(hi)).map(dv=>{
+    const v=unconv(dv), y=sy(v).toFixed(1);
+    return `<line class="grid" x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}"/>
+     <text class="axis" x="${PL-8}" y="${(sy(v)+3.5).toFixed(1)}"
+       text-anchor="end">${cash(v,0)}</text>`;
+  }).join('');
   /* NO BREAK-EVEN RULE. There was a labelled dashed line at zero whenever the
      series crossed it, on the argument that a drawdown should not read as
      ordinary variation. Removed by request, and the argument it rested on was
@@ -1657,9 +1712,16 @@ function chart(days){
      stylesheet, which is why the whole chart sat out the theme swap. */
   const dots=pts.map((pt,i)=>`<circle class="cdot ${pt.y<0?'neg':'pos'}"
      cx="${sx(i).toFixed(1)}" cy="${sy(pt.y).toFixed(1)}" r="3.5"
-     ><title>${esc(pt.x)} — cum ${cash(pt.y)} (${pt.n} fill(s))</title></circle>`).join('');
+     ><title>${esc(dayLabel(pt.x,true))} — cum ${cash(pt.y)} (${pt.n} fill(s))</title></circle>`).join('');
+  /* The year appears only when the span crosses one, decided from the data rather
+     than always shown or always hidden: on a two-week chart "'26" twice is noise,
+     and on one running from December into January its absence makes the axis lie
+     about the order of its own ends. */
+  const spansYears=pts.length>1
+    &&String(pts[0].x).slice(0,4)!==String(pts[pts.length-1].x).slice(0,4);
   const labels=pts.map((pt,i)=>i===0||i===pts.length-1
-    ? `<text class="axis" x="${sx(i).toFixed(1)}" y="${H-8}" text-anchor="${i?'end':'start'}">${esc(pt.x)}</text>`:'').join('');
+    ? `<text class="axis" x="${sx(i).toFixed(1)}" y="${H-9}"
+        text-anchor="${i?'end':'start'}">${esc(dayLabel(pt.x,spansYears))}</text>`:'').join('');
   /* Sign is encoded in the FILL, and the trick is that the area path is not cut
      up to do it. The one path is painted twice, each time clipped to a
      half-plane split at the zero line: brass above, red below. So the geometry
@@ -1673,7 +1735,8 @@ function chart(days){
      clip rect gets zero height and paints nothing, which is why this needs no
      `crosses` branch of its own. */
   const z=sy(0).toFixed(1);
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}"
+    preserveAspectRatio="xMidYMid meet">
     <defs>
       <linearGradient id="gpos" gradientUnits="userSpaceOnUse"
         x1="0" x2="0" y1="${PT}" y2="${z}">
