@@ -24,8 +24,10 @@ from pathlib import Path
 import pytest
 from conftest import RAW_DIR, ROOT, code_only
 
+from optjournal import replay as replay_mod
 from optjournal import web
 from optjournal.cli import main
+from optjournal.clock import epoch_et
 from optjournal.config import (
     DEFAULT_ARCHIVE,
     DEFAULT_DB,
@@ -1671,7 +1673,7 @@ def test_a_snapshot_leg_keeps_the_sign_of_the_position_it_seeds():
     A dict rather than a database row because `_snapshot_leg` reads a mapping,
     and the property is about the sign, not about SQL.
     """
-    from optjournal.web import _snapshot_leg, _strikes_of
+    from optjournal.replay import _snapshot_leg, _strikes_of
 
     short = {"conid": "C1", "strike": 270.0, "put_call": "P", "expiry": "20260904",
              "multiplier": 100.0, "position": -5, "cost_basis_price": 3.20}
@@ -1697,8 +1699,7 @@ def test_a_closed_contract_takes_its_side_from_the_OPENING_fill():
     readings apart -- and that is why the existing snapshot test above, whose leg
     has no fills at all, does not cover this.
     """
-    from optjournal.replay import ReplayLeg
-    from optjournal.web import _strikes_of
+    from optjournal.replay import ReplayLeg, _strikes_of
 
     sold_to_open = ReplayLeg(
         conid="C1", strike=105.0, right="P", expiry="20260904",
@@ -1725,8 +1726,7 @@ def test_the_segment_ends_where_the_position_goes_flat_not_at_the_last_fill():
     edge) rather than the timestamp of that second fill. Reading the last fill
     instead would retire a live strike from the chart.
     """
-    from optjournal.replay import ReplayLeg
-    from optjournal.web import _strikes_of
+    from optjournal.replay import ReplayLeg, _strikes_of
 
     partly_closed = ReplayLeg(
         conid="C3", strike=590.0, right="C", expiry="20260904",
@@ -2937,7 +2937,7 @@ def test_an_events_kind_comes_from_its_legs_not_its_label():
         _event("Roll", _leg(420, "C", "BUY", "C", 1, 1.10),
                _leg(410, "C", "SELL", "O", -1, 2.30), at="2026-08-10 11:00:00"),
     ]}
-    kinds = [row["kind"] for row in web._annotations(lifecycle, [])]
+    kinds = [row["kind"] for row in replay_mod._annotations(lifecycle, [])]
     assert kinds == ["open", "close", "roll"]
 
 
@@ -2951,13 +2951,13 @@ def test_an_opening_event_reports_no_realised_pnl():
         _event("Short put", _leg(270, "P", "SELL", "O", -3, 5.24),
                realized_pnl=zero),
     ]}
-    assert web._annotations(lifecycle, [])[0]["realized"] is None
+    assert replay_mod._annotations(lifecycle, [])[0]["realized"] is None
 
     closed = {"events": [
         _event("Short put close", _leg(270, "P", "BUY", "C", 3, 2.60),
                realized_pnl={"base": 684.59, "native": 787.86, "ccy": "USD"}),
     ]}
-    got = web._annotations(closed, [])[0]["realized"]
+    got = replay_mod._annotations(closed, [])[0]["realized"]
     assert got is not None and got["native"] == 787.86, (
         "the control: a CLOSING event must keep its realised figure"
     )
@@ -2972,11 +2972,11 @@ def test_annotations_carry_the_delta_an_event_changed():
         _event("Short put close", _leg(270, "P", "BUY", "C", 3, 2.60),
                at="2026-08-03 09:55:23"),
     ]}
-    open_ts = web.epoch_et("2026-07-24 10:35:01")
-    close_ts = web.epoch_et("2026-08-03 09:55:23")
+    open_ts = epoch_et("2026-07-24 10:35:01")
+    close_ts = epoch_et("2026-08-03 09:55:23")
     marks = [[open_ts, 0.0, 0.52], [close_ts - 3600, 700.0, 0.32],
              [close_ts, 792.0, 0.0]]
-    rows = web._annotations(lifecycle, marks)
+    rows = replay_mod._annotations(lifecycle, marks)
     assert (rows[0]["delta_before"], rows[0]["delta_after"]) == (None, 0.52)
     assert (rows[1]["delta_before"], rows[1]["delta_after"]) == (0.32, 0.0)
 
@@ -2988,7 +2988,7 @@ def test_an_event_without_a_timestamp_is_dropped():
     lifecycle = {"events": [
         _event("Short put", _leg(270, "P", "SELL", "O", -3, 5.24), at=None),
     ]}
-    assert web._annotations(lifecycle, []) == []
+    assert replay_mod._annotations(lifecycle, []) == []
 
 
 def test_a_stat_cards_note_is_a_hoverable_element_not_a_title_attribute():

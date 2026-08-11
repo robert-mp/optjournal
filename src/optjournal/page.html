@@ -164,7 +164,7 @@ import {
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
  * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
- * @property {Object} replays -- Replay by key; rows resolve into it (web._attach_replays)
+ * @property {Object} replays -- Replay by key; rows resolve into it (replay.attach)
  * @property {OdteBlock} odte
  * @property {FxBlock} fx
  * @property {Array} costs -- Costs per statement section, may be empty
@@ -716,7 +716,7 @@ import {
  * @property {string|null} expiry
  */
 
-/** @typedef {Object} Replay -- one trade's chart data (web._attach_replays)
+/** @typedef {Object} Replay -- one trade's chart data (replay.attach)
  * @property {string} key -- "lc:<conids>@<date>" or "pos:<conid>"
  * @property {string|null} underlying -- the symbol the price line belongs to
  * @property {string|null} label -- the strategy name, or "Open position"
@@ -739,7 +739,7 @@ import {
  *   first; empty for a snapshot-only contract, which has no fills to annotate
  */
 
-/** @typedef {Object} Annotation -- one decision on the timeline (web._annotations)
+/** @typedef {Object} Annotation -- one decision on the timeline (replay._annotations)
  * @property {number} ts -- the event's first fill, as an epoch (US Eastern)
  * @property {string} at -- the same instant as "YYYY-MM-DD HH:MM", for display
  * @property {string|null} label -- the strategy name from strategies.classify

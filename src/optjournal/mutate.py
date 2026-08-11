@@ -8,7 +8,7 @@ merely large.
 Two results are worth acting on. A real defect caught by ZERO tests is an
 unguarded invariant, and the suite should grow there: that is how `history._flat`
 (a 0.4-share residual booking a partial close as a completed round trip) and
-`web._snapshot_leg`'s sign were found, both of which had passed 579 tests. A
+`replay._snapshot_leg`'s sign were found, both of which had passed 579 tests. A
 defect caught by fifteen tests means fourteen are coupled to something they are
 not about. Measured over all 31 mutants: **31 caught, median 1, minimum 1,
 maximum 19**.
@@ -242,7 +242,7 @@ MUTANTS: tuple[Mutant, ...] = (
     ),
     Mutant(
         key="snapshot-sign",
-        module="web.py",
+        module="replay.py",
         find='        seed_quantity=float(row.get("position") or 0.0),',
         replace='        seed_quantity=abs(float(row.get("position") or 0.0)),',
         breaks="a short snapshot-only position would draw its P&L upside down",
@@ -349,7 +349,7 @@ MUTANTS: tuple[Mutant, ...] = (
     ),
     Mutant(
         key="strike-side",
-        module="web.py",
+        module="replay.py",
         find="            if index == 0:\n                opened_at, sold = stamp, delta_qty < 0",
         replace="            opened_at, sold = (stamp if index == 0 else opened_at), "
                 "delta_qty < 0",
