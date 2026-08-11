@@ -15,6 +15,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,7 @@ from optjournal.config import (
     ROOT,
 )
 from optjournal.costs import CostScope, build_costs
-from optjournal.db import connect, migrate, open_journal
+from optjournal.db import connect, open_journal
 from optjournal.events import (
     DEFAULT_COUNTRIES,
     DEFAULT_IMPACTS,
@@ -120,20 +121,6 @@ def _resolve_path(args) -> Path | None:
     return newest_statement(args.archive)
 
 
-def _open_db(args) -> sqlite3.Connection:
-    """A migrated connection the CALLER closes.
-
-    For the commands that genuinely need one outliving a single block -- ingest
-    and sync read rows back after writing, prune and bars hand the same handle to
-    several calls. Anything that makes one call wants `open_journal`, which closes
-    it; three commands used this for a single call each and so never closed
-    anything, which is exactly the drift `open_journal` was written to stop.
-    """
-    conn = connect(args.db)
-    migrate(conn)
-    return conn
-
-
 def _asset_filter(raw: str) -> tuple[str, ...]:
     """Decode a `--assets` value into the tuple `ingest` and `serve` expect.
 
@@ -185,8 +172,16 @@ def cmd_statements(args) -> int:
 
 def cmd_prune(args) -> int:
     """Collapse byte-identical archive duplicates. Dry run unless --apply."""
-    conn = _open_db(args) if args.db.exists() else None
-    result = prune_archive(args.archive, conn, apply=args.apply)
+    # `ExitStack` rather than a bare `with`, because pruning an archive with no
+    # journal beside it is a supported run: `prune_archive` takes None and skips
+    # the provenance re-pointing. The stack closes the connection when there is
+    # one and holds nothing when there is not, so both paths get the same
+    # rollback-on-exit guarantee without a second spelling of the open.
+    with ExitStack() as stack:
+        conn = (
+            stack.enter_context(open_journal(args.db)) if args.db.exists() else None
+        )
+        result = prune_archive(args.archive, conn, apply=args.apply)
 
     data = {
         "applied": result.applied,
@@ -343,14 +338,14 @@ def cmd_ingest(args) -> int:
     if not paths:
         return _no_statements(args)
 
-    conn = _open_db(args)
-    results = [
-        ingest_file(conn, p, assets=assets, reingest=args.reingest) for p in paths
-    ]
-    totals = {
-        t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
-        for t in ("trades", "cash_transactions", "position_snapshots", "securities")
-    }
+    with open_journal(args.db) as conn:
+        results = [
+            ingest_file(conn, p, assets=assets, reingest=args.reingest) for p in paths
+        ]
+        totals = {
+            t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            for t in ("trades", "cash_transactions", "position_snapshots", "securities")
+        }
 
     data = {
         "db": str(args.db),
@@ -434,21 +429,21 @@ def cmd_watch(args) -> int:
     spends no request. A symbol with no bars yet shows a dash rather than a zero
     -- `optjournal bars` is what fills it in.
     """
-    conn = _open_db(args)
-    now = datetime.now(UTC).isoformat(timespec="seconds")
+    with open_journal(args.db) as conn:
+        now = datetime.now(UTC).isoformat(timespec="seconds")
 
-    for symbol in (args.add or []):
-        conn.execute(
-            "INSERT INTO watchlist (symbol, note, added_at) VALUES (?,?,?)"
-            " ON CONFLICT(symbol) DO UPDATE SET note=COALESCE(excluded.note, note)",
-            (symbol.upper(), args.note, now),
-        )
-    for symbol in (args.rm or []):
-        conn.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.upper(),))
-    if args.add or args.rm:
-        conn.commit()
+        for symbol in (args.add or []):
+            conn.execute(
+                "INSERT INTO watchlist (symbol, note, added_at) VALUES (?,?,?)"
+                " ON CONFLICT(symbol) DO UPDATE SET note=COALESCE(excluded.note, note)",
+                (symbol.upper(), args.note, now),
+            )
+        for symbol in (args.rm or []):
+            conn.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.upper(),))
+        if args.add or args.rm:
+            conn.commit()
 
-    rows = watchlist_data(conn)
+        rows = watchlist_data(conn)
     _emit(rows, render_watchlist(rows), args.json)
     return EXIT_OK
 
@@ -469,43 +464,45 @@ def cmd_market(args) -> int:
     default should narrow the VIEW, never the STORE (the same rule ingest learned
     the hard way).
     """
-    conn = _open_db(args)
-    result: dict[str, object] = {}
-    lines: list[str] = []
+    with open_journal(args.db) as conn:
+        result: dict[str, object] = {}
+        lines: list[str] = []
 
-    if args.fetch:
-        try:
-            events = fetch_events()
-        except EventRateLimited as exc:
-            # EXIT_THROTTLED, not EXIT_ERROR: the same distinction the IBKR path
-            # draws, so a nightly cron stays silent on a back-off and alerts only
-            # on something that actually changed.
-            print(f"calendar: {exc}", file=sys.stderr)
-            # `nothing`, not `failed`: the feed pushed back, nothing was lost, and
-            # the same week is served later. A ledger that called this a failure
-            # would accumulate consecutive_failures for a working system.
-            record_run(conn, "market", status="nothing", detail=f"rate limited: {exc}")
-            return EXIT_THROTTLED
-        except EventFetchError as exc:
-            print(f"calendar fetch failed: {exc}", file=sys.stderr)
-            record_run(conn, "market", status="failed", detail=str(exc)[:400])
-            return EXIT_ERROR
-        stored = store_events(conn, events)
-        result["fetched"] = len(events)
-        result["stored"] = stored
-        lines.append(f"calendar {len(events)} event(s) -> {stored} stored")
-        record_run(conn, "market", status="ok" if stored else "nothing",
-                   detail=f"{len(events)} fetched, {stored} stored",
-                   done=stored, total=len(events))
+        if args.fetch:
+            try:
+                events = fetch_events()
+            except EventRateLimited as exc:
+                # EXIT_THROTTLED, not EXIT_ERROR: the same distinction the IBKR
+                # path draws, so a nightly cron stays silent on a back-off and
+                # alerts only on something that actually changed.
+                print(f"calendar: {exc}", file=sys.stderr)
+                # `nothing`, not `failed`: the feed pushed back, nothing was lost,
+                # and the same week is served later. A ledger that called this a
+                # failure would accumulate consecutive_failures for a working
+                # system.
+                record_run(conn, "market", status="nothing",
+                           detail=f"rate limited: {exc}")
+                return EXIT_THROTTLED
+            except EventFetchError as exc:
+                print(f"calendar fetch failed: {exc}", file=sys.stderr)
+                record_run(conn, "market", status="failed", detail=str(exc)[:400])
+                return EXIT_ERROR
+            stored = store_events(conn, events)
+            result["fetched"] = len(events)
+            result["stored"] = stored
+            lines.append(f"calendar {len(events)} event(s) -> {stored} stored")
+            record_run(conn, "market", status="ok" if stored else "nothing",
+                       detail=f"{len(events)} fetched, {stored} stored",
+                       done=stored, total=len(events))
 
-    now = datetime.now(UTC)
-    start = int(now.timestamp())
-    end = int((now + timedelta(days=args.days)).timestamp())
-    countries = () if args.all_events else DEFAULT_COUNTRIES
-    impacts = () if args.all_events else DEFAULT_IMPACTS
-    events = upcoming(conn, start=start, end=end,
-                      countries=countries, impacts=impacts)
-    result["events"] = events
+        now = datetime.now(UTC)
+        start = int(now.timestamp())
+        end = int((now + timedelta(days=args.days)).timestamp())
+        countries = () if args.all_events else DEFAULT_COUNTRIES
+        impacts = () if args.all_events else DEFAULT_IMPACTS
+        events = upcoming(conn, start=start, end=end,
+                          countries=countries, impacts=impacts)
+        result["events"] = events
 
     # From the shared helper rather than spelled out, because this line said
     # "USD high-impact" while DEFAULT_IMPACTS held two grades -- a label that
@@ -552,76 +549,79 @@ def cmd_bars(args) -> int:
     fetch on purpose, so this is the only thing that notices a session where
     every poll failed. Exit 3 means there was nothing to check.
     """
-    conn = _open_db(args)
     live = getattr(args, "live", False)
 
     def day(epoch: int) -> str:
         return datetime.fromtimestamp(epoch, UTC).date().isoformat()
 
-    if getattr(args, "audit", False):
-        result = audit_perishable(conn)
-        data = dataclasses.asdict(result) | {"ok": result.ok}
-        if not result.market_traded:
-            lines = [f"{result.day}: the market did not trade, nothing to audit"]
-        elif not result.covered and not result.missing:
-            lines = [f"{result.day}: no contract was eligible for hourly collection"]
-        elif result.missing:
-            lines = [
-                f"{result.day}: NO hourly option bars for "
-                f"{len(result.missing)} of {len(result.covered) + len(result.missing)}"
-                " eligible contract(s) -- that session is unrecoverable"
-            ]
-            lines += [f"  MISSING: {symbol}" for symbol in result.missing]
-            lines += [f"  ok:      {symbol}" for symbol in result.covered]
-        else:
-            lines = [
-                f"{result.day}: hourly option bars present for all "
-                f"{len(result.covered)} eligible contract(s)"
-            ]
-        _emit(data, "\n".join(lines), args.json)
-        if not result.market_traded or not (result.covered or result.missing):
-            return EXIT_NO_DATA
-        return EXIT_ERROR if result.missing else EXIT_OK
+    with open_journal(args.db) as conn:
+        if getattr(args, "audit", False):
+            result = audit_perishable(conn)
+            data = dataclasses.asdict(result) | {"ok": result.ok}
+            if not result.market_traded:
+                lines = [f"{result.day}: the market did not trade, nothing to audit"]
+            elif not result.covered and not result.missing:
+                lines = [
+                    f"{result.day}: no contract was eligible for hourly collection"
+                ]
+            elif result.missing:
+                lines = [
+                    f"{result.day}: NO hourly option bars for "
+                    f"{len(result.missing)} of "
+                    f"{len(result.covered) + len(result.missing)}"
+                    " eligible contract(s) -- that session is unrecoverable"
+                ]
+                lines += [f"  MISSING: {symbol}" for symbol in result.missing]
+                lines += [f"  ok:      {symbol}" for symbol in result.covered]
+            else:
+                lines = [
+                    f"{result.day}: hourly option bars present for all "
+                    f"{len(result.covered)} eligible contract(s)"
+                ]
+            _emit(data, "\n".join(lines), args.json)
+            if not result.market_traded or not (result.covered or result.missing):
+                return EXIT_NO_DATA
+            return EXIT_ERROR if result.missing else EXIT_OK
 
-    if args.dry_run:
-        requests = bars_manifest(conn, perishable_only=live)
-        data = [dataclasses.asdict(r) for r in requests]
-        lines = [f"{len(requests)} window(s) derived, nothing fetched"]
-        lines += [
-            f"  {r.kind:<10} {r.symbol:<20} {r.bar_size}  "
-            f"{day(r.start)} -> {day(r.end)}"
-            + ("  live-only" if r.perishable else "")
-            for r in requests
+        if args.dry_run:
+            requests = bars_manifest(conn, perishable_only=live)
+            data = [dataclasses.asdict(r) for r in requests]
+            lines = [f"{len(requests)} window(s) derived, nothing fetched"]
+            lines += [
+                f"  {r.kind:<10} {r.symbol:<20} {r.bar_size}  "
+                f"{day(r.start)} -> {day(r.end)}"
+                + ("  live-only" if r.perishable else "")
+                for r in requests
+            ]
+            _emit(data, "\n".join(lines), args.json)
+            return EXIT_OK if requests else EXIT_NO_DATA
+
+        outcome = backfill_bars(conn, perishable_only=live)
+        data = dataclasses.asdict(outcome)
+        lines = [
+            f"{outcome.written} bar(s) stored across {outcome.requested} window(s)"
+            + (f", {outcome.skipped} with no bars at that granularity"
+               if outcome.skipped else "")
         ]
+        lines += [f"  FAILED: {failure}" for failure in outcome.failures]
         _emit(data, "\n".join(lines), args.json)
-        return EXIT_OK if requests else EXIT_NO_DATA
-
-    outcome = backfill_bars(conn, perishable_only=live)
-    data = dataclasses.asdict(outcome)
-    lines = [
-        f"{outcome.written} bar(s) stored across {outcome.requested} window(s)"
-        + (f", {outcome.skipped} with no bars at that granularity"
-           if outcome.skipped else "")
-    ]
-    lines += [f"  FAILED: {failure}" for failure in outcome.failures]
-    _emit(data, "\n".join(lines), args.json)
-    # Recorded HERE rather than in the cron, because a cron runs under MeshClaw's
-    # interpreter and cannot import this package at all -- `import py_ibkr` there
-    # is a ModuleNotFoundError, which is why the crons shell out in the first
-    # place. See jobs.py.
-    #
-    # Three statuses where the old ledger had one: `failed` when a window failed,
-    # `nothing` when the run was legitimately empty, `ok` when bars landed. That
-    # distinction is the whole point -- crons.json read `ok` for two days while
-    # this command wrote no bars at all.
-    record_run(
-        conn, "bars_live" if live else "bars_daily",
-        status=("failed" if outcome.failures
-                else "ok" if outcome.written else "nothing"),
-        detail=("; ".join(outcome.failures)[:400] if outcome.failures
-                else f"{outcome.written} bar(s), {outcome.skipped} empty"),
-        done=outcome.written, total=outcome.requested,
-    )
+        # Recorded HERE rather than in the cron, because a cron runs under
+        # MeshClaw's interpreter and cannot import this package at all --
+        # `import py_ibkr` there is a ModuleNotFoundError, which is why the crons
+        # shell out in the first place. See jobs.py.
+        #
+        # Three statuses where the old ledger had one: `failed` when a window
+        # failed, `nothing` when the run was legitimately empty, `ok` when bars
+        # landed. That distinction is the whole point -- crons.json read `ok` for
+        # two days while this command wrote no bars at all.
+        record_run(
+            conn, "bars_live" if live else "bars_daily",
+            status=("failed" if outcome.failures
+                    else "ok" if outcome.written else "nothing"),
+            detail=("; ".join(outcome.failures)[:400] if outcome.failures
+                    else f"{outcome.written} bar(s), {outcome.skipped} empty"),
+            done=outcome.written, total=outcome.requested,
+        )
     if outcome.failures:
         return EXIT_ERROR
     return EXIT_OK if outcome.written else EXIT_NO_DATA
@@ -802,15 +802,16 @@ def cmd_sync(args) -> int:
     # drifted: `new_trades` held the row LIST here and a COUNT in web.py -- one
     # name, two types, computed from the same table. Nothing broke only because
     # each consumer had met just one producer.
-    data = sync_journal(
-        conn=_open_db(args),
-        archive_dir=args.archive,
-        query_id=query_id,
-        assets=_asset_filter(args.assets),
-        from_date=args.from_date,
-        to_date=args.to_date,
-        force=args.force,
-    )
+    with open_journal(args.db) as conn:
+        data = sync_journal(
+            conn=conn,
+            archive_dir=args.archive,
+            query_id=query_id,
+            assets=_asset_filter(args.assets),
+            from_date=args.from_date,
+            to_date=args.to_date,
+            force=args.force,
+        )
     new_trade_rows = data["new_trade_rows"]
 
     lines = [f"sync {query_id}  {data['raw_bytes']:,} bytes -> {data['archive']}"]
