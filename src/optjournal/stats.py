@@ -945,12 +945,13 @@ def month_stats(
 
     episode_pnl = asset_category == _EPISODE_PNL_CATEGORY
     orders: set[str] = set()
-    #: Base total and the per-currency native ledger, accumulated together so
-    #: the figure can be gated once at the end. Local rather than accumulated
-    #: onto `stats` because a `Money` is frozen: an amount cannot be advanced
-    #: without its currency, which is the property that keeps the two in step.
-    fill_commission_base = 0.0
-    native: dict[str, float] = {}
+    #: Rows, not running totals, so this reads like the fourteen other figures in
+    #: this module rather than being the one place that still hand-rolls the
+    #: accumulate-then-gate block `Money.charged` exists to hold. The two are
+    #: exactly equivalent -- verified over every combination of present, zero and
+    #: absent amounts across one and two rows -- so this is one spelling instead
+    #: of two, not a change in any reported figure.
+    fill_commission: list[tuple[float | None, float | None, str | None]] = []
     fill_pnl: list[tuple[float | None, float | None, str | None]] = []
     for row in conn.execute(
         f"SELECT trade_date, trade_id, ib_order_id, fifo_pnl_realized_base,"
@@ -971,14 +972,11 @@ def month_stats(
             # that is also where the P&L it nets against is attributed.
             fill_pnl.append((row["fifo_pnl_realized_base"],
                              row["fifo_pnl_realized"], row["currency"]))
-            fill_commission_base += row["ib_commission_base"] or 0.0
-            if row["ib_commission"]:
-                native[row["currency"]] = (
-                    native.get(row["currency"], 0.0) + row["ib_commission"]
-                )
+            fill_commission.append((row["ib_commission_base"],
+                                    row["ib_commission"], row["currency"]))
     stats.orders = len(orders)
     if not episode_pnl:
-        stats.commissions = Money.gated(fill_commission_base, native)
+        stats.commissions = Money.charged(fill_commission)
         stats.net_pnl = Money.charged(fill_pnl)
 
     # Fees are account-level CashTransaction rows, never trade-linked -- verified
