@@ -286,6 +286,42 @@ MUTANTS: tuple[Mutant, ...] = (
                 "        ]",
         breaks="the Annual tab would follow a month control it does not display",
     ),
+    # The four gaps a reference-count survey missed: all four functions run on
+    # every `build_state`, so the payload suite exercised them without naming
+    # them, and only these four of their twelve documented rules were unguarded.
+    # See the README's "Counting test references is not measuring coverage".
+    Mutant(
+        key="fx-rate-guard",
+        module="stats.py",
+        find='        " WHERE fx_rate_to_base IS NOT NULL AND fx_rate_to_base > 0"',
+        replace='        " WHERE fx_rate_to_base IS NOT NULL"',
+        breaks="a stored rate of zero would reach 1.0/rate and raise on page load, "
+               "and a negative one would flip the sign of every restated total",
+    ),
+    Mutant(
+        key="fx-self-quote",
+        module="stats.py",
+        find="        if not code or code == base.upper() or code in quotes:",
+        replace="        if not code or code in quotes:",
+        breaks="the base currency would be offered as an alternative to itself, a "
+               "no-op entry in the toggle that restates nothing",
+    ),
+    Mutant(
+        key="cohort-avg-zero",
+        module="stats.py",
+        find='        "avg_pnl": None if c.avg_pnl is None else c.avg_pnl.payload(),',
+        replace='        "avg_pnl": (c.avg_pnl or Money(base=0.0)).payload(),',
+        breaks="an empty cohort would report its average outcome as break-even "
+               "rather than as absent",
+    ),
+    Mutant(
+        key="stats-avg-zero",
+        module="stats.py",
+        find='        "avg_win": None if stats.avg_win is None else stats.avg_win.payload(),',
+        replace='        "avg_win": (stats.avg_win or Money(base=0.0)).payload(),',
+        breaks="a period with no closed win would report an average win of zero, "
+               "reading as trades that closed flat rather than none closing",
+    ),
     Mutant(
         key="quarantine",
         module="stats.py",

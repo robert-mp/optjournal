@@ -432,8 +432,11 @@ how `_snapshot_leg` silently taking `abs()` of a short position was found. A
 defect caught by **fifteen** tests suggests fourteen are coupled to something they
 are not about.
 
-Measured over all 36 mutants, after the harness repair described below: **31
-caught, 5 uncaught**, median 1 test, maximum 20. The two newest guard the campaign
+Measured over 36 mutants, after the harness repair described below: **31
+caught, 5 uncaught**, median 1 test, maximum 20. Four more were added later for the
+`stats.py` gaps described at the end of this section, each verified lethal against
+`tests/test_stats.py` individually but not yet included in a full survey run, so
+they are outside the counts above. The two newest of the 36 guard the campaign
 unit — `roll-continues` (a roll counted as decided while a leg is still open) is
 caught by 2 tests, and `campaign-sum` (a campaign scored by its final contract
 rather than the sum of them) by 1, the demo case where a loser is rolled out and
@@ -491,6 +494,21 @@ if the tests that failed are about that rule; otherwise it marks a chokepoint.
 **Equivalent mutants are not findings.** Some changes have no observable effect,
 so "nothing caught it" says nothing about the suite. The tool reports; judging
 whether a defect is real is the reader's job.
+
+**Counting test references is not measuring coverage**, and this is the cheapest
+lesson here. An architecture review grepped `tests/` for each public name in
+`stats.py` and reported four functions at zero — `fx_quotes`, `available_years`,
+`cohort_data`, `stats_data` — concluding the module's interface was unguarded. The
+counts were accurate and the conclusion was wrong: all four run on every
+`build_state`, so the payload suite exercises them transitively and no name ever
+appears. Breaking twelve of their documented rules one at a time found **eight
+already caught** — the option-currency restriction, the rate inversion, the
+newest-snapshot preference, the year ordering, the category filter, `win_rate` in
+both views, the day list's realised figures. The four that were not are in
+`tests/test_stats.py`, and they are all the same shape: a `None` that means "no
+data" flattened into a zero that means "measured zero", plus the `> 0` rate filter
+standing in front of a division. That is the method the rest of this section
+describes, applied to a claim rather than to code.
 
 The zeroes keep paying for the tool. A later round added ten mutants, one per
 finding from a code audit, and **eight were caught by nothing** while 602 tests
