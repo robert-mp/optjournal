@@ -79,7 +79,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `logs.py` | the rotating application log, beside the journal. A leaf. Exists because macOS rotates NOTHING for a launchd agent's stdout: `newsyslog` only touches files listed in `/etc/newsyslog.conf`, so a supervised `serve` appends to one file forever. Two files answer two questions -- launchd's `serve.out.log` is "did the process start", this one is "what did the jobs do" |
 | `locks.py` | cross-process `flock`, because the cron and the server are two processes and a `threading.Lock` only serialises two browser tabs. A leaf |
 | `jobs.py` | the job registry, the runner, and the run ledger. The registry being CODE is the point: MeshClaw's registration was an unversioned side channel, and the consequence is measurable — four optjournal crons are registered and none is the calendar refresh, so 143 lines of tested policy have never run on a schedule. Jobs call functions, never the CLI, so a cause arrives as a typed exception instead of an integer. See `SCHEDULER_PLAN.md` |
-| `sync.py` | the ONE sync path — fetch, ingest, snapshot — called by `POST /api/sync`, `optjournal sync` and the `sync` job. Its own module because of the import graph, not for tidiness: it briefly lived in `web.py` and `jobs.py` reached it through a deferred import, which `tests/test_layering.py` correctly called a cycle. It raises rather than returning an error dict, because each caller needs a different shape for a cooldown (HTTP body, exit code, ledger status) and flattening them into a string is how a locked keychain became a bare exit 1 |
+| `sync.py` | the ONE sync path — fetch, ingest, snapshot — called by `POST /api/sync`, `optjournal sync` and the `sync` job. Its own module because of the import graph, not for tidiness: it briefly lived in `web.py` and `jobs.py` reached it through a deferred import, which `tests/test_layering.py` correctly called a cycle. It raises rather than returning an error dict, because each caller needs a different shape for a cooldown (HTTP body, exit code, ledger status) and flattening them into a string is how a locked keychain became a bare exit 1. Its success reply stays a **dict** on purpose — see [Why the sync reply is not a dataclass](#why-the-sync-reply-is-not-a-dataclass) |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
 | `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one. See [The Money model](#the-money-model) |
 | `notes.py` | IBKR trade note codes (`AFx`, `Ep`, `A`) and the one rule for reading them: whole-token matching, over either the stored `AFx;P` string or py_ibkr's parsed list. A leaf, because its two readers — `history.py` (database) and `analysis.py` (statement) — sit on opposite sides of the graph and cannot import each other |
@@ -108,6 +108,46 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `mutate.py` | mutation testing: known defects, and which tests notice each. Answers "what would a real bug cost" rather than "what is covered" — see [Measuring the suite](#measuring-the-suite) |
 | `demo.py` | deterministic synthetic statement; refuses to touch real data |
 | `sections.py`, `compat.py` | shims over py-ibkr's partial statement model |
+
+### Why the sync reply is not a dataclass
+
+An architecture review proposed replacing `sync_journal`'s 18-key return dict with
+a frozen `SyncResult`, for the win "a key mismatch becomes a type error". It was
+investigated and **rejected**, because in this project that sentence is not true.
+
+There is no type checker here — `pyproject.toml` runs ruff and pytest, and ruff
+does not resolve attributes. Measured directly: ruff passes a file that reads
+`r.new_tradez` off a dataclass just as happily as `d["new_tradez"]` off a dict. At
+runtime both raise, one `AttributeError` and one `KeyError`, so a *read* of a
+missing name already fails loudly either way.
+
+The drift the review cited would not have been caught either. The recorded defect
+is that `new_trades` held a COUNT in one producer and the row LIST in the other —
+"one name and two types". Python does not enforce annotations, so
+`SyncResult(new_trades=[{...}])` is accepted in silence and the page renders the
+list into its sentence, exactly as the dict did.
+
+Two things a dataclass *would* buy, and neither applies. It refuses an unknown
+attribute on WRITE (`TypeError` under `slots=True`) where a dict accepts a new key
+— but nothing assigns to this reply after it is returned. And it makes the field
+set visible in one place — which `sync.py`'s single `return` statement already
+does.
+
+What it would COST is real: the whole dict is the published shape of
+`optjournal sync --json` (`cli._emit` serialises it verbatim) and the body of
+`POST /api/sync` (`web._do_sync` returns it, and `page.html` reads `new_trades`,
+`new_cash` and `reused_archive` off it, with a `@typedef` block pinning them). So
+the review's companion suggestion — narrow to four fields and move the rest to the
+callers — would silently break both the CLI's machine output and the page's sync
+toast. The dict is not an internal convenience that grew; it is a wire format.
+
+**The real gap was on the other side, and it was found by measuring instead.**
+Renaming a key in the CONSUMER — `result["summry"]` in `jobs._sync` — passed the
+entire suite. The neighbouring test reads `_sync`'s SOURCE for the functions it
+must not call, which is right for a negative obligation and blind to a typo. So
+the fix was a test that runs the translation with a stubbed sync path (a real one
+spends an IBKR request, which is why it had never been executed under test), plus
+the first `jobs.py` mutant, `sync-empty-ok`.
 
 ### Modelled numbers
 

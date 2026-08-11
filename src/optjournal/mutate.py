@@ -322,6 +322,18 @@ MUTANTS: tuple[Mutant, ...] = (
         breaks="a period with no closed win would report an average win of zero, "
                "reading as trades that closed flat rather than none closing",
     ),
+    # The first `jobs.py` mutant, and the reason it exists: renaming a key on the
+    # CONSUMER side of the sync reply passed the whole suite. The neighbouring
+    # test reads `_sync`'s source for what it must not call, which cannot tell
+    # `result["summary"]` from `result["summry"]`.
+    Mutant(
+        key="sync-empty-ok",
+        module="jobs.py",
+        find='        "ok" if result["changed"] else "nothing",',
+        replace='        "ok",',
+        breaks="a sync that collected nothing would record `ok`, which is the "
+               "exact reading that let three crons report health for two days",
+    ),
     Mutant(
         key="quarantine",
         module="stats.py",

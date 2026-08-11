@@ -799,6 +799,53 @@ def test_resolving_interrupted_runs_is_safe_with_no_rows(conn, ctx):
     assert interrupted_runs(conn, archive_dir=ctx.archive_dir) == 0
 
 
+@pytest.mark.parametrize(("changed", "status"), [(True, "ok"), (False, "nothing")])
+def test_the_sync_job_reads_the_result_it_was_handed(conn, ctx, monkeypatch,
+                                                     changed, status):
+    """Every key `_sync` reads off `sync_journal`'s reply, exercised.
+
+    THE GAP THIS CLOSES was measured, not guessed: renaming any of `changed`,
+    `summary` or `new_trades` in the CONSUMER -- a plain typo -- passed the whole
+    suite. The neighbouring test reads `_sync`'s SOURCE for what it must not call,
+    which is the right shape for a negative obligation and blind to this: a
+    source-text assertion cannot tell `result["summary"]` from `result["summry"]`.
+
+    Running it costs nothing because the shared path is stubbed. That is the only
+    reason this can exist as an executed test rather than another source read --
+    a real sync spends an IBKR request against a lockout budget, which is why the
+    job's own translation had never been run under test.
+
+    Both branches, because `changed` decides `ok` versus `nothing` and that
+    distinction is the one this ledger exists for: an empty run is not a success,
+    and collapsing the two is what let three crons report health while collecting
+    nothing.
+    """
+    from optjournal import jobs as mod
+
+    reply = {
+        "changed": changed,
+        "summary": "3 new trade(s), 0 new cash row(s)",
+        "new_trades": 3,
+        # Present because the real reply carries them; unread here, and a
+        # dataclass would not change that -- see the README on why this stayed a
+        # dict.
+        "new_trade_rows": [{"symbol": "SPY"}],
+        "warnings": [],
+    }
+    monkeypatch.setattr(mod, "sync_journal", lambda **_: reply)
+
+    outcome = mod._sync(conn, ctx)
+    assert outcome.status == status, (
+        f"changed={changed} must record {status!r}: an empty sync is not a "
+        "success and a productive one is not silence"
+    )
+    assert outcome.detail == reply["summary"], (
+        "the ledger shows the shared path's own summary, so a reader sees the "
+        "same sentence the CLI and the page do"
+    )
+    assert (outcome.done, outcome.total) == (3, 3)
+
+
 def test_the_sync_job_calls_the_shared_path_rather_than_reimplementing_it(ctx):
     """THE NEGATIVE OBLIGATION from the plan, and it needs an assertion.
 
