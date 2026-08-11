@@ -35,13 +35,28 @@
 
   <!-- The installed console script, not `python -m`: the entry point is what
        pyproject declares and what a human runs, so supervising anything else
-       would supervise a different program. -->
+       would supervise a different program.
+
+       THE QUERY ID IS PASSED HERE, and its absence was an outage. `serve` holds
+       the scheduler, so a `serve` with no query id runs the `sync` job on every
+       due tick and records a failed run with "no Flex query id configured" in the
+       ledger, forever, while `optjournal sync` in a shell keeps working, because
+       the shell has `$OPTJOURNAL_QUERY_ID` and a launchd agent INHERITS NO SHELL
+       ENVIRONMENT. That asymmetry is the bug; stating the id on the command line
+       is the fix that cannot be undone by whichever terminal last exported what.
+       (`cmd_serve` also falls back to the variable now, for a hand-run serve.)
+
+       The id is an IDENTIFIER, not the credential: the Flex token lives in the OS
+       keyring (`flex.read_token`), which is why this is safe to track in the repo
+       and why `cron/optjournal_sync.py` has held the same value all along. -->
   <key>ProgramArguments</key>
   <array>
     <string>/Users/robrtmar/optjournal/.venv/bin/optjournal</string>
     <string>serve</string>
     <string>--port</string>
     <string>8765</string>
+    <string>--query-id</string>
+    <string>1591754</string>
   </array>
 
   <key>WorkingDirectory</key>

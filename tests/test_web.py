@@ -2200,6 +2200,54 @@ def test_an_explicit_path_wins_over_demo(monkeypatch, tmp_path):
     assert kw["archive_dir"] == DEFAULT_DEMO_DIR, "only --db was overridden"
 
 
+def test_serve_falls_back_to_the_query_id_in_the_environment(monkeypatch):
+    """THE BUG: `sync` read this variable and `serve` did not, so the SCHEDULER starved.
+
+    `serve` holds the 60-second reconciler, which means it is the process that runs
+    the `sync` job -- and `jobs._sync` returns `failed -- no Flex query id
+    configured` when the context has none. So a `serve` started without the flag
+    filled the ledger with that line on every due tick while `optjournal sync` in a
+    shell worked perfectly, because only the CLI path consulted the environment.
+    One config value, two readers, one of which had been given the schedule.
+    """
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", "1591754")
+    assert _serve_kwargs(monkeypatch, ["serve"])["query_id"] == "1591754"
+
+
+def test_an_explicit_query_id_beats_the_environment(monkeypatch):
+    """The flag is the more specific statement, so it wins -- same rule as --db."""
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", "from-env")
+    kw = _serve_kwargs(monkeypatch, ["serve", "--query-id", "explicit"])
+    assert kw["query_id"] == "explicit"
+
+
+def test_no_query_id_anywhere_stays_none_rather_than_empty(monkeypatch):
+    """`serve` treats the id as optional, and `bool("")` and `None` must not differ.
+
+    An empty variable is a plausible way to "unset" one in a shell, and `web.serve`
+    branches on truthiness while `jobs.Context.query_id` is typed `str | None`. An
+    empty STRING there would type-check and read as configured to neither.
+    """
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", "")
+    assert _serve_kwargs(monkeypatch, ["serve"])["query_id"] is None
+
+
+def test_the_demo_ignores_a_query_id_in_the_environment(monkeypatch):
+    """An exported variable must not turn a demo serve into a real fetch.
+
+    `--demo --query-id` is REFUSED (below), because the flag is a deliberate
+    statement worth objecting to. The variable is ambient -- it may have been
+    exported for the cron in the same shell -- so honouring it here would silently
+    arm the Sync button and the scheduler against the synthetic database, which is
+    the outcome that refusal exists to prevent. Ignored, not refused: the developer
+    asked for the demo and should get it.
+    """
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", "1591754")
+    kw = _serve_kwargs(monkeypatch, ["serve", "--demo"])
+    assert kw["query_id"] is None, "the demo would sync real trades into synthetic tables"
+    assert kw["db_path"] == DEFAULT_DEMO_DB, "and it is still the demo being served"
+
+
 def test_demo_refuses_a_query_id(monkeypatch, capsys):
     """A sync would put real trades in the synthetic database.
 

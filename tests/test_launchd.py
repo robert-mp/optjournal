@@ -107,6 +107,34 @@ def test_a_deliberate_stop_is_not_respawned_into(agent):
     assert keep["SuccessfulExit"] is False
 
 
+def test_the_agent_passes_a_query_id_so_the_sync_job_can_run(agent):
+    """A LAUNCHD AGENT INHERITS NO SHELL ENVIRONMENT, and that is the whole bug.
+
+    This plist deliberately carries no schedule -- the schedule is `jobs.JOBS` --
+    which makes the supervised `serve` the process that runs `sync`. But `serve`
+    was launched here with no query id, and launchd does not see the
+    `$OPTJOURNAL_QUERY_ID` a developer exports in a terminal. So the ledger
+    recorded `failed -- no Flex query id configured` on every due tick while
+    `optjournal sync` run by hand worked, and the journal quietly stopped
+    collecting: exactly the "looks fine, does nothing" failure the rest of this
+    file exists to catch.
+
+    Asserted on the ARGUMENTS rather than on `EnvironmentVariables`, because the
+    flag is the channel that does not depend on which shell last exported what.
+    `cmd_serve` reads the variable as a fallback for a hand-run serve; the agent
+    should not need it.
+    """
+    args = agent["ProgramArguments"]
+    assert "serve" in args, "this plist no longer supervises `serve`"
+    assert "--query-id" in args, (
+        "the supervised `serve` gets no query id, so the scheduled `sync` job "
+        "fails on every tick -- see jobs._sync. launchd inherits no shell, so "
+        "exporting $OPTJOURNAL_QUERY_ID does not reach it."
+    )
+    value = args[args.index("--query-id") + 1]
+    assert value.isdigit(), f"--query-id is {value!r}, not a Flex query id"
+
+
 def test_the_agent_runs_python_unbuffered(agent):
     """MEASURED, and it is the difference between a log and an empty file.
 

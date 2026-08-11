@@ -1261,7 +1261,16 @@ def serve(
         print(f"optjournal UI on http://{host}:{actual}")
         print("  loopback only, no authentication -- do not expose this port")
         if not query_id:
-            print("  no --query-id given, so Sync now is disabled")
+            # NAMES THE SCHEDULER, not just the button. The button being disabled is
+            # visible in the page; the sync JOB failing on every due tick is only
+            # visible to someone who opens the ledger, and that is the shape this
+            # went wrong in -- a supervised serve logged `failed -- no Flex query id
+            # configured` for as long as it ran while `optjournal sync` in a shell
+            # worked, because only the CLI read $OPTJOURNAL_QUERY_ID.
+            print("  no query id (--query-id or $OPTJOURNAL_QUERY_ID):"
+                  " Sync now is disabled")
+            if scheduler:
+                print("  and the scheduled sync job will fail on every tick")
         if clock is None:
             print("  scheduler OFF (--no-scheduler): nothing runs unless you press it")
         else:

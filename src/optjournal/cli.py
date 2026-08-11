@@ -736,6 +736,22 @@ def cmd_serve(args) -> int:
             " trades into the synthetic database. Serve the demo without a query"
             " id, or serve the real journal without --demo."
         )
+    # THE SAME FALLBACK `sync` HAS, and its absence here was a real outage rather
+    # than an inconsistency: `serve` now HOLDS THE SCHEDULER, so a query id that
+    # only the CLI could see meant the supervised process ran `jobs._sync` with
+    # `query_id=None` on every due tick, and the ledger filled with `failed -- no
+    # Flex query id configured` while `optjournal sync` in a shell worked fine.
+    # The query id is an identifier, not the secret -- the TOKEN is in the OS
+    # keyring (`flex.read_token`) and `cron/optjournal_sync.py:104` has carried the
+    # id in the repo all along. So the environment is a channel `serve` can share
+    # with the cron rather than a place to hide something.
+    #
+    # READ AFTER the `--demo` check, deliberately: the guard above is about an
+    # EXPLICIT flag, so a developer who exports the variable and then serves the
+    # demo gets the demo, not a refusal and not a real fetch into synthetic tables.
+    query_id = args.query_id
+    if not query_id and not args.demo:
+        query_id = os.environ.get("OPTJOURNAL_QUERY_ID") or None
     # A ROTATING LOG, FOR SERVE ONLY. This is the long-lived process -- the one
     # whose reconciler logs every tick -- and macOS rotates nothing for a launchd
     # agent's stdout, so a supervised `serve` would otherwise append to one file
@@ -747,7 +763,7 @@ def cmd_serve(args) -> int:
         serve(
             db_path=db,
             archive_dir=archive_dir,
-            query_id=args.query_id,
+            query_id=query_id,
             assets=assets,
             host=args.host,
             port=args.port,
@@ -978,7 +994,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("serve", parents=[common],
                        help="local web UI (loopback only, no auth)")
     p.add_argument("--query-id", dest="query_id",
-                   help="Flex Query ID; without it the Sync button is disabled")
+                   help="Flex Query ID; falls back to $OPTJOURNAL_QUERY_ID. "
+                        "Without either, the Sync button is disabled and the "
+                        "scheduled sync job fails")
     p.add_argument("--port", type=int, default=8765, help="default: 8765")
     p.add_argument("--host", default="127.0.0.1",
                    help="loopback addresses only (default: 127.0.0.1)")
