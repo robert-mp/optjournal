@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from optjournal.analysis import CostReport
-from optjournal.bars import MARKET_TZ, audit_perishable
+from optjournal.bars import audit_perishable
+from optjournal.clock import MARKET_TZ
 from optjournal.costs import (
     AUTOFX_MARKUP_BPS,
     AUTOFX_MARKUP_MEASURED_BPS,

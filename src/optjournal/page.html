@@ -726,7 +726,7 @@ import {
  * @property {Array} strikes -- Strike rows, one per distinct contract
  * @property {string|null} opened_at -- null for a snapshot-only contract
  * @property {string|null} closed_at -- null while the position is open
- * @property {number|null} opened_ts -- entry as an epoch, US Eastern (bars.epoch_et)
+ * @property {number|null} opened_ts -- entry as an epoch, US Eastern (clock.epoch_et)
  * @property {number|null} closed_ts -- exit as an epoch; null while open
  * @property {Array} fills -- epochs of each fill, for the dots on the line
  * @property {Array} marks -- [ts, pnl, delta] modelled mark-to-market per bar,

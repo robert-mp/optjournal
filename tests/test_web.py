@@ -69,7 +69,7 @@ def state(populated) -> dict:
     """
     from datetime import UTC, datetime, timedelta
 
-    from optjournal.bars import MARKET_TZ
+    from optjournal.clock import MARKET_TZ
     from optjournal.db import connect
     from optjournal.events import parse_events, store_events
 

@@ -156,7 +156,7 @@ class MarketEvent:
 
     event_id: str
     #: Epoch seconds UTC. The feed sends an offset; the instant is what is stored,
-    #: and the page renders it in `bars.MARKET_TZ` like every other stamp here.
+    #: and the page renders it in `clock.MARKET_TZ` like every other stamp here.
     starts_at: int
     country: str
     title: str

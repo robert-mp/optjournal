@@ -44,8 +44,8 @@ MAY_MODEL = {"bars", "demo"}
 #: the rule it needs, reading IBKR note codes as whole tokens, is shared with
 #: `history` on the far side of the graph. `IMPORTS_LEAVES_ONLY` states the
 #: weaker property that still holds: it depends on nothing that reads a database.
-LEAVES = {"money", "notes", "blackscholes", "config", "marketdata", "compat",
-          "fills", "events", "vol", "locks", "logs"}
+LEAVES = {"money", "notes", "blackscholes", "clock", "config", "marketdata",
+          "compat", "fills", "events", "vol", "locks", "logs"}
 
 #: Modules that may import leaves and nothing else. Weaker than `LEAVES` and
 #: load-bearing for the same reason: `analysis.py` is pure statement mathematics,

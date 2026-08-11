@@ -26,11 +26,11 @@ from optjournal import __version__, browser, logs
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import newest_statement, prune_archive
 from optjournal.bars import (
-    MARKET_TZ,
     audit_perishable,
     backfill_bars,
     bars_manifest,
 )
+from optjournal.clock import MARKET_TZ
 from optjournal.compat import unknown_codes
 from optjournal.config import (
     DEFAULT_ARCHIVE,

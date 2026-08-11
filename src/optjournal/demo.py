@@ -33,14 +33,11 @@ from decimal import Decimal
 from pathlib import Path
 
 from optjournal.bars import (
-    MARKET_TZ,
     close_series,
-    epoch_et,
-    et_day,
-    expiry_epoch,
     upsert_bars,
 )
 from optjournal.blackscholes import bs_price, implied_vol
+from optjournal.clock import MARKET_TZ, epoch_et, et_day, expiry_epoch
 from optjournal.marketdata import Bar
 
 #: Marks the output unmistakably. `statements` and the UI show the query name.
@@ -891,7 +888,7 @@ def write_demo_bars(conn) -> int:
 
         # A snapshot's report date names the session it describes, so its 16:00
         # ET close is the instant the mark was taken -- the same parse an expiry
-        # needs, which is why both go through `bars.expiry_epoch`.
+        # needs, which is why both go through `clock.expiry_epoch`.
         anchor_at = epoch_et(contract["anchor_at"]) or expiry_epoch(
             contract["report_date"]
         )
@@ -934,7 +931,7 @@ def write_demo_bars(conn) -> int:
                     continue
                 close = round(max(0.01, price), 2)
             # Stamped at midnight ET, which is where the price source puts an
-            # option's daily bar -- and the reason bars.et_day exists. Emitting
+            # option's daily bar -- and the reason clock.et_day exists. Emitting
             # them at the session open instead would make the demo the one place
             # the two daily series join on a raw timestamp, so the join bug that
             # silently emptied the band would be untestable here.

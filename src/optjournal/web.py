@@ -60,11 +60,11 @@ from optjournal.archive import newest_statement
 from optjournal.bars import (
     ReplayLeg,
     delta_around,
-    epoch_et,
     replay_bars,
     replay_model,
 )
 from optjournal.campaigns import position_count
+from optjournal.clock import epoch_et
 from optjournal.costs import CostScope, build_costs
 from optjournal.db import connect, open_journal
 from optjournal.events import (
@@ -494,7 +494,7 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "opened_at": opened,
             "closed_at": closed,
             # Epochs, so the page never parses a timezone. Every journal stamp is
-            # US Eastern (bars.epoch_et carries the evidence) and the chart
+            # US Eastern (clock.epoch_et carries the evidence) and the chart
             # labels the same zone, so fills and bars share one timeline.
             "opened_ts": epoch_et(opened),
             "closed_ts": epoch_et(closed),

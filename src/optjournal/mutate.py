@@ -179,9 +179,10 @@ MUTANTS: tuple[Mutant, ...] = (
     ),
     Mutant(
         key="et-zone",
-        module="bars.py",
+        module="clock.py",
         find="        return int(naive.replace(tzinfo=MARKET_TZ).timestamp())",
-        replace="        return int(naive.replace(tzinfo=UTC).timestamp())",
+        replace='        return int(naive.replace('
+                'tzinfo=ZoneInfo("UTC")).timestamp())',
         breaks="every fill marker would sit four or five hours off its bar",
     ),
     Mutant(

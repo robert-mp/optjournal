@@ -690,7 +690,7 @@ def interrupted_runs(conn: sqlite3.Connection, *, archive_dir: Path) -> int:
 #: 09:30-16:00 is the cash session; the poll runs from the first completed hourly
 #: bar (10:00) to one past the close (16:05 in the cron it replaces), so the window
 #: is expressed as hours-past-the-open rather than as a second set of clock times
-#: that could disagree with `bars.MARKET_TZ`.
+#: that could disagree with `clock.MARKET_TZ`.
 SESSION_OPEN_H = 9
 SESSION_OPEN_M = 30
 SESSION_CLOSE_H = 16

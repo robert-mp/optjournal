@@ -327,7 +327,7 @@ CREATE TABLE IF NOT EXISTS market_events (
   source       TEXT    NOT NULL,
   event_id     TEXT    NOT NULL,
   -- Epoch seconds UTC. The feed sends ISO with an offset; storing the instant
-  -- keeps one timeline, and the page renders it in bars.MARKET_TZ like every
+  -- keeps one timeline, and the page renders it in clock.MARKET_TZ like every
   -- other stamp in this journal.
   starts_at    INTEGER NOT NULL,
   country      TEXT    NOT NULL,

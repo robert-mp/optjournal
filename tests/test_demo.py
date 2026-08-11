@@ -994,8 +994,9 @@ def test_synthetic_bars_reprice_the_statements_own_anchor(conn):
     plausible vol instead would mark positions at values contradicting the
     realised P&L printed beside them.
     """
-    from optjournal.bars import close_series, epoch_et, et_day
+    from optjournal.bars import close_series
     from optjournal.blackscholes import implied_vol
+    from optjournal.clock import epoch_et, et_day
     from optjournal.demo import _UNDERLYING_CONID, write_demo_bars
 
     _with_underlying(conn, "SPY", [(n, 690.0 - n) for n in range(40)])
@@ -1059,7 +1060,8 @@ def test_synthetic_bars_are_stamped_where_the_source_stamps_them(conn):
     """
     from datetime import datetime
 
-    from optjournal.bars import MARKET_TZ, close_series
+    from optjournal.bars import close_series
+    from optjournal.clock import MARKET_TZ
     from optjournal.demo import write_demo_bars
 
     _with_underlying(conn, "SPY", [(n, 690.0 - n) for n in range(40)])
