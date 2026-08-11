@@ -20,6 +20,7 @@ back to the behaviour it exercises.
 from __future__ import annotations
 
 import re
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -81,21 +82,41 @@ def conn(tmp_path) -> sqlite3.Connection:
     return connect_migrated(tmp_path / "journal.db")
 
 
+@pytest.fixture(scope="session")
+def _populated_master(tmp_path_factory) -> Path:
+    """The ingest, done ONCE per session. Never handed to a test.
+
+    Private, and `populated_db` copies it, because the alternative -- handing this
+    file to every test -- would make the suite order-dependent: the watchlist
+    endpoint tests write rows, and a shared file would carry them into whatever
+    ran next. A copy per test keeps the isolation the function scope gave for
+    free while paying for the ingest once.
+    """
+    if not STATEMENTS:
+        pytest.skip("needs an archived statement")
+    db = tmp_path_factory.mktemp("master") / "journal.db"
+    c = connect_migrated(db)
+    for path in STATEMENTS:
+        ingest_file(c, path, assets=ASSET_FILTER_ALL)
+    c.close()
+    return db
+
+
 @pytest.fixture
-def populated_db(tmp_path) -> Path:
+def populated_db(tmp_path, _populated_master) -> Path:
     """A database with every archived statement ingested, as the CLI leaves it.
 
     Returns the PATH, not a connection: the web layer opens its own connection
     per request (sqlite3 handles cannot cross threads), so a test that handed it
     a live handle would be testing something the server never does.
+
+    A COPY of a session-scoped master, so each test still gets a private file it
+    may write to. Ingesting all statements per test rebuilt an identical database
+    66 times, which measured 33s of an 85s suite -- and the suite runs twice per
+    mutant, so it was the single biggest cost in the mutation survey.
     """
-    if not STATEMENTS:
-        pytest.skip("needs an archived statement")
     db = tmp_path / "journal.db"
-    c = connect_migrated(db)
-    for path in STATEMENTS:
-        ingest_file(c, path, assets=ASSET_FILTER_ALL)
-    c.close()
+    shutil.copy(_populated_master, db)
     return db
 
 

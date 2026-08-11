@@ -539,7 +539,7 @@ _SELF_REFERENTIAL = frozenset({
 
 
 #: Seconds a single suite run may take before the mutant is called out as hung.
-#: The clean suite is ~25s, so this is 20x headroom -- generous on purpose, since
+#: The clean suite is ~52s, so this is ~10x headroom -- generous on purpose, since
 #: a slow machine reporting "hung" would be worse than waiting.
 _SUITE_TIMEOUT_S = 500
 

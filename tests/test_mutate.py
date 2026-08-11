@@ -121,7 +121,7 @@ def test_the_timeout_is_generous_against_the_real_suite():
     """A slow machine reporting "hung" would be worse than waiting.
 
     Pinned so that someone shortening this has to consider the clean suite's own
-    runtime, which is ~25s.
+    runtime, which is ~52s.
     """
     assert _SUITE_TIMEOUT_S >= 300
 
