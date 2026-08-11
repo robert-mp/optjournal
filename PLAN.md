@@ -165,7 +165,7 @@ count -- see "the method" below, which mattered more than the results.
 | `marketdata._on_grid` keeps the off-grid live stub | 2 |
 | `bars.epoch_et` reads journal stamps as UTC, not ET | 2 |
 | `bars.expiry_epoch` accepts only one of the two stored formats | 3 |
-| `bars.replay_model` stops sharing the vol solve | 1 |
+| `replay.replay_model` stops sharing the vol solve | 1 |
 | `ingest._commission_base` always converts, ignoring the currency | 1 |
 | `render._charged` reads base where it means native | 2 |
 | `web._snapshot_leg` takes abs() of the seeded quantity | **0** |
@@ -719,7 +719,7 @@ high" row in the mockup. So the feature is buildable with `urllib` and no new
 dependency, the same way `marketdata.fetch_bars` already calls Yahoo.
 
 **True implied vol is NOT reachable for a symbol you do not hold.** This is the
-finding that reshapes the watchlist. `bars._vol_series` solves IV from *the
+finding that reshapes the watchlist. `replay._vol_series` solves IV from *the
 option's own daily closes*, so it only exists for contracts already in the
 journal — measured: TSLA 270617C700 has 461 bars, the traded GOOG/META legs have
 14-15, and a symbol you merely watch has none. Yahoo's options endpoint now

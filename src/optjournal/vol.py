@@ -7,7 +7,7 @@ WHY REALISED AND NOT IMPLIED. Implied vol is what the market CHARGES for what a
 stock might do; realised is what the stock DID. An options seller reads them
 differently, and the two are not substitutes.
 
-True IV is not reachable for a symbol this journal does not hold. `bars._vol_series`
+True IV is not reachable for a symbol this journal does not hold. `replay._vol_series`
 solves IV from an OPTION's own daily closes, so it exists only for contracts
 already traded -- measured on the real journal: 461 bars for the held LEAP, 14-15
 for the traded legs, and none at all for a symbol merely watched. Yahoo's option

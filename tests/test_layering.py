@@ -31,10 +31,17 @@ from conftest import ROOT
 
 PACKAGE = ROOT / "src" / "optjournal"
 
-#: Modules that may import `blackscholes`. `bars` owns the modelled series the
-#: replay panel draws; `demo` prices its synthetic contracts, which exist only
-#: in a database that refuses to hold a real statement.
-MAY_MODEL = {"bars", "demo"}
+#: Modules that may import `blackscholes`. `replay` IS the modelled layer -- the
+#: band, the marks and the effective delta the panel captions as modelled -- and
+#: `demo` prices its synthetic contracts, which exist only in a database that
+#: refuses to hold a real statement.
+#:
+#: `bars` was here while it held both halves, and dropping it is the point of the
+#: split rather than a side effect: this set is module-granular, so it could not
+#: distinguish "the replay layer models" from "the module that also owns the
+#: manifest and the upsert models". Nothing about a bar window needs a price
+#: model, and now nothing in `bars.py` can reach one.
+MAY_MODEL = {"replay", "demo"}
 
 #: Modules that must import nothing from the package. Each is a value type or
 #: pure arithmetic that any layer may hold without acquiring a direction.

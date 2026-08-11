@@ -88,7 +88,8 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `vol.py` | realised volatility from closes, and the move it implies. A leaf, and deliberately NOT `blackscholes` — see [Modelled numbers](#modelled-numbers) |
 | `events.py` | economic calendar: fetch, parse and store this week's releases. A leaf. One feed, no Protocol — see [Adding a calendar feed](#a-new-calendar-feed) |
 | `clock.py` | the market zone and the four conversions stated against it: `MARKET_TZ`, `epoch_et`, `expiry_epoch`, `et_day`. A leaf. Which zone the journal's stamps are in is a property of the market, settled from real fills in three time zones (see `epoch_et`), and four modules need it at different depths — so it lives where every layer can hold it rather than inside the module that happened to discover it |
-| `bars.py` | the journal-shaped half of price bars — which contract over which window (from episodes), the idempotent write, the series a chart reads, and the expected-move band. Reads the clock from `clock.py`; it is still the heaviest consumer of it, no longer its address |
+| `bars.py` | the journal-shaped half of price bars — which contract over which window (from episodes), the idempotent write, and the series a chart reads. Storage only: it imports no price model, which is what `tests/test_layering.py` now enforces by naming `replay.py` rather than this module in the pricing allowlist |
+| `replay.py` | the MODELLED layer, and the only module that prices anything: implied vol solved from each contract's own closes, the expected-move band, the mark-to-market series and the effective delta. One solve shared by the band and the marks, so they cannot disagree. Holds `bars.close_series` — pricing needs the closes storage keeps, and that direction is one-way — see [Modelled numbers](#modelled-numbers) |
 | `blackscholes.py` | option pricing and the implied vol backed out of a market price. A leaf: pure float maths, `math.erf` for the normal CDF, so no numpy or scipy |
 | `analysis.py` | cost/friction report from the raw statement (whole account); pure statement mathematics — holds leaves (`notes.py`) and nothing that reads a database |
 | `costs.py` | the same costs read from SQLite instead: the account's whole life, narrowed to any set of asset categories, with measured cost kept structurally apart from the estimated AutoFX markup. Reconciled against `analysis.py` statement by statement — see `tests/test_costs.py` |
@@ -138,13 +139,22 @@ mistaken for "specific-lot handled", and a second test asserts the lot fields ar
 empty — the day one arrives, the suite says the assumption changed. PLAN.md task 9
 has the design for the fallback a broker that reports nothing would need.
 
-Its output reaches the replay panel and nowhere else, through `bars.py`: the
+Its output reaches the replay panel and nowhere else, through `replay.py`: the
 expected-move band, the per-bar P&L on the scorecard, and the effective-delta
 series — each labelled as modelled, on a panel whose caption says so. `stats.py`,
 `analysis.py` and `serialize.py` never import it, so no headline number, no
 calendar day and no annual row can be traced back to a model. The journal's
 credibility rests on that separation: "nothing counts until the position is
 flat" is worth little if a modelled figure can reach the same card.
+
+**The allowlist names a module that exists for pricing.** This layer lived in
+`bars.py` while that module owned both the modelled series and the manifest, the
+upsert and the audit — so `tests/test_layering.py` had to permit pricing in a
+module most of which has no business with it. Nothing about a bar window needs
+Black-Scholes, and now nothing in `bars.py` can reach it: the allowlist is
+`{replay, demo}`, and `replay.py`'s whole purpose is the modelled numbers. The
+dependency runs one way, `replay.py` → `bars.close_series`, because a vol solve
+needs the closes storage keeps.
 
 The vol it solves against is the contract's own — its daily closes, plus **your
 own fills**, which are option prices the market really charged. Fills matter

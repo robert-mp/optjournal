@@ -57,12 +57,7 @@ from typing import Any
 from optjournal import __version__
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
-from optjournal.bars import (
-    ReplayLeg,
-    delta_around,
-    replay_bars,
-    replay_model,
-)
+from optjournal.bars import replay_bars
 from optjournal.campaigns import position_count
 from optjournal.clock import epoch_et
 from optjournal.costs import CostScope, build_costs
@@ -95,6 +90,7 @@ from optjournal.jobs import (
     Context as JobContext,
 )
 from optjournal.marketdata import BarFetchError, fetch_quote
+from optjournal.replay import ReplayLeg, delta_around, replay_model
 from optjournal.serialize import (
     audit_data,
     broker_costs_data,
@@ -479,7 +475,7 @@ def _attach_replays(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
         # legs, or a segment could be drawn for a position the P&L series was not
         # walking. Same reason `_snapshot_leg` is one constructor.
         replay_legs = _replay_legs(legs)
-        # One vol solve behind both, via bars.replay_model. Solving per consumer
+        # One vol solve behind both, via replay.replay_model. Solving per consumer
         # meant 20 solves for 10 replays and 60% of build_state inside them.
         band, marks = replay_model(
             conn, replay_legs, bars.points, underlying_conid=bars.conid,

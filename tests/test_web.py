@@ -1697,7 +1697,7 @@ def test_a_closed_contract_takes_its_side_from_the_OPENING_fill():
     readings apart -- and that is why the existing snapshot test above, whose leg
     has no fills at all, does not cover this.
     """
-    from optjournal.bars import ReplayLeg
+    from optjournal.replay import ReplayLeg
     from optjournal.web import _strikes_of
 
     sold_to_open = ReplayLeg(
@@ -1725,7 +1725,7 @@ def test_the_segment_ends_where_the_position_goes_flat_not_at_the_last_fill():
     edge) rather than the timestamp of that second fill. Reading the last fill
     instead would retire a live strike from the chart.
     """
-    from optjournal.bars import ReplayLeg
+    from optjournal.replay import ReplayLeg
     from optjournal.web import _strikes_of
 
     partly_closed = ReplayLeg(
