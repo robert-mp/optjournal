@@ -473,10 +473,12 @@ defect caught by **fifteen** tests suggests fourteen are coupled to something th
 are not about.
 
 Measured over 36 mutants, after the harness repair described below: **31
-caught, 5 uncaught**, median 1 test, maximum 20. Four more were added later for the
-`stats.py` gaps described at the end of this section, each verified lethal against
-`tests/test_stats.py` individually but not yet included in a full survey run, so
-they are outside the counts above. The two newest of the 36 guard the campaign
+caught, 5 uncaught**, median 1 test, maximum 20. Five more were added later and sit
+outside those counts: four for the `stats.py` gaps described at the end of this
+section, and `sync-empty-ok` for the sync job's own reading of the reply. Each was
+verified lethal against its own test file individually, but none has been through a
+full survey run, so folding them into the totals above would report a measurement
+nobody took. The registry holds 41. The two newest of the original 36 guard the campaign
 unit — `roll-continues` (a roll counted as decided while a leg is still open) is
 caught by 2 tests, and `campaign-sum` (a campaign scored by its final contract
 rather than the sum of them) by 1, the demo case where a loser is rolled out and
