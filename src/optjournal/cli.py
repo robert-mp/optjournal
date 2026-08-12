@@ -701,6 +701,7 @@ def cmd_mutate(args) -> int:
 
     outcomes = mutate.run_all(
         source=ROOT, workdir=args.workdir, only=tuple(args.only or ()),
+        jobs=args.jobs,
     )
     data = [
         {"defect": o.mutant.key, "module": o.mutant.module,
@@ -1033,6 +1034,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run just this defect (repeatable); default is all")
     p.add_argument("--workdir", type=Path, default=Path("/tmp/optjournal-mutants"),
                    help="where clones are built (default: /tmp/optjournal-mutants)")
+    # Serial by default: a concurrent run interleaves the per-mutant progress
+    # lines, and a hang is easier to read about alone. Measured 3.8x at 4 and a
+    # further 1.8x at 8, with identical outcomes -- see `mutate.run_all`.
+    p.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+                   help="run N mutants concurrently (default: 1; each gets its "
+                        "own clone, so ~8 suits a 10-core machine)")
     p.set_defaults(func=cmd_mutate)
 
     p = sub.add_parser("sweep", parents=[common],

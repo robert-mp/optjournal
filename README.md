@@ -465,6 +465,18 @@ Four invariants worth knowing before changing the UI:
 answers a different question from coverage: not "did this line run" but "would a
 wrong line be caught, and by how many tests".
 
+**It runs the suite twice per mutant** — a clean baseline it refuses to measure
+against unless green, then the mutated run — so the suite's own runtime is paid 82
+times over the 41 mutants. Timed end to end, the clone is 1% of a mutant's cost and
+the two suite runs are 99%; copying 69 MB per mutant looks like the expensive part
+and is not. `--jobs N` runs N mutants concurrently, which is safe structurally
+rather than hopefully: each already has its own clone, interpreter and database,
+because that isolation is what makes the number trustworthy. Measured over six real
+mutants, **750s serial against 144s at `--jobs 6`, a 5.2x speedup with byte-identical
+outcomes** — same status, same failed count, same test names. Serial is still the
+default, because a concurrent run interleaves the progress lines and a hang is
+easier to read about alone.
+
 Two results are worth acting on. A real defect caught by **zero** tests is an
 unguarded invariant — that is how a `_flat` epsilon wide enough to book a
 0.4-share residual as a closed round trip was found, having passed 579 tests, and

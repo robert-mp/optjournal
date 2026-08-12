@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import signal
 import subprocess
+import time
+from pathlib import Path
+
+import pytest
 
 from optjournal import mutate
 from optjournal.mutate import (
@@ -136,6 +140,85 @@ def test_every_mutant_has_a_plain_english_consequence():
 def test_mutant_keys_are_unique():
     keys = [m.key for m in MUTANTS]
     assert len(keys) == len(set(keys)), "a duplicate key overwrites a result"
+
+
+def _counting_run_all(monkeypatch, jobs):
+    """`run_all` with `run_mutant` stubbed, recording concurrency and order.
+
+    The real thing spends ~106s per mutant in two pytest runs; what needs
+    asserting is that `jobs` fans out and that the report still reads in
+    registry order, neither of which involves pytest.
+    """
+    import threading
+
+    live, peak, seen = 0, 0, []
+    guard = threading.Lock()
+
+    def _fake(mutant, *, source, workdir):
+        nonlocal live, peak
+        with guard:
+            live += 1
+            peak = max(peak, live)
+        # Long enough that a serial run cannot fake a peak above one.
+        time.sleep(0.05)
+        with guard:
+            live -= 1
+            seen.append(mutant.key)
+        return MutationOutcome(mutant, "measured", failed=1)
+
+    monkeypatch.setattr(mutate, "run_mutant", _fake)
+    outcomes = mutate.run_all(
+        source=Path("/nonexistent"), workdir=Path("/tmp"), jobs=jobs,
+    )
+    return outcomes, peak, seen
+
+
+def test_jobs_runs_mutants_concurrently_and_serial_stays_the_default(monkeypatch):
+    """`--jobs N` must actually overlap, and 1 must not.
+
+    Safe to parallelise for a structural reason rather than a hopeful one: each
+    mutant already gets its own clone, interpreter and database, because that
+    isolation is what makes the measurement trustworthy. This pins that the fan-out
+    exists at all -- a `jobs` argument silently ignored would look like a 4x
+    speedup that never happened, and the surveyed NUMBERS would still be right, so
+    nothing else would notice.
+    """
+    _, serial_peak, _ = _counting_run_all(monkeypatch, jobs=1)
+    assert serial_peak == 1, f"jobs=1 overlapped {serial_peak} mutants"
+
+    _, parallel_peak, _ = _counting_run_all(monkeypatch, jobs=4)
+    assert parallel_peak > 1, (
+        "jobs=4 ran one at a time, so the flag is decorative and a survey takes "
+        "as long as it always did"
+    )
+
+
+@pytest.mark.parametrize("jobs", [0, -1])
+def test_a_nonsense_job_count_runs_serially_rather_than_raising(monkeypatch, jobs):
+    """`--jobs 0` is a typo, not a request for zero work.
+
+    `ThreadPoolExecutor(max_workers=0)` raises, so the guard is `jobs <= 1` rather
+    than a truthiness check -- and a survey that crashes on a mistyped flag after
+    someone waited for it is worse than one that ignores the flag.
+    """
+    outcomes, peak, _ = _counting_run_all(monkeypatch, jobs=jobs)
+    assert len(outcomes) == len(MUTANTS) and peak == 1
+
+
+def test_a_parallel_report_still_reads_in_registry_order(monkeypatch):
+    """Order is the reader's index into `MUTANTS`, so completion order must not leak.
+
+    `ThreadPoolExecutor.map` preserves input order; `as_completed` would not. If a
+    report were sorted by whichever suite finished first, two runs of the same
+    registry would print different reports and neither would be wrong -- which
+    makes them impossible to diff.
+    """
+    outcomes, peak, seen = _counting_run_all(monkeypatch, jobs=4)
+    assert peak > 1, "not actually parallel, so this proves nothing"
+    assert [o.mutant.key for o in outcomes] == [m.key for m in MUTANTS]
+    # And completion order genuinely differed from registry order, or the
+    # assertion above would hold trivially.
+    assert seen != [m.key for m in MUTANTS] or len(MUTANTS) < 2
 
 
 def test_a_sigkill_return_code_is_what_the_runner_signals():
