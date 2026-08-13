@@ -41,6 +41,16 @@ raw
 journal.db
 journal.db-shm
 journal.db-wal
+# Timestamped copies of that database, which the three rules above do NOT match:
+# a pattern with no slash matches a NAME at any depth, so `journal.db` catches
+# `snapshots/journal.db` and misses `snapshots/journal-20260813T085234Z.db`. Each
+# snapshot is a whole journal -- one carried the account number, 264 equity
+# summaries and 179 trades -- and 7.5MB of them sat here untracked and unignored,
+# one `git add -A` from the mistake this file exists to prevent. Two rules for the
+# same reason raw/ has two: the directory, and the name, so a snapshot written
+# anywhere else is still covered.
+snapshots/
+journal-*.db
 # Cross-process lock files. Empty, per-database, and recreated on demand --
 # see locks.py. Committing one would be committing a runtime artifact.
 *.migrate.lock
@@ -58,6 +68,7 @@ build/
 # Assistant tooling: workflow scripts and session state, not project source.
 # Written here by the harness rather than by anyone working on the journal.
 .claude/
+.kiro/
 
 # Playwright MCP scratch (console logs from browser verification runs).
 .playwright-mcp/
