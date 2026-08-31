@@ -11,7 +11,6 @@ import argparse
 import dataclasses
 import json
 import logging
-import os
 import sqlite3
 import sys
 import tempfile
@@ -22,7 +21,7 @@ from typing import Any
 
 from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 
-from optjournal import __version__, browser, logs
+from optjournal import __version__, browser, logs, settings
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import newest_statement, prune_archive
 from optjournal.bars import (
@@ -51,7 +50,6 @@ from optjournal.events import (
     store_events,
     upcoming,
 )
-from optjournal import settings
 from optjournal.flex import (
     KEYRING_SERVICE,
     FetchCooldown,

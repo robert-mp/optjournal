@@ -54,7 +54,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from optjournal import __version__, replay, settings as prefs
+from optjournal import __version__, replay
+from optjournal import settings as prefs
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.campaigns import position_count

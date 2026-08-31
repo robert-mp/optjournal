@@ -29,9 +29,11 @@ from typing import Any
 from optjournal.analysis import CostReport
 from optjournal.bars import (
     audit_perishable,
-    close_series as bars_close_series,
     watch_closes,
     weekly_closes,
+)
+from optjournal.bars import (
+    close_series as bars_close_series,
 )
 from optjournal.clock import MARKET_TZ, et_day, parse_day
 from optjournal.costs import (
@@ -53,7 +55,6 @@ from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
 from optjournal.stats import first_activity
 from optjournal.trend import bucket, bxtrender_short
-from optjournal.zdte import plan as zdte_plan
 from optjournal.vol import (
     expected_move,
     rank,
@@ -61,6 +62,7 @@ from optjournal.vol import (
     realised_vol,
     realised_vol_series,
 )
+from optjournal.zdte import plan as zdte_plan
 
 Row = dict[str, Any]
 
