@@ -379,9 +379,13 @@ def cmd_ingest(args) -> int:
         if r.already_ingested:
             lines.append(f"  {r.source_file}: unchanged, skipped")
             continue
+        # Superseded rows are named only when there are any. Every statement
+        # archived before Trade Confirmations existed reports zero, and a counter
+        # that reads 0 on every line of every run teaches the eye to skip the line.
+        settled = (f" settled {r.trades_superseded}," if r.trades_superseded else "")
         lines.append(
             f"  {r.source_file}: trades +{r.trades_inserted}"
-            f" (dup {r.trades_skipped_existing},"
+            f" ({settled}dup {r.trades_skipped_existing},"
             f" filtered {r.trades_filtered_out})"
             f"  cash +{r.cash_inserted} (dup {r.cash_skipped_existing})"
             f"  positions {r.positions_written}"

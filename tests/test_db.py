@@ -13,7 +13,7 @@ import sqlite3
 import pytest
 from conftest import STATEMENTS, add_statement
 
-from optjournal.db import SCHEMA_VERSION, connect, migrate
+from optjournal.db import CONFIRM_SOURCE, SCHEMA_VERSION, connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 
 # `conn` comes from conftest. The explicit connect()/migrate() pairs further
@@ -1010,3 +1010,250 @@ def test_the_heartbeat_and_the_anchor_are_separable(tmp_path):
         "pruning history deleted the catch-up anchor"
     )
     assert anchor["heartbeat_at"] == 1786310100
+
+
+def _confirm_shaped(statement, target):
+    """The demo statement with its settled figures removed, as a same-session
+    Trade Confirmation reports the same fills.
+
+    An execution has a price and a quantity the instant it happens, but no FIFO
+    match and no final commission until the day is closed out, so those are the
+    two fields dropped.
+
+    Doctored from an Activity Statement rather than built from a real
+    TradeConfirms payload because the rank guard under test never reads the XML:
+    it compares `source_kind` on rows a source has already normalised. The
+    parser for IBKR's own confirm shape is a separate concern, and cannot be
+    written honestly without a sample of it to read.
+    """
+    import re
+
+    raw = statement.read_text()
+    assert 'fifoPnlRealized="907.4"' in raw, "the demo statement stopped settling"
+    # `ibCommission="` and not `ibCommission`, so ibCommissionCurrency survives.
+    raw = re.sub(r'fifoPnlRealized="[^"]*"', 'fifoPnlRealized=""', raw)
+    raw = re.sub(r'ibCommission="[^"]*"', 'ibCommission="0"', raw)
+    target.write_text(raw)
+    return target
+
+
+def _settlement(conn):
+    return conn.execute(
+        "SELECT COUNT(*) AS n,"
+        " SUM(fifo_pnl_realized IS NULL) AS unsettled,"
+        " SUM(ib_commission = 0) AS free,"
+        " COUNT(DISTINCT source_kind) AS kinds,"
+        " MIN(source_kind) AS kind"
+        " FROM trades"
+    ).fetchone()
+
+
+def test_the_activity_statement_supersedes_a_same_day_confirmation(tmp_path):
+    """The settled record replaces the same-session one, in place.
+
+    Both queries describe one execution under one `tradeID`, so first-write-wins
+    meant a confirm arriving first BLOCKED the row that carries the realised
+    P&L, the FIFO match and the final commission -- silently and permanently,
+    because a confirm looks like a complete fill. Ranked instead: a confirm may
+    be superseded, and superseding is not the same event as a new fill, so it is
+    counted apart from one.
+    """
+    from optjournal.db import ACTIVITY_SOURCE
+    from optjournal.demo import write_demo_statement
+
+    activity = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    confirm = _confirm_shaped(activity, tmp_path / "confirm.xml")
+
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+
+    first = ingest_file(conn, confirm, source_kind=CONFIRM_SOURCE)
+    assert first.trades_inserted, "the confirm stored no fills"
+    before = _settlement(conn)
+    assert before["unsettled"] == before["n"], "the confirm arrived pre-settled"
+    assert before["kind"] == CONFIRM_SOURCE
+
+    second = ingest_file(conn, activity)
+
+    assert second.trades_inserted == 0, (
+        "the confirm's fills were counted as new fills again, so a morning sync "
+        "would announce yesterday's trades as today's"
+    )
+    assert second.trades_superseded == before["n"]
+    after = _settlement(conn)
+    assert after["n"] == before["n"], "the same execution was stored twice"
+    assert after["unsettled"] == 0, "the settled P&L never landed"
+    assert after["free"] == 0, "the provisional zero commission survived"
+    assert (after["kinds"], after["kind"]) == (1, ACTIVITY_SOURCE)
+    conn.close()
+
+
+def test_a_confirmation_arriving_late_cannot_walk_a_settled_row_back(tmp_path):
+    """Rank runs one way. Re-running the confirm query after the Activity
+    Statement has landed must not restore the mid-session view of the fill.
+
+    This is the failure the guard exists for and the one nothing would report:
+    the row would still be there, still under the right id, with its realised
+    P&L quietly back to nothing.
+    """
+    from optjournal.db import ACTIVITY_SOURCE
+    from optjournal.demo import write_demo_statement
+
+    activity = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    confirm = _confirm_shaped(activity, tmp_path / "confirm.xml")
+
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    ingest_file(conn, activity)
+    settled = _settlement(conn)
+    assert settled["unsettled"] == 0
+
+    late = ingest_file(conn, confirm, source_kind=CONFIRM_SOURCE)
+
+    assert late.trades_inserted == 0 and late.trades_superseded == 0
+    assert late.trades_skipped_existing == settled["n"]
+    assert dict(_settlement(conn)) == dict(settled)
+    assert _settlement(conn)["kind"] == ACTIVITY_SOURCE
+    conn.close()
+
+
+def test_a_source_of_unknown_rank_cannot_supersede_anything(tmp_path):
+    """`SOURCE_RANK` fails closed: a kind nobody ranked ranks below every kind
+    somebody did.
+
+    So adding a third Flex query is a decision made in `SOURCE_RANK`, not one
+    made accidentally by whoever first passes its name -- which would otherwise
+    let an untested reader overwrite settled figures on its first run.
+    """
+    from optjournal.demo import write_demo_statement
+
+    activity = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    stranger = _confirm_shaped(activity, tmp_path / "stranger.xml")
+
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    ingest_file(conn, activity)
+    settled = _settlement(conn)
+
+    result = ingest_file(conn, stranger, source_kind="some-later-query")
+
+    assert result.trades_superseded == 0
+    assert result.trades_skipped_existing == settled["n"]
+    assert dict(_settlement(conn)) == dict(settled)
+    conn.close()
+
+
+def test_a_supersede_does_not_re_date_when_the_journal_first_saw_a_fill(tmp_path):
+    """`first_seen_at` answers "what is new since yesterday", so it records a
+    SIGHTING, not the last write.
+
+    Refreshed on supersede, every fill confirmed yesterday would look new again
+    the morning its Activity Statement lands -- which is precisely the day the
+    reader stops needing to be told about it. Backdated by hand rather than
+    trusting two ingests a second apart to differ, since the stamp has
+    second resolution and both would tie.
+    """
+    from optjournal.demo import write_demo_statement
+
+    activity = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    confirm = _confirm_shaped(activity, tmp_path / "confirm.xml")
+
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    ingest_file(conn, confirm, source_kind=CONFIRM_SOURCE)
+    conn.execute("UPDATE trades SET first_seen_at = '2026-08-30T21:15:00+00:00'")
+    conn.commit()
+
+    ingest_file(conn, activity)
+
+    stamps = {
+        r["first_seen_at"]
+        for r in conn.execute("SELECT DISTINCT first_seen_at FROM trades")
+    }
+    assert stamps == {"2026-08-30T21:15:00+00:00"}, (
+        "superseding a confirm re-dated the fill, so every settled trade would "
+        f"read as newly seen; got {stamps}"
+    )
+    conn.close()
+
+
+def test_a_superseded_row_equals_one_the_statement_wrote_from_scratch(tmp_path):
+    """A supersede must leave the winning source's row ENTIRE, not a blend.
+
+    The upsert used to name its updated columns by hand and missed some, so a
+    superseded row took the statement's `proceeds_base` while keeping the
+    confirm's `fx_rate_to_base` -- the rate that figure was derived from. Nothing
+    would have reported that: both values are plausible, and only their ratio is
+    wrong.
+
+    Every column the confirm wrote is SCRAMBLED first, rather than trusting the
+    doctored statement to differ. That is the difference between a test with teeth
+    and one that looks like it has them: the first version compared a confirm that
+    diverged in two fields, so dropping `fx_rate_to_base` from the update left
+    both rows agreeing and the test passed on a defect it was written to catch.
+    With every value wrong to begin with, a column the supersede forgets is a
+    column that stays wrong.
+
+    The key is left alone because it is what the two rows are matched on, and
+    `source_kind` because a scrambled rank would make the supersede itself
+    unreachable. `first_seen_at` is excluded from the comparison, being the one
+    field a supersede deliberately keeps -- see
+    `test_a_supersede_does_not_re_date_when_the_journal_first_saw_a_fill`.
+    """
+    from optjournal.demo import write_demo_statement
+
+    activity = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    confirm = _confirm_shaped(activity, tmp_path / "confirm.xml")
+
+    def rows(conn):
+        return {
+            str(r["trade_id"]): {
+                k: v for k, v in dict(r).items() if k != "first_seen_at"
+            }
+            for r in conn.execute("SELECT * FROM trades")
+        }
+
+    superseded = connect(tmp_path / "superseded.db")
+    migrate(superseded)
+    ingest_file(superseded, confirm, source_kind=CONFIRM_SOURCE)
+    # `source_file` is scrambled to the confirm's own name, so it stays a valid
+    # foreign key while still being the wrong answer.
+    keep = {"broker", "trade_id", "source_kind"}
+    columns = [
+        r["name"] for r in superseded.execute("PRAGMA table_info(trades)")
+        if r["name"] not in keep
+    ]
+    # Per-row values, not one constant: `ib_exec_id` and `transaction_id` are
+    # unique per broker, so a single sentinel across 28 rows collides.
+    superseded.execute(
+        "UPDATE trades SET " + ", ".join(
+            f"{c} = " + ("'confirm.xml'" if c == "source_file"
+                         else "'SCRAMBLED-' || trade_id")
+            for c in columns
+        )
+    )
+    superseded.commit()
+
+    ingest_file(superseded, activity)
+
+    direct = connect(tmp_path / "direct.db")
+    migrate(direct)
+    ingest_file(direct, activity)
+
+    got, want = rows(superseded), rows(direct)
+    assert got.keys() == want.keys() and got
+    differing = {
+        trade_id: {
+            column: (value, want[trade_id][column])
+            for column, value in fields.items()
+            if value != want[trade_id][column]
+        }
+        for trade_id, fields in got.items()
+    }
+    left_behind = {k: v for k, v in differing.items() if v}
+    assert not left_behind, (
+        "superseding did not rewrite every column, so the row keeps values the "
+        f"settled statement never wrote: {left_behind}"
+    )
+    superseded.close()
+    direct.close()

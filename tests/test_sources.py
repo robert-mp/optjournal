@@ -83,8 +83,12 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
     including for a fill fetched from IBKR long after the direct-read code was
     deleted. That is what makes this a comparison rather than a snapshot.
 
-    `broker` is excluded from the hash because the pre-seam schema had no such
-    column, and `first_seen_at` because it is a wall clock rather than data.
+    `broker` and `source_kind` are excluded from the hash because the pre-seam
+    schema had no such columns, and `first_seen_at` because it is a wall clock
+    rather than data. A column added since is not evidence about the seam either
+    way, and re-baselining the hashes to absorb one would throw away the only
+    thing that makes them a comparison: they came from running the deleted code,
+    and it cannot be run again to produce a new set.
     """
     if not STATEMENTS:
         pytest.skip("needs an archived statement")
@@ -124,6 +128,7 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
             continue
         row.pop("first_seen_at", None)
         row.pop("broker", None)
+        row.pop("source_kind", None)
         actual = hashlib.sha256(
             json.dumps(row, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]

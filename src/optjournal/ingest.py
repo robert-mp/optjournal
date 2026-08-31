@@ -2,9 +2,12 @@
 
 Ingest is idempotent by construction. Statements overlap -- a 30-day and a
 365-day query both contain the same fills, verified against real data -- so
-trades and cash transactions are inserted with first-write-wins on IBKR's
-own identifiers, and `first_seen_at` records when the journal first saw a
-row rather than when it was last re-presented.
+trades and cash transactions are keyed on IBKR's own identifiers and a fill
+already held is left alone. The one exception is rank (`SOURCE_RANK`): a
+same-session Trade Confirmation may be superseded by the next day's settled
+Activity Statement, never the reverse. `first_seen_at` records when the
+journal first saw a row rather than when it was last re-presented, and a
+supersede does not touch it.
 
 Everything is stored by default (`ASSET_FILTER_ALL`). The filter existed
 because the journal began options-only, but filtering at ingest made the
@@ -28,7 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from optjournal.db import DEFAULT_BROKER
+from optjournal.db import ACTIVITY_SOURCE, CONFIRM_SOURCE, DEFAULT_BROKER
 from optjournal.sources import source_for
 
 __all__ = [
@@ -47,6 +50,67 @@ ASSET_FILTER_ALL: tuple[str, ...] = ()
 #: database that had been widened by hand.
 DEFAULT_ASSET_FILTER = ASSET_FILTER_ALL
 
+#: How much to trust each Flex query, when both describe the same fill.
+#:
+#: The Activity Statement outranks a Trade Confirmation because it is the settled
+#: record: it carries realised P&L, the FIFO match and the final commission, none
+#: of which a same-session confirm can know. An unknown value ranks 0 so a source
+#: added later cannot silently outrank either of these by accident -- it has to be
+#: given a rank here, deliberately.
+SOURCE_RANK: dict[str, int] = {CONFIRM_SOURCE: 1, ACTIVITY_SOURCE: 2}
+
+#: Every column `_ingest_trades` writes, in the order it binds them.
+#:
+#: ONE list, so the column names, the placeholders and the supersede's SET clause
+#: cannot disagree. They were three hand-maintained copies, and the count of `?`
+#: was written out as a 37-character string -- a column added in the wrong place
+#: would have bound every value after it to its neighbour's column, storing a
+#: strike as a multiplier without raising anything. Same construction as
+#: `bars._UPSERT`, which writes price bars.
+_TRADE_COLUMNS: tuple[str, ...] = (
+    "broker", "trade_id", "ib_exec_id", "transaction_id", "ib_order_id",
+    "account_id", "trade_date", "date_time",
+    "asset_category", "symbol", "conid", "underlying_symbol", "underlying_conid",
+    "put_call", "strike", "expiry", "multiplier",
+    "buy_sell", "open_close", "notes", "level_of_detail",
+    "quantity", "trade_price", "currency", "fx_rate_to_base",
+    "proceeds", "proceeds_base",
+    "ib_commission", "ib_commission_base", "ib_commission_currency", "taxes",
+    "fifo_pnl_realized", "fifo_pnl_realized_base", "mtm_pnl",
+    "raw", "source_file", "first_seen_at", "source_kind",
+)
+
+#: The three columns a supersede leaves alone.
+#:
+#: `broker` and `trade_id` are the key being matched on. `first_seen_at` records
+#: when the JOURNAL first saw the fill, which is a fact about the journal rather
+#: than about the fill: a supersede is not a new sighting, and re-dating it would
+#: make every trade confirmed yesterday read as new the morning its Activity
+#: Statement lands -- precisely the day a reader stops needing to be told.
+#:
+#: Everything else is rewritten, including contract fields that cannot really
+#: change, so the row becomes the winning source's row ENTIRE rather than a blend
+#: of two. Taking `proceeds_base` while keeping the confirm's `fx_rate_to_base`
+#: (the rate it was derived from) would store a row whose own figures disagree.
+_KEEP_ON_SUPERSEDE = frozenset({"broker", "trade_id", "first_seen_at"})
+
+#: Ranked, not first-write-wins. The same fill arrives under one `tradeID` from
+#: two queries -- a Trade Confirmation the same session, the Activity Statement
+#: the next day -- and `DO NOTHING` meant a confirm landing first BLOCKED the
+#: authoritative row carrying the realised P&L, the FIFO match and the settled
+#: commission. Silently and forever, because a confirm looks like a complete fill.
+#:
+#: Reaching this statement is what decides a supersede (see `_stored_rank`), so
+#: the conflict clause here is unconditional: by then the incoming fill has
+#: already outranked the stored one.
+_TRADE_UPSERT = (
+    f"INSERT INTO trades ({', '.join(_TRADE_COLUMNS)})"
+    f" VALUES ({', '.join('?' for _ in _TRADE_COLUMNS)})"
+    " ON CONFLICT(broker, trade_id) DO UPDATE SET "
+    + ", ".join(f"{c}=excluded.{c}"
+                for c in _TRADE_COLUMNS if c not in _KEEP_ON_SUPERSEDE)
+)
+
 
 @dataclass(slots=True)
 class IngestResult:
@@ -57,6 +121,11 @@ class IngestResult:
     #: which also covers re-ingesting the same filename.
     duplicate_of: str | None = None
     trades_inserted: int = 0
+    #: Fills the journal already held, rewritten from a source that knows more
+    #: about them: an Activity Statement over a same-session Trade Confirmation.
+    #: Counted apart from `trades_inserted` so a morning sync reports three
+    #: fills SETTLED rather than three fills NEW, which they would not be.
+    trades_superseded: int = 0
     trades_skipped_existing: int = 0
     trades_filtered_out: int = 0
     cash_inserted: int = 0
@@ -102,12 +171,17 @@ def ingest_file(
     assets: Iterable[str] = DEFAULT_ASSET_FILTER,
     reingest: bool = False,
     broker: str = DEFAULT_BROKER,
+    source_kind: str = ACTIVITY_SOURCE,
 ) -> IngestResult:
     """Ingest one archived statement. Safe to call repeatedly.
 
     `broker` selects the statement source (see sources.py) and is stamped on
     every trade row. Defaults to IBKR, the only source today, so existing
     callers are unchanged.
+
+    `source_kind` says which Flex query produced the file, and defaults to the
+    Activity Statement -- the settled record, and everything this journal
+    archived before Trade Confirmations existed.
     """
     path = Path(path)
     source = source_for(broker)
@@ -187,7 +261,8 @@ def ingest_file(
     base_currency = source.base_currency(path)
     for _account_id, fills in source.statements(path):
         _ingest_trades(conn, fills, path.name, assets, result,
-                       base_currency=base_currency, broker=broker)
+                       base_currency=base_currency, broker=broker,
+                       source_kind=source_kind)
 
     _ingest_cash(conn, source.cash_transactions(path), path.name, result,
                  broker=broker)
@@ -233,9 +308,31 @@ def _commission_base(
     return None
 
 
+def _stored_rank(conn, broker: str, trade_id: Any) -> int | None:
+    """The rank of the fill already stored under this key, or None if new.
+
+    Read BEFORE the write, and it is what decides the write -- rather than a
+    `WHERE` on the upsert, which `bars.upsert_bars` can use because it counts
+    only rows touched. Here `trades_inserted` has to keep meaning "fills the
+    journal had not seen": it is printed by the nightly cron and the Sync
+    button, and `DO UPDATE` reports a supersede and an insert identically, so
+    superseding yesterday's confirms would announce them as new fills every
+    morning. Knowing whether the row existed is the only way to tell those
+    apart, so the rank comparison lives here too, once, in Python.
+    """
+    row = conn.execute(
+        "SELECT source_kind FROM trades WHERE broker = ? AND trade_id = ?",
+        (broker, trade_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return SOURCE_RANK.get(row["source_kind"], 0)
+
+
 def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
                    base_currency: str | None = None,
-                   broker: str = DEFAULT_BROKER) -> None:
+                   broker: str = DEFAULT_BROKER,
+                   source_kind: str = ACTIVITY_SOURCE) -> None:
     """Write broker-neutral fills into the trades table.
 
     Reads `NormalisedFill`s (sources.py), never a broker's own model, so this
@@ -249,7 +346,12 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
     value while IBKR was the only broker, so the argument was decorative and
     would have stayed decorative until a second broker's rows collided with the
     first's on `(broker, trade_id)`.
+
+    `source_kind` says WHICH Flex query these fills came from, and ranks them
+    (`SOURCE_RANK`): a same-session Trade Confirmation may be superseded by the
+    next day's Activity Statement, never the other way round.
     """
+    incoming_rank = SOURCE_RANK.get(source_kind, 0)
     for fill in fills:
         if not _matches_filter(fill.asset_category, assets):
             result.trades_filtered_out += 1
@@ -258,6 +360,16 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
         qty = fill.quantity
         if qty is None:
             result.warnings.append(f"trade {fill.trade_id}: unparseable quantity")
+            continue
+
+        stored_rank = _stored_rank(conn, broker, fill.trade_id)
+        if stored_rank is not None and incoming_rank <= stored_rank:
+            # Already known, and this query knows no more about it than the row
+            # does. Covers both the overlapping statements this journal has
+            # always re-read and a confirm query re-run after the Activity
+            # Statement has landed -- which must not walk the settled figures
+            # back to what the fill looked like mid-session.
+            result.trades_skipped_existing += 1
             continue
 
         rate = fill.fx_rate_to_base
@@ -278,17 +390,8 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
             commission, commission_ccy, fill.currency, rate, base_currency
         )
 
-        cur = conn.execute(
-            "INSERT INTO trades (broker, trade_id, ib_exec_id, transaction_id, ib_order_id,"
-            " account_id, trade_date, date_time, asset_category, symbol, conid,"
-            " underlying_symbol, underlying_conid, put_call, strike, expiry,"
-            " multiplier, buy_sell, open_close, notes, level_of_detail, quantity,"
-            " trade_price, currency, fx_rate_to_base, proceeds, proceeds_base,"
-            " ib_commission, ib_commission_base, ib_commission_currency, taxes,"
-            " fifo_pnl_realized,"
-            " fifo_pnl_realized_base, mtm_pnl, raw, source_file, first_seen_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(broker, trade_id) DO NOTHING",
+        conn.execute(
+            _TRADE_UPSERT,
             (
                 broker,
                 fill.trade_id, fill.exec_id, fill.transaction_id, fill.order_id,
@@ -306,32 +409,32 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
                 None if realized is None else realized * rate,
                 fill.mtm_pnl,
                 json.dumps(fill.raw, default=str, sort_keys=True),
-                source_file, _now(),
+                source_file, _now(), source_kind,
             ),
         )
-        if cur.rowcount:
+        if stored_rank is None:
             result.trades_inserted += 1
-            # Warned here rather than beside the conversion, because a warning
-            # is a report of a decision TAKEN -- and on a duplicate row no
-            # decision is taken, the INSERT is a no-op. Emitting it before the
-            # insert made the nightly cron report "0 new trade(s)" next to a
-            # per-trade warning, every run, about one row settled on
-            # 2026-08-03. It would have gone on firing until that row aged out
-            # of IBKR's rolling window in August 2027, and a warning that fires
-            # daily on correctly-handled data is one nobody reads when it
-            # finally means something.
-            if commission and commission_ccy and commission_ccy != fill.currency:
-                handled = (
-                    f"treated as already-base {base_currency}"
-                    if commission_ccy == base_currency
-                    else "left unconverted: the statement carries no rate for it"
-                )
-                result.warnings.append(
-                    f"trade {fill.trade_id}: commission billed in {commission_ccy}"
-                    f" but the instrument trades in {fill.currency}; {handled}"
-                )
         else:
-            result.trades_skipped_existing += 1
+            result.trades_superseded += 1
+
+        # Warned only for a row this ingest actually wrote, because a warning is
+        # a report of a decision TAKEN -- and an already-known fill took no
+        # decision, having `continue`d above. Emitting it for every fill read
+        # made the nightly cron report "0 new trade(s)" next to a per-trade
+        # warning, every run, about one row settled on 2026-08-03. It would have
+        # gone on firing until that row aged out of IBKR's rolling window in
+        # August 2027, and a warning that fires daily on correctly-handled data
+        # is one nobody reads when it finally means something.
+        if commission and commission_ccy and commission_ccy != fill.currency:
+            handled = (
+                f"treated as already-base {base_currency}"
+                if commission_ccy == base_currency
+                else "left unconverted: the statement carries no rate for it"
+            )
+            result.warnings.append(
+                f"trade {fill.trade_id}: commission billed in {commission_ccy}"
+                f" but the instrument trades in {fill.currency}; {handled}"
+            )
 
 
 def _ingest_cash(conn, cash, source_file: str, result: IngestResult,

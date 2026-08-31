@@ -41,17 +41,33 @@ from pathlib import Path
 
 from optjournal.locks import locked
 
-__all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate",
+__all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
+           "SCHEMA_VERSION", "connect", "migrate",
            "open_journal", "schema_is_current"]
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
 #: had -- so the default states a fact rather than guessing one.
 DEFAULT_BROKER = "ibkr"
+
+#: Which Flex query a fill came from. Two names because IBKR serves the same fill
+#: through two different query types and only one of them is authoritative:
+#:
+#: * ACTIVITY_SOURCE -- the Activity Statement. T+1, and the settled record: it
+#:   carries realised P&L, the FIFO match and the final commission.
+#: * CONFIRM_SOURCE -- a Trade Confirmation. Available the same session, and
+#:   therefore provisional: it knows the fill happened and little about what it
+#:   eventually netted.
+#:
+#: Held here rather than in `ingest.py` because the column default in
+#: `_ADDED_COLUMNS` needs the same string, and two spellings of "which query" is
+#: exactly the drift that would let a migration default disagree with the writer.
+ACTIVITY_SOURCE = "activity"
+CONFIRM_SOURCE = "confirm"
 
 #: Columns added to existing tables after their CREATE statement shipped.
 #: `executescript(_SCHEMA)` uses CREATE TABLE IF NOT EXISTS, which is a no-op on
@@ -72,11 +88,24 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # recorded" is the normal state of this column and must stay distinguishable
     # from a date -- the same line every absent figure in this journal draws.
     ("watchlist", "earnings_on", "TEXT"),
+    # WHICH FLEX QUERY DELIVERED THIS FILL, and therefore how much to trust it.
+    #
+    # A Trade Confirmation query reports a fill the same session; an Activity
+    # Statement reports it the next day and is the authoritative record -- it
+    # carries the realised P&L, the settled commission and the FIFO match that a
+    # confirm cannot know yet. The same fill therefore arrives TWICE under one
+    # `tradeID`, which is this table's primary key, so the two must be ranked
+    # rather than merely deduplicated: see `ingest.SOURCE_RANK`.
+    #
+    # Defaulted to the activity statement, because every row that exists before
+    # this column did came from one. That default is what makes the backfill a
+    # no-op instead of a guess.
+    ("trades", "source_kind", f"TEXT NOT NULL DEFAULT '{ACTIVITY_SOURCE}'"),
 )
 
-_TRADES_DDL = """
+_TRADES_DDL = f"""
 CREATE TABLE IF NOT EXISTS trades (
-  broker                  TEXT    NOT NULL DEFAULT 'ibkr',
+  broker                  TEXT    NOT NULL DEFAULT '{DEFAULT_BROKER}',
   trade_id                TEXT    NOT NULL,
   ib_exec_id              TEXT    NOT NULL,
   transaction_id          TEXT    NOT NULL,
@@ -119,6 +148,11 @@ CREATE TABLE IF NOT EXISTS trades (
   raw                     TEXT    NOT NULL,
   source_file             TEXT    NOT NULL REFERENCES statements(source_file),
   first_seen_at           TEXT    NOT NULL,
+  -- WHICH FLEX QUERY delivered this fill. IBKR serves the same fill through two
+  -- of them under one tradeID, and only the Activity Statement is authoritative,
+  -- so the writer RANKS them rather than taking whichever arrived first. See
+  -- `ingest.SOURCE_RANK`.
+  source_kind             TEXT    NOT NULL DEFAULT '{ACTIVITY_SOURCE}',
   -- Identity is per broker: two brokers may both number a fill 1.
   PRIMARY KEY (broker, trade_id)
 );
