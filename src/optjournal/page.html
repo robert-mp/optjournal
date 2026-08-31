@@ -302,11 +302,16 @@ import {
  * @property {number} open_positions -- open positions, grouping a multi-leg
  *   strategy into one. Attached by web.build_state, not month_stats: it needs
  *   the campaign grouping, which is built after the stats are
+ * @property {string} scoring -- 'position' or 'contract': which unit the five
+ *   figures below count. Read for LABELS, never to recompute -- the server has
+ *   already counted in this unit, and a page that re-derived the other reading
+ *   would be a second implementation of campaigns.py
  * @property {number} decided_campaigns -- the headline trade count for options,
- *   and the scoreboard's unit: positions whose every contract is closed. A roll
- *   continues a position, so this is below closed_episodes while one is in
- *   flight. Always equals wins + losses
- * @property {number} wins -- decided POSITIONS that netted up, not contracts
+ *   and the scoreboard's unit: under 'position', positions whose every contract
+ *   is closed (a roll continues one, so this sits below closed_episodes while
+ *   one is in flight); under 'contract', each closed round trip. Always equals
+ *   wins + losses
+ * @property {number} wins -- decided outcomes that netted up, in `scoring`'s unit
  * @property {number} losses
  * @property {number|null} win_rate -- null until anything was decided
  * @property {Money|null} avg_win -- null without wins; an average of no
@@ -906,7 +911,7 @@ import {
  *  One name per shape, deliberately: reusing one name for two shapes blinds
  *  the guard to both. Declared here, in the file being edited, in the same
  *  diff as the code that introduces the name.
- * @payload st:State s:Stats best:Stats x:Episode ep:Episode dy:Day
+ * @payload st:State s:Stats best:Stats alt:Stats x:Episode ep:Episode dy:Day
  * @payload pos:Position o:Order l:Leg h:History
  * @payload stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
  * @payload mo:Money
@@ -932,6 +937,7 @@ import {
  * @local when button parts names y
  * @local COST_OPTIONS bits cost fees on wh
  * @local STATS_KEYS_REQUIRED missing state
+ * @local SCORINGS
  */
 
 const $=s=>document.querySelector(s);
@@ -983,7 +989,18 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      NOT part of `state`: they come from their own endpoint because each one costs
      an HTTP request, so they must not ride along on every payload reload. Null
      until the Watchlist tab asks. */
-  quotes:null,quotesAt:null};
+  quotes:null,quotesAt:null,
+  /* The scoreboard's unit: null means "the server's default" (position), the
+     same convention `cost` uses, so the page carries no duplicate of a decision
+     that lives in stats.py and cannot drift from it.
+
+     IN the hash, and a SERVER round trip when it changes -- unlike the display
+     currency, which restates client-side. Wins and losses are counted from the
+     campaign linkage, so the other reading is not derivable from a payload
+     already summarised in one unit: asking the server is the only way to get it
+     without reimplementing campaigns.py here, which is exactly the duplication
+     that module exists to prevent. */
+  scoring:null};
 
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -1254,6 +1271,108 @@ function renderCcy(){
     b.onclick=()=>{S.ccy=b.dataset.ccy;draw();});
 }
 
+/* ------------------------------------------------ scoreboard unit toggle */
+/* The two units, first one default -- the same order `stats.SCORINGS` declares,
+   because applyHash and syncHash both treat element 0 as the value not worth
+   recording in a URL. */
+const SCORINGS=['position','contract'];
+const SCORING=()=>S.scoring||SCORINGS[0];
+/* Whether the journal holds any position made of more than one contract. When
+   nothing is grouped the two readings are ARITHMETICALLY IDENTICAL, and a
+   toggle that visibly changes nothing reads as broken rather than as agreement
+   -- so it says so instead of offering a choice with no consequence.
+
+   Derived from the payload the same way the 0DTE and Equities buttons are:
+   closed_episodes exceeds decided_campaigns exactly when grouping merged
+   something. Read off `all_time`, never the selected month: a single month may
+   group nothing while the journal does, and the control is global. */
+function groupingMatters(){
+  const alt=(S.state||{}).all_time;
+  if(!alt) return false;
+  /* Under contract scoring the two are equal BY CONSTRUCTION, so this test
+     cannot see grouping in the payload it is looking at. The open book is the
+     other witness: a multi-contract position that has not closed yet is still
+     grouping the reader will meet. */
+  return SCORING()===SCORINGS[1]
+    ? true
+    : alt.closed_episodes!==alt.decided_campaigns
+      ||alt.open_episodes!==alt.open_positions;
+}
+function scoringLabel(unit){
+  return unit===SCORINGS[1]?'Per contract':'Per position';
+}
+function scoringTip(unit){
+  return unit===SCORINGS[1]
+    ? 'Score every contract round trip on its own: each leg of a strangle, and '
+      +'each leg of a roll, counts as its own win or loss. This is what a '
+      +'broker trade log shows, so it is the reading to use when reconciling '
+      +'against one.'
+    : 'Score the decision: a multi-leg structure and every roll of it count '
+      +'once, and the outcome is the sum of their contracts. A hedge leg cannot '
+      +'be a loss inside a winning position, and a loser cannot be rolled out '
+      +'and scratched into a win.';
+}
+/* The noun for one outcome, taken from the PAYLOAD's scoring rather than the
+   control's. The two are the same once a load settles, and differ for exactly
+   the moment that matters: a payload counted in the old unit must not be
+   labelled with the new one. Both helpers take the stats block for that reason,
+   so a caller cannot accidentally read the control instead.
+
+   `n` for the plural, because "1 decided positions" is the kind of detail that
+   makes a reader distrust every other figure on the card. */
+function unitWord(s,n){
+  const one=(s||{}).scoring===SCORINGS[1]?'contract round trip':'position';
+  return n===1?one:one+'s';
+}
+function unitNote(s){
+  return `decided ${unitWord(s,2)}`;
+}
+/* Rendered inside the cog panel rather than the header, and the header is why:
+   nine tabs, a theme chip, the currency pair and two icons already wrap onto a
+   second line, so a fourth control there cost more legibility than it bought. A
+   scoring unit is also a SET-ONCE preference -- unlike the display currency,
+   which a reader flips to check a figure against the broker -- and set-once
+   belongs behind the settings button.
+
+   What that costs, and how it is paid: the control is no longer on screen beside
+   the figures it governs, so a reader could forget which unit they are in. Every
+   surface therefore NAMES the unit in place -- the stat cards' notes via
+   `unitWord`, the Annual footnote, and `scoringBanner` below whenever the
+   reading is not the default. The rule the header placement was protecting was
+   never "the control must be visible", it was "the numbers must never be
+   unlabelled", and that one still holds. */
+function scoringRow(){
+  const matters=groupingMatters();
+  const row=SCORINGS.map(unit=>{
+    const on=unit===SCORING();
+    const tip=matters?scoringTip(unit)
+      :'Every position in this journal is a single contract, so both readings '
+       +'count the same outcomes and this changes nothing yet.';
+    return `<button data-scoring="${esc(unit)}" class="${on?'on':''}"
+      ${matters?'':'disabled'} title="${esc(tip)}"
+      >${esc(scoringLabel(unit))}</button>`;
+  }).join('');
+  return `<h2 class="sub3 mt-5">Scoreboard</h2>
+    <div class="ccytog">${row}</div>
+    <div class="note">Which unit <b>W</b>, <b>L</b>, win rate and the averages
+      count, on every tab. ${esc(scoringTip(SCORING()))} The money never moves:
+      net P&amp;L, commission and the fill counts are identical under both, so the
+      two readings differ only in how many outcomes the same cash is divided
+      into.${matters?'':` Nothing in this journal is grouped yet, so both
+      readings currently agree.`}</div>`;
+}
+/* Said out loud wherever the figures are, and ONLY when the reading is not the
+   default. A per-contract scoreboard sitting under an unlabelled "Winning
+   Trades" card is the one way this feature can mislead now that its control
+   lives behind a button -- and the default needs no announcement, for the same
+   reason it is the one value the hash omits. */
+function scoringBanner(s){
+  return (s||{}).scoring===SCORINGS[1]
+    ? ` Scored <b>per contract round trip</b>: each leg of a spread and each leg
+       of a roll counts as its own win or loss.`
+    : '';
+}
+
 /* One sentence telling the reader which currency they are looking at, and
    whether it is IBKR's own figure or a restatement of it. */
 function ccyNote(){
@@ -1404,16 +1523,21 @@ function dashboard(){
      counts in the month it closed, full stop. Fills stay visible in the
      sub-note as what they are -- activity, not trades.
 
-     Decided POSITIONS, not closed contract round trips, and the two differ:
-     a roll continues one position across two contracts, so the episode count
-     scored a single decision twice. The contract count stays in the sub-note
-     because it is the money's unit -- Net P&L and Commissions below are
-     attributed by it -- and a reader who adds up the P&L needs to see it. */
+     The unit is whichever the reader chose, and the sub-note names it. Under
+     the default it is decided POSITIONS, not closed contract round trips, and
+     the two differ: a roll continues one position across two contracts, so the
+     episode count scored a single decision twice. The contract count stays in
+     the sub-note either way because it is the money's unit -- Net P&L and
+     Commissions below are attributed by it -- and a reader who adds up the P&L
+     needs to see it. Under contract scoring the two are equal, and the note
+     saying so twice is honest rather than redundant: it is the reconciliation
+     the reader came for. */
   const cards=[
     opt
       ? statCard('Trades', s.decided_campaigns,
-          `decided position(s) · ${s.closed_episodes} contract round trip(s) · ${
-          s.total_trades} fill(s), ${s.orders} order(s)`)
+          `decided ${unitWord(s,s.decided_campaigns)}`
+          +` · ${s.closed_episodes} contract round trip(s)`
+          +` · ${s.total_trades} fill(s), ${s.orders} order(s)`)
       : statCard('Total Trades', s.total_trades,
           s.orders?`${s.orders} order(s)`:''),
     statCard('Net P&L', moneyOf(s.net_pnl), pnlNote,
@@ -1448,14 +1572,20 @@ function dashboard(){
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
-    /* Judged on the POSITION, so a roll is one decision and its outcome is the
-       sum of every contract in the chain. Counting the final leg alone would
-       let a loser be rolled out and scratched into a win. */
-    statCard('Winning Trades', s.wins, 'decided positions', s.wins?'pos':''),
-    statCard('Losing Trades', s.losses, 'decided positions', s.losses?'neg':''),
+    /* The unit these four count is the reader's choice, so the note NAMES it
+       rather than asserting one. Under 'position' a roll is one decision and its
+       outcome is the sum of every contract in the chain, so a loser cannot be
+       rolled out and scratched into a win; under 'contract' each round trip
+       stands alone, which is what a broker log shows. Taken from the payload's
+       own `scoring`, never from `S.scoring`: the figures were counted by the
+       server, and labelling them from the control would let a stale payload be
+       described by a unit it was not counted in. */
+    statCard('Winning Trades', s.wins, unitNote(s), s.wins?'pos':''),
+    statCard('Losing Trades', s.losses, unitNote(s), s.losses?'neg':''),
     statCard('Win Rate', pct(s.win_rate),
-      s.decided_campaigns?`${s.decided_campaigns} decided`:'nothing decided yet'),
-    statCard('Avg Win', moneyOf(s.avg_win), 'per decided position',
+      s.decided_campaigns?`${s.decided_campaigns} decided ${unitWord(s,
+        s.decided_campaigns)}`:'nothing decided yet'),
+    statCard('Avg Win', moneyOf(s.avg_win), `per decided ${unitWord(s,1)}`,
       cls(s.avg_win?.base)),
     /* An em-dash on a card whose figure is genuinely absent reads as "this
        failed to load". `none yet` says the same thing as data: there have been
@@ -1468,7 +1598,7 @@ function dashboard(){
         :moneyOf(s.avg_loss),
       s.losses===0&&s.decided_campaigns>0
         ?`${s.decided_campaigns} decided, none at a loss`
-        :'per decided position',
+        :`per decided ${unitWord(s,1)}`,
       cls(s.avg_loss?.base)),
     nl!=null
       ? statCard('Gain % of Net Liq', pct(s.gain_pct_of_net_liq,2),
@@ -1486,7 +1616,7 @@ function dashboard(){
       per-fill realisation, net of commission.`}</span>i</span></h2>
       <div class="sub">${esc(s.asset_category)} trades and commission only —
       account-level fees and other instruments live on the Costs tab.
-      ${esc(ccyNote())}</div></div>
+      ${esc(ccyNote())}${scoringBanner(s)}</div></div>
       <div class="pills">
         ${S.type?`<span class="pill" title="Every trade-derived figure below is
           restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
@@ -2932,6 +3062,11 @@ function annual(){
      of its own rows whenever the filter was on. */
   let best=yrs[0];
   yrs.forEach(s=>{if(s.net_pnl.base>best.net_pnl.base)best=s;});
+  /* The footnote's `decided` sentence names the unit the rows were counted in.
+     It asserted POSITIONS unconditionally, which under the per-contract reading
+     claimed the grouping the reader had just switched off -- the one mislabel
+     this toggle must not commit, and worst here, where the two counts sit in
+     adjacent columns and the note is what reconciles them. */
   const row=(s,klass)=>statsRow(s,{
     label:s.month==='ALL'?'all time':s.month, wide:true, klass:klass||''});
   return `<div class="card">
@@ -2951,11 +3086,17 @@ function annual(){
     <div class="note">Three units, narrowing left to right. <b>fills</b> counts
       executions: an order filled in two parts is two fills but one outcome.
       <b>closed</b> counts contract round trips, and is what <b>net P&amp;L</b> is
-      attributed by. <b>decided</b> counts POSITIONS, and is what W, L and win
-      rate measure — a roll closes one contract and opens the next, so one
-      continuing decision would otherwise be scored twice. <b>closed</b> is
-      never below <b>decided</b>, and a row where they differ is a row where a
-      roll was in flight or finished in another period. A year that traded
+      attributed by. ${SCORING()===SCORINGS[1]
+        ? `<b>decided</b> counts the same round trips, each scored on its own:
+           every leg of a spread and every leg of a roll is its own W or L, which
+           is what a broker trade log shows. The two columns agree by
+           construction — switch to <b>Per position</b> to group a rolled or
+           multi-leg position into one outcome.`
+        : `<b>decided</b> counts POSITIONS, and is what W, L and win
+           rate measure — a roll closes one contract and opens the next, so one
+           continuing decision would otherwise be scored twice. <b>closed</b> is
+           never below <b>decided</b>, and a row where they differ is a row where a
+           roll was in flight or finished in another period.`} A year that traded
       without deciding anything shows no rate rather than 0%.</div>
     ${monthlyTable()}
   </div>`;
@@ -3365,6 +3506,7 @@ function cog(){
         <td class="${stm.ingested?'pos':'dim2'}">${stm.ingested?'yes':'no'}</td>
         <td class="dim">${esc(stm.asset_filter||'-')}</td></tr>`).join('')}
     </tbody></table>
+    ${scoringRow()}
     <div class="note"><b>Needs the Flex query template:</b>
       <i>Gain % of Net Liq</i> reads the Equity Summary section — enable it on the
       query and sync, and the figure fills in from the next statement. <i>Trade
@@ -3419,6 +3561,12 @@ function applyHash(){
      empty array, which the server would read as a selection of nothing. */
   const cost=hs.getAll('cost').filter(Boolean);
   S.cost=cost.length?cost:null;
+  /* Validated against the two units the server knows, like the tab and the
+     theme: an unknown value would otherwise put a chip in an impossible state
+     while the server quietly served the default, so the control would disagree
+     with the figures beside it. */
+  const sco=(hs.get('scoring')||'').toLowerCase();
+  S.scoring=SCORINGS.includes(sco)?sco:null;
 }
 function syncHash(push){
   const hs=new URLSearchParams();
@@ -3439,6 +3587,10 @@ function syncHash(push){
      reads. `set` would keep only the last one and silently narrow a four-way
      selection to one on the next reload. */
   (S.cost||[]).forEach(c=>hs.append('cost',c));
+  /* Only the non-default, like the theme and the display currency: recording
+     'position' would put a key in every URL to say what the server already
+     assumes. */
+  if(S.scoring&&S.scoring!==SCORINGS[0]) hs.set('scoring',S.scoring);
   const next=hs.toString()?'#'+hs:'';
   if(next===(location.hash||'')) return;
   /* A tab jump is a navigation, so it pushes and the back button walks tabs.
@@ -3542,6 +3694,22 @@ function draw(push){
      selected" is a real answer and shows an empty state, where null would silently
      restore the default and make the click look ignored. A reload costs a request
      because commission is summed server-side under the new predicate. */
+  /* The scoreboard unit, wired here rather than in `cog()` because the panel is
+     re-rendered by `draw()` like every other view and a handler attached during
+     render would be lost with the node.
+
+     `load()`, not `draw()`: the other reading is a different COUNT, and only the
+     server holds the campaign linkage that produces it. Deriving it here would
+     be a second implementation of campaigns.py in the page -- the exact
+     duplication that module exists to prevent. */
+  document.querySelectorAll('button[data-scoring]').forEach(b=>
+    b.onclick=()=>{
+      const unit=b.dataset.scoring;
+      /* The default is stored as null, so the hash and the request omit it and
+         one spelling of "position" cannot disagree with the server's. */
+      S.scoring=unit===SCORINGS[0]?null:unit;
+      load();
+    });
   document.querySelectorAll('.multi button[data-cost]').forEach(b=>
     b.onclick=()=>{
       const csc=(S.state.broker_costs||{}).scope||{};
@@ -3860,7 +4028,7 @@ async function loadQuotes(announce){
    `undefined` on a headline figure, which reads as data loss rather than as a
    process that needs restarting -- and the fix is a restart, which nothing on
    screen said. */
-const STATS_KEYS_REQUIRED=['decided_campaigns','inflight_realized'];
+const STATS_KEYS_REQUIRED=['decided_campaigns','inflight_realized','scoring'];
 
 /* Says so, in the banner that already exists for things the reader must act on.
    Not a console warning (nobody has devtools open on their own journal) and not a
@@ -3888,6 +4056,10 @@ async function load(){
   /* Same repeated key on the wire as in the hash, so one vocabulary spans URL,
      request and payload -- `parse_qs` hands the server the list directly. */
   (S.cost||[]).forEach(c=>qs.append('cost',c));
+  /* Sent only when it is not the default, matching the hash: an omitted key and
+     'position' mean the same thing to the server, and one spelling of a default
+     is one fewer place for the page and stats.py to disagree. */
+  if(S.scoring) qs.set('scoring',S.scoring);
   const r=await fetch('/api/state'+(qs.toString()?'?'+qs:''));
   if(!r.ok){note('Could not read state: HTTP '+r.status,'bad');return;}
   S.state=await r.json();

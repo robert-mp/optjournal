@@ -27,7 +27,16 @@ import pytest
 from conftest import add_statement, connect_migrated
 
 from optjournal.money import Money
-from optjournal.stats import Cohort, MonthStats, cohort_data, fx_quotes, stats_data
+from optjournal.stats import (
+    CONTRACT_SCORING,
+    POSITION_SCORING,
+    Cohort,
+    MonthStats,
+    cohort_data,
+    fx_quotes,
+    month_stats,
+    stats_data,
+)
 
 
 @pytest.fixture()
@@ -168,3 +177,168 @@ def test_a_period_with_no_wins_reports_no_average_win_not_a_zero(conn):
     assert stats_data(stats)["avg_win"] == {
         "base": 250.0, "native": None, "ccy": None
     }
+
+
+def _leg(
+    conn: sqlite3.Connection,
+    *,
+    conid: str,
+    order_id: str,
+    at: str,
+    qty: int,
+    proceeds: float,
+    pnl: float | None,
+    put_call: str = "P",
+) -> None:
+    """One OPT fill on `conid`, enough for `build_history` to fold into episodes.
+
+    `fifo_pnl_realized` is IBKR's own figure and only the closing fill carries
+    one, which is the shape the real statement has: an opening sale realises
+    nothing.
+    """
+    trade_id = f"{conid}-{at}-{qty}"
+    conn.execute(
+        "INSERT INTO trades (broker, trade_id, ib_exec_id, transaction_id,"
+        " ib_order_id, account_id, trade_date, date_time, asset_category,"
+        " symbol, conid, underlying_symbol, put_call, strike, expiry,"
+        " multiplier, buy_sell, open_close, quantity, trade_price, currency,"
+        " fx_rate_to_base, proceeds, proceeds_base, ib_commission,"
+        " ib_commission_base, fifo_pnl_realized, fifo_pnl_realized_base,"
+        " raw, source_file, first_seen_at)"
+        " VALUES ('IBKR',?,?,?,?,'U1',?,?,'OPT',?,?,'SPY',?,500,'2026-04-17',"
+        "100,?,?,?,?,'USD',1.0,?,?,-1.0,-1.0,?,?,'{}','t.xml',"
+        "'2026-03-02T00:00:00Z')",
+        (trade_id, trade_id, trade_id, order_id, at[:10], at,
+         f"SPY  {put_call}{conid}", conid, put_call,
+         "SELL" if qty < 0 else "BUY", "O" if pnl is None else "C",
+         qty, abs(proceeds) / (abs(qty) * 100),
+         proceeds, proceeds, pnl, pnl),
+    )
+    conn.commit()
+
+
+def _strangle(conn: sqlite3.Connection) -> None:
+    """A strangle sold and bought back: one decision, two contracts, split
+    outcomes.
+
+    Two conids on separate order ids filled in the SAME SECOND, which is how
+    every real multi-leg event in this journal arrives -- see `campaigns.py`. The
+    put wins 400 and the call loses 100, so the position nets +300 while its legs
+    disagree, and that is exactly the case the two scorings read differently.
+    """
+    _leg(conn, conid="1", order_id="10", at="2026-03-02 15:00:00",
+         qty=-1, proceeds=500.0, pnl=None, put_call="P")
+    _leg(conn, conid="2", order_id="11", at="2026-03-02 15:00:00",
+         qty=-1, proceeds=300.0, pnl=None, put_call="C")
+    _leg(conn, conid="1", order_id="12", at="2026-03-09 15:00:00",
+         qty=1, proceeds=-100.0, pnl=400.0, put_call="P")
+    _leg(conn, conid="2", order_id="13", at="2026-03-09 15:00:00",
+         qty=1, proceeds=-400.0, pnl=-100.0, put_call="C")
+
+
+def test_the_two_scorings_divide_the_same_money_into_different_outcomes(conn):
+    """The toggle's whole contract, on the case that motivates it.
+
+    A strangle is ONE decision made of two contracts whose outcomes disagree.
+    Scored by position it is a single win; scored by contract it is a win and a
+    loss on the same trade. Both readings are defensible -- the second is what a
+    broker trade log shows -- so the journal offers both, and this pins the
+    invariant that makes offering both safe: the MONEY does not move. Net P&L,
+    commission and the fill count are identical, and only the number of outcomes
+    that cash is divided into changes.
+
+    Measured on the real journal, the same 29 closed round trips read 14W/1L by
+    position and 24W/5L by contract.
+    """
+    _strangle(conn)
+    by_position = month_stats(conn, "2026-03", base_currency="EUR")
+    by_contract = month_stats(
+        conn, "2026-03", base_currency="EUR", scoring=CONTRACT_SCORING
+    )
+
+    assert (by_position.wins, by_position.losses) == (1, 0), (
+        "a hedge leg cannot be a loss inside a winning position"
+    )
+    assert (by_contract.wins, by_contract.losses) == (1, 1), (
+        "scored per contract, the call leg is its own loss"
+    )
+    assert by_position.decided_campaigns == 1
+    assert by_contract.decided_campaigns == 2
+
+    # The invariant. Anything here moving would mean the toggle had become a
+    # second opinion about the account rather than a second way of counting it.
+    assert by_position.net_pnl.base == by_contract.net_pnl.base == 300.0
+    assert by_position.commissions.base == by_contract.commissions.base
+    assert by_position.total_trades == by_contract.total_trades == 4
+    assert by_position.closed_episodes == by_contract.closed_episodes == 2
+
+
+def test_contract_scoring_reports_no_in_flight_cash_because_it_groups_nothing(conn):
+    """`inflight_realized` explains a gap that only grouping can open.
+
+    It is the cash settled inside a position still running -- a roll's near leg.
+    Under contract scoring every closed round trip is its own finished outcome,
+    so the gap cannot exist and the figure is structurally zero. Asserted rather
+    than assumed, because a stale non-zero here would feed the Dashboard a note
+    claiming "of this figure, X closed inside a position still running" beside a
+    scoreboard where no position is still running.
+    """
+    # One leg closed, its partner still open: a position mid-flight.
+    _leg(conn, conid="1", order_id="10", at="2026-03-02 15:00:00",
+         qty=-1, proceeds=500.0, pnl=None, put_call="P")
+    _leg(conn, conid="2", order_id="11", at="2026-03-02 15:00:00",
+         qty=-1, proceeds=300.0, pnl=None, put_call="C")
+    _leg(conn, conid="1", order_id="12", at="2026-03-09 15:00:00",
+         qty=1, proceeds=-100.0, pnl=400.0, put_call="P")
+
+    by_position = month_stats(conn, "2026-03", base_currency="EUR")
+    by_contract = month_stats(
+        conn, "2026-03", base_currency="EUR", scoring=CONTRACT_SCORING
+    )
+
+    assert by_position.inflight_realized.base == 400.0, (
+        "the closed leg's cash sits inside a position that has not finished"
+    )
+    assert by_position.decided_campaigns == 0, "the position is not decided yet"
+    assert by_contract.inflight_realized.base == 0.0
+    assert (by_contract.wins, by_contract.decided_campaigns) == (1, 1), (
+        "the closed round trip is a finished outcome on its own terms"
+    )
+
+
+@pytest.mark.parametrize("given", ["positon", "", "POSITION", "leg", None])
+def test_an_unrecognised_scoring_heals_to_the_default(conn, given):
+    """A query string is user input, so an unknown unit must not reach the branch.
+
+    Healing rather than raising, because the value arrives from a URL a reader
+    can hand-edit and a 500 on a typo is a worse answer than the default view.
+    The healed value is CARRIED on the stats, which is what lets the page label
+    the figures with the unit they were actually counted in rather than the one
+    that was asked for.
+
+    'POSITION' heals too: the vocabulary is exact, and accepting a case variant
+    here would make the page's own comparisons against `SCORINGS` disagree with
+    the server about which chip is active.
+    """
+    _strangle(conn)
+    stats = month_stats(conn, "2026-03", base_currency="EUR", scoring=given)
+    assert stats.scoring == POSITION_SCORING
+    assert (stats.wins, stats.losses) == (1, 0), (
+        "an unknown unit must be counted as the default, not as the other one"
+    )
+    assert stats_data(stats)["scoring"] == POSITION_SCORING
+
+
+def test_the_scoring_travels_into_the_payload_for_the_page_to_label_with(conn):
+    """`stats_data` carries the unit beside the counts it governs.
+
+    The page reads this for its labels, never to recompute: 93% by position and
+    83% by contract are the same account, so a payload whose unit the reader has
+    to infer from a control's state is one a stale fetch can mislabel.
+    """
+    _strangle(conn)
+    view = stats_data(month_stats(
+        conn, "2026-03", base_currency="EUR", scoring=CONTRACT_SCORING
+    ))
+    assert view["scoring"] == CONTRACT_SCORING
+    assert (view["wins"], view["losses"], view["decided_campaigns"]) == (1, 1, 2)

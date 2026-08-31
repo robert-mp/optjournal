@@ -261,6 +261,7 @@ def build_state(
     month: str | None = None,
     trade_type: str | None = None,
     cost_scope: list[str] | None = None,
+    scoring: str | None = None,
 ) -> dict[str, Any]:
     """Everything the page renders, in one JSON-safe payload.
 
@@ -277,6 +278,14 @@ def build_state(
     bar, so they stay pinned to the journal's home category. The invariant is
     that a tab's figures change only in response to a control that tab
     displays.
+
+    `scoring` is the exception that proves that rule rather than breaking it: it
+    reaches EVERY period block, Annual and monthly included, because the control
+    for it lives in the header beside the display currency and is therefore on
+    screen wherever its effect is. A unit of account applied to one tab and not
+    another would leave the Dashboard and the Annual table disagreeing about the
+    same month -- which is the defect `campaigns.py` was written to remove, not
+    one to reintroduce behind a toggle.
     """
     with open_journal(db_path) as conn:
         # RESOLVE ABANDONED RUNS FIRST, before anything reads `job_runs`.
@@ -362,12 +371,12 @@ def build_state(
             "stats": stats_data(
                 month_stats(conn, selected, asset_category=view_category,
                             scope=scope, report=view_report,
-                            campaign_list=view_campaigns)
+                            campaign_list=view_campaigns, scoring=scoring)
             ),
             "all_time": stats_data(
                 month_stats(conn, None, asset_category=view_category,
                             scope=scope, report=view_report,
-                            campaign_list=view_campaigns)
+                            campaign_list=view_campaigns, scoring=scoring)
             ),
             "positions": positions_data(conn),
             "orders": orders,
@@ -426,13 +435,13 @@ def build_state(
         state["annual"] = [
             stats_data(s) for s in annual_stats(
                 conn, asset_category=asset_category,
-                report=report, campaign_list=home_campaigns,
+                report=report, campaign_list=home_campaigns, scoring=scoring,
             )
         ]
         state["monthly"] = [
             stats_data(s) for s in monthly_stats(
                 conn, asset_category=asset_category,
-                report=report, campaign_list=home_campaigns,
+                report=report, campaign_list=home_campaigns, scoring=scoring,
             )
         ]
         # The Annual table's total row. Deliberately not `all_time`, which is the
@@ -441,7 +450,7 @@ def build_state(
         # adding up -- destroying the one reconciliation it exists to show.
         state["annual_total"] = stats_data(
             month_stats(conn, None, asset_category=asset_category, report=report,
-                        campaign_list=home_campaigns)
+                        campaign_list=home_campaigns, scoring=scoring)
         )
         # Cohorts are the whole book by definition -- they exist to compare the
         # 0DTE subset against everything else, so scoping them to 0DTE would
@@ -607,6 +616,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     # rather than a delimiter this layer has to invent and the
                     # page has to match. parse_qs already hands us the list.
                     cost_scope=params.get("cost"),
+                    # Unvalidated here on purpose: `stats.scoring_or_default`
+                    # owns the vocabulary, and a second check in this layer is a
+                    # second place for the two to disagree about what a valid
+                    # unit is.
+                    scoring=(params.get("scoring") or [None])[0],
                 ))
             except sqlite3.OperationalError as exc:
                 self._json(500, {"error": f"database not readable: {exc}"})

@@ -52,11 +52,14 @@ from optjournal.money import Money, win_rate
 
 __all__ = [
     "ALL_TRADES",
+    "CONTRACT_SCORING",
     "Cohort",
     "DayPnl",
     "EQUITY_CATEGORY",
     "EQUITY_TRADES",
     "MonthStats",
+    "POSITION_SCORING",
+    "SCORINGS",
     "TradeScope",
     "annual_stats",
     "available_months",
@@ -70,7 +73,41 @@ __all__ = [
     "odte_cohorts",
     "odte_scope",
     "scope_for",
+    "scoring_or_default",
 ]
+
+#: The unit the scoreboard counts an outcome in. Only wins, losses, the
+#: averages and `decided_campaigns` read this; the MONEY is unaffected, and that
+#: is the whole point -- `net_pnl` is a sum over episodes either way, so the two
+#: readings differ in how many outcomes that same cash is divided into, never in
+#: how much of it there was.
+#:
+#: POSITION groups a multi-leg structure and every leg of a roll into ONE
+#: decision, which is `campaigns.py`'s argument and the default. CONTRACT scores
+#: each round trip alone: the hedge leg of a winning strangle counts as its own
+#: loss, and a roll counts once per contract. That is what a broker-style trade
+#: log shows, so it is offered rather than argued away -- measured on the real
+#: journal, the same 29 closed round trips read 14W/1L by position and 24W/5L by
+#: contract, and a reader comparing this journal against a broker's is otherwise
+#: left to reconcile two definitions by hand.
+POSITION_SCORING = "position"
+CONTRACT_SCORING = "contract"
+#: Validated against, so an unknown value heals to the default rather than
+#: reaching the `units` branch and being scored by position while a control
+#: claims otherwise.
+SCORINGS = (POSITION_SCORING, CONTRACT_SCORING)
+
+
+def scoring_or_default(value: str | None) -> str:
+    """`value` if it names a scoring unit, else the default.
+
+    One place, because three layers ask the same question -- the HTTP handler,
+    `month_stats` and `_period_stats` -- and a query string is user input. A
+    `?scoring=positon` typo must render the default and say so through the
+    control, never reach the branch in `month_stats` and be read as the other
+    unit.
+    """
+    return value if value in SCORINGS else POSITION_SCORING
 
 
 def _in_period(value: str | None, period: str | None) -> bool:
@@ -337,11 +374,20 @@ class MonthStats:
     #: `net_pnl` and `commissions` are attributed by the episode's close date.
     closed_episodes: int = 0
     open_episodes: int = 0
-    #: Campaigns decided in the period: the scoreboard's unit, and the headline
+    #: Which unit the four figures below count, `POSITION_SCORING` or
+    #: `CONTRACT_SCORING`. Carried on the stats rather than left to the caller
+    #: to remember, because a win rate is meaningless without it: 93% by
+    #: position and 83% by contract are the same account, and a surface that
+    #: displays one while labelling it the other is the defect this exists to
+    #: make impossible.
+    scoring: str = POSITION_SCORING
+    #: Outcomes decided in the period: the scoreboard's unit, and the headline
     #: trade count. Always equals `wins + losses`, which is what lets a reader
-    #: reconcile it against `closed_episodes` -- the two differ exactly when a
-    #: roll carried a decision across the period boundary, or is still in
-    #: flight. See `campaigns.py` for why this is not the episode count.
+    #: reconcile it against `closed_episodes`. Under position scoring the two
+    #: differ exactly when a roll carried a decision across the period boundary
+    #: or is still in flight; under contract scoring they agree by construction,
+    #: since each closed round trip is its own outcome. See `campaigns.py` for
+    #: why position is the default.
     decided_campaigns: int = 0
     wins: int = 0
     losses: int = 0
@@ -637,6 +683,7 @@ def _period_stats(
     base_currency: str,
     report: Any = None,
     campaign_list: list[campaigns.Campaign] | None = None,
+    scoring: str | None = None,
 ) -> list[MonthStats]:
     """`month_stats` over several periods, sharing one episode history pass.
 
@@ -662,12 +709,16 @@ def _period_stats(
         report = build_history(
             conn, asset_category=asset_category, base_currency=base_currency
         )
-    if campaign_list is None:
+    # Not built under contract scoring, which reads no linkage: this function
+    # exists to hoist work out of the per-period loop, and hoisting a query
+    # nothing below will look at is the same waste in one place instead of many.
+    if campaign_list is None and scoring_or_default(scoring) != CONTRACT_SCORING:
         campaign_list = campaigns_for(conn, asset_category, report.episodes)
     return [
         month_stats(
             conn, period, asset_category=asset_category,
             base_currency=base_currency, report=report, campaign_list=campaign_list,
+            scoring=scoring,
         )
         for period in periods
     ]
@@ -680,6 +731,7 @@ def annual_stats(
     base_currency: str = "EUR",
     report: Any = None,
     campaign_list: list[campaigns.Campaign] | None = None,
+    scoring: str | None = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar year, newest first.
 
@@ -693,11 +745,17 @@ def annual_stats(
     filter bar, and a tab whose numbers move with a control it does not display
     leaves the reader nothing to explain the change with. A scope parameter here
     would be an unused hook inviting exactly that.
+
+    Takes `scoring` despite that, and the asymmetry is the point: the
+    scoreboard's UNIT is a global reading of the journal, chosen beside the
+    display currency in the header and rendered on every tab, so this table
+    moving with it is the control working rather than an unexplained change. A
+    scope is per-tab; the unit is not.
     """
     return _period_stats(
         conn, available_years(conn, asset_category),
         asset_category=asset_category, base_currency=base_currency,
-        report=report, campaign_list=campaign_list,
+        report=report, campaign_list=campaign_list, scoring=scoring,
     )
 
 
@@ -708,12 +766,15 @@ def monthly_stats(
     base_currency: str = "EUR",
     report: Any = None,
     campaign_list: list[campaigns.Campaign] | None = None,
+    scoring: str | None = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar month, newest first.
 
     The same rows the month selector produces one at a time, so the Annual
     tab's breakdown and the Dashboard agree for any month the reader checks --
-    they are the same call with the same period string.
+    they are the same call with the same period string. `scoring` travels for
+    that reason: pass a different unit here than the Dashboard used and the two
+    surfaces would disagree about the same month.
 
     Unscoped for the same reason as `annual_stats`: it feeds the Annual tab,
     which carries no filter.
@@ -721,7 +782,7 @@ def monthly_stats(
     return _period_stats(
         conn, available_months(conn, asset_category),
         asset_category=asset_category, base_currency=base_currency,
-        report=report, campaign_list=campaign_list,
+        report=report, campaign_list=campaign_list, scoring=scoring,
     )
 
 
@@ -819,7 +880,6 @@ def cohort_data(c: Cohort) -> dict[str, Any]:
 #: which is what "preserve existing behaviour for other asset types" means.
 _EPISODE_PNL_CATEGORY = "OPT"
 
-
 def daily_series(
     conn: sqlite3.Connection,
     period: str | None = None,
@@ -916,6 +976,7 @@ def month_stats(
     scope: TradeScope = ALL_TRADES,
     report: Any = None,
     campaign_list: list[campaigns.Campaign] | None = None,
+    scoring: str | None = None,
 ) -> MonthStats:
     """Statistics for one period, or for everything when `period` is None.
 
@@ -934,11 +995,19 @@ def month_stats(
     same either way and only the query is repeated. It used to fall back to one
     campaign per episode, which made a forgotten keyword score a roll twice with
     nothing raised -- the kind of default that is wrong in silence.
+
+    `scoring` picks the scoreboard's unit (`POSITION_SCORING` or
+    `CONTRACT_SCORING`); see those constants. It moves wins, losses, the averages
+    and `decided_campaigns` and NOTHING else -- net P&L, commission and the fill
+    counts are identical under both, so the two readings always agree on the
+    money. Under contract scoring `campaign_list` goes unread, so a caller that
+    knows the unit up front can skip building the linkage entirely.
     """
     stats = MonthStats(
         month=period or "ALL",
         base_currency=base_currency,
         asset_category=asset_category or "ALL",
+        scoring=scoring_or_default(scoring),
     )
 
     where, params = _category_where(asset_category)
@@ -1059,11 +1128,22 @@ def month_stats(
     # no test failing. A caller with many periods still passes its own, because
     # the linkage is per report and rebuilding it fifteen times is the cost
     # `_period_stats` exists to avoid.
-    if campaign_list is None:
-        campaign_list = campaigns_for(conn, asset_category, report.episodes)
-    units: list[list[Any]] = [
-        [report.episodes[i] for i in c.episode_indices] for c in campaign_list
-    ]
+    #: The population every figure below counts, as a list of outcomes each
+    #: holding the episodes that settle it. ONE list comprehension apart, the two
+    #: scorings share every line that follows -- the filter, the win/loss split,
+    #: the averages and the in-flight figure -- so neither reading can acquire a
+    #: rule the other lacks.
+    if stats.scoring == CONTRACT_SCORING:
+        # Each round trip alone. No linkage is read, so no query is spent: this
+        # is the reading that deliberately does NOT group, and building the
+        # grouping to then ignore it would be the one wasted query in the module.
+        units: list[list[Any]] = [[e] for e in report.episodes]
+    else:
+        if campaign_list is None:
+            campaign_list = campaigns_for(conn, asset_category, report.episodes)
+        units = [
+            [report.episodes[i] for i in c.episode_indices] for c in campaign_list
+        ]
     decided = [
         scoped for scoped in ([e for e in u if scope.has_episode(e)] for u in units)
         if scoped
@@ -1091,6 +1171,12 @@ def month_stats(
     # disagree with the gap. Scoped and period-filtered exactly like `closed`
     # above, because it is a subset of it -- the note it feeds claims "of this
     # figure", and a differently-scoped subset could exceed its own total.
+    #
+    # Structurally zero under contract scoring, and correctly so: a unit of one
+    # episode is either closed (and fully decided) or open (and contributes no
+    # realised cash here), so there is no cash settled inside an unfinished
+    # outcome. The gap it explains is a consequence of grouping, and vanishes
+    # with it rather than needing to be suppressed.
     stats.inflight_realized = Money.charged(
         (e.realized_pnl_base, e.realized_pnl, e.currency)
         for unit in units
@@ -1123,6 +1209,10 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "fees": stats.fees.payload(),
         "closed_episodes": stats.closed_episodes,
         "open_episodes": stats.open_episodes,
+        # Sent with the figures it governs, not alongside them: the page labels
+        # the scoreboard from this, so a payload could not carry counts whose
+        # unit the reader has to infer from a control's state.
+        "scoring": stats.scoring,
         "decided_campaigns": stats.decided_campaigns,
         "wins": stats.wins,
         "losses": stats.losses,
