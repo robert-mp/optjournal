@@ -564,6 +564,25 @@ def test_the_stale_server_guard_names_keys_that_exist(state):
         "the banner would fire on every load"
     )
 
+    # And the same both ways for the STATE-level list, which exists because a
+    # missing `journal` is worse than a cell reading `undefined`: the form still
+    # renders and Save posts to an endpoint the old process does not have, so a
+    # whole write-up goes nowhere and nothing says why.
+    top = re.search(r"const STATE_KEYS_REQUIRED=\[([^\]]*)\]", js)
+    assert top, "the state-level half of the stale-server guard is gone"
+    top_keys = re.findall(r"'([a-z_]+)'", top.group(1))
+    assert top_keys, "the state-level guard checks nothing, so it can never fire"
+    undeclared_top = sorted(set(top_keys) - set(shapes["State"]))
+    assert not undeclared_top, (
+        f"the guard watches State.{undeclared_top}, which the typedef does not "
+        "declare"
+    )
+    absent_top = sorted(k for k in top_keys if k not in state)
+    assert not absent_top, (
+        f"the guard watches {absent_top}, absent from a real payload -- the "
+        "banner would fire on every load"
+    )
+
 
 def test_the_stale_server_guard_runs_before_anything_renders(state):
     """It must be called where the payload ARRIVES, not from a render path.

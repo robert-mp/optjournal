@@ -1134,7 +1134,7 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  * @payload lb:Logbook
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite
  * @local Math S TABS THEMES b sel m r el location window qs hs ids
- * @local JFIELDS entered closed options
+ * @local JFIELDS entered closed options STATE_KEYS_REQUIRED
  * @local cells days buckets evs glegs lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
@@ -5502,6 +5502,15 @@ async function loadQuotes(announce){
    screen said. */
 const STATS_KEYS_REQUIRED=['decided_campaigns','inflight_realized','scoring'];
 
+/* The same guard one level up, for keys on the STATE rather than on `stats`.
+   Separate because the consequence is different in kind: a missing `stats` key
+   renders `undefined` in a cell, which is visible. A missing `journal` renders a
+   working-looking form whose Save posts to an endpoint the old process does not
+   have -- so the reader types a whole write-up, presses Save, and the only table
+   here that cannot be re-derived never receives it. Visible-but-wrong is a
+   papercut; invisible-and-lossy is why this list exists at all. */
+const STATE_KEYS_REQUIRED=['journal'];
+
 /* Says so, in the banner that already exists for things the reader must act on.
    Not a console warning (nobody has devtools open on their own journal) and not a
    thrown error (the rest of the page is fine and still worth reading): the
@@ -5510,7 +5519,8 @@ const STATS_KEYS_REQUIRED=['decided_campaigns','inflight_realized','scoring'];
 function staleServerCheck(state){
   const s=state&&state.stats;
   if(!s) return;
-  const missing=STATS_KEYS_REQUIRED.filter(k=>!(k in s));
+  const missing=STATS_KEYS_REQUIRED.filter(k=>!(k in s))
+    .concat(STATE_KEYS_REQUIRED.filter(k=>!(k in state)));
   if(!missing.length) return;
   note('This page is newer than the server process it is talking to, so some '
     +'figures will read <b>undefined</b>. The server re-reads the page on every '
