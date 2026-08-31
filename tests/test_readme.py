@@ -1,4 +1,4 @@
-"""The README's module table, against the modules that exist.
+"""The module table, against the modules that exist.
 
 That table is the map a contributor reads first, and it had silently lost two
 entries: `strategies.py` (317 lines, feeding two payload keys) and
@@ -10,6 +10,12 @@ decides what counts as one trade.
 Only presence is checked, never wording. A test that asserted on descriptions
 would fail on every honest improvement to them, so it would be deleted within a
 week and the drift would come back.
+
+The table lives in `docs/architecture.md`, not the README: the README is the
+install-and-run document and the design rationale moved out of it. This guard
+follows the content rather than the filename -- searching only the README would
+have kept passing on a file that no longer holds the map, which is the silent
+no-op the whole module exists to prevent.
 """
 
 from __future__ import annotations
@@ -18,6 +24,9 @@ import re
 
 from conftest import ROOT
 
+#: The document holding the map. One name, so moving the table again is one edit
+#: here rather than a hunt through three regexes.
+ARCHITECTURE = ROOT / "docs" / "architecture.md"
 README = ROOT / "README.md"
 PACKAGE = ROOT / "src" / "optjournal"
 
@@ -30,8 +39,17 @@ _NOT_IN_TABLE = {
 
 def _table_body() -> str:
     """The `| module | owns |` table, which is the map under test."""
-    match = re.search(r"\| module \| owns \|(.*?)(?:\n\n|\n#)", README.read_text(), re.S)
-    assert match, "README no longer has a `| module | owns |` table"
+    # `\Z` as a terminator, not just a blank line or a following heading: the
+    # table is the last thing in the file, and without it this regex matched
+    # nothing and the guard failed as though the table were gone.
+    match = re.search(
+        r"\| module \| owns \|(.*?)(?:\n\n|\n#|\Z)", ARCHITECTURE.read_text(), re.S
+    )
+    assert match, (
+        f"{ARCHITECTURE.relative_to(ROOT)} no longer has a `| module | owns |` "
+        "table. If it moved, point ARCHITECTURE at the new file -- do not delete "
+        "this guard, or a shipped module can go undocumented in silence."
+    )
     return match.group(1)
 
 

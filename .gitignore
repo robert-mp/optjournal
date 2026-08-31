@@ -66,10 +66,10 @@ journal-*.db
 # kept out of raw/ so a fake statement can never be mistaken for a real one.
 demo/
 
-# Brazil-style build symlink and any scratch that lands in it. Ignored because
-# it is not source: a probe script and a 471KB scratch database were once swept
-# in by a broad `git add -A`, and the archive is the only data this repo is
-# supposed to carry.
+# Build symlink and any scratch that lands in it. Ignored because it is not
+# source: a probe script and a 471KB scratch database were once swept in by a
+# broad `git add -A`, and the archive is the only data this repo is supposed to
+# carry.
 build/
 
 # Assistant tooling: workflow scripts and session state, not project source.
