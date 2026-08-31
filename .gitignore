@@ -72,6 +72,17 @@ demo/
 # carry.
 build/
 
+# Private research notes on the reference implementation: its schema, its
+# endpoints, and a cross-check of this account's figures against it. Kept out of
+# the repo DELIBERATELY -- it describes someone else's application and quotes real
+# account numbers, and neither belongs in a repo meant to be handed to a friend.
+#
+# Ignored rather than merely left untracked, because untracked is not a defence: a
+# broad `git add -A` committed it once, in a commit about something else entirely,
+# and the fix was rewriting four commits. An ignore rule makes that impossible
+# instead of unlikely -- the same reasoning as the `build/` entry above.
+IAG_REFERENCE.md
+
 # Assistant tooling: workflow scripts and session state, not project source.
 # Written here by the harness rather than by anyone working on the journal.
 .claude/
