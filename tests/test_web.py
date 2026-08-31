@@ -318,6 +318,10 @@ def test_contract_parser_is_correct():
 #: HTTP call per watched symbol.
 _UNSAMPLED = frozenset({
     "ChartPoint", "Bucket", "SyncResponse",
+    # `JField` is page-side, like `Bucket`: the journal form's own field table,
+    # never sent by the server. `JournalWrite` is the `/api/journal` reply, off
+    # the state payload like every other write reply here.
+    "JField", "JournalWrite",
     "MarketFetch", "WatchWrite", "QuoteReply", "Quote",
     # Reached only through `QuoteReply.ranks`, the `/api/quotes` reply, not the
     # state payload -- so no `/api/state` sample can carry it, exactly like
@@ -413,7 +417,9 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         # The reader's own writing, anchored to the entry the `state` fixture
         # seeds. Not exempted: every key here is one the modal binds to, and an
         # unsampled shape is a shape the drift guard stops covering.
-        "JournalEntry": first(list(state["journal"].values())),
+        "Journal": state["journal"],
+        "Trigger": first(state["journal"]["triggers"]),
+        "JournalEntry": first(list(state["journal"]["entries"].values())),
         "Scheduler": state["scheduler"],
         # Sampled from the real payload, and the `scheduler` fixture seeds a
         # job_state row so this anchors something rather than being None on a
@@ -4410,8 +4416,9 @@ def test_the_typed_field_is_preserved_across_a_render_and_not_across_subjects():
 
     This guarded a note editor until the note panel went. The editor's textarea went
     with it and so did the `textarea` half of the selector -- a selector matching
-    nothing is a mechanism no test can reach. What did NOT go is either failure it
-    was written for, because the earnings date field is the same shape of problem:
+    nothing is a mechanism no test can reach. Both halves are back, because the
+    journal form brought eleven textareas and a select, and neither failure the
+    guard was written for ever went away:
 
     Preserved across a render of the SAME row: a quote landing mid-sentence otherwise
     eats the text, the focus and the caret, exactly as it once ate the add field's.
@@ -4428,13 +4435,27 @@ def test_the_typed_field_is_preserved_across_a_render_and_not_across_subjects():
         "preserveInputs no longer scans the panel's inputs, so the earnings date "
         "loses what was typed on every redraw"
     )
-    assert "textarea" not in keep, (
-        "the textarea selector is back with no textarea on the page: a selector that "
-        "matches nothing cannot be tested, which is why the disabled-tab slot went"
+    assert "textarea" in keep and "select" in keep, (
+        "the journal form's fields are textareas and a select, so a redraw "
+        "mid-sentence discards writing this database cannot rebuild"
+    )
+    # The other half of the rule that once removed `textarea`: a selector may only
+    # name what the page actually renders, or it is a mechanism no test can reach.
+    assert "<textarea" in _fn("jfield") and "<select" in _fn("jfield"), (
+        "the selector names textarea and select but the page renders neither -- "
+        "either restore the fields or narrow the selector back"
     )
     assert "subject:el.dataset.subject" in keep.replace(" ", ""), (
         "the subject is not captured, so a date typed for one symbol can be "
         "restored under another"
+    )
+    # Every journal field carries the anchor it belongs to, for the same reason the
+    # earnings date carries its symbol: opening another decision's editor with text
+    # unsaved in this one would otherwise restore this decision's sentence under
+    # that one's heading, and Save would file it there.
+    assert 'data-subject="${esc(anchor)}"' in _fn("jfield"), (
+        "the journal fields do not name the decision they belong to, so text typed "
+        "for one write-up can be restored into another's"
     )
     # And the field it now protects actually carries a subject to be checked against.
     assert 'id="wearn" data-subject="${esc(w.symbol)}"' in _fn("watchDetail"), (
@@ -5214,7 +5235,7 @@ def test_the_journal_endpoint_round_trips_an_entry(populated):
         assert (entry["followed_target"], entry["exit_trigger"]) == ("yes", "target")
 
         _, state = _get(base, "/api/state")
-    assert state["journal"][anchor]["lessons"] == "closed a week early"
+    assert state["journal"]["entries"][anchor]["lessons"] == "closed a week early"
 
 
 def test_the_journal_endpoint_derives_the_decisions_identity_from_the_fills(populated):
@@ -5305,7 +5326,7 @@ def test_emptying_an_entry_through_the_endpoint_removes_it_from_the_state(popula
         _, emptied = _post(base, "/api/journal", {"anchor": anchor, "lessons": ""})
         assert emptied["entry"] is None
         _, state = _get(base, "/api/state")
-    assert anchor not in state["journal"]
+    assert anchor not in state["journal"]["entries"]
 
 
 def test_an_over_long_entry_is_refused_rather_than_read_as_empty(populated):
@@ -5324,7 +5345,7 @@ def test_an_over_long_entry_is_refused_rather_than_read_as_empty(populated):
         })
         assert (status, payload["kind"]) == (413, "too-long")
         _, state = _get(base, "/api/state")
-    assert state["journal"][anchor]["lessons"] == "worth keeping", (
+    assert state["journal"]["entries"][anchor]["lessons"] == "worth keeping", (
         "the refused write deleted the entry it was too long to replace"
     )
 
@@ -5351,4 +5372,137 @@ def test_the_lifecycle_cards_carry_the_anchor_the_journal_is_keyed_on(populated)
     assert not unknown, (
         f"these anchors name no fill in the journal: {unknown}. The endpoint "
         "resolves an entry's account from the fills, so it would refuse them"
+    )
+
+
+def test_the_journal_form_offers_exactly_the_fields_the_journal_stores():
+    """The page's field table against `journal.FIELDS`, both directions.
+
+    The two are separate lists in separate languages, and the endpoint refuses a
+    name the journal does not declare -- so a field only the page knows about is a
+    box whose text is rejected on Save, and a field only the journal knows about is
+    a column no reader can ever fill.
+
+    Names, not order: the page groups them into two moments and the table declares
+    them in schema order, which is a presentation choice rather than drift.
+    """
+    from optjournal.journal import FIELDS
+
+    js = _code_only(_js())
+    table = js[js.index("const JFIELDS=["):js.index("];", js.index("const JFIELDS=["))]
+    named = set(re.findall(r"name:'([a-z_]+)'", table))
+    assert named == set(FIELDS), (
+        f"the form and the table disagree. Only in the page: "
+        f"{sorted(named - set(FIELDS))}; only in journal.FIELDS: "
+        f"{sorted(set(FIELDS) - named)}"
+    )
+
+
+def test_every_journal_field_says_which_moment_it_belongs_to():
+    """Two sections, and membership is DECLARED rather than sliced.
+
+    The first version split the list by index (`slice(0,3)`), so inserting a field
+    silently moved the boundary and a question meant for the close would appear at
+    entry -- asking a reader to answer, before the trade, whether they followed a
+    plan they had not written yet.
+    """
+    js = _code_only(_js())
+    table = js[js.index("const JFIELDS=["):js.index("];", js.index("const JFIELDS=["))]
+    rows = re.findall(r"name:'([a-z_]+)',at:'(entry|close)'", table)
+    assert len(rows) == table.count("name:'"), (
+        "a field in the table declares no moment, so it renders in neither section"
+    )
+    at_entry = {name for name, when in rows if when == "entry"}
+    assert at_entry == {"plan_target", "plan_invalidation", "entry_note"}, (
+        f"the entry section is {sorted(at_entry)}. Only what is known BEFORE the "
+        "outcome belongs there -- that is what makes it worth reading afterwards"
+    )
+
+
+def test_the_form_reads_its_vocabulary_from_the_payload():
+    """The trigger labels are not spelled twice.
+
+    A label written in the page as well as in `journal.TRIGGERS` is a label that
+    will disagree, and a VALUE written twice is an option whose write the server
+    refuses -- with the reader's text in it. So the page renders `state.journal`'s
+    own list, and the only vocabulary it hard-codes is the adherence fallback for a
+    payload too old to carry one.
+    """
+    js = _code_only(_js())
+    for label in ("Hit the profit target", "Time-based", "Tested side",
+                  "Assigned or expired"):
+        assert label not in js, (
+            f"{label!r} is spelled in the page as well as in journal.TRIGGERS"
+        )
+    assert "JTRIGGERS()" in _fn("jfield"), "the options are not read from the payload"
+
+
+def test_a_decision_with_no_anchor_says_so_instead_of_offering_a_button():
+    """A snapshot-only position has no order to file writing under.
+
+    A button that posts and fails would be worse than none: the reader would have
+    typed a plan first. So the card explains, in the same place the button would
+    be, that the archive holds no opening fills for this position.
+    """
+    src = _fn("journalRow")
+    assert "if(!a)" in src.replace(" ", ""), "no guard for a card without an anchor"
+    assert "only a snapshot" in src, (
+        "the card offers no reason, so the missing button reads as a bug"
+    )
+    opens = src.index("data-jopen")
+    assert src.index("only a snapshot") < opens, (
+        "the guard must return before the button is rendered"
+    )
+
+
+def test_a_failed_journal_save_keeps_the_text_on_screen():
+    """The one write on this page whose input cannot be recovered.
+
+    A watchlist note refused is a note retyped from what is still on screen; a
+    journal entry refused after the form closed is writing gone. So neither the
+    network failure nor the server refusal closes the editor or reloads, and both
+    say the text is still there -- while success closes it, because the act is
+    finished and the badge now says what landed.
+    """
+    src = _fn("bindJournal")
+    fail = src.index("Could not save")
+    refused = src.index("was refused")
+    closed = src.index("S.jrnl=null")
+    assert fail < refused < closed, (
+        "the editor is closed before the failure branches, so a refused save "
+        "discards the writing it refused"
+    )
+    assert src.count("still on screen") == 2, (
+        "one of the two failure paths does not tell the reader their text survived"
+    )
+    assert "await load()" in src[closed:], (
+        "the reload must follow the success, or the badge never updates"
+    )
+
+
+def test_every_journal_field_is_one_element_with_an_id():
+    """`preserveInputs` is keyed by `id`, so a field without one is unprotected.
+
+    The adherence questions were three radios sharing a `name` first, which reads
+    better and cannot be keyed: an unsaved pick reverted on the next redraw,
+    silently, and Save then wrote the answer the reader had replaced. Text was
+    protected and a one-word answer was not -- and the one-word answer is the half
+    that lands in the adherence count.
+
+    So every field is a textarea or a select with an id, one mechanism covers the
+    whole form, and `bindJournal` reads them all the same way.
+    """
+    src = _fn("jfield")
+    assert 'type="radio"' not in src, (
+        "a radio has no id for preserveInputs to key on, so an unsaved pick is "
+        "lost on the next redraw"
+    )
+    assert src.count('id="${esc(id)}"') == 2, (
+        "every branch must give its field an id: one for the select, one for the "
+        "textarea"
+    )
+    reader = _fn("bindJournal")
+    assert "$('#j-'+jf.name)" in reader, (
+        "the save reads fields by something other than their id, so the two halves "
+        "of the form can disagree about what a field is called"
     )

@@ -173,8 +173,8 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  *   the watchdog and the thing it watched stopped together
  * @property {Logbook} logbook -- the header dateline (serialize.logbook_data).
  *   Whole-journal, so it moves with neither the month nor the trade-type filter
- * @property {Object} journal -- JournalEntry by Lifecycle.anchor
- *   (serialize.journal_data). The only table here a re-ingest cannot rebuild
+ * @property {Journal} journal -- what the reader wrote, plus the vocabulary the
+ *   form writes it in (serialize.journal_data)
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
  * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
@@ -947,6 +947,36 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  * @property {string} replay_key -- index into State.replays
  */
 
+/** @typedef {Object} Journal -- the journal layer (serialize.journal_data)
+ * @property {Object} entries -- JournalEntry by Lifecycle.anchor. The only table
+ *   in this database a re-ingest cannot rebuild
+ * @property {Array} triggers -- Trigger options, in the order they read
+ * @property {Array} adherence -- the answers `followed_*` accepts
+ */
+
+/** @typedef {Object} JField -- page-side: one row of the journal form. `name` is a
+ *  `journal.FIELDS` name and the server refuses anything else, so a typo in this
+ *  table fails loudly instead of posting into nothing
+ * @property {string} name
+ * @property {string} at -- 'entry' or 'close': which moment the field belongs to
+ * @property {string} label
+ * @property {string} kind -- text / choice / trigger
+ * @property {string} hint
+ */
+
+/** @typedef {Object} JournalWrite -- the /api/journal reply (web._journal_write)
+ * @property {boolean} ok
+ * @property {string} kind
+ * @property {string} [message]
+ * @property {string} [anchor]
+ * @property {JournalEntry|null} [entry] -- null when the write emptied the entry
+ */
+
+/** @typedef {Object} Trigger -- one exit-trigger option (journal.TRIGGERS)
+ * @property {string} key -- what is stored
+ * @property {string} label -- what the reader picks
+ */
+
 /** @typedef {Object} JournalEntry -- what the reader wrote about one decision
  *  (journal.Entry.payload). Every field is nullable: an entry exists the moment
  *  ANY of them is written, and a plan noted at entry sits beside a review that
@@ -1102,7 +1132,9 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  * @payload ivr:IvRank ir:IvRank
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook
+ * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite
  * @local Math S TABS THEMES b sel m r el location window qs hs ids
+ * @local JFIELDS entered closed options
  * @local cells days buckets evs glegs lcs legs mons month months
  * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
@@ -1150,6 +1182,13 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      silently lose -- and a link to "the calendar" means the week,
      not one cell of it. */
   marketday:null,
+  /* Which decision's journal editor is open, by anchor. NOT in the hash, and
+     that is the `marketday` reasoning taken one step further: an open form is
+     not a view of the data, it is an unfinished act. A reload restoring it would
+     restore an EMPTY form -- the typing is not in the URL and could not be --
+     which looks like the writing was lost. A link to "that trade" is `replay`,
+     which is in the hash and shows what happened. */
+  jrnl:null,
   /* Calendar filter, TWO INDEPENDENT AXES: a Set of countries and a Set of
      impacts, each holding the values currently shown.
 
@@ -2855,8 +2894,175 @@ function trades(){
       ${legs.length>1?'':`<div class="note">One leg, so this is a single-leg
         position rather than a strategy. Legs placed together on one underlying
         group into a named strategy the day it happens.</div>`}
+      ${journalRow(lc)}
     </div>`;
   }).join('');
+}
+
+/* ------------------------------------------------ the journal layer */
+/* The one thing on this page that is not derived from a statement.
+ *
+ * Everything else here can be rebuilt by re-ingesting `raw/`; a plan cannot, so
+ * the editor is deliberately hard to lose text in. It opens on click and stays
+ * open until the reader closes it, `draw()` never re-renders it from under them
+ * (see `jrnl` in S on why it is not in the hash), and Save reports what the
+ * server stored rather than assuming.
+ */
+const JENTRY=a=>((S.state.journal||{}).entries||{})[a]||null;
+const JTRIGGERS=()=>((S.state.journal||{}).triggers||[]);
+const JADHERE=()=>((S.state.journal||{}).adherence||['yes','no','na']);
+
+/* Which of the fields carry something, so a card can say "written up" without
+   the reader opening it. Counted rather than boolean: "4 notes" tells a reader
+   whether they wrote a sentence or a whole review, and a badge that reads the
+   same for both is a badge worth ignoring. */
+function jcount(je){
+  if(!je) return 0;
+  return JFIELDS.filter(jf=>je[jf.name]!=null&&String(je[jf.name])!=='').length;
+}
+
+/* Every writable field, ONE list, in the order the form shows them. The names
+   are `journal.FIELDS` and the server refuses anything else, so a typo here
+   fails loudly rather than posting into nothing -- which is the whole reason the
+   endpoint stopped filtering unknown names. */
+const JFIELDS=[
+  {name:'plan_target',at:'entry',label:'Exit plan — target',kind:'text',
+   hint:'Where this comes off in profit. Written before the trade, so the version you can trust.'},
+  {name:'plan_invalidation',at:'entry',label:'Exit plan — invalidation',kind:'text',
+   hint:'What would say the idea was wrong. Not a price you fear: a condition you would act on.'},
+  {name:'entry_note',at:'entry',label:'Why this trade',kind:'text',hint:''},
+  {name:'followed_target',at:'close',label:'Followed the target plan?',kind:'choice',hint:''},
+  {name:'why_not_target',at:'close',label:'If not, why',kind:'text',hint:''},
+  {name:'followed_invalidation',at:'close',label:'Followed the invalidation plan?',
+   kind:'choice',
+   hint:'N/A is a real answer: a trade taken off at target never reached it.'},
+  {name:'why_not_invalidation',at:'close',label:'If not, why',kind:'text',hint:''},
+  {name:'exit_trigger',at:'close',label:'What actually took it off',kind:'trigger',hint:''},
+  {name:'exit_trigger_other',at:'close',label:'Other — what',kind:'text',hint:''},
+  {name:'lessons',at:'close',label:'Key lessons',kind:'text',hint:''},
+  {name:'close_note',at:'close',label:'Closing notes',kind:'text',hint:''},
+];
+
+/* The badge on a card, and the button that opens the editor. Three states, not
+   two: a decision with no anchor cannot be journalled at all, and saying so is
+   better than a button that fails -- the position is held only as a snapshot, so
+   there is no order to file writing under. */
+function journalRow(lc){
+  const a=lc.anchor;
+  if(!a) return `<div class="note">No opening fills on record for this position,
+    only a snapshot, so there is no order to attach a journal entry to.</div>`;
+  const je=JENTRY(a), n=jcount(je), shownj=S.jrnl===a;
+  const badge=n?`<span class="pill ok">written up <b>${n}</b></span>`
+    :`<span class="pill dim">not written up</span>`;
+  return `<div class="jrow">
+    <div class="jsum">${badge}${je&&je.updated_at?`<span class="dim2 mono"
+      >last written ${esc(String(je.updated_at).slice(0,10))}</span>`:''}</div>
+    <button class="jbtn" data-jopen="${esc(a)}">${
+      shownj?'close':(n?'edit the write-up':'write this up')}</button>
+  </div>${shownj?journalForm(lc,je):''}`;
+}
+
+/* `data-subject` is the anchor, and it is not decoration. An id is unique per
+   RENDER, not per subject: `#j-lessons` is the lessons box whichever decision is
+   open, so opening another card's editor while text sits unsaved in this one would
+   restore THIS decision's sentence under THAT decision's heading -- and Save would
+   then file it there. `restoreInputs` refuses a restore across subjects, which is
+   the same mechanism `#wearn` needed when selecting another watched symbol carried
+   the previous symbol's typed date across. */
+function jfield(jf,je,anchor){
+  const v=(je&&je[jf.name]!=null)?String(je[jf.name]):'';
+  const id='j-'+jf.name;
+  const subj=` data-subject="${esc(anchor)}"`;
+  const hint=jf.hint?`<span class="jh">${esc(jf.hint)}</span>`:'';
+  /* A SELECT and not three radios, for a reason that outranks the nicer layout:
+     `preserveInputs` is keyed by `id`, and radios sharing one `name` have no id
+     to be keyed by -- so a pick made and not yet saved reverted on the next
+     redraw, silently, and Save then wrote the answer the reader had replaced.
+     Text was protected and a one-word answer was not, which is the worse half to
+     lose: it lands in the adherence count. One control, one id, one mechanism,
+     and the same shape as the trigger immediately below it. */
+  const options=jf.kind==='choice'
+    ?JADHERE().map(ans=>({key:ans,label:ans==='na'?'N/A':ans}))
+    :JTRIGGERS();
+  if(jf.kind!=='text')
+    return `<label class="jf"><span class="jl">${esc(jf.label)}</span>
+      <select id="${esc(id)}"${subj}><option value=""${v?'':' selected'}>—</option>
+      ${options.map(trg=>`<option value="${esc(trg.key)}"${
+        v===trg.key?' selected':''}>${esc(trg.label)}</option>`).join('')}</select>
+      ${hint}</label>`;
+  return `<label class="jf"><span class="jl">${esc(jf.label)}</span>
+    <textarea id="${esc(id)}" rows="2"${subj}>${esc(v)}</textarea>
+    ${hint}</label>`;
+}
+
+/* Two sections, because the two halves are written weeks apart and a form that
+   mixes them asks a reader at entry to answer questions only the close can. Both
+   are always shown -- hiding the review until a lifecycle closes would hide the
+   plan's own review from anyone reading an old trade -- but the captions say
+   which moment each belongs to. */
+function journalForm(lc,je){
+  const entered=JFIELDS.filter(jf=>jf.at==='entry');
+  const closed=JFIELDS.filter(jf=>jf.at==='close');
+  return `<div class="jform">
+    <div class="jsec"><h3>At entry</h3>
+      <div class="jsub">Written before the outcome is known, which is what makes it
+        worth reading afterwards.</div>
+      ${entered.map(jf=>jfield(jf,je,lc.anchor)).join('')}</div>
+    <div class="jsec"><h3>At the close</h3>
+      <div class="jsub">The review. Whether the plan was followed is a different
+        question from whether the trade won.</div>
+      ${closed.map(jf=>jfield(jf,je,lc.anchor)).join('')}</div>
+  </div>
+  <div class="jact">
+    <button class="jsave" data-jsave="${esc(lc.anchor)}">Save</button>
+    <span class="dim2">Only what you changed is written. Emptying every field
+      deletes the entry.</span>
+  </div>`;
+}
+
+/* Reads every field and posts them ALL, which is safe only because the server
+   merges on key presence rather than replacing the row: an empty box here means
+   "clear this", which is exactly what a reader deleting a sentence intends. The
+   two are the same act from the form's side, and the server's rule is what keeps
+   the entry form and the review from erasing each other across separate opens. */
+function bindJournal(){
+  document.querySelectorAll('[data-jopen]').forEach(b=>
+    b.onclick=()=>{const a=b.dataset.jopen;
+      S.jrnl=S.jrnl===a?null:a; draw();});
+  document.querySelectorAll('[data-jsave]').forEach(b=>
+    b.onclick=async()=>{
+      const anchor=b.dataset.jsave;
+      const body={anchor};
+      /* Every field is one element with an id -- textarea or select -- so this
+         reads them all the same way. That uniformity is the point: it is what lets
+         `preserveInputs` protect the whole form with one selector. */
+      JFIELDS.forEach(jf=>{
+        const el=$('#j-'+jf.name);
+        body[jf.name]=el?el.value:'';
+      });
+      b.disabled=true; b.classList.add('busy');
+      let jnres;
+      try{
+        const r=await fetch('/api/journal',{method:'POST',
+          headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        jnres=await r.json();
+      }catch(err){
+        b.disabled=false; b.classList.remove('busy');
+        note('Could not save: '+esc(err)+' — your text is still on screen.','bad');
+        return;
+      }
+      if(!jnres.ok){
+        b.disabled=false; b.classList.remove('busy');
+        note(esc(jnres.message||'the journal write was refused')
+          +' Nothing was saved, and your text is still on screen.','bad');
+        return;
+      }
+      /* Closed on success, because the reader has finished the act. Reopening is
+         one click and the badge above it now says what landed. */
+      S.jrnl=null;
+      note(jnres.entry?'Written up.':'Entry deleted — every field was empty.','ok');
+      await load();
+    });
 }
 
 /* ------------------------------------------------ positions */
@@ -4791,6 +4997,7 @@ function draw(push){
     el.onclick=()=>{const k=el.dataset.replay;
       S.replay=S.replay===k?null:k;draw();});
   bindReplayControls();
+  bindJournal();
   document.querySelectorAll('[data-calday-clear]').forEach(el=>
     el.onclick=()=>{S.calday=null;draw();});
   /* Server-side like the month filter, so the aggregations are recomputed
@@ -4931,12 +5138,14 @@ function draw(push){
  * not, so nothing can be held by reference. A field with no id is skipped rather
  * than guessed at -- a wrong restore would put one field's text in another.
  *
- * `#body input`. It read `input,textarea` while the panel carried a note editor,
- * and the textarea half went out WITH that editor rather than being kept in case: a
- * selector matching nothing is a mechanism no test can reach, which is this
- * project's own argument against the disabled-tab slot it deleted for the same
- * reason. The remaining fields -- the add box and the earnings date -- are inputs,
- * and a textarea arriving later restores one word to this selector.
+ * `input,textarea,select`. The textarea half was removed once, when the panel that
+ * carried a note editor went, on the argument that a selector matching nothing is a
+ * mechanism no test can reach -- with the note that a textarea arriving later
+ * restores one word here. The journal form is that arrival: eleven of its fields
+ * are textareas and one is a select, and without them a redraw mid-sentence
+ * discards writing that nothing in this database can rebuild. `select` is here for
+ * completeness rather than urgency -- a dropdown cannot be mid-edit -- but a value
+ * silently reverting is the same class of surprise.
  *
  * `data-subject` is the other half, and it is a different failure. An id is unique
  * per RENDER, not per subject: `#wearn` is the earnings field whatever row is open,
@@ -4947,7 +5156,7 @@ function draw(push){
  * the watchlist exists. */
 function preserveInputs(){
   const keep={};
-  document.querySelectorAll('#body input').forEach(el=>{
+  document.querySelectorAll('#body input,#body textarea,#body select').forEach(el=>{
     if(!el.id) return;
     keep[el.id]={value:el.value,subject:el.dataset.subject||'',
       start:el.selectionStart,end:el.selectionEnd,

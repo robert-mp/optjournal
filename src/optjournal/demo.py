@@ -32,6 +32,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from optjournal import journal
 from optjournal.bars import (
     close_series,
     upsert_bars,
@@ -982,6 +983,89 @@ DEMO_WATCHLIST: tuple[tuple[str, str], ...] = (
     ("ZZZDEMO", "demo: no bars anywhere -- this row is what a dash looks like"),
 )
 
+
+#: Two write-ups for the demo, and deliberately only two: the Trades tab should
+#: show a card that has been written up, a card that has been written up and
+#: REVIEWED, and seven that have not -- because "not written up" is the state most
+#: cards are in for any real reader, and a demo where every card is complete never
+#: shows the badge that matters.
+#:
+#: Keyed by POSITION in the account's order sequence rather than by a literal order
+#: id, because the ids are derived from a hash and a change to the synthetic trades
+#: would silently re-point these at nothing. `0` is the earliest order the demo
+#: placed, which is necessarily its campaign's anchor: an anchor is the LOWEST order
+#: id in a campaign, so the lowest overall must be one.
+DEMO_JOURNAL: tuple[tuple[int, dict[str, str]], ...] = (
+    (0, {
+        "plan_target": "demo: take it off at half the credit, or on the first "
+                       "green day after a gap down",
+        "plan_invalidation": "demo: the short strike trades through, or the "
+                            "thesis for the print stops being true",
+        "entry_note": "demo: sold into elevated vol ahead of earnings, sized so a "
+                      "full loss is one week of income",
+    }),
+    (1, {
+        "plan_target": "demo: 50% of credit",
+        "plan_invalidation": "demo: 2x the credit received",
+        "followed_target": "no",
+        "why_not_target": "demo: closed at 35% because the position was the "
+                          "largest in the book and the print was two days out",
+        "followed_invalidation": "na",
+        "exit_trigger": "external",
+        "lessons": "demo: taking it early was right for the size and wrong for "
+                   "the rule. Either size smaller or hold the rule",
+        "close_note": "demo: the plan was fine; the position was too big for it",
+    }),
+)
+
+
+def write_demo_journal(conn) -> int:
+    """Seed the demo's write-ups. Returns how many entries were created.
+
+    Without this, the journal layer has no rendered state anywhere: `serve --demo`
+    would show nine cards all reading "not written up", and the form, the badge and
+    the adherence vocabulary would never be drawn by anything that runs.
+
+    Written through `journal.save`, not an INSERT, so the demo exercises the same
+    writer the endpoint does -- a seed that bypassed it could store a row the real
+    path could not produce, which is the failure mode of every hand-built fixture.
+
+    SKIPPED where an entry already exists, which is `write_demo_watchlist`'s rule
+    and the same reasoning: this is the user-input table, `save` MERGES rather than
+    replacing, and a re-run must not be able to overwrite a sentence a reader wrote
+    into their demo database. `reset_demo_rows` leaves the table alone for the same
+    reason. The cost is stated rather than hidden: editing the seeds above does not
+    reach a demo database that already holds them.
+    """
+    orders = [
+        str(row["ib_order_id"])
+        for row in conn.execute(
+            "SELECT DISTINCT ib_order_id FROM trades WHERE account_id = ?"
+            " AND ib_order_id IS NOT NULL"
+            " ORDER BY CAST(ib_order_id AS INTEGER)",
+            (DEMO_ACCOUNT,),
+        )
+    ]
+    written = 0
+    for index, values in DEMO_JOURNAL:
+        if index >= len(orders):
+            continue
+        anchor = orders[index]
+        if journal.entry_for(conn, anchor, account_id=DEMO_ACCOUNT) is not None:
+            continue
+        target = conn.execute(
+            "SELECT COALESCE(underlying_symbol, symbol) AS underlying,"
+            " MIN(trade_date) AS opened_on FROM trades"
+            " WHERE account_id = ? AND ib_order_id = ?",
+            (DEMO_ACCOUNT, anchor),
+        ).fetchone()
+        journal.save(
+            conn, anchor, account_id=DEMO_ACCOUNT, values=dict(values),
+            underlying_symbol=target["underlying"],
+            opened_on=target["opened_on"],
+        )
+        written += 1
+    return written
 
 def write_demo_watchlist(conn) -> int:
     """Seed the demo's watched symbols. Returns how many rows were inserted.

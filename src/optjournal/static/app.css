@@ -1245,3 +1245,47 @@ stop.gneg{stop-color:var(--bad)}
 #msg.warn{background:var(--warnfill);color:var(--warnfg)}
 #msg.bad{background:var(--badfill2);color:var(--badlit)}
 .note{margin-top:12px;font-size:12px;color:var(--dim2);line-height:1.6}
+
+/* ------------------------------------------------ the journal layer */
+/* The write-up on a lifecycle card. Set apart from the figures above it by a rule
+   and a tint rather than by a heading, because it is not another reading of the
+   trade -- it is the one thing on the card the broker did not supply, and it
+   should look like a different kind of object. */
+.jrow{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  margin-top:14px;padding-top:13px;border-top:1px solid var(--line)}
+.jsum{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.pill.ok{background:var(--okfill2);color:var(--ok);border-color:var(--okfill2)}
+.pill.dim{color:var(--dim2)}
+.jbtn{font:inherit;font-size:12px;padding:7px 13px;border-radius:9px;
+  color:var(--fg);background:var(--panel2);border:1px solid var(--line2);
+  cursor:pointer;white-space:nowrap}
+.jbtn:hover{border-color:var(--dim2)}
+.jsave{font:inherit;font-size:12.5px;font-weight:600;padding:8px 18px;
+  border-radius:9px;color:var(--fg);background:var(--okfill2);
+  border:1px solid var(--ok);cursor:pointer}
+.jsave.busy,.jsave:disabled{opacity:.55;cursor:default}
+/* Two columns where the width allows, because entry and close are two moments
+   and reading them side by side is the point: the plan on the left, whether it
+   was followed on the right. One column below 900px, where side-by-side would
+   make both unreadably narrow. */
+.jform{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}
+@media (max-width:900px){.jform{grid-template-columns:1fr}}
+.jsec{padding:14px 15px;border-radius:11px;background:var(--bg2);
+  border:1px solid var(--line)}
+.jsec h3{margin:0;font-size:13px;letter-spacing:.02em}
+.jsub{font-size:10.5px;color:var(--dim2);line-height:1.45;margin:3px 0 11px}
+.jf{display:block;margin-top:11px}
+.jl{display:block;font-size:11px;color:var(--dim);margin-bottom:4px}
+.jh{display:block;font-size:10.5px;color:var(--dim2);line-height:1.45;margin-top:3px}
+/* `font-family:inherit` for the same reason `.wed textarea` needs it: a plan is
+   prose, and a textarea defaults to monospace. */
+.jf textarea,.jf select{font:inherit;font-size:12.5px;padding:7px 11px;width:100%;
+  box-sizing:border-box;border-radius:9px;color:var(--fg);background:var(--panel2);
+  border:1px solid var(--line2)}
+.jf textarea{font-family:inherit;resize:vertical;min-height:44px}
+/* A SIBLING of the grid, not a cell in it, so Save sits under the whole form
+   rather than under one half of it -- one button writes both sections. It was a
+   grid item spanning both columns first; outside the grid it needs no span, and
+   `.jform`'s job stays "two moments side by side" rather than "two moments and a
+   button". */
+.jact{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}

@@ -51,6 +51,8 @@ from optjournal.events import (
     upcoming,
 )
 from optjournal.history import HistoryReport
+from optjournal.journal import ADHERENCE as JOURNAL_ADHERENCE
+from optjournal.journal import TRIGGERS as JOURNAL_TRIGGERS
 from optjournal.journal import entries as journal_entries
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
@@ -1275,7 +1277,17 @@ def logbook_data(conn: sqlite3.Connection, *, today: date) -> Row:
 
 
 def journal_data(conn: sqlite3.Connection) -> Row:
-    """Every journal entry, keyed by the anchor its decision is filed under.
+    """What the reader wrote, and the vocabulary the form must write it in.
+
+    The two ENUMERATIONS travel with the entries rather than being re-typed in
+    the page. The modal renders `triggers` as its options and `adherence` as its
+    radio values, so a label spelled twice is a label that will disagree, and a
+    VALUE spelled twice is a button whose write the server refuses -- with the
+    reader's text in it. A list, not a mapping, because the render order is part
+    of the answer: the triggers read from "went to plan" to "taken out of my
+    hands", and a reader scanning them should meet them in that order.
+
+    Entries are keyed by the anchor its decision is filed under.
 
     Keyed by ANCHOR ALONE, dropping the account and broker the table also keys on,
     because an order id names one placement and a placement belongs to one
@@ -1288,6 +1300,11 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     request each would put a network round trip inside a render loop.
     """
     return {
-        anchor: entry.payload()
-        for (_broker, _account, anchor), entry in journal_entries(conn).items()
+        "entries": {
+            anchor: entry.payload()
+            for (_broker, _account, anchor), entry in journal_entries(conn).items()
+        },
+        "triggers": [{"key": key, "label": label}
+                     for key, label in JOURNAL_TRIGGERS.items()],
+        "adherence": list(JOURNAL_ADHERENCE),
     }

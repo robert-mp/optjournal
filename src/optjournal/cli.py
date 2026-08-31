@@ -287,6 +287,7 @@ def cmd_demo(args) -> int:
         QUERY_NAME,
         reset_demo_rows,
         write_demo_bars,
+        write_demo_journal,
         write_demo_statement,
         write_demo_watchlist,
     )
@@ -309,6 +310,12 @@ def cmd_demo(args) -> int:
         # `reset_demo_rows`: `watchlist` is the user-input table, so a re-run must
         # not be able to delete a symbol a reader added to their demo database.
         watched = write_demo_watchlist(conn)
+        # The write-ups, for the same reason as the watchlist: without a
+        # seeded entry the journal layer has no rendered state anywhere, so
+        # the badge, the form and the adherence vocabulary are drawn by
+        # nothing that runs. Two of nine cards, deliberately -- see
+        # `DEMO_JOURNAL` on why the un-written state has to be on screen too.
+        journalled = write_demo_journal(conn)
 
     payload = {
         "query_name": QUERY_NAME, "statement": str(path), "db": str(db),
@@ -316,6 +323,7 @@ def cmd_demo(args) -> int:
         "positions": result.positions_written,
         "option_bars": option_bars,
         "watched": watched,
+        "journalled": journalled,
     }
     lines = [
         f"wrote {path.name}  ({path.stat().st_size:,} bytes)",
@@ -331,6 +339,12 @@ def cmd_demo(args) -> int:
         "  0 synthetic option bars: no underlying series stored yet. Run"
         f" `optjournal bars --db {db}` for the real NVDA/SPY history, then"
         " re-run this to price the options against it."
+    ]
+    lines += [
+        f"  {journalled} write-up(s) seeded on the Trades tab"
+        if journalled else
+        "  0 write-ups seeded: the demo already holds them (a re-run never "
+        "overwrites a note you wrote)",
     ]
     lines += [
         f"  {watched} watched symbol(s) added"

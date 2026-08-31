@@ -1284,3 +1284,79 @@ def test_the_barren_demo_symbol_reports_nothing_rather_than_zero(conn):
         "Nones -- 'no sessions stored' is itself a measurement"
     )
     assert row["note"], "the seeded row carries a note, which the panel renders"
+
+
+def test_the_demo_seeds_write_ups_without_making_every_card_complete(conn):
+    """The journal layer needs rendered state, and needs the EMPTY state too.
+
+    Without a seeded entry, `serve --demo` draws nine cards all reading "not
+    written up" and the badge, the form and the adherence vocabulary are rendered
+    by nothing that runs. With every card written up, the badge that says a
+    decision has NOT been thought about -- the state most cards are in for any real
+    reader -- is the one that never appears.
+
+    Anchors are checked to be real order ids rather than trusted: `DEMO_JOURNAL`
+    names positions in the account's order sequence precisely because the ids are
+    derived from a hash, and a seed pointing at no fill would be an entry no card
+    can ever show.
+    """
+    from optjournal import journal
+    from optjournal.demo import (
+        DEMO_ACCOUNT,
+        DEMO_JOURNAL,
+        write_demo_journal,
+    )
+
+    written = write_demo_journal(conn)
+    assert written == len(DEMO_JOURNAL)
+
+    entries = journal.entries(conn)
+    assert len(entries) == len(DEMO_JOURNAL)
+    orders = {
+        str(r["ib_order_id"]) for r in conn.execute(
+            "SELECT DISTINCT ib_order_id FROM trades WHERE ib_order_id IS NOT NULL")
+    }
+    for (_broker, account, anchor), entry in entries.items():
+        assert account == DEMO_ACCOUNT
+        assert anchor in orders, (
+            f"{anchor} is no order in the demo, so no card could ever show it"
+        )
+        assert entry.underlying_symbol and entry.opened_on, (
+            "the entry cannot say which decision it belongs to"
+        )
+
+    # One reviewed and one not, so both halves of the form have rendered state.
+    reviewed = [e for e in entries.values() if e.values["exit_trigger"]]
+    assert len(reviewed) == 1, "the close review has no seeded example"
+    assert reviewed[0].values["followed_target"] in journal.ADHERENCE
+
+    # And most cards stay un-written: the state a real journal is mostly in.
+    lifecycles = conn.execute(
+        "SELECT COUNT(DISTINCT ib_order_id) AS n FROM trades"
+    ).fetchone()["n"]
+    assert len(entries) < lifecycles / 2, (
+        "the demo writes up too many decisions to show the un-written badge"
+    )
+
+
+def test_re_running_the_demo_never_overwrites_a_seeded_write_up(conn):
+    """`journal.save` MERGES, so a second run could rewrite a sentence.
+
+    The demo database is a place readers poke at, and this is the user-input table
+    -- the same argument that makes `write_demo_watchlist` an INSERT OR IGNORE and
+    keeps `reset_demo_rows` off both tables.
+    """
+    from optjournal import journal
+    from optjournal.demo import DEMO_ACCOUNT, write_demo_journal
+
+    write_demo_journal(conn)
+
+    anchor = sorted(journal.entries(conn))[0][2]
+    journal.save(conn, anchor, account_id=DEMO_ACCOUNT,
+                 values={"plan_target": "what the reader typed"})
+
+    assert write_demo_journal(conn) == 0, "a re-run created a second entry"
+    kept = journal.entry_for(conn, anchor, account_id=DEMO_ACCOUNT)
+    assert kept.values["plan_target"] == "what the reader typed", (
+        "the re-run overwrote a note the reader had written"
+    )
