@@ -14,15 +14,24 @@ Personal local tool: single user, loopback only, data lives beside the code.
 ## Quickstart
 
 ```bash
-# one-time: store the Flex token in the OS keyring
-security add-generic-password -s ibkr-flex-token -a "$USER" -w '<token>'
-
-uv run optjournal sync 1591754        # fetch + ingest + report what is new
-uv run optjournal serve --query-id 1591754   # UI on http://127.0.0.1:8765
+uv run optjournal setup               # token → OS keyring, query id → settings
+uv run optjournal sync                # fetch + ingest + report what is new
+uv run optjournal serve               # UI on http://127.0.0.1:8765
 
 uv run optjournal demo                # synthetic data in demo/ (never raw/)
 uv run optjournal serve --demo        # browse it
 ```
+
+`setup` asks for two things: the Flex token from Client Portal (Settings →
+Flex Web Service), which it writes to the OS keyring without echoing it, and
+the Flex Query ID, which it stores in `.optjournal.json` beside the database.
+It then spends one request confirming both actually work against IBKR, because
+a plausible-looking token and a plausible-looking id still fail together, and
+finding that out from a cron days later is worse. `--no-verify` skips that,
+`--query-id` and `--token-stdin` make it scriptable.
+
+Every command still takes `--query-id`, and `$OPTJOURNAL_QUERY_ID` still wins
+over the stored setting, so an existing install keeps working unchanged.
 
 `optjournal --help` lists the rest: `fetch`, `ingest`, `orders`,
 `positions`, `history`, `costs`, `friction`, `statements`, `prune`, `sweep`.
@@ -70,6 +79,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | module | owns |
 |---|---|
 | `config.py` | filesystem defaults (`raw/`, `journal.db`, `demo/`) |
+| `settings.py` | preferences that outlive a process: the Flex query id and the scoreboard unit, in a gitignored `.optjournal.json`. Owns the query id's precedence (argument, then `$OPTJOURNAL_QUERY_ID`, then stored) so `serve`, `sync` and the cron cannot disagree about it. Fails open on damage, like the fetch sidecar: a preference file must never stop the journal reading itself. The SECRET is not here -- that is the keyring, via `flex.py` |
 | `flex.py` | IBKR Flex fetch: token, retries, lockout budget, cooldown |
 | `fills.py` | `NormalisedFill`: one executed fill in broker-neutral terms. A leaf, like `money.py` -- the seam between a broker's statement and the database |
 | `sources.py` | `StatementSource` Protocol and the `SOURCES` registry: reads a broker's statement into `NormalisedFill`s. `IbkrSource` is the only implementation today and the one place that knows py_ibkr's attribute names |

@@ -174,6 +174,30 @@ import {
  *   the journal's whole history, narrowed to the reader's selection. Distinct from
  *   `costs`, which is one statement's own 30-day window (serialize.broker_costs_data)
  * @property {Sync} sync
+ * @property {Settings} settings -- what the settings page edits
+ */
+
+/** @typedef {Object} Settings -- editable preferences (web.build_state)
+ * @property {string|null} query_id -- the id a sync would actually use
+ * @property {string} query_id_source -- 'stored', 'override' or 'unset'.
+ *   'override' means a --query-id flag or $OPTJOURNAL_QUERY_ID outranks the
+ *   stored value, so the form must not offer to edit what would not take effect
+ * @property {string} scoring -- the scoreboard unit in force, same value as
+ *   stats.scoring; here so the settings form reads its own block
+ * @property {Object|null} token -- ALWAYS null on load. The keyring has been
+ *   measured at 8.2s with a locked keychain, so presence is fetched from
+ *   /api/settings/token by a button and held here afterwards
+ */
+
+/** @typedef {Object} TokenStatus -- GET /api/settings/token (web._token_status)
+ * @property {boolean} ok
+ * @property {string} kind
+ * @property {boolean|null} present -- true, false, or NULL when the keyring
+ *   itself could not be read. Three states, because "unreadable" must not be
+ *   reported as "missing": that would send a reader with a perfectly good token
+ *   off to re-enter it
+ * @property {string} account -- the OS user the entry is filed under
+ * @property {string} message
  */
 
 /** @typedef {Object} BrokerCosts -- the Costs tab's whole payload
@@ -912,6 +936,7 @@ import {
  *  the guard to both. Declared here, in the file being edited, in the same
  *  diff as the code that introduces the name.
  * @payload st:State s:Stats best:Stats alt:Stats x:Episode ep:Episode dy:Day
+ * @payload se:Settings tok:TokenStatus
  * @payload pos:Position o:Order l:Leg h:History
  * @payload stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
  * @payload mo:Money
@@ -937,7 +962,7 @@ import {
  * @local when button parts names y
  * @local COST_OPTIONS bits cost fees on wh
  * @local STATS_KEYS_REQUIRED missing state
- * @local SCORINGS
+ * @local SCORINGS qidsave tokcheck
  */
 
 const $=s=>document.querySelector(s);
@@ -1352,8 +1377,13 @@ function scoringRow(){
       ${matters?'':'disabled'} title="${esc(tip)}"
       >${esc(scoringLabel(unit))}</button>`;
   }).join('');
+  /* Wrapped in a `.setrow` so the toggle sizes to its content like every other
+     control in this panel. Bare, `.ccytog` is a block-level flex container and
+     stretched the full width of the card -- two buttons on the left and a metre
+     of empty border to the right, which reads as a layout that broke rather than
+     as a segmented control. */
   return `<h2 class="sub3 mt-5">Scoreboard</h2>
-    <div class="ccytog">${row}</div>
+    <div class="setrow"><div class="ccytog">${row}</div></div>
     <div class="note">Which unit <b>W</b>, <b>L</b>, win rate and the averages
       count, on every tab. ${esc(scoringTip(SCORING()))} The money never moves:
       net P&amp;L, commission and the fill counts are identical under both, so the
@@ -3482,36 +3512,99 @@ function odte(){
   </div>`;
 }
 
-/* ------------------------------------------------ cog panel */
-function cog(){
-  const st=S.state;
+/* ------------------------------------------------ settings panel
+
+   TWO CARDS, and the split is the point. This panel was one card holding version
+   strings, absolute paths, a 25-row archive inventory and a timestamp -- every
+   one of them read-only. It was labelled Settings and let a reader change
+   nothing, which is a worse answer than having no panel: someone looking for
+   where to put their Flex query id found a table that displayed it.
+
+   So: SETTINGS is the things a person can change, and each control writes
+   through and says so. ADVANCED is the diagnostics that were here before, behind
+   a <details> because their audience is someone debugging, not someone
+   configuring -- and the archive table is 25 rows on this journal, which is a
+   scroll nobody asked for on the way to two buttons. */
+function settingsPanel(){
+  const st=S.state, se=st.settings||{};
+  const src=se.query_id_source;
+  const overridden=src==='override';
+  const tok=se.token;
+  /* The token is PRESENCE only, fetched on demand -- see the Settings typedef on
+     why it is not on the payload. Three states, not two: null means nobody has
+     asked yet, and rendering that as "missing" would tell a reader with a
+     perfectly good token to go and re-enter it. */
+  const tokLine=tok===null||tok===undefined
+    ? `<span class="dim2">not checked</span>`
+    : tok.present===true
+      ? `<span class="pos">stored</span> <span class="dim">for ${esc(tok.account||'')}</span>`
+      : tok.present===false
+        ? `<span class="neg">missing</span> <span class="dim">— run
+           <code>optjournal setup</code></span>`
+        : `<span class="neg">unreadable</span> <span class="dim">${esc(
+           tok.message||'')}</span>`;
   return `<div class="card">
-    <h2 class="sub3">Journal details</h2>
-    <table><tbody>
-      <tr><td class="dim">version</td><td class="mono">${esc(st.version)}</td></tr>
-      <tr><td class="dim">database</td><td class="mono">${esc(st.db)}</td></tr>
-      <tr><td class="dim">archive</td><td class="mono">${esc(st.archive)}</td></tr>
-      <tr><td class="dim">query id</td><td class="mono">${esc(st.sync.query_id||'not set')}</td></tr>
-      <tr><td class="dim">last fetch</td><td class="mono">${esc(st.sync.last_fetch||'never')}</td></tr>
-      <tr><td class="dim">fetch cooldown</td><td class="mono">${st.sync.cooldown_s}s
-        (${st.sync.cooldown_remaining_s}s remaining)</td></tr>
-      <tr><td class="dim">generated</td><td class="mono">${esc(st.generated_at)}</td></tr>
-    </tbody></table>
-    <h2 class="sub3 mt-5">Archive</h2>
-    <table><thead><tr><th>file</th><th>period</th><th class="n">bytes</th>
-      <th>ingested</th><th>assets</th></tr></thead><tbody>
-      ${(st.statements||[]).map(stm=>`<tr><td class="mono">${esc(stm.file)}</td>
-        <td class="dim">${esc(stm.from_date||'?')} → ${esc(stm.to_date||'?')}</td>
-        <td class="n mono">${(stm.bytes||0).toLocaleString()}</td>
-        <td class="${stm.ingested?'pos':'dim2'}">${stm.ingested?'yes':'no'}</td>
-        <td class="dim">${esc(stm.asset_filter||'-')}</td></tr>`).join('')}
-    </tbody></table>
+    <div class="crow"><div><h2>Settings</h2>
+      <div class="sub">Stored beside the journal in <code>.optjournal.json</code>,
+      so they survive a restart. The Flex <b>token</b> is never here — it lives in
+      the OS keyring, and <code>optjournal setup</code> is the only thing that
+      writes it.</div></div></div>
+
+    <h2 class="sub3 mt-5">IBKR connection</h2>
+    <div class="setrow">
+      <label class="flabel" for="qid">Flex Query ID</label>
+      <input id="qid" class="tin mono" inputmode="numeric" maxlength="32"
+        value="${esc(se.query_id||'')}" placeholder="1591754"
+        ${overridden?'disabled':''}>
+      <button id="qidsave" ${overridden?'disabled':''}>Save</button>
+      <span id="qidmsg" class="dim"></span>
+    </div>
+    ${overridden?`<div class="note">This id comes from a
+      <code>--query-id</code> flag or <code>$OPTJOURNAL_QUERY_ID</code>, which
+      outrank anything saved here — so the field is read-only rather than
+      accepting a value that would not take effect. Drop the flag to edit it
+      from this page.</div>`
+      :src==='unset'?`<div class="note"><b>No query id yet.</b> Client Portal →
+        Performance &amp; Reports → Flex Queries. Sync stays disabled until this
+        is set.</div>`:''}
+    <div class="setrow mt-4">
+      <span class="flabel">Flex token</span>
+      <span>${tokLine}</span>
+      <button id="tokcheck">Check keyring</button>
+      <span class="dim">presence only, and never the value</span>
+    </div>
+
     ${scoringRow()}
-    <div class="note"><b>Needs the Flex query template:</b>
-      <i>Gain % of Net Liq</i> reads the Equity Summary section — enable it on the
-      query and sync, and the figure fills in from the next statement. <i>Trade
-      Replay</i> needs intraday underlying prices, implied volatility and greeks —
-      none of which a statement carries.</div>
+
+    <details class="adv mt-5">
+      <summary>Advanced — journal details and archive</summary>
+      <div class="note">Diagnostics, not settings: nothing here is editable, and
+      it is what you want when something looks wrong rather than when you are
+      setting the journal up.</div>
+      <table><tbody>
+        <tr><td class="dim">version</td><td class="mono">${esc(st.version)}</td></tr>
+        <tr><td class="dim">database</td><td class="mono">${esc(st.db)}</td></tr>
+        <tr><td class="dim">archive</td><td class="mono">${esc(st.archive)}</td></tr>
+        <tr><td class="dim">last fetch</td><td class="mono">${esc(st.sync.last_fetch||'never')}</td></tr>
+        <tr><td class="dim">fetch cooldown</td><td class="mono">${st.sync.cooldown_s}s
+          (${st.sync.cooldown_remaining_s}s remaining)</td></tr>
+        <tr><td class="dim">generated</td><td class="mono">${esc(st.generated_at)}</td></tr>
+      </tbody></table>
+      <h2 class="sub3 mt-5">Archive — ${(st.statements||[]).length} statement(s)</h2>
+      <table><thead><tr><th>file</th><th>period</th><th class="n">bytes</th>
+        <th>ingested</th><th>assets</th></tr></thead><tbody>
+        ${(st.statements||[]).map(stm=>`<tr><td class="mono">${esc(stm.file)}</td>
+          <td class="dim">${esc(stm.from_date||'?')} → ${esc(stm.to_date||'?')}</td>
+          <td class="n mono">${(stm.bytes||0).toLocaleString()}</td>
+          <td class="${stm.ingested?'pos':'dim2'}">${stm.ingested?'yes':'no'}</td>
+          <td class="dim">${esc(stm.asset_filter||'-')}</td></tr>`).join('')}
+      </tbody></table>
+      <div class="note"><b>Needs the Flex query template:</b>
+        <i>Gain % of Net Liq</i> reads the Equity Summary section — enable it on the
+        query and sync, and the figure fills in from the next statement. <i>Trade
+        Replay</i> needs intraday underlying prices, implied volatility and greeks —
+        none of which a statement carries.</div>
+    </details>
   </div>`;
 }
 
@@ -3648,7 +3741,7 @@ function draw(push){
    * this. A framework's reconciliation is the other answer to this problem, and
    * for one field it is not worth a build step -- see the note in README. */
   const keep=preserveInputs();
-  $('#body').innerHTML=(S.showCog?cog():'')+(v?v():
+  $('#body').innerHTML=(S.showCog?settingsPanel():'')+(v?v():
     `<div class="card"><div class="empty">nothing here yet</div></div>`);
   restoreInputs(keep);
   const sel=$('#month');
@@ -3703,13 +3796,47 @@ function draw(push){
      be a second implementation of campaigns.py in the page -- the exact
      duplication that module exists to prevent. */
   document.querySelectorAll('button[data-scoring]').forEach(b=>
-    b.onclick=()=>{
+    b.onclick=async()=>{
       const unit=b.dataset.scoring;
       /* The default is stored as null, so the hash and the request omit it and
          one spelling of "position" cannot disagree with the server's. */
       S.scoring=unit===SCORINGS[0]?null:unit;
+      /* PERSISTED as well as applied, because this is a settings page: a control
+         in a panel labelled Settings that forgets on restart is the complaint
+         this panel exists to answer. The hash still carries it so a link works,
+         and `load()` below re-reads the stored value either way -- so a failed
+         save leaves the view and the file agreeing, not diverging. */
+      await save({scoring:unit});
       load();
     });
+  const qidsave=$('#qidsave');
+  if(qidsave) qidsave.onclick=async()=>{
+    const el=$('#qid'), msg=$('#qidmsg');
+    if(msg) msg.textContent='saving...';
+    const res=await save({query_id:(el&&el.value||'').trim()});
+    /* The SERVER's message, not a local guess: it holds the shape rule (digits,
+       length) and repeating it here would be two rules to keep in step. */
+    if(msg) msg.textContent=res&&res.ok?'saved':((res&&res.message)||'failed');
+    if(res&&res.ok) load();
+  };
+  const tokcheck=$('#tokcheck');
+  if(tokcheck) tokcheck.onclick=async()=>{
+    tokcheck.disabled=true;
+    try{
+      /* A GET, and the one place the keyring is touched from the page. Held on
+         `S.state.settings` rather than in a variable so the next `draw()` still
+         shows the answer -- and never persisted, because a keyring can change
+         under a running server. */
+      const r=await fetch('/api/settings/token');
+      const j=await r.json();
+      if(S.state&&S.state.settings) S.state.settings.token=j;
+    }catch(err){
+      note('Could not reach the journal to check the keyring: '+err,'bad');
+    }finally{
+      tokcheck.disabled=false;
+    }
+    draw();
+  };
   document.querySelectorAll('.multi button[data-cost]').forEach(b=>
     b.onclick=()=>{
       const csc=(S.state.broker_costs||{}).scope||{};
@@ -3979,6 +4106,22 @@ function bindWatchlist(){
       await watchWrite({symbol:symbol,action:'remove'});
     });
   const qb=$('#wquote'); if(qb) qb.onclick=()=>loadQuotes(true);
+}
+
+/* One POST for every setting, returning the server's own reply rather than
+   raising or banner-ing: each caller in the settings panel reports differently
+   (the query id writes into a field's own status span, the scoring toggle just
+   reloads), and a helper that decided that for them would make one of the two
+   wrong. A transport failure still answers the same SHAPE as a refusal, so no
+   caller has to distinguish "no reply" from "no". */
+async function save(body){
+  try{
+    const r=await fetch('/api/settings',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    return await r.json();
+  }catch(e){
+    return {ok:false,message:'could not reach the journal: '+e};
+  }
 }
 
 async function watchWrite(body){

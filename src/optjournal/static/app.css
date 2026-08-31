@@ -454,6 +454,35 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
 .mt-4{margin-top:16px}
 .mt-5{margin-top:18px}
 .mt-6{margin-top:20px}
+/* ---- the settings panel ----------------------------------------------
+   One editable setting per row: label, control, action, status. `align-items:
+   center` rather than baseline because the row mixes an input, a button and a
+   status span whose text is often empty -- baseline alignment against an empty
+   span collapses the row. Wraps, so a narrow window stacks the status under the
+   control instead of pushing the Save button off the card. */
+.setrow{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+/* The label inside a row, so it does not carry `.flabel`'s bottom margin, which
+   was written for a label ABOVE its control. */
+.setrow .flabel{margin-bottom:0;min-width:118px}
+/* A text input, styled to match `.seg`/`.ccytog` controls rather than inheriting
+   the browser default -- a raw input beside those reads as an artefact. */
+.tin{background:var(--panel);border:1px solid var(--line);border-radius:9px;
+  color:var(--fg);font:inherit;font-size:13px;padding:8px 11px;min-width:170px}
+.tin:focus{outline:none;border-color:var(--accentlit1)}
+.tin:disabled{opacity:.55;cursor:not-allowed}
+.setrow button{background:var(--panel);border:1px solid var(--line);border-radius:9px;
+  color:var(--fg);font:inherit;font-weight:600;font-size:13px;padding:8px 15px;
+  cursor:pointer}
+.setrow button:hover:not(:disabled){border-color:var(--accentlit1)}
+.setrow button:disabled{opacity:.4;cursor:not-allowed}
+/* Diagnostics, folded away. The marker is styled as a control because it IS one:
+   an unstyled <summary> triangle in a panel of rounded buttons reads as unfinished
+   markup rather than as something to click. */
+.adv>summary{cursor:pointer;font-size:14px;font-weight:600;padding:9px 0;
+  color:var(--dim)}
+.adv>summary:hover{color:var(--fg)}
+.adv[open]>summary{color:var(--fg)}
+
 /* A headline figure: the dashboard's net P&L, which is deliberately larger than
    every other number on the page. */
 .big{font-size:22px;font-weight:700}

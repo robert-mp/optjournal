@@ -54,7 +54,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from optjournal import __version__, replay
+from optjournal import __version__, replay, settings as prefs
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.campaigns import position_count
@@ -73,6 +73,7 @@ from optjournal.flex import (
     cooldown_remaining,
     last_fetch,
     load,
+    read_token,
 )
 from optjournal.history import build_history
 from optjournal.ingest import DEFAULT_ASSET_FILTER
@@ -104,6 +105,8 @@ from optjournal.serialize import (
 from optjournal.stats import (
     EQUITY_CATEGORY,
     EQUITY_TRADES,
+    POSITION_SCORING,
+    SCORINGS,
     annual_stats,
     available_months,
     campaigns_for,
@@ -141,6 +144,14 @@ def _is_loopback(host: str) -> bool:
 #: listings, and not enough for a path or a quote. Not a ticker universe:
 #: see `_watchlist_write` on why this journal has no such list.
 _SYMBOL_OK = re.compile(r"^[A-Za-z0-9.\-]+$")
+
+#: How long `/api/settings/token` waits for the OS credential store before
+#: answering "unreadable". Not a guess: `keyring.get_password` was measured on
+#: this machine returning nothing at all within 10s while the keychain waited for
+#: an unlock, so the read needs a deadline or the request never replies. Long
+#: enough that a keychain which merely needs a moment still answers, short enough
+#: that a button does not look stuck.
+KEYRING_TIMEOUT_S = 4.0
 
 
 def _origin_is_same(origin: str | None, *, host: str, port: int) -> bool:
@@ -287,6 +298,10 @@ def build_state(
     same month -- which is the defect `campaigns.py` was written to remove, not
     one to reintroduce behind a toggle.
     """
+    # The stored unit applies when the request names none, so a choice made in the
+    # settings page survives a reload and a restart. An explicit request parameter
+    # still wins: that is the page's own hash, i.e. what this reader last clicked.
+    scoring = prefs.scoring(scoring)
     with open_journal(db_path) as conn:
         # RESOLVE ABANDONED RUNS FIRST, before anything reads `job_runs`.
         #
@@ -492,6 +507,29 @@ def build_state(
     else:
         state["costs"] = []
 
+    # WHERE the effective id came from, so the settings page can offer to edit it
+    # only when editing would actually take effect. A `--query-id` flag or an
+    # exported variable outranks the stored setting (see `settings.query_id`), and
+    # a form that saved into a value something else overrides is a form that lies
+    # about having worked.
+    stored_qid = prefs.read().get("query_id")
+    if query_id and query_id != (str(stored_qid).strip() if stored_qid else None):
+        source = "override"
+    elif query_id:
+        source = "stored"
+    else:
+        source = "unset"
+    state["settings"] = {
+        "query_id": query_id,
+        "query_id_source": source,
+        "scoring": state["stats"]["scoring"],
+        # Deliberately NOT a keyring lookup. `flex.read_token` reaches the OS
+        # credential store, which has been measured at 8.2s on this machine when
+        # the keychain needs unlocking -- once per page load, on every tab. The
+        # page asks `GET /api/settings/token` from a button instead, so the cost
+        # is paid by someone who wants the answer.
+        "token": None,
+    }
     state["sync"] = {
         "query_id": query_id,
         "configured": bool(query_id),
@@ -609,7 +647,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._json(200, build_state(
                     db_path=self.cfg.db_path,
                     archive_dir=self.cfg.archive_dir,
-                    query_id=self.cfg.query_id,
+                    # RESOLVED per request, not taken from the frozen config: the
+                    # settings page can save a new id while this process runs, and
+                    # reading `cfg.query_id` here left the page showing "no query
+                    # id" immediately after a save that had genuinely worked.
+                    query_id=self._effective_query_id(),
                     month=(params.get("month") or [None])[0],
                     trade_type=(params.get("type") or [None])[0],
                     # Repeatable, so `?cost=OPT&cost=CASH` is a multi-select
@@ -624,6 +666,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 ))
             except sqlite3.OperationalError as exc:
                 self._json(500, {"error": f"database not readable: {exc}"})
+        elif path == "/api/settings/token":
+            self._json(*self._token_status())
         elif path == "/api/quotes":
             self._json(*self._quotes())
         elif path == "/api/jobs/run":
@@ -730,6 +774,114 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             stored = store_events(conn, events)
         return 200, {"ok": True, "kind": "market", "fetched": len(events),
                      "stored": stored}
+
+    def _effective_query_id(self) -> str | None:
+        """The id a sync would actually use, resolved per request.
+
+        Read here rather than trusted from `self.cfg`, because the settings page
+        can change it while this process runs and `ServeConfig` is frozen. The
+        alternative was telling the reader to restart the server after saving,
+        which for a setting this basic is not a workable answer.
+        """
+        return prefs.query_id(self.cfg.query_id)
+
+    def _token_status(self) -> tuple[int, dict[str, Any]]:
+        """Whether a Flex token is in the OS keyring. On demand, and bounded.
+
+        Its own endpoint because the credential store is SLOW, and worse than
+        slow: measured on this machine, `keyring.get_password` did not return AT
+        ALL within 10s when the keychain wanted an unlock the caller could not
+        answer. On `/api/state` that would hold the whole page hostage to a
+        system dialog; here a button asks and a page load never does.
+
+        Bounded by a thread with a deadline for the same measurement. A blocking
+        read left the HTTP request open with no reply and the button spinning
+        forever, so the wait is capped and a timeout is reported as
+        `present: null` -- UNREADABLE, which is a different answer from missing.
+        Telling someone their stored token is gone because a dialog was pending
+        would send them to re-enter a credential that is already there.
+
+        The worker is a daemon so a still-blocked read cannot keep the process
+        alive; the OS resolves or cancels its own prompt in its own time.
+
+        Reports PRESENCE, never the value, and never whether IBKR accepts it:
+        only a real fetch can answer that, and that costs a request.
+        """
+        import getpass
+
+        account = getpass.getuser()
+        outcome: list[tuple[str, str]] = []
+
+        def probe() -> None:
+            try:
+                read_token(account)
+            except TokenMissing as exc:
+                outcome.append(("absent", str(exc)))
+            except Exception as exc:  # pragma: no cover - backend failures
+                outcome.append(("error", str(exc)))
+            else:
+                outcome.append(("present", "a token is stored for this account"))
+
+        worker = threading.Thread(target=probe, daemon=True)
+        worker.start()
+        worker.join(KEYRING_TIMEOUT_S)
+        if not outcome:
+            log.warning("keyring did not answer within %ss", KEYRING_TIMEOUT_S)
+            return 200, {
+                "ok": False, "kind": "keyring", "present": None,
+                "account": account,
+                "message": f"the OS keyring did not answer within "
+                           f"{KEYRING_TIMEOUT_S}s, usually because it is waiting "
+                           f"for you to unlock it. Check for a system prompt, or "
+                           f"run `optjournal setup` in a terminal.",
+            }
+        kind, message = outcome[0]
+        if kind == "error":  # pragma: no cover - backend failures
+            log.warning("keyring unreadable: %s", message)
+            return 200, {"ok": False, "kind": "keyring", "present": None,
+                         "account": account, "message": message}
+        return 200, {"ok": True, "kind": "token", "present": kind == "present",
+                     "account": account, "message": message}
+
+    def _settings_write(self) -> tuple[int, dict[str, Any]]:
+        """Save preferences from the settings page.
+
+        Only the keys `settings.update` knows, and it refuses the rest -- so a
+        renamed field fails loudly here instead of silently storing a preference
+        nothing reads.
+
+        The token is NOT settable through this endpoint, and that is deliberate:
+        it would put a brokerage credential in an HTTP body on a server with no
+        authentication, where the browser would also keep it in form state and
+        the request in devtools history. `optjournal setup` reads it from a
+        no-echo prompt instead.
+        """
+        body = self._body()
+        changes: dict[str, Any] = {}
+        if "query_id" in body:
+            raw = str(body.get("query_id") or "").strip()
+            # Length- and shape-checked, not verified: only IBKR can say whether
+            # a well-formed id exists, and an id that does not simply fails the
+            # next fetch with a message that says so.
+            if raw and (len(raw) > 32 or not raw.isdigit()):
+                return 400, {"ok": False, "kind": "query_id",
+                             "message": f"{raw!r} is not a Flex query id: "
+                                        "Client Portal shows it as digits."}
+            changes["query_id"] = raw or None
+        if "scoring" in body:
+            raw = str(body.get("scoring") or "").strip()
+            if raw and raw not in SCORINGS:
+                return 400, {"ok": False, "kind": "scoring",
+                             "message": f"unknown scoreboard unit {raw!r}"}
+            # The DEFAULT is stored as absence, matching the hash and the wire:
+            # one spelling of "position" rather than two that can disagree.
+            changes["scoring"] = None if raw in ("", POSITION_SCORING) else raw
+        if not changes:
+            return 400, {"ok": False, "kind": "empty",
+                         "message": "no known setting in the request"}
+        stored = prefs.update(**changes)
+        return 200, {"ok": True, "kind": "settings", "stored": stored,
+                     "query_id": self._effective_query_id()}
 
     def _watchlist_write(self) -> tuple[int, dict[str, Any]]:
         """Add or remove one watched symbol.
@@ -886,14 +1038,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/jobs/run":
             self._json(*self._job_run())
             return
+        if path == "/api/settings":
+            self._json(*self._settings_write())
+            return
         if path != "/api/sync":
             self._json(404, {"error": "not found"})
             return
-        if not self.cfg.query_id:
+        query_id = self._effective_query_id()
+        if not query_id:
             self._json(400, {
                 "ok": False, "kind": "config",
-                "message": "No Flex query ID configured. Start with "
-                           "`optjournal serve --query-id <id>`.",
+                "message": "No Flex query ID configured. Set one in Settings, "
+                           "or run `optjournal setup`.",
             })
             return
         # Serialised: two concurrent syncs would each spend a request and race
@@ -906,7 +1062,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, _do_sync(
                 db_path=self.cfg.db_path,
                 archive_dir=self.cfg.archive_dir,
-                query_id=self.cfg.query_id,
+                query_id=query_id,
                 assets=self.cfg.assets,
             ))
         finally:

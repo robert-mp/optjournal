@@ -51,7 +51,15 @@ from optjournal.events import (
     store_events,
     upcoming,
 )
-from optjournal.flex import FetchCooldown, TokenMissing, fetch, load
+from optjournal import settings
+from optjournal.flex import (
+    KEYRING_SERVICE,
+    FetchCooldown,
+    TokenMissing,
+    fetch,
+    load,
+    read_token,
+)
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal.jobs import record_run
@@ -750,9 +758,11 @@ def cmd_serve(args) -> int:
     # READ AFTER the `--demo` check, deliberately: the guard above is about an
     # EXPLICIT flag, so a developer who exports the variable and then serves the
     # demo gets the demo, not a refusal and not a real fetch into synthetic tables.
-    query_id = args.query_id
-    if not query_id and not args.demo:
-        query_id = os.environ.get("OPTJOURNAL_QUERY_ID") or None
+    # `settings.query_id` holds the precedence (argument, environment, stored
+    # file) so `serve`, `sync` and the cron cannot each carry their own version
+    # of it -- and the STORED step is the one a launchd agent can actually see,
+    # which the environment channel above never was.
+    query_id = None if args.demo else settings.query_id(args.query_id)
     # A ROTATING LOG, FOR SERVE ONLY. This is the long-lived process -- the one
     # whose reconciler logs every tick -- and macOS rotates nothing for a launchd
     # agent's stdout, so a supervised `serve` would otherwise append to one file
@@ -782,6 +792,108 @@ def cmd_serve(args) -> int:
     return EXIT_OK
 
 
+def _prompt_token(existing: bool) -> str | None:
+    """Ask for the Flex token without echoing it, or None to keep what is there.
+
+    `getpass`, not `input`: a Flex token is a bearer credential for a brokerage
+    account, and echoing it puts it in the scrollback of a terminal that may be
+    shared or screen-shared. It is also why nothing here prints the value back.
+    """
+    import getpass
+
+    hint = " (blank keeps the stored one)" if existing else ""
+    while True:
+        entered = getpass.getpass(f"IBKR Flex token{hint}: ").strip()
+        if entered:
+            return entered
+        if existing:
+            return None
+        print("  A token is required. Client Portal → Settings → Flex Web Service.")
+
+
+def cmd_setup(args) -> int:
+    """Store the Flex token and query id, so a fresh install works after this.
+
+    The one command a new journal needs, and it exists because the setup it
+    replaces was a macOS-specific `security add-generic-password` invocation
+    copied out of a README plus an id remembered in a shell. Neither survives
+    handing this journal to somebody else, which is the case this is for.
+
+    The token goes to the OS keyring through `keyring` rather than the `security`
+    binary: same store on macOS, but it also works on Linux and Windows, and it
+    cannot leave the secret in shell history the way a `-w '<token>'` argument
+    does.
+
+    Non-interactive by flag as well as interactive by prompt (`--token-stdin`,
+    `--query-id`, `--no-verify`), because the first thing anyone automating an
+    install needs is a way to run this without a TTY.
+    """
+    import getpass as _getpass
+
+    import keyring
+
+    account = _getpass.getuser()
+    stored_token = keyring.get_password(KEYRING_SERVICE, account)
+    stored_qid = settings.read().get("query_id")
+
+    if args.token_stdin:
+        token = sys.stdin.read().strip() or None
+        if not token and not stored_token:
+            print("No token on stdin, and none stored.", file=sys.stderr)
+            return EXIT_CONFIG
+    elif args.query_id and not sys.stdin.isatty():
+        # A query id was given with no TTY to prompt on: configure what we can
+        # and leave the token alone rather than blocking on input nobody can
+        # provide. Silently prompting into a dead stdin is how a scripted
+        # install hangs forever.
+        token = None
+    else:
+        token = _prompt_token(bool(stored_token))
+
+    if token:
+        keyring.set_password(KEYRING_SERVICE, account, token)
+
+    query_id = args.query_id
+    if not query_id and sys.stdin.isatty():
+        shown = f" [{stored_qid}]" if stored_qid else ""
+        query_id = input(f"Flex Query ID{shown}: ").strip() or None
+    if query_id:
+        settings.update(query_id=query_id)
+
+    effective_qid = settings.query_id(query_id)
+    have_token = bool(token or stored_token)
+    print()
+    print(f"token      {'stored in the OS keyring' if have_token else 'MISSING'}"
+          f" (service {KEYRING_SERVICE}, account {account})")
+    print(f"query id   {effective_qid or 'MISSING'}")
+    print(f"settings   {settings.path_for()}")
+    print(f"database   {DEFAULT_DB}")
+    print(f"archive    {DEFAULT_ARCHIVE}")
+
+    if not have_token or not effective_qid:
+        print("\nIncomplete: run `optjournal setup` again.", file=sys.stderr)
+        return EXIT_CONFIG
+
+    # VERIFIED BY USE, not by inspecting the values. A token that is the right
+    # shape and a query id that is a plausible number still fail together at
+    # IBKR, and finding that out on the first real sync -- possibly from a cron,
+    # days later -- is the failure this avoids. It costs one request against the
+    # lockout budget, which is why it can be turned off.
+    if args.verify:
+        print("\nVerifying against IBKR (one request)...")
+        try:
+            read_token(account)
+            result = fetch(effective_qid, archive_dir=DEFAULT_ARCHIVE)
+        except FetchCooldown as exc:
+            print(f"  skipped: {exc}")
+        else:
+            print(f"  ok: {result.raw_bytes:,} bytes -> {result.raw_path.name}")
+            print("\nNext:  optjournal ingest && optjournal serve")
+            return EXIT_OK
+    print("\nNext:  optjournal sync && optjournal serve")
+    return EXIT_OK
+
+
 def cmd_sync(args) -> int:
     """Fetch the latest statement, fold it in, and report only what is new.
 
@@ -789,11 +901,11 @@ def cmd_sync(args) -> int:
     nothing changed and to distinguish IBKR throttling from a real failure --
     a cron that cannot tell those apart either spams or hides outages.
     """
-    query_id = args.query_id or os.environ.get("OPTJOURNAL_QUERY_ID")
+    query_id = settings.query_id(args.query_id)
     if not query_id:
         print(
-            "No Flex query ID. Pass it as an argument or set "
-            "OPTJOURNAL_QUERY_ID.",
+            "No Flex query ID. Run `optjournal setup`, pass it as an argument, "
+            "or set OPTJOURNAL_QUERY_ID.",
             file=sys.stderr,
         )
         return EXIT_CONFIG
@@ -978,6 +1090,18 @@ def build_parser() -> argparse.ArgumentParser:
                       help="report whether the last session's perishable option "
                            "bars actually landed; fetches nothing")
     p.set_defaults(func=cmd_bars)
+
+    p = sub.add_parser("setup", parents=[common],
+                       help="store the Flex token and query id (run me first)")
+    p.add_argument("--query-id", dest="query_id", default=None,
+                   help="Flex Query ID to store; prompted for when omitted")
+    p.add_argument("--token-stdin", action="store_true",
+                   help="read the token from stdin instead of prompting, for "
+                        "scripted installs")
+    p.add_argument("--no-verify", dest="verify", action="store_false",
+                   help="skip the confirming fetch, which spends one IBKR "
+                        "request against the lockout budget")
+    p.set_defaults(func=cmd_setup, verify=True)
 
     p = sub.add_parser("sync", parents=[common, archive, database],
                        help="fetch, ingest and report new activity (for cron)")

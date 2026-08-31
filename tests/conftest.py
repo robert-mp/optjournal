@@ -19,6 +19,7 @@ back to the behaviour it exercises.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sqlite3
@@ -26,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from optjournal import settings
 from optjournal.db import connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 
@@ -74,6 +76,33 @@ skip_if_copy = pytest.mark.skipif(
     reason="pins the original checkout's absolute paths; this tree is a copy "
            "(git worktree or mutation clone), where they cannot hold",
 )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolated_settings_home(tmp_path_factory):
+    """Point `settings` at a scratch directory for the whole session.
+
+    AUTOUSE, because the failure it prevents is silent and does not belong to any
+    one test: `settings.path_for` defaults to the repo root, so every test that
+    exercises the Flex query id's precedence would otherwise read the developer's
+    own `.optjournal.json`. That made
+    `test_no_query_id_anywhere_stays_none_rather_than_empty` pass or fail
+    depending on whether whoever ran the suite had run `optjournal setup` --
+    a test whose result depends on the machine is a test that has stopped
+    describing the code.
+
+    Session-scoped so a test CAN write settings and see them, which the ones
+    about persistence need; anything wanting a pristine directory passes its own
+    `root` (see tests/test_settings.py, which uses `tmp_path` throughout).
+    """
+    home = tmp_path_factory.mktemp("settings-home")
+    previous = os.environ.get(settings.HOME_ENV)
+    os.environ[settings.HOME_ENV] = str(home)
+    yield home
+    if previous is None:
+        os.environ.pop(settings.HOME_ENV, None)
+    else:
+        os.environ[settings.HOME_ENV] = previous
 
 
 @pytest.fixture

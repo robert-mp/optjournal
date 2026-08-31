@@ -297,6 +297,11 @@ def test_contract_parser_is_correct():
 _UNSAMPLED = frozenset({
     "ChartPoint", "Bucket", "SyncResponse",
     "MarketFetch", "WatchWrite", "QuoteReply", "Quote",
+    # `GET /api/settings/token`. Deliberately off the state payload -- the
+    # keyring has been measured at 8.2s with a locked keychain, so presence is
+    # fetched by a button rather than on every page load, and no `/api/state`
+    # sample can carry it.
+    "TokenStatus",
     # `/api/jobs/run`, both verbs. Exempt for the same reason as the rest and one
     # more: its keys are CONDITIONAL on the HTTP status (`jobs` only on 400,
     # `run_id` on 202 and 409, `status` only on the GET), so no single reply
@@ -420,6 +425,7 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "Strike": first(striped["strikes"]) if striped else None,
         "Annotation": first(evented["events"]) if evented else None,
         "Sync": state["sync"],
+        "Settings": state["settings"],
     }
     missing = sorted(k for k, v in samples.items() if v is None)
     assert not missing, (
