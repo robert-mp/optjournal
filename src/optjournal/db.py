@@ -47,7 +47,7 @@ __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -409,6 +409,66 @@ CREATE TABLE IF NOT EXISTS watchlist (
   -- `clock.et_day` on every read and it cannot drift from the date it counts to.
   earnings_on TEXT,
   added_at   TEXT NOT NULL
+);
+
+-- THE ONLY IRREPLACEABLE TABLE IN THIS DATABASE.
+--
+-- Every other row here is re-derivable: delete the journal, re-ingest `raw/`, and
+-- the trades, positions, episodes, campaigns and every statistic come back
+-- identical. What a trader INTENDED cannot be recovered from a statement, so
+-- these rows are the only ones a lost file actually loses. That asymmetry is why
+-- the table is deliberately dull -- text and small enums, nothing derived, no
+-- cached figure that could disagree with what it was computed from.
+--
+-- KEYED ON AN ORDER ID, not on a campaign. A campaign is recomputed on every
+-- ingest by a 90-second heuristic (`campaigns.link`), and its `episode_indices`
+-- are positions in a list that is rebuilt each time -- so keying on any of that
+-- would lose a reader's notes the first time a roll changed the grouping. An
+-- order id is IBKR's own, issued once, naming one placement forever.
+-- `Campaign.anchor` is its lowest, so a roll added tomorrow does not move it.
+--
+-- `underlying_symbol` and `opened_on` are RECORDED but not part of the key. They
+-- are what makes an orphan legible: if the clustering ever changes such that no
+-- campaign claims this anchor, the row still reads "the META decision opened on
+-- 2026-08-03" and can be surfaced for re-attaching, instead of being a number
+-- nothing points at. Silently losing a reader's own writing is the one failure
+-- this table may not have.
+CREATE TABLE IF NOT EXISTS journal_entries (
+  broker           TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}',
+  account_id       TEXT NOT NULL,
+  anchor_order_id  TEXT NOT NULL,
+
+  underlying_symbol TEXT,
+  opened_on        TEXT,
+
+  -- ENTRY: what the plan was, in the reader's own words. Two fields because a
+  -- plan has two halves and conflating them is what makes a journal unreadable
+  -- later: `plan_target` is where the trade is meant to be taken off in profit,
+  -- `plan_invalidation` is what would say the idea was wrong.
+  plan_target       TEXT,
+  plan_invalidation TEXT,
+  entry_note        TEXT,
+
+  -- CLOSE: the review. `followed_*` are 'yes' / 'no' / 'na' (see
+  -- journal.ADHERENCE) rather than a boolean, because "there was no loss exit to
+  -- follow" is a third answer and storing it as false would silently count a
+  -- winner as a plan not followed.
+  followed_target       TEXT,
+  followed_invalidation TEXT,
+  why_not_target        TEXT,
+  why_not_invalidation  TEXT,
+  -- Why the trade actually came off, from a fixed list (`journal.TRIGGERS`). An
+  -- enum and not free text purely so it can be COUNTED: "how often do I close on
+  -- a time stop rather than at target" is the question a journal exists to
+  -- answer, and free text cannot be grouped.
+  exit_trigger          TEXT,
+  exit_trigger_other    TEXT,
+  lessons               TEXT,
+  close_note            TEXT,
+
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL,
+  PRIMARY KEY (broker, account_id, anchor_order_id)
 );
 
 -- The SCHEDULING ANCHOR: one row per job, forever. See SCHEDULER_PLAN.md step 4.

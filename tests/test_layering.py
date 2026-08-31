@@ -192,6 +192,28 @@ def test_the_import_graph_is_acyclic():
     assert not cycles, "import cycles: " + "; ".join(" -> ".join(c) for c in cycles)
 
 
+def test_the_journal_holds_only_the_database():
+    """The irreplaceable table's module may not depend on the derivable ones.
+
+    `journal_entries` is the only table in this database that a re-ingest cannot
+    rebuild, and everything it attaches to -- campaigns, episodes, statistics --
+    IS rebuilt, on every ingest. So the dependency runs one way only: the layer
+    that derives may read the journal, and the journal may not read the layer
+    that derives. `orphans()` is handed the live anchors for exactly this reason,
+    where computing them itself would have been shorter.
+
+    Not `IMPORTS_LEAVES_ONLY`, because `db` is not a leaf. The property here is
+    narrower and about direction rather than purity: `journal.py` can open
+    SQLite, and must not know how a campaign is assembled.
+    """
+    held = sorted(_internal_imports(PACKAGE / "journal.py"))
+    assert set(held) <= {"db", *LEAVES}, (
+        f"journal.py imports {sorted(set(held) - {'db', *LEAVES})}. The one table "
+        "that cannot be re-derived must not depend on the layers that are: pass "
+        "what it needs in, as `orphans()` does with the live anchors."
+    )
+
+
 def test_the_leaf_list_names_only_real_modules():
     """A stale entry here would silently stop enforcing anything."""
     missing = sorted(

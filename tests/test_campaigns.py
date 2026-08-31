@@ -283,3 +283,83 @@ def test_the_count_applies_a_scope_without_disturbing_the_indices():
     assert position_count(camps, eps) == 2, "the control"
     assert position_count(camps, eps, in_scope=lambda e: e.conid == "A") == 1
     assert position_count(camps, eps, in_scope=lambda e: False) == 0
+
+
+# ------------------------------------------------------------------- the anchor
+
+
+def test_the_anchor_is_the_decisions_lowest_order_id():
+    """A campaign's stable handle, for anything keyed on a decision.
+
+    `episode_indices` cannot be one: they index the list `link` was handed, and
+    every ingest rebuilds that list. An order id is IBKR's own and names one
+    placement forever, so `journal.py` keys a reader's notes on it.
+    """
+    campaigns = link(
+        [_Ep("C1", ["T1"]), _Ep("C2", ["T2"])],
+        order_groups=_one_group("1241544750", "1241544513"),
+        order_of_trade={"T1": "1241544750", "T2": "1241544513"},
+    )
+    assert len(campaigns) == 1
+    assert campaigns[0].anchor == "1241544513"
+
+
+def test_a_roll_added_later_does_not_move_the_anchor():
+    """The property that makes it a key: a decision that GROWS keeps its handle.
+
+    A roll opens a new contract under a new, higher order id. If the anchor were
+    the newest order, or anything derived from membership, every roll would
+    re-point a reader's notes at a fresh key and orphan what they wrote.
+    """
+    before = link(
+        [_Ep("C1", ["T1"])],
+        order_groups=_one_group("1247248833"),
+        order_of_trade={"T1": "1247248833"},
+    )
+    after = link(
+        [_Ep("C1", ["T1"]), _Ep("C2", ["T2"])],
+        order_groups=_one_group("1247248833", "1299999999"),
+        order_of_trade={"T1": "1247248833", "T2": "1299999999"},
+    )
+    assert before[0].anchor == after[0].anchor == "1247248833"
+
+
+def test_the_anchor_compares_numerically_not_as_text():
+    """`min` on strings ranks '999' above '1000'.
+
+    True of the real ids only because they are all ten digits, which is the kind
+    of accident that holds until IBKR issues a shorter one. Asserted on ids of
+    different lengths, since equal lengths cannot tell the two orderings apart.
+    """
+    campaigns = link(
+        [_Ep("C1", ["T1"]), _Ep("C2", ["T2"])],
+        order_groups=_one_group("999", "1000"),
+        order_of_trade={"T1": "999", "T2": "1000"},
+    )
+    assert campaigns[0].anchor == "999", "text ordering would have chosen 1000"
+
+
+def test_a_non_numeric_order_id_sorts_last_rather_than_raising():
+    """A broker that labels an order 'A17' must not break a page render.
+
+    Numbers first, so the anchor stays IBKR's earliest placement whenever one is
+    present, and the odd label is merely last instead of an exception thrown
+    halfway through building the payload.
+    """
+    campaigns = link(
+        [_Ep("C1", ["T1"]), _Ep("C2", ["T2"])],
+        order_groups=_one_group("A17", "1000"),
+        order_of_trade={"T1": "A17", "T2": "1000"},
+    )
+    assert campaigns[0].anchor == "1000"
+
+
+def test_a_campaign_with_no_fills_has_no_anchor():
+    """The LEAP held from before the archive: a position with no orders.
+
+    None rather than a placeholder, because two such campaigns would collide on
+    any placeholder chosen -- so `journal.save` refuses them explicitly instead
+    of quietly filing both under one key.
+    """
+    campaigns = link([_Ep("C1", [])], order_groups=[], order_of_trade={})
+    assert campaigns[0].anchor is None

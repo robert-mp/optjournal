@@ -90,6 +90,19 @@ def _dt(value: Any) -> datetime | None:
         return None
 
 
+def _order_sort_key(order_id: str) -> tuple[int, float]:
+    """Sortable numerically when an order id is a number, else last.
+
+    `(0, value)` for the numeric ids IBKR issues and `(1, inf)` for anything
+    else, so a broker that ever labels an order 'A17' sorts after every number
+    rather than raising in the middle of a page render.
+    """
+    try:
+        return (0, float(order_id))
+    except (TypeError, ValueError):
+        return (1, float("inf"))
+
+
 @dataclass(frozen=True, slots=True)
 class Campaign:
     """One continuing decision, and the episodes that carried it out.
@@ -121,6 +134,33 @@ class Campaign:
     #: matching the lifecycle card and the Dashboard's own rule.
     realized: Money | None
     commission: Money | None
+
+    @property
+    def anchor(self) -> str | None:
+        """The campaign's stable handle: its lowest order id, or None if it has
+        no fills.
+
+        `episode_indices` cannot be a handle -- they are positions in the list
+        `link` was handed, and every ingest rebuilds that list. Nor can the
+        campaign's identity be its membership, which a 90-second heuristic
+        decides and a later fill can change. An ORDER ID is neither: IBKR issued
+        it, it names one placement forever, and it is already carried here
+        because the Trades tab reaches campaigns through orders.
+
+        The LOWEST, so the handle is the decision's earliest placement and a roll
+        added tomorrow does not move it. Compared numerically, because IBKR order
+        ids are numbers in text and `min` on strings would rank '999' above
+        '1000' -- true today only because the real ids are all ten digits, which
+        is the kind of accident that holds until it does not. Ties fall back to
+        the string so the answer is total either way.
+
+        None for a campaign built only from position snapshots: the archive holds
+        no fills for it, so there is no order to name. Callers that key anything
+        on this have to say what they do about that -- see `journal.py`.
+        """
+        if not self.order_ids:
+            return None
+        return min(self.order_ids, key=lambda oid: (_order_sort_key(oid), oid))
 
     @property
     def is_win(self) -> bool:
