@@ -232,6 +232,13 @@ def position_groups(
             "opened_at": opening.get("first_fill_at"),
             "closed_at": camp.closed_at if camp else None,
             "conids": list(camp.conids) if camp else [],
+            # The handle anything keyed on this DECISION uses -- today the
+            # journal entry. `campaigns.Campaign.anchor`: the lowest order id the
+            # decision filled under, which survives the rebuild this whole
+            # structure goes through on every ingest. None for a card no campaign
+            # claims (snapshots only), and the page renders that as a decision it
+            # cannot yet attach writing to rather than hiding the button.
+            "anchor": camp.anchor if camp else None,
             "episodes": len(eps),
             "fills": sum(e.get("fills") or 0 for e in members),
             # Down to the same leaf rows again, through every event's orders.

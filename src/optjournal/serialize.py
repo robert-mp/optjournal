@@ -51,6 +51,7 @@ from optjournal.events import (
     upcoming,
 )
 from optjournal.history import HistoryReport
+from optjournal.journal import entries as journal_entries
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
 from optjournal.stats import first_activity
@@ -1270,4 +1271,23 @@ def logbook_data(conn: sqlite3.Connection, *, today: date) -> Row:
         #: or a negative day -- nonsense a reader cannot interpret, where "day 1"
         #: is merely uninteresting.
         "day": max(1, (today - start).days + 1),
+    }
+
+
+def journal_data(conn: sqlite3.Connection) -> Row:
+    """Every journal entry, keyed by the anchor its decision is filed under.
+
+    Keyed by ANCHOR ALONE, dropping the account and broker the table also keys on,
+    because an order id names one placement and a placement belongs to one
+    account: `(broker, anchor)` already resolves to exactly one row, and with one
+    broker configured the anchor does too. So the page can look an entry up from a
+    lifecycle card without carrying an account it would only be able to get wrong.
+
+    The whole map in one payload, rather than a lookup per card. The Trades tab
+    asks "has this decision been written up" for every card it draws, and a
+    request each would put a network round trip inside a render loop.
+    """
+    return {
+        anchor: entry.payload()
+        for (_broker, _account, anchor), entry in journal_entries(conn).items()
     }

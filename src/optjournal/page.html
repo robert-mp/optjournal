@@ -173,6 +173,8 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  *   the watchdog and the thing it watched stopped together
  * @property {Logbook} logbook -- the header dateline (serialize.logbook_data).
  *   Whole-journal, so it moves with neither the month nor the trade-type filter
+ * @property {Object} journal -- JournalEntry by Lifecycle.anchor
+ *   (serialize.journal_data). The only table here a re-ingest cannot rebuild
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
  * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
@@ -933,6 +935,9 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  * @property {string|null} opened_at
  * @property {string|null} closed_at
  * @property {Array} conids
+ * @property {string|null} anchor -- the decision's stable handle, an IBKR order
+ *   id (campaigns.Campaign.anchor). Null for a card no campaign claims, which has
+ *   no order to file writing under. Index into State.journal
  * @property {number} episodes
  * @property {number} fills
  * @property {Money} proceeds
@@ -940,6 +945,29 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  * @property {Money|null} commission -- same rule
  * @property {Array} events -- StrategyGroup rows
  * @property {string} replay_key -- index into State.replays
+ */
+
+/** @typedef {Object} JournalEntry -- what the reader wrote about one decision
+ *  (journal.Entry.payload). Every field is nullable: an entry exists the moment
+ *  ANY of them is written, and a plan noted at entry sits beside a review that
+ *  will not be written for weeks
+ * @property {string} anchor
+ * @property {string} account_id
+ * @property {string|null} underlying
+ * @property {string|null} opened_on
+ * @property {string} created_at
+ * @property {string} updated_at
+ * @property {string|null} plan_target
+ * @property {string|null} plan_invalidation
+ * @property {string|null} entry_note
+ * @property {string|null} followed_target -- yes / no / na
+ * @property {string|null} followed_invalidation
+ * @property {string|null} why_not_target
+ * @property {string|null} why_not_invalidation
+ * @property {string|null} exit_trigger -- a journal.TRIGGERS key
+ * @property {string|null} exit_trigger_other
+ * @property {string|null} lessons
+ * @property {string|null} close_note
  */
 
 /** @typedef {Object} Sync -- fetch machinery state (web.build_state)

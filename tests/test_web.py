@@ -71,6 +71,7 @@ def state(populated) -> dict:
     """
     from datetime import UTC, datetime, timedelta
 
+    from optjournal import journal
     from optjournal.clock import MARKET_TZ
     from optjournal.db import connect
     from optjournal.events import parse_events, store_events
@@ -111,6 +112,25 @@ def state(populated) -> dict:
         " detail, done, total) VALUES ('sync', ?, ?, ?, 'ok', '2 new trades', 1, 1)",
         (fired, str(today), str(today)),
     )
+    # A journal entry, seeded for the same reason as the events and the job row:
+    # the contract guard anchors `JournalEntry` to a real payload row, and every
+    # fresh journal has none -- so the shape would be quietly exempted rather than
+    # checked. Written against a REAL order id through the module's own writer, so
+    # the row is one the endpoint could have produced and it attaches to a
+    # lifecycle card the Trades tab actually draws.
+    target = conn.execute(
+        "SELECT ib_order_id, account_id, COALESCE(underlying_symbol, symbol) AS u,"
+        " MIN(trade_date) AS opened FROM trades WHERE ib_order_id IS NOT NULL"
+    ).fetchone()
+    if target:
+        journal.save(
+            conn, target["ib_order_id"], account_id=target["account_id"],
+            underlying_symbol=target["u"], opened_on=target["opened"],
+            values={"plan_target": "take at 50% of credit",
+                    "plan_invalidation": "short strike tested",
+                    "followed_target": "yes", "exit_trigger": "target",
+                    "lessons": "sized right, closed a week early"},
+        )
     conn.commit()
     conn.close()
     return build_state(db_path=populated, archive_dir=RAW_DIR, query_id="1591754")
@@ -390,6 +410,10 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "WatchOption": first([
             option for row in state["watchlist"] for option in row["options"]
         ]),
+        # The reader's own writing, anchored to the entry the `state` fixture
+        # seeds. Not exempted: every key here is one the modal binds to, and an
+        # unsampled shape is a shape the drift guard stops covering.
+        "JournalEntry": first(list(state["journal"].values())),
         "Scheduler": state["scheduler"],
         # Sampled from the real payload, and the `scheduler` fixture seeds a
         # job_state row so this anchors something rather than being None on a
@@ -5143,4 +5167,188 @@ def test_the_demo_never_gets_a_scheduler_whatever_the_flag_says():
     assert "scheduler=bool(args.scheduler)andnotargs.demo" in wiring, (
         "the demo can now start a scheduler, which would fetch real data into a "
         "synthetic journal"
+    )
+
+
+def _an_anchor(db_path) -> tuple[str, str]:
+    """A real order id from the archive, and the account that placed it.
+
+    Real rather than invented, because `/api/journal` derives the account, the
+    underlying and the open date from the fills the anchor names -- so an invented
+    id is refused, which is behaviour with its own test below.
+    """
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT ib_order_id, account_id FROM trades"
+        " WHERE ib_order_id IS NOT NULL ORDER BY ib_order_id LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return str(row["ib_order_id"]), str(row["account_id"])
+
+
+def test_the_journal_endpoint_round_trips_an_entry(populated):
+    """Write a plan, then a review, then read the state back.
+
+    One test for the sequence, because the sequence is the behaviour: the two are
+    written weeks apart from different forms, and the second must not blank the
+    first. A whole-row POST is how a review erases the plan it is reviewing.
+    """
+    anchor, _account = _an_anchor(populated)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, wrote = _post(base, "/api/journal", {
+            "anchor": anchor,
+            "plan_target": "take at 50% of credit",
+            "plan_invalidation": "short strike tested",
+        })
+        assert (status, wrote["ok"]) == (200, True)
+        assert wrote["entry"]["plan_target"] == "take at 50% of credit"
+
+        _, reviewed = _post(base, "/api/journal", {
+            "anchor": anchor, "followed_target": "yes",
+            "exit_trigger": "target", "lessons": "closed a week early",
+        })
+        entry = reviewed["entry"]
+        assert entry["plan_target"] == "take at 50% of credit", (
+            "the close review blanked the plan it was reviewing"
+        )
+        assert (entry["followed_target"], entry["exit_trigger"]) == ("yes", "target")
+
+        _, state = _get(base, "/api/state")
+    assert state["journal"][anchor]["lessons"] == "closed a week early"
+
+
+def test_the_journal_endpoint_derives_the_decisions_identity_from_the_fills(populated):
+    """The account, the underlying and the open date are BROKER facts.
+
+    So the form does not send them and cannot send them wrong. The entry is keyed
+    on the account IBKR says placed the order, which is also what makes the key
+    resolvable from a card that carries only an anchor.
+    """
+    anchor, account = _an_anchor(populated)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _, wrote = _post(base, "/api/journal", {
+            "anchor": anchor, "entry_note": "n",
+            # Sent and ignored: these are not writable fields, and a request that
+            # could set them could file an entry under an account it has no
+            # business naming.
+        })
+    assert wrote["entry"]["account_id"] == account
+    assert wrote["entry"]["underlying"], "no underlying was resolved from the fills"
+    assert wrote["entry"]["opened_on"], "no open date was resolved from the fills"
+
+
+def test_an_entry_against_an_order_this_journal_never_saw_is_refused(populated):
+    """404, not a stored row.
+
+    A row keyed on a typo would be invisible from every surface afterwards: no
+    card carries that anchor, so nothing would ever render it back, and the reader
+    would believe they had written something down.
+    """
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/journal",
+                                {"anchor": "9999999999", "lessons": "x"})
+    assert status == 404
+    assert payload["kind"] == "anchor"
+
+
+def test_a_journal_write_with_no_anchor_is_refused(populated):
+    """The snapshot-only position: a decision with no fills to attach writing to.
+
+    Named as such in the message, because "no anchor" is not a thing a reader did
+    wrong -- it is a position this journal holds only as a snapshot.
+    """
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/journal", {"lessons": "x"})
+    assert (status, payload["kind"]) == (400, "anchor")
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("followed_target", "true"),
+    ("followed_invalidation", "1"),
+    ("exit_trigger", "felt_wrong"),
+])
+def test_the_journal_endpoint_refuses_a_value_outside_its_enumeration(
+    populated, field, value
+):
+    """Coerced to null instead, the adherence and trigger counts would be wrong in
+    the reassuring direction -- and those counts are the whole reason the two
+    fields are enumerations rather than free text."""
+    anchor, _account = _an_anchor(populated)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/journal",
+                                {"anchor": anchor, field: value})
+    assert (status, payload["kind"]) == (400, "journal")
+
+
+def test_the_journal_endpoint_refuses_a_field_the_table_does_not_have(populated):
+    """A typo in the page's form must fail loudly.
+
+    Ignored instead, the request answers `ok` and the text is never seen again --
+    which for this table means it is gone, since nothing can re-derive it.
+    """
+    anchor, _account = _an_anchor(populated)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/journal",
+                                {"anchor": anchor, "plan": "take at 50%"})
+    assert (status, payload["kind"]) == (400, "journal")
+
+
+def test_emptying_an_entry_through_the_endpoint_removes_it_from_the_state(populated):
+    """Clearing every field deletes, and the page must see that.
+
+    A stored row of nulls would keep a "written up" badge on a card whose writing
+    the reader just deleted.
+    """
+    anchor, _account = _an_anchor(populated)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _post(base, "/api/journal", {"anchor": anchor, "lessons": "x"})
+        _, emptied = _post(base, "/api/journal", {"anchor": anchor, "lessons": ""})
+        assert emptied["entry"] is None
+        _, state = _get(base, "/api/state")
+    assert anchor not in state["journal"]
+
+
+def test_an_over_long_entry_is_refused_rather_than_read_as_empty(populated):
+    """The one place a size cap could DESTROY writing rather than reject it.
+
+    `_body` answers `{}` for a body over its limit, which `journal.save` would
+    read as an entry emptied of every field and delete. So the length is checked
+    before the body is read, and the reply says nothing was saved -- for a table
+    whose rows cannot be re-derived from anything.
+    """
+    anchor, _account = _an_anchor(populated)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _post(base, "/api/journal", {"anchor": anchor, "lessons": "worth keeping"})
+        status, payload = _post(base, "/api/journal", {
+            "anchor": anchor, "lessons": "x" * (web.JOURNAL_BODY_LIMIT + 1),
+        })
+        assert (status, payload["kind"]) == (413, "too-long")
+        _, state = _get(base, "/api/state")
+    assert state["journal"][anchor]["lessons"] == "worth keeping", (
+        "the refused write deleted the entry it was too long to replace"
+    )
+
+
+def test_the_lifecycle_cards_carry_the_anchor_the_journal_is_keyed_on(populated):
+    """Without it the page has a journal it cannot attach to anything.
+
+    Asserted against the state rather than against `position_groups` directly,
+    because the payload is what the page reads and a key lost in serialization
+    would pass a unit test on the grouping.
+    """
+    state = web.build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    lifecycles = state["lifecycles"]
+    assert lifecycles, "the archive should form lifecycles"
+    anchored = [lc for lc in lifecycles if lc["anchor"]]
+    assert anchored, "no lifecycle carries an anchor, so nothing can be journalled"
+    conn = connect(populated)
+    known = {
+        str(r["ib_order_id"]) for r in conn.execute(
+            "SELECT DISTINCT ib_order_id FROM trades WHERE ib_order_id IS NOT NULL")
+    }
+    conn.close()
+    unknown = sorted(lc["anchor"] for lc in anchored if lc["anchor"] not in known)
+    assert not unknown, (
+        f"these anchors name no fill in the journal: {unknown}. The endpoint "
+        "resolves an entry's account from the fills, so it would refuse them"
     )

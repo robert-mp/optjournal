@@ -54,14 +54,14 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from optjournal import __version__, replay
+from optjournal import __version__, journal, replay
 from optjournal import settings as prefs
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.campaigns import position_count
 from optjournal.clock import parse_day
 from optjournal.costs import CostScope, build_costs
-from optjournal.db import connect, open_journal
+from optjournal.db import DEFAULT_BROKER, connect, open_journal
 from optjournal.events import (
     EventFetchError,
     EventRateLimited,
@@ -99,6 +99,7 @@ from optjournal.serialize import (
     costs_data,
     history_data,
     jobs_data,
+    journal_data,
     logbook_data,
     market_data,
     odte_context_data,
@@ -157,6 +158,19 @@ _SYMBOL_OK = re.compile(r"^[A-Za-z0-9.\-]+$")
 #: enough that a keychain which merely needs a moment still answers, short enough
 #: that a button does not look stuck.
 KEYRING_TIMEOUT_S = 4.0
+
+#: How large a journal entry POST may be. Eight times `_body`'s default, because
+#: eleven free-text fields -- two exit plans, two "why not", lessons, notes -- run
+#: past 8KB for a reader who writes properly, and this is the one endpoint where
+#: an over-long body must not be read as an empty one: `journal.save` deletes an
+#: entry emptied of every field. See `_journal_write`, which refuses rather than
+#: truncating.
+JOURNAL_BODY_LIMIT = 65536
+
+#: The keys `/api/journal` reads for itself. Everything else in the body is a
+#: journal field, and `journal.FIELDS` is what judges it -- see `_journal_write`
+#: on why this endpoint must not do its own filtering.
+_JOURNAL_CONTROL = frozenset({"anchor", "broker"})
 
 #: The watchlist columns a request may write, in the order the upsert names them.
 #: A tuple rather than "whatever keys the body has", because these names are
@@ -489,6 +503,11 @@ def build_state(
             # that moved with a filter the header does not display is the same
             # defect the Annual total was fixed for.
             "logbook": logbook_data(conn, today=date.today()),
+            # What the reader wrote, by decision anchor. The whole map in one
+            # payload because the Trades tab asks "was this written up" per card,
+            # and the only table here that a re-ingest cannot rebuild is the one
+            # worth reading in a single query.
+            "journal": journal_data(conn),
         }
         # How many POSITIONS the open contracts form, which needs the campaign
         # grouping and so cannot be computed inside month_stats. Set on both
@@ -1057,6 +1076,88 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return 200, {"ok": True, "kind": "watchlist", "action": action,
                      "symbol": symbol, "changed": changed}
 
+    def _journal_write(self) -> tuple[int, dict[str, Any]]:
+        """Write one decision's journal entry.
+
+        The request carries the ANCHOR and the text, and nothing else. Which
+        account the decision belongs to, which underlying, and when it opened are
+        read here from the fills the anchor named -- broker facts, so a form has
+        no business sending them and no way to send them wrong. It also means an
+        anchor no fill matches is refused: the journal cannot hold writing about a
+        decision this journal has never seen, and a row keyed on a typo would be
+        invisible from every surface afterwards.
+
+        KEY-PRESENT SEMANTICS, matching `_watchlist_write` and for the same
+        reason: a field absent from the body is left alone, a field present and
+        empty is cleared. That is what lets the entry form and the close review be
+        two surfaces without either erasing the other's fields -- a whole-row
+        write would mean the review blanks the plan it is reviewing.
+
+        THE BODY LIMIT IS RAISED, and that is not a nicety. `_body` answers `{}`
+        for a body over its cap, which here would parse as "no fields", which
+        `journal.save` reads as an entry emptied -- so a reader whose lessons ran
+        long would get `ok` back and find their writing deleted. The length is
+        therefore checked explicitly and refused with 413, because this is the one
+        table where a silent loss is unrecoverable: everything else in the
+        database can be rebuilt from `raw/`.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > JOURNAL_BODY_LIMIT:
+            return 413, {
+                "ok": False, "kind": "too-long",
+                "message": f"that entry is {length:,} bytes, over the "
+                           f"{JOURNAL_BODY_LIMIT:,} this endpoint accepts. Nothing "
+                           f"was saved and nothing was changed -- shorten it and "
+                           f"save again, or the text would have been lost.",
+            }
+        body = self._body(limit=JOURNAL_BODY_LIMIT)
+        anchor = str(body.get("anchor") or "").strip()
+        broker = str(body.get("broker") or DEFAULT_BROKER).strip()
+        if not anchor:
+            return 400, {"ok": False, "kind": "anchor",
+                         "message": "no decision named: this position has no "
+                                    "fills in the archive, so there is no order "
+                                    "to attach an entry to."}
+        # Everything except this endpoint's own control keys, PASSED THROUGH rather
+        # than filtered to `journal.FIELDS`. Filtering here would drop a name the
+        # journal does not declare and answer `ok` -- so a typo in the page's form
+        # would post successfully and the text would never be seen again, which for
+        # this table means gone, since nothing can re-derive it. `journal.save`
+        # decides what is writable, in one place, and refuses the rest loudly.
+        values = {k: v for k, v in body.items() if k not in _JOURNAL_CONTROL}
+        with open_journal(self.cfg.db_path) as conn:
+            target = conn.execute(
+                "SELECT account_id,"
+                # Options carry the underlying; equities ARE it.
+                " COALESCE(underlying_symbol, symbol) AS underlying,"
+                " MIN(trade_date) AS opened_on"
+                " FROM trades WHERE broker = ? AND ib_order_id = ?",
+                (broker, anchor),
+            ).fetchone()
+            if target is None or target["account_id"] is None:
+                return 404, {
+                    "ok": False, "kind": "anchor",
+                    "message": f"no fill in this journal was placed under order "
+                               f"{anchor}, so there is no decision to write up.",
+                }
+            try:
+                entry = journal.save(
+                    conn, anchor, account_id=target["account_id"], values=values,
+                    underlying_symbol=target["underlying"],
+                    opened_on=target["opened_on"], broker=broker,
+                )
+            except journal.JournalError as exc:
+                return 400, {"ok": False, "kind": "journal", "message": str(exc)}
+        return 200, {
+            "ok": True, "kind": "journal", "anchor": anchor,
+            # None when the write emptied the entry, which the page renders as an
+            # un-journalled card again rather than leaving a stale badge on it.
+            "entry": entry.payload() if entry else None,
+        }
+
     def _job_run(self) -> tuple[int, dict[str, Any]]:
         """Run one registered job now. The page's only write to the scheduler.
 
@@ -1167,6 +1268,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/watchlist":
             self._json(*self._watchlist_write())
+            return
+        if path == "/api/journal":
+            self._json(*self._journal_write())
             return
         if path == "/api/jobs/run":
             self._json(*self._job_run())
