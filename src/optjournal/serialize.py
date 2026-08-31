@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import sqlite3
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from optjournal.analysis import CostReport
-from optjournal.bars import audit_perishable
-from optjournal.clock import MARKET_TZ
+from optjournal.bars import audit_perishable, watch_closes, weekly_closes
+from optjournal.clock import MARKET_TZ, et_day, parse_day
 from optjournal.costs import (
     AUTOFX_MARKUP_BPS,
     AUTOFX_MARKUP_MEASURED_BPS,
@@ -47,7 +47,14 @@ from optjournal.history import HistoryReport
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
 from optjournal.stats import first_activity
-from optjournal.vol import expected_move, realised_vol
+from optjournal.trend import bucket, bxtrender_short
+from optjournal.vol import (
+    expected_move,
+    rank,
+    rank_band,
+    realised_vol,
+    realised_vol_series,
+)
 
 Row = dict[str, Any]
 
@@ -738,7 +745,35 @@ def market_data(
     }
 
 
-def watchlist_data(conn: sqlite3.Connection, *, lookback: int = 21) -> list[Row]:
+def _days_until(recorded: str | None, *, today: date) -> int | None:
+    """Whole days from `today` to a recorded YYYY-MM-DD day. Signed, or None.
+
+    Derived on every read rather than stored beside the date, and that is the whole
+    reason it is a function here instead of a column in `watchlist`: a stored "14
+    days" is wrong tomorrow, silently, while the date it was counted from still
+    reads correctly beside it. There is no drift available to a figure recomputed
+    from its own input.
+
+    SIGNED, so a date that has passed reports a negative count rather than being
+    clamped to zero or swallowed. A recorded date stands until the reader records
+    the next one, and the surfaces render the past case as the date plus "recorded,
+    now past" -- which says what is true (this is what you typed, and it has gone
+    by) where a bare "-14d" invites reading it as a countdown that ran backwards
+    and a clamp to 0 would claim the company reports today.
+
+    Zero means today. None means either nothing recorded or a stored value that is
+    not a day at all; both writers validate through `clock.parse_day`, so the
+    second only happens to a hand-edited journal, and reporting None there is what
+    keeps one bad cell from taking the payload -- and the page -- down with it.
+    """
+    day = parse_day(recorded)
+    return None if day is None else (day - today).days
+
+
+def watchlist_data(
+    conn: sqlite3.Connection, *, sessions: int = 21, history: int = 520,
+    now: datetime | None = None,
+) -> list[Row]:
     """Watched symbols with price, realised vol, and this journal's own context.
 
     The context is the part a broker app cannot show: whether YOU hold it, and
@@ -756,10 +791,66 @@ def watchlist_data(conn: sqlite3.Connection, *, lookback: int = 21) -> list[Row]
     Measured on the real journal: GOOG had 5 daily closes and PLTR 4, which is
     why `bars_manifest` has to learn about watched symbols (task 14d) before this
     tab is useful for anything just added.
+
+    TWO WINDOWS, deliberately separate. `history` is how many SESSIONS are read
+    back, wide because everything derived from these closes needs more of them
+    than one column does; `sessions` is the realised vol window and stays at 21,
+    so widening the read cannot silently move a figure the whole watchlist story
+    is built on. The parameter was called `lookback` while it meant both, which is
+    the shape that lets one change do two things.
+
+    The read goes through `bars.watch_closes` rather than a SELECT here, because
+    what a row needs is SESSIONS and `price_bars` stores ROWS: a symbol that is
+    both watched and traded holds two conids covering the same ET days, and 21
+    rows of it spanned 12 sessions. That is a `bars.py` rule (journal shape plus
+    the clock), and having the reader own it is what keeps this serializer from
+    holding a second, drifting copy of it.
+
+    FOUR DERIVED FIGURES RIDE HERE, and each one travels with the count or the
+    bounds that explain its absence. `bx_daily` and `bx_weekly` are `trend`'s two
+    arms, `rv_rank` is `vol`'s position of today's realised vol inside its own
+    year, and every one of them is None below its own gate -- never 0.0, which on a
+    signed oscillator would read as a neutral measurement and on a rank as the
+    quiet end of the year. What makes a dash explainable rather than mute is the
+    count beside it: `closes` for the daily arm, `weeks` for the weekly one,
+    `rv_rank_windows` for the rank. Measured on the real journal while the read
+    window was still 60 days, five of its six watched symbols held 45 or 46
+    sessions and 10 ISO weeks, so the dash IS the normal state until `optjournal
+    bars` has run against the widened window.
+
+    This layer composes and names; it computes nothing. The arithmetic is in two
+    leaves (`vol`, `trend`) that import only `math`, and the two server-side
+    labels, `bx_bucket` and `rv_rank_band`, come from those modules' own functions
+    rather than from comparisons written here -- so a cut point cannot drift from
+    the constant a caption quotes.
+
+    THE WEEKLY ARM IS READ IN FULL, not through `history`. 120 ISO weeks is about
+    600 sessions, more than `history`'s 520, and a cap counted in sessions cannot
+    express a week count -- so `bars.weekly_closes` reads everything stored and the
+    session cap governs the daily figures only. Both still come off one
+    deduplicated series, which is why the weekly reader is built on the daily one.
+
+    TWO OF THE ROW'S FACTS ARE TYPED, not measured: `note` and `earnings_on`. They
+    are the only ones stored on the watchlist table, because they are the only ones
+    with nowhere else to come from -- nothing this repo can reach publishes an
+    earnings date (see `db.py`'s column comment for what was probed). So the row
+    carries the date VERBATIM, and `earnings_in_days` beside it is derived here on
+    every read rather than stored; the surfaces label the pair as recorded rather
+    than fetched, which is the whole reason the column is honest.
+
+    `now` exists so a countdown can be asserted without asserting the calendar. It
+    is optional rather than required because every caller wants the same answer --
+    today -- and a required argument that every call site fills in identically is
+    how two call sites end up filling it in differently. The ET day is taken
+    through `clock.et_day`, the same conversion the closes are bucketed by, so
+    "today" on this tab means the trading day the rest of the tab is stated in.
     """
     rows = conn.execute(
-        "SELECT symbol, note, added_at FROM watchlist ORDER BY symbol"
+        "SELECT symbol, note, earnings_on, added_at FROM watchlist ORDER BY symbol"
     ).fetchall()
+    # One ET day for the whole payload, so two rows of one response cannot land on
+    # opposite sides of midnight and report countdowns a day apart.
+    today = date.fromisoformat(et_day(int((now or datetime.now(UTC)).timestamp())))
 
     held: dict[str, list[Row]] = {}
     for position in conn.execute(
@@ -778,25 +869,45 @@ def watchlist_data(conn: sqlite3.Connection, *, lookback: int = 21) -> list[Row]
     out: list[Row] = []
     for row in rows:
         symbol = str(row["symbol"]).upper()
-        closes = [
-            r["close"] for r in conn.execute(
-                "SELECT close FROM price_bars WHERE symbol = ? AND bar_size = '1d'"
-                " AND close IS NOT NULL ORDER BY ts DESC LIMIT ?",
-                (symbol, lookback),
-            )
-        ]
-        last = closes[0] if closes else None
+        series = watch_closes(conn, symbol, sessions=history)
+        closes = [close for _, close in series]
+        # The vol's own slice, taken here rather than by reading less: the whole
+        # series is what says how much history exists, and `closes` reports that.
+        window = closes[:sessions]
+        last = window[0] if window else None
         # Change over one session and one week, from the same series. None rather
         # than 0.0 when the history is not there, for the same reason as the vol.
-        prev = closes[1] if len(closes) > 1 else None
-        week = closes[5] if len(closes) > 5 else None
-        realised = realised_vol(closes)
+        prev = window[1] if len(window) > 1 else None
+        week = window[5] if len(window) > 5 else None
+        realised = realised_vol(window)
+        # The daily arm, and the same arm one session back. Two calls rather than a
+        # series because `bxtrender_short` returns the newest value: dropping the
+        # NEWEST close (the series is newest first) is what "one session ago" means,
+        # and both calls are gated, so a symbol holding exactly `MIN_SETTLED`
+        # sessions gets a value and no delta rather than a delta against nothing.
+        bx_daily = bxtrender_short(closes)
+        bx_previous = bxtrender_short(closes[1:])
+        weekly = weekly_closes(conn, symbol)
+        # Oldest first out of `bars`, newest first into `trend`. The reversal is
+        # here, once, at the seam between the two conventions.
+        bx_weekly = bxtrender_short([close for _, close, _ in reversed(weekly)])
+        vol_series = realised_vol_series(closes, window=sessions)
+        rv_rank = rank(vol_series)
         out.append({
             "symbol": symbol,
             "note": row["note"],
             "added_at": row["added_at"],
             "last": last,
-            "closes": len(closes),
+            #: SESSIONS held, not rows stored. The two differed by a factor of two
+            #: on a symbol covered by two conids, and this count is what the page
+            #: prints to say WHY a figure is missing -- so it has to count the same
+            #: thing the figure was computed over.
+            "closes": len(series),
+            #: The ET trading day of the newest close used. A stored close with no
+            #: date is the shape `marketdata.parse_quote` refuses outright, and the
+            #: page's stale marker had to say "stored close" with no idea which
+            #: session it came from.
+            "closes_through": series[0][0] if series else None,
             "change_1d": None if (last is None or prev is None)
                          else (last - prev) / prev * 100,
             "change_5d": None if (last is None or week is None)
@@ -804,6 +915,58 @@ def watchlist_data(conn: sqlite3.Connection, *, lookback: int = 21) -> list[Row]
             #: REALISED, not implied. See vol.py.
             "realised_vol": realised,
             "expected_move_5d": expected_move(last, realised, days=5),
+            #: B-Xtrender's short arm over daily closes, and its one-session
+            #: change. The delta carries the published indicator's SECOND state
+            #: (rising or falling), which the surfaces render as a glyph rather
+            #: than as a second shade of the sign's colour.
+            "bx_daily": bx_daily,
+            "bx_daily_delta": None if (bx_daily is None or bx_previous is None)
+                              else bx_daily - bx_previous,
+            #: Which band the daily arm sits in, from `trend.bucket` -- so the cut
+            #: points live once, beside the measured share of sessions each band
+            #: holds, instead of being retyped per surface. Deliberately not
+            #: "oversold"/"overbought": those are claims about what a share is
+            #: worth, and this is a statement about the shape of recent closes.
+            "bx_bucket": bucket(bx_daily),
+            #: The same arm over ISO weeks, with the newest bucket named and
+            #: counted. A weekly value over an incomplete week repaints every
+            #: session (measured on TSLA: -19.02, -18.63, -19.71 across one week's
+            #: three sessions), so it may never be shown as a bare figure.
+            "bx_weekly": bx_weekly,
+            #: The ISO week of the newest close, and how many of its sessions are
+            #: stored. Both are facts about the stored series rather than figures,
+            #: like `closes_through`, so they answer even when `bx_weekly` does not.
+            "bx_weekly_week": weekly[-1][0] if weekly else None,
+            "bx_weekly_sessions": weekly[-1][2] if weekly else None,
+            #: ISO weeks held, which is what explains the weekly arm's dash. In
+            #: weeks and not sessions because that is the arm's own unit.
+            "weeks": len(weekly),
+            #: Today's realised vol as a MIN-MAX position inside its own trailing
+            #: year, 0 to 100, with both bounds and the window count beside it. A
+            #: rank, not a percentile, and not an IV rank: implied vol is
+            #: unreachable for a symbol this journal does not hold. See vol.py.
+            "rv_rank": rv_rank,
+            #: The bounds the rank was measured against, and they answer exactly
+            #: when it does. A low and a high off a dozen windows would read as a
+            #: year's extremes while being two adjacent readings from one fortnight
+            #: -- the count is what says a range exists, and below the gate it says
+            #: one does not.
+            "rv_rank_low": min(vol_series) if rv_rank is not None else None,
+            "rv_rank_high": max(vol_series) if rv_rank is not None else None,
+            #: Windows actually measured. Reported below the gate too, because it
+            #: is the number that turns the rank's dash into a sentence.
+            "rv_rank_windows": len(vol_series),
+            #: Which side of `vol.RANK_MIDPOINT`, from `vol.rank_band`. The midpoint
+            #: is the middle of THIS symbol's own year, never IV rank's 30.
+            "rv_rank_band": rank_band(rv_rank),
+            #: The next earnings date, TYPED. Verbatim from the column, because the
+            #: only claim being made about it is that this is what the reader
+            #: recorded -- there is no source to reconcile it against.
+            "earnings_on": row["earnings_on"],
+            #: Days from the ET trading day to that date, derived here and never
+            #: stored. Negative for a date that has gone by, 0 for today, None when
+            #: nothing is recorded. See `_days_until` for why it is signed.
+            "earnings_in_days": _days_until(row["earnings_on"], today=today),
             "options": held.get(symbol, []),
             "held": bool(held.get(symbol)),
         })

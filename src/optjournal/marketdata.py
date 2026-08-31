@@ -139,6 +139,19 @@ class Quote:
     at: int | None
     previous_close: float | None
     currency: str | None
+    #: The company or fund name, from the same `meta` block, at NO extra request:
+    #: this parser already receives it and used to drop it. Nullable because it is
+    #: fetched fact and the surface has to work without it -- a watchlist row shows
+    #: the bare symbol until a quote has arrived, exactly as the stored close
+    #: already carries its stale marker until then.
+    #:
+    #: Probed live across nine symbols (six stocks, an ETF, a dual-class ticker and
+    #: an OCC option): present on every one, in a 25-key block that carries no
+    #: implied vol. Not cached anywhere -- see the plan for why `watchlist` (the
+    #: user-input table) and `securities.description` (one of six real watched
+    #: symbols, and "TESLA INC" against this source's "Tesla, Inc.") are both the
+    #: wrong home.
+    name: str | None = None
 
 
 def occ_symbol(symbol: str) -> str:
@@ -229,6 +242,17 @@ def parse_quote(payload: Any, *, symbol: str) -> Quote:
     Friday's. Refusing it is the same rule `money.py` applies to a figure whose
     currency cannot be established: drop the number rather than present it
     unqualified.
+
+    THE NAME PREFERS `longName`, and the fallback order is measured rather than
+    stylistic. `shortName` is truncated at 31 characters by the source -- SPY reads
+    "State Street SPDR S&P 500 ETF T" there against the full "State Street SPDR
+    S&P 500 ETF Trust" in `longName` -- and it disagrees outright on a dual-class
+    ticker (BRK-B: "Berkshire Hathaway Inc. New"). It is kept as a fallback because
+    a truncated name is still worth more than a bare symbol, and because the two
+    were identical on seven of the nine symbols probed, so which one answered would
+    not be visible in the output. Unlike the price, the name is
+    NOT tied to the timestamp: it does not go stale within a session, so an undated
+    quote may still carry it.
     """
     chart = payload.get("chart") if isinstance(payload, dict) else None
     if not isinstance(chart, dict):
@@ -247,6 +271,20 @@ def parse_quote(payload: Any, *, symbol: str) -> Quote:
         value = meta.get(name)
         return float(value) if isinstance(value, int | float) else None
 
+    def text(*names: str) -> str | None:
+        """The first of `names` holding a non-empty string.
+
+        A string check rather than a truthiness one, because the source has been
+        seen to answer numbers where a name was expected on other keys, and a
+        stringified float under a company-name label is the defect shape this
+        project hunts.
+        """
+        for name in names:
+            value = meta.get(name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
     stamp = meta.get("regularMarketTime")
     at = int(stamp) if isinstance(stamp, int | float) else None
     price = number("regularMarketPrice")
@@ -258,6 +296,7 @@ def parse_quote(payload: Any, *, symbol: str) -> Quote:
         previous_close=number("chartPreviousClose"),
         currency=meta.get("currency") if isinstance(meta.get("currency"), str)
                  else None,
+        name=text("longName", "shortName"),
     )
 
 

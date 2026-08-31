@@ -329,3 +329,107 @@ def test_update_reports_up_to_date_when_the_heads_match(monkeypatch, tmp_path):
     assert ("log", "--oneline", "HEAD..@{u}") not in calls, (
         "there is no range to log when the heads agree"
     )
+# --- watch: the two fields the reader types -----------------------------------
+#
+# `optjournal watch` is the only writer of user-typed facts in the CLI, and it is
+# exactly the boundary this module exists for: argparse succeeds, the command
+# prints a table, the exit code is 0, and what was typed did not reach the row.
+# No statement is needed for any of it, so these run wherever the suite does.
+
+
+def _watch_json(capsys, *argv: str) -> list[dict]:
+    """Run `optjournal watch ... --json` and hand back the rows it printed."""
+    capsys.readouterr()
+    assert main(["watch", *argv, "--json"]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_watch_records_an_earnings_date_that_round_trips(tmp_path, capsys):
+    """The date reaches the row, comes back verbatim, and carries a countdown.
+
+    Verbatim because it is the one figure on this tab the reader supplied: there is
+    no source to reconcile it against, so the only claim being made is "this is what
+    you typed". The countdown beside it is derived on every read, so it is asserted
+    as a TYPE here and pinned to a fixed clock in `test_serialize.py` -- asserting
+    the number here would make this test fail on a date rather than on a change.
+    """
+    db = tmp_path / "watch.db"
+    rows = _watch_json(capsys, "dell", "--earnings", "2026-08-27",
+                       "--note", "watching the print", "--db", str(db))
+    assert [r["symbol"] for r in rows] == ["DELL"], "lower case in, upper case stored"
+    assert rows[0]["earnings_on"] == "2026-08-27"
+    assert isinstance(rows[0]["earnings_in_days"], int)
+    assert rows[0]["note"] == "watching the print"
+
+
+def test_watch_leaves_typed_fields_alone_unless_the_flag_is_passed(tmp_path, capsys):
+    """A bare re-add is not an edit, and `--clear-note` is.
+
+    The same key-present rule as the endpoint, and here the flag's presence is what
+    says which request this is. Both directions matter: a re-add that blanked a note
+    would lose the only thing in this journal nothing can re-derive, and a note that
+    cannot be cleared is the hole `web._watchlist_write` documents -- so the CLI
+    grew the explicit verb rather than overloading `--note ''`, which argparse and a
+    shell disagree about often enough.
+    """
+    db = tmp_path / "watch.db"
+    _watch_json(capsys, "DELL", "--earnings", "2026-08-27", "--note", "mine",
+                "--db", str(db))
+
+    rows = _watch_json(capsys, "DELL", "--db", str(db))
+    assert (rows[0]["note"], rows[0]["earnings_on"]) == ("mine", "2026-08-27"), (
+        "a bare re-add rewrote a typed field"
+    )
+
+    rows = _watch_json(capsys, "DELL", "--clear-note", "--db", str(db))
+    assert rows[0]["note"] is None
+    assert rows[0]["earnings_on"] == "2026-08-27", (
+        "clearing the note cleared a date the command never mentioned"
+    )
+
+    # And a date can be un-recorded, since the reader is the only source of it.
+    rows = _watch_json(capsys, "DELL", "--earnings", "", "--db", str(db))
+    assert rows[0]["earnings_on"] is None
+    assert rows[0]["earnings_in_days"] is None
+
+
+def test_watch_refuses_a_malformed_earnings_date(tmp_path, capsys):
+    """Refused with a reason, and nothing written.
+
+    A format check only, through the same `clock.parse_day` the endpoint uses, so
+    the two surfaces cannot disagree about what a date is. `27/08/2026` is the
+    interesting case: it is a date to a human, and stored it would sort wrong, print
+    beside a YYYY-MM-DD date in the same column, and count down to nothing.
+
+    Exit 2 (config) rather than 1, because nothing failed -- the invocation was
+    wrong, which is what that code means.
+    """
+    db = tmp_path / "watch.db"
+    assert main(["watch", "DELL", "--earnings", "27/08/2026", "--db", str(db)]) == 2
+    assert "YYYY-MM-DD" in capsys.readouterr().err
+
+    rows = _watch_json(capsys, "--db", str(db))
+    assert rows == [], "a refused command still added the symbol"
+
+
+def test_watch_refuses_a_field_with_no_symbol_to_write_it_to(tmp_path, capsys):
+    """`optjournal watch --earnings 2026-08-27` names nothing to record it against.
+
+    Silently doing nothing is the failure this module's docstring describes: the
+    table prints, the exit code is 0, and the date is nowhere. So it is refused with
+    the shape of a working command in the message.
+    """
+    db = tmp_path / "watch.db"
+    assert main(["watch", "--earnings", "2026-08-27", "--db", str(db)]) == 2
+    assert "name the symbol" in capsys.readouterr().err
+
+
+def test_watch_refuses_setting_and_clearing_a_note_at_once(tmp_path):
+    """Two requests in one command, so argparse refuses it at the parser.
+
+    SystemExit rather than a return code: a mutually exclusive group is argparse's
+    own answer, and it prints the usage line naming both flags.
+    """
+    db = tmp_path / "watch.db"
+    with pytest.raises(SystemExit):
+        main(["watch", "DELL", "--note", "x", "--clear-note", "--db", str(db)])

@@ -46,13 +46,29 @@ MAY_MODEL = {"replay", "demo"}
 #: Modules that must import nothing from the package. Each is a value type or
 #: pure arithmetic that any layer may hold without acquiring a direction.
 #:
+#: `vol` and `trend` are the watchlist's two arithmetic leaves, and they are here
+#: rather than in `MAY_MODEL` on purpose. Realised vol is a standard deviation of
+#: log returns and B-Xtrender is two exponential means, a difference and Wilder's
+#: RSI -- all of it arithmetic over broker-stated closes, nothing solved -- so the
+#: watchlist can grow derived columns without the quarantine growing with it.
+#: `trend.py` is the most recent module that could have been used to argue for
+#: widening `MAY_MODEL`, and the count above is still two.
+#:
+#: `iv` is the third watchlist leaf and the one that looks like it belongs in
+#: `MAY_MODEL` and does not. It carries an IMPLIED volatility, which `vol.py`'s
+#: docstring says is unreachable here -- but what is unreachable is an implied vol
+#: this journal would SOLVE. `iv.py` solves nothing: it reads three numbers CBOE
+#: publishes (a 30-day implied vol and the high and low of that same series over
+#: the trailing year) and divides. The quarantine is a rule against modelling, not
+#: against the word "implied", so the count above is still two.
+#:
 #: `analysis` is not here: it holds `notes`, which is itself a leaf. That is the
 #: point of a leaf -- any layer may hold one without acquiring a direction -- and
 #: the rule it needs, reading IBKR note codes as whole tokens, is shared with
 #: `history` on the far side of the graph. `IMPORTS_LEAVES_ONLY` states the
 #: weaker property that still holds: it depends on nothing that reads a database.
 LEAVES = {"money", "notes", "blackscholes", "clock", "config", "marketdata",
-          "compat", "fills", "events", "vol", "locks", "logs"}
+          "compat", "fills", "events", "vol", "trend", "iv", "locks", "logs"}
 
 #: Modules that may import leaves and nothing else. Weaker than `LEAVES` and
 #: load-bearing for the same reason: `analysis.py` is pure statement mathematics,

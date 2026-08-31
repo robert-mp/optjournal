@@ -949,3 +949,67 @@ def write_demo_bars(conn) -> int:
 
 def _midnight_et(day: str, tz) -> int:
     return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=tz).timestamp())
+
+
+# ------------------------------------------------------------------ watchlist
+
+#: What the demo watches, and why each row is here.
+#:
+#: NVDA and SPY because they are the only symbols whose REAL underlying series this
+#: database holds: the demo's option symbols are invented, so the source answers 404
+#: for every one of them and the only fetched bars here are these two names'.
+#: Measured after one `optjournal bars` run against a fresh demo, 2,122 fetched
+#: daily bars across NVDA and SPY and zero fetched option ones -- so they are also
+#: the only two that can produce a realised vol, a rank and a B-Xtrender reading
+#: offline. They are the two the demo already trades as well, which is what makes
+#: the "what YOU hold against it" column say something on this database.
+#:
+#: ZZZDEMO is DELIBERATELY BARREN, and it has to be a symbol the price source will
+#: not answer for or it would stop being barren the first time `optjournal bars`
+#: ran: probed live, it is HTTP 404 for both the chart and the quote, exactly like
+#: the demo's invented option symbols. It puts the dash-with-a-reason path on
+#: screen beside a populated row, which is the state five of the six REAL watched
+#: symbols are in today and the state no other fixture renders -- and it costs one
+#: failed request per bars run, reported as a failure, which is the honest price of
+#: having that row.
+#:
+#: Sorted last by `ORDER BY symbol`, so the populated rows lead: the panel selects
+#: the first visible row, and opening on the empty one would show the tab at its
+#: least informative.
+DEMO_WATCHLIST: tuple[tuple[str, str], ...] = (
+    ("NVDA", "demo: traded here, and the underlying series is real"),
+    ("SPY", "demo: watched and traded, with no option bars a source would serve"),
+    ("ZZZDEMO", "demo: no bars anywhere -- this row is what a dash looks like"),
+)
+
+
+def write_demo_watchlist(conn) -> int:
+    """Seed the demo's watched symbols. Returns how many rows were inserted.
+
+    Without this the tab renders only its empty state in `serve --demo` and in
+    every sweep run, which is the one executed check this panel has: a grep over
+    `demo.py`, `test_demo.py` and `test_rendered.py` for "watchlist" returned zero
+    before this, so no derived watchlist figure had ever been rendered by anything.
+
+    INSERT OR IGNORE rather than a delete-and-rewrite, and `reset_demo_rows` leaves
+    the table alone. `watchlist` is the USER-INPUT table (`db.py`'s own words) and
+    has no account column to scope a delete by, so a re-run must not be able to
+    remove a symbol or blank a note a reader typed into their demo database. The
+    cost of that choice is stated rather than hidden: a change to the seed notes
+    above does not reach a demo database that already holds these three rows.
+
+    Not gated on `_assert_demo_database`, unlike `write_demo_bars`. A watched symbol
+    is a row saying "show me this", not a price claiming to be something a source
+    served, so the worst case in a real journal is three rows a reader can delete --
+    where a computed bar would be indistinguishable from a fetched one forever.
+    """
+    before = conn.total_changes
+    conn.executemany(
+        "INSERT OR IGNORE INTO watchlist (symbol, note, added_at) VALUES (?,?,?)",
+        [
+            (symbol, note, f"{TO_DATE:%Y-%m-%d} 00:00:00")
+            for symbol, note in DEMO_WATCHLIST
+        ],
+    )
+    conn.commit()
+    return conn.total_changes - before

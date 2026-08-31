@@ -7,8 +7,17 @@ wiring and does no formatting.
 
 from __future__ import annotations
 
+import textwrap
 from collections.abc import Sequence
 from typing import Any
+
+# Two leaves, held for their CONSTANTS rather than their arithmetic: the watchlist
+# table's footnotes state the periods, the band's provenance and the rank's cut
+# point, and generating those sentences from the constants is what stops the
+# terminal report and the page describing two different indicators. Leaves import
+# nothing, so this costs no direction (see tests/test_layering.py).
+from optjournal.trend import MIN_SETTLED, PARAMS_CAPTION
+from optjournal.vol import RANK_BANDS_SOURCE, RANK_MIDPOINT, RANK_MIN_WINDOWS
 
 __all__ = [
     "render_friction",
@@ -457,17 +466,53 @@ def render_watchlist(rows: list[dict]) -> str:
 
     `rv` and `move` are headed as REALISED on purpose -- see vol.py. Abbreviating
     to `iv` would fit the column better and be wrong, which is the trade this
-    project consistently refuses.
+    project consistently refuses. The same rule sizes the two rank columns: `rvr`
+    is headed as a realised vol rank and its footnote states the cut point, because
+    a 0-to-100 column beside an options journal reads as IV rank to every reader
+    who has one in another tool.
 
     A dash means "no data", never zero: a symbol with fewer than six closes has
     made no claim about its volatility, and printing 0.0 would put a flat row
-    beside a real one.
+    beside a real one. Each derived column has its own gate, so a thin symbol
+    dashes in some columns and answers in others -- which is why the footnotes name
+    the count each dash is waiting on rather than one blanket sentence.
     """
     if not rows:
         return "  (nothing watched -- `optjournal watch AAPL` adds a symbol)"
 
     def pct(value: Any) -> str:
         return "-" if value is None else f"{value:+.2f}%"
+
+    def signed(value: Any) -> str:
+        """A signed oscillator reading. The sign IS the published state, so it is
+        always printed, and a dash is never a zero."""
+        return "-" if value is None else f"{value:+.1f}"
+
+    def earnings(row: dict) -> str:
+        """The recorded date, with the derived countdown in the same cell.
+
+        Both, never one: the date alone makes the reader do the arithmetic, and the
+        countdown alone is a bare number in a table whose every other figure is
+        measured off stored closes. The pair says "this is the day you typed, and
+        this is how far off it is".
+
+        A past date says so in words rather than printing a negative day count.
+        `-13d` in a column of countdowns reads as a countdown that ran backwards; a
+        recorded date that has gone by is a stale note to yourself, and the footnote
+        below names those symbols so it can be replaced.
+        """
+        when = row["earnings_on"]
+        if not when:
+            return "-"
+        days = row["earnings_in_days"]
+        if days is None:
+            # A stored value `clock.parse_day` refuses, which only a hand-edited
+            # journal holds. Printed verbatim rather than hidden: the reader is the
+            # only one who can correct it, so they have to be able to see it.
+            return str(when)
+        if days < 0:
+            return f"{when} past"
+        return f"{when} today" if days == 0 else f"{when} {days}d"
 
     body = [
         [
@@ -476,7 +521,21 @@ def render_watchlist(rows: list[dict]) -> str:
             pct(row["change_1d"]),
             pct(row["change_5d"]),
             "-" if row["realised_vol"] is None else f"{row['realised_vol']:.1f}%",
+            # One decimal, matching the page's cell, tile and ring caption. The two
+            # surfaces read the same `rv_rank` off the same serializer, so a column
+            # rounded here and not there would have the terminal and the tab
+            # disagreeing about the same figure by up to half a point -- the drift
+            # this report exists to make impossible. The caption already prints the
+            # year's low and high to one decimal, so this is also the tenth being
+            # spent where the bounds already spend one.
+            "-" if row["rv_rank"] is None else f"{row['rv_rank']:.1f}",
+            signed(row["bx_daily"]),
+            signed(row["bx_weekly"]),
             _money(row["expected_move_5d"]),
+            # The one typed cell, sitting between the derived figures and the
+            # journal's own context -- which is what it is: neither measured nor
+            # fetched.
+            earnings(row),
             # The context a broker screen cannot give: what YOU hold against it.
             ", ".join(
                 f"{o['quantity']:+g} {_num_or(o['strike'])}{o['put_call'] or ''}"
@@ -487,13 +546,59 @@ def render_watchlist(rows: list[dict]) -> str:
     ]
     out = [
         table(
-            ["symbol", "last", "1d", "5d", "realised vol", "move 5d", "options"],
+            ["symbol", "last", "1d", "5d", "realised vol", "rvr",
+             "bx daily", "bx weekly", "move 5d", "earnings", "options"],
             body,
-            align="<>>>>><",
+            # Eleven columns: one label, eight numbers, then two cells that are
+            # text (a date with its countdown, and the option legs). The align
+            # string defaults to right beyond its own length, so it has to reach
+            # every column or the last one silently right-aligns.
+            align="<>>>>>>>><<",
         ),
         "",
+        # What this report's vol columns ARE, and no longer a claim about what is
+        # unreachable. The sentence used to end "implied vol needs an option chain
+        # this journal cannot reach", which was true of an implied vol this journal
+        # would SOLVE and became false as a blanket statement the moment `iv.py`
+        # started reading one CBOE had already measured. A footnote that contradicts
+        # a column on the other surface is the drift these sentences exist to stop.
         "  realised vol is what the stock DID, not what the market charges for what",
-        "  it might do -- implied vol needs an option chain this journal cannot reach",
+        "  it might do",
+        # Both provenance sentences are INTERPOLATED from the constants rather than
+        # typed, so a retune cannot leave the terminal claiming the old numbers --
+        # the rule `impact_source` already follows for the calendar's grades. They
+        # are wrapped rather than hand-broken for the same reason: the sentences live
+        # in `vol.py` and `trend.py`, so their length is not this module's to know.
+        _wrapped(
+            f"rvr is realised vol's position in this symbol's own trailing year, "
+            f"0 to 100. {RANK_MIDPOINT:.0f} is {RANK_BANDS_SOURCE}"
+        ),
+        # And why the IMPLIED rank the page carries is absent here. Stated rather
+        # than left to inference: a reader who has seen the tab's IVR column would
+        # otherwise read this report's silence as "no such figure exists", when what
+        # it means is "this report does not spend network requests". Every column
+        # above comes out of the database; `iv.fetch_iv_rank` costs two HTTP calls per
+        # symbol, and a reporting command that quietly reached the network would be a
+        # different kind of command.
+        _wrapped(
+            "ivr, the IMPLIED vol rank the Watchlist tab shows, is not here: it is "
+            "CBOE's figure and costs two requests per symbol, and this report reads "
+            "only the journal"
+        ),
+        _wrapped(f"bx is {PARAMS_CAPTION}; the weekly arm reads ISO weeks, "
+                 f"Monday start"),
+        # Unconditional, like the two above it, and for the same reason: the column
+        # needs its provenance stated whether it holds a date or a dash. A blank
+        # earnings cell in a table of measured figures reads as "nothing scheduled",
+        # and what it means is "nothing recorded" -- the countdown is the only
+        # column here whose input is the reader.
+        _wrapped(
+            "earnings is a date YOU recorded, not a fetched one: no source this "
+            "journal reaches publishes an earnings date, so a dash means none "
+            "recorded rather than none due. `optjournal watch NVDA --earnings "
+            "2026-08-27` records one; the days beside it are counted from the ET "
+            "trading day on every run and never stored"
+        ),
     ]
     thin = [r["symbol"] for r in rows if r["realised_vol"] is None]
     if thin:
@@ -501,7 +606,69 @@ def render_watchlist(rows: list[dict]) -> str:
             f"  no vol yet for {', '.join(thin)}: fewer than 6 daily closes stored."
             f" `optjournal bars` collects them."
         )
+    # Each gate names its own unit and its own count, because a symbol can be past
+    # one and short of another: 120 ISO weeks is about 600 sessions, so the weekly
+    # arm is the last of the three to answer and the rank the first.
+    warming = [
+        f"{r['symbol']} ({r['closes']} of {MIN_SETTLED} sessions)"
+        for r in rows if r["bx_daily"] is None
+    ]
+    if warming:
+        out.append(_wrapped(
+            f"no B-Xtrender yet for {', '.join(warming)}: inside that window the"
+            f" reading is a warm-up figure, and its SIGN can be wrong"
+        ))
+    weekly_warming = [
+        f"{r['symbol']} ({r['weeks']} of {MIN_SETTLED} weeks)"
+        for r in rows if r["bx_weekly"] is None
+    ]
+    if weekly_warming:
+        out.append(_wrapped(
+            f"no weekly B-Xtrender yet for {', '.join(weekly_warming)}"
+        ))
+    # Two different Nones, named apart. Below the gate there are not enough windows
+    # for a low and a high to be bounds; at or above it, the only other way to have
+    # no rank is a year whose readings are one number, where the position is 0/0 and
+    # a printed 50 would be the middle of a range that does not exist.
+    unranked = [
+        f"{r['symbol']} ({r['rv_rank_windows']} of {RANK_MIN_WINDOWS} windows)"
+        if r["rv_rank_windows"] < RANK_MIN_WINDOWS
+        else f"{r['symbol']} (a flat year: its low and its high are one number)"
+        for r in rows if r["rv_rank"] is None
+    ]
+    if unranked:
+        out.append(_wrapped(
+            f"no rvr yet for {', '.join(unranked)}: a min-max position needs"
+            f" enough windows for its low and its high to be bounds"
+        ))
+    # A date that has gone by, named. The cell says "past" in three characters,
+    # which cannot say what to do about it: the date STANDS until the reader records
+    # the next one, so the report that shows it is where the replacement belongs.
+    stale = [
+        f"{r['symbol']} ({r['earnings_on']})"
+        for r in rows
+        if r["earnings_in_days"] is not None and r["earnings_in_days"] < 0
+    ]
+    if stale:
+        out.append(_wrapped(
+            f"recorded and now past: {', '.join(stale)} -- the date stands until you"
+            f" record the next one, so it is not counted down any further"
+        ))
     return "\n".join(out)
+
+
+def _wrapped(text: str, *, width: int = 78, indent: str = "  ") -> str:
+    """One note, wrapped to a terminal width, every line carrying the indent.
+
+    Exists because the watchlist's footnotes are generated from constants in `vol`
+    and `trend` rather than typed here, so their length is not this module's to know
+    -- and a hand-broken f-string would go ragged the moment one of those sentences
+    was rewritten. The other reports break their own literals by hand, which is
+    correct for a sentence whose words live in the same line as the break.
+    """
+    return textwrap.fill(
+        text, width=width, initial_indent=indent, subsequent_indent=indent
+    )
 
 
 def _num_or(value: Any, dash: str = "") -> str:

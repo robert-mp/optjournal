@@ -17,6 +17,8 @@ from optjournal.bars import (
     CONTEXT_MAX_BARS,
     CONTEXT_MIN_BARS,
     HOURLY_LIMIT_DAYS,
+    SNAPSHOT_FLOOR_DAYS,
+    WATCH_LOOKBACK_DAYS,
     BackfillOutcome,
     audit_perishable,
     backfill_bars,
@@ -25,6 +27,8 @@ from optjournal.bars import (
     last_traded_day,
     replay_bars,
     upsert_bars,
+    watch_closes,
+    weekly_closes,
 )
 from optjournal.clock import MARKET_TZ
 from optjournal.marketdata import (
@@ -163,10 +167,11 @@ def test_bars_come_back_in_time_order():
 def _quote_payload(**meta):
     """A chart response carrying only what `parse_quote` reads.
 
-    Shaped from a REAL capture. The live `meta` block holds 23 keys; these four
-    are the ones read, and the field names are copied from the capture rather
-    than guessed -- `chartPreviousClose`, not `previousClose`, which the response
-    does not carry at all.
+    Shaped from a REAL capture. The live `meta` block holds 25 keys; five of them
+    are read, and the field names are copied from the capture rather than guessed --
+    `chartPreviousClose`, not `previousClose`, which the response does not carry at
+    all. None of the 25 is an implied vol, which is why the panel's gauge carries a
+    realised figure.
     """
     return {"chart": {"error": None, "result": [{"meta": dict(meta)}]}}
 
@@ -192,6 +197,83 @@ def test_an_undated_price_is_discarded():
     quote = parse_quote(_quote_payload(regularMarketPrice=330.915), symbol="TSLA")
     assert quote.at is None
     assert quote.price is None, "an undated price must not reach the page"
+
+
+def test_a_quote_carries_the_company_name():
+    """The name the watchlist shows beside the symbol, at NO extra request.
+
+    It was already arriving in the `meta` block this parser reads and being dropped,
+    which is why it rides on `/api/quotes` rather than becoming a stored column: the
+    request is already being spent on the price.
+
+    `longName` verbatim -- probed live, DELL's value is byte for byte the string the
+    mockup drew -- with no cleanup, because a name is the source's fact and
+    "improving" it is how one column comes to show two data qualities.
+    """
+    quote = parse_quote(_quote_payload(
+        longName="Dell Technologies Inc.", shortName="Dell Technologies Inc.",
+        regularMarketPrice=484.60, regularMarketTime=1786114925,
+    ), symbol="DELL")
+    assert quote.name == "Dell Technologies Inc."
+
+
+def test_the_name_falls_back_to_the_short_one_but_prefers_the_long():
+    """The order is measured, not stylistic.
+
+    `shortName` is truncated at 31 characters by the source: SPY reads "State Street
+    SPDR S&P 500 ETF T" there against the full "...ETF Trust" in `longName`, and on
+    a dual-class ticker the two disagree outright (BRK-B: "Berkshire Hathaway Inc.
+    New"). So `longName` wins whenever it is there, and the short one is still worth
+    more than a bare symbol when it is not.
+    """
+    both = parse_quote(_quote_payload(
+        longName="State Street SPDR S&P 500 ETF Trust",
+        shortName="State Street SPDR S&P 500 ETF T",
+    ), symbol="SPY")
+    assert both.name == "State Street SPDR S&P 500 ETF Trust"
+
+    short_only = parse_quote(
+        _quote_payload(shortName="State Street SPDR S&P 500 ETF T"), symbol="SPY"
+    )
+    assert short_only.name == "State Street SPDR S&P 500 ETF T"
+
+
+def test_a_nameless_quote_reports_none_so_the_row_shows_its_symbol():
+    """None rather than the symbol repeated, or an empty string.
+
+    Measured: ZVZZT, the exchange's own test ticker, answers with a price and NO
+    name at all, so this is a live case rather than a defensive one. None is what
+    lets the row render the bare symbol and lets a later search box say whether
+    company search is available yet; a symbol echoed into the name slot would make
+    "DELL DELL" look like data.
+
+    An empty or blank string is treated as absent for the same reason, and a
+    non-string is refused: a number under a company-name label is the defect shape
+    this project keeps hunting.
+    """
+    assert parse_quote(_quote_payload(regularMarketPrice=26.98), symbol="X").name is None
+    assert parse_quote(_quote_payload(longName="   "), symbol="X").name is None
+    assert parse_quote(_quote_payload(longName=42), symbol="X").name is None
+    # A blank long name must not shadow a usable short one.
+    assert parse_quote(
+        _quote_payload(longName="", shortName="Coherent Corp."), symbol="COHR"
+    ).name == "Coherent Corp."
+
+
+def test_a_name_survives_an_undated_price():
+    """The price is discarded without a timestamp; the name is not.
+
+    Different rules for different facts, and the reason is what each one goes stale
+    against: a price is meaningless without its age (outside market hours the source
+    keeps serving Friday's), while a company name does not change within a session.
+    Tying the two would blank the name on exactly the rows whose price is already
+    unusable, which is the reader's worst moment to lose the label.
+    """
+    quote = parse_quote(_quote_payload(
+        longName="Palantir Technologies Inc.", regularMarketPrice=177.32,
+    ), symbol="PLTR")
+    assert quote.price is None and quote.at is None
+    assert quote.name == "Palantir Technologies Inc."
 
 
 def test_a_quote_for_a_symbol_with_no_meta_is_empty_not_an_error():
@@ -646,6 +728,221 @@ def test_a_computed_bar_never_displaces_a_fetched_one(conn):
     )
 
 
+# --------------------------------------------------------------------------
+# watched symbols: rows stored, SESSIONS read
+# --------------------------------------------------------------------------
+
+def _et_bar(day: str, hour: int, close: float) -> Bar:
+    """A daily bar stamped at a given hour inside one ET session.
+
+    The hour is a parameter because the source does not stamp two daily series
+    alike: an option's daily bar arrives at 04:00Z, which is midnight ET, while
+    its underlying's arrives at 13:30Z, the session open. A reader joining on the
+    TIMESTAMP therefore sees two different bars where a reader joining on the ET
+    trading day sees one session -- which is the whole subject of these tests.
+    """
+    stamp = int(
+        datetime.strptime(day, "%Y-%m-%d").replace(hour=hour, tzinfo=MARKET_TZ)
+        .timestamp()
+    )
+    return Bar(ts=stamp, open=close, high=close, low=close, close=close, volume=1)
+
+
+def test_two_conids_covering_one_session_read_as_one_close(conn):
+    """The measured NVDA shape: one symbol's sessions stored under two conids.
+
+    A watched symbol gets the synthetic `watch:SYMBOL` key, and if the same name
+    is also traded its real underlying conid accumulates the same daily closes.
+    On the real journal that was 41 rows under conid 4815747 and 43 under
+    `watch:NVDA`, with 39 ET days present under BOTH and identical closes -- so
+    reading `LIMIT 21` rows returned 21 rows spanning 12 sessions, and every
+    duplicate is a zero-return day that drags a realised vol down.
+
+    Seeded here at the same shape, one conid stamped at the session open and the
+    other at midnight ET so the two cannot be collapsed by timestamp: eight rows
+    over five sessions, three of them present under both keys.
+    """
+    days = ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07"]
+    prices = [100.0, 101.0, 102.0, 103.0, 104.0]
+    upsert_bars(
+        conn, conid="4815747", symbol="NVDA", bar_size="1d", source="yahoo",
+        bars=[_et_bar(d, 9, p) for d, p in zip(days[:4], prices[:4], strict=True)],
+    )
+    upsert_bars(
+        conn, conid="watch:NVDA", symbol="NVDA", bar_size="1d", source="yahoo",
+        bars=[_et_bar(d, 0, p) for d, p in zip(days[1:], prices[1:], strict=True)],
+    )
+    stored = conn.execute(
+        "SELECT COUNT(*) AS n FROM price_bars WHERE symbol = 'NVDA'"
+    ).fetchone()["n"]
+    assert stored == 8, "the fixture is meant to store more rows than sessions"
+
+    series = watch_closes(conn, "NVDA")
+    assert [day for day, _ in series] == list(reversed(days)), (
+        "five ET sessions were stored as nine rows and must read back as five, "
+        "newest first -- vol.log_returns' documented input order"
+    )
+    assert [close for _, close in series] == list(reversed(prices))
+    assert watch_closes(conn, "NVDA", sessions=3) == [
+        ("2026-08-07", 104.0), ("2026-08-06", 103.0), ("2026-08-05", 102.0),
+    ], "the cap counts sessions, which is the unit the caller asked for"
+
+
+def test_the_higher_ranked_source_wins_a_duplicated_session(conn):
+    """Which duplicate survives is `marketdata.SOURCE_RANK`, not arrival order.
+
+    The demo's computed bars are ranked below every real source so a genuine
+    fetch always displaces one on WRITE; a reader that preferred the later
+    timestamp instead would undo that on READ, showing a synthetic price for a
+    session a real fetch also covers. So the synthetic bar here is inserted
+    second AND stamped later, leaving rank as the only thing that can pick the
+    fetched close.
+    """
+    upsert_bars(conn, conid="AAA1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_et_bar("2026-08-05", 9, 222.0)])
+    upsert_bars(conn, conid="watch:AAA", symbol="AAA", bar_size="1d",
+                source="synthetic",
+                bars=[_et_bar("2026-08-05", 15, 111.0),
+                      _et_bar("2026-08-04", 15, 99.0)])
+
+    assert watch_closes(conn, "AAA") == [("2026-08-05", 222.0), ("2026-08-04", 99.0)], (
+        "the fetched close must win the day both cover, and the computed one must "
+        "still answer for the day only it covers -- outranked is not discarded"
+    )
+
+
+def test_the_watch_window_covers_a_year_of_sessions(conn):
+    """The read window cannot be trimmed back to a month without a red test.
+
+    60 calendar days was ~41 sessions, which sized the fetch to ONE column: five
+    of the six real watched symbols held 45 or 46 closes and 10 ISO weeks, so
+    anything computed over a longer window was structurally absent. The floor
+    asserted here is the weekly indicator's ~120 ISO weeks (840 calendar days),
+    which is the reason the constant now carries.
+
+    The request COST is asserted in the same breath, because that is what makes
+    the width free: one daily request per watched symbol, whatever the span, and
+    never a perishable one.
+    """
+    conn.execute(
+        "INSERT INTO watchlist (symbol, note, added_at) VALUES ('NVDA', NULL, ?)",
+        ("2026-08-01",),
+    )
+    conn.commit()
+
+    watched = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "watchlist"]
+    assert len(watched) == 1, "one request per watched symbol, or the span is not free"
+    request = watched[0]
+    assert request.bar_size == "1d" and not request.perishable
+    span_days = (request.end - request.start) / DAY
+    assert span_days >= 840, (
+        f"the watch window is {span_days:.0f} calendar days; the weekly arm needs "
+        "~120 ISO weeks, which is ~840"
+    )
+    assert WATCH_LOOKBACK_DAYS == SNAPSHOT_FLOOR_DAYS, (
+        "the two windows are the same judgement -- ask wider than the answer needs "
+        "and let the source truncate -- and are meant to stay one number"
+    )
+
+
+# --------------------------------------------------------------------------
+# watched symbols: sessions bucketed into ISO weeks
+# --------------------------------------------------------------------------
+
+def test_a_week_is_its_last_session_and_a_short_week_is_still_a_week(conn):
+    """A week's close is where it ENDED, and a holiday-shortened week is one week.
+
+    No gap filling and no holiday calendar, for the perishable audit's own reason:
+    the sessions present in the data are the definition. That is not an edge case
+    either -- measured over 755 fetched closes, 31 of 158 ISO weeks hold four
+    sessions and 2 hold three, so filling them to five would invent a third of a
+    year of closes the market never printed.
+
+    Seeded as two full weeks around one whose Wednesday is missing, which is the
+    shape a real holiday leaves. The middle week must still appear, exactly once,
+    carrying its own last session's close.
+    """
+    days = [
+        "2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07",
+        "2026-08-10", "2026-08-11", "2026-08-13", "2026-08-14",   # no 08-12
+        "2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21",
+    ]
+    prices = [100.0 + n for n in range(len(days))]
+    upsert_bars(
+        conn, conid="watch:AAA", symbol="AAA", bar_size="1d", source="yahoo",
+        bars=[_et_bar(d, 0, p) for d, p in zip(days, prices, strict=True)],
+    )
+
+    weeks = weekly_closes(conn, "AAA")
+    assert [key for key, _, _ in weeks] == ["2026-W32", "2026-W33", "2026-W34"], (
+        "ISO weeks, Monday start, OLDEST FIRST -- and the short week is one week"
+    )
+    assert [close for _, close, _ in weeks] == [104.0, 108.0, 113.0], (
+        "a week's close is its last session's close, not its first or its mean"
+    )
+    assert [count for _, _, count in weeks] == [5, 4, 5], (
+        "the short week reports the four sessions it actually holds"
+    )
+
+
+def test_the_current_week_reports_how_many_sessions_are_in(conn):
+    """The newest bucket is normally partial, and its count is what says so.
+
+    Measured on 755 real closes, the newest ISO week held 3 sessions against 5 in
+    each of the five weeks before it, and the weekly indicator over that partial
+    week repaints every session (TSLA: -19.02, -18.63, -19.71 across those three).
+    Including it matches TradingView and this repo's own rule that a bar for a
+    session in progress is legitimately incomplete; showing it UNLABELLED would be
+    the undated-price defect again, so the count travels with the value.
+
+    A second session is then added to the same week and the count -- not the number
+    of weeks -- is what moves, which is the property the caption depends on.
+    """
+    upsert_bars(
+        conn, conid="watch:AAA", symbol="AAA", bar_size="1d", source="yahoo",
+        bars=[_et_bar(d, 0, p) for d, p in (
+            ("2026-08-14", 99.0),      # a Friday: the previous week, complete
+            ("2026-08-17", 100.0),     # the Monday of the newest week
+        )],
+    )
+    assert weekly_closes(conn, "AAA")[-1] == ("2026-W34", 100.0, 1)
+
+    upsert_bars(
+        conn, conid="watch:AAA", symbol="AAA", bar_size="1d", source="yahoo",
+        bars=[_et_bar("2026-08-18", 0, 101.0)],
+    )
+    weeks = weekly_closes(conn, "AAA")
+    assert len(weeks) == 2, "a second session in the same week is not a second week"
+    assert weeks[-1] == ("2026-W34", 101.0, 2), (
+        "the newest week's close follows its newest session, and the count says how "
+        "much of the week is in"
+    )
+
+
+def test_a_week_reads_one_close_per_session_however_many_conids_stored_it(conn):
+    """The weekly arm inherits `watch_closes`' collapse rather than repeating it.
+
+    Built on the deduplicated reader on purpose: a symbol that is watched AND traded
+    stores the same ET days under two conids, and a second SELECT here would count
+    each of them as a session -- which cannot move the week's close, but reports a
+    complete week as a ten-session one and would eventually disagree about which
+    source wins a day.
+    """
+    days = ["2026-08-17", "2026-08-18", "2026-08-19"]
+    prices = [100.0, 101.0, 102.0]
+    for conid, hour in (("4815747", 9), ("watch:AAA", 0)):
+        upsert_bars(
+            conn, conid=conid, symbol="AAA", bar_size="1d", source="yahoo",
+            bars=[_et_bar(d, hour, p) for d, p in zip(days, prices, strict=True)],
+        )
+    assert weekly_closes(conn, "AAA") == [("2026-W34", 102.0, 3)], (
+        "six stored rows are three sessions of one week"
+    )
+
+
+def test_a_symbol_with_no_bars_has_no_weeks(conn):
+    """Zero weeks, not one empty one: the count is what explains the weekly dash."""
+    assert weekly_closes(conn, "NOTHING") == []
 
 
 

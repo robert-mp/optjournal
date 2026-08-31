@@ -499,6 +499,49 @@ MUTANTS: tuple[Mutant, ...] = (
     # ignoring its broker argument) and `legs-merge` (a view grouping without it)
     # are both silent, and both are caught.
     Mutant(
+        key="watch-sessions",
+        module="bars.py",
+        find='        day = et_day(int(row["ts"]))',
+        replace='        day = str(row["ts"])',
+        breaks="a watched symbol whose closes are also stored under a traded "
+               "conid would have every shared session counted twice, so a "
+               "21-session realised vol would span 12 sessions with a "
+               "zero-return day between every real one -- 30.15% where the real "
+               "sessions say 40.71%, and always understating",
+    ),
+    # The gate, not the arithmetic. `trend.py`'s sums are the kind of thing a unit
+    # test catches on the first run; what would ship silently is answering at all
+    # on a symbol whose stored history is still warming up, because every value it
+    # produces is well-formed, inside the published range, and wrong by more than
+    # the band is wide.
+    Mutant(
+        key="bx-gate",
+        module="trend.py",
+        find="MIN_SETTLED = 120",
+        replace="MIN_SETTLED = MIN_CLOSES",
+        breaks="a symbol holding 40 daily closes would report a B-Xtrender "
+               "reading computed inside the warm-up zone: measured on real "
+               "closes, 2.2 to 7.5 points from the settled value at 45 sessions, "
+               "a flipped SIGN on TSLA at 44, and the long arm pegged at exactly "
+               "-50.0000 from 35 closes through 43 -- the strongest signal the "
+               "page can draw, from five weeks of history",
+    ),
+    # The degenerate case, not the formula. `(now - lo) / (hi - lo)` is the kind of
+    # arithmetic a hand-computed vector pins on the first run; what would ship
+    # silently is the 0/0 case answered with the midpoint, because 50.0 is a
+    # well-formed rank, renders mid-gauge, and is wrong about the only symbol whose
+    # vol never moved -- the flat year is the one year with no position to report.
+    Mutant(
+        key="rank-degenerate",
+        module="vol.py",
+        find="    if high == low:\n        return None",
+        replace="    if high == low:\n        return RANK_MIDPOINT",
+        breaks="a symbol whose realised vol was identical across its whole "
+               "trailing year would report a rank of 50.0 -- the middle of a "
+               "range that does not exist -- where the position is 0/0 and the "
+               "only honest answer is a dash",
+    ),
+    Mutant(
         key="held-scope",
         module="history.py",
         find="            \"      AND broker = p.broker)\",",

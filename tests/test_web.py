@@ -34,7 +34,7 @@ from optjournal.config import (
     DEFAULT_DEMO_DB,
     DEFAULT_DEMO_DIR,
 )
-from optjournal.db import connect, migrate
+from optjournal.db import connect, migrate, open_journal
 from optjournal.history import build_history
 from optjournal.stats import campaigns_for
 from optjournal.web import _origin_is_same, build_state, page_html, serve
@@ -147,13 +147,15 @@ def _js() -> str:
     """
     body = page_html().split("<script", 1)[1]
     script = body.split(">", 1)[1].split("</script>")[0]
-    return _IMPORT.sub("", script, count=1)
+    return _IMPORT.sub("", script)
 
 
-#: The leading ES module import. Dropped from the scanned script rather than
-#: stripped by `code_only`, because its quoted path parses as a property read on
-#: a binding named `replay` that exists nowhere -- and stripping ALL string
-#: literals broke the tests that legitimately assert on them.
+#: The ES module imports, ALL of them. Dropped from the scanned script rather than
+#: stripped by `code_only`, because each quoted path parses as a property read on a
+#: binding named after the file (`replay`, `watch`) that exists nowhere -- and
+#: stripping ALL string literals broke the tests that legitimately assert on them.
+#: It was `count=1` while there was one module, which reported `watch` as an
+#: undeclared binding the moment the second one landed.
 _IMPORT = re.compile(r"^\s*import\s*\{[^}]*\}\s*from\s*['\"][^'\"]+['\"];?", re.M)
 
 #: Shared with test_frontend, which needs the same stripping over replay.js. The
@@ -297,6 +299,12 @@ def test_contract_parser_is_correct():
 _UNSAMPLED = frozenset({
     "ChartPoint", "Bucket", "SyncResponse",
     "MarketFetch", "WatchWrite", "QuoteReply", "Quote",
+    # Reached only through `QuoteReply.ranks`, the `/api/quotes` reply, not the
+    # state payload -- so no `/api/state` sample can carry it, exactly like
+    # `Quote` and `QuoteReply` above. The branch that added it never saw this:
+    # the coherence test skips without the `raw/` archive, which the watchlist
+    # worktree lacked, so it first ran here on the real checkout.
+    "IvRank",
     # `GET /api/settings/token`. Deliberately off the state payload -- the
     # keyring has been measured at 8.2s with a locked keychain, so presence is
     # fetched by a button rather than on every page load, and no `/api/state`
@@ -1038,8 +1046,11 @@ def test_endpoint_reply_shapes_match_what_the_page_reads():
         _Handler._watchlist_write: ("ok", "kind", "action", "symbol", "changed",
                                     "message"),
         _Handler._quotes: ("ok", "quotes", "failed", "asked_at",
-                           # one Quote entry, read per row in the watchlist
-                           "price", "at", "previous_close", "currency"),
+                           # one Quote entry, read per row in the watchlist. `name`
+                           # rides here rather than on /api/state because it is
+                           # already inside the reply this request pays for, so it
+                           # costs no second per-symbol call
+                           "price", "at", "previous_close", "currency", "name"),
         # Both verbs of /api/jobs/run. Its keys are conditional on the status --
         # `jobs` only on 400, `run_id` on 202 and 409 -- so a sampled reply would
         # make four of them look absent, which is why it is source-pinned.
@@ -1500,6 +1511,17 @@ def _post(base: str, path: str, body: dict | None = None) -> tuple[int, dict]:
     ({"symbol": "SPY DROP TABLE"}, "symbol"),
     ({"symbol": "SPY", "action": "drop"}, "action"),
     ({}, "symbol"),
+    # The typed earnings date, refused by its own `kind` so the page can point at
+    # the field rather than at the row. A format check only -- this journal cannot
+    # know whether a company reports that day -- but the format is checked in both
+    # halves: the SPELLING, because `date.fromisoformat` accepts `20260827` and
+    # `2026-W35-1` on this interpreter and a column showing two spellings of one
+    # date is a column nobody can sort, and the CALENDAR, because a countdown to
+    # 2026-13-45 would be arithmetic over a day that does not exist.
+    ({"symbol": "SPY", "earnings_on": "27/08/2026"}, "date"),
+    ({"symbol": "SPY", "earnings_on": "2026-13-45"}, "date"),
+    ({"symbol": "SPY", "earnings_on": "20260827"}, "date"),
+    ({"symbol": "SPY", "earnings_on": "next thursday"}, "date"),
 ])
 def test_the_watchlist_endpoint_refuses_a_bad_request(populated, body, kind):
     """A user-input table reached over HTTP, so the input is not trusted.
@@ -1566,6 +1588,89 @@ def test_a_re_add_keeps_the_existing_note(populated):
             "SELECT note FROM watchlist WHERE symbol = 'AMD'").fetchone()["note"]
         conn.close()
     assert note == "keep me", "a bare re-add blanked the note"
+
+
+def _watch_row(db: Path, symbol: str = "AMD") -> dict:
+    """The stored row for one watched symbol, as a plain dict."""
+    conn = connect(db)
+    try:
+        row = conn.execute(
+            "SELECT note, earnings_on FROM watchlist WHERE symbol = ?", (symbol,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return {} if row is None else dict(row)
+
+
+def test_a_typed_field_is_written_when_present_and_left_alone_when_absent(tmp_path):
+    """Key-present semantics, in the SEQUENCE that made them necessary.
+
+    Three requests that all look like "add AMD" and mean three different things:
+
+    * `note` and `earnings_on` PRESENT -- write both.
+    * both ABSENT (the add form's own body) -- leave both alone. This is the
+      documented behaviour of a bare re-add, and it has to key off PRESENCE rather
+      than emptiness, which is the whole reason the request shape decides.
+    * `note` present and EMPTY -- write NULL. That was impossible before: the
+      endpoint mapped "" to None and the upsert's `COALESCE(excluded.note, note)`
+      read None as "keep the old value", so a note could be set and never cleared
+      while the reply said `ok`.
+
+    Over a SCRATCH journal rather than the `populated` fixture, deliberately: this
+    rule needs no statement, and `populated` skips wherever the archive is absent
+    (a fresh clone, a worktree, every `optjournal mutate` clone) -- which is exactly
+    where a silent write regression would go unmeasured. The sibling assertion on
+    `populated` stays as it is; this one runs everywhere.
+    """
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass  # migrate a journal into existence; the endpoint needs no rows
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        _, added = _post(base, "/api/watchlist", {
+            "symbol": "amd", "note": "a note", "earnings_on": "2026-08-27"})
+        assert added["symbol"] == "AMD"
+        assert _watch_row(db) == {"note": "a note", "earnings_on": "2026-08-27"}
+
+        # The add form sends neither key, so neither is touched.
+        _post(base, "/api/watchlist", {"symbol": "AMD"})
+        assert _watch_row(db) == {"note": "a note", "earnings_on": "2026-08-27"}, (
+            "a bare re-add blanked a typed field: absence must mean 'leave alone'"
+        )
+
+        _, cleared = _post(base, "/api/watchlist", {"symbol": "AMD", "note": ""})
+        assert cleared["ok"] is True
+        assert _watch_row(db)["note"] is None, (
+            "an explicit empty note must clear it -- the endpoint answered ok and "
+            "kept the old value, which is the hole this closes"
+        )
+        assert _watch_row(db)["earnings_on"] == "2026-08-27", (
+            "clearing one field rewrote another the request never mentioned"
+        )
+
+        # And the date clears the same way, since the reader can un-record one.
+        _post(base, "/api/watchlist", {"symbol": "AMD", "earnings_on": "   "})
+        assert _watch_row(db)["earnings_on"] is None, (
+            "whitespace is not a date: a field emptied in a text box has to clear "
+            "rather than store spaces the reader cannot see or delete"
+        )
+
+
+def test_a_refused_date_writes_nothing_at_all(tmp_path):
+    """A 400 leaves the row as it was, including the fields that WERE valid.
+
+    One request is one edit. Writing the acceptable half of a refused body would
+    leave the reader looking at a row that half-took, with an error message about
+    the other half -- and no way to tell which half landed.
+    """
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        _post(base, "/api/watchlist", {"symbol": "AMD", "note": "keep me"})
+        status, payload = _post(base, "/api/watchlist", {
+            "symbol": "AMD", "note": "and this", "earnings_on": "27/08/2026"})
+    assert (status, payload["kind"]) == (400, "date")
+    assert _watch_row(db) == {"note": "keep me", "earnings_on": None}
 
 
 def test_an_oversized_body_is_refused_rather_than_read(populated):
@@ -3948,6 +4053,826 @@ def test_the_age_wording_matches_the_other_freshness_readout():
         "a null age must read as `never`, not as `NaN ago`"
     )
 
+
+# --------------------------------------------------------------------------
+# The Watchlist panel: a list beside a detail pane.
+#
+# These are SOURCE assertions, and deliberately so: this panel's behaviour lives
+# in page.html, which node cannot import and this project has no browser test
+# runner for. Each one below was verified in a real browser first (demo journal,
+# 1600x1200, three watched rows) and then pinned here at the narrowest point that
+# would have caught the failure -- which is the same trade `test_a_render_preserves_
+# what_the_user_was_typing` records, and the reason README's "the greps are the
+# defence, not the smell" paragraph exists. What the browser showed: the hash
+# carried the open row across a reload, Enter on a focused symbol cell selected it,
+# every sort reversed on a second click with the barren row last in both
+# directions, the note survived a redraw mid-sentence with its caret, and no cell
+# rendered `undefined` or `NaN`.
+# --------------------------------------------------------------------------
+
+
+def test_the_row_and_the_panel_print_one_price():
+    """Both surfaces derive the shown price through the SAME helper.
+
+    This is the rule a measured defect produced: showing the fetched quote (773.26)
+    beside a change computed from stored bars (-0.16%) put two DIFFERENT sessions in
+    one row, because the bars ended Thursday and the quote was Friday's. A detail
+    pane reading `w.last` while the row it was opened from reads `qs[sym].price`
+    would be the same defect across two surfaces instead of two columns -- and
+    nothing else in this suite would notice: `previous_close` appears here only as a
+    payload key name, never as an assertion about how the change is derived.
+
+    So the derivation is `shownPrice` in static/watch.js, where node tests execute
+    every branch of it, and this pins that both call sites go through it.
+    """
+    for surface in ("watchTable", "watchDetail"):
+        body = _fn(surface)
+        assert "shownPrice(" in body, (
+            f"{surface} no longer calls shownPrice, so the row and the panel can "
+            "print a price from one session beside a change from another"
+        )
+    # And the page must not have grown its own copy of the fallback beside it.
+    js = _code_only(_js())
+    assert "previous_close" not in js, (
+        "the 1d basis is being derived in the page again; it belongs in watch.js, "
+        "where the quote-present, quote-without-a-previous-close and no-quote "
+        "branches are each covered by an executed test"
+    )
+    # Both also render the price through one helper, so the stale marker and its
+    # title cannot differ between the two.
+    assert _fn("watchTable").count("wprice(") == 1
+    assert _fn("watchDetail").count("wprice(") == 1
+
+
+def test_exactly_one_row_is_marked_current_for_a_selection():
+    """The open row is marked twice over: a tint for the eye, `aria-current` for a
+    screen reader, and both driven by one comparison against the chosen symbol.
+
+    A tint alone says nothing to a screen reader, and `aria-current` alone is
+    invisible -- so the test that matters is that they cannot disagree. One
+    expression decides both.
+    """
+    body = _fn("watchTable")
+    marked = body.replace(" ", "").replace("\n", "")
+    assert "conston=w.symbol===chosen" in marked, (
+        "the selected row is no longer decided by one comparison, so the class and "
+        "the ARIA state can drift apart"
+    )
+    assert 'class="${on?\'wsel\':\'\'}"' in marked, "the open row lost its tint"
+    assert "on?'aria-current=\"true\"':''" in marked, (
+        "the open row lost aria-current, so a screen reader cannot tell which row "
+        "the detail pane is describing"
+    )
+    # One row, because the selection is a single symbol and the pane shows one row.
+    assert "aria-current" not in _fn("watchDetail")
+
+
+def test_the_selected_symbol_round_trips_through_the_hash():
+    """`#wsym=DELL` is written, read back, and healed against the payload.
+
+    Healed BEFORE syncHash, following `S.replay` and `S.calday`: this one has an
+    edge neither of those has, because the reader can DELETE the row that is open.
+    Stop watching DELL and the payload reloads without it, so an unhealed key would
+    leave the address bar naming a symbol the journal no longer holds while the pane
+    quietly showed a different one.
+    """
+    js = _code_only(_js())
+    assert "hs.get('wsym')" in js, "the open row is not read back from the hash"
+    assert "hs.set('wsym',S.wsym)" in js.replace(" ", ""), (
+        "the open row is not written to the hash, so a reload loses it"
+    )
+    # Upper-cased on the way in, because that is how the endpoint stores a symbol
+    # and how the payload sends it back.
+    assert "(hs.get('wsym')||'').toUpperCase()" in js.replace(" ", "")
+    draw = _fn("draw").replace(" ", "").replace("\n", "")
+    assert "S.wsym=null" in draw, "wsym is not healed against the payload"
+    assert draw.index("S.wsym=null") < draw.index("syncHash("), (
+        "the heal must run before the hash is written, or the address bar carries a "
+        "symbol the page cannot open"
+    )
+    # A selection is a redraw, never a refetch: every figure is already in hand.
+    assert "wsym" not in _code_only(_js()).split("window.onhashchange")[1], (
+        "opening a row must not trigger a payload refetch"
+    )
+    assert "draw()" in _fn("selectWatch")
+    assert "load()" not in _fn("selectWatch")
+
+
+def test_the_symbol_cell_is_a_real_control():
+    """A `<button>`, not a click handler on a `<td>`.
+
+    That is what brings the accessible name, the role, Enter and Space and the
+    page's global `:focus-visible` ring without inventing any of them -- and a
+    master-detail list whose master is mouse-only fails this page's own standard
+    (`statCard` carries `tabindex` because "a tooltip reachable only by mouse is
+    still hidden from anyone driving the page from the keyboard").
+
+    The whole row carries the same `data-wsel` so a click anywhere selects, which
+    means one handler serves both paths and neither can rot separately.
+    """
+    body = _fn("watchTable").replace("\n", " ")
+    assert re.search(r'<button class="wselb"\s+data-wsel="\$\{esc\(w\.symbol\)\}"', body), (
+        "the symbol cell is no longer a button, so the list is unreachable from "
+        "the keyboard"
+    )
+    # Its accessible name is the symbol, and the company name once one has arrived.
+    assert "esc(w.symbol)}</b>" in body.replace(" ", "").replace("<b>", "<b>")
+    # The full name must ride in the title, since the cell ellipses it. It reaches
+    # there through `wselwhy` rather than inline: the same title also carries the held
+    # marker's meaning, because that glyph is `aria-hidden` and a second nested `title`
+    # would be a tooltip whose winner depends on where the pointer stopped. So the
+    # pin is in two parts, and the fallback is the part that matters here.
+    assert 'title="${esc(wselwhy(w,name))}"' in body, (
+        "the symbol button's title is no longer wselwhy's sentence, so either the "
+        "company name or the held fact has left the accessible name"
+    )
+    assert "constwhat=name||w.symbol" in _code_only(_js()).replace(" ", ""), (
+        "wselwhy no longer falls back to the company name, so the title on an unheld "
+        "row says nothing the ellipsed cell does not already show"
+    )
+    assert "el.onclick=()=>selectWatch(el.dataset.wsel)" in _fn(
+        "bindWatchlist").replace(" ", "").replace("\n", ""), (
+        "one handler must serve the row and the button, or mouse and keyboard "
+        "reach two code paths"
+    )
+    # Re-clicking the open row must not clear it: this panel always shows a row,
+    # and clearing would leave the pane empty with no way back but a reload.
+    assert "symbol===S.wsym) return" in _fn("selectWatch").replace("\n", " ")
+
+
+def test_the_symbol_cell_carries_the_ellipsis_trio():
+    """All three properties, because any one missing disables the other two.
+
+    `min-width:0` (a flex/grid item refuses to shrink below min-content without
+    it), `white-space:nowrap` (text-overflow only applies to a single line) and
+    `text-overflow:ellipsis` with `overflow:hidden`. The idiom is `.mkdot`'s, and
+    the reason is that "CrowdStrike Holdings, Inc." beside a symbol exceeds any
+    share of a split card -- without the trio the pane widens instead.
+    """
+    css = _css().replace(" ", "").replace("\n", "")
+    rule = css.split(".wselb{")[1].split("}")[0]
+    for prop in ("min-width:0", "white-space:nowrap",
+                 "overflow:hidden", "text-overflow:ellipsis"):
+        assert prop in rule, (
+            f".wselb lost {prop}, which silently disables the rest of the "
+            f"truncation: the cell will widen the pane instead of ellipsing"
+        )
+
+
+def test_the_sort_reverses_on_a_second_click():
+    """A click on the SORTED column flips its direction; a click on a new one
+    starts descending for the derived columns and ascending for the symbol.
+
+    A sort that only ever ascends passes any test that checks order once, which is
+    why the reversal is pinned rather than the order. Verified in a browser over
+    every column: `rvr` gave NVDA, SPY then SPY, NVDA on the second click, and
+    `aria-sort` followed both times.
+    """
+    handler = _fn("bindWatchlist").replace(" ", "").replace("\n", "")
+    assert "key===was[0]?key+':'+(was[1]==='desc'?'asc':'desc')" in handler, (
+        "clicking the sorted column no longer reverses it"
+    )
+    assert "key+':'+(key==='symbol'?'asc':'desc')" in handler, (
+        "a new column must open descending for a derived figure (the interesting "
+        "end is the top) and ascending for the symbol (alphabetical)"
+    )
+    # The state that carries it, and its default: symbol-ascending, which is
+    # `serialize.watchlist_data`'s own ORDER BY so the page and the CLI agree
+    # about which row is first.
+    js = _code_only(_js()).replace(" ", "").replace("\n", "")
+    assert "wsort:'symbol:asc'" in js
+    # aria-sort tracks the same two halves, or the glyph and the announcement
+    # disagree.
+    table = _fn("watchTable").replace(" ", "").replace("\n", "")
+    assert "aria-sort=\"${col===key?(asc?'ascending':'descending'):'none'}\"" in table
+    assert "col===key?(asc?'↑':'↓'):'⇅'" in table, (
+        "the inactive double arrow is gone, so an unsorted column reads as "
+        "unsortable"
+    )
+
+
+def test_nulls_sort_last_in_both_directions():
+    """An absent figure is not a small one.
+
+    A symbol holding no B-Xtrender has not stored enough sessions to have a
+    reading, so it must never top an ascending sort, where it would read as the most
+    extreme value in the column. The null branch therefore returns its verdict
+    BEFORE the direction multiplier is applied -- that ordering is the whole rule,
+    and folding the nulls into the comparison is how they end up first in one
+    direction.
+    """
+    body = _fn("watchSort").replace(" ", "").replace("\n", "")
+    assert "if(va==null||vb==null){" in body, "the null case is no longer separate"
+    assert "returnva==null?1:-1" in body, (
+        "a missing value must sort after a measured one whichever way the column "
+        "is pointing"
+    )
+    nulls = body.index("returnva==null?1:-1")
+    direction = body.index("*(asc?1:-1)")
+    assert nulls < direction, (
+        "the direction multiplier now reaches the null verdict, which puts "
+        "unmeasured rows first in one of the two directions"
+    )
+    # Ties break on the symbol, so the block of nulls has a stable readable order
+    # rather than the payload's arrival order.
+    assert body.count("wa.symbol<wb.symbol?-1:1") == 2
+
+
+def test_every_implied_vol_on_the_tab_is_attributed_to_whoever_measured_it():
+    """This rule INVERTED when the source arrived, and the inversion is the point.
+
+    What stood here before was an absence grep: the tab must never render the letters
+    IV, because implied vol is not reachable for a symbol this journal does not hold.
+    That premise was true of an implied vol this journal would COMPUTE, and it is
+    still true -- `iv.py` computes none. It was never true of one this journal is
+    TOLD. CBOE publishes iv30 and the high and low of its own iv30 over the trailing
+    year, so the tab now carries a real IV rank, and the rule that replaces the
+    absence is the one that made the absence necessary in the first place:
+
+        A FIGURE THIS JOURNAL DID NOT MEASURE MUST SAY WHOSE IT IS.
+
+    That is `market_events.impact`'s rule, stored verbatim as "the FEED's judgement,
+    not the journal's" and printed with that sentence beside it. So the assertions
+    are all positive now. An absence grep would pass over a ring with no caption at
+    all; naming the source is what cannot be faked.
+    """
+    watch = " ".join(_fn(name) for name in
+                     ("watchTable", "watchDetail", "watchFilters", "wring"))
+    labels = _code_only(watch)
+
+    # The provenance sentence, spent at all three surfaces that show the figure: the
+    # sortable header, the tile's caption, and the filter group's caption. One of the
+    # three going missing is a rank on screen with nobody's name on it.
+    assert labels.count("IVR_SOURCE") >= 3, (
+        f"IVR_SOURCE is spent {labels.count('IVR_SOURCE')} times across the header, "
+        f"the tile and the filter caption; every surface that prints CBOE's rank has "
+        f"to print whose rank it is"
+    )
+    # And that sentence actually names them, rather than being an empty slot.
+    source = re.search(r'const IVR_SOURCE="([^"]*)"', _js())
+    assert source, "IVR_SOURCE is gone, so nothing on the tab attributes the rank"
+    for word in ("CBOE", "trailing year", "delayed"):
+        assert word in source.group(1), (
+            f"the attribution no longer says {word!r}: a reader cannot tell whose "
+            f"figure this is, over what window, or how fresh"
+        )
+
+    # The bounds travel WITH the rank, which is what makes it reproducible. The same
+    # 76.7 inside a two-point year is a different fact from one inside a
+    # seventy-point year, and the rank alone can be neither checked nor doubted.
+    detail = _fn("watchDetail")
+    for part in ("ivr.iv30", "ivr.low", "ivr.high", "ivr.as_of"):
+        assert part in detail, (
+            f"the rank's caption dropped {part}, so the figure no longer states the "
+            f"range it is a position inside or how old it is"
+        )
+
+    # The two ranks stay distinguishable on screen. Realised and implied are
+    # different measurements, and the tab shows both -- an implied rank high while
+    # the realised rank is low is the market charging more than the stock delivered,
+    # which is only readable if the labels never blur.
+    assert "realised vol" in labels or "realised vol" in detail, (
+        "the realised figure lost its label, so two ranks share one vocabulary"
+    )
+    for part in ("rv_rank_low", "rv_rank_high", "rv_rank_windows"):
+        assert part in detail, (
+            f"the realised rank dropped {part}: it moved into the realised vol "
+            f"tile's caption, it did not stop needing its own bounds"
+        )
+
+
+def test_the_attribution_sentence_survives_the_rewrite():
+    """The footer sentences, and what each one is for.
+
+    The first DISTINGUISHES the tab's two volatilities, and its wording had to change
+    when the second one arrived. It used to end "implied vol needs an option chain
+    this journal cannot reach", which was the honest sentence while the neighbouring
+    rank was realised. With an IVR column two cells left it became a footer denying
+    what the table above it shows -- caught by reading the rendered page, not by any
+    assertion here, which is why this one now pins the CONTRAST rather than the
+    denial.
+
+    The second is the only instruction that turns this tab's dashes into numbers, so
+    it names the symbols that are waiting.
+    """
+    body = _fn("watchlist")
+    assert "realised vol is what the stock DID" in body
+    assert "IVR is what the" in body and "market CHARGES" in body, (
+        "the footer no longer contrasts the two volatilities, so a reader has no "
+        "sentence telling them why the tab carries both"
+    )
+    assert "cannot reach" not in body, (
+        "the footer is denying that implied vol is reachable while an IVR column is "
+        "on screen two cells away"
+    )
+    assert "no vol yet for ${esc(thin.join(', '))}: run" in body, (
+        "the remedy no longer names the thin symbols, so a reader cannot tell "
+        "which rows a `bars` run would fill in"
+    )
+    assert "optjournal bars" in body
+    # And the typed column says it is typed, which is slice 4's clause.
+    assert "earnings dates are ones you recorded" in body
+
+
+def test_the_typed_field_is_preserved_across_a_render_and_not_across_subjects():
+    """`loadQuotes()` calls `draw()` on its own, so a redraw lands mid-typing.
+
+    This guarded a note editor until the note panel went. The editor's textarea went
+    with it and so did the `textarea` half of the selector -- a selector matching
+    nothing is a mechanism no test can reach. What did NOT go is either failure it
+    was written for, because the earnings date field is the same shape of problem:
+
+    Preserved across a render of the SAME row: a quote landing mid-sentence otherwise
+    eats the text, the focus and the caret, exactly as it once ate the add field's.
+
+    NOT preserved across subjects, which is the sharper bug. An id is unique per
+    RENDER, not per subject, so `#wearn` is the earnings field whatever row is open:
+    selecting another symbol restored the previous symbol's typed date under the new
+    symbol's heading, and Save would have written it there. Verified in a browser
+    both ways.
+    """
+    helper = _code_only(_js())
+    keep = helper[helper.index("function preserveInputs"):]
+    assert "#body input" in keep, (
+        "preserveInputs no longer scans the panel's inputs, so the earnings date "
+        "loses what was typed on every redraw"
+    )
+    assert "textarea" not in keep, (
+        "the textarea selector is back with no textarea on the page: a selector that "
+        "matches nothing cannot be tested, which is why the disabled-tab slot went"
+    )
+    assert "subject:el.dataset.subject" in keep.replace(" ", ""), (
+        "the subject is not captured, so a date typed for one symbol can be "
+        "restored under another"
+    )
+    # And the field it now protects actually carries a subject to be checked against.
+    assert 'id="wearn" data-subject="${esc(w.symbol)}"' in _fn("watchDetail"), (
+        "the earnings field lost its id or its subject, so preserveInputs either "
+        "skips it or cannot tell which symbol the text belongs to"
+    )
+    restore = helper[helper.index("function restoreInputs"):]
+    assert "!==was.subject)return" in restore.replace(" ", ""), (
+        "a field whose subject changed under it must be dropped, not reconciled"
+    )
+    # It writes through the same endpoint, and an emptied box CLEARS -- which is what
+    # web._watchlist_write's key-present semantics were built for. The field is the
+    # earnings date now that the note editor has gone; `note` is still a writable
+    # column, reachable from `optjournal watch --note`, so the SEMANTICS did not move
+    # with the panel that used to exercise them.
+    assert 'data-wfield="earnings_on"' in _fn("watchDetail")
+    assert "body[wf.dataset.wfield]=el.value" in _fn("bindWatchlist").replace(" ", ""), (
+        "the field's value must be sent unmodified, or an emptied box cannot clear "
+        "a recorded date"
+    )
+
+
+def test_the_gate_counts_on_screen_match_the_python_constants():
+    """A dash names the count it is waiting for, and 120 must be the real gate.
+
+    The page holds its own copy of both gates because a count alone cannot explain
+    a dash -- "43" means nothing without "of 120" -- and neither gate is on the wire
+    (they are constants of the arithmetic, not facts about a symbol). A copy needs a
+    test, or a retune in `trend.py` leaves the screen explaining a dash with a
+    threshold that no longer applies, which is exactly the drift `PARAMS_CAPTION`
+    and `BANDS_SOURCE` exist to prevent one level down.
+    """
+    from optjournal import trend, vol  # noqa: PLC0415 - local to this test
+
+    js = _code_only(_js())
+    assert f"const BX_SETTLED={trend.MIN_SETTLED};" in js, (
+        f"the page explains a B-Xtrender dash against a gate that is not "
+        f"trend.MIN_SETTLED ({trend.MIN_SETTLED})"
+    )
+    assert f"const RVR_WINDOWS={vol.RANK_MIN_WINDOWS};" in js, (
+        f"the page explains a rank dash against a gate that is not "
+        f"vol.RANK_MIN_WINDOWS ({vol.RANK_MIN_WINDOWS})"
+    )
+    # And the tile's caption is the leaf's own generated sentence, so a retune of
+    # the periods cannot leave the screen claiming the old ones.
+    assert trend.PARAMS_CAPTION in js, (
+        "the B-Xtrender tile's caption no longer matches trend.PARAMS_CAPTION, so "
+        "the periods on screen are not the periods that produced the figure"
+    )
+    # Each dash actually spends them, or the constants are decoration.
+    assert "BX_SETTLED} sessions stored" in _fn("watchTable")
+    assert "BX_SETTLED} ISO weeks stored" in _fn("watchDetail")
+    # `wrankwhy` is an arrow const rather than a `function`, so it is read out of
+    # the whole script: it is one sentence shared by the cell's title and the
+    # tile's caption, which is the point of it existing at all.
+    assert "RVR_WINDOWS} windows measured" in js
+
+
+def test_the_held_marker_is_rendered_and_says_what_it_means():
+    """`Watch.held` shipped on the wire with NO reader, and this is that gap closed.
+
+    The defect shape is specific and worth naming, because it is invisible to every
+    other check here: a payload key can be emitted by `serialize` (serialize.py:971),
+    declared on the `Watch` typedef, pass the contract test that pairs those two, and
+    still be read by nothing at all. The contract test asks whether the page DECLARES
+    what the payload sends. It cannot ask whether the page SPENDS it. So the marker the
+    tab needs most -- the one fact a quote screen cannot show, that you have positions
+    open on this name -- was declared and never drawn, and the plan recorded it as
+    built.
+
+    Three assertions, because the marker fails in three separate ways. Unread: the
+    row does not branch on `held`. Unexplained: the glyph is `aria-hidden`, so if the
+    title does not carry the sentence then a screen reader gets a symbol and no fact,
+    and a hover gets the company name only. Untheming: a hex here wears Leather's
+    brass on Admiralty and Ledger, which is the defect the performance chart shipped
+    once already with `#0a0806` hardcoded into a stroke.
+    """
+    row = _fn("watchTable")
+    assert "w.held" in row, (
+        "watchTable no longer branches on Watch.held, so the payload key is back to "
+        "having no reader and the held marker is not drawn on any row"
+    )
+    assert 'class="whold"' in row, \
+        "the held marker's class is gone, so nothing in the stylesheet can reach it"
+
+    # The sentence, and the fact that it is spent. `wselwhy` is an arrow const, so it
+    # is read out of the whole script like `wrankwhy` above.
+    js = _code_only(_js())
+    assert "you hold" in js and "option position(s) on it" in js, (
+        "the held marker's title no longer says what the mark means, and the glyph is "
+        "aria-hidden -- so the row states a fact only in pixels"
+    )
+    assert "title=\"${esc(wselwhy(" in row, (
+        "the symbol button's title is no longer wselwhy's sentence, so either the "
+        "held fact is unreachable or it is in a second nested title attribute"
+    )
+
+    # Themed, not hardcoded. `--accent` is defined by :root and re-defined by both
+    # other themes (app.css:53, :136, :203), which is what makes the marker travel.
+    marker = re.search(r"\.whold\{([^}]*)\}", _css())
+    assert marker, ".whold lost its rule, so the marker renders at body colour and size"
+    assert "var(--accent)" in marker.group(1), (
+        f"the held marker's colour is not a theme variable: {marker.group(1)!r} -- a "
+        f"hex here is Leather's brass worn on Admiralty and Ledger"
+    )
+
+
+# --------------------------------------------------------------------------
+# The filter row and the two gauges.
+#
+# Same trade as the section above, and one addition worth naming: the gauges'
+# ARITHMETIC is not here at all. It is in static/watch.js under node tests, because
+# an inverted knob or an arc scaled by the radius renders a well-formed picture that
+# contains no `undefined` and no `NaN` -- nothing in this file, and nothing in the
+# sweep, can see it. What is pinned here is the part Python can see and would
+# otherwise drift: that the numbers on screen are the numbers the Python constants
+# produced, and that a control which hides every row says so.
+#
+# Verified in a real browser first (demo journal, 1600x2400, three watched rows):
+# company-name search narrowed to one row while the box kept its caret through four
+# redraws, each bucket and each band narrowed and named itself when it emptied the
+# table, the earnings chip enabled the moment a date was recorded and excluded the
+# 14d row while keeping the 80d and the dateless ones, and Clear filters restored all
+# three rows with the previously open row still open. One defect came out of that
+# session and is fixed with its own assertion below.
+# --------------------------------------------------------------------------
+
+
+def test_the_meter_scale_is_fixed_at_the_indicators_own_bounds():
+    """The literal -50 and +50 reach `meterKnob`, so the meter cannot auto-scale.
+
+    B-Xtrender is an RSI minus 50, so [-50, +50] is a real statable bound rather than
+    a preference -- and three years of TSLA used only [-35.6, +41.6] of it. Scaling to
+    the visible rows instead would make one knob position mean a different reading on
+    every refresh, and two symbols compared side by side would be read off two
+    different scales.
+
+    The bounds and the box travel as ONE object, which is the other half: the numbers
+    printed at the ends of the scale and the knob's position between them are read from
+    the same four fields, so a picture that disagrees with its own labels cannot be
+    written. `meterKnob` clamps rather than extrapolating (a node test), so a value
+    past the bound is pinned at the end instead of drawn off the track.
+    """
+    js = _code_only(_js()).replace(" ", "")
+    assert "constWMETER={x:6,w:156,lo:-50,hi:50}" in js, (
+        "the meter's domain is no longer the indicator's own [-50, +50] stated as "
+        "literals beside its box"
+    )
+    meter = _fn("wmeter")
+    assert "meterKnob(w.bx_daily,WMETER)" in meter.replace(" ", ""), (
+        "the knob is not placed by the tested helper against the fixed box"
+    )
+    # The scale's ends are PRINTED, from the same object, and nothing near the meter
+    # measures the data to find them.
+    assert "WMETER.lo" in meter and "WMETER.hi" in meter, (
+        "the scale ends are no longer read from the box the knob is placed against"
+    )
+    for measured in ("Math.min", "Math.max", "reduce("):
+        assert measured not in meter, (
+            f"{measured} in the meter means the scale is being derived from the rows "
+            f"on screen, which is the auto-scaling this test exists to prevent"
+        )
+
+
+def test_the_band_caption_matches_the_constants_that_produced_it():
+    """The bucket chips' numbers and their provenance sentence are `trend.py`'s.
+
+    B-Xtrender publishes no oversold or overbought level at all -- no hline, no level
+    inputs, only zero crossed with rising-or-falling -- so any band on screen is
+    IMPORTED, and an imported threshold with no provenance is one its reader cannot
+    audit. `BANDS_SOURCE` is the sentence that names the import and, in the same
+    breath, refuses the convention's valuation words: "oversold" and "overbought" are
+    claims about what a share is worth, and this is a statement about the shape of
+    recent closes.
+
+    Both halves are bound to Python, so a retune of the band cannot leave the row
+    offering the old one with nothing on screen saying so.
+    """
+    from optjournal import trend  # noqa: PLC0415 - local to this test
+
+    js = _code_only(_js())
+    assert f"const BX_LO={int(trend.BX_OVERSOLD)};" in js, (
+        f"the low band chip is not cut at trend.BX_OVERSOLD ({trend.BX_OVERSOLD})"
+    )
+    assert f"const BX_HI={int(trend.BX_OVERBOUGHT)};" in js, (
+        f"the high band chip is not cut at trend.BX_OVERBOUGHT "
+        f"({trend.BX_OVERBOUGHT})"
+    )
+    assert trend.BANDS_SOURCE in js, (
+        "the band caption is no longer trend.BANDS_SOURCE, so the page can quote a "
+        "provenance the constants no longer have"
+    )
+    # And each is actually SPENT: the labels are generated from the cut points, and
+    # the sentence is rendered in the row's caption.
+    labels = _code_only(_js()).replace(" ", "")
+    assert "low:'below'+num(BX_LO,0)" in labels and "high:'above+'+num(BX_HI,0)" in labels, (
+        "the chip labels are typed rather than generated, so one can read 'below -20' "
+        "after the band has moved"
+    )
+    assert "BX_BANDS" in _fn("watchFilters"), "the provenance sentence is not rendered"
+    # The band belongs to ONE arm, and the row says which: +/-20 cuts the outer ~10%
+    # of the daily short arm and about a third of the long one, so a caption that did
+    # not name the arm would be describing a bucket that holds a different share of
+    # the sessions depending on which series you read it against.
+    assert "daily short arm" in _fn("watchFilters")
+
+
+def test_the_indicator_parameters_are_on_screen():
+    """A figure headed BXTRENDER with no periods stated cannot be reproduced.
+
+    B-Xtrender at 5/20/15 and B-Xtrender at other settings are different numbers, so
+    the tile's caption is `trend.PARAMS_CAPTION` -- generated in Python from the
+    constants themselves, which is what stops a retune leaving the screen claiming
+    the old periods. The same gap `impact_source` closes for the calendar feed.
+    """
+    from optjournal import trend  # noqa: PLC0415 - local to this test
+
+    assert trend.PARAMS_CAPTION in _code_only(_js())
+    assert "cap:PARAMS_CAPTION" in _fn("watchDetail").replace(" ", ""), (
+        "the daily tile no longer captions itself with the generated sentence"
+    )
+    # The column header spends it too, so a reader scanning the table can reach the
+    # periods without opening a row.
+    assert "PARAMS_CAPTION" in _fn("watchTable")
+
+
+def test_the_ivr_chips_and_the_ring_tick_read_one_constant():
+    """The picture and the filter cannot disagree about where the cut point is.
+
+    One page constant, bound to `iv.IVR_HIGH`, spent three times: the two chip labels
+    and the ring's threshold tick. If the tick were drawn from its own literal, a
+    retune would move the chips and leave the mark where it was -- a gauge whose
+    reference line contradicts the control beside it, which is worse than having no
+    mark at all.
+
+    THIRTY IS THE READER'S LINE, and the caption has to say that rather than imply
+    research put it there. tastytrade, whose formula this rank uses, publish 50 as the
+    level premium selling leans on, 80 as extreme and 20 as depressed. 30 is none of
+    those: it is a wider net, chosen by the person running the screen. A chip may cut
+    wherever its reader wants; what it may not do is borrow someone else's authority
+    for the choice. So the assertion is on both halves -- the number, and the sentence
+    disclaiming whose number it is.
+    """
+    from optjournal import iv  # noqa: PLC0415 - local to this test
+
+    js = _code_only(_js())
+    assert f"const IVR_HIGH={int(iv.IVR_HIGH)};" in js, (
+        f"the IVR chips are not cut at iv.IVR_HIGH ({iv.IVR_HIGH})"
+    )
+    bands = re.search(r'const IVR_BANDS="([^"]*)"', _js())
+    assert bands, "IVR_BANDS is gone, so the cut point is on screen unexplained"
+    for word in ("your own", "tastytrade"):
+        assert word in bands.group(1), (
+            f"the band caption no longer says {word!r}: 30 has to read as the "
+            f"reader's own screening line and not as anyone's published level"
+        )
+    flat = js.replace(" ", "")
+    assert ("upper:'IVR>'+num(IVR_HIGH,0)" in flat
+            and "lower:'IVR<='+num(IVR_HIGH,0)" in flat), (
+        "the chip labels no longer come from the constant, so they can name a cut "
+        "point the filter does not use"
+    )
+    # The tick, from the SAME constant, as a fraction of a turn rather than a
+    # percentage -- `ringPoint` takes a turn, and 30 would be thirty laps.
+    tick = _fn("wring").replace(" ", "")
+    assert tick.count("ringPoint(IVR_HIGH/100,") == 2, (
+        "both ends of the tick must come from the same fraction as the chips, or the "
+        "mark and the control point at two different numbers"
+    )
+
+
+def test_the_ring_caption_names_its_window_and_its_bounds():
+    """A 0-to-100 arc in an options journal reads as IV rank to anyone who has one.
+
+    So the tile states, in words, every part of what it measured: the window (a
+    trailing year, in the label), the figure, the year's low and its high, and how
+    many windows it ranked against. The bounds matter most -- a rank hides an outlier
+    inside a rate, and printing both ends is what makes 67 checkable.
+
+    NO VERDICT WORD. "Elevated" is a claim about a level against some normal, and
+    nothing here establishes a normal; the slot prints the measurement instead.
+    """
+    ring = _fn("watchDetail")
+    assert "ivr · iv rank, 1y" in ring, (
+        "the tile no longer names what it ranks or over what window"
+    )
+    for part in ("ivr.iv30", "ivr.low", "ivr.high"):
+        assert part in ring, f"the caption dropped {part}"
+    assert "this year's low" in ring and "to its high" in ring
+    # The LEVEL beside the rank, which is the pair that makes a rank legible: 78.7 on
+    # an implied vol of 33.6% and 78.7 on one of 90% are the same position and
+    # completely different trades.
+    assert "implied vol is" in ring, (
+        "the caption no longer prints the implied vol the rank is a position of, so a "
+        "high rank on a modest level is indistinguishable from one on a violent level"
+    )
+    # Absent, it is a dash whose title says WHICH absence -- not fetched, not carried,
+    # or failed -- because those have three different remedies.
+    assert "wdash(ivrWhy(w.symbol))" in ring.replace(" ", "")
+    # NO VERDICT WORD, even now that one would be attributable. tastytrade's "premium
+    # selling favored" belongs to their 50, and this tab cuts at the reader's 30: a
+    # verdict imported across a different threshold is advice the number does not
+    # support. The measurement prints instead.
+    for verdict in ("Elevated", "elevated", "favored", "favoured"):
+        assert verdict not in ring, (
+            f"the ring is passing a verdict ({verdict}): the tab cuts at 30 and that "
+            f"word is calibrated on 50, so it would recommend on the strength of a "
+            f"threshold nobody applied"
+        )
+
+
+def test_the_gradient_stops_carry_no_colour_attribute():
+    """A presentation attribute cannot hold a `var()`, so a colour in one is a colour
+    no theme can repaint.
+
+    This is the defect the performance chart shipped with: its line and its dot halo
+    were SVG attributes holding hexes, one of them Leather's own background, so on
+    Admiralty the dots were ringed in a brown the page no longer contained. The
+    stylesheet check cannot see an attribute, which is why that chart sat out the
+    first theme release entirely.
+
+    So the meter's gradient stops carry CLASSES and the colours live in app.css, where
+    `test_no_colour_literal_lives_outside_a_theme_block` and the theme-parity check
+    both reach them.
+    """
+    meter = _fn("wmeter")
+    assert "<linearGradient" in meter, "the meter lost its gradient"
+    stops = re.findall(r"<stop[^>]*>", meter)
+    assert len(stops) == 3, f"expected three stops, found {stops}"
+    for stop in stops:
+        assert "stop-color" not in stop, (
+            f"a stop carries a colour attribute ({stop}), which survives every theme "
+            f"swap unchanged"
+        )
+        assert "class=" in stop, "a stop with no class cannot be coloured at all"
+    css = _css().replace(" ", "").replace("\n", "")
+    for name, var in (("lo", "--badfill1"), ("mid", "--bg2"), ("hi", "--okfill1")):
+        assert f".wmeterstop.{name}{{stop-color:var({var})}}" in css, (
+            f"the {name} stop has no themed colour in app.css"
+        )
+    # The knob likewise: it takes the page's own sign palette through currentColor
+    # rather than naming a colour of its own.
+    assert "fill:currentColor" in css.split(".wmknob{")[1].split("}")[0]
+    assert "'pos'" in meter and "'neg'" in meter, (
+        "the knob no longer carries a sign class, so it cannot be tinted at all"
+    )
+
+
+def test_an_unknown_earnings_date_is_not_excluded():
+    """The earnings filter excludes only dates you RECORDED.
+
+    Sparse nulls are the normal state of this column, not an edge: `earnings_on` is
+    typed, so most rows carry none for a long time. Dropping them would present the
+    filtered list as "nothing here reports within 28 days" when the truth is "nothing
+    here reports within 28 days that you have told me about" -- a claim this journal
+    has no source for, since nothing it can reach publishes an earnings date.
+
+    The rule is `earningsSoon` in watch.js, where node tests run the mixed set (14
+    days, 80 days, null, and the -1 past case) rather than reading it. It is a
+    function and not an inline comparison for one measured reason: `null >= 0` is TRUE
+    in JavaScript, so the obvious spelling hides every dateless row the moment the
+    filter goes on, silently and only while the chip is pressed. Verified in a browser
+    over a mixed set: NVDA at 14d dropped out, SPY at 80d and the dateless ZZZDEMO
+    stayed.
+    """
+    rows = _fn("watchRows").replace(" ", "")
+    assert "earningsSoon(w.earnings_in_days,WEARN_SOON)" in rows, (
+        "the earnings filter is comparing days inline again; `null >= 0` is true in "
+        "JavaScript, so that spelling hides every row with no date recorded"
+    )
+    assert "!(S.wearn&&earningsSoon(" in rows, (
+        "the filter must EXCLUDE the near ones rather than keep them, and only while "
+        "the chip is pressed"
+    )
+    # The chip says what it does, because both readings of it are defensible and they
+    # differ by the whole table.
+    chip = _fn("watchFilters")
+    assert "excludes only" in chip and "no earnings date is kept" in chip, (
+        "the chip's title no longer states that a row with no date is kept"
+    )
+    # And it is disabled, with its own reason, when no row carries a date at all --
+    # rather than offered as a control that would hide nothing.
+    flat = chip.replace(" ", "").replace("\n", "")
+    assert "dated?'':'disabled'" in flat, (
+        "the chip is offered even when no date exists anywhere, where pressing it "
+        "cannot change the list"
+    )
+    assert "no watched symbol carries an earnings date yet" in chip
+
+
+def test_a_filter_matching_nothing_says_which_control_is_hiding_the_rows():
+    """A non-empty watchlist with an empty filtered set has no first row.
+
+    Which makes it a STATE, not an edge to be discovered at runtime: the likely
+    accidental implementation is a blank `<tbody>` beside a detail pane reading from
+    `undefined`, and `sweep.check_no_junk_bindings` fails on exactly that. Both panes
+    are specified, and both name the CONTROL -- a reader who typed in the search box
+    and then pressed a bucket chip cannot see which of the two emptied the table.
+
+    One sentence, one function, spent by both panes, so they cannot describe two
+    different situations.
+    """
+    said = _fn("wnorows")
+    assert "watched symbol(s) are hidden by" in said
+    active = _fn("wactive")
+    for control in ("the search box", "the BXTRENDER filter", "the IV rank filter",
+                    "the EARNINGS filter"):
+        assert control in active, f"an empty result cannot name {control}"
+    # The search TERM is quoted back, because a typo is the likeliest cause.
+    assert 'the search box ("${needle}")' in active
+    # Both panes: the table's colspan row and the detail pane's block, each with the
+    # way out beside it.
+    table = _fn("watchTable").replace(" ", "").replace("\n", "")
+    assert 'colspan="5"' in table, "the empty row does not span the five columns"
+    assert "esc(wnorows())" in table and "data-wclear" in table
+    assert "${body||none}" in table, (
+        "the empty row is not rendered in place of an empty body, so the table shows "
+        "a bare header and the reader is left guessing"
+    )
+    pane = _fn("watchNone")
+    assert "wnorows()" in pane and "data-wclear" in pane
+    assert "wnone" in pane, "the detail pane has no block of its own to say it"
+    # The pane is chosen over the card only when there is no open row, and `S.wsym`
+    # survives it so clearing the filter restores the selection.
+    tab = _fn("watchlist").replace(" ", "").replace("\n", "")
+    assert "wopen?watchDetail(wopen):watchNone()" in tab, (
+        "the detail pane still renders from an undefined row when the filter matches "
+        "nothing"
+    )
+    assert "rows[0]||null" in tab, "an empty filtered set must not yield undefined"
+    assert "S.wsym=null" not in _fn("watchRows"), "the filter must not clear the choice"
+    # Clearing empties the FIELD as well as the state. Caught in a browser: without
+    # it, `preserveInputs` restored "nvidnvidzzz" over the freshly rendered empty box,
+    # so the table showed every row while the search box described a filter that was
+    # no longer applied.
+    bind = _fn("bindWatchlist").replace(" ", "").replace("\n", "")
+    assert "if(sb)sb.value='';S.wsearch=''" in bind, (
+        "Clear filters leaves the reader's text in the search box, which then "
+        "describes a filter that is not applied"
+    )
+
+
+def test_the_search_input_carries_an_id():
+    """Or `preserveInputs` drops what the reader typed on the next redraw.
+
+    The helper is keyed by `id` because that is what survives an innerHTML
+    replacement, and this field redraws the whole tab on every keystroke -- so without
+    an id the box would lose its text, its focus and its caret on the first character.
+    That is exactly what happened to `#wadd`, which is why the helper exists at all.
+
+    And it carries NO `data-subject`: a search box is not editing one symbol, so its
+    text must survive a change of selection rather than being dropped with it.
+    """
+    filters = _fn("watchFilters")
+    assert 'id="wsearch"' in filters, "the search box has no id, so a redraw eats it"
+    box = filters[filters.index('id="wsearch"'):filters.index('id="wsearch"') + 400]
+    assert "data-subject" not in box.split("</div>")[0], (
+        "a data-subject on the search box would drop the reader's query whenever "
+        "another row was opened"
+    )
+    # Its value is rendered FROM state, so the box and the filter agree after any
+    # redraw, and the handler writes state on input.
+    assert 'value="${esc(S.wsearch||\'\')}"' in filters
+    assert "sb.oninput" in _fn("bindWatchlist"), "typing does not narrow the list"
+    # The placeholder says whether company search is available yet, because the name
+    # only exists after Refresh has run -- offering "symbol or company" before that
+    # would silently match nothing.
+    assert "symbol or company" in filters and "company names arrive with" in filters
+    assert "named" in filters, "the placeholder is not derived from what arrived"
 
 
 # --------------------------------------------------------------------------

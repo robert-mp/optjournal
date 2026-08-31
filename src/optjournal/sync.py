@@ -84,12 +84,27 @@ def sync_journal(
 
     It ends with a snapshot, and the placement is deliberate: beside the write it
     protects, so it cannot be the thing that silently stopped running. Same
-    argument that turned `bars-audit` from a cron into a page-load field. What it
-    captures is what CANNOT be refetched -- 1,816 `price_bars` rows of which 329
-    are hourly option bars the README says cannot be backfilled at any price, plus
-    `market_events` and `watchlist`. A `raw/` backup would protect none of that:
-    the Flex query is `Last30CalendarDays`, so every statement comes back for the
-    cost of a request.
+    argument that turned `bars-audit` from a cron into a page-load field.
+
+    WHAT IT IS FOR IS THE PERISHABLE HALF, and the split is lopsided enough after
+    this change that "it backs up `price_bars`" would name the wrong thing.
+    Counted on the real journal: 1,816 `price_bars` rows, of which **329 are hourly
+    option bars** that no later run can recover -- an option's intraday series
+    exists only while its session is running (the README's asymmetric retention).
+    Everything else in that table comes back for the cost of one keyless request.
+
+    Widening `bars.WATCH_LOOKBACK_DAYS` from 60 to 1100 multiplies the RE-FETCHABLE
+    half and leaves the perishable count untouched, which is the point worth
+    stating rather than the growth. The arithmetic, from the probe behind that
+    constant (755 daily closes per symbol at 1100 days) against six watched symbols
+    holding ~270 rows between them today: ~4,500 rows where there were ~270, so the
+    table lands near 6,000 once the daily job has run at the new window, roughly
+    three quarters of it daily closes. Those are two measurements multiplied, not a
+    count of the table as it stands, and it is written that way on purpose -- the
+    figure that matters is unchanged either way: **329**, plus `market_events` and
+    `watchlist`, the two tables holding what no source will re-serve (a feed's
+    week, and what you typed). A `raw/` backup would protect none of it: the Flex
+    query is `Last30CalendarDays`, so every statement comes back for a request.
     """
     started = _now()
     result = fetch(

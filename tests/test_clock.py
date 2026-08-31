@@ -1,4 +1,4 @@
-"""The market clock: the zone, and the four conversions stated against it.
+"""The market clock: the zone, and the conversions stated against it.
 
 Beside `clock.py` rather than inside `test_bars.py`, where these lived while the
 clock did. Nothing here opens a database or reads a bar -- the whole module is
@@ -8,11 +8,17 @@ would be testing something else.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
-from optjournal.clock import MARKET_TZ, epoch_et, et_day, expiry_epoch
+from optjournal.clock import (
+    MARKET_TZ,
+    epoch_et,
+    et_day,
+    expiry_epoch,
+    parse_day,
+)
 
 
 def _utc_day(day: str) -> int:
@@ -87,3 +93,41 @@ def test_an_expiry_lands_on_the_sixteen_hundred_close_in_either_format():
     assert expiry_epoch("nonsense") is None
     close = datetime.fromtimestamp(expiry_epoch("2026-09-04"), MARKET_TZ)
     assert (close.hour, close.minute) == (16, 0), "an expiry is the 16:00 ET close"
+
+
+def test_a_day_is_read_back_only_in_the_spelling_this_journal_writes():
+    """`parse_day` accepts `et_day`'s own output and nothing that merely resembles it.
+
+    The spelling check is not decoration, and the reason is measured: on this
+    interpreter `date.fromisoformat("20260827")` returns 2026-08-27 and
+    `"2026-W35-1"` returns 2026-08-24, so parsing alone would let a typed earnings
+    date be stored in a spelling the column has never held -- `20260827` printed
+    beside `2026-08-27` in one column, sorting differently and reading as a number.
+
+    `expiry_epoch` deliberately accepts BOTH spellings, two tests above, because
+    IBKR sends both. Nothing sends this one: it is typed, so there is exactly one
+    right answer about what it looks like.
+    """
+    assert parse_day("2026-08-27") == date(2026, 8, 27)
+    assert parse_day("  2026-08-27  ") == date(2026, 8, 27), "typed input has spaces"
+    for other in ("20260827", "2026-W35-1", "2026-8-27", "27/08/2026"):
+        assert parse_day(other) is None, f"{other} is not the spelling we write"
+    # Round trip against the function that produces the spelling in the first place.
+    noon = int(datetime(2026, 8, 27, 12, tzinfo=MARKET_TZ).timestamp())
+    assert parse_day(et_day(noon)) == date(2026, 8, 27)
+
+
+@pytest.mark.parametrize("text", [None, "", "   ", "2026-13-45", "2026-02-30",
+                                  "next thursday"])
+def test_a_value_that_is_not_a_day_is_none_rather_than_a_raise(text):
+    """None, because one of the three callers is a READER.
+
+    Two entry points validate before writing, so this is only reachable for a
+    hand-edited journal -- which a single-user SQLite file invites. A raise there
+    would take the whole payload, and the page, down over one cell.
+
+    The two well-shaped non-dates are the interesting half: `2026-13-45` and
+    `2026-02-30` pass any regex a reader would write and are not days, and a
+    countdown to one would be arithmetic over something that does not exist.
+    """
+    assert parse_day(text) is None

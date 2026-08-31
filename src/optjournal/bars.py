@@ -59,6 +59,8 @@ __all__ = [
     "ReplaySeries",
     "replay_bars",
     "upsert_bars",
+    "watch_closes",
+    "weekly_closes",
 ]
 
 #: Calendar days of context either side of a holding window. Four rather than
@@ -134,11 +136,27 @@ SNAPSHOT_DRAW_BARS = 504
 
 #: Calendar days of daily history to keep for a WATCHED symbol.
 #:
-#: Sized from what the watchlist reports: a 20-session realised vol needs 21
-#: closes, and 60 calendar days is ~41 sessions -- enough for the vol plus a
-#: week's change, with room for holidays. Comfortably past HOURLY_LIMIT_DAYS, so
-#: `_bar_size_for` resolves a watch window to daily without a special case.
-WATCH_LOOKBACK_DAYS = 60
+#: Sized by the WIDEST window anything reads off these closes, which is the
+#: watchlist's weekly B-Xtrender arm: it needs ~120 settled ISO weeks before its
+#: value has converged, and 120 weeks is ~840 calendar days. 1100 is that plus
+#: room, and it is the figure `SNAPSHOT_FLOOR_DAYS` already uses for the same
+#: class of reason -- ask wider than the answer needs and let the source truncate
+#: to what it holds.
+#:
+#: This replaces the previous reason rather than adding to it. That reason was "a
+#: 20-session realised vol needs 21 closes, and 60 calendar days is ~41
+#: sessions", which sized the window to ONE column: measured, five of the six
+#: real watched symbols held 45 or 46 closes and 10 ISO weeks, so every figure
+#: computed over a longer window than a month was structurally absent.
+#:
+#: THE REQUEST COST IS NIL, which is why this is a constant and not a schedule
+#: change. `bars_manifest` already emits exactly one daily request per watched
+#: symbol whatever the span, `_bar_size_for` resolves anything past
+#: HOURLY_LIMIT_DAYS (40) to '1d' with no special case, and a live probe through
+#: this repo's own `fetch_bars` at 1100 days returned 755 daily closes with zero
+#: nulls for both GOOG and PLTR. The STORAGE cost is real and lands in
+#: `sync.py`'s snapshot docstring, which quantifies it there.
+WATCH_LOOKBACK_DAYS = 1100
 
 _COLUMNS = (
     "conid", "symbol", "bar_size", "ts",
@@ -364,12 +382,20 @@ def bars_manifest(
         # A watched symbol has no conid -- it is not a contract this account has
         # traded, so IBKR has never named it here. `price_bars` is keyed on conid,
         # so it needs a stable synthetic one, and `watch:SYMBOL` is both stable
-        # and impossible to collide with an IBKR integer id. The watchlist reads
-        # bars BY SYMBOL, so nothing downstream depends on the shape of this key;
-        # it exists only to keep the primary key honest. If the same name is later
-        # traded, the real conid's rows arrive alongside and the symbol lookup
-        # finds both, which is why this is `setdefault`-like rather than a
-        # rewrite: the real id wins nothing and loses nothing.
+        # and impossible to collide with an IBKR integer id.
+        #
+        # The watchlist reads bars BY SYMBOL, and that is where the invariant now
+        # lives: ONE ROW PER ET TRADING DAY, highest-ranked source winning a day
+        # two conids both cover -- see `watch_closes`, which is the only reader.
+        # This comment used to end "the real id wins nothing and loses nothing",
+        # which was a measured defect written down as a reassurance: NVDA held 41
+        # rows under conid 4815747 and 43 under `watch:NVDA` with 39 ET days
+        # present under BOTH and identical closes, so a symbol lookup finding both
+        # counted 39 sessions twice and a 21-row realised vol spanned 12 sessions,
+        # reading 30.15% where the 21 real sessions say 40.71%. Nothing about the
+        # key was wrong; the READER was, and stale prose beside it is exactly the
+        # trap this project has already paid for once (`conid` sat on the seam for
+        # four months with the reason written beside it).
         add(underlyings.get(name) or f"watch:{name}", name,
             int((moment - timedelta(days=WATCH_LOOKBACK_DAYS)).timestamp()),
             ceiling, "watchlist", open_=False)
@@ -644,6 +670,124 @@ def close_series(
         args,
     ).fetchall()
     return [(int(r["ts"]), float(r["close"])) for r in rows]
+
+
+def watch_closes(
+    conn: sqlite3.Connection, symbol: str, *, sessions: int | None = None
+) -> list[tuple[str, float]]:
+    """A watched symbol's daily closes as SESSIONS: ``(et_day, close)``, newest first.
+
+    NEWEST FIRST because that is `vol.log_returns`' documented input convention,
+    which exists so a caller can take the most recent window with a `LIMIT`
+    instead of reading a whole series. `sessions` caps how many ET days come back;
+    None reads everything stored.
+
+    ONE ROW PER ET TRADING DAY, and that is the whole point of the function.
+    `price_bars` is keyed on `(conid, bar_size, ts)` while the watchlist looks up
+    by SYMBOL, so a name that is both watched and traded has its sessions covered
+    twice: measured on the real journal, NVDA held 41 rows under conid 4815747 and
+    43 under the synthetic `watch:NVDA` key, with 39 ET days present under both and
+    identical closes. The serializer's own `ORDER BY ts DESC LIMIT 21` therefore
+    returned 21 ROWS spanning 12 SESSIONS, and realised vol read 30.15% where the
+    21 real sessions say 40.71%. Every duplicate is a zero-return day, so the
+    defect always understates -- and an oscillator over EMAs would be hurt worse
+    than a standard deviation is.
+
+    Collapsing on the ET DAY rather than on the timestamp is the rule the README
+    already states for joining two daily series: the source does not stamp them
+    alike, an option's daily bar arriving at 04:00Z (midnight ET) while its
+    underlying's arrives at 13:30Z (the session open).
+
+    WHICH duplicate wins is `marketdata.SOURCE_RANK`, read through the same
+    `_RANK_CASE` expression the upsert's guard uses, so the reader and the writer
+    cannot drift into disagreeing about which source is more trustworthy -- a real
+    fetch must beat the demo's computed bar here exactly as it does on write. Ties
+    within one rank go to the LATER `ts`, the closest thing to a settled close the
+    stored row can offer.
+
+    A null close is dropped, for `close_series`' reason: a bar's close is nullable
+    by design and a day with no print is not a session this can report a price for.
+    """
+    rows = conn.execute(
+        f"SELECT ts, close, ({_RANK_CASE}) AS rank FROM price_bars"
+        " WHERE symbol = ? AND bar_size = '1d' AND close IS NOT NULL"
+        " ORDER BY ts DESC",
+        (str(symbol or "").strip().upper(),),
+    )
+    # ET day is monotonic in ts, so `ORDER BY ts DESC` visits each day's rows
+    # contiguously: a new day means every earlier one is complete, which is what
+    # makes the `sessions` cap exact rather than approximate.
+    best: dict[str, tuple[int, int, float]] = {}
+    order: list[str] = []
+    for row in rows:
+        day = et_day(int(row["ts"]))
+        contender = (int(row["rank"]), int(row["ts"]), float(row["close"]))
+        if day not in best:
+            if sessions is not None and len(order) >= sessions:
+                break
+            order.append(day)
+            best[day] = contender
+        elif contender[:2] > best[day][:2]:
+            best[day] = contender
+    return [(day, best[day][2]) for day in order]
+
+
+def weekly_closes(
+    conn: sqlite3.Connection, symbol: str
+) -> list[tuple[str, float, int]]:
+    """A watched symbol's ISO weeks: ``(week_key, close, sessions)``, OLDEST FIRST.
+
+    Oldest first, which is the opposite of `watch_closes` and deliberate: this is a
+    SERIES a caller iterates or hands onward, not a window a caller takes the top
+    of, and `LIMIT`-shaped ordering would buy nothing here because a week's bucket
+    is only complete once every row of it has been seen. The one caller that feeds
+    `trend` reverses it, and `trend`'s docstring says that in as many words.
+
+    `week_key` is ISO `YYYY-Www`, MONDAY START, which is what TradingView draws for
+    US equities -- and matching it is the whole point, since the number's meaning is
+    "what the published indicator says about this symbol". A week's close is its
+    LAST session's close, so a week is summarised by where it ended rather than by
+    an average of it.
+
+    NO GAP FILLING AND NO HOLIDAY CALENDAR. The sessions present in the data are the
+    definition of the week, which is the same principle the perishable audit's
+    holiday oracle uses rather than maintaining a date list forever. A
+    holiday-shortened week is still one week, which is also what TradingView does,
+    and it is not an edge case: MEASURED over 755 fetched daily closes (each of
+    TSLA, GOOG, PLTR, SPY, NVDA and DELL, identically), 158 ISO weeks of which 125
+    hold five sessions, 31 hold four and 2 hold three. Filling those 33 weeks to
+    five would invent a third of a year of closes the market never printed.
+
+    `sessions` is carried because the NEWEST bucket is normally incomplete -- the
+    same 755 closes end in a 2026-W33 holding 3 sessions against 5 in each of the
+    five weeks before it -- and a weekly figure over a partial week repaints daily.
+    Measured on TSLA, the weekly short arm moved -19.02, -18.63, -19.71 across
+    those three sessions. Including the partial week matches TradingView and this
+    repo's own rule that a bar for a session in progress is legitimately
+    incomplete; showing it UNLABELLED would be the undated-price defect again, so
+    the count travels with the value and the surfaces print it.
+
+    Built on `watch_closes`, not on a second SELECT, so the ISO-week arm inherits
+    the one-row-per-ET-session collapse rather than a second copy of the defect
+    that reader exists to fix: a duplicated session inside a week could only move
+    the `sessions` count, but a second query would eventually disagree about which
+    source wins a day.
+    """
+    weeks: dict[tuple[int, int], list[tuple[str, float]]] = {}
+    for day, close in watch_closes(conn, symbol):
+        year, week, _ = datetime.strptime(day, "%Y-%m-%d").date().isocalendar()
+        weeks.setdefault((year, week), []).append((day, close))
+    out: list[tuple[str, float, int]] = []
+    # Sorted on the (year, week) TUPLE rather than on the formatted key, because a
+    # key is only orderable as text while the week is zero-padded, and an ISO week
+    # crossing a year boundary is exactly where that would first be tested.
+    for (year, week), rows in sorted(weeks.items()):
+        # `watch_closes` returns newest first, so within a bucket the FIRST row is
+        # already the week's last session. Taken by max() on the DAY anyway, so the
+        # week's close does not depend on the reader's order staying what it is.
+        close = max(rows)[1]
+        out.append((f"{year}-W{week:02d}", close, len(rows)))
+    return out
 
 
 @dataclass(frozen=True, slots=True)

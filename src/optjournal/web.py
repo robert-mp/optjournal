@@ -58,6 +58,7 @@ from optjournal import __version__, replay, settings as prefs
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.campaigns import position_count
+from optjournal.clock import parse_day
 from optjournal.costs import CostScope, build_costs
 from optjournal.db import connect, open_journal
 from optjournal.events import (
@@ -77,6 +78,8 @@ from optjournal.flex import (
 )
 from optjournal.history import build_history
 from optjournal.ingest import DEFAULT_ASSET_FILTER
+from optjournal.iv import IvFetchError, fetch_iv_rank
+from optjournal.iv import band as iv_band
 from optjournal.jobs import (
     JOBS,
     JobBusy,
@@ -152,6 +155,59 @@ _SYMBOL_OK = re.compile(r"^[A-Za-z0-9.\-]+$")
 #: enough that a keychain which merely needs a moment still answers, short enough
 #: that a button does not look stuck.
 KEYRING_TIMEOUT_S = 4.0
+
+#: The watchlist columns a request may write, in the order the upsert names them.
+#: A tuple rather than "whatever keys the body has", because these names are
+#: interpolated into the SQL: what is writable is a decision of this module's, and
+#: the derived and fetched figures on that table's tab have no column to write.
+_WATCH_FIELDS = ("note", "earnings_on")
+
+
+def _iv_ranks(symbols: list[str]) -> dict[str, Any]:
+    """CBOE's IV rank per symbol, and the two absences told apart.
+
+    THREE OUTCOMES, not two, which is the whole reason this is a function rather
+    than a comprehension. A symbol can rank; or CBOE can decline to carry it, which
+    is an ANSWER and belongs in `unranked`; or the request can fail, which is a
+    FAILURE and belongs in `ranks_failed`. Collapsing the last two would let a
+    server having a bad minute render as "this symbol has no options", which is a
+    false statement about the reader's own watchlist. `iv.fetch_iv_rank` draws the
+    same line one level down: None for a 403, raise for anything else.
+
+    One dead symbol does not blank the others, matching `_quotes` above: the loop
+    keeps going and the failure is named in the reply.
+
+    `band` is computed HERE rather than in the page, so the cut point that the two
+    filter chips are worded from lives once, in `iv.py`, beside the comment that
+    says it is the reader's chosen line and not tastytrade's.
+    """
+    ranks: dict[str, Any] = {}
+    unranked: list[str] = []
+    ranks_failed: list[str] = []
+    for symbol in symbols:
+        try:
+            got = fetch_iv_rank(symbol)
+        except IvFetchError as exc:
+            log.debug("iv rank %s failed: %s", symbol, exc)
+            ranks_failed.append(symbol)
+            continue
+        if got is None:
+            unranked.append(symbol)
+            continue
+        ranks[symbol] = {
+            "rank": got.rank,
+            "iv30": got.iv30,
+            #: The bounds travel WITH the rank. The same 76.7 inside a two-point
+            #: year is a different fact from one inside a seventy-point year, and
+            #: without them on screen the figure cannot be reproduced or doubted.
+            "low": got.low,
+            "high": got.high,
+            "band": iv_band(got.rank),
+            #: CBOE's own stamp, not the moment of the fetch: outside market hours
+            #: this endpoint keeps serving the last session's reading.
+            "as_of": got.as_of,
+        }
+    return {"ranks": ranks, "unranked": unranked, "ranks_failed": ranks_failed}
 
 
 def _origin_is_same(origin: str | None, *, host: str, port: int) -> bool:
@@ -710,11 +766,33 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "at": quote.at,
                 "previous_close": quote.previous_close,
                 "currency": quote.currency,
+                #: The company name rides HERE rather than in `/api/state`, and
+                #: that is the split this route exists for: it is fetched fact,
+                #: already inside the reply this request pays for, so it costs
+                #: nothing extra -- while a per-symbol name on the state payload
+                #: would spend a request on every page load and every tab switch.
+                #: The consequence is designed for rather than hidden: a row shows
+                #: its bare symbol until Refresh has run.
+                "name": quote.name,
             }
         return 200, {
             "ok": True,
             "quotes": quotes,
             "failed": failed,
+            #: IV ranks ride this route for the reason the route exists, and they
+            #: are the most expensive thing on it: TWO requests per symbol, because
+            #: CBOE serves the current implied vol and its trailing-year bounds from
+            #: two different paths. So a Refresh on a six-symbol watchlist costs six
+            #: quote requests plus twelve of these, which is why nothing on the state
+            #: payload triggers it.
+            #:
+            #: A SEPARATE KEY, not a field on each quote, and the reason is
+            #: provenance rather than tidiness: a quote is Yahoo's and a rank is
+            #: CBOE's, and the page prints whose each figure is. Merging them into
+            #: one per-symbol dict would put two sources under one name and make the
+            #: attribution a thing the renderer has to remember rather than a thing
+            #: the shape carries.
+            **_iv_ranks(symbols),
             #: The server's clock at the moment it answered, so the page renders
             #: an AGE rather than a timestamp it would have to trust its own clock
             #: to interpret. A quote is meaningless without one -- run on a
@@ -884,7 +962,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                      "query_id": self._effective_query_id()}
 
     def _watchlist_write(self) -> tuple[int, dict[str, Any]]:
-        """Add or remove one watched symbol.
+        """Add or remove one watched symbol, and write the fields the body carries.
 
         One symbol per request rather than a submitted list, because the UI edits
         one row at a time and a list would need a merge rule (is an absent symbol
@@ -894,6 +972,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         ticker universe: this journal has no such list, and inventing one would
         reject a legitimate foreign listing. A symbol that does not exist simply
         stores a row with no bars, which the tab already renders as a dash.
+
+        KEY-PRESENT SEMANTICS, and they are the fix rather than a convenience. A
+        field ABSENT from the body is left alone; a field PRESENT and empty is
+        written NULL. The two readings were previously collapsed by
+        `str(note) if note else None`, which maps "" to None, which the upsert's
+        `COALESCE(excluded.note, note)` then reads as "keep the old value" -- so a
+        note could be set and never cleared, and the endpoint answered `ok` while
+        doing nothing. Presence is what tells the two apart, and it has to be
+        presence rather than emptiness because the add form deliberately sends no
+        `note` key at all: that is what makes a bare re-add keep an existing note,
+        which is behaviour with its own test.
+
+        `earnings_on` is validated as a YYYY-MM-DD day and refused with kind
+        `"date"` otherwise. A FORMAT check only, in the spirit of `_SYMBOL_OK`:
+        this journal cannot know whether a company reports that day, and refusing
+        a date for being implausible would be inventing a calendar it does not
+        have. What it can know is that `27/08/2026` is not a day this journal
+        writes, and that a countdown derived from `2026-13-45` would be arithmetic
+        over something that does not exist -- see `clock.parse_day`.
         """
         body = self._body()
         symbol = str(body.get("symbol") or "").strip().upper()
@@ -904,20 +1001,48 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if action not in ("add", "remove"):
             return 400, {"ok": False, "kind": "action",
                          "message": f"unknown action {action!r}"}
-        note = body.get("note")
+        # The typed fields, from a LITERAL tuple rather than from the body's own
+        # keys: the column names are interpolated into SQL below, so what may be
+        # written is decided here and not by the caller.
+        fields: dict[str, str | None] = {}
+        for column in _WATCH_FIELDS:
+            if column not in body:
+                continue
+            typed = str(body[column] or "").strip()
+            if column == "earnings_on" and typed and parse_day(typed) is None:
+                return 400, {
+                    "ok": False, "kind": "date",
+                    "message": f"{typed} is not a YYYY-MM-DD date. An earnings "
+                               f"date is typed, so it is checked for spelling "
+                               f"rather than against a calendar this journal "
+                               f"does not have.",
+                }
+            # Blank means CLEAR. Stripped first, so a field emptied to spaces by a
+            # textarea clears rather than storing whitespace that renders as a
+            # value the reader cannot see or delete.
+            fields[column] = typed or None
         with open_journal(self.cfg.db_path) as conn:
             if action == "remove":
                 cursor = conn.execute(
                     "DELETE FROM watchlist WHERE symbol = ?", (symbol,))
                 changed = cursor.rowcount
             else:
-                # COALESCE, so re-adding a symbol does not blank an existing note
-                # -- the same upsert rule `optjournal watch` uses.
+                # Only the columns the body actually carried are assigned, so an
+                # absent one is untouched by construction rather than by a
+                # COALESCE that cannot tell "" from missing. DO NOTHING when the
+                # body carried none, which is the bare re-add.
+                updates = ", ".join(
+                    f"{column}=excluded.{column}"
+                    for column in _WATCH_FIELDS if column in fields
+                )
                 conn.execute(
-                    "INSERT INTO watchlist (symbol, note, added_at) VALUES (?,?,?)"
-                    " ON CONFLICT(symbol) DO UPDATE SET"
-                    " note=COALESCE(excluded.note, note)",
-                    (symbol, str(note) if note else None, _now()),
+                    "INSERT INTO watchlist (symbol, note, earnings_on, added_at)"
+                    " VALUES (:symbol, :note, :earnings_on, :added_at)"
+                    " ON CONFLICT(symbol) DO "
+                    + (f"UPDATE SET {updates}" if updates else "NOTHING"),
+                    {"symbol": symbol, "added_at": _now(),
+                     "note": fields.get("note"),
+                     "earnings_on": fields.get("earnings_on")},
                 )
                 changed = 1
             conn.commit()

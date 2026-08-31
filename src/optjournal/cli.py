@@ -30,7 +30,7 @@ from optjournal.bars import (
     backfill_bars,
     bars_manifest,
 )
-from optjournal.clock import MARKET_TZ
+from optjournal.clock import MARKET_TZ, parse_day
 from optjournal.compat import unknown_codes
 from optjournal.config import (
     DEFAULT_ARCHIVE,
@@ -290,6 +290,7 @@ def cmd_demo(args) -> int:
         reset_demo_rows,
         write_demo_bars,
         write_demo_statement,
+        write_demo_watchlist,
     )
 
     out, db = args.out, args.db
@@ -305,12 +306,18 @@ def cmd_demo(args) -> int:
         # a no-op on a fresh database and fills in once `bars` has run. Ordered
         # after the ingest because the contracts it prices come from it.
         option_bars = write_demo_bars(conn)
+        # Watched rows, so the Watchlist tab has something to render in
+        # `serve --demo` and in every sweep run. Additive and outside
+        # `reset_demo_rows`: `watchlist` is the user-input table, so a re-run must
+        # not be able to delete a symbol a reader added to their demo database.
+        watched = write_demo_watchlist(conn)
 
     payload = {
         "query_name": QUERY_NAME, "statement": str(path), "db": str(db),
         "trades": result.trades_inserted, "cash": result.cash_inserted,
         "positions": result.positions_written,
         "option_bars": option_bars,
+        "watched": watched,
     }
     lines = [
         f"wrote {path.name}  ({path.stat().st_size:,} bytes)",
@@ -326,6 +333,11 @@ def cmd_demo(args) -> int:
         "  0 synthetic option bars: no underlying series stored yet. Run"
         f" `optjournal bars --db {db}` for the real NVDA/SPY history, then"
         " re-run this to price the options against it."
+    ]
+    lines += [
+        f"  {watched} watched symbol(s) added"
+        if watched else
+        "  watchlist already seeded (a re-run never removes a symbol you added)"
     ]
     lines += [
         "",
@@ -433,18 +445,70 @@ def cmd_watch(args) -> int:
     feature has, and `watch AAPL` reading as "add AAPL" is the shape a reader
     already expects from `git branch`.
 
-    Prices and realised vol come from bars this journal already stores, so this
-    spends no request. A symbol with no bars yet shows a dash rather than a zero
-    -- `optjournal bars` is what fills it in.
+    Every MEASURED figure here comes from bars this journal already stores, so this
+    spends no request: the price, realised vol, its rank inside the symbol's own
+    trailing year, and B-Xtrender over both daily closes and ISO weeks. A figure
+    whose window is not yet full shows a dash rather than a zero, and the footnotes
+    name the count each dash is waiting on -- `optjournal bars` is what fills them
+    in.
+
+    TWO FIELDS ARE TYPED, and they take the same key-present semantics as the
+    endpoint (`web._watchlist_write`), for the same reason: a flag not passed leaves
+    the stored value alone, while `--clear-note` and `--earnings ''` write NULL.
+    Absence and emptiness are different requests -- collapsing them is how a note
+    became impossible to clear -- and on a CLI the flag's presence is what says
+    which one this is. `--note` and `--clear-note` are mutually exclusive at the
+    parser, since a command carrying both is asking for two things at once.
+
+    A malformed `--earnings` is refused rather than stored: a format check only,
+    through the same `clock.parse_day` the endpoint uses, so the two surfaces cannot
+    disagree about what a date is.
     """
+    # Stripped before anything looks at it, so the two surfaces agree: a value
+    # emptied to spaces clears rather than storing whitespace the reader can neither
+    # see nor delete, and `--earnings '  2026-08-27 '` is the date it looks like.
+    earnings = None if args.earnings is None else args.earnings.strip()
+    if earnings and parse_day(earnings) is None:
+        print(
+            f"\n--earnings wants a YYYY-MM-DD day; {args.earnings!r} is not one."
+            f" (An earnings date is typed, so it is checked for spelling rather"
+            f" than against a calendar this journal does not have.)",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+    # Which fields this invocation is writing, decided before the loop so the SQL
+    # is built once. A flag absent from the command line is absent from here, which
+    # is what leaves the stored value alone.
+    fields: dict[str, str | None] = {}
+    if args.clear_note:
+        fields["note"] = None
+    elif args.note is not None:
+        fields["note"] = args.note.strip() or None
+    if earnings is not None:
+        fields["earnings_on"] = earnings or None
+    if fields and not args.add:
+        print(
+            "\nNothing to write to: name the symbol as well, e.g."
+            " `optjournal watch NVDA --earnings 2026-08-27`.",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
     with open_journal(args.db) as conn:
         now = datetime.now(UTC).isoformat(timespec="seconds")
-
+        # Only the fields this invocation named are assigned on conflict, so a bare
+        # re-add is a no-op rather than a blanking -- the endpoint's rule, spelled
+        # the same way, because both write the same row.
+        updates = ", ".join(f"{column}=excluded.{column}" for column in fields)
         for symbol in (args.add or []):
             conn.execute(
-                "INSERT INTO watchlist (symbol, note, added_at) VALUES (?,?,?)"
-                " ON CONFLICT(symbol) DO UPDATE SET note=COALESCE(excluded.note, note)",
-                (symbol.upper(), args.note, now),
+                "INSERT INTO watchlist (symbol, note, earnings_on, added_at)"
+                " VALUES (:symbol, :note, :earnings_on, :added_at)"
+                " ON CONFLICT(symbol) DO "
+                + (f"UPDATE SET {updates}" if updates else "NOTHING"),
+                {"symbol": symbol.upper(), "added_at": now,
+                 "note": fields.get("note"),
+                 "earnings_on": fields.get("earnings_on")},
             )
         for symbol in (args.rm or []):
             conn.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.upper(),))
@@ -1169,11 +1233,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_history)
 
     p = sub.add_parser("watch", parents=[common, database],
-                       help="watchlist: symbols, prices, realised vol, your context")
+                       help="watchlist: prices, realised vol and its 1y rank, "
+                            "B-Xtrender daily and weekly, your earnings dates "
+                            "and your context")
     p.add_argument("add", nargs="*", metavar="SYMBOL",
                    help="symbols to add; with none, just shows the list")
     p.add_argument("--rm", nargs="+", metavar="SYMBOL", help="symbols to remove")
-    p.add_argument("--note", help="a note to attach to the symbols being added")
+    # Mutually exclusive, because "set this note" and "remove the note" are two
+    # requests and a command carrying both has not said which it wants. Passing
+    # neither leaves an existing note alone, which is what makes a bare re-add safe.
+    note = p.add_mutually_exclusive_group()
+    note.add_argument("--note", help="a note to attach to the symbols named")
+    note.add_argument("--clear-note", action="store_true",
+                      help="remove the note from the symbols named")
+    p.add_argument("--earnings", metavar="YYYY-MM-DD",
+                   help="the next earnings date for the symbols named, as YOU "
+                        "know it -- no source this journal reaches publishes one. "
+                        "Pass '' to remove a date")
     p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("market", parents=[common, database],

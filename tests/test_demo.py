@@ -1214,3 +1214,73 @@ def test_every_demo_replay_carries_a_band_and_an_effective_delta(demo, tmp_path)
         )
     assert compared, "nothing was actually compared"
 
+
+
+# ------------------------------------------------------------------ watchlist
+#
+# The Watchlist tab had NO fixture at all: a grep for "watchlist" across
+# `demo.py`, this module and `test_rendered.py` returned zero, so `serve --demo`
+# rendered only the empty state and every sweep run checked a tab with no rows in
+# it. Three seeded symbols change that, and the barren one is the interesting one:
+# it is the state five of the six real watched symbols are in today.
+
+
+def test_the_demo_seeds_watched_symbols_and_a_rerun_adds_none(conn):
+    """Three rows, and re-running the generator must not disturb them.
+
+    Additive, and outside `reset_demo_rows` on purpose: `watchlist` is the
+    user-input table and has no account column to scope a delete by, so a re-run
+    that rewrote it could remove a symbol or blank a note a reader typed into their
+    own demo database. The cost is that a change to the seeded notes does not reach
+    a database already holding these rows, which is stated in the function's
+    docstring rather than discovered.
+    """
+    from optjournal.demo import DEMO_WATCHLIST, write_demo_watchlist
+
+    assert write_demo_watchlist(conn) == len(DEMO_WATCHLIST) == 3
+    stored = [str(r["symbol"]) for r in conn.execute(
+        "SELECT symbol FROM watchlist ORDER BY symbol")]
+    assert stored == ["NVDA", "SPY", "ZZZDEMO"], (
+        "NVDA and SPY are the only symbols whose real underlying series the demo "
+        "holds, so they are the only two that can produce an indicator offline"
+    )
+
+    conn.execute("UPDATE watchlist SET note = 'mine' WHERE symbol = 'NVDA'")
+    conn.commit()
+    assert write_demo_watchlist(conn) == 0, "a re-run inserted a duplicate"
+    assert conn.execute(
+        "SELECT note FROM watchlist WHERE symbol = 'NVDA'"
+    ).fetchone()["note"] == "mine", "a re-run overwrote a note the reader typed"
+
+
+def test_the_barren_demo_symbol_reports_nothing_rather_than_zero(conn):
+    """Every derived figure absent, every count a real number.
+
+    ZZZDEMO holds no bars and never will: probed live, the source answers HTTP 404
+    for both its chart and its quote, so `optjournal bars` cannot populate it the
+    way it populates NVDA and SPY. That is what keeps one dash-with-a-reason row on
+    screen beside populated ones instead of the tab looking uniformly full.
+
+    Note what this does NOT assert: that the other two rows carry indicators. On a
+    fresh demo `price_bars` is empty -- the real NVDA and SPY history arrives only
+    once `optjournal bars` has run against the demo database -- so no test or sweep
+    expectation may assume a populated figure here.
+    """
+    from optjournal.demo import write_demo_watchlist
+    from optjournal.serialize import watchlist_data
+
+    write_demo_watchlist(conn)
+    row = next(r for r in watchlist_data(conn) if r["symbol"] == "ZZZDEMO")
+
+    for key in (
+        "last", "change_1d", "change_5d", "realised_vol", "expected_move_5d",
+        "bx_daily", "bx_daily_delta", "bx_bucket", "bx_weekly", "bx_weekly_week",
+        "bx_weekly_sessions", "rv_rank", "rv_rank_low", "rv_rank_high",
+        "rv_rank_band", "closes_through",
+    ):
+        assert row[key] is None, f"{key} is {row[key]!r} on a symbol with no bars"
+    assert (row["closes"], row["weeks"], row["rv_rank_windows"]) == (0, 0, 0), (
+        "the counts are what explain each dash, so they are zeroes rather than "
+        "Nones -- 'no sessions stored' is itself a measurement"
+    )
+    assert row["note"], "the seeded row carries a note, which the panel renders"

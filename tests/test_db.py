@@ -895,7 +895,13 @@ def test_the_ledger_survives_v7_and_changes_nothing_else(tmp_path):
     conn.commit()
 
     migrate(conn)
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 8
+    # SCHEMA_VERSION rather than the literal 8 this shipped with: what the test is
+    # about is that a journal stamped at an OLD version arrives at the current one
+    # with every row intact, and a literal makes that assertion need an edit on
+    # every bump -- which is an invitation to edit the number and stop reading the
+    # rest.
+    assert conn.execute(
+        "SELECT MAX(version) FROM schema_version").fetchone()[0] == SCHEMA_VERSION
     for table in ("job_state", "job_runs"):
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
@@ -904,6 +910,73 @@ def test_the_ledger_survives_v7_and_changes_nothing_else(tmp_path):
     for _ in range(3):
         migrate(conn)
     assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
+
+
+def test_a_pre_migration_journal_gains_the_earnings_column(tmp_path):
+    """`earnings_on` reaches a journal that already has a `watchlist` table.
+
+    The trap this exists for is structural rather than hypothetical: `_SCHEMA` uses
+    CREATE TABLE IF NOT EXISTS, so adding a column there reaches NEW databases only
+    -- and every journal on disk is an old one. The `_ADDED_COLUMNS` entry is the
+    only thing that makes the column real for them, and without it the tab renders,
+    the endpoint accepts a date and the write fails with "no such column" on the one
+    machine that has been keeping a journal.
+
+    So the table is created here at the OLD shape rather than by dropping the column
+    from a current one: that is the state on disk, three columns and a stamp from
+    before this change, and it exercises the ALTER against exactly it.
+
+    The row planted first is what proves the migration is additive. A rebuild that
+    lost a typed note would be worse than a missing column, because `watchlist` is
+    the user-input table -- nothing can re-derive what was in it.
+    """
+    from optjournal.db import schema_is_current
+
+    path = tmp_path / "j.db"
+    conn = connect(path)
+    conn.executescript(
+        "CREATE TABLE watchlist ("
+        "  symbol   TEXT PRIMARY KEY,"
+        "  note     TEXT,"
+        "  added_at TEXT NOT NULL"
+        ");"
+        "CREATE TABLE schema_version (version INTEGER NOT NULL,"
+        "                             applied_at TEXT NOT NULL);"
+        "INSERT INTO schema_version (version, applied_at) VALUES (8, 'then');"
+    )
+    conn.execute("INSERT INTO watchlist (symbol, note, added_at)"
+                 " VALUES ('DELL', 'watching the print', '2026-08-01')")
+    conn.commit()
+    assert "earnings_on" not in {
+        r["name"] for r in conn.execute("PRAGMA table_info(watchlist)")
+    }, "the fixture is meant to start at the pre-migration shape"
+    assert not schema_is_current(conn)
+
+    migrate(conn)
+
+    assert "earnings_on" in {
+        r["name"] for r in conn.execute("PRAGMA table_info(watchlist)")
+    }, (
+        "the ALTER did not run: CREATE TABLE IF NOT EXISTS is a no-op on an "
+        "existing table, so _ADDED_COLUMNS is what reaches a real journal"
+    )
+    # Additive, and the typed row is untouched -- with the new column NULL rather
+    # than a date the migration invented.
+    row = conn.execute(
+        "SELECT note, earnings_on FROM watchlist WHERE symbol = 'DELL'").fetchone()
+    assert (row["note"], row["earnings_on"]) == ("watching the print", None)
+
+    # And the column is writable, which is the whole point of it existing. A date
+    # written here is what `optjournal watch --earnings` and the endpoint both do.
+    conn.execute("UPDATE watchlist SET earnings_on = '2026-08-27'"
+                 " WHERE symbol = 'DELL'")
+    conn.commit()
+    assert conn.execute(
+        "SELECT earnings_on FROM watchlist WHERE symbol = 'DELL'"
+    ).fetchone()["earnings_on"] == "2026-08-27"
+    migrate(conn)  # idempotent: migrate runs on every single connection
+    assert schema_is_current(conn)
+    conn.close()
 
 
 def test_the_heartbeat_and_the_anchor_are_separable(tmp_path):

@@ -21,13 +21,21 @@ from xml.etree import ElementTree
 import pytest
 from conftest import ROOT, code_only
 
-MODULE = ROOT / "src" / "optjournal" / "static" / "replay.js"
+STATIC = ROOT / "src" / "optjournal" / "static"
+#: Every pure module the page imports. A TUPLE rather than one path, because the
+#: boundary tests below are properties of the SEAM and not of one file: the second
+#: module arrived (watch.js, the watchlist's price and direction derivations) and
+#: the checks that had been keeping replay.js honest for a year would have covered
+#: none of it. Widened in the same diff that added the file, so the seam never has
+#: an unpoliced member.
+MODULES = (STATIC / "replay.js", STATIC / "watch.js")
 SUITE = ROOT / "tests" / "frontend"
 PAGE = ROOT / "src" / "optjournal" / "page.html"
 
 
-def test_the_module_exists_where_the_page_and_the_tests_both_expect_it():
-    assert MODULE.is_file(), f"no module at {MODULE}"
+@pytest.mark.parametrize("module", MODULES, ids=lambda p: p.name)
+def test_the_module_exists_where_the_page_and_the_tests_both_expect_it(module):
+    assert module.is_file(), f"no module at {module}"
     assert SUITE.is_dir()
 
 
@@ -65,25 +73,28 @@ _BROWSER_ONLY = (
 )
 
 
+@pytest.mark.parametrize("module", MODULES, ids=lambda p: p.name)
 @pytest.mark.parametrize("token", _BROWSER_ONLY)
-def test_the_pure_module_touches_no_browser_api(token):
-    source = code_only(MODULE.read_text())
+def test_the_pure_module_touches_no_browser_api(token, module):
+    source = code_only(module.read_text())
     assert token not in source, (
-        f"replay.js references {token!r}. Move it to page.html: this module has "
-        "to stay importable by node, with no DOM and no globals."
+        f"{module.name} references {token!r}. Move it to page.html: these modules "
+        "have to stay importable by node, with no DOM and no globals."
     )
 
 
-def test_the_page_imports_the_module_rather_than_duplicating_it():
+@pytest.mark.parametrize("module", MODULES, ids=lambda p: p.name)
+def test_the_page_imports_the_module_rather_than_duplicating_it(module):
     """Two copies of the same scale is worse than one untested copy: the tests
     would pass against a function the page no longer runs.
     """
     page = PAGE.read_text()
-    assert "/static/replay.js" in page, "page.html does not import the module"
+    assert f"/static/{module.name}" in page, f"page.html does not import {module.name}"
     assert 'type="module"' in page, "an ES module needs a module script tag"
 
 
-def test_the_page_imports_exactly_what_it_calls():
+@pytest.mark.parametrize("module", MODULES, ids=lambda p: p.name)
+def test_the_page_imports_exactly_what_it_calls(module):
     """No stale names in the import list, and nothing called without importing.
 
     Both directions, because they fail differently. An unused import is a quiet
@@ -91,11 +102,15 @@ def test_the_page_imports_exactly_what_it_calls():
     `markAt`) had accumulated, each a function the page never calls and replay.js
     uses internally, so a reader auditing the seam saw twelve names where nine
     were live. A MISSING import is worse and louder: the page throws a
-    ReferenceError at render, which no Python-side test would catch.
+    ReferenceError at render, which no Python-side test would catch -- and the
+    watchlist is one tab of nine, so a browser render of the Dashboard would not
+    reach it either.
     """
     page = PAGE.read_text()
-    block = re.search(r"import\s*\{([^}]*)\}\s*from\s*'/static/replay\.js'", page)
-    assert block, "no replay.js import block found in page.html"
+    block = re.search(
+        rf"import\s*\{{([^}}]*)\}}\s*from\s*'/static/{re.escape(module.name)}'", page
+    )
+    assert block, f"no {module.name} import block found in page.html"
     imported = {n.strip() for n in block.group(1).split(",") if n.strip()}
 
     # Comments stripped, or the comment explaining WHY a name was dropped from
@@ -110,7 +125,7 @@ def test_the_page_imports_exactly_what_it_calls():
     )
     # The other direction: every exported name the page references must be
     # imported, or it is an undefined identifier at runtime.
-    exported = set(re.findall(r"^export (?:function|const) (\w+)", MODULE.read_text(), re.M))
+    exported = set(re.findall(r"^export (?:function|const) (\w+)", module.read_text(), re.M))
     referenced = {
         name for name in exported
         if re.search(rf"(?<![\w.]){name}\s*\(", body) or re.search(rf"\b{name}\b", body)
@@ -121,18 +136,19 @@ def test_the_page_imports_exactly_what_it_calls():
     )
 
 
-def test_the_page_does_not_redefine_what_the_module_exports():
+@pytest.mark.parametrize("module", MODULES, ids=lambda p: p.name)
+def test_the_page_does_not_redefine_what_the_module_exports(module):
     """Catches the specific rot this seam exists to prevent -- a helper copied
     back into the page during a quick fix, leaving the tested version orphaned.
     """
-    exported = set(re.findall(r"^export function (\w+)", MODULE.read_text(), re.M))
+    exported = set(re.findall(r"^export function (\w+)", module.read_text(), re.M))
     assert exported, "no exports found; the extraction regex is wrong"
     page = PAGE.read_text()
     duplicated = sorted(
         name for name in exported if re.search(rf"\bfunction {name}\s*\(", page)
     )
     assert not duplicated, (
-        f"page.html redefines {duplicated}, which replay.js already exports"
+        f"page.html redefines {duplicated}, which {module.name} already exports"
     )
 
 

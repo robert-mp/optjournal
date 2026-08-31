@@ -105,6 +105,18 @@ import {
   indexOfTs, niceTicks, nextStop, reachedEvents, plotGeometry, sessionBreaks,
   strikeSpan,
 } from '/static/replay.js';
+/* The watchlist's derivations and its gauge geometry, in their own module for the
+   same reason: each takes data and returns data. `shownPrice` is imported ONCE and
+   called by two surfaces (the table row and the detail pane), which is what makes
+   it structurally impossible for them to print a price from one session beside a
+   change from another -- see its docstring for the browser-caught defect.
+   The three geometry functions are there because a gauge is the one drawing that
+   can be arithmetically wrong while every check here still passes: an inverted
+   knob or an arc scaled by the radius renders a well-formed picture with no
+   `undefined` in it. Only an executed test sees those, so the numbers live where
+   node can run them and this file keeps the markup they position. */
+import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
+  shownPrice} from '/static/watch.js';
 
 /* ===================== the payload contract =====================
    Everything this page reads, declared beside the code that reads it. The
@@ -724,8 +736,13 @@ import {
  * @property {string|null} note
  * @property {string} added_at
  * @property {number|null} last -- null until bars are stored for it
- * @property {number} closes -- daily closes held, so the page can say WHY a
- *   vol is missing rather than showing a bare dash
+ * @property {number} closes -- distinct ET SESSIONS held, so the page can say WHY
+ *   a vol is missing rather than showing a bare dash. Sessions and not rows: a
+ *   name that is watched AND traded stores two conids over the same days, and 21
+ *   rows of NVDA covered 12 sessions (see bars.watch_closes)
+ * @property {string|null} closes_through -- the ET day of the newest close used,
+ *   which is what lets the stale marker name the session it is showing. Null only
+ *   when no close is stored at all
  * @property {number|null} change_1d -- percent
  * @property {number|null} change_5d -- percent
  * @property {number|null} realised_vol -- percent. REALISED, not implied: see
@@ -733,6 +750,49 @@ import {
  *   vol would be a well-formed number under a label that does not describe it
  * @property {number|null} expected_move_5d -- one stdev of what the stock HAS
  *   been doing, over five sessions. Not the market's expected move
+ * @property {number|null} bx_daily -- B-Xtrender's short arm over daily closes,
+ *   in [-50, +50] by construction. Null below trend.MIN_SETTLED sessions, where
+ *   every value is a warm-up figure: measured on TSLA's real closes, the SIGN
+ *   flips at 44 of them. `closes` is what says why it is null
+ * @property {number|null} bx_daily_delta -- the same arm one session ago
+ *   subtracted, which is the indicator's published SECOND state (rising or
+ *   falling). Null on the session a symbol first crosses the gate, because the
+ *   earlier window is one short
+ * @property {string|null} bx_bucket -- low|mid|high from trend.bucket, computed
+ *   server-side so a chip and a caption cannot disagree about the cut points.
+ *   Carries no valuation vocabulary on purpose: the RSI convention's own words
+ *   live in trend.BANDS_SOURCE, attributed
+ * @property {number|null} bx_weekly -- the same arm over ISO weeks. Null below
+ *   trend.MIN_SETTLED WEEKS; `weeks` says how many are held
+ * @property {string|null} bx_weekly_week -- the newest ISO week, YYYY-Www, and a
+ *   fact about the stored series rather than a figure, so it answers even when
+ *   bx_weekly does not
+ * @property {number|null} bx_weekly_sessions -- sessions stored in that week. The
+ *   newest week is normally partial and its value repaints daily, so the weekly
+ *   figure may never be rendered without this count beside it
+ * @property {number} weeks -- ISO weeks held, in the weekly arm's own unit
+ * @property {number|null} rv_rank -- today's realised vol as a MIN-MAX position
+ *   inside its own trailing year, 0 to 100. A rank, not a percentile, and not an
+ *   IV rank: implied vol is unreachable for a symbol this journal does not hold.
+ *   Null below vol.RANK_MIN_WINDOWS windows and on a flat year, where the
+ *   position is 0/0 rather than the midpoint
+ * @property {number|null} rv_rank_low -- the year's lowest reading, percent
+ * @property {number|null} rv_rank_high -- and its highest. Both answer exactly
+ *   when rv_rank does, because a low and a high off a dozen windows would read as
+ *   a year's extremes
+ * @property {number} rv_rank_windows -- windows measured, reported below the gate
+ *   too: it is what turns the rank's dash into a sentence
+ * @property {string|null} rv_rank_band -- upper|lower from vol.rank_band, cut at
+ *   vol.RANK_MIDPOINT (the middle of this symbol's own year) and never at IV
+ *   rank's 30. The edge belongs to lower, matching the chips' own wording
+ * @property {string|null} earnings_on -- the next earnings date, YYYY-MM-DD, as
+ *   the reader TYPED it. Not fetched and not derivable: nothing this journal
+ *   reaches publishes one (see db.py's column comment for what was probed), so
+ *   null means none recorded and never none due, and every surface says which
+ * @property {number|null} earnings_in_days -- days from the ET trading day to that
+ *   date, derived on every read and never stored, so it cannot drift from the date
+ *   beside it. Negative once the date has gone by, which the cell renders in words:
+ *   a recorded date stands until the reader records the next one
  * @property {Array} options -- WatchOption rows: what this journal holds on it
  * @property {boolean} held
  */
@@ -908,16 +968,48 @@ import {
  *   AGE from this; a price without it is discarded server-side rather than shown
  * @property {number|null} previous_close -- the source's own prior settle
  * @property {string|null} currency
+ * @property {string|null} name -- the company or fund name, from the same meta
+ *   block at no extra request. Null until a quote has arrived, which is why the
+ *   row falls back to the bare symbol rather than reserving space for it
+ */
+
+/** @typedef {Object} IvRank -- one symbol's implied vol and its place in its own
+ *  year, from QuoteReply.ranks (web._iv_ranks, iv.IvRank). CBOE's figures, not
+ *  this journal's: it publishes iv30 and the high and low of that same series over
+ *  the trailing year, so all that happens here is a division -- which is why an
+ *  IMPLIED number can sit on this tab without the modelled-number quarantine
+ *  growing. See iv.py. Never stored, for Quote's reason
+ * @property {number} rank -- 0 to 100, CLAMPED. tastytrade's formula:
+ *   (iv30 - low) / (high - low) * 100. Clamped because CBOE's bounds move on a
+ *   slower cadence than its live iv30, so the live figure can sit outside its own
+ *   published year -- measured on TSLA at a raw -0.2
+ * @property {number} iv30 -- the 30-day implied vol itself, percent, so the reader
+ *   can see a high rank on a modest level for what it is
+ * @property {number} low -- the trailing year's lowest iv30, percent
+ * @property {number} high -- and its highest. Both travel WITH the rank: the same
+ *   76.7 inside a two-point year is a different fact from one inside a
+ *   seventy-point year, and the rank alone cannot be doubted
+ * @property {string|null} band -- upper|lower from iv.band, cut at iv.IVR_HIGH.
+ *   The SERVER decides it so the cut point lives once
+ * @property {string} as_of -- CBOE's own timestamp, verbatim. Not the moment of the
+ *   fetch: outside market hours this endpoint keeps serving the last session
  */
 
 /** @typedef {Object} QuoteReply -- the /api/quotes reply
  *  (web._Handler._quotes)
  * @property {boolean} ok
- * @property {Object} quotes -- symbol -> {price, at, previous_close, currency}
+ * @property {Object} quotes -- symbol -> Quote (price, at, previous_close,
+ *   currency, name)
  * @property {Array} failed -- symbols the source would not answer for. One dead
  *   ticker must not blank the others, so it is a list rather than an error
  * @property {number} asked_at -- the SERVER's clock when it answered, so the page
  *   renders an age without trusting its own clock against the source's
+ * @property {Object} ranks -- symbol -> IvRank. Only the symbols that HAVE one
+ * @property {Array} unranked -- symbols CBOE does not carry (HTTP 403, measured).
+ *   An ANSWER, not a failure, and permanent: nothing to retry
+ * @property {Array} ranks_failed -- symbols whose rank request failed. Kept apart
+ *   from `unranked` because a server having a bad minute must not render as "this
+ *   symbol has no options", which would be false about the reader's own watchlist
  */
 
 /** @typedef {Object} ChartPoint -- page-side: built from Stats.days for the equity curve
@@ -947,8 +1039,9 @@ import {
  * @payload res:SyncResponse pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
  * @payload e:Annotation
  * @payload mk:Market d:MarketDay mev:MarketEvent mf:MarketFacet
- * @payload w:Watch wo:WatchOption
+ * @payload w:Watch wo:WatchOption wopen:Watch wa:Watch wb:Watch
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
+ * @payload ivr:IvRank ir:IvRank
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook
  * @local Math S TABS THEMES b sel m r el location window qs hs ids
@@ -956,13 +1049,14 @@ import {
  * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
  * @local play scrub speed loop ev reached stops at dismiss
- * @local chosen withEvents ws opts thin
+ * @local chosen withEvents ws opts thin px tile
  * @local countries impacts shownByDay next want picked
  * @local JSON Object ages input mine qb wf behind was
  * @local when button parts names y
  * @local COST_OPTIONS bits cost fees on wh
  * @local STATS_KEYS_REQUIRED missing state
  * @local SCORINGS qidsave tokcheck
+ * @local WBX_LABEL WIVR_LABEL WMETER WRING items it arc tin tout sb
  */
 
 const $=s=>document.querySelector(s);
@@ -1010,6 +1104,48 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      Not in the hash, for the same reason as marketday: a link to "the calendar"
      means the week, not one reading of it. */
   mkcountries:null,mkimpacts:null,
+  /* Which watched symbol the detail pane is showing. IN the hash, unlike
+     marketday and for the opposite reason: the market strip always has a
+     sensible default day, while "DELL on the watchlist" is a view worth linking
+     to and a reload that dropped it would leave the pane showing a different
+     symbol from the one being read. Healed in draw() against State.watchlist
+     BEFORE syncHash, the `replay` discipline, so the address bar never carries a
+     symbol the page cannot open -- a removed row is exactly how that happens.
+     NULL means "no explicit choice", not "nothing selected": the pane then shows
+     the first row of the sorted list, derived rather than stored, so the URL
+     stays clean until the reader picks a row. */
+  wsym:null,
+  /* The table's sort, as "column:dir" -- one string, because the two halves are
+     never useful apart and two keys would let a column arrive without a
+     direction. NOT in the hash: a sort narrows nothing and changes no figure, it
+     reorders a list already delivered, which is the same reasoning that keeps the
+     calendar's filter axes out (`mkcountries`). Symbol-ascending by default
+     because that is `serialize.watchlist_data`'s own ORDER BY and the CLI's, so
+     the page and the terminal agree about which row is first -- defaulting to a
+     derived column, as the mockup's IVR-descending does, would make which row
+     opens depend on a figure that is absent for five of six real symbols. */
+  wsort:'symbol:asc',
+  /* The watchlist's four filters. NONE of them is in the hash, and that is the
+     `mkcountries`/`mkimpacts` precedent rather than an oversight: each narrows a
+     list the payload has already delivered in full and changes no figure in it,
+     where `wsym` names a view worth linking to. A link to "the watchlist" means
+     the watchlist.
+
+     `wsearch` is the search box's text, and it is spelled out rather than shortened
+     to `wq` for a measured reason: the contract table above already binds `wq` to a
+     `Quote` in this file, and one two-letter name on two concepts is the defect
+     shape this project hunts, in an identifier instead of in a label.
+
+     `wbx` and `wivr` are single-select (null means All), because a bucket and a
+     band each partition their range -- picking two of three buckets is a question
+     nobody asks, and `.seg` is the page's shape for "pick one". `wearn` is a
+     boolean toggle, since "exclude the ones reporting soon" has no second value.
+
+     A row whose bucket or band is NULL is hidden by a chosen bucket or band, which
+     is the honest reading: an unmeasured symbol is not quietly inside the set the
+     reader believes was measured. The empty-state prose names whichever control is
+     doing it. */
+  wsearch:'',wbx:null,wivr:null,wearn:false,
   /* Live quotes, keyed by symbol, and the server clock when they were asked for.
      NOT part of `state`: they come from their own endpoint because each one costs
      an HTTP request, so they must not ride along on every payload reload. Null
@@ -1025,7 +1161,14 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      already summarised in one unit: asking the server is the only way to get it
      without reimplementing campaigns.py here, which is exactly the duplication
      that module exists to prevent. */
-  scoring:null};
+  scoring:null,
+  /* IV ranks, from the SAME reply as the quotes, and the whole reply rather than
+     just its ranks: `{ranks, unranked, ranks_failed}`. The two lists are kept
+     because they are what lets a dash say WHICH absence it is -- not fetched, not
+     carried, or failed -- and those have three different remedies. Null, not `{}`,
+     until a fetch has happened: null means "never asked" and an empty `ranks` means
+     "asked, and nothing came back", which the empty-state prose distinguishes. */
+  ivr:null};
 
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -3315,94 +3458,831 @@ function market(){
   </div>`;
 }
 
-/* Watchlist: symbols being watched, with what this journal knows about them.
+/* Watchlist: a list of watched symbols beside a detail pane for the open one.
  *
- * The last two columns are the reason this is not a quote screen. A broker app
- * shows a price; only this journal can say "you are short the 520 put on it".
+ * A MASTER-DETAIL panel, which is this page's one two-pane shape -- Calendar,
+ * Market and Replay all put detail under master, and this does too below 1180px.
+ * It replaced a nine-column table because that table had honestly run out of
+ * room: five derived figures now arrive on the wire and each one needs its
+ * window, its periods or its count stated beside it, and a caption per cell is
+ * not something a table row has space for.
  *
- * `realised_vol` is REALISED, and the header says so. Implied vol is not
- * reachable for a symbol this journal does not hold -- it is solved from an
- * OPTION's own closes, and a watched name has none (see vol.py). Labelling
- * realised vol as IV would fit the column and be wrong.
+ * THE TABLE HOLDS THE FIVE COLUMNS WORTH SCANNING; the pane is where a figure
+ * explains itself. What left the table -- 1d, 5d, the expected move and the
+ * option positions -- moved into the pane rather than being deleted. The options
+ * block in particular is the reason this is not a quote screen: a broker app
+ * shows a price, and only this journal can say "you are short the 520 put on it".
+ *
+ * `realised_vol` and `rv_rank` are REALISED, and every label here says so.
+ * Implied vol is not reachable for a symbol this journal does not hold -- it is
+ * solved from an OPTION's own closes, and a watched name has none (see vol.py).
+ * Labelling realised vol as IV would fit the column and be wrong, and carrying IV
+ * rank's conventional 30 onto this rank would be the same defect one level up, in
+ * a threshold rather than in a value.
  */
+
+/* The two gates the payload's counts are measured against. Mirrored here because
+   a dash has to say what it is WAITING for, and a count cannot do that alone:
+   "43" means nothing without "of 120". Not on the wire, because they are
+   constants of the arithmetic rather than facts about a symbol -- so the page
+   holds a copy and `test_the_gate_counts_on_screen_match_the_python_constants`
+   binds each to its own leaf. Two names for one value, exactly as `trend.py` and
+   `vol.py` spell them separately: they share 120 on purpose (see vol.py's
+   RANK_MIN_WINDOWS) and a retune of one is not a retune of the other. */
+const BX_SETTLED=120;
+const RVR_WINDOWS=120;
+
+/* The indicator's periods, as the tile prints them. Generated in Python from the
+   constants themselves (`trend.PARAMS_CAPTION`) and copied here because the page
+   holds no Python; a test binds the two, so a retune cannot leave the screen
+   claiming the old numbers. B-Xtrender at 5/20/15 and B-Xtrender at other
+   settings are different figures, so a value with no periods stated is one its
+   reader cannot reproduce -- the gap `impact_source` closes for the calendar.
+   ONE string literal, not two concatenated: the test compares it against the
+   Python constant, and a sentence split across a `+` is a sentence that guard
+   cannot see. */
+const PARAMS_CAPTION='B-Xtrender, short arm 5/20/15, centred on 50; Jhunjhunwala 2019';
+
+/* The three cut points the filter row offers, and the two sentences saying where
+   each came from. Every one of them is a copy of a Python constant, bound by test
+   (`test_the_band_caption_matches_the_constants_that_produced_it` and
+   `test_the_rvr_chips_and_the_ring_tick_read_one_constant`) for the reason
+   BX_SETTLED is: a chip labelled "below -20" beside a bucket cut somewhere else is
+   a control that lies about what it does, and a retune in `trend.py` would leave
+   this row offering the old band with nothing on screen to say so.
+
+   ONE constant per cut point, spent EVERYWHERE that point appears: `IVR_HIGH` sets
+   both chip labels AND the ring's threshold tick, so the picture and the filter
+   cannot end up disagreeing about where 30 is. The bucketing itself is not done
+   here at all -- `trend.bucket` and `iv.band` decide it server-side and the page
+   filters on `bx_bucket` and the band on the fetched rank -- so these numbers are
+   LABELS, and that is the strongest reason they must be the same numbers.
+
+   The two SOURCE sentences are one double-quoted literal each: their Python
+   originals contain apostrophes, and a `\'` escape or a `+` join is a sentence the
+   guard cannot see, which is the point PARAMS_CAPTION's comment makes above. */
+const BX_LO=-20;
+const BX_HI=20;
+const BX_BANDS="Wilder's RSI 70/30, re-centred by the indicator's own -50; 'oversold' and 'overbought' are that convention's words for below and above the band, not this journal's view of what a share is worth";
+/* The IV rank cut, a copy of `iv.IVR_HIGH` and bound to it by
+   `test_the_ivr_chips_read_ivs_own_constant`. THIRTY IS THE READER'S CHOSEN LINE,
+   which is why the caption says so instead of citing anyone: tastytrade publish 50
+   as the level premium selling leans on, 80 as extreme and 20 as depressed, and 30
+   is none of those. A chip is allowed to cut where its reader wants; what it is not
+   allowed to do is imply someone else's research put the line there. */
+const IVR_HIGH=30;
+const IVR_BANDS="your own screening line, not tastytrade's: they lean on 50 for selling premium, call 80 and above extreme and under 20 depressed. 30 is the wider net";
+/* WHOSE number the rank is, printed wherever the rank is. CBOE computes iv30 and
+   computes the year's high and low of its own iv30 series, so all this journal does
+   is divide -- which is the whole reason an implied number can sit on this tab at
+   all without the modelled-number quarantine growing (see iv.py). Attributed for
+   `market_events.impact`'s reason: a figure this journal did not measure says so. */
+const IVR_SOURCE="CBOE's own 30-day implied vol, ranked between the high and low of that same series over the trailing year. tastytrade's formula, CBOE's numbers, delayed";
+/* How near is "reporting soon", for the one filter that reads a typed date. 28
+   days rather than a month because it is four whole weeks of expiries, which is
+   the unit an options seller actually holds; a calendar month would make the
+   filter's reach depend on which month it is. It is a filter's threshold and
+   nothing else -- no figure on this tab is computed from it, and the countdown
+   itself is `serialize`'s. */
+const WEARN_SOON=28;
+
+/* How each bucket and each band is WORDED, once, so the chip a reader presses and
+   the sentence naming what is hidden say the same thing. Derived from the cut
+   points above rather than typed, which is what stops a chip reading "below -20"
+   after the band moved.
+   The keys are the server's -- `trend.bucket` returns low/mid/high and
+   `vol.rank_band` returns upper/lower -- and they carry no valuation vocabulary on
+   purpose: "oversold" and "overbought" are claims about what a share is WORTH, and
+   an RSI of an EMA difference is a statement about the shape of recent closes. Those
+   two words appear on this tab exactly once each, inside `BX_BANDS`, attributed to
+   the convention they come from. */
+const WBX_LABEL={low:'below '+num(BX_LO,0),mid:'mid',high:'above +'+num(BX_HI,0)};
+const WIVR_LABEL={upper:'IVR > '+num(IVR_HIGH,0),lower:'IVR <= '+num(IVR_HIGH,0)};
+
+/* One symbol's IV rank, and WHY it is absent when it is.
+ *
+ * Three absences, told apart, because they have three different remedies and a
+ * single dash would send the reader looking for the wrong one. Not fetched yet is a
+ * button press away; not carried by CBOE is permanent and nothing to fix; a failed
+ * request is worth retrying. `/api/quotes` returns the three separately for exactly
+ * this -- see `web._iv_ranks`, which refuses to collapse the last two because a
+ * server having a bad minute would otherwise render as "this symbol has no options",
+ * a false statement about the reader's own watchlist.
+ *
+ * Absent until Refresh, like the company name and for the same reason: this costs
+ * two HTTP requests per symbol, so nothing on a page load may trigger it. */
+const ivrOf=sym=>(S.ivr&&S.ivr.ranks||{})[sym]||null;
+const ivrWhy=sym=>{
+  if(!S.ivr) return 'no IV rank yet: press Refresh prices. It costs two requests '
+    +'per symbol, so no page load spends them';
+  if((S.ivr.ranks_failed||[]).includes(sym)) return 'the IV rank request for '+sym
+    +' failed. Press Refresh prices to try again';
+  if((S.ivr.unranked||[]).includes(sym)) return 'CBOE does not carry '+sym
+    +', so it has no implied vol to rank. Nothing to fix';
+  return 'no IV rank for '+sym;
+};
+
+/* The meter's box AND its domain, as one object, because the two must not drift:
+   the numbers printed at the ends of the scale and the knob's position between
+   them are read from the same four fields, so a picture that disagrees with its own
+   labels is unrepresentable.
+   `lo` and `hi` are B-Xtrender's OWN bounds, not a range measured off the visible
+   rows: the arm is an RSI minus 50, so it lives in [-50, +50] by construction, and
+   measured over 756 real closes for four symbols the widest excursion was -37.7 and
+   +41.6 (see watch.js for the figures) -- headroom rather than a fit, which is what
+   makes the scale stable. Auto-scaling to the rows on screen would make one knob
+   position mean a different reading per refresh, and `meterKnob` clamps rather than
+   extrapolating so an impossible input reads as "at the limit" instead of as a knob
+   off the end of its track.
+   The geometry is in viewBox units: 6 units of margin at each end is the knob's own
+   radius plus one, so a knob pinned at either bound is fully inside the picture. */
+const WMETER={x:6,w:156,lo:-50,hi:50};
+/* The ring, likewise in viewBox units. `r` is spent three times -- the track, the
+   arc's dasharray and both ends of the threshold tick -- so a resize moves all four
+   together. 34 centres a 26-radius ring inside a 68-unit box, leaving 8 units for
+   the 6-unit stroke and the tick's overhang. */
+const WRING={cx:34,cy:34,r:26};
+
+/* An absent figure, with the reason within reach. Never 0, and never a bare dash:
+   in a column of measurements a bare dash reads as "nothing to report", where what
+   it means here is "not enough history yet" -- a different sentence, and one with a
+   remedy attached. Escaped here rather than at each call site, so a symbol
+   interpolated into a reason cannot slip through unescaped. */
+const wdash=why=>`<span class="dim" title="${esc(why)}">&mdash;</span>`;
+/* The direction glyph, one per state name from `bxDirection`. A GLYPH and not a
+   fourth colour: app.css's own rule is that hue alone does not survive red-green
+   colour blindness, and two shades of green meaning "rising" and "falling" is a
+   harder discrimination than green against rose. */
+const WDIR={up:'↑',down:'↓',flat:'→'};
+
+/* The price as BOTH surfaces print it: the figure, plus the stale marker and its
+   title when what is on screen is a stored close rather than a fetched quote.
+   The derivation is `shownPrice`'s (in watch.js, unit-tested); this is only its
+   rendering, shared so the row and the pane cannot mark the same price
+   differently. The marker names the SESSION, from `closes_through`: "stored
+   close" alone left the reader to guess whether it was yesterday's or a
+   fortnight's, and an undated price is the one thing `marketdata.parse_quote`
+   discards outright rather than storing. */
+function wprice(px,w){
+  if(px.price==null) return wdash(`no close stored for ${w.symbol} yet: run `
+    +`optjournal bars`);
+  const stamped=w.closes_through?`stored close from ${w.closes_through}`
+    :'stored close';
+  return num(px.price,2)+(px.live?'':`<span class="dim wstale" title="${
+    esc(stamped)}; press Refresh prices for a quote">*</span>`);
+}
+
+/* The table's order: one column, one direction, nulls last in BOTH of them.
+ *
+ * NULLS LAST IS THE RULE WORTH STATING. An absent B-Xtrender is not a small one:
+ * it means the symbol has not stored enough sessions to have a reading. So a
+ * symbol holding nothing must never top an ascending sort, where it would read as
+ * the most extreme value in the column. Measured rows first in both directions,
+ * unmeasured after them.
+ *
+ * The tie-break is always the symbol, so equal values -- and the block of nulls,
+ * which is every value tied -- come out in a stable readable order rather than in
+ * whatever order the payload happened to arrive in.
+ *
+ * The close column sorts on what is SHOWN, through the same `shownPrice` the cell
+ * prints, so the column deciding the order cannot disagree with the figures in
+ * it once quotes have arrived.
+ *
+ * A COPY is sorted. `Array.sort` is in place, and sorting `S.state.watchlist`
+ * itself would permanently reorder the payload, whose order is the serializer's
+ * own `ORDER BY symbol` that the CLI prints.
+ */
+function watchSort(rows){
+  const qs=S.quotes||{};
+  const[col,dir]=String(S.wsort||'symbol:asc').split(':');
+  const asc=dir!=='desc';
+  const value=w=>col==='close'?shownPrice(w,qs[w.symbol]).price
+    :col==='bxtrender'?w.bx_daily
+    :col==='ivr'?(ivrOf(w.symbol)||{}).rank
+    :col==='earn'?w.earnings_in_days
+    :w.symbol;
+  return rows.slice().sort((wa,wb)=>{
+    const va=value(wa), vb=value(wb);
+    if(va==null||vb==null){
+      if(va==null&&vb==null) return wa.symbol<wb.symbol?-1:1;
+      return va==null?1:-1;
+    }
+    if(va===vb) return wa.symbol<wb.symbol?-1:1;
+    return (va<vb?-1:1)*(asc?1:-1);
+  });
+}
+
+/* The one TYPED cell in the row, and the only one whose input is the reader.
+   Both halves are shown -- the date and the derived countdown -- because the date
+   alone makes the reader do the arithmetic and a bare countdown is a number with
+   no provenance in a row of measured figures.
+   A past date says so in words rather than rendering a negative day count, which
+   would read as a countdown running backwards; the date STANDS until the next one
+   is recorded, so the cell says that instead of hiding it.
+   The dash's title points at the panel, which is where the field that records one
+   lives: an empty cell here means none RECORDED, never none due, and a blank in a
+   column of measurements would say the other thing. */
+const wearn=w=>{
+  if(!w.earnings_on) return wdash(`no earnings date recorded for ${w.symbol}; `
+    +`add one in the panel`);
+  const days=w.earnings_in_days;
+  const when=days==null?'':days<0?'recorded, now past'
+    :days===0?'today':`in ${days}d`;
+  return `${esc(w.earnings_on)}${when?
+    ` <span class="dim">${esc(when)}</span>`:''}`;
+};
+
+/* Why the rank is absent, in the count that explains it -- and the two reasons are
+   different, so they are two sentences. Below the gate the year is not there yet;
+   at or above it with no answer, the year IS there and every reading in it is
+   identical, so there is no range to place today inside. `vol.rank` returns None
+   for that case rather than the midpoint of a range that does not exist. */
+const wrankwhy=w=>w.rv_rank_windows>=RVR_WINDOWS
+  ?`${w.rv_rank_windows} windows measured and they do not differ, so there is no `
+    +`low and high to place today between`
+  :`${w.rv_rank_windows} of ${RVR_WINDOWS} windows measured: a rank is a position `
+    +`between a low and a high, and each of those is a single reading`;
+
+/* The row button's title, and the ONLY place the held marker's meaning is written.
+ *
+ * `Watch.held` was on the wire and read by nothing, so the marker the mockup draws
+ * before each symbol was declared and never rendered -- a payload key with no reader
+ * is a contract nobody checks. It renders now, and it renders as the one thing this
+ * tab can say that a quote screen cannot: you have options open on this name.
+ *
+ * The glyph itself is `aria-hidden`, because a mark is not a word. What a screen
+ * reader and a hover both get is this sentence, on the button that already owned a
+ * title -- rather than a second `title` nested inside the first, which is a tooltip
+ * whose winner depends on where the pointer stopped. The count comes from `options`,
+ * the same rows the detail pane lists contract by contract, so the row and the pane
+ * cannot disagree about whether the name is held. */
+const wselwhy=(w,name)=>{
+  const what=name||w.symbol;
+  if(!w.held) return what;
+  const n=(w.options||[]).length;
+  return `${what}; you hold ${n} option position(s) on it`;
+};
+
+/* Whether a company NAME exists to search against yet.
+ *
+ * The name is not stored: it rides in the `/api/quotes` reply (`Quote.name`, at no
+ * extra request), so before Refresh has run this tab knows only symbols. That is a
+ * designed consequence rather than a gap -- `watchlist` is the user-input table and
+ * a cached name would need an age story like every other fetched figure here -- but
+ * it means a search box offering "symbol or company" would silently match nothing
+ * on half a page load. So the placeholder says which, from this one derivation, and
+ * the search itself reads the same answer.
+ *
+ * Asked of the QUOTES rather than of `S.quotesAt`, because a reply can come back
+ * with prices and no names for a symbol the source is thin on: what matters is
+ * whether there is a name to match. */
+function wnamed(){
+  return Object.values(S.quotes||{}).some(wq=>!!(wq&&wq.name));
+}
+
+/* Which rows the table shows: the four filters, then slice 5's sort.
+ *
+ * NARROWING ONLY. Every figure is already in the payload, so filtering is a pure
+ * function of state -- no request, no server round trip, and the same reason
+ * `S.wbx` and its three siblings stay out of the hash.
+ *
+ * A ROW WITH NO BUCKET OR NO BAND IS HIDDEN by a chosen bucket or band, and that is
+ * the honest reading rather than the convenient one: a symbol inside its warm-up
+ * window has no B-Xtrender reading, so it is not "in the mid bucket" -- it is
+ * unmeasured, and quietly including it would put an unmeasured row inside a set the
+ * reader believes was measured. Whichever control is doing the hiding is named on
+ * screen when the result is empty, which is what keeps that defensible.
+ *
+ * EARNINGS IS THE ONE FILTER THAT WORKS THE OTHER WAY, because its input is typed
+ * rather than measured: it excludes only dates you recorded. A row with no date is
+ * KEPT, since "nothing here reports within 28 days" and "nothing here reports
+ * within 28 days that you have told me about" are different claims and only the
+ * second one is true. That rule is `earningsSoon` in watch.js rather than a
+ * comparison here, and the reason is executable: `null >= 0` is TRUE in JavaScript,
+ * so the obvious inline spelling hides every dateless row the moment the filter goes
+ * on, and only a node test over the three cases catches it. */
+function watchRows(){
+  const ws=S.state.watchlist||[];
+  const qs=S.quotes||{};
+  const needle=String(S.wsearch||'').trim().toUpperCase();
+  const named=wnamed();
+  const finds=w=>{
+    if(!needle) return true;
+    if(String(w.symbol).toUpperCase().includes(needle)) return true;
+    const wq=qs[w.symbol];
+    return named&&!!wq&&String(wq.name||'').toUpperCase().includes(needle);
+  };
+  return watchSort(ws.filter(w=>finds(w)
+    &&(!S.wbx||w.bx_bucket===S.wbx)
+    /* The band is the SERVER's (`iv.band`), never a comparison spelled here, so
+       the cut point cannot end up in two places at different values. A symbol with
+       no rank has a null band and matches NEITHER chip -- which is the honest
+       answer: an unmeasured row does not belong in a set the reader believes was
+       measured, and it does not belong in that set's complement either. */
+    &&(!S.wivr||(ivrOf(w.symbol)||{}).band===S.wivr)
+    &&!(S.wearn&&earningsSoon(w.earnings_in_days,WEARN_SOON))));
+}
+
+/* Which controls are narrowing the table right now, worded as the row words them.
+   Used only to explain an empty result, and it has to name the CONTROL rather than
+   say "the filters": a reader who typed a symbol into the search box and then
+   pressed a bucket chip cannot see which of the two emptied the table, and a blank
+   pane with a live filter row above it reads as a broken tab rather than a narrowed
+   one. The search term is quoted verbatim, because a typo is the likeliest cause. */
+function wactive(){
+  const on=[];
+  const needle=String(S.wsearch||'').trim();
+  if(needle) on.push(`the search box ("${needle}")`);
+  if(S.wbx) on.push(`the BXTRENDER filter (${WBX_LABEL[S.wbx]})`);
+  if(S.wivr) on.push(`the IV rank filter (${WIVR_LABEL[S.wivr]})`);
+  if(S.wearn) on.push(`the EARNINGS filter (exclude ≤ ${WEARN_SOON}d)`);
+  return on;
+}
+
+/* The sentence BOTH panes print when the filtered set is empty, from one function
+   so the table's colspan row and the detail pane's block cannot describe two
+   different situations. `sweep.check_no_junk_bindings` is what makes this a state
+   rather than an edge to be found at runtime: the accidental implementation is an
+   empty <tbody> beside a pane reading from `undefined`. */
+function wnorows(){
+  const total=(S.state.watchlist||[]).length;
+  const on=wactive();
+  return `nothing matches: all ${total} watched symbol(s) are hidden by `
+    +`${on.join(' and ')||'the filter row'}`;
+}
+
+/* The filter row: four controls, each captioned with where its numbers came from,
+ * plus the count that replaced the header's symbol pill.
+ *
+ * `.filters` is the page's existing filter-bar shape and `.wf` is the modifier that
+ * makes it a five-track row inside a card -- see the CSS, which carries the two
+ * specificity gotchas.
+ *
+ * WHY EACH CAPTION EXISTS. B-Xtrender at 5/20/15 and B-Xtrender at other settings
+ * are different numbers, and the published indicator states NO oversold or
+ * overbought level at all (no hline, no level inputs, only zero crossed with
+ * rising-or-falling) -- so every band on this row is imported, and an imported band
+ * with no provenance is a threshold its reader cannot audit. That is the gap
+ * `impact_source` closes for the calendar, and the same answer applies twice here.
+ * Both sentences are the Python constants' own, so a retune cannot leave the screen
+ * quoting the old ones.
+ *
+ * The RVR caption carries a REFUSAL as well as a source, and it is the load-bearing
+ * half: every reader arrives at a 0-to-100 gauge in an options journal expecting IV
+ * rank's conventional 30, and this figure is one symbol's own realised vol against
+ * its own year. Saying so is cheaper than being misread. */
+function watchFilters(shown,total){
+  const named=wnamed();
+  const dated=(S.state.watchlist||[]).some(w=>!!w.earnings_on);
+  const hidden=total-shown;
+  /* One builder for both segmented controls, so "pick one" behaves identically on
+     each and All is the same absence of a value in both: the empty string, which is
+     what `dataset` gives back for `data-wbx=""` and what the handler maps to null.
+     The DOT is the bucket's own colour, and only the bucket rows carry one: a band
+     is a side of one number and has no third state to distinguish, so a dot there
+     would be decoration standing where information stands two tracks left. */
+  const seg=(attr,picked,items)=>`<div class="seg">${items.map(it=>
+    `<button data-${attr}="${it.val}" class="${(picked||'')===it.val?'on':''}"
+      title="${esc(it.hint)}">${it.dot?`<span class="wdot ${it.dot}"></span>`:''
+      }${esc(it.label)}</button>`).join('')}</div>`;
+  const bx=seg('wbx',S.wbx,[
+    {val:'',label:'all',dot:'',
+     hint:'every reading, and the symbols that have none yet'},
+    {val:'low',label:WBX_LABEL.low,dot:'lo',
+     hint:`the daily short arm at or below ${num(BX_LO,0)}`},
+    {val:'mid',label:WBX_LABEL.mid,dot:'mid',
+     hint:`the daily short arm between ${num(BX_LO,0)} and +${num(BX_HI,0)}`},
+    {val:'high',label:WBX_LABEL.high,dot:'hi',
+     hint:`the daily short arm at or above +${num(BX_HI,0)}`}]);
+  const ivr=seg('wivr',S.wivr,[
+    {val:'',label:'all',dot:'',
+     hint:'every rank, and the symbols that have none yet'},
+    {val:'upper',label:WIVR_LABEL.upper,dot:'',
+     hint:`implied vol more than ${num(IVR_HIGH,0)}% of the way up its own year: `
+       +`where premium is dear for THIS name, whatever the absolute level. `
+       +`Measured live: LOW ranked 78.7 on an iv30 of 33.6% while TSLA ranked 0.8 `
+       +`on a HIGHER 37.4%, because each is judged against its own year`},
+    {val:'lower',label:WIVR_LABEL.lower,dot:'',
+     hint:`at or below ${num(IVR_HIGH,0)}, the line itself included`}]);
+  return `<div class="filters wf">
+    <div><div class="flabel">search</div>
+      <input id="wsearch" value="${esc(S.wsearch||'')}" maxlength="40"
+        autocomplete="off" spellcheck="false" placeholder="${esc(named
+          ?'symbol or company…'
+          :'symbol… (company names arrive with Refresh prices)')}"></div>
+    <div><div class="flabel">bxtrender</div>${bx}
+      <div class="wcap">${esc(`bands at ${num(BX_LO,0)} and +${num(BX_HI,0)} on `
+        +`the daily short arm, ${BX_BANDS}`)}</div></div>
+    <div><div class="flabel">iv rank</div>${ivr}
+      <div class="wcap">${esc(`cut at ${num(IVR_HIGH,0)}, ${IVR_BANDS}. `
+        +IVR_SOURCE)}</div></div>
+    <div><div class="flabel">earnings</div>
+      <button class="chip${S.wearn?' on':''}" data-wearn="1" ${dated?'':'disabled'}
+        aria-pressed="${S.wearn?'true':'false'}" title="${esc(dated
+          ?`hide the symbols reporting within ${WEARN_SOON} days. It excludes only `
+            +`dates YOU recorded: a row with no earnings date is kept, because an `
+            +`unknown date is not a known-clear one, and a date already past is `
+            +`kept too`
+          :'no watched symbol carries an earnings date yet, so this would hide '
+            +'nothing. Record one in the panel')}">exclude ≤ ${WEARN_SOON}d</button>
+      </div>
+    <div><div class="flabel">showing</div>
+      <div class="wshow">${shown} of ${total}${hidden>0
+        ?` <span class="dim">${hidden} hidden</span>`:''}</div></div>
+  </div>`;
+}
+
+/* The detail pane when the filters match nothing. A block that says so, not a
+   half-populated card: the pane's every figure comes from an open row, and there is
+   no open row to read.
+   `S.wsym` is deliberately LEFT STANDING while this shows, so clearing the filter
+   brings back the row that was open rather than resetting to the first one. */
+function watchNone(){
+  return `<div class="wdpane"><div class="wnone">
+    <div class="wk">nothing to show</div>
+    <div>${esc(wnorows())}</div>
+    <div class="wcap">the row you had open is remembered — clearing the filter
+      brings it back</div>
+    <div class="mt-3"><button class="btn sm" data-wclear="1">Clear filters</button>
+    </div></div></div>`;
+}
+
+/* The master pane: five columns, one row per watched symbol.
+ *
+ * The symbol cell holds a real `<button>`, which is what makes the list reachable
+ * from the keyboard: it brings the accessible name, the role, Enter and Space and
+ * the page's global `:focus-visible` ring with it, none of which a `tabindex` on
+ * the `<tr>` would. The whole row carries the same `data-wsel`, so a click
+ * anywhere in it selects and one handler serves both paths.
+ *
+ * The company name appears only once quotes have arrived (`Quote.name`, at no
+ * extra request), and the cell TRUNCATES rather than widening the pane:
+ * "CrowdStrike Holdings, Inc." beside a symbol exceeds any share of a split card.
+ * The `title` carries the full name, so the ellipsis loses nothing.
+ */
+function watchTable(rows,chosen){
+  const qs=S.quotes||{};
+  const[col,dir]=String(S.wsort||'symbol:asc').split(':');
+  const asc=dir!=='desc';
+  /* `aria-sort` because a glyph is not available to a screen reader, and an
+     INACTIVE double arrow on every unsorted column because one state cannot say
+     which column is deciding the order -- the reader would be left guessing
+     whether the unmarked columns are unsortable or merely not sorted. */
+  const th=(key,label,hint,klass)=>`<th class="${klass}" aria-sort="${
+    col===key?(asc?'ascending':'descending'):'none'}"><button class="wsb"
+      data-wsort="${key}" title="${esc(hint)}">${esc(label)}<span class="wsg">${
+      col===key?(asc?'↑':'↓'):'⇅'}</span></button></th>`;
+  const body=rows.map(w=>{
+    const wq=qs[w.symbol];
+    const px=shownPrice(w,wq);
+    const name=wq&&wq.name?wq.name:'';
+    const on=w.symbol===chosen;
+    const way=bxDirection(w.bx_daily_delta);
+    return `<tr class="${on?'wsel':''}" data-wsel="${esc(w.symbol)}"${
+      on?' aria-current="true"':''}>
+      <td><button class="wselb" data-wsel="${esc(w.symbol)}"
+        title="${esc(wselwhy(w,name))}">${w.held
+          ?'<span class="whold" aria-hidden="true">◉</span>':''}<b>${
+        esc(w.symbol)}</b> ${
+        name?`<span class="dim">${esc(name)}</span>`:''}</button></td>
+      <td class="n mono">${wprice(px,w)}</td>
+      <td class="n mono ${cls(w.bx_daily)}">${w.bx_daily==null
+        ?wdash(`${w.closes} of ${BX_SETTLED} sessions stored: inside that window `
+          +`the reading is a warm-up figure and its sign can be wrong. Run `
+          +`optjournal bars`)
+        :num(w.bx_daily,1)+(way?`<span class="wway" title="${
+          esc(num(w.bx_daily_delta,1)+' since the previous session')
+          }">${WDIR[way]}</span>`:'')}</td>
+      <td class="n mono">${(()=>{const ir=ivrOf(w.symbol);
+        return ir?num(ir.rank,1):wdash(ivrWhy(w.symbol));})()}</td>
+      <td class="n mono">${wearn(w)}</td>
+    </tr>`;
+  }).join('');
+  /* An empty filtered set is a STATE, not an edge to discover at runtime: the
+     careless implementation is a blank <tbody>, which reads as a broken tab under a
+     live filter row. One row of prose naming the control that is hiding everything,
+     and the control to undo it, beside the header that is still standing. The
+     `colspan` tracks the header list above it -- five columns, one cell. */
+  const none=`<tr><td colspan="5" class="empty">${esc(wnorows())}
+    <button class="btn sm" data-wclear="1">Clear filters</button></td></tr>`;
+  return `<table class="wtab"><thead><tr>
+    ${th('symbol','symbol','the ticker as stored, and the company name once a '
+      +'quote has been fetched','')}
+    ${th('close','close','the fetched quote when there is one, else the newest '
+      +'stored session close, marked with *','n')}
+    ${th('bxtrender','bxtrender',PARAMS_CAPTION,'n')}
+    ${th('ivr','ivr','IV rank, 1y: where implied vol sits between this symbol\'s '
+      +'own yearly low and high, 0 to 100. NOT the absolute level -- a name can '
+      +'rank high on a modest implied vol, which is the whole point of a rank. '
+      +IVR_SOURCE,'n')}
+    ${th('earn','earnings','a date you recorded, not a fetched one: nothing this '
+      +'journal reaches publishes an earnings date','n')}
+  </tr></thead><tbody>${body||none}</tbody></table>`;
+}
+
+/* One tile. Label left, figure right, plus the two things a figure on this tab
+   needs and `statCard` has nowhere to put: a DELTA beside the value (the
+   indicator's second published state) and a CAPTION under it naming the window,
+   the periods or the count the figure came from.
+   The BOX is `.stat`'s, through its own class rather than through copies of its
+   values, so the padding, radius, ground and border cannot drift from the
+   dashboard's cards; `.wtile` adds only the layout.
+   `kids` is the slot the two gauges sit in, and it comes BEFORE the caption on
+   purpose: figure, then the picture of it, then where the figure came from. A
+   provenance line wedged between a number and its own gauge separates the two
+   things a reader is comparing, and the caption is the part they read last. */
+function wtile(label,value,opts){
+  const tile=opts||{};
+  return `<div class="stat wtile ${tile.klass||''}">
+    <div class="wth"><span class="wk">${esc(label)}</span>
+      <span class="wtv"><span class="v ${tile.big?'':'sm'} ${tile.tint||''}"
+        >${value}</span>${tile.delta?
+        `<span class="wdelta">${tile.delta}</span>`:''}</span></div>
+    ${tile.kids||''}
+    ${tile.cap?`<div class="wcap">${esc(tile.cap)}</div>`:''}</div>`;
+}
+
+/* THE METER: one reading placed on the indicator's own fixed scale.
+ *
+ * It earns its place by making the position readable without reading the number --
+ * which is the gradient's job, and the reason the track is not a plain bar: the
+ * knob's distance from the centre says how far the arm has run, and the hue behind
+ * it says which way. Both scale ends are printed, because a picture whose bounds are
+ * not on screen is a picture that could be showing anything.
+ *
+ * GEOMETRY ATTRIBUTES, NEVER A `style`. Inline styles are forbidden anywhere in this
+ * page (a rule with a test behind it), and they are also invisible to the layout
+ * assertions, so a knob positioned by CSS would be a knob nothing could check. SVG
+ * attributes are what the performance chart and the replay chart already use.
+ *
+ * NO COLOUR IN THE MARKUP EITHER, which is why the gradient's three stops carry
+ * CLASSES and no `stop-color` attribute. A presentation attribute cannot hold a
+ * `var()`, so a hex in one is a colour that survives a theme swap unchanged -- the
+ * exact defect the performance chart shipped, with Leather's own background
+ * hardcoded into a stroke and worn on every theme.
+ *
+ * `meterKnob` returns null for an absent reading rather than a knob at the left end,
+ * because that end is a POSITION and the strongest reading the meter can show. A
+ * symbol inside its warm-up window gets the dash and its reason, and no picture. */
+function wmeter(w){
+  const knob=meterKnob(w.bx_daily,WMETER);
+  if(knob==null) return '';
+  const mid=WMETER.x+WMETER.w/2;
+  return `<svg class="wmeter" viewBox="0 0 168 30" role="img"
+    aria-label="${esc(`${num(w.bx_daily,1)} on a fixed scale from ${
+      num(WMETER.lo,0)} to +${num(WMETER.hi,0)}`)}">
+    <defs><linearGradient id="wmg" x1="0" y1="0" x2="1" y2="0">
+      <stop class="lo" offset="0"/><stop class="mid" offset="0.5"/>
+      <stop class="hi" offset="1"/></linearGradient></defs>
+    <rect x="${WMETER.x}" y="6" width="${WMETER.w}" height="7" rx="3.5"
+      fill="url(#wmg)"/>
+    <line class="wmzero" x1="${mid}" y1="3" x2="${mid}" y2="16"/>
+    <circle class="wmknob ${w.bx_daily>0?'pos':w.bx_daily<0?'neg':''}"
+      cx="${knob.toFixed(2)}" cy="9.5" r="5"/>
+    <text class="wmend" x="${WMETER.x}" y="28">${num(WMETER.lo,0)}</text>
+    <text class="wmend wmr" x="${WMETER.x+WMETER.w}" y="28">+${
+      num(WMETER.hi,0)}</text></svg>`;
+}
+
+/* THE RING: the rank as a proportion, drawn from 12 o'clock clockwise.
+ *
+ * Three elements, and each is load-bearing. The TRACK, because an arc with nothing
+ * behind it cannot be read as a proportion -- 40% of a circle and 40% of nothing
+ * look identical. The ARC, whose length is a fraction of the circumference
+ * (`ringArc`), rotated -90 degrees about its own centre so it begins at the top and
+ * runs clockwise: a dasharray carries a length and says nothing about where the
+ * stroke starts, so the direction is stated here and pinned by `ringPoint`'s tests.
+ * The TICK, because the picture and the filter chips must agree about where the cut
+ * point is, and it comes from the same `IVR_HIGH` the chips are labelled from.
+ *
+ * THE TRACK AND THE TICK ARE DRAWN EVEN WITH NO RANK, and the arc is not. An empty
+ * ring beside a dash reads as "the scale exists, the reading does not", which is the
+ * honest picture on a symbol whose year is still filling in; drawing nothing at all
+ * would leave the tile's caption explaining an absence with no shape to attach it
+ * to. A rank of 0 draws the same empty arc and is a different fact, so the two are
+ * told apart where it counts: the figure beside the ring, and this element's own
+ * accessible name. */
+function wring(w){
+  const ir=ivrOf(w.symbol);
+  const value=ir?ir.rank:null;
+  const arc=ringArc(value,WRING.r);
+  const tin=ringPoint(IVR_HIGH/100,WRING.r-5);
+  const tout=ringPoint(IVR_HIGH/100,WRING.r+5);
+  return `<svg class="wring" viewBox="0 0 68 68" role="img"
+    aria-label="${esc(value==null
+      ?'no IV rank yet, so the ring is empty'
+      :`${num(value,1)} of 100, with a mark at ${num(IVR_HIGH,0)}`)}">
+    <circle class="wrtrack" cx="${WRING.cx}" cy="${WRING.cy}" r="${WRING.r}"/>
+    ${arc?`<circle class="wrarc" cx="${WRING.cx}" cy="${WRING.cy}" r="${WRING.r}"
+      stroke-dasharray="${arc.on.toFixed(2)} ${arc.off.toFixed(2)}"
+      transform="rotate(-90 ${WRING.cx} ${WRING.cy})"/>`:''}
+    <line class="wrtick" x1="${(WRING.cx+tin.x).toFixed(2)}"
+      y1="${(WRING.cy+tin.y).toFixed(2)}" x2="${(WRING.cx+tout.x).toFixed(2)}"
+      y2="${(WRING.cy+tout.y).toFixed(2)}"/></svg>`;
+}
+
+/* The detail pane: the open row, with every figure's provenance beside it.
+ *
+ * Its own grid (`.wdet`), not `.stats`: that row is `display:flex` with an 18%
+ * basis and lays equal tiles across one line, and `statCard` emits label ABOVE
+ * value with no slot for a delta beside the figure and no way to make one tile
+ * wider than its neighbours.
+ *
+ * Every absent figure is an em dash whose title names the count it waits on,
+ * because `sweep.check_no_junk_bindings` fails on `undefined` or `NaN` anywhere in
+ * the rendered text and the sweep is the only executed check of this tab.
+ */
+function watchDetail(w){
+  const wq=(S.quotes||{})[w.symbol];
+  /* The SAME derivation the row uses, from the same module and with the same
+     marker. A pane reading `w.last` beside a row reading `qs[sym].price` is the
+     strongest rule in this codebase broken, not a cosmetic slip -- see watch.js
+     for the browser-caught defect that produced the rule. */
+  const px=shownPrice(w,wq);
+  const name=wq&&wq.name?wq.name:'';
+  /* Read ONCE per render and passed nowhere: `wring` reads it again through the
+     same helper rather than taking it as an argument, so the tile's figure and the
+     ring's arc are two reads of one object and cannot describe different symbols. */
+  const ivr=ivrOf(w.symbol);
+  const way=bxDirection(w.bx_daily_delta);
+  const pc=v=>v==null?wdash('not enough stored sessions to measure a change over '
+    +'that span'):num(v,2)+'%';
+
+  const daily=wtile('bxtrender · daily',
+    w.bx_daily==null?wdash(`${w.closes} of ${BX_SETTLED} sessions stored: inside `
+      +`that window the reading is a warm-up figure and its sign can be wrong. `
+      +`Run optjournal bars`):num(w.bx_daily,1),
+    {klass:'wide',big:true,tint:cls(w.bx_daily),cap:PARAMS_CAPTION,kids:wmeter(w),
+     delta:w.bx_daily_delta==null?'':`<span class="${cls(w.bx_daily_delta)}">${
+       num(w.bx_daily_delta,1)}</span>${way?WDIR[way]:''}`});
+  /* The rank, with the sentence it can print about itself: a min-max rank states
+     its own meaning in one line, which is most of why it is the statistic here
+     rather than a percentile. The ring above the caption is the same figure as a
+     picture; the caption is what makes it readable, and what a ring cannot say. */
+  const ring=wtile('ivr · iv rank, 1y',
+    ivr?num(ivr.rank,1):wdash(ivrWhy(w.symbol)),
+    {klass:'tall',big:true,kids:wring(w),
+     /* Every term of the rank, because the rank alone is unfalsifiable: the same
+        76.7 inside a two-point year is a different fact from one inside a
+        seventy-point year, and the reader cannot tell which without the bounds.
+        The provenance sentence rides here too -- this is CBOE's figure, and the
+        one place it is guaranteed to be read is beside the number itself. */
+     cap:ivr?`implied vol is ${num(ivr.iv30,1)}%, ${num(ivr.rank,1)}% of the way `
+       +`from this year's low, ${num(ivr.low,1)}%, to its high, `
+       +`${num(ivr.high,1)}%. ${IVR_SOURCE}, as of ${ivr.as_of}`
+       :ivrWhy(w.symbol)});
+  /* The typed date, and the field that records one. The panel is where the table's
+     dash sends the reader, so the field has to be here or that title is a lie. An
+     empty value CLEARS: `_watchlist_write` reads a present-and-empty field as
+     NULL, which is how a date that has gone by is removed. */
+  const earnings=wtile('earnings',
+    w.earnings_on?esc(w.earnings_on):wdash(`no earnings date recorded for ${
+      w.symbol}; the field below records one`),
+    {delta:w.earnings_in_days==null?'':`<span class="dim">${esc(
+       w.earnings_in_days<0?'recorded, now past'
+       :w.earnings_in_days===0?'today':'in '+w.earnings_in_days+'d')}</span>`,
+     cap:'recorded by you, not fetched: no source this journal reaches publishes '
+       +'an earnings date, so the days beside it are counted from the ET trading '
+       +'day on every load and never stored',
+     kids:`<form class="wed" data-wsave="${esc(w.symbol)}"
+       data-wfield="earnings_on"><input id="wearn" data-subject="${esc(w.symbol)}"
+       value="${esc(w.earnings_on||'')}" placeholder="YYYY-MM-DD" maxlength="10"
+       autocomplete="off" spellcheck="false">
+       <button class="btn sm" type="submit">Save</button></form>`});
+  /* The weekly arm, and its week NAMED and COUNTED. The newest ISO week is
+     normally partial and a figure over it repaints every session -- measured on
+     TSLA: -19.02, -18.63, -19.71 across one week's three sessions -- so the count
+     travels with the value and this tile never prints a bare figure. */
+  const weekly=wtile('bxtrender · weekly',
+    w.bx_weekly==null?wdash(`${w.weeks} of ${BX_SETTLED} ISO weeks stored`)
+      :num(w.bx_weekly,1),
+    {tint:cls(w.bx_weekly),
+     cap:w.bx_weekly_week==null?'no closes stored yet, so there is no week to read'
+       :`${w.bx_weekly_week}, ${w.bx_weekly_sessions||0} session(s) stored of a `
+         +`full week's five: the newest week is usually partial, and a figure over `
+         +`it repaints as its sessions land`});
+
+  /* Which contracts, not just "held": the strike and the side are the reason to
+     look at this name rather than at a chart. Through `strike()`, which keeps a
+     half-strike -- 267.5 and 268 are different contracts, and the table cell this
+     replaced rounded them together. */
+  const opts=(w.options||[]).map(wo=>
+    `<div class="mono">${wo.quantity>0?'+':''}${wo.quantity} ${
+      wo.strike!=null?strike(wo.strike):''}${wo.put_call||''}${wo.expiry?
+      ` <span class="dim">expires ${esc(wo.expiry)}</span>`:''}</div>`).join('');
+  return `<div class="wdpane">
+    <div class="kicker">underlying</div>
+    <div class="wdh"><span class="wdsym">${esc(w.symbol)}</span>
+      <span class="big mono">${wprice(px,w)}</span>
+      ${name?`<span class="dim">${esc(name)}</span>`
+        :`<span class="dim2">press Refresh prices for the company name</span>`}</div>
+    <div class="wdet">${daily}${ring}${earnings}${weekly}</div>
+    <div class="stats mt-3">
+      ${wtile('1d',pc(px.chg1),{tint:cls(px.chg1),cap:px.live
+        ?'from the quote\'s own previous close, so it describes the same session '
+          +'as the price above'
+        :'from the stored closes, the same series as the price above'})}
+      ${wtile('5d',pc(w.change_5d),{tint:cls(w.change_5d),
+        cap:'over five stored sessions, from the closes'})}
+      ${wtile('realised vol',w.realised_vol==null
+        ?wdash(`${w.closes} session(s) stored; six closes is the fewest a `
+          +`standard deviation is worth reporting over`)
+        :num(w.realised_vol,1)+'%',
+        /* The REALISED rank lives here, in the caption of the realised figure it
+           ranks, rather than in a second ring. Two rings cut at two different
+           points would be a reader's problem, not a feature -- and the pairing is
+           the useful part: an implied rank high while the realised rank is low is
+           the market charging more than this stock has lately delivered, which is
+           the comparison the two numbers exist to support. */
+        {cap:'annualised from the stored daily closes'
+          +(w.expected_move_5d==null?''
+            :`, which implies ±${num(w.expected_move_5d,2)} over five sessions `
+              +`-- one standard deviation of what the stock DID`)
+          +(w.rv_rank==null?`. No realised rank: ${wrankwhy(w)}`
+            :`. That is ${num(w.rv_rank,1)} of 100 against its own year, `
+              +`${num(w.rv_rank_low,1)}% to ${num(w.rv_rank_high,1)}% over `
+              +`${w.rv_rank_windows} windows`)})}
+    </div>
+    <div class="wblk"><div class="wk">your positions</div>
+      ${opts||`<div class="dim">no open option position on ${esc(w.symbol)} —
+        a name you are watching, not one you hold</div>`}</div>
+    <div class="mt-3"><button class="wrm" data-wrm="${esc(w.symbol)}"
+      title="stop watching ${esc(w.symbol)}: the note and the earnings date go
+      with it">stop watching ${esc(w.symbol)}</button></div>
+  </div>`;
+}
+
 function watchlist(){
   const ws=S.state.watchlist||[];
-  const pct=v=>v==null?'<span class="dim">—</span>':
-    `<span class="${v>=0?'g':'r'}">${v>=0?'+':''}${num(v,2)}%</span>`;
-
   /* The add field lives in the header, so editing happens where you are looking.
      Rendered even when the list is empty -- an empty state that only tells you to
-     run a CLI command is a dead end when the button could be right there. */
+     run a CLI command is a dead end when the control could be right there. */
   const adder=`<form id="waddf" class="wadd">
     <input id="wadd" placeholder="+ add symbol" maxlength="24"
       autocomplete="off" spellcheck="false">
     <button class="btn sm" type="submit">Add</button></form>`;
+  /* EXACTLY TWO children in the `.crow`: a title cluster and an actions cluster.
+     It is `justify-content:space-between` with a two-child assumption, and the old
+     header's four children are why the "3 symbol(s)" pill floated to the middle of
+     it. That pill is retired rather than moved: once a filter row exists,
+     "12 symbol(s)" beside a table showing 7 rows contradicts itself.
+     `<h2>`, not the old `<h3>`: app.css styles `.card h2` and styles no h3 at all,
+     so this title wore the user agent's size and its 1em margins. BETA is the
+     `.pill.gap` the lifecycle headings already use for an inline label, and
+     Refresh is a labelled `.btn.sm` -- the Economic Calendar's precedent for a
+     section action, and a control whose accessible name is its own text. */
+  const header=`<div class="crow">
+    <div class="wtitle"><h2>Watchlist</h2><span class="pill gap">BETA</span></div>
+    <div class="wacts">${adder}
+      <button id="wquote" class="btn sm">Refresh prices</button></div></div>`;
 
-  if(!ws.length) return `<div class="card">
-    <div class="crow"><h3>Watchlist</h3>${adder}</div>
+  if(!ws.length) return `<div class="card">${header}
     <div class="empty">nothing watched yet — add a symbol above, or run
       <code>optjournal watch AAPL</code></div></div>`;
 
-  /* Quotes arrive from a SEPARATE request (/api/quotes), because each one costs an
-     HTTP call and the payload is shared by every tab. Absent until asked for, so
-     every read here tolerates undefined. */
-  const qs=S.quotes||{};
-  const rows=ws.map(w=>{
-    /* Which contracts, not just "held": the strike and side are the reason to
-       look at this row rather than a chart. */
-    const opts=(w.options||[]).map(wo=>
-      `${wo.quantity>0?'+':''}${wo.quantity} ${
-        wo.strike!=null?num(wo.strike,0):''}${wo.put_call||''}`).join(', ');
-    const wq=qs[w.symbol];
-    /* The live price, when one has been fetched, else the stored close. Labelled
-       by WHICH it is: the two differed by 0.50% on the real journal, and a column
-       headed `last` showing yesterday's close is the defect this closes. */
-    const shown=wq&&wq.price!=null?wq.price:w.last;
-    const live=!!(wq&&wq.price!=null);
-    /* 1d MUST come from the same session as the price beside it. Caught in the
-       browser: showing the fetched quote (773.26) next to a change computed from
-       stored bars (-0.16%) put two DIFFERENT sessions in one row, because the
-       bars ended Thursday and the quote was Friday's. The quote carries its own
-       `previous_close`, so when a quote is shown the change is derived from it and
-       the row is internally consistent; without one, both fall back to the bars.
-       5d has no quote-side equivalent and stays on the bars either way -- it is a
-       week, so one session of drift does not misdescribe it. */
-    const chg1=live&&wq.previous_close?
-      (wq.price-wq.previous_close)/wq.previous_close*100 : w.change_1d;
-    return `<tr>
-      <td><b>${esc(w.symbol)}</b>${w.note?
-        `<div class="dim wnote">${esc(w.note)}</div>`:''}</td>
-      <td class="mono r">${shown==null?'<span class="dim">—</span>'
-        :num(shown,2)+(live?'':'<span class="dim wstale" title="stored close; press Refresh for a quote">*</span>')}</td>
-      <td class="mono r">${pct(chg1)}</td>
-      <td class="mono r">${pct(w.change_5d)}</td>
-      <td class="mono r">${w.realised_vol==null?
-        `<span class="dim" title="${w.closes} daily close(s) stored; 6 is the minimum"
-          >—</span>`:num(w.realised_vol,1)+'%'}</td>
-      <td class="mono r">${w.expected_move_5d==null?'<span class="dim">—</span>':
-        '&plusmn;'+num(w.expected_move_5d,2)}</td>
-      <td class="mono">${opts?esc(opts):'<span class="dim">—</span>'}</td>
-      <td class="r"><button class="wrm" data-wrm="${esc(w.symbol)}"
-        title="stop watching ${esc(w.symbol)}">&times;</button></td>
-    </tr>`;
-  }).join('');
+  /* Filtered THEN sorted, in `watchRows`, so the row that opens is the first row of
+     what is actually on screen. */
+  const rows=watchRows();
+  /* Which row is open: the reader's choice when they have made one, else the first
+     row of the list AS IT IS SORTED AND FILTERED. Derived rather than stored, so the
+     URL stays clean until a row is clicked and a re-sort carries the default with it.
+     draw() has already healed a symbol the payload no longer holds, so the find can
+     only miss when the reader has chosen nothing -- or when the filter is hiding the
+     row they chose, which is the one case with NO first row to fall back to and the
+     reason both panes have an empty state. `S.wsym` is left standing through it. */
+  const wopen=rows.find(w=>w.symbol===S.wsym)||rows[0]||null;
+  /* The symbols with no realised vol at all, named in the footer. With the read
+     window at 1100 calendar days this is the one instruction that turns this tab's
+     dashes into numbers, so it stays a sentence rather than only a title.
+     Counted over the WHOLE list rather than the filtered one: the remedy is a `bars`
+     run, which is about what the journal stores and not about what is on screen. */
   const thin=ws.filter(w=>w.realised_vol==null).map(w=>w.symbol);
-  return `<div class="card">
-    <div class="crow"><h3>Watchlist</h3>
-      <span class="pill">${ws.length} symbol(s)</span>
-      ${adder}
-      <button id="wquote" class="btn sm">Refresh prices</button></div>
+  return `<div class="card">${header}
     ${quoteNote()}
-    <table><thead><tr>
-      <th>symbol</th><th class="r">last</th><th class="r">1d</th><th class="r">5d</th>
-      <th class="r">realised vol</th><th class="r">move 5d</th><th>your options</th>
-      <th></th>
-    </tr></thead><tbody>${rows}</tbody></table>
-    <div class="dim mkattr">realised vol is what the stock DID, not what the market
-      charges for what it might do — implied vol needs an option chain this journal
-      cannot reach${thin.length?` · no vol yet for ${esc(thin.join(', '))}: run
-      <code>optjournal bars</code>`:''}</div>
+    ${watchFilters(rows.length,ws.length)}
+    <div class="wsplit">
+      <div class="wtpane">${watchTable(rows,wopen?wopen.symbol:'')}</div>
+      ${wopen?watchDetail(wopen):watchNone()}
+    </div>
+    <div class="dim mkattr">realised vol is what the stock DID; IVR is what the
+      market CHARGES for what it might do, ranked against its own year${
+      thin.length?` · no vol yet for ${esc(thin.join(', '))}: run
+      <code>optjournal bars</code>`:''} · earnings dates are ones you recorded, not
+      fetched ones — the days beside them are counted on every load</div>
   </div>`;
+}
+
+/* Open one row in the detail pane. A pure redraw and no request: every figure is
+   already in the payload.
+   Re-selecting the OPEN row does nothing rather than clearing it -- the market
+   strip's rule rather than the calendar's toggle, because this panel always shows
+   SOME row and clearing would leave the pane empty with no way back but a reload.
+   That early return is also what makes the row's own click and the bubbled click
+   from the button inside it one selection instead of two renders. */
+function selectWatch(symbol){
+  if(!symbol||symbol===S.wsym) return;
+  S.wsym=symbol;
+  draw();
 }
 
 /* How old the fetched quotes are, in words.
@@ -3641,6 +4521,12 @@ function applyHash(){
      nothing in this one, and applyHash runs before the state it would check. */
   S.calday=hs.get('calday')||null;
   S.replay=hs.get('replay')||null;
+  /* Upper-cased, because that is how `_watchlist_write` stores a symbol and how
+     the payload sends it back: `#wsym=dell` from a hand-typed URL would otherwise
+     match no row and heal away, silently losing a link that was almost right.
+     Validated in draw() against the payload rather than here, for calday's
+     reason -- applyHash runs before the state it would check exists. */
+  S.wsym=(hs.get('wsym')||'').toUpperCase()||null;
   /* Validated against the registry, like the tab: an unknown id would otherwise
      put an unstyled `data-theme` on <html>, where the attribute matches no block
      and the page silently falls back to `:root` while the chip claims the bogus
@@ -3672,6 +4558,12 @@ function syncHash(push){
   if(S.ccy&&S.ccy!==BASE()) hs.set('ccy',S.ccy);
   if(S.calday) hs.set('calday',S.calday);
   if(S.replay) hs.set('replay',S.replay);
+  /* Only an EXPLICIT selection is recorded. The pane's default is the first row
+     of the sorted list, derived on every render, so writing it here would put a
+     symbol in every watchlist URL to say "the one you would have got anyway" --
+     the rule the theme and the display currency already follow for their
+     defaults, and it also stops a re-sort from rewriting the address bar. */
+  if(S.wsym) hs.set('wsym',S.wsym);
   /* Leather is what `:root` already carries, so recording it would put a key in
      every URL to say "the default" -- the same rule the display currency follows
      for the account base. */
@@ -3714,6 +4606,13 @@ function draw(push){
      its panel is how the old registry rotted. Checked before syncHash so the
      address bar never carries a key the page cannot open. */
   if(S.replay&&S.state&&!((S.state.replays||{})[S.replay])) S.replay=null;
+  /* And the same for the watched symbol, which has one edge the other two do not:
+     the reader can DELETE the row that is open. Stop watching DELL and the payload
+     reloads without it, so without this heal the URL keeps naming DELL, the pane
+     falls back to the first row, and the address bar describes a symbol the
+     journal no longer holds. Before syncHash, like both of its siblings. */
+  if(S.wsym&&S.state&&!((S.state.watchlist||[])
+      .some(w=>w.symbol===S.wsym))) S.wsym=null;
   /* A running playback drives element ids that this render is about to
      replace, so it has to die with them. */
   replayStop();
@@ -3904,16 +4803,31 @@ function draw(push){
   else {b.disabled=false;b.title='Fetch from IBKR — spends one request';}
 }
 
-/* Read every text input's value, selection and focus before a render.
+/* Read every text field's value, selection and focus before a render.
  *
  * Keyed by `id` because that is what survives innerHTML replacement: the NODES do
- * not, so nothing can be held by reference. An input with no id is skipped rather
- * than guessed at -- a wrong restore would put one field's text in another. */
+ * not, so nothing can be held by reference. A field with no id is skipped rather
+ * than guessed at -- a wrong restore would put one field's text in another.
+ *
+ * `#body input`. It read `input,textarea` while the panel carried a note editor,
+ * and the textarea half went out WITH that editor rather than being kept in case: a
+ * selector matching nothing is a mechanism no test can reach, which is this
+ * project's own argument against the disabled-tab slot it deleted for the same
+ * reason. The remaining fields -- the add box and the earnings date -- are inputs,
+ * and a textarea arriving later restores one word to this selector.
+ *
+ * `data-subject` is the other half, and it is a different failure. An id is unique
+ * per RENDER, not per subject: `#wearn` is the earnings field whatever row is open,
+ * so selecting another symbol restored the previous symbol's typed date under the
+ * new symbol's heading -- and pressing Save would then have written it there. A
+ * field may name what it is editing, and a restore across subjects is refused
+ * rather than reconciled. Generic, like the rest of this helper: nothing here knows
+ * the watchlist exists. */
 function preserveInputs(){
   const keep={};
   document.querySelectorAll('#body input').forEach(el=>{
     if(!el.id) return;
-    keep[el.id]={value:el.value,
+    keep[el.id]={value:el.value,subject:el.dataset.subject||'',
       start:el.selectionStart,end:el.selectionEnd,
       focused:document.activeElement===el};
   });
@@ -3923,12 +4837,14 @@ function preserveInputs(){
 /* Put it back on the freshly rendered nodes.
  *
  * A field the new render does not contain is simply dropped: the tab changed, and
- * carrying text into a different panel would be worse than losing it. setSelectionRange
+ * carrying text into a different panel would be worse than losing it. So is one
+ * whose subject changed under it, for the same reason one level finer. setSelectionRange
  * is guarded because it throws on input types that do not support selection. */
 function restoreInputs(keep){
   Object.keys(keep||{}).forEach(id=>{
     const el=document.getElementById(id); if(!el) return;
     const was=keep[id];
+    if((el.dataset.subject||'')!==was.subject) return;
     el.value=was.value;
     if(was.focused){
       el.focus();
@@ -4106,6 +5022,75 @@ function bindWatchlist(){
       await watchWrite({symbol:symbol,action:'remove'});
     });
   const qb=$('#wquote'); if(qb) qb.onclick=()=>loadQuotes(true);
+  /* Selection: a pure redraw, no request -- every figure is already in the
+     payload, so opening a row costs nothing. Both the `<tr>` and the `<button>`
+     in its symbol cell carry `data-wsel`, so ONE handler serves mouse and
+     keyboard: the button brings Enter and Space with it, and the click that
+     bubbles from it up to the row is a no-op because `selectWatch` returns early
+     on the symbol already open. */
+  document.querySelectorAll('[data-wsel]').forEach(el=>
+    el.onclick=()=>selectWatch(el.dataset.wsel));
+  /* Sorting, also a pure redraw. A click on the SORTED column reverses it; a click
+     on a new one starts DESCENDING for the four derived columns, because the
+     interesting end of a B-Xtrender reading or a rank is the top, and ASCENDING
+     for the symbol, because that is alphabetical. Stated once here so the rule is
+     not rediscovered per header. */
+  document.querySelectorAll('[data-wsort]').forEach(b=>
+    b.onclick=()=>{
+      const key=b.dataset.wsort, was=String(S.wsort||'').split(':');
+      S.wsort=key===was[0]?key+':'+(was[1]==='desc'?'asc':'desc')
+        :key+':'+(key==='symbol'?'asc':'desc');
+      draw();
+    });
+  /* The filter row. Every one of these is a pure redraw with no request, for the
+     same reason selection and sorting are: they narrow a list the payload has
+     already delivered in full.
+     The search box redraws on every keystroke, which it can afford to because
+     `preserveInputs` carries its text, its focus and its caret across the render --
+     that is why `#wsearch` has an id, and why it carries no `data-subject`: a search
+     box is not editing one symbol. */
+  const sb=$('#wsearch');
+  if(sb) sb.oninput=()=>{S.wsearch=sb.value;draw();};
+  /* Both segmented filters are single-select, and All is the ABSENCE of a value
+     rather than a fourth state: `data-wbx=""` gives back the empty string, which maps
+     to null, which is what `watchRows` reads as "no bucket chosen". */
+  document.querySelectorAll('[data-wbx]').forEach(b=>
+    b.onclick=()=>{S.wbx=b.dataset.wbx||null;draw();});
+  document.querySelectorAll('[data-wivr]').forEach(b=>
+    b.onclick=()=>{S.wivr=b.dataset.wivr||null;draw();});
+  /* A toggle, so it flips rather than reading a value out of the attribute:
+     "exclude the ones reporting soon" has no second setting. */
+  document.querySelectorAll('[data-wearn]').forEach(b=>
+    b.onclick=()=>{S.wearn=!S.wearn;draw();});
+  /* The way out of an empty table, offered in BOTH panes. It clears all four rather
+     than the one that emptied the list: the reader pressed it because nothing is
+     showing, and leaving a second filter standing would answer that with a second
+     empty table. `S.wsym` is untouched, so the row that was open comes back.
+     THE FIELD IS EMPTIED IN THE DOM TOO, and that line is not redundant. Caught in a
+     browser: clearing left the table showing all three rows with "nvidnvidzzz" still
+     sitting in the search box, because `preserveInputs` carries what the reader was
+     typing across the render and put it back over the freshly rendered empty value.
+     The box then described a filter that was no longer applied, which is this
+     project's own defect shape in a control instead of in a number. */
+  document.querySelectorAll('[data-wclear]').forEach(b=>
+    b.onclick=()=>{if(sb) sb.value='';
+      S.wsearch='';S.wbx=null;S.wivr=null;S.wearn=false;draw();});
+  /* The typed fields, one form each and one handler for all of them: the form names
+     its column in `data-wfield`, so a second typed field is a tile rather than a
+     second code path. It stays generic now that only the earnings date is left,
+     because `_WATCH_FIELDS` still carries two columns and `note` is still writable
+     from the CLI -- the handler lost a caller, not its reason. The value is sent
+     UNMODIFIED, which is what makes clearing possible: `_watchlist_write` reads a
+     present-and-empty field as NULL, and an emptied box is how a stale date goes. */
+  document.querySelectorAll('form[data-wsave]').forEach(wf=>
+    wf.onsubmit=async ev=>{
+      ev.preventDefault();
+      const el=wf.querySelector('input');
+      if(!el||!wf.dataset.wfield) return;
+      const body={symbol:wf.dataset.wsave};
+      body[wf.dataset.wfield]=el.value;
+      await watchWrite(body,`Saved <b>${esc(wf.dataset.wsave)}</b>.`);
+    });
 }
 
 /* One POST for every setting, returning the server's own reply rather than
@@ -4124,7 +5109,12 @@ async function save(body){
   }
 }
 
-async function watchWrite(body){
+/* `said` overrides the toast, because these three writes are not one act: an add
+   and a remove announce themselves by what they did to the LIST, while saving a
+   field changed one row that is already on screen -- and "Watching DELL." after
+   editing a note describes something that did not happen. Pre-escaped by the
+   caller, since it carries markup. */
+async function watchWrite(body,said){
   try{
     const r=await fetch('/api/watchlist',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -4132,8 +5122,8 @@ async function watchWrite(body){
     if(!wres.ok){note(esc(wres.message||'watchlist write failed'),'bad');return;}
     if(wres.action==='remove'&&!wres.changed)
       note(`${esc(wres.symbol)} was not on the watchlist.`,'warn');
-    else note(wres.action==='add'?`Watching <b>${esc(wres.symbol)}</b>.`
-      :`Stopped watching <b>${esc(wres.symbol)}</b>.`,'ok');
+    else note(said||(wres.action==='add'?`Watching <b>${esc(wres.symbol)}</b>.`
+      :`Stopped watching <b>${esc(wres.symbol)}</b>.`),'ok');
   }catch(e){note('Watchlist write failed: '+esc(e),'bad');return;}
   await load();
   /* Quotes are keyed by symbol, so an added row simply has none until the next
@@ -4151,8 +5141,16 @@ async function loadQuotes(announce){
     const r=await fetch('/api/quotes');
     const qres=await r.json();
     S.quotes=qres.quotes||{}; S.quotesAt=qres.asked_at||null;
+    /* Set even when `ranks` is empty, because the OBJECT is the signal: null means
+       never asked and `{}` means asked-and-nothing-came-back, and only the second
+       one lets the IV rank chips enable themselves honestly. */
+    S.ivr={ranks:qres.ranks||{},unranked:qres.unranked||[],
+           ranks_failed:qres.ranks_failed||[]};
     if(qres.failed&&qres.failed.length)
       note('No quote for '+esc(qres.failed.join(', ')),'warn');
+    else if(qres.ranks_failed&&qres.ranks_failed.length)
+      note('No IV rank for '+esc(qres.ranks_failed.join(', '))
+        +' — the request failed, not the symbol.','warn');
     else if(announce) note('Prices updated.','ok');
   }catch(e){note('Quote fetch failed: '+esc(e),'bad');}
   draw();

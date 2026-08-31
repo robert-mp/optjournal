@@ -20,10 +20,16 @@ import pytest
 
 from optjournal.vol import (
     MIN_RETURNS,
+    RANK_BANDS_SOURCE,
+    RANK_MIDPOINT,
+    RANK_MIN_WINDOWS,
     TRADING_DAYS,
     expected_move,
     log_returns,
+    rank,
+    rank_band,
     realised_vol,
+    realised_vol_series,
 )
 
 
@@ -133,6 +139,139 @@ def test_expected_move_refuses_what_it_cannot_answer():
     assert expected_move(100.0, None, days=5) is None
     assert expected_move(0.0, 20.0, days=5) is None
     assert expected_move(100.0, 20.0, days=0) is None
+
+
+# ---------------------------------------------------------------- the rank
+#
+# The gauge the mockup drew as IV RANK, filled with the only rank this journal can
+# measure. Three of these tests are about a number NOT being produced, which is the
+# balance of risk here: the formula is one line and a hand vector settles it, while
+# every way of getting a plausible 0-to-100 figure out of too little history looks
+# exactly like a working gauge.
+
+
+def _series(now: float, low: float, high: float, *, count: int) -> list[float]:
+    """A vol series, NEWEST FIRST, whose low, high and newest reading are known.
+
+    Padded with a value strictly inside the range so the bounds stay where the test
+    put them however long the series is.
+    """
+    inside = (low + high) / 2
+    body = [low, high] + [inside] * max(0, count - 3)
+    return [now, *body]
+
+
+def test_the_rank_is_a_min_max_position_in_the_symbols_own_year():
+    """`(now - lo) / (hi - lo) * 100`, which is what the word rank means here.
+
+    Hand computed rather than compared against a second implementation: 35 sitting
+    between a low of 20 and a high of 60 is 15/40 of the way up, so 37.5. That is
+    also the arithmetic a reader can check against the two bounds printed beside the
+    gauge, which is the whole reason both bounds are on the wire.
+
+    A percentile over the same series would answer something else entirely (the
+    share of readings below 35, which here is dominated by the padding), and the two
+    are not substitutes -- see the module docstring.
+    """
+    series = _series(35.0, 20.0, 60.0, count=RANK_MIN_WINDOWS)
+    assert rank(series) == pytest.approx(37.5)
+    # The ends are the ends, not a scaled interior: today AT the year's low reads 0
+    # and at its high reads 100.
+    assert rank(_series(20.0, 20.0, 60.0, count=RANK_MIN_WINDOWS)) == pytest.approx(0.0)
+    assert rank(
+        _series(60.0, 20.0, 60.0, count=RANK_MIN_WINDOWS)
+    ) == pytest.approx(100.0)
+
+
+def test_a_flat_year_ranks_nothing_rather_than_fifty():
+    """`hi == lo` is 0/0, and 50.0 would be the worst available answer.
+
+    It would render mid-gauge -- the middle of a range that does not exist -- on the
+    one symbol whose realised vol genuinely never moved, and mid-gauge is a
+    perfectly ordinary reading that no reader would question. This is the same line
+    `realised_vol` draws between "no data" and "no movement", except that here even
+    the flat case has no position to report. `mutate.py`'s `rank-degenerate` is this
+    branch answering `RANK_MIDPOINT` instead.
+    """
+    flat = [22.5] * RANK_MIN_WINDOWS
+    assert rank(flat) is None
+    assert rank(flat) != RANK_MIDPOINT, "a flat year cannot have a position"
+    # And the band inherits the refusal rather than inventing a side to be on.
+    assert rank_band(rank(flat)) is None
+
+
+def test_a_quarter_of_a_year_of_windows_ranks_nothing():
+    """Below the gate the bounds are not bounds, so there is no position.
+
+    A min-max rank rests on two SINGLE observations, and neither gains precision
+    from the windows around it -- unlike a mean or a standard deviation. Over a
+    handful of windows today's vol usually IS the extreme, so the figure prints 0 or
+    100 with nothing wrong with the arithmetic, which is `trend.MIN_SETTLED`'s
+    failure mode in a different statistic.
+
+    Asserted at the boundary in both directions, because a gate written `>` instead
+    of `>=` passes any test that only checks a number far below it.
+    """
+    quarter = _series(35.0, 20.0, 60.0, count=RANK_MIN_WINDOWS // 4)
+    assert len(quarter) == RANK_MIN_WINDOWS // 4
+    assert rank(quarter) is None
+    exact = _series(35.0, 20.0, 60.0, count=RANK_MIN_WINDOWS)
+    assert rank(exact) is not None, (
+        "the gate counts windows, and exactly RANK_MIN_WINDOWS of them is enough"
+    )
+    one_short = _series(35.0, 20.0, 60.0, count=RANK_MIN_WINDOWS - 1)
+    assert len(one_short) == RANK_MIN_WINDOWS - 1
+    assert rank(one_short) is None, "one window fewer must not answer"
+
+
+def test_the_rank_band_source_refuses_iv_ranks_thirty():
+    """The constant says why 30 was not carried over, so nobody re-imports it.
+
+    IV rank's conventional 30 is calibrated on IMPLIED vol across a population of
+    symbols; this figure is one symbol's own realised vol against its own year.
+    Carrying the threshold over would be this project's recurring defect one level
+    up -- in a threshold rather than in a value -- and the refusal has to live in a
+    string the surfaces print, because a comment cannot be read from the page.
+    """
+    assert "30" in RANK_BANDS_SOURCE and "not carried over" in RANK_BANDS_SOURCE
+    assert "implied vol" in RANK_BANDS_SOURCE, (
+        "the sentence has to name the statistic 30 belongs to, or it reads as "
+        "an arbitrary preference"
+    )
+    assert RANK_MIDPOINT == 50.0
+    # The cut point is the middle of the range and the edge belongs to "lower",
+    # which is exactly how the two filter chips are worded (`> 50`, `<= 50`) -- so
+    # the pair partitions the range instead of leaving the midpoint in neither.
+    assert rank_band(RANK_MIDPOINT + 0.1) == "upper"
+    assert rank_band(RANK_MIDPOINT) == "lower"
+    assert rank_band(RANK_MIDPOINT - 0.1) == "lower"
+
+
+def test_the_vol_series_reads_newest_first_like_everything_else_here():
+    """One convention for both leaves, and a reversal here is invisible.
+
+    A reversed series has the SAME low and the SAME high, so the bounds beside the
+    gauge would look right while the rank reported where the year STARTED as where
+    it is now. Asserted on a series whose two halves have deliberately different
+    volatility, so the newest window and the oldest cannot coincide.
+
+    The window is asserted in the same breath: it is the 21 sessions the watchlist's
+    realised-vol column already uses, so the reading being ranked is the reading on
+    screen rather than a second figure that resembles it.
+    """
+    quiet = [100.0 * (1.002 if i % 2 else 1.0) for i in range(40)]
+    lively = [100.0 * (1.03 if i % 2 else 1.0) for i in range(40)]
+    newest_first = list(reversed(quiet + lively))     # the lively half is NEWEST
+
+    series = realised_vol_series(newest_first, window=21)
+    assert series[0] == pytest.approx(realised_vol(newest_first[:21]))
+    assert series[0] > series[-1], "the series was built from the wrong end"
+    assert len(series) == len(newest_first) - 20, (
+        "one window per session that has 21 closes behind it"
+    )
+    # `history` caps the count without moving what the newest window is.
+    capped = realised_vol_series(newest_first, window=21, history=10)
+    assert len(capped) == 10 and capped[0] == pytest.approx(series[0])
 
 
 def test_this_module_imports_no_option_model():

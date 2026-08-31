@@ -771,6 +771,256 @@ td.n,th.n{text-align:right}
 /* Marks a price as a stored close rather than a fetched quote. A glyph, not a
    colour: the distinction is factual, not good or bad. */
 .wstale{margin-left:2px}
+
+/* ---- watchlist: a list beside a detail pane ----
+   The tab's own layout, and this page's only master-detail GRID. Every rule below
+   is scoped to a `w*` class or to `.wtab`, which is what makes styling `tbody tr`
+   safe at all: a selector this stylesheet has never had, and an unscoped one would
+   repaint the eight other tables on the page. */
+.wtitle{display:flex;align-items:baseline}
+/* The header's second child, and there are exactly two. `.crow` is
+   space-between with a two-child assumption, so the add form and Refresh travel as
+   one cluster; the old header handed it four children, which is why the
+   "3 symbol(s)" pill floated into the middle of the row. */
+.wacts{display:flex;gap:9px;align-items:center;flex-wrap:wrap;
+  justify-content:flex-end}
+/* The tab's filter row: `.filters`' shape, five tracks, nested INSIDE the card.
+   TWO SPECIFICITY TRAPS LIVE HERE, and both are silent.
+   (1) `grid-template-columns` on this modifier is only legal because `.filters`
+   itself declares `display:grid` in this file -- the layout test refuses a grid
+   property on a selector whose display mode no rule sharing one of its classes sets,
+   which is the check that caught four inert declarations left behind by a
+   grid-to-flex change.
+   (2) `.filters.wf` is specificity (0,2,0) and the 760px query's `.filters` is
+   (0,1,0), so this rule beats it REGARDLESS OF ORDER: without its own entry inside
+   that media query the row would simply never collapse on a narrow window, with
+   nothing on screen to say why. Hence the entry at the bottom of this section.
+   The ground is `--bg2` rather than `.filters`' `--panel`, because inside a card
+   panel-on-panel is invisible; `--bg2` is what `.wblk` and `.mkfilter`'s neighbours
+   already use for a nested surface.
+   THE TWO CAPTIONED TRACKS ARE `minmax(0, <fr>)`, and that is not decoration: an
+   `auto` track sizes to MAX-CONTENT, and those two carry whole sentences. Measured
+   in a browser at 1600px with `1.5fr auto auto auto auto`, they took the width their
+   sentences wanted and the search box was left about 30px, showing "syr" -- a
+   control crushed to nothing by prose two tracks away. The last two tracks stay
+   `auto` because a chip and a count are the width they are. */
+.filters.wf{grid-template-columns:minmax(150px,1fr) minmax(0,1.5fr) minmax(0,1.4fr)
+  auto auto;gap:16px;align-items:start;margin:12px 0 0;background:var(--bg2)}
+.wf input{font:inherit;font-size:12.5px;padding:8px 11px;width:100%;
+  border-radius:9px;color:var(--fg);background:var(--panel2);
+  border:1px solid var(--line2)}
+.wf input::placeholder{color:var(--dim2)}
+/* `.seg` is a block-level flex box, so in a grid track it fills the track and
+   leaves dead space after the last button -- which reads as a fourth, unlabelled
+   option. `max-content` sizes it to its buttons; `max-width` keeps a long label
+   from pushing the row past the card. */
+.wf .seg{width:max-content;max-width:100%}
+/* The bucket's own colour, beside its label rather than instead of it: a chip that
+   says "below -20" AND carries the dot the column uses is legible at any acuity,
+   where a row of three coloured dots would be a colour-only control. Its own class
+   rather than `.mkimp`, which means the calendar feed's impact grade -- a class whose
+   name describes a different concept is the kind of small lie that outlives whoever
+   wrote it. */
+.wdot{display:inline-block;width:7px;height:7px;border-radius:50%;
+  margin-right:6px;vertical-align:middle}
+.wdot.lo{background:var(--imphi)}
+.wdot.mid{background:var(--dim2)}
+.wdot.hi{background:var(--ok)}
+/* A disabled chip. `.chip` had no disabled rule because the calendar's chips are
+   always offerable; the earnings filter is not, since it can only exclude dates that
+   have been recorded and a journal may hold none. Borrowed from `.btn:disabled`
+   through the same values rather than a new name, since it is the same statement. */
+.chip:disabled{opacity:.45;cursor:not-allowed}
+.chip:disabled:hover{color:var(--dim);border-color:var(--line2)}
+/* "showing 7 of 12", which replaced the header's symbol-count pill: a count beside a
+   filter row is a fact about the filter, and one beside a heading contradicted the
+   table under it. Monospace so the two numbers do not jump as they change. */
+.wshow{font-family:var(--mono);font-size:13px;white-space:nowrap;padding-top:2px}
+/* 50/50, which is the mockup's own proportion at whatever width this card gets
+   (`.wrap` caps it at 1480px, measured as a 1436px card at a 1600px viewport).
+   `minmax(0,1fr)` rather than `1fr`, because a bare `1fr` floors at min-content:
+   one long company name or one long caption would then widen its track past the
+   card instead of ellipsing inside it. Not `.duo`, which is a fixed 50/50 nowrap
+   flex that never stacks. */
+.wsplit{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;
+  margin-top:12px}
+/* THE TABLE PANE SCROLLS, so the two panes end roughly level and a long list
+   cannot stretch the card past the pane beside it. The number is MEASURED, in a
+   real browser at a 1600px viewport where this card is 1436px wide: the detail
+   pane renders 679px on the demo's barren row, 709px on a row holding one option
+   position and 730px on one whose positions block is taller, so 700px sits inside
+   that range. No single figure can match every row -- the pane is content-driven,
+   and a note, a company name or four option legs all move it -- which is why the
+   cap is a round number in the middle rather than a pin: its job is that fifty
+   watched symbols do not make this card 3000px tall.
+   The pane also STRETCHES to the row when the table is shorter than the cap (grid
+   items stretch by default), which is harmless: it has no ground of its own.
+   THE SCROLLBAR IS THE PLATFORM'S, deliberately. `color-scheme:dark` (top of this
+   file) already makes the UA thumb take the dark ground, whereas a themed thin
+   scrollbar needs two colour names this 68-name palette does not have, declared in
+   three theme blocks, behind a `::-webkit-` pseudo-element that the colour-literal
+   test would police and no other test would ever exercise. */
+.wtpane{max-height:700px;overflow-y:auto;min-width:0}
+.wdpane{min-width:0}
+/* A body scrolling under a static header loses the column names, which is worse
+   than not scrolling. `--panel` is the card's own ground, so the header does not
+   read as a floating strip. The hairline is repeated as an inset shadow because a
+   collapsed border belongs to the TABLE rather than to the cell, and so does not
+   reliably travel with a sticky one. */
+.wtab thead th{position:sticky;top:0;z-index:1;background:var(--panel);
+  box-shadow:inset 0 -1px 0 var(--line)}
+.wtab tbody tr{cursor:pointer}
+/* Except the one row that is not a row: the empty-filter message. It carries no
+   `data-wsel`, so the pointer cursor above would promise a selection that clicking
+   it cannot make. */
+.wtab tbody td.empty{cursor:default}
+.wtab tbody tr:hover{background:var(--bg2)}
+/* AFTER the hover rule, and the order is load-bearing: both selectors are one
+   class and two elements, so specificity ties and source order decides -- with
+   these two swapped, hovering the open row made it read as unselected.
+   `--seg1`/`--seg2` are the names `.seg button.on`, `.chip.on` and the selected
+   calendar day already share, so an open row reads as the same family of selection
+   as every other choice on the page. */
+.wtab tbody tr.wsel{background:linear-gradient(160deg,var(--seg1),var(--seg2))}
+/* An INSET shadow, not a border-left: a border shifts the row's content by 3px
+   when it is selected, so the whole table twitches on every click. */
+.wtab tbody tr.wsel td:first-child{box-shadow:inset 3px 0 0 var(--accentedge)}
+/* The sort control is a real button, so Enter, Space and the global focus ring
+   come free. It inherits the `th` typography rather than restating it, which is
+   what keeps a sortable header looking like a header. */
+.wsb{font:inherit;color:inherit;letter-spacing:inherit;text-transform:inherit;
+  background:none;border:0;padding:0;cursor:pointer}
+.wsb:hover{color:var(--fg)}
+.wsg{margin-left:4px;color:var(--dim2)}
+/* The direction glyph beside a B-Xtrender reading. No colour of its own: it
+   inherits the cell's sign tint, and the glyph is the half that survives a
+   greyscale screenshot and deuteranopia. */
+.wway{margin-left:4px}
+/* The symbol cell's control. The ellipsis TRIO -- `min-width:0`, `nowrap` and
+   `text-overflow` -- is `.mkdot`'s idiom, and all three are load-bearing: any one
+   missing silently disables the other two, and a company name beside a symbol
+   exceeds any share of a split card. The full name rides in the title. */
+.wselb{display:block;width:100%;text-align:left;font:inherit;color:inherit;
+  background:none;border:0;padding:0;cursor:pointer;
+  min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* The held marker before a symbol. `--accent`, not a hex: a hardcoded colour here
+   would wear Leather's brass on Admiralty and Ledger, which is the defect the
+   performance chart already shipped once. Sized down and nudged off the baseline
+   because it is a mark beside a word, not a word -- and it reserves no space when
+   absent, so an unheld row's symbol starts where the header does. */
+.whold{color:var(--accent);font-size:9px;margin-right:5px;vertical-align:middle}
+/* The detail grid. Three columns, because the ring wants one of its own beside two
+   narrower tiles and the daily arm wants the width of both of them. */
+.wdet{display:grid;grid-template-columns:1fr 1fr 1.1fr;gap:10px}
+.wdet>.wide{grid-column:1/3}
+.wdet>.tall{grid-row:1/3;grid-column:3}
+/* A tile is a `.stat` BOX with this layout inside it, so the padding, radius,
+   ground and border stay the dashboard's names instead of a second copy of their
+   values that would drift from them. */
+.wtile{display:flex;flex-direction:column;gap:5px}
+.wth{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+/* The NARROW tiles stack their label above their figure; only the wide daily arm
+   puts the two on one line. Both halves of that are measured rather than taste.
+   Label-left cost the earnings tile its date: at a 1600px viewport the tile's
+   header row is 222px and its parts are label 63px + gap 10px + value 149px, so
+   the value box grew to 44px against 22px for one line and "2026-08-27" rendered
+   as "2026-08-" over "27". A broken date is not a date. Stacking gives the figure
+   the tile's whole width, which is also the layout the earnings and weekly tiles
+   are drawn with, so the fix and the target agree. */
+.wtile:not(.wide) .wth{flex-direction:column;align-items:flex-start;gap:4px}
+/* And the figure never breaks mid-token even so. Stacking buys enough width for
+   today's strings; `nowrap` is what keeps a longer one (a date beside a delta on a
+   narrower pane) from splitting inside the number itself rather than wrapping at
+   the space between the two, which is the only break that stays readable. */
+.wtv{display:flex;align-items:baseline;gap:6px;white-space:nowrap}
+/* A tile's or a block's label. Its own name rather than `.stat .k`, which carries
+   a 7px bottom margin for the label-ABOVE-value card and pushes the baseline off
+   in a label-left header row. */
+.wk{font-size:11.5px;color:var(--dim);letter-spacing:.05em;text-transform:uppercase}
+.wdelta{font-size:11.5px;font-family:var(--mono)}
+/* The provenance line under a figure: the window, the periods or the count it came
+   from. Always present, because a figure on this tab that cannot say where it came
+   from is one its reader cannot reproduce. */
+.wcap{font-size:10.5px;color:var(--dim2);line-height:1.45}
+.wblk{margin-top:12px;padding:12px 14px;border-radius:11px;background:var(--bg2);
+  border:1px solid var(--line)}
+/* The two typed fields. `font-family:inherit` on the textarea because a textarea
+   defaults to monospace and a note is prose, not a figure. */
+.wed{display:flex;gap:7px;align-items:flex-start;margin-top:7px}
+.wed input,.wed textarea{font:inherit;font-size:12.5px;padding:7px 11px;flex:1;
+  min-width:0;border-radius:9px;color:var(--fg);background:var(--panel2);
+  border:1px solid var(--line2)}
+.wed textarea{font-family:inherit;min-height:58px;resize:vertical}
+.wed input::placeholder,.wed textarea::placeholder{color:var(--dim2)}
+.wdh{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:2px 0 12px}
+.wdsym{font-size:26px;font-weight:800;font-family:var(--mono);letter-spacing:.02em}
+/* The detail pane with nothing to show, because the filter row is hiding every row.
+   A block, not a half-populated card: every figure in the pane comes from an open row
+   and there is none, so the honest render is the sentence saying which control is
+   doing it. Same ground and radius as `.wblk` through the same names. */
+.wnone{display:flex;flex-direction:column;gap:7px;padding:14px 16px;
+  border-radius:11px;background:var(--bg2);border:1px solid var(--line);
+  color:var(--dim);font-size:12.5px}
+
+/* ---- the two gauges ----
+   Both are inline SVG positioned by GEOMETRY attributes and coloured only from here.
+   Geometry attributes because `style="..."` is forbidden in the page (and invisible
+   to these tests); colour only from here because a presentation attribute cannot hold
+   a `var()`, so a hex in one survives every theme swap unchanged -- which is exactly
+   how the performance chart came to ring its dots in Leather's background on the
+   Admiralty page. Every name below already exists in all three theme blocks. */
+.wmeter{display:block;width:100%;max-width:230px;height:auto;margin-top:4px}
+/* The gradient's stops. `stop-color` belongs in CSS for the reason above, and the
+   `stop.gpos` rules further down this file are the same idiom on the performance
+   chart. The three names are the meter's own reading of its scale: a negative end, a
+   neutral middle and a positive end, so the knob's position is legible without
+   reading the figure -- which is the whole reason the track is not a plain bar. */
+.wmeter stop.lo{stop-color:var(--badfill1)}
+.wmeter stop.mid{stop-color:var(--bg2)}
+.wmeter stop.hi{stop-color:var(--okfill1)}
+/* Zero, which is the indicator's own centre and not the middle of the visible data.
+   Quiet, because it is a reference and the knob is the reading. */
+.wmzero{stroke:var(--dim2);stroke-width:1}
+/* The knob takes the page's sign palette through `currentColor`, so `.pos` and
+   `.neg` -- the same two classes every signed figure on this page wears -- colour it
+   without a rule of their own here. A reading of exactly zero carries neither and
+   sits at the centre in the inherited colour, which is the honest picture of a
+   reading with no sign. */
+.wmknob{fill:currentColor;stroke:var(--panel);stroke-width:1.5}
+/* The scale ends. Printed because a gauge whose bounds are not on screen could be
+   showing anything, and `text-anchor` on the right one so the label ends where the
+   track does rather than running past it. */
+.wmend{fill:var(--dim2);font-size:9px;font-family:var(--mono)}
+.wmend.wmr{text-anchor:end}
+.wring{display:block;width:82px;height:auto;margin:6px 0 2px}
+/* The track, which is what makes the arc read as a PROPORTION: 40% of a circle and
+   40% of nothing look identical. */
+.wrtrack{fill:none;stroke:var(--line2);stroke-width:6}
+/* The value arc. `--chartline` is the journal's own brass/gilt, the same name the
+   performance line uses, deliberately not `--accent`: this is a measurement, and it
+   should read as the same kind of mark as the other measured line on the page.
+   `round` caps so a small rank is still a visible mark rather than a hairline. */
+.wrarc{fill:none;stroke:var(--chartline);stroke-width:6;stroke-linecap:round}
+/* The threshold tick, at the same constant the two RVR chips are labelled from. Quiet
+   like the meter's centre tick, and for the same reason: it is a reference. */
+.wrtick{stroke:var(--dim2);stroke-width:1.5}
+/* One column below 1180px, with the detail UNDER the table: stacking detail below
+   master is this page's only master-detail shape, and Calendar, Market and Replay
+   all do it. Its own entry at this existing breakpoint rather than a line inside
+   the `.stats` block, so each override sits beside the rule it overrides.
+   The spans reset with it: a `.wide` covering two of three columns and a `.tall`
+   covering two rows describe a grid that is no longer on screen. */
+@media(max-width:1180px){
+  .wsplit{grid-template-columns:minmax(0,1fr)}
+  .wdet>.wide,.wdet>.tall{grid-column:auto;grid-row:auto}
+}
+/* The filter row's OWN entry at the narrow breakpoint, and it is not optional:
+   `.filters.wf` is specificity (0,2,0) while the rule two lines below in the 760px
+   query is `.filters` at (0,1,0), so the modifier beats it whatever the source order
+   and five tracks would stay five tracks on a phone. The failure is silent -- a row
+   scrolling off the card edge, with the collapse rule sitting right there looking
+   like it applies. */
+@media(max-width:760px){.filters.wf{grid-template-columns:1fr}}
 /* Replay drill-down. The panel is the chart's home rather than a table cell:
    reading a strike against a price scale needs a y-axis, and an axis needs
    room. Clicking the card header opens it, the same act as clicking a calendar

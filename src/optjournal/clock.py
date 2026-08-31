@@ -1,4 +1,4 @@
-"""The market clock: one zone, and the four conversions stated against it.
+"""The market clock: one zone, and the conversions stated against it.
 
 Every timestamp this journal stores is a local time in ONE zone, and which zone
 is a property of the market rather than of any module -- `epoch_et` records the
@@ -18,15 +18,22 @@ address.
 This changes no dependency count on its own: every module that imports the clock
 also needs something else from `bars.py`. What it buys is one address for the ET
 rule, and clock tests that live beside the clock.
+
+`parse_day` arrived last and for the same reason rather than for a new one: a typed
+earnings date is validated at TWO entry points (`web._watchlist_write` and
+`cli.cmd_watch`) and parsed back by a serializer to derive a countdown, and neither
+entry point may hold the other. What a day looks like in this journal is one rule,
+so it lives here beside the function that writes one.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from datetime import date, datetime
 from functools import cache
 from zoneinfo import ZoneInfo
 
-__all__ = ["MARKET_TZ", "epoch_et", "et_day", "expiry_epoch"]
+__all__ = ["MARKET_TZ", "epoch_et", "et_day", "expiry_epoch", "parse_day"]
 
 #: The clock every journal timestamp is stated in. See epoch_et for the
 #: evidence; it is also the zone the chart labels its x axis in, so fills and
@@ -112,3 +119,42 @@ def et_day(stamp: int) -> str:
     actually mean.
     """
     return datetime.fromtimestamp(stamp, MARKET_TZ).strftime("%Y-%m-%d")
+
+
+#: The one spelling a day is written in here: `et_day`'s own output, and the format
+#: every date column in this journal already holds. Pinned as a pattern as well as
+#: parsed, for a MEASURED reason -- on this interpreter (3.12)
+#: `date.fromisoformat("20260827")` returns 2026-08-27 and `"2026-W35-1"` returns
+#: 2026-08-24, so parsing alone would accept two spellings this journal never
+#: writes and a column would then show `20260827` beside `2026-08-27`.
+_DAY_SPELLING = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_day(text: str | None) -> date | None:
+    """A YYYY-MM-DD day, or None if that is not what `text` is.
+
+    The date half of `et_day`, and here for the reason every other rule in this
+    module is: three layers need it and no two of them may hold each other.
+    `web._watchlist_write` validates a typed earnings date, `cli.cmd_watch`
+    validates the same date from the same reader's other surface, and
+    `serialize.watchlist_data` parses the stored value back to derive a countdown
+    from it. Two entry points and a serializer, which is exactly the shape the
+    README's leaf argument describes -- the alternative is the rule written twice
+    and drifting, so that the endpoint refuses a date the CLI stores.
+
+    NONE RATHER THAN RAISING, because the third caller is a reader. A payload that
+    raises on one unparseable cell takes every tab on the page with it, and a
+    journal is an SQLite file a human can edit; both writers validate, so this only
+    has to be true of the value they wrote, and honest about anything else.
+
+    A calendar check as well as a format one: `2026-13-45` and `2026-02-30` have the
+    right shape and are not days, and a countdown derived from one would be
+    arithmetic over something that does not exist.
+    """
+    stamp = str(text or "").strip()
+    if not _DAY_SPELLING.match(stamp):
+        return None
+    try:
+        return date.fromisoformat(stamp)
+    except ValueError:
+        return None

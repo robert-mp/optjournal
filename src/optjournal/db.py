@@ -46,7 +46,7 @@ __all__ = ["DEFAULT_BROKER", "SCHEMA_VERSION", "connect", "migrate",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -68,6 +68,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("statements", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
     ("securities", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
     ("equity_summaries", "broker", f"TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}'"),
+    # The typed earnings date. Nullable and with no default, because "none
+    # recorded" is the normal state of this column and must stay distinguishable
+    # from a date -- the same line every absent figure in this journal draws.
+    ("watchlist", "earnings_on", "TEXT"),
 )
 
 _TRADES_DDL = """
@@ -347,9 +351,29 @@ CREATE INDEX IF NOT EXISTS market_events_when ON market_events(starts_at);
 -- ingested fact, which is why it has no `broker` column and should not gain one:
 -- a symbol you are watching is not a broker's record of anything. Nothing joins
 -- it to `trades`; the watchlist view looks up prices and positions by symbol.
+--
+-- Being the user-input table is also what decides which watchlist columns may
+-- live here at all. A note and an earnings date are TYPED, so they have nowhere
+-- else to be stored; every other figure the tab shows is either fetched (a price,
+-- a company name) or derived from stored bars (realised vol, its rank, both
+-- B-Xtrender arms), and none of those gains a column -- a cached fetched value
+-- would need an age story like every other cached figure here, and a cached
+-- derived one could disagree with the closes it was computed from.
 CREATE TABLE IF NOT EXISTS watchlist (
   symbol     TEXT PRIMARY KEY,
   note       TEXT,
+  -- The next earnings date, YYYY-MM-DD, as YOU recorded it. Nothing this journal
+  -- can reach publishes one: the chart meta block has no earnings key, the
+  -- endpoint's `events` parameter serves dividends and splits at every window
+  -- tested, `quoteSummary` answers 401, and `market_events` is a macro calendar
+  -- whose country column holds currency codes. So the provenance is unambiguous
+  -- and every surface labels it as typed rather than fetched. Deriving a next
+  -- date from a quarterly cadence would be a guess wearing a date's clothes.
+  --
+  -- The COUNTDOWN is deliberately not stored beside it: a stored "14 days" is
+  -- wrong tomorrow, so `serialize.watchlist_data` derives it against
+  -- `clock.et_day` on every read and it cannot drift from the date it counts to.
+  earnings_on TEXT,
   added_at   TEXT NOT NULL
 );
 
