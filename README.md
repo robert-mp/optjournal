@@ -138,6 +138,7 @@ should get you running, not explain every decision.
 | [docs/money.md](docs/money.md) | the `Money` model: base vs as-charged, and when the native figure is withheld |
 | [docs/testing.md](docs/testing.md) | what the suite measures, and mutation testing |
 | [docs/theming.md](docs/theming.md) | the theme registry and the contrast rules |
+| [docs/trade-confirmations.md](docs/trade-confirmations.md) | same-day fills: what IBKR documents about the confirm query, what is only inferred, and the two columns that block it |
 | [docs/contributing.md](docs/contributing.md) | adding functionality, data safety, local development |
 | `PLAN.md`, `SCHEDULER_PLAN.md` | open work, with the measured scope for each step |
 
