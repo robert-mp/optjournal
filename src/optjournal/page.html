@@ -3526,13 +3526,13 @@ const RVR_WINDOWS=120;
 /* The indicator's periods, as the tile prints them. Generated in Python from the
    constants themselves (`trend.PARAMS_CAPTION`) and copied here because the page
    holds no Python; a test binds the two, so a retune cannot leave the screen
-   claiming the old numbers. B-Xtrender at 5/20/15 and B-Xtrender at other
+   claiming the old numbers. B-Xtrender at 5/20/5 and B-Xtrender at other
    settings are different figures, so a value with no periods stated is one its
    reader cannot reproduce -- the gap `impact_source` closes for the calendar.
    ONE string literal, not two concatenated: the test compares it against the
    Python constant, and a sentence split across a `+` is a sentence that guard
    cannot see. */
-const PARAMS_CAPTION='B-Xtrender, short arm 5/20/15, centred on 50; Jhunjhunwala 2019';
+const PARAMS_CAPTION='B-Xtrender, short arm 5/20/5, centred on 50; Jhunjhunwala 2019';
 
 /* The three cut points the filter row offers, and the two sentences saying where
    each came from. Every one of them is a copy of a Python constant, bound by test
@@ -3849,7 +3849,7 @@ function wnorows(){
  * makes it a five-track row inside a card -- see the CSS, which carries the two
  * specificity gotchas.
  *
- * WHY EACH CAPTION EXISTS. B-Xtrender at 5/20/15 and B-Xtrender at other settings
+ * WHY EACH CAPTION EXISTS. B-Xtrender at 5/20/5 and B-Xtrender at other settings
  * are different numbers, and the published indicator states NO oversold or
  * overbought level at all (no hline, no level inputs, only zero crossed with
  * rising-or-falling) -- so every band on this row is imported, and an imported band

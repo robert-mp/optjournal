@@ -14,20 +14,45 @@ import pytest
 from optjournal import zdte
 
 
-def test_the_vix_band_is_the_annualised_vol_over_root_252():
-    """VIX de-annualises by sqrt(252), and the band is prev_close times that.
+def test_the_vix_band_uses_the_desk_divisor_of_sixteen():
+    """VIX de-annualises by 16, the desk convention, not by sqrt(252) = 15.87.
 
-    The one figure a reader might expect to be wrong: VIX is an annual number
-    and the band is a daily one, so the conversion is the claim. VIX 16 on a
-    5000 index is a ~1.008% day, so ~50.4 points either side.
+    The one figure a reader might expect to be wrong: VIX is an annual number and
+    the band is a daily one, so the conversion is the claim -- and WHICH
+    de-annualisation is a second claim on top of it. Pinned against the reference
+    implementation's own published figures, because a number 0.8% off is invisible
+    in a band and still the wrong number beside a platform quoting the other one.
     """
     p = zdte.plan(spx_prev_close=5000.0, vix=16.0)
     assert p is not None
-    expected_pct = 16.0 / math.sqrt(252)
-    assert p.vix_daily_move_pct == pytest.approx(expected_pct)
-    vix_band = next(b for b in p.bands if b.label == "VIX 1σ")
-    assert vix_band.high == pytest.approx(5000.0 * (1 + expected_pct / 100))
-    assert vix_band.low == pytest.approx(5000.0 * (1 - expected_pct / 100))
+    assert p.vix_daily_move_pct == pytest.approx(1.0), "VIX 16 is a 1% session"
+    assert p.vix_daily_move_pct != pytest.approx(16.0 / math.sqrt(252)), (
+        "sqrt(252) is the textbook divisor and NOT the one in use here"
+    )
+
+
+@pytest.mark.parametrize("spx, vix, want_pct, want_points, want_low, want_high", [
+    # Both rows read from the reference implementation's own stored snapshots, so
+    # this is a cross-check against a second program rather than against itself.
+    (7711.76, 15.25, 0.9531, 73.5, 7638.26, 7785.26),
+    (7711.76, 14.43, 0.9019, 69.55, 7642.21, 7781.31),
+])
+def test_the_plan_reproduces_the_reference_figures_to_the_cent(
+    spx, vix, want_pct, want_points, want_low, want_high
+):
+    """The whole point of matching the divisor: the rails agree to the cent.
+
+    `points` is rounded to one decimal and the band is built FROM it, which is
+    what makes the low and high land exactly on the reference's own numbers --
+    banding off the raw percentage gives 7638.2592 and a rail that is always
+    slightly out.
+    """
+    p = zdte.plan(spx_prev_close=spx, vix=vix)
+    assert round(p.vix_daily_move_pct, 4) == want_pct
+    assert p.points == want_points
+    band = next(b for b in p.bands if b.label == "VIX 1σ")
+    assert round(band.low, 2) == want_low
+    assert round(band.high, 2) == want_high
 
 
 def test_the_fixed_bands_are_exactly_two_and_three_percent():
@@ -51,7 +76,8 @@ def test_the_band_carries_its_own_percentage_so_a_caption_need_not_re_derive_it(
     and a caption reading "2.0%" beside edges that no longer divide to exactly
     that is the small lie this avoids.
     """
-    band = zdte.plan(spx_prev_close=5000.0, vix=16.0).bands[1]
+    band = next(b for b in zdte.plan(spx_prev_close=5000.0, vix=16.0).bands
+                if b.label == "2%")
     assert band.pct == 2.0
     assert band.payload() == {"label": "2%", "pct": 2.0,
                               "low": 4900.0, "high": 5100.0}

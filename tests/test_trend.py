@@ -56,10 +56,18 @@ from optjournal.trend import (
 #: Two properties make it hand-computable; see the vector test for the derivation.
 ALTERNATING = [100.0 + t + 2.0 * (t % 2) for t in range(400)]
 
-#: A 24-session sine, 300 long. Chosen by search as a case where the published
+#: A 38-session sine, 300 long. Chosen by search as a case where the published
 #: formula and the popular wrong one disagree in SIGN while neither is pegged at
 #: an extreme, so the disagreement cannot be dismissed as a boundary artefact.
-SINE_24 = [100.0 + 10.0 * math.sin(2 * math.pi * t / 24.0) for t in range(300)]
+#:
+#: The period is 38 rather than the 24 this started at because the search
+#: condition is per SMOOTHING: at L3=15 a 24-session sine separated the two
+#: readings, and at L3=5 both go negative and the vector proves nothing. The
+#: search was re-run rather than the assertion relaxed -- a discriminating vector
+#: that no longer discriminates is the silent no-op this whole module hunts.
+SINE_DISCRIMINATING = [
+    100.0 + 10.0 * math.sin(2 * math.pi * t / 38.0) for t in range(300)
+]
 
 #: A falling 24-session sine, 400 long, whose first 44 values are the warm-up zone
 #: the seeding test reads. Falling because the two seedings then disagree in sign
@@ -125,26 +133,33 @@ def test_the_short_arm_matches_a_hand_computed_vector():
     2. A constant contributes nothing to the CHANGES the RSI reads, so the RSI
        sees a strictly alternating +0.30, -0.30, +0.30 ... series.
     3. Wilder's average of a one-on-one-off sequence settles into a two-cycle.
-       With `r = (15-1)/15 = 14/15`, the peak solves `g = m/15 + r^2 * g`, giving
-       `g = 15m/29`; on that same step the average of the down moves is `r` times
-       its own peak, `14m/29`. The wobble size cancels in the ratio.
-    4. `rsi = 100 * gain / (gain + loss) = 100 * 15/29 = 51.7241...`, so the arm
-       reads `+1.7241379310` -- independent of the slope AND of the wobble.
+       With `r = (L-1)/L`, the peak solves `g = m/L + r^2 * g`, giving
+       `g = mL/(2L-1)`; on that same step the average of the down moves is `r`
+       times its own peak, `m(L-1)/(2L-1)`. They sum to exactly `m`, so the wobble
+       size cancels in the ratio.
+    4. `rsi = 100 * gain / (gain + loss) = 100 * L/(2L-1)`, so the arm reads
+       `100*L/(2L-1) - 50` -- independent of the slope AND of the wobble.
 
-    Measured: 1.7241379310062 against the closed form's 1.7241379310345, agreeing
-    to eleven decimals at 400 closes. At 120 it is 1.71725, which is the same
-    convergence story `MIN_SETTLED` is sized by.
+    Written against `SHORT_L3` rather than a literal, because the closed form is
+    what makes this test worth having: it holds at ANY smoothing, so a retune
+    keeps a real check instead of needing a fresh number pasted in from a run.
+    At L=5 it is +5.5555555556 (verified numerically at 5.5555555555 over 400
+    closes); at L=15 it was +1.7241379310.
 
     This vector also separates Wilder's smoothing from an EMA of the same period,
     which is the difference between `ta.rma` and `ta.ema` and a one-character
-    difference in a constant. Smoothing the same series with `2/(15+1)` gives the
-    two-cycle `8m/15` against `7m/15`, so `100 * 8/15 - 50 = +3.3333` -- verified
-    numerically at +3.3333333333336 while the module answers +1.7241379310062.
+    difference in a constant. Smoothing with `2/(L+1)` instead solves
+    `g = alpha*m + (1-alpha)^2 * g`, which at L=5 gives `3m/5` against `2m/5` and
+    so `100 * 3/5 - 50 = +10.0` -- verified numerically, against the module's
+    +5.5555555555, so the two conventions stay far apart at this length too.
     """
-    closed_form = 100.0 * 15.0 / 29.0 - CENTRE
+    closed_form = 100.0 * SHORT_L3 / (2 * SHORT_L3 - 1) - CENTRE
     got = bxtrender_short(newest_first(ALTERNATING))
     assert got == pytest.approx(closed_form, abs=1e-9)
-    assert round(got, 4) == 1.7241
+    wilder_vs_ema = 100.0 * 2.0 / (SHORT_L3 + 1 + 2.0) - CENTRE
+    assert got != pytest.approx(wilder_vs_ema, abs=1e-6), (
+        "Wilder's smoothing and an EMA of the same period must not coincide"
+    )
 
     # The long arm on the same rising series is pegged at the top, which is a real
     # reading rather than a warm-up artefact: an EMA(20) of a ramp rises at every
@@ -165,18 +180,18 @@ def test_the_rsi_reads_the_ema_difference_not_the_price():
     `SINE_24` was found by search under exactly that condition, with the extra
     requirement that NEITHER reading is pegged at +/-50: a disagreement between
     two saturated values proves nothing, since almost any formula saturates on a
-    contrived series. Measured: the published formula reads +1.9650 and the wrong
-    one -8.9169 on the same 300 closes.
+    contrived series. Measured at L3=5: the published formula reads +25.2040 and
+    the wrong one -5.4298 on the same 300 closes.
     """
-    correct = bxtrender_short(newest_first(SINE_24))
+    correct = bxtrender_short(newest_first(SINE_DISCRIMINATING))
 
     # The wrong composition, written out so the difference is visible: same
     # primitives, same periods' spirit, RSI applied to the PRICES.
-    smoothed = ema([v - CENTRE for v in rsi(SINE_24, SHORT_L1)], 3)
+    smoothed = ema([v - CENTRE for v in rsi(SINE_DISCRIMINATING, SHORT_L1)], 3)
     wrong = smoothed[-1]
 
-    assert correct == pytest.approx(1.9649835, abs=1e-6)
-    assert wrong == pytest.approx(-8.9168625, abs=1e-6)
+    assert correct == pytest.approx(25.2039923, abs=1e-6)
+    assert wrong == pytest.approx(-5.4297571, abs=1e-6)
     assert correct > 0 > wrong, (
         "the two compositions must disagree in sign on this vector, or the test "
         "has stopped distinguishing them"
@@ -189,11 +204,19 @@ def test_the_rsi_reads_the_ema_difference_not_the_price():
 def test_the_ema_is_seeded_with_an_sma_not_the_first_value():
     """TradingView seeds with an SMA; pandas seeds with the first value.
 
-    Both converge, and near the start of a series the choice is worth more than
-    the whole band width. MEASURED on TSLA's 755 fetched daily closes: a 44-close
-    window reads **-1.3487** with SMA seeding against **+9.4472** with recursive
-    seeding, a **10.80** point gap that flips the sign and therefore the bucket;
-    the same comparison at 200 closes is 0.0003 and at 755 is 0.0000.
+    Both converge, and inside the warm-up the choice still decides the SIGN. On
+    `WARM_UP`'s first 35 closes the published seeding reads **+5.7523** and the
+    recursive one **-10.1443** -- opposite states of the indicator's primary
+    published signal, from one line of seeding.
+
+    The window is 35 rather than the 44 this test used at L3=15, and it was found
+    by search for the same reason `SINE_DISCRIMINATING`'s period moved: a shorter
+    Wilder smoothing leaves its seed behind faster, so the zone where seeding
+    changes the answer is narrower. On REAL data the effect is now modest -- TSLA
+    at 44 closes is 0.64 points apart, agreeing to four decimals by 200 and
+    exactly at the full series -- and that is stated rather than hidden, because
+    the reason to keep the published seeding is that the figure's whole meaning is
+    "what the published indicator says", not that the alternative is dramatic.
 
     Since the figure's whole meaning is "what the published indicator says about
     this symbol", the published seeding is the correct one and the other is a bug
@@ -212,11 +235,11 @@ def test_the_ema_is_seeded_with_an_sma_not_the_first_value():
     # is a different statistic under the same name.
     assert ema([1.0, 2.0], 3) == []
 
-    published = raw_short(WARM_UP[:44])
-    recursive = _recursively_seeded_short(WARM_UP[:44])
-    assert published == pytest.approx(1.1126245, abs=1e-6)
-    assert recursive == pytest.approx(-25.4266196, abs=1e-6)
-    assert abs(published - recursive) > 20.0, (
+    published = raw_short(WARM_UP[:35])
+    recursive = _recursively_seeded_short(WARM_UP[:35])
+    assert published == pytest.approx(5.7523152, abs=1e-6)
+    assert recursive == pytest.approx(-10.1442692, abs=1e-6)
+    assert abs(published - recursive) > 4.0, (
         "the two seedings must still disagree in the warm-up zone, or this test "
         "has stopped measuring the choice"
     )
@@ -430,4 +453,4 @@ def test_the_band_vocabulary_is_attributed_in_one_string():
         f"centred on {CENTRE}; Jhunjhunwala 2019"
     )
     assert from_the_constants == PARAMS_CAPTION
-    assert "5/20/15" in PARAMS_CAPTION and "Jhunjhunwala" in PARAMS_CAPTION
+    assert "5/20/5" in PARAMS_CAPTION and "Jhunjhunwala" in PARAMS_CAPTION

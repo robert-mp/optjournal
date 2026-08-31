@@ -14,8 +14,8 @@ TradingView (Pine) port. Both arms, both seedings and every default here are tha
 implementation's, because the whole meaning of the figure is "what the published
 indicator says about this symbol":
 
-    short arm   rsi(ema(close, 5) - ema(close, 20), 15) - 50
-    long arm    rsi(ema(close, 20), 15) - 50
+    short arm   rsi(ema(close, 5) - ema(close, 20), 5) - 50
+    long arm    rsi(ema(close, 20), 5) - 50
 
 THE RSI READS THE EMA DIFFERENCE, NOT THE PRICE. That is the one step every wrong
 copy drops. A popular Python repository computes `ema(rsi(close, 5) - 50, 3)`
@@ -74,21 +74,33 @@ __all__ = [
     "rsi",
 ]
 
-#: The short arm's three periods: fast EMA, slow EMA, RSI. QuantTherapy's Pine
-#: defaults, unchanged. B-Xtrender at 5/20/15 and B-Xtrender at other settings
-#: are different numbers, so a column headed BXTRENDER showing +22.4 with no
-#: periods stated is a figure its reader cannot reproduce -- which is why
-#: `PARAMS_CAPTION` exists and is generated from these three names.
+#: The short arm's three periods: fast EMA, slow EMA, RSI SMOOTHING.
+#:
+#: L3 IS 5, NOT 15, and the difference is the whole reading. This module shipped
+#: at 15 -- a length some Pine ports carry -- and produced a faithful
+#: implementation of a DIFFERENT setting: verified against an independently
+#: written reference, zero delta on six symbols, and still not the number the
+#: published setup names. That is this project's recurring defect shape, a
+#: well-formed figure under a label that does not describe it, and the reason
+#: `PARAMS_CAPTION` prints the periods beside the value: B-Xtrender at 5/20/5 and
+#: B-Xtrender at 5/20/15 are different indicators, and a column headed BXTRENDER
+#: showing +22.4 with no periods stated cannot be reproduced by its reader.
+#:
+#: Measured on the real journal over 520 closes each, changing L3/L2 from 15 to 5:
+#: TSLA's short arm moved +19.21 -> +29.15, SPY's -7.51 -> -22.17, META's
+#: +5.32 -> +28.46, and GOOG's long arm -15.15 -> -44.84. Several cross a band edge
+#: and GOOG's short arm changes sign, so this was never a rounding difference.
 SHORT_L1 = 5
 SHORT_L2 = 20
-SHORT_L3 = 15
+SHORT_L3 = 5
 
-#: The long arm's two periods: the same slow EMA, read by the same RSI. It shares
-#: `SHORT_L2`'s value at 20 and is spelled separately anyway, because the two are
-#: independent inputs in the published indicator and collapsing them would make a
-#: retune of one silently retune the other.
+#: The long arm's two periods: the same slow EMA, read by an RSI of the same
+#: smoothing as the short arm's. `LONG_L1` shares `SHORT_L2`'s value at 20 and is
+#: spelled separately anyway, because the two are independent inputs in the
+#: published indicator and collapsing them would make a retune of one silently
+#: retune the other.
 LONG_L1 = 20
-LONG_L2 = 15
+LONG_L2 = 5
 
 #: An RSI runs 0 to 100; the indicator subtracts this so its zero is the RSI's
 #: midpoint and the sign carries the state. It also bounds the output to
@@ -98,34 +110,49 @@ CENTRE = 50
 
 #: Where the arithmetic first produces a number at all, and therefore the floor
 #: below which there is nothing to gate. An SMA-seeded EMA(20) over n closes
-#: yields n-19 values; Wilder's RSI(15) needs 16 inputs to produce its first; so
-#: both arms need 20 + 15 = 35 closes for one value, and 35 is not a choice.
+#: yields n-19 values; Wilder's RSI(5) needs 6 inputs to produce its first; so
+#: both arms need 20 + 5 = 25 closes for one value, and 25 is not a choice.
 #:
 #: It is NOT the gate. `MIN_SETTLED` is. The two are separate constants because
 #: they answer different questions -- "can this be computed" and "is the answer
 #: worth showing" -- and a single number would quietly answer the second with the
 #: first, which is how a pegged extreme reaches a reader.
-MIN_CLOSES = 35
+#:
+#: 25, not 35: it fell with the RSI smoothing when L3/L2 went 15 -> 5, because it
+#: IS `SHORT_L2 + SHORT_L3`. Derived rather than written down, so the next retune
+#: cannot leave a stale floor claiming an arithmetic that no longer holds.
+MIN_CLOSES = SHORT_L2 + SHORT_L3
 
 #: The gate the functions actually enforce, in the arm's own unit (sessions for a
 #: daily series, ISO weeks for a weekly one). Below this they return None and the
 #: surface renders an em dash titled with the count held.
 #:
-#: MEASURED, over 755 fetched daily closes each for TSLA, GOOG, PLTR and SPY,
-#: which is why 35 is not the answer:
+#: MEASURED at the CURRENT smoothing (L3/L2 = 5) over 520 daily closes each for
+#: TSLA, GOOG, PLTR and SPY, as trailing windows against each symbol's own
+#: full-series reading. Re-measured when the smoothing changed from 15, because
+#: every figure below moved and a warm-up justification quoting the old numbers
+#: would be describing a different indicator:
 #:
-#: * at 45 closes the newest short-arm value is 2.2 to 7.5 points away from what
-#:   the SAME session reads once the series is long (SPY 2.22, PLTR 2.78, GOOG
-#:   5.28, TSLA 7.50), against a range 100 points wide and a band at 20;
-#: * at 44 closes TSLA's short arm reads -1.35 where the settled value is +8.24,
-#:   so the SIGN flips, and the sign is the indicator's primary published state;
-#: * from 35 closes through 43, TSLA's long arm reports exactly -50.0000, the
-#:   pegged extreme, which renders as the strongest signal anything on the page
-#:   can show. It is pegged because a 16-value EMA(20) is still falling out of its
-#:   own seed, so every change is a down move, every up move is zero, and the RSI
-#:   is 0 with nothing wrong with the arithmetic.
-#: * by 120 closes the same four symbols are within 0.01 to 0.05 points of their
-#:   settled values, which is under the last digit anything prints.
+#: * at 30 closes the short arm is 9.1 to 27.3 points from its settled value
+#:   (GOOG 9.12, TSLA 15.71, SPY 18.01, PLTR 27.35), against a range 100 points
+#:   wide and a band at 20;
+#: * the SIGN flips inside the warm-up on every one of the four -- TSLA and GOOG
+#:   at 25 to 27 closes, PLTR at 40 to 41, SPY at 25 -- and the sign is this
+#:   indicator's primary published state;
+#: * the long arm reports exactly +/-50.0000, the pegged extreme, from 25 closes
+#:   through 27 (GOOG), 33 (TSLA), 36 (SPY) and 40 (PLTR). That renders as the
+#:   strongest signal anything on the page can show. It is pegged because a
+#:   six-value EMA(20) is still climbing out of its own seed, so every change has
+#:   one sign, the other average is zero, and the RSI saturates with nothing
+#:   wrong with the arithmetic;
+#: * by 60 closes the four are within 0.35 points, by 90 within 0.016, and by 120
+#:   within 0.0012 -- under the last digit anything prints.
+#:
+#: So 120 survives the retune with room to spare: the shorter smoothing converges
+#: FASTER (120 was 0.01 to 0.05 points at L3=15 and is 0.0004 to 0.0012 now), and
+#: the gate is left where it is rather than tightened to the new arithmetic,
+#: because the realised-vol rank on the same panel is sized on the same 120 and
+#: the tab's derived figures should appear together rather than in stages.
 #:
 #: This is `vol.MIN_RETURNS`' discipline per indicator: a warm-up value is noise
 #: presented as a measurement. 120 is where the warm-up error has fallen into the
@@ -284,7 +311,7 @@ def rsi(values: list[float], length: int) -> list[float]:
 def bxtrender_short(closes: list[float | None]) -> float | None:
     """The short arm's newest value, or None below `MIN_SETTLED`.
 
-    `rsi(ema(c, 5) - ema(c, 20), 15) - 50`. The two EMAs are aligned on the SLOW
+    `rsi(ema(c, 5) - ema(c, 20), 5) - 50`. The two EMAs are aligned on the SLOW
     one before subtracting: the fast series begins 15 values earlier, and in Pine
     those bars have `na` for the slow leg, so their difference does not exist. The
     alignment is the fiddly part and it is load-bearing -- pairing the two series
@@ -307,7 +334,7 @@ def bxtrender_short(closes: list[float | None]) -> float | None:
 def bxtrender_long(closes: list[float | None]) -> float | None:
     """The long arm's newest value, or None below `MIN_SETTLED`.
 
-    `rsi(ema(c, 20), 15) - 50`: the RSI reads the slow EMA itself rather than a
+    `rsi(ema(c, 20), 5) - 50`: the RSI reads the slow EMA itself rather than a
     difference of two, so this arm is a statement about the trend of the trend.
 
     It shares the floor with the short arm (both are 20 + 15 = 35 closes), and it

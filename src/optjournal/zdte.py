@@ -10,27 +10,34 @@ Nothing here is modelled in the pricing sense (see the pricing quarantine in
 are either FIXED -- the 2% and 3% lines a 0DTE desk quotes as its "normal day"
 and "big day" rails -- or VIX read as exactly what it already is.
 
-WHY `sqrt(252)`. VIX is an annualised standard deviation quoted in percent.
-Volatility scales with the square root of time, so one trading session is
-`VIX / sqrt(252)`, the 252 being the trading days in a year that every desk
-uses to de-annualise. The exact count drifts a day or two a year and does not
-move the band at two decimals, so it is a constant rather than a calendar
-lookup. VIX 16 gives ~1.008% expected for the session, which is the figure a
-seller sizes a one-day strangle against. This is a ONE-SIGMA move: about a 68%
-chance the close lands inside it, which is the reading, not a guarantee, and
-the page says so.
+WHY `VIX / 16`, AND NOT `VIX / sqrt(252)`. VIX is an annualised standard
+deviation in percent, and volatility scales with the square root of time, so the
+textbook one-session figure is `VIX / sqrt(252)` = `VIX / 15.87`. Desks quote
+`VIX / 16` instead -- the same de-annualisation with the root rounded to a number
+you can do in your head -- and that is the convention this journal follows,
+because the figure's whole purpose is to be the one a 0DTE seller is already
+looking at. Checked against the reference implementation on two sessions: VIX
+15.25 gives 0.9531% (16) not 0.9607% (sqrt 252), and 14.43 gives 0.9019% not
+0.9090%, both matching to four decimals on `/16`.
+
+The gap is ~0.8% of the figure, which is invisible in a band and would still be
+the wrong number on a screen next to a platform quoting the other one. Named as
+a constant so the choice is a line of code rather than a magic divisor.
+
+This is a ONE-SIGMA move: about a 68% chance the close lands inside it, which is
+the reading, not a guarantee, and the page says so.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
-__all__ = ["TRADING_DAYS", "Band", "ZdtePlan", "plan"]
+__all__ = ["VIX_DIVISOR", "Band", "ZdtePlan", "plan"]
 
-#: Trading days in a year, for de-annualising VIX. A constant, not a calendar
-#: count: see the module docstring on why the drift does not matter here.
-TRADING_DAYS = 252
+#: The desk divisor that turns annualised VIX into a one-session move. 16, not
+#: `sqrt(252)` = 15.87: see the module docstring, where both are checked against
+#: the reference implementation's own figures.
+VIX_DIVISOR = 16.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,15 +60,24 @@ class Band:
 class ZdtePlan:
     """The planner's numbers for one session.
 
-    `vix_daily_move_pct` is the one-sigma expected move as a percent; the `vix`
-    band in `bands` is that same figure turned into price rails. The two fixed
-    bands (2%, 3%) travel beside it deliberately: a desk quotes fixed rails as
-    habit, and seeing the VIX band sit inside or outside them is the read.
+    `vix_daily_move_pct` is the one-sigma expected move as a percent and
+    `points` is that move in index points; the `vix` band in `bands` is
+    `prev_close` plus and minus those points. The two fixed bands (2%, 3%)
+    travel beside it deliberately: a desk quotes fixed rails as habit, and
+    seeing the VIX band sit inside or outside them is the read.
     """
 
     spx_prev_close: float
     vix: float
     vix_daily_move_pct: float
+    #: The expected move in POINTS, rounded to the cent, and the band is built
+    #: FROM this rather than from the unrounded percentage. That ordering is the
+    #: reference implementation's and it is what makes the rails reproduce
+    #: exactly: 7711.76 - 69.55 = 7642.21, where banding off the raw percentage
+    #: gives 7642.2103 and a rail that never quite matches the platform a reader
+    #: is checking against. Two decimals, not one -- checked on two of its own
+    #: snapshots, where 69.5497 is stored as 69.55.
+    points: float
     bands: list[Band]
 
     def payload(self) -> dict:
@@ -69,6 +85,7 @@ class ZdtePlan:
             "spx_prev_close": self.spx_prev_close,
             "vix": self.vix,
             "vix_daily_move_pct": self.vix_daily_move_pct,
+            "points": self.points,
             "bands": [b.payload() for b in self.bands],
         }
 
@@ -77,6 +94,12 @@ def _band(label: str, prev_close: float, pct: float) -> Band:
     delta = prev_close * pct / 100.0
     return Band(label=label, pct=pct,
                 low=prev_close - delta, high=prev_close + delta)
+
+
+def _points_band(label: str, prev_close: float, pct: float, points: float) -> Band:
+    """The VIX band, built from the ROUNDED points -- see `ZdtePlan.points`."""
+    return Band(label=label, pct=pct,
+                low=prev_close - points, high=prev_close + points)
 
 
 def plan(spx_prev_close: float, vix: float) -> ZdtePlan | None:
@@ -94,9 +117,10 @@ def plan(spx_prev_close: float, vix: float) -> ZdtePlan | None:
     if spx_prev_close <= 0 or vix < 0:
         return None
 
-    vix_daily_move_pct = vix / math.sqrt(TRADING_DAYS)
+    vix_daily_move_pct = vix / VIX_DIVISOR
+    points = round(spx_prev_close * vix_daily_move_pct / 100.0, 2)
     bands = [
-        _band("VIX 1σ", spx_prev_close, vix_daily_move_pct),
+        _points_band("VIX 1σ", spx_prev_close, vix_daily_move_pct, points),
         _band("2%", spx_prev_close, 2.0),
         _band("3%", spx_prev_close, 3.0),
     ]
@@ -104,5 +128,6 @@ def plan(spx_prev_close: float, vix: float) -> ZdtePlan | None:
         spx_prev_close=spx_prev_close,
         vix=vix,
         vix_daily_move_pct=vix_daily_move_pct,
+        points=points,
         bands=bands,
     )

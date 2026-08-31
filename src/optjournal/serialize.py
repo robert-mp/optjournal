@@ -763,9 +763,19 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
     and pairs them with the day's events.
 
     Closes come from `price_bars` under the index's own symbol as conid (see
-    `bars.CONTEXT_SYMBOLS`), newest taken as the reading. The VIX row's stamp is
-    carried too: a stale VIX beside a fresh SPX is a fact the reader must see,
-    not one to hide by showing only one date.
+    `bars.CONTEXT_SYMBOLS`). The S&P figure is the last COMPLETED session's
+    close, which is not the newest row: on a trading day the newest daily bar is
+    TODAY's, still moving, and printing it as "prior close" would label a live
+    quote as a settled one and shift every rail under the reader mid-session.
+    Measured against the reference implementation on 2026-08-31, which read
+    7711.76 (Friday's close) while the newest row held 7686.14 (Monday, in
+    progress).
+
+    The VIX is deliberately NOT excluded the same way: the plan wants the CURRENT
+    level of volatility against the prior close, which is the live reading, and a
+    seller sizing a strangle at 09:40 wants today's VIX rather than Friday's. The
+    two dates therefore differ by design during a session, and both are carried so
+    the page can say so rather than printing one date over two figures.
 
     Today's events are the same rows the Market tab holds, narrowed to the ET
     session date -- an economic print at 08:30 is exactly the "big day" warning a
@@ -777,13 +787,20 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
     if not spx or not vix:
         return None
 
-    spx_ts, spx_close = spx[-1]
+    today = now.astimezone(MARKET_TZ).date().isoformat()
+    # The last close from a session that is NOT today. Falls back to the newest
+    # row only when every row predates today, which is the pre-open and
+    # weekend case -- there the newest row IS the prior close.
+    settled = [(ts, close) for ts, close in spx if et_day(ts) != today]
+    if not settled:
+        return None
+    spx_ts, spx_close = settled[-1]
+    # The VIX is the live level, so the newest row stands. See the docstring.
     vix_ts, vix_close = vix[-1]
     result = zdte_plan(spx_prev_close=spx_close, vix=vix_close)
     if result is None:
         return None
 
-    today = now.astimezone(MARKET_TZ).date().isoformat()
     day_start = now.astimezone(MARKET_TZ).replace(
         hour=0, minute=0, second=0, microsecond=0)
     rows = upcoming(conn, start=int(day_start.timestamp()),

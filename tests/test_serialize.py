@@ -447,3 +447,48 @@ def test_the_planner_is_absent_until_both_feeds_have_landed(conn):
 
     _seed_index(conn, "^VIX", "2026-08-28", 16.0)
     assert odte_context_data(conn, now=now) is not None, "both present now"
+
+
+def test_the_prior_close_is_the_last_settled_session_not_todays_moving_bar(conn):
+    """"Prior close" must exclude today, and on a trading day that is the bug.
+
+    The newest daily bar during a session is TODAY's, still moving. Printing it
+    as the prior close labels a live quote as a settled one AND shifts every rail
+    under the reader mid-session, which is the opposite of what a pre-open
+    planner is for. Caught by comparing against the reference implementation,
+    which read Friday's 7711.76 while the newest row here held Monday's 7686.14.
+
+    The VIX is deliberately the newest row: the plan wants CURRENT volatility
+    against the prior close, so the two dates differ during a session by design.
+    """
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-08-28", 7711.76)   # Friday, settled
+    _seed_index(conn, "^GSPC", "2026-08-31", 7686.14)   # Monday, in progress
+    _seed_index(conn, "^VIX", "2026-08-28", 14.43)
+    _seed_index(conn, "^VIX", "2026-08-31", 15.25)
+    now = datetime(2026, 8, 31, 17, 0, tzinfo=UTC)      # Monday, mid-session ET
+
+    ctx = odte_context_data(conn, now=now)
+    assert ctx["spx_prev_close"] == 7711.76, "Monday's moving bar is not a close"
+    assert ctx["spx_date"] == "2026-08-28"
+    assert ctx["vix"] == 15.25, "the VIX is the live level, so today's row stands"
+    assert ctx["vix_date"] == "2026-08-31"
+    # And the rails follow the settled close, matching the reference exactly.
+    band = next(b for b in ctx["bands"] if b["label"] == "VIX 1σ")
+    assert round(band["low"], 2) == 7638.26
+    assert round(band["high"], 2) == 7785.26
+
+
+def test_before_the_open_the_newest_row_is_itself_the_prior_close(conn):
+    """On a weekend or pre-open, every stored row predates today.
+
+    The exclusion must not empty the series in that case -- it is the ordinary
+    state for a planner read on Sunday evening, and the newest row genuinely IS
+    the last completed session.
+    """
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-08-28", 7711.76)
+    _seed_index(conn, "^VIX", "2026-08-28", 14.43)
+    ctx = odte_context_data(conn, now=datetime(2026, 8, 30, 18, 0, tzinfo=UTC))
+    assert ctx is not None and ctx["spx_prev_close"] == 7711.76
+    assert ctx["spx_date"] == "2026-08-28"
