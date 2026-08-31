@@ -165,35 +165,54 @@ MIN_SETTLED = 120
 #:
 #: The published indicator states no oversold or overbought level AT ALL -- no
 #: hline, no level input, only the sign crossed with rising-or-falling -- so any
-#: band here comes from somewhere else and the somewhere has to be named. These
-#: are Wilder's RSI 70/30 re-centred by the indicator's own -50; `BANDS_SOURCE`
-#: says so on screen.
+#: band here comes from somewhere else and the somewhere has to be named.
 #:
-#: MEASURED over TSLA's 721 daily short-arm values (from 755 fetched closes):
-#: +/-20 cuts the outer 12.1% and 9.2%, so each band names a genuinely unusual
-#: session. The same band over the LONG arm cuts 29.1% and 37.0% of the same
-#: sessions, and over four symbols the long arm sits at or above +20 on 37.0%
-#: (TSLA), 51.5% (PLTR), 56.2% (GOOG) and 67.4% (SPY) of them. That is why one
-#: band set cannot serve both arms and why the panel states which arm it is
-#: banding: a bucket holding half of all sessions has stopped meaning anything.
-#: Only the daily short arm is banded, and the shares wobble a point or two with
-#: the window, which is why the series each figure came from is stated.
-BX_OVERSOLD = -20.0
-BX_OVERBOUGHT = 20.0
+#: +/-30, the reference implementation's own default (where it is a setting
+#: adjustable from 1 to 50). This is NO LONGER Wilder's RSI 70/30 re-centred, and
+#: the change is not cosmetic: that derivation is what produced +/-20, and at the
+#: published RSI smoothing of 5 it stopped describing a band at all.
+#:
+#: MEASURED over 731 to 750 daily short-arm values per symbol at L3=5:
+#:
+#: * +/-20 cuts 27.4% to 31.7% above and 28.5% to 33.4% below -- a "band" holding
+#:   three sessions in ten on each side, which names nothing;
+#: * +/-30 cuts 16.1% to 21.9% above and 17.2% to 22.2% below, across TSLA, GOOG,
+#:   PLTR, SPY, META and NVDA.
+#:
+#: So the reference's 30 is corroborated here rather than merely copied: the
+#: shorter smoothing widens the distribution, and the band has to widen with it.
+#: The old figures (+/-20 cutting 12.1% and 9.2%) were measured at L3=15 and
+#: described a different indicator.
+#:
+#: The LONG arm is still not banded, and by more than before: it sits at or above
+#: +30 on 37.1% (TSLA), 46.8% (META), 49.2% (NVDA), 52.7% (PLTR), 55.4% (GOOG)
+#: and 64.2% (SPY) of the same sessions. One band set cannot serve both arms,
+#: which is why the panel states which arm it is banding.
+BX_OVERSOLD = -30.0
+BX_OVERBOUGHT = 30.0
 
 #: Where the band came from and what its words do and do not claim, as one string
 #: so the caption on the page and the constants above cannot drift apart.
 #:
-#: The numbers are interpolated rather than typed for the same reason: the band is
-#: not an independent choice, it IS the RSI convention re-centred, so 70/30 and
-#: +/-20 are one decision spelled twice. If a later band is ever chosen on its own
-#: evidence instead of imported, this sentence must be rewritten rather than
-#: reformatted, because it would no longer be Wilder's.
+#: REWRITTEN, not reformatted, exactly as the previous version of this comment
+#: instructed: the band is no longer Wilder's RSI convention re-centred, so a
+#: caption still saying so would be attributing this journal's choice to a source
+#: that did not make it. It is now the reference implementation's default,
+#: corroborated by the distribution measured above -- two independent reasons,
+#: both named, because "a widely used tool defaults to it" and "it cuts a fifth of
+#: sessions here" are different kinds of evidence and a reader deserves to know
+#: the band rests on both.
+#:
+#: The number is interpolated so a retune cannot leave the screen quoting the old
+#: one. The valuation words stay quarantined in this string: they are the RSI
+#: convention's vocabulary for above and below a band, and `bucket` deliberately
+#: answers "low"/"mid"/"high" instead, because this figure describes the shape of
+#: recent closes and says nothing about what a share is worth.
 BANDS_SOURCE = (
-    f"Wilder's RSI {CENTRE + BX_OVERBOUGHT:.0f}/{CENTRE + BX_OVERSOLD:.0f}, "
-    f"re-centred by the indicator's own -{CENTRE}; 'oversold' and 'overbought' "
-    "are that convention's words for below and above the band, not this "
-    "journal's view of what a share is worth"
+    f"band at +/-{BX_OVERBOUGHT:.0f}, the reference implementation's default and "
+    f"the outer fifth of sessions measured here; 'oversold' and 'overbought' are "
+    "the RSI convention's words for below and above it, not this journal's view "
+    "of what a share is worth"
 )
 
 #: The caption a tile prints, generated from the periods above so a retune cannot

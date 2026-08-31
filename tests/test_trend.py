@@ -417,10 +417,18 @@ def test_the_band_vocabulary_is_attributed_in_one_string():
     """Where the band came from, and what its words are not claiming.
 
     The published indicator states NO oversold or overbought level: no hline, no
-    level input, only the sign crossed with rising-or-falling. So +/-20 is imported
-    from Wilder's RSI 70/30 re-centred by the indicator's own -50, and an imported
-    threshold that does not say where it came from is a figure its reader cannot
-    argue with. `impact_source` closes the same gap for the calendar feed.
+    level input, only the sign crossed with rising-or-falling. So the band comes
+    from elsewhere and has to say so: it is the reference implementation's default
+    of +/-30, corroborated by the distribution measured in `trend.py` (the outer
+    ~fifth of sessions per side at this smoothing). A threshold that does not say
+    where it came from is a figure its reader cannot argue with; `impact_source`
+    closes the same gap for the calendar feed.
+
+    This sentence WAS "Wilder's RSI 70/30 re-centred", which produced +/-20 and
+    was rewritten rather than reformatted when the band changed -- the previous
+    version of this docstring said to do exactly that, because attributing this
+    journal's own choice to a convention that did not make it is the kind of quiet
+    misstatement the whole module is built against.
 
     The two valuation words survive HERE and only here. "Oversold" and
     "overbought" are claims that a share is cheaper or dearer than it should be;
@@ -433,9 +441,14 @@ def test_the_band_vocabulary_is_attributed_in_one_string():
     own evidence rather than imported, this sentence has to be rewritten rather
     than reformatted -- it would no longer be Wilder's.
     """
-    assert "Wilder" in BANDS_SOURCE
-    assert f"{CENTRE + BX_OVERBOUGHT:.0f}/{CENTRE + BX_OVERSOLD:.0f}" in BANDS_SOURCE
-    assert "70/30" in BANDS_SOURCE, "the RSI convention the band is imported from"
+    assert f"{BX_OVERBOUGHT:.0f}" in BANDS_SOURCE, (
+        "the band's own number must be in the caption it captions"
+    )
+    assert "reference implementation" in BANDS_SOURCE, "where the band came from"
+    assert "70/30" not in BANDS_SOURCE, (
+        "the band is no longer the RSI convention re-centred; claiming so would "
+        "attribute this choice to a source that did not make it"
+    )
     assert "oversold" in BANDS_SOURCE and "overbought" in BANDS_SOURCE
     assert "not this journal's view of what a share is worth" in BANDS_SOURCE
 
