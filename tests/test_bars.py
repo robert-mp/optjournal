@@ -457,11 +457,21 @@ def test_windows_merge_per_conid_and_bar_size(conn):
     assert len(keys) == len(set(keys)), f"duplicate windows: {keys}"
 
 
-def test_a_flat_book_asks_for_nothing(conn):
-    """The manifest is derived from positions, not scheduled, so there is
-    nothing to fetch while the book is empty.
+def test_a_flat_book_asks_only_for_the_market_context(conn):
+    """A flat book has no positions and no watched symbols, so nothing
+    position-derived is fetched -- but the S&P and VIX context is unconditional,
+    because it is the market the journal trades in, not something the journal
+    traded. A fresh clone should have the 0DTE planner before its first fill.
     """
-    assert bars_manifest(conn) == []
+    manifest = bars_manifest(conn)
+    assert {(r.symbol, r.kind, r.bar_size) for r in manifest} == {
+        ("^GSPC", "context", "1d"),
+        ("^VIX", "context", "1d"),
+    }
+    # Non-perishable, so a market-hours poll (which asks perishable-only) still
+    # asks for nothing: index closes backfill, and re-fetching them intraday
+    # would spend requests on a figure that only changes at the daily close.
+    assert bars_manifest(conn, perishable_only=True) == []
 
 
 # --------------------------------------------------------------------------

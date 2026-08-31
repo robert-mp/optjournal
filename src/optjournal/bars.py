@@ -158,6 +158,22 @@ SNAPSHOT_DRAW_BARS = 504
 #: `sync.py`'s snapshot docstring, which quantifies it there.
 WATCH_LOOKBACK_DAYS = 1100
 
+#: Market context the 0DTE planner reads: the S&P 500 and the VIX, as their
+#: Yahoo symbols. Fetched by the same daily manifest as everything else rather
+#: than a job of their own, because "two more daily closes" is what they are --
+#: not a new kind of collection. They are their own conid: an index is not a
+#: contract this account traded, so IBKR never named it, and unlike a watched
+#: stock there is no `watch:` row either, so the symbol IS the stable key.
+CONTEXT_SYMBOLS = ("^GSPC", "^VIX")
+#: A short daily window: the planner needs the last completed session's S&P
+#: close and the current VIX, and nothing here reads further back. Past
+#: HOURLY_LIMIT_DAYS (40) ON PURPOSE and not a day under it -- `_bar_size_for`
+#: resolves any shorter span to '1h', and the planner reads the '1d' series, so
+#: a 30-day window would fetch hourly index bars the reader never sees and leave
+#: the daily series the planner queries permanently empty. 60 also survives a
+#: long holiday weekend or a missed fetch with a recent close still in hand.
+CONTEXT_LOOKBACK_DAYS = 60
+
 _COLUMNS = (
     "conid", "symbol", "bar_size", "ts",
     "open", "high", "low", "close", "volume",
@@ -399,6 +415,17 @@ def bars_manifest(
         add(underlyings.get(name) or f"watch:{name}", name,
             int((moment - timedelta(days=WATCH_LOOKBACK_DAYS)).timestamp()),
             ceiling, "watchlist", open_=False)
+
+    # Market context for the 0DTE planner: the S&P 500 and the VIX, always, on a
+    # short daily window. Unconditional -- unlike watched symbols and positions
+    # these do not come from the journal, they ARE the market the journal trades
+    # in, so the planner should have them on a fresh clone before a single symbol
+    # is watched. Non-perishable (daily closes backfill), so this adds nothing to
+    # the perishable audit or its bars-missed count.
+    for symbol in CONTEXT_SYMBOLS:
+        add(symbol, symbol,
+            int((moment - timedelta(days=CONTEXT_LOOKBACK_DAYS)).timestamp()),
+            ceiling, "context", open_=False)
 
     requests = [r for r in merged.values() if r.perishable or not perishable_only]
     return sorted(requests, key=lambda r: (r.kind, r.symbol, r.bar_size))

@@ -27,7 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from optjournal.analysis import CostReport
-from optjournal.bars import audit_perishable, watch_closes, weekly_closes
+from optjournal.bars import (
+    audit_perishable,
+    close_series as bars_close_series,
+    watch_closes,
+    weekly_closes,
+)
 from optjournal.clock import MARKET_TZ, et_day, parse_day
 from optjournal.costs import (
     AUTOFX_MARKUP_BPS,
@@ -48,6 +53,7 @@ from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
 from optjournal.stats import first_activity
 from optjournal.trend import bucket, bxtrender_short
+from optjournal.zdte import plan as zdte_plan
 from optjournal.vol import (
     expected_move,
     rank,
@@ -743,6 +749,61 @@ def market_data(
             and event["impact"] in DEFAULT_IMPACTS
         ),
     }
+
+
+def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
+    """The 0DTE planner's pre-open reading, or None when the feed has not landed.
+
+    Three parts, and each is an ABSENCE the planner renders rather than a zero:
+    the S&P 500's last completed session close, the current VIX, and the
+    expected-range bands `zdte.plan` derives from the two. None when either close
+    is missing -- a fresh clone, or a `bars` fetch that has not run -- because a
+    planner drawn from no data is worse than one that says "run `optjournal
+    bars`". The band maths lives in `zdte.py`; this only reads the two numbers
+    and pairs them with the day's events.
+
+    Closes come from `price_bars` under the index's own symbol as conid (see
+    `bars.CONTEXT_SYMBOLS`), newest taken as the reading. The VIX row's stamp is
+    carried too: a stale VIX beside a fresh SPX is a fact the reader must see,
+    not one to hide by showing only one date.
+
+    Today's events are the same rows the Market tab holds, narrowed to the ET
+    session date -- an economic print at 08:30 is exactly the "big day" warning a
+    same-day seller wants beside the bands. Filtered here rather than in the page
+    so the two surfaces cannot disagree about which day "today" is.
+    """
+    spx = bars_close_series(conn, "^GSPC", bar_size="1d")
+    vix = bars_close_series(conn, "^VIX", bar_size="1d")
+    if not spx or not vix:
+        return None
+
+    spx_ts, spx_close = spx[-1]
+    vix_ts, vix_close = vix[-1]
+    result = zdte_plan(spx_prev_close=spx_close, vix=vix_close)
+    if result is None:
+        return None
+
+    today = now.astimezone(MARKET_TZ).date().isoformat()
+    day_start = now.astimezone(MARKET_TZ).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    rows = upcoming(conn, start=int(day_start.timestamp()),
+                    end=int((day_start + timedelta(days=1)).timestamp()))
+    events = [
+        {
+            "at": datetime.fromtimestamp(r["starts_at"], MARKET_TZ).strftime("%H:%M"),
+            "country": r["country"],
+            "title": r["title"],
+            "impact": r["impact"],
+        }
+        for r in rows
+    ]
+
+    payload = result.payload()
+    payload["spx_date"] = et_day(spx_ts)
+    payload["vix_date"] = et_day(vix_ts)
+    payload["events_today"] = events
+    payload["today"] = today
+    return payload
 
 
 def _days_until(recorded: str | None, *, today: date) -> int | None:

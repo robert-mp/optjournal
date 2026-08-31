@@ -100,6 +100,7 @@ from optjournal.serialize import (
     jobs_data,
     logbook_data,
     market_data,
+    odte_context_data,
     orders_data,
     positions_data,
     statements_data,
@@ -536,6 +537,12 @@ def build_state(
             # Whether the filter is offerable at all, derived rather than
             # asserted in the page.
             "selectable": odte.episodes > 0,
+            # The pre-open planner: the day's expected range from the S&P close
+            # and the VIX, both read from stored bars. None until a `bars` fetch
+            # has landed them, and the page draws that absence as "run bars"
+            # rather than an empty gauge -- it is context on top of the cohort
+            # comparison, not a reason to blank the tab.
+            "context": odte_context_data(conn, now=datetime.now(UTC)),
         }
         base_ccy = str(state["stats"].get("base_currency") or "")
         state["fx"] = {"base": base_ccy, "quotes": fx_quotes(conn, base_ccy)}

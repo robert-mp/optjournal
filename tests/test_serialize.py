@@ -392,3 +392,58 @@ def test_a_symbol_with_no_bars_reports_nothing_rather_than_zero(conn):
     assert row["last"] is None
     assert row["realised_vol"] is None
     assert row["change_1d"] is None
+
+
+def _seed_index(conn, symbol: str, day: str, close: float) -> None:
+    """One daily index close under the symbol's own conid, as the manifest stores it.
+
+    `^GSPC` and `^VIX` are not contracts, so the symbol IS the conid -- see
+    `bars.CONTEXT_SYMBOLS`. Daily, because that is what the planner reads and what
+    the manifest fetches for them.
+    """
+    upsert_bars(conn, conid=symbol, symbol=symbol, bar_size="1d", source="yahoo",
+                bars=[_bar(day, 16, close)])
+
+
+def test_the_planner_pairs_the_latest_index_closes_with_the_days_events(conn):
+    """`odte_context_data` reads the newest S&P and VIX closes and bands them.
+
+    The whole planner in one assertion: the two levels come back as stored, the
+    bands are `zdte.plan`'s (checked in full in test_zdte.py, so only their
+    presence and the fixed rails are pinned here), and the dates ride along so a
+    reader can see which session each figure is from.
+    """
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-08-27", 6000.0)
+    _seed_index(conn, "^GSPC", "2026-08-28", 6120.0)   # newer, so this one wins
+    _seed_index(conn, "^VIX", "2026-08-28", 16.0)
+    now = datetime(2026, 8, 31, 13, 0, tzinfo=UTC)
+
+    ctx = odte_context_data(conn, now=now)
+    assert ctx is not None
+    assert ctx["spx_prev_close"] == 6120.0, "the newest close is the reading"
+    assert ctx["vix"] == 16.0
+    assert ctx["spx_date"] == "2026-08-28" and ctx["vix_date"] == "2026-08-28"
+    labels = {b["label"] for b in ctx["bands"]}
+    assert labels == {"VIX 1σ", "2%", "3%"}
+    two = next(b for b in ctx["bands"] if b["label"] == "2%")
+    assert two["low"] == pytest.approx(6120.0 * 0.98)
+    assert two["high"] == pytest.approx(6120.0 * 1.02)
+
+
+def test_the_planner_is_absent_until_both_feeds_have_landed(conn):
+    """One index without the other is not half a planner, it is none.
+
+    A band needs the S&P close and the VIX together, so a fetch that got one and
+    not the other is an absence the tab renders as "run bars", not a partial
+    reading that implies a range it cannot compute.
+    """
+    from optjournal.serialize import odte_context_data
+    now = datetime(2026, 8, 31, 13, 0, tzinfo=UTC)
+    assert odte_context_data(conn, now=now) is None, "nothing fetched yet"
+
+    _seed_index(conn, "^GSPC", "2026-08-28", 6120.0)
+    assert odte_context_data(conn, now=now) is None, "S&P alone is not enough"
+
+    _seed_index(conn, "^VIX", "2026-08-28", 16.0)
+    assert odte_context_data(conn, now=now) is not None, "both present now"

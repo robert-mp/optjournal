@@ -305,6 +305,12 @@ _UNSAMPLED = frozenset({
     # the coherence test skips without the `raw/` archive, which the watchlist
     # worktree lacked, so it first ran here on the real checkout.
     "IvRank",
+    # The 0DTE planner's shapes. `OdteBlock.context` is null until a `bars` fetch
+    # has landed the S&P and VIX daily closes, and the archive-only fixture has
+    # ingested statements but no index bars -- so the nested context never
+    # materialises here. Exempt for the same reason as the quote shapes above,
+    # and exercised directly against inserted bars in test_serialize.py instead.
+    "OdteContext", "OdteBand", "OdteEvent",
     # `GET /api/settings/token`. Deliberately off the state payload -- the
     # keyring has been measured at 8.2s with a locked keychain, so presence is
     # fetched by a button rather than on every page load, and no `/api/state`
@@ -2226,7 +2232,8 @@ def test_restating_positions_reproduces_ibkrs_own_native_figures(state):
 def test_annual_and_odte_are_in_the_payload(state):
     """Both tabs were disabled with hardcoded reasons; now they have data."""
     assert state["annual"], "the Annual tab renders from this"
-    assert set(state["odte"]) == {"cohort", "rest", "unknown_dte", "selectable"}
+    assert set(state["odte"]) == {
+        "cohort", "rest", "unknown_dte", "selectable", "context"}
     # A cohort in isolation says nothing, so the comparison set must be present.
     assert state["odte"]["rest"]["episodes"] >= 0
 

@@ -871,6 +871,35 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  * @property {Cohort} rest
  * @property {number} unknown_dte
  * @property {boolean} selectable -- whether the 0DTE filter is offerable at all
+ * @property {OdteContext|null} context -- the pre-open planner, null until a
+ *   `bars` fetch has landed the S&P and VIX closes (serialize.odte_context_data)
+ */
+
+/** @typedef {Object} OdteContext -- the day's expected range (zdte.plan)
+ * @property {number} spx_prev_close -- last completed S&P 500 session close
+ * @property {string} spx_date -- the ET session that close is from
+ * @property {number} vix -- the current VIX level
+ * @property {string} vix_date -- the ET session the VIX is from; may lag spx_date
+ * @property {number} vix_daily_move_pct -- VIX de-annualised to one session, a
+ *   one-sigma percentage (~68% of closes land inside), NOT a guarantee
+ * @property {Array} bands -- OdteBand rows: the VIX 1σ range and the fixed 2%/3% rails
+ * @property {Array} events_today -- OdteEvent rows on the ET session date
+ * @property {string} today -- the ET session date the planner is drawn for
+ */
+
+/** @typedef {Object} OdteBand -- one expected range around the prior close (zdte.Band)
+ * @property {string} label
+ * @property {number} pct -- the percentage this band is drawn at, carried so a
+ *   caption need not re-derive it from rounded edges
+ * @property {number} low
+ * @property {number} high
+ */
+
+/** @typedef {Object} OdteEvent -- one economic release on the session (serialize.odte_context_data)
+ * @property {string} at -- HH:MM in the market zone
+ * @property {string} country
+ * @property {string} title
+ * @property {string} impact -- the feed's grade, shown as theirs not ours
  */
 
 /** @typedef {Object} Cohort
@@ -1036,6 +1065,7 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  * @payload csc:CostSelection cc:CategoryCost fxr:FxPairCost fee:FeeGroup
  * @payload whr:Withholding
  * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle
+ * @payload oc:OdteContext ob:OdteBand oe:OdteEvent
  * @payload res:SyncResponse pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
  * @payload e:Annotation
  * @payload mk:Market d:MarketDay mev:MarketEvent mf:MarketFacet
@@ -1057,6 +1087,7 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  * @local STATS_KEYS_REQUIRED missing state
  * @local SCORINGS qidsave tokcheck
  * @local WBX_LABEL WIVR_LABEL WMETER WRING items it arc tin tout sb
+ * @local events
  */
 
 const $=s=>document.querySelector(s);
@@ -4313,6 +4344,69 @@ function quoteNote(){
     :''}</div>`;
 }
 
+/* The pre-open planner: the day's expected range, before the cohort history.
+   Index LEVELS, never money -- an S&P close is 5,000 points in every display
+   currency, so `num` and not `cash`, which would restate it at an FX rate that
+   has no business touching an index. Null context is a real state (no `bars`
+   fetch has landed the closes yet) and says how to fix it rather than drawing an
+   empty gauge. The 1σ caption states the ~68% reading out loud: a band a reader
+   could otherwise take as a limit is a probability, and an unlabelled one lies
+   by omission. */
+function odtePlanner(oc){
+  const lvl=v=>v==null?'—':num(v,2);
+  if(!oc) return `<div class="card">
+    <div class="crow"><div><h2>0DTE planner</h2>
+      <div class="sub">The day's expected range from the S&amp;P 500 and the VIX,
+      before the open.</div></div></div>
+    <div class="note"><b>Not available yet.</b> The planner reads the S&amp;P and
+      VIX daily closes, which arrive with the price bars — run
+      <code>optjournal bars</code> (the daily job fetches them too) and it fills
+      in from the next session.</div></div>`;
+  /* A VIX read on an older session than the S&P close is a fact, not an error:
+     say which sessions each came from and let the reader judge, rather than
+     printing one date over two figures. */
+  const stale=oc.vix_date!==oc.spx_date;
+  const events=(oc.events_today||[]);
+  return `<div class="card">
+    <div class="crow"><div><h2>0DTE planner</h2>
+      <div class="sub">Expected range for <b>${esc(oc.today)}</b>, from the prior
+      S&amp;P 500 close and the current VIX. Index levels, not ${esc(BASE())}.</div></div>
+      <div class="pills"><span class="pill">S&amp;P <b>${lvl(oc.spx_prev_close)}</b>
+        <span class="dim">${esc(oc.spx_date)}</span></span>
+        <span class="pill">VIX <b>${lvl(oc.vix)}</b>
+        <span class="${stale?'neg':'dim'}">${esc(oc.vix_date)}</span></span></div></div>
+    <table><thead><tr><th>expected range</th><th class="n">±</th>
+      <th class="n">low</th><th class="n">high</th></tr></thead><tbody>
+      ${oc.bands.map(ob=>`<tr>
+        <td>${esc(ob.label)}</td>
+        <td class="n mono">${pct(ob.pct,2)}</td>
+        <td class="n mono">${lvl(ob.low)}</td>
+        <td class="n mono">${lvl(ob.high)}</td></tr>`).join('')}
+    </tbody></table>
+    <div class="note">The <b>VIX 1σ</b> range is the VIX read as one session
+      (annualised vol over the root of 252 trading days): about a
+      <b>${pct(oc.vix_daily_move_pct,2)}</b> move, inside which roughly two closes
+      in three land — a probability, not a limit. The <b>2%</b> and <b>3%</b>
+      rails are fixed, the desk's habitual "normal" and "big" day, and where the
+      VIX band sits against them is the read.${stale?` The VIX is from
+      ${esc(oc.vix_date)} while the S&amp;P close is ${esc(oc.spx_date)}; the next
+      fetch aligns them.`:''}</div>
+    ${events.length?`<h2 class="sub2 mt-4">On the calendar today</h2>
+    <div class="note">A scheduled release is the most common reason a quiet tape
+      turns into a 2% day. Times in the market zone.</div>
+    <table><tbody>
+      ${events.map(oe=>`<tr>
+        <td class="mono dim">${esc(oe.at)}</td>
+        <td><span class="mkimp ${oe.impact==='High'?'hi':oe.impact==='Medium'?'md':'lo'}"></span>
+          ${esc(oe.country)}</td>
+        <td>${esc(oe.title)}</td></tr>`).join('')}
+    </tbody></table>`
+    :`<div class="note mt-3">No scheduled releases today on the journal's
+      calendar — a lighter tape than a print day, though nothing rules out an
+      intraday headline.</div>`}
+  </div>`;
+}
+
 function odte(){
   const od=S.state.odte, h=S.state.history||{};
   if(!od) return `<div class="card"><div class="empty">no data</div></div>`;
@@ -4353,7 +4447,7 @@ function odte(){
       the contract's remaining life happens to be. This tab fills in once a round trip
       opened on an expiry date has closed.</div>
   </div>`;
-  return `<div class="card">
+  return `${odtePlanner(od.context)}<div class="card">
     <div class="crow"><div><h2>Zero days to expiration</h2>
       <div class="sub">Contracts opened on their own expiry date. ${esc(ccyNote())}</div></div>
       <div class="pills"><span class="pill">0DTE <b>${od.cohort.episodes}</b></span>
