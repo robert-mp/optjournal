@@ -792,6 +792,115 @@ def cmd_serve(args) -> int:
     return EXIT_OK
 
 
+def _git(*argv: str) -> tuple[int, str]:
+    """Run one git command in the journal's own directory.
+
+    `ROOT`, not the caller's cwd: `optjournal update` is meant to work from
+    anywhere, and a `git pull` that silently updated whichever repository the
+    shell happened to be sitting in would be a genuinely bad surprise.
+    """
+    import subprocess
+
+    proc = subprocess.run(
+        ["git", *argv], cwd=ROOT, capture_output=True, text=True, check=False,
+    )
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def cmd_update(args) -> int:
+    """Fast-forward this journal to the latest published commit.
+
+    THE UPDATE MECHANISM FOR A GIT INSTALL, which is what this is: the code is a
+    clone, so `git pull` is the delivery channel and there is no second one to
+    build. What this adds over typing `git pull` is the three things that have to
+    happen with it -- dependencies resolved, schema migrated, and a refusal when
+    the tree is not in a state where a fast-forward is safe.
+
+    Refuses rather than merges, always. `--ff-only` is the whole safety model: a
+    friend running this has no local commits to preserve, so anything that is not
+    a fast-forward means their clone has diverged in a way a tool should not
+    guess about. Dirty working trees are refused for the same reason -- a pull
+    that stashed someone's edits without being asked is a worse outcome than
+    stopping.
+
+    The database is NOT touched here beyond migration, and migration is
+    idempotent and already guarded by `locks.py`: `open_journal` runs it, so
+    opening the journal after an update is the migration.
+    """
+    code, remote = _git("remote")
+    if code != 0 or not remote:
+        print(
+            "No git remote, so there is nothing to update from. This command is "
+            "for a clone installed from a repository; see the README.",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    code, dirty = _git("status", "--porcelain")
+    if code == 0 and dirty:
+        print("Refusing to update: this working tree has uncommitted changes.\n"
+              f"{dirty}\n\nCommit or discard them first.", file=sys.stderr)
+        return EXIT_CONFIG
+
+    code, out = _git("fetch", "--quiet")
+    if code != 0:
+        print(f"Could not reach the remote: {out}", file=sys.stderr)
+        return EXIT_ERROR
+
+    _, local_head = _git("rev-parse", "HEAD")
+    _, upstream = _git("rev-parse", "@{u}")
+    if local_head == upstream:
+        print(f"Already up to date ({local_head[:9]}).")
+        return EXIT_OK
+
+    _, log = _git("log", "--oneline", "HEAD..@{u}")
+    behind = len(log.splitlines()) if log else 0
+    print(f"{behind} new commit(s):")
+    print(log)
+    if args.check:
+        print("\n--check, so nothing was changed. Run `optjournal update` to apply.")
+        return EXIT_OK
+
+    code, out = _git("pull", "--ff-only", "--quiet")
+    if code != 0:
+        print(f"\nFast-forward refused, so nothing changed: {out}\n\n"
+              "This clone has commits the remote does not, or has diverged. "
+              "Sort that out by hand -- a tool guessing here would be guessing "
+              "about your work.", file=sys.stderr)
+        return EXIT_ERROR
+
+    # Dependencies BEFORE the schema: a migration added in the new commits may
+    # import something the old lockfile does not have, and `uv sync` failing
+    # after a partial migration is the one ordering that leaves a journal in a
+    # state neither commit describes.
+    import subprocess
+
+    print("\nResolving dependencies...")
+    synced = subprocess.run(["uv", "sync", "--quiet"], cwd=ROOT, check=False)
+    if synced.returncode != 0:
+        print("`uv sync` failed. The code is updated but its dependencies are "
+              "not, so run `uv sync` by hand before using the journal.",
+              file=sys.stderr)
+        return EXIT_ERROR
+
+    # Opening the journal IS the migration -- `open_journal` runs it under the
+    # cross-process lock. Done here rather than left to the next command so an
+    # update reports the schema move instead of the next `serve` doing it
+    # silently at a moment nobody is watching.
+    db = args.db or DEFAULT_DB
+    if db.exists():
+        with open_journal(db) as conn:
+            version = conn.execute(
+                "SELECT MAX(version) FROM schema_version").fetchone()[0]
+        print(f"Schema at version {version}.")
+
+    _, now = _git("rev-parse", "HEAD")
+    print(f"\nUpdated to {now[:9]}. Restart `optjournal serve` to pick it up: "
+          "the server re-reads the page on every request but loads its Python "
+          "once, at startup.")
+    return EXIT_OK
+
+
 def _prompt_token(existing: bool) -> str | None:
     """Ask for the Flex token without echoing it, or None to keep what is there.
 
@@ -1090,6 +1199,12 @@ def build_parser() -> argparse.ArgumentParser:
                       help="report whether the last session's perishable option "
                            "bars actually landed; fetches nothing")
     p.set_defaults(func=cmd_bars)
+
+    p = sub.add_parser("update", parents=[common, database],
+                       help="fast-forward to the latest published commit")
+    p.add_argument("--check", action="store_true",
+                   help="report what is new without changing anything")
+    p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("setup", parents=[common],
                        help="store the Flex token and query id (run me first)")

@@ -20,11 +20,13 @@ string the user types, and the tuple the ingest receives.
 
 from __future__ import annotations
 
+import argparse
 import json
 
 import pytest
 from conftest import STATEMENTS, connect_migrated
 
+from optjournal import cli
 from optjournal.cli import _asset_filter, main
 from optjournal.ingest import ASSET_FILTER_ALL
 
@@ -243,3 +245,87 @@ def test_friction_prints_the_estimate_as_a_range(tmp_path, capsys):
     text = capsys.readouterr().out
     assert "range" in text, "the human report hides the estimate's range"
     assert "ESTIMATE" in text, "the markup column is not labelled as estimated"
+
+
+def _run_update(monkeypatch, tmp_path, *, remote, dirty="", extra=None):
+    """Drive `cmd_update` against a scripted git, recording what it ran.
+
+    Scripted rather than driven against a real clone: the refusals are the whole
+    point of this command, and provoking a diverged history and a dirty tree for
+    real costs more setup than it buys. What matters is that a refusal happens
+    BEFORE any command that writes -- which is a claim about the call order, and
+    the recorded list is what proves it.
+    """
+    calls: list[tuple[str, ...]] = []
+    replies = {
+        ("remote",): (0, remote),
+        ("status", "--porcelain"): (0, dirty),
+        ("fetch", "--quiet"): (0, ""),
+        ("rev-parse", "HEAD"): (0, "aaaaaaaaa"),
+        ("rev-parse", "@{u}"): (0, "bbbbbbbbb"),
+        ("log", "--oneline", "HEAD..@{u}"): (0, "bbbbbbb feat: a thing"),
+        ("pull", "--ff-only", "--quiet"): (0, ""),
+    }
+    replies.update(extra or {})
+
+    def fake_git(*argv):
+        calls.append(argv)
+        return replies.get(argv, (0, ""))
+
+    monkeypatch.setattr(cli, "_git", fake_git)
+    args = argparse.Namespace(check=True, db=tmp_path / "absent.db")
+    return cli.cmd_update(args), calls
+
+
+def test_update_refuses_without_a_remote_and_touches_nothing(monkeypatch, tmp_path):
+    """A clone with no remote has nothing to update from, and says so.
+
+    Checked FIRST, so the failure is one clear sentence rather than a git error
+    about `@{u}` being unresolvable -- which is the same fact spelled in a way
+    that sends the reader to the wrong place.
+    """
+    code, calls = _run_update(monkeypatch, tmp_path, remote="")
+    assert code == cli.EXIT_CONFIG
+    assert calls == [("remote",)], "nothing else may run once there is no remote"
+
+
+def test_update_refuses_a_dirty_tree_before_it_fetches(monkeypatch, tmp_path):
+    """Uncommitted work stops the update, and stops it early.
+
+    A pull that stashed someone's edits without being asked is a worse outcome
+    than stopping, so this refuses. It refuses before `git fetch` as well, which
+    is what keeps a refusal from touching the network at all.
+    """
+    code, calls = _run_update(
+        monkeypatch, tmp_path, remote="origin", dirty=" M src/optjournal/cli.py")
+    assert code == cli.EXIT_CONFIG
+    assert ("fetch", "--quiet") not in calls, "a refusal must not reach the network"
+    assert ("pull", "--ff-only", "--quiet") not in calls
+
+
+def test_update_check_reports_what_is_new_without_pulling(monkeypatch, tmp_path):
+    """`--check` is read-only, and that has to be true of the git calls too.
+
+    A dry run that fetches is fine -- fetching changes no working file -- but one
+    that pulls is not a dry run at all, and the flag exists for someone deciding
+    whether to update at a moment that suits them.
+    """
+    code, calls = _run_update(monkeypatch, tmp_path, remote="origin")
+    assert code == cli.EXIT_OK
+    assert ("fetch", "--quiet") in calls
+    assert ("pull", "--ff-only", "--quiet") not in calls
+
+
+def test_update_reports_up_to_date_when_the_heads_match(monkeypatch, tmp_path):
+    """Nothing new is a success, not a no-op worth a warning.
+
+    This runs on a schedule in the hands of anyone who wires it up, so the quiet
+    path has to be the common one.
+    """
+    code, calls = _run_update(
+        monkeypatch, tmp_path, remote="origin",
+        extra={("rev-parse", "@{u}"): (0, "aaaaaaaaa")})
+    assert code == cli.EXIT_OK
+    assert ("log", "--oneline", "HEAD..@{u}") not in calls, (
+        "there is no range to log when the heads agree"
+    )

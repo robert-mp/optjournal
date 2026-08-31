@@ -37,6 +37,33 @@ over the stored setting, so an existing install keeps working unchanged.
 `positions`, `history`, `costs`, `friction`, `statements`, `prune`, `sweep`.
 Every reporting command takes `--json`.
 
+## Installing this on another machine
+
+The code is a clone, so `git` is the delivery channel and there is no second
+one. On a Mac with [uv](https://docs.astral.sh/uv/) and git:
+
+```bash
+git clone <repo-url> optjournal && cd optjournal
+uv sync
+uv run optjournal setup      # asks for the token and query id, then verifies
+uv run optjournal serve      # http://127.0.0.1:8765
+```
+
+Each install is its own journal: its own `journal.db`, its own `raw/` archive,
+its own keyring entry, its own `.optjournal.json`. Nothing is shared and
+nothing is uploaded — the server binds loopback only and refuses anything else.
+
+`uv run optjournal update` fast-forwards to the latest published commit, then
+resolves dependencies and reports the schema version. It refuses rather than
+merges: `--ff-only`, and a dirty working tree stops it before it touches the
+network. `--check` reports what is new and changes nothing.
+
+Two things it deliberately does not do. It never runs `git stash`, because a
+tool that pockets someone's uncommitted edits to get its job done has made a
+decision that was not its to make. And it does not restart a running `serve` —
+the server re-reads `page.html` on every request but loads its Python once at
+startup, so a code update needs the restart the command tells you about.
+
 Two cost commands, answering two questions. `costs` reads one statement — the
 newest archive covers 30 calendar days — and is the only way to see a section no
 database column carries. `friction` reads the journal: every ingested fill, over
