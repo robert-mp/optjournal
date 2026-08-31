@@ -453,12 +453,26 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="broker-stamp",
         module="ingest.py",
-        find='" ON CONFLICT(broker, trade_id) DO NOTHING",\n'
-             "            (\n                broker,",
-        replace='" ON CONFLICT(broker, trade_id) DO NOTHING",\n'
-                "            (\n                DEFAULT_BROKER,",
+        find="            _TRADE_UPSERT,\n            (\n                broker,",
+        replace="            _TRADE_UPSERT,\n            (\n"
+                "                DEFAULT_BROKER,",
         breaks="`ingest --broker X` would resolve X's source, read X's statement, "
                "and then file every row under 'ibkr' -- the argument decorative",
+    ),
+    # Only the CONFIRM-BLOCKS-ACTIVITY direction is surveyed. Inverting the
+    # comparison the other way (letting equal rank overwrite) breaks re-ingest
+    # idempotency, which two long-standing tests assert loudly; a mutant is worth
+    # registering for the direction that fails QUIETLY, and this one leaves a row
+    # that still looks like a complete fill.
+    Mutant(
+        key="confirm-rank",
+        module="ingest.py",
+        find="if stored_rank is not None and incoming_rank <= stored_rank:",
+        replace="if stored_rank is not None:",
+        breaks="a fill first seen in a same-session Trade Confirmation would keep "
+               "the mid-session view of itself forever -- no realised P&L, no FIFO "
+               "match, a provisional commission -- because the settled Activity "
+               "Statement arrives under the same tradeID and would be skipped",
     ),
     Mutant(
         key="legs-merge",
@@ -584,6 +598,18 @@ _SELF_REFERENTIAL = frozenset({
 })
 
 
+#: Set in the clone's environment so its suite knows it is a copy, which a copy
+#: cannot work out for itself. `conftest._is_copy` tried, by looking for what git
+#: leaves behind -- a `.git` FILE in a worktree, no `.git` at all in a subtree copy
+#: -- but `_prepare` copies the whole checkout, `.git` directory included, so the
+#: clone looks exactly like the original. The two tests that pin the original's
+#: absolute paths therefore ran here and failed, the baseline was never green, and
+#: every mutant came back `dirty-baseline` while the summary line still printed.
+#:
+#: A copy is a copy because whatever made it says so. Read by `conftest`, and the
+#: name lives here because this is the only thing that sets it.
+CLONE_ENV = "OPTJOURNAL_TREE_IS_COPY"
+
 #: Seconds a single suite run may take before the mutant is called out as hung.
 #: The clean suite is ~52s, so this is ~10x headroom -- generous on purpose, since
 #: a slow machine reporting "hung" would be worse than waiting.
@@ -609,7 +635,7 @@ def _pytest(clone: Path, *args: str) -> subprocess.CompletedProcess[str]:
          "-q", "--tb=no", "-p", "no:cacheprovider", *args],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         cwd=str(clone),
-        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), CLONE_ENV: "1"},
         start_new_session=True,      # its own group, so the kill reaches children
     )
     try:

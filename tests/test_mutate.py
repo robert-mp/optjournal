@@ -236,3 +236,41 @@ def test_a_sigkill_return_code_is_what_the_runner_signals():
         line.startswith(("FAILED ", "ERROR "))
         for line in killed.stdout.splitlines()
     ), "the premise: a killed suite leaves no failure lines to count"
+
+
+def test_the_clone_is_told_it_is_a_copy(tmp_path, monkeypatch):
+    """The wire between this harness and `conftest._is_copy`.
+
+    Two tests pin the ORIGINAL checkout's absolute paths -- the launchd plist
+    execs this checkout's console script, and `raw/` holds the real archive --
+    and both are right to. Neither can hold in a clone, so both skip there, and
+    they skip on `mutate.CLONE_ENV` because a `copytree` of the whole checkout
+    (`.git` directory and all) cannot tell it is a copy any other way.
+
+    Asserted on the env the harness actually builds rather than on the skip
+    itself, because a skip that stops firing looks like a passing suite. When
+    inference was the mechanism instead, the plist test ran in every clone and
+    failed, so the baseline was never green and every mutant came back
+    `dirty-baseline` -- with the tool still printing its summary line.
+
+    The environment is stripped deliberately (see `_pytest`), which is exactly
+    why the marker has to be added back explicitly.
+    """
+    seen = {}
+
+    class _Popen:
+        def __init__(self, args, **kwargs):
+            seen.update(kwargs.get("env") or {})
+            self.args, self.pid = args, 0
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+        returncode = 0
+
+    monkeypatch.setattr(mutate.subprocess, "Popen", _Popen)
+    mutate._pytest(tmp_path)
+
+    assert seen.get(mutate.CLONE_ENV), (
+        f"the clone's suite is not told it is a copy; env was {sorted(seen)}"
+    )

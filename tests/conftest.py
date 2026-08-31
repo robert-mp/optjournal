@@ -30,6 +30,7 @@ import pytest
 from optjournal import settings
 from optjournal.db import connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
+from optjournal.mutate import CLONE_ENV
 
 #: The real archive, which the suite uses as its fixture corpus: these are
 #: statements IBKR actually served, so they are the only source of true rates,
@@ -45,13 +46,21 @@ ROOT = Path(__file__).resolve().parent.parent
 def _is_copy() -> bool:
     """Whether this tree is a COPY of the checkout rather than the checkout itself.
 
-    Two copies exist in practice: a git worktree under `.claude/worktrees/`, and
-    the `copytree` clone `optjournal mutate` builds. Detected from what git leaves
-    behind rather than by matching path names, so it holds wherever a copy is made:
-    in a worktree `.git` is a FILE holding a `gitdir:` pointer, and in a clone made
-    by copying a subtree it is absent. The real checkout is the only tree with a
-    `.git` DIRECTORY.
+    Two copies exist in practice, and each announces itself differently.
+
+    A git WORKTREE is recognisable from what git left behind: `.git` is a FILE
+    holding a `gitdir:` pointer rather than a directory. Read from git rather than
+    by matching path names, so it holds wherever the worktree is put.
+
+    A `copytree` CLONE, which `optjournal mutate` builds, is not recognisable at
+    all -- it is the whole checkout copied, `.git` directory and all, so it looks
+    exactly like the original and the git check above says "original". That is why
+    it is TOLD, via `mutate.CLONE_ENV`. Inferring it was the earlier attempt, and
+    it silently did nothing: the plist test went on running in every clone,
+    failing, and leaving a baseline the harness refuses to measure against.
     """
+    if os.environ.get(CLONE_ENV):
+        return True
     dot_git = ROOT / ".git"
     return dot_git.is_file() or not dot_git.exists()
 
