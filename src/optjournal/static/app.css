@@ -1289,3 +1289,10 @@ stop.gneg{stop-color:var(--bad)}
    `.jform`'s job stays "two moments side by side" rather than "two moments and a
    button". */
 .jact{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}
+
+/* The dev-mode marker in the footer. Amber (the warn pair, not the error one):
+   dev mode is a state to be aware of, not a fault. Deliberately conspicuous, so a
+   screenshot taken in dev mode is obviously in dev mode. Themed through the same
+   tokens as every other surface, so it survives a palette switch. */
+.devtag{color:var(--warnfg);background:var(--warnfill);border-radius:6px;
+  padding:1px 7px;font-weight:600;font-style:normal}

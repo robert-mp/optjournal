@@ -446,6 +446,11 @@ def build_state(
         state: dict[str, Any] = {
             "version": __version__,
             "generated_at": _now(),
+            # Developer-only surfaces on? Resolved per request from the env var or
+            # the stored flag (`settings.dev`), never from anything the browser
+            # sent -- so a page in another tab cannot turn it on over this
+            # unauthenticated server. Off for every friend who never set it.
+            "dev": prefs.dev(),
             "asset_category": asset_category,
             "asset_counts": asset_counts,
             "db": str(db_path),

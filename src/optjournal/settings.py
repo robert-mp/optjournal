@@ -23,6 +23,12 @@ journal reading itself: every value here has a working default, the data is in
 SQLite and `raw/`, and a preference file is a convenience. `read` therefore
 treats any damage as absence -- the same rule `flex._read_state` follows for
 the fetch sidecar, and for the same reason.
+
+That is not in tension with the dev flag failing CLOSED. Failing open means
+"fall back to the default", and the default for `dev` is off -- so a damaged
+file reads as no preferences, `dev` finds no key, and the answer is False. One
+rule, two safe outcomes: a missing query id is absence, and missing dev mode is
+the shipped app.
 """
 
 from __future__ import annotations
@@ -35,8 +41,10 @@ from typing import Any
 from optjournal.config import ROOT
 
 __all__ = [
+    "DEV_ENV",
     "FILENAME",
     "HOME_ENV",
+    "dev",
     "path_for",
     "read",
     "query_id",
@@ -51,7 +59,17 @@ FILENAME = ".optjournal.json"
 #: Keys this module will write. A fixed set rather than a free-form dict, so a
 #: typo becomes an error at the call site instead of a preference that silently
 #: never applies -- the failure mode a settings file invites.
-_KEYS = frozenset({"query_id", "scoring"})
+#:
+#: `dev` is writable HERE (a hand-edited file, or `update(dev=True)`) but is
+#: deliberately absent from `web._settings_write`, which names its two keys by
+#: hand and writes nothing else. So the unauthenticated HTTP surface cannot turn
+#: dev mode on: it is set out-of-band, the way IAG's `is_admin` is a server
+#: decision the client can only read -- see `dev` below.
+_KEYS = frozenset({"query_id", "scoring", "dev"})
+
+#: The environment channel for the dev flag. `OPTJOURNAL_DEV=1 optjournal serve`
+#: turns developer-only surfaces on for one session without touching the file.
+DEV_ENV = "OPTJOURNAL_DEV"
 
 
 #: Overrides the directory holding the settings file. Two callers need it and
@@ -147,6 +165,45 @@ def query_id(
         if candidate and str(candidate).strip():
             return str(candidate).strip()
     return None
+
+
+def _truthy(value: Any) -> bool:
+    """Only an explicit, recognised yes is True; everything else is False.
+
+    This is the whole safety property of the dev flag. Absent, empty, a stray
+    "0", a typo, a file a crash truncated -- every one of them reads as NOT dev,
+    so a friend who never set it and a config that got damaged both get the
+    shipped app rather than a half-built surface. It is the same spirit as IAG's
+    entitlement defaulting to free on any error, one level simpler because there
+    is no server here to be wrong about.
+    """
+    if value is True:
+        return True
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def dev(*, root: Path | None = None) -> bool:
+    """Whether developer-only surfaces are shown. OFF unless explicitly turned on.
+
+    Precedence is `query_id`'s minus the argument step: the ENVIRONMENT
+    (`OPTJOURNAL_DEV=1`, a per-session choice) beats the STORED setting (a
+    persisted one). No argument step, because nothing takes dev mode as a command
+    argument -- it is a property of who is running the journal, not of one
+    invocation. An empty or whitespace env value is absence, not "off", matching
+    `query_id`: an exported-but-blank variable falls through to the file.
+
+    NOT reachable through the web API, and that is the point rather than an
+    omission. `web._settings_write` writes only `query_id` and `scoring`, so a
+    page open in another tab cannot flip dev mode over the unauthenticated HTTP
+    surface. The privileged flag is set out-of-band -- a shell export or the
+    hand-editable file -- never by the untrusted caller, which is the line IAG
+    draws by computing `is_admin` server-side and letting the client only read
+    it. Fails closed: the default, and the answer to any damage, is False.
+    """
+    env = os.environ.get(DEV_ENV)
+    if env is not None and env.strip():
+        return _truthy(env)
+    return _truthy(read(root).get("dev"))
 
 
 def scoring(explicit: str | None = None, *, root: Path | None = None) -> str | None:

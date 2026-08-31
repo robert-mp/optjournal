@@ -5525,3 +5525,69 @@ def test_every_journal_field_is_one_element_with_an_id():
         "the save reads fields by something other than their id, so the two halves "
         "of the form can disagree about what a field is called"
     )
+
+
+def test_the_web_api_cannot_turn_dev_mode_on(populated, monkeypatch):
+    """The `is_admin` lesson, applied: the untrusted surface cannot set the
+    privileged flag.
+
+    This server has no authentication, so a page open in another tab can POST
+    here. `dev` gates developer-only surfaces, so if `/api/settings` accepted it
+    that page could flip it. `_settings_write` names `query_id` and `scoring` by
+    hand and writes nothing else, so `{dev:true}` is simply not a known setting --
+    and the state it renders stays `dev:false`.
+
+    Asserted through a real server, and both ways: the write is refused AND the
+    payload is unchanged, so a future edit that started honouring `dev` here would
+    fail the second half even if it returned 200.
+    """
+    monkeypatch.delenv("OPTJOURNAL_DEV", raising=False)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/settings", {"dev": True})
+        assert status == 400 and payload["kind"] == "empty", (
+            "the API treated dev as a known setting; it must not be settable here"
+        )
+        _, state = _get(base, "/api/state")
+    assert state["dev"] is False, "a web POST turned dev mode on"
+
+
+def test_the_state_carries_dev_off_by_default_and_on_when_the_env_says_so(
+    populated, monkeypatch
+):
+    """`build_state` resolves the flag per request, so the env is enough to flip
+    it without a file -- and it is off when nothing says otherwise."""
+    monkeypatch.delenv("OPTJOURNAL_DEV", raising=False)
+    off = web.build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    assert off["dev"] is False
+
+    monkeypatch.setenv("OPTJOURNAL_DEV", "1")
+    on = web.build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    assert on["dev"] is True
+
+
+def test_the_footer_marks_dev_mode_only_when_it_is_on():
+    """A visible, always-on marker -- so a dev never wonders, and never ships a
+    screenshot not knowing. Off, the footer reads exactly as before.
+
+    The marker is gated on the payload's own `dev`, not on anything the page
+    decides, so it cannot disagree with the flag the server resolved.
+    """
+    js = _code_only(_js())
+    foot = js[js.index("$('#foot')"):js.index("$('#foot')") + 260]
+    assert "st.dev?" in foot and "dev mode" in foot, (
+        "the footer does not render a dev marker off the payload's dev flag"
+    )
+    # And it is conditional: a friend's footer carries no marker.
+    assert "':''" in foot, "the dev marker is not gated, so it always shows"
+
+
+def test_dev_mode_opens_the_diagnostics_block_rather_than_hiding_it():
+    """Dev mode REVEALS -- it opens the Advanced diagnostics by default. It must
+    not gate the whole block away, because a friend still wants to check whether a
+    statement ingested."""
+    panel = _fn("settingsPanel")
+    assert 'class="adv mt-5"${st.dev?\' open\':\'\'}' in panel, (
+        "the Advanced block is not opened by dev mode (or is hidden by it)"
+    )
+    # The block itself is unconditional: its content shows for everyone.
+    assert "Advanced — journal details and archive" in panel

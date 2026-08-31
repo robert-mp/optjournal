@@ -158,3 +158,64 @@ def test_the_home_override_redirects_the_file(tmp_path, monkeypatch):
     assert settings.query_id(root=other) is None, (
         "an explicit root outranks the environment"
     )
+
+
+def test_dev_is_off_by_default(tmp_path):
+    """The whole safety property in one line: absent means the shipped app.
+
+    A friend who never set anything gets `dev()` False, so no developer-only
+    surface can appear by accident.
+    """
+    assert settings.dev(root=tmp_path) is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", True])
+def test_dev_reads_the_recognised_yeses_as_on(tmp_path, value):
+    settings.update(root=tmp_path, dev=value)
+    assert settings.dev(root=tmp_path) is True, f"{value!r} should enable dev mode"
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "maybe", "2"])
+def test_dev_fails_closed_on_anything_unrecognised(tmp_path, value):
+    """Not a recognised yes is off -- a stray value must never read as on."""
+    settings.update(root=tmp_path, dev=value)
+    assert settings.dev(root=tmp_path) is False, f"{value!r} should NOT enable dev"
+
+
+def test_dev_defaults_off_when_the_file_is_damaged(tmp_path):
+    """Failing open (damage -> no preferences) and dev failing closed are the
+    same outcome: a truncated file reads as absence, so dev finds no key and is
+    off. A damaged config must not strand a friend in a half-built UI.
+    """
+    (tmp_path / settings.FILENAME).write_text("{ this is not json", encoding="utf-8")
+    assert settings.dev(root=tmp_path) is False
+
+
+def test_dev_precedence_is_environment_then_stored(tmp_path, monkeypatch):
+    """Env beats the file, matching `query_id`; there is no argument step.
+
+    A blank or whitespace env value is absence, not "off" -- an exported-but-empty
+    variable falls through to the stored flag rather than forcing dev off.
+    """
+    monkeypatch.delenv(settings.DEV_ENV, raising=False)
+    settings.update(root=tmp_path, dev=True)
+    assert settings.dev(root=tmp_path) is True, "the stored flag should apply"
+
+    monkeypatch.setenv(settings.DEV_ENV, "0")
+    assert settings.dev(root=tmp_path) is False, "a set env value beats the file"
+
+    monkeypatch.setenv(settings.DEV_ENV, "   ")
+    assert settings.dev(root=tmp_path) is True, (
+        "a blank env value is absence, so the stored flag applies -- as with query_id"
+    )
+
+    monkeypatch.setenv(settings.DEV_ENV, "1")
+    monkeypatch.setattr(settings, "read", lambda root=None: {})
+    assert settings.dev(root=tmp_path) is True, "env alone turns dev on with no file"
+
+
+def test_dev_is_a_writable_key_so_update_does_not_refuse_it(tmp_path):
+    """It has to be writable to the FILE (a hand-edit, or `update`). What it must
+    not be is writable over HTTP -- that is `web`'s concern, tested there."""
+    settings.update(root=tmp_path, dev=True)
+    assert settings.read(root=tmp_path).get("dev") is True

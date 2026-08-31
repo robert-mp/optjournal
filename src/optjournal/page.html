@@ -147,6 +147,8 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
 /** @typedef {Object} State -- the /api/state payload (web.build_state)
  * @property {string} version
  * @property {string} generated_at
+ * @property {boolean} dev -- developer-only surfaces on (settings.dev). Off
+ *   unless OPTJOURNAL_DEV or the stored flag says so; the web API cannot set it
  * @property {string} asset_category -- the journal's home category, OPT
  * @property {Object} asset_counts -- fills per category; derives offerable Trade Types
  * @property {string} db
@@ -4784,7 +4786,7 @@ function settingsPanel(){
 
     ${scoringRow()}
 
-    <details class="adv mt-5">
+    <details class="adv mt-5"${st.dev?' open':''}>
       <summary>Advanced — journal details and archive</summary>
       <div class="note">Diagnostics, not settings: nothing here is editable, and
       it is what you want when something looks wrong rather than when you are
@@ -5123,7 +5125,14 @@ function draw(push){
      latch; Refresh is the way to ask again. */
   if(S.tab==='watchlist'&&!S.quotesAt&&(S.state.watchlist||[]).length) loadQuotes(false);
   const st=S.state;
-  $('#foot').textContent=`optjournal ${st.version} · ${st.db} · loopback only, no authentication`;
+  /* innerHTML rather than textContent because dev mode adds a marked pill, so
+     the dynamic pieces are escaped. A visible, always-on marker on purpose: a
+     dev should never wonder whether dev mode is on, and should never ship a
+     screenshot not knowing it was -- the same reason IAG surfaces `is_admin` as
+     a signal rather than hiding it. Off for a friend, so the footer reads
+     exactly as before. */
+  $('#foot').innerHTML=`optjournal ${esc(st.version)} · ${esc(st.db)} · loopback only, `
+    +`no authentication${st.dev?' · <b class="devtag">dev mode</b>':''}`;
   const b=$('#sync'), rem=st.sync.cooldown_remaining_s;
   b.classList.remove('busy');
   if(!st.sync.configured){b.disabled=true;b.title='No query id — start with --query-id';}
