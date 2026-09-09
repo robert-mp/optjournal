@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
-from conftest import ROOT, STATEMENTS, connect_migrated
+from conftest import LIVE_STATEMENTS, ROOT, STATEMENTS, connect_migrated
 
 from optjournal.db import DEFAULT_BROKER
 from optjournal.fills import NormalisedFill
@@ -49,7 +49,7 @@ def test_a_source_yields_broker_neutral_fills():
     couple of fields is enough -- the byte-for-byte equivalence is the next test.
     """
     if not STATEMENTS:
-        pytest.skip("needs an archived statement")
+        pytest.skip("needs a tracked statement fixture")
     source = source_for(DEFAULT_BROKER)
     account, fills = next(source.statements(STATEMENTS[-1]))
     assert account.startswith("U"), "IBKR account ids look like U..."
@@ -57,8 +57,35 @@ def test_a_source_yields_broker_neutral_fills():
     fill = fills[0]
     assert isinstance(fill, NormalisedFill)
     # Broker-neutral names carry values; the raw dict keeps the source's own.
-    assert fill.trade_id and fill.exec_id
+    assert fill.trade_id
     assert isinstance(fill.raw, dict) and fill.raw, "raw column source missing"
+
+
+def test_missing_execution_ids_do_not_collide(tmp_path, monkeypatch):
+    """Trade id is the identity when a broker omits its secondary execution id."""
+    statement = STATEMENTS[0]
+    account, original = next(IbkrSource().statements(statement))
+    assert len(original) >= 2
+
+    class MissingExecSource(IbkrSource):
+        broker = "missing-exec"
+
+        def statements(self, path):
+            yield account, [
+                dataclasses.replace(original[0], exec_id=None),
+                dataclasses.replace(original[1], exec_id=None),
+            ]
+
+    monkeypatch.setitem(SOURCES, MissingExecSource.broker, MissingExecSource())
+    conn = connect_migrated(tmp_path / "missing-exec.db")
+    result = ingest_file(conn, statement, broker=MissingExecSource.broker)
+
+    assert result.trades_inserted == 2
+    rows = conn.execute(
+        "SELECT trade_id, ib_exec_id FROM trades ORDER BY trade_id"
+    ).fetchall()
+    assert len(rows) == 2
+    assert all(row["ib_exec_id"] is None for row in rows)
 
 
 def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
@@ -90,8 +117,8 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
     thing that makes them a comparison: they came from running the deleted code,
     and it cannot be run again to produce a new set.
     """
-    if not STATEMENTS:
-        pytest.skip("needs an archived statement")
+    if not LIVE_STATEMENTS:
+        pytest.skip("needs the optional live acceptance corpus")
     import hashlib
     import json
 
@@ -113,7 +140,7 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
     }
 
     conn = connect_migrated(tmp_path / "seam.db")
-    for path in STATEMENTS:
+    for path in LIVE_STATEMENTS:
         ingest_file(conn, path)
     rows = {
         str(r["trade_id"]): dict(r)

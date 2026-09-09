@@ -60,7 +60,9 @@ class NormalisedFill:
     #: to. Unique only WITHIN the broker -- identity in the database is
     #: `(broker, trade_id)`, see db._rekey_trades_by_broker.
     trade_id: str
-    exec_id: str
+    # Some IBKR executions legitimately omit ibExecID. The trade id remains the
+    # row identity; exec_id is an optional secondary dedupe key.
+    exec_id: str | None
     transaction_id: str
     order_id: str | None
 
@@ -84,7 +86,7 @@ class NormalisedFill:
     notes: str | None
     level_of_detail: str | None
 
-    quantity: int | float
+    quantity: int | float | None
     trade_price: float | None
     currency: str | None
     fx_rate_to_base: float

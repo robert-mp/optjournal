@@ -146,10 +146,11 @@ mirrored rather than imported for that reason, and a test holds the copies to
 ## Development
 
 ```bash
-uv run pytest -q            # 642 tests; the raw/ statements are fixtures
+uv run pytest -q            # deterministic tracked fixtures
 uv run ruff check src tests cron
+uv run mypy
 uv run optjournal sweep     # every page in a real browser (~2 min)
-uv run optjournal mutate    # all 25 known defects (~15 min: a full suite run each)
+uv run optjournal mutate    # full mutation survey; intentionally slower
 uv run optjournal mutate --only fee-ccy --only strike-side   # one or a few
 ```
 
@@ -163,10 +164,12 @@ binding `page.html` to `build_state`, static checks over the page's JavaScript
 (history discipline, hash round-tripping), and one executed render in a real
 browser engine (`test_rendered.py`).
 
-Shared scaffolding lives in `tests/conftest.py` — `RAW_DIR`/`STATEMENTS`, a
-migrated `conn`, a `populated_db`, `add_statement`, and the `code_only` comment
-stripper both JS guards use. What a *trade row* contains stays in the module
-asserting it: that is the subject of those tests, not setup for them.
+Shared scaffolding lives in `tests/conftest.py` — `RAW_DIR`/`STATEMENTS` point
+at the tracked, redacted corpus, while `LIVE_RAW_DIR`/`LIVE_STATEMENTS` are an
+explicit opt-in for private acceptance checks. It also provides a migrated
+`conn`, a `populated_db`, `add_statement`, and the `code_only` comment stripper
+both JS guards use. What a *trade row* contains stays in the module asserting
+it: that is the subject of those tests, not setup for them.
 
 **Every consumer of a payload is bound to its producer by a test**, because the
 one that was not shipped broken: `render.py` kept reading the flat money keys the

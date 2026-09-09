@@ -145,7 +145,12 @@ should get you running, not explain every decision.
 ## Development
 
 ```bash
-uv run pytest -q          # the suite
-uv run ruff check         # lint
-uv run optjournal mutate  # mutation testing: see docs/testing.md
+uv run pytest -q                      # deterministic suite
+uv run ruff check src tests cron      # lint
+uv run mypy                           # static types
+uv run optjournal mutate              # mutation testing: see docs/testing.md
 ```
+
+Normal tests use the redacted statements in `tests/fixtures/statements/`.
+Private statements in `raw/` are optional acceptance data and never determine
+whether a fresh checkout or CI is green.

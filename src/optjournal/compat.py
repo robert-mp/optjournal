@@ -62,5 +62,5 @@ def install_code_fallback() -> None:
         cls._member_map_.setdefault(member._name_, member)
         return member
 
-    Code._missing_ = classmethod(_missing_)  # type: ignore[method-assign]
+    Code._missing_ = classmethod(_missing_)  # type: ignore[assignment]
     _INSTALLED = True

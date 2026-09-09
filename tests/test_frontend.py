@@ -28,7 +28,12 @@ STATIC = ROOT / "src" / "optjournal" / "static"
 #: the checks that had been keeping replay.js honest for a year would have covered
 #: none of it. Widened in the same diff that added the file, so the seam never has
 #: an unpoliced member.
-MODULES = (STATIC / "replay.js", STATIC / "watch.js")
+MODULES = (
+    STATIC / "format.js",
+    STATIC / "market.js",
+    STATIC / "replay.js",
+    STATIC / "watch.js",
+)
 SUITE = ROOT / "tests" / "frontend"
 PAGE = ROOT / "src" / "optjournal" / "page.html"
 

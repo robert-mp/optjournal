@@ -438,7 +438,7 @@ def replay_model(
     points: list[tuple[int, float]],
     *,
     underlying_conid: str | None,
-) -> tuple[list[list[float]], list[list[float]]]:
+) -> tuple[list[list[float]], list[list[float | None]]]:
     """The band and the modelled marks for one replay, as ``(band, marks)``.
 
     Solves the vol series ONCE and hands it to both. They are the two halves of
@@ -490,7 +490,10 @@ def delta_around(
     before: float | None = None
     after: float | None = None
     for row in marks:
-        if row[0] < stamp:
+        row_stamp = row[0]
+        if row_stamp is None:
+            continue
+        if row_stamp < stamp:
             before = row[2]
         else:
             after = row[2]
@@ -618,7 +621,7 @@ def _snapshot_leg(row: dict[str, Any]) -> ReplayLeg:
 
 
 def _annotations(
-    lifecycle: dict[str, Any], marks: list[list[float]]
+    lifecycle: dict[str, Any], marks: list[list[float | None]]
 ) -> list[dict[str, Any]]:
     """One card per EVENT on the timeline: what was done, what it cost, what it changed.
 

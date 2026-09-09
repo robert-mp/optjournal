@@ -53,6 +53,7 @@ state. `test_reading_the_closes_backwards_flips_the_sign` is what would catch it
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 __all__ = [
     "BANDS_SOURCE",
@@ -225,7 +226,7 @@ PARAMS_CAPTION = (
 )
 
 
-def _chronological(closes: list[float | None]) -> list[float]:
+def _chronological(closes: Sequence[float | None]) -> list[float]:
     """Usable closes, OLDEST FIRST, from a newest-first list.
 
     Non-positive and missing closes are dropped rather than crashing the
@@ -327,7 +328,7 @@ def rsi(values: list[float], length: int) -> list[float]:
     return out
 
 
-def bxtrender_short(closes: list[float | None]) -> float | None:
+def bxtrender_short(closes: Sequence[float | None]) -> float | None:
     """The short arm's newest value, or None below `MIN_SETTLED`.
 
     `rsi(ema(c, 5) - ema(c, 20), 5) - 50`. The two EMAs are aligned on the SLOW

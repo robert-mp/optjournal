@@ -1,9 +1,4 @@
-"""Tests run against real archived statements in raw/.
-
-There are no synthetic fixtures on purpose. The failure mode we care about
-is py_ibkr silently discarding data IBKR actually sends, and only genuine
-statements exercise that.
-"""
+"""Parser-contract tests over a tracked, redacted Flex statement."""
 
 from __future__ import annotations
 
@@ -12,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from conftest import RAW_DIR, skip_if_copy
+from conftest import RAW_DIR
 from py_ibkr import Trade
 
 from optjournal import flex
@@ -50,20 +45,9 @@ def statement(request) -> Path:
     return request.param
 
 
-@skip_if_copy
 def test_raw_dir_is_populated():
-    """The suite's fixture corpus must be present.
-
-    Skipped in a COPY of the checkout: a fresh git worktree has no `raw/`, and
-    the archive is deliberately not version controlled. Every test that actually
-    READS a statement is already parametrized over `statements()` and so skips
-    itself when the corpus is absent -- this one exists to say why the rest went
-    quiet, which is only meaningful in the real checkout. See
-    `conftest.skip_if_copy`.
-    """
-    assert statements(), (
-        f"no archived statements in {RAW_DIR}; run `uv run optjournal fetch <id>`"
-    )
+    """A fresh checkout must include the deterministic parser corpus."""
+    assert statements(), f"no tracked statement fixtures in {RAW_DIR}"
 
 
 def test_parses_without_error(statement: Path):

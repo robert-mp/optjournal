@@ -342,7 +342,7 @@ def _finalise(ep: Episode, still_held: bool) -> None:
 
 def _held(
     conn: sqlite3.Connection, asset_category: str | None
-) -> tuple[dict[str, Any], str | None]:
+) -> tuple[dict[tuple[str, str, str], dict[str, Any]], str | None]:
     """Open positions from each broker's newest snapshot, and the newest date.
 
     Keyed by `(broker, account_id, conid)` -- the same identity the episode walk

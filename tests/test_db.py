@@ -1,18 +1,20 @@
 """Tests for persistence, ingest idempotency and the grouping views.
 
-Ingest runs against the real archived statements, because the behaviour that
-matters -- overlapping statements re-presenting the same fills -- only exists
-in genuine data. View maths is tested with hand-built rows so expectations
-are computable by hand.
+Ingest runs against a tracked, redacted Flex statement. Tests that need a
+second statement create a content-distinct copy with the same fills, reproducing
+the overlap that rolling Flex windows produce without depending on private data.
+View maths is tested with hand-built rows so expectations are computable by hand.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 from conftest import STATEMENTS, add_statement
 
+from optjournal import db as db_module
 from optjournal.db import CONFIRM_SOURCE, SCHEMA_VERSION, connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 
@@ -40,7 +42,7 @@ def test_pragmas_applied(conn):
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
+@pytest.mark.skipif(not STATEMENTS, reason="no tracked statement fixtures")
 def test_ingest_keeps_everything_by_default(conn):
     """Storage is unfiltered; category scoping happens at query time.
 
@@ -54,10 +56,10 @@ def test_ingest_keeps_everything_by_default(conn):
         row["asset_category"]
         for row in conn.execute("SELECT DISTINCT asset_category FROM trades")
     }
-    assert len(cats) > 1, "the real archive holds stock and FX besides options"
+    assert len(cats) > 1, "the fixture holds stock and FX besides options"
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
+@pytest.mark.skipif(not STATEMENTS, reason="no tracked statement fixtures")
 def test_ingest_can_still_narrow_to_options(conn):
     r = ingest_file(conn, STATEMENTS[-1], assets=("OPT",))
     assert r.trades_filtered_out > 0, "expected stock and FX trades to be filtered"
@@ -68,7 +70,7 @@ def test_ingest_can_still_narrow_to_options(conn):
     assert cats == {"OPT"}
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
+@pytest.mark.skipif(not STATEMENTS, reason="no tracked statement fixtures")
 def test_ingest_all_assets_keeps_everything(conn):
     r = ingest_file(conn, STATEMENTS[-1], assets=ASSET_FILTER_ALL)
     assert r.trades_filtered_out == 0
@@ -79,7 +81,7 @@ def test_ingest_all_assets_keeps_everything(conn):
     assert len(cats) > 1
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
+@pytest.mark.skipif(not STATEMENTS, reason="no tracked statement fixtures")
 def test_reingesting_same_file_is_a_noop(conn):
     first = ingest_file(conn, STATEMENTS[-1])
     again = ingest_file(conn, STATEMENTS[-1])
@@ -89,11 +91,22 @@ def test_reingesting_same_file_is_a_noop(conn):
     assert total == first.trades_inserted
 
 
-@pytest.mark.skipif(len(STATEMENTS) < 2, reason="need two overlapping statements")
-def test_overlapping_statements_do_not_duplicate(conn):
+def _overlapping_statement(tmp_path: Path) -> Path:
+    """A second statement file carrying the same fills under a new digest."""
+    source = STATEMENTS[0]
+    text = source.read_text()
+    old = 'whenGenerated="20260227;060000"'
+    assert old in text, "fixture generation stamp changed; update this seam"
+    path = tmp_path / "activity-overlap.xml"
+    path.write_text(text.replace(old, 'whenGenerated="20260228;060000"', 1))
+    return path
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="no tracked statement fixtures")
+def test_overlapping_statements_do_not_duplicate(conn, tmp_path):
     ingest_file(conn, STATEMENTS[0])
     before = conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()["n"]
-    second = ingest_file(conn, STATEMENTS[1])
+    second = ingest_file(conn, _overlapping_statement(tmp_path))
     after = conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()["n"]
     assert second.trades_skipped_existing > 0, "overlap should be detected"
     assert after >= before
@@ -101,20 +114,20 @@ def test_overlapping_statements_do_not_duplicate(conn):
     assert len(ids) == len(set(ids))
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
-def test_first_seen_at_is_preserved_across_reingest(conn):
+@pytest.mark.skipif(not STATEMENTS, reason="no tracked statement fixtures")
+def test_first_seen_at_is_preserved_across_reingest(conn, tmp_path):
     ingest_file(conn, STATEMENTS[0])
     original = {
         r["trade_id"]: r["first_seen_at"]
         for r in conn.execute("SELECT trade_id, first_seen_at FROM trades")
     }
-    ingest_file(conn, STATEMENTS[1])
+    ingest_file(conn, _overlapping_statement(tmp_path))
     for tid, seen in conn.execute("SELECT trade_id, first_seen_at FROM trades"):
         if tid in original:
             assert seen == original[tid], "first_seen_at must not be overwritten"
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
+@pytest.mark.skipif(not STATEMENTS, reason="no tracked statement fixtures")
 def test_base_currency_conversion_is_applied(conn):
     ingest_file(conn, STATEMENTS[-1])
     for r in conn.execute(
@@ -126,7 +139,7 @@ def test_base_currency_conversion_is_applied(conn):
         )
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
+@pytest.mark.skipif(not STATEMENTS, reason="no tracked statement fixtures")
 def test_raw_column_is_populated(conn):
     ingest_file(conn, STATEMENTS[-1])
     for r in conn.execute("SELECT raw FROM trades"):
@@ -700,6 +713,59 @@ def test_execution_ids_are_also_scoped_to_their_broker(conn):
         _insert_trade(conn, trade_id="C", ib_exec_id="E1", broker="ibkr")
 
 
+def test_missing_execution_ids_are_not_one_shared_identifier(conn):
+    """A broker may omit the secondary id on more than one real execution."""
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="A", ib_exec_id=None, broker="ibkr")
+    _insert_trade(conn, trade_id="B", ib_exec_id=None, broker="ibkr")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE ib_exec_id IS NULL"
+    ).fetchone()[0] == 2
+
+
+def test_migration_makes_execution_id_optional_and_normalises_empty(tmp_path):
+    """Existing journals upgrade without preserving an empty fake identifier."""
+    db = tmp_path / "old-exec.db"
+    conn = connect(db)
+    migrate(conn)
+    conn.execute("DROP INDEX trades_exec")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("ALTER TABLE trades RENAME TO trades_current")
+    old_ddl = db_module._TRADES_DDL.replace(
+        "ib_exec_id              TEXT,",
+        "ib_exec_id              TEXT    NOT NULL,",
+    ).replace(
+        "CREATE TABLE IF NOT EXISTS trades",
+        "CREATE TABLE trades",
+    )
+    conn.executescript(old_ddl)
+    columns = [r["name"] for r in conn.execute("PRAGMA table_info(trades)")]
+    names = ", ".join(columns)
+    conn.execute(
+        f"INSERT INTO trades ({names}) SELECT {names} FROM trades_current"
+    )
+    conn.execute("DROP TABLE trades_current")
+    conn.execute(
+        "CREATE UNIQUE INDEX trades_exec ON trades(broker, ib_exec_id)"
+    )
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="A", ib_exec_id="", broker="ibkr")
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    migrate(conn)
+
+    info = {r["name"]: r for r in conn.execute("PRAGMA table_info(trades)")}
+    assert info["ib_exec_id"]["notnull"] == 0
+    assert conn.execute(
+        "SELECT ib_exec_id FROM trades WHERE trade_id = 'A'"
+    ).fetchone()[0] is None
+    index_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'trades_exec'"
+    ).fetchone()[0]
+    assert "WHERE ib_exec_id IS NOT NULL" in index_sql
+
+
 def test_an_existing_journal_is_rekeyed_losslessly(tmp_path):
     """The migration rebuilds `trades`, which is the risky kind of change.
 
@@ -1041,7 +1107,7 @@ def _settlement(conn):
     return conn.execute(
         "SELECT COUNT(*) AS n,"
         " SUM(fifo_pnl_realized IS NULL) AS unsettled,"
-        " SUM(ib_commission = 0) AS free,"
+        " SUM(ib_commission = 0 AND asset_category != 'CASH') AS free,"
         " COUNT(DISTINCT source_kind) AS kinds,"
         " MIN(source_kind) AS kind"
         " FROM trades"

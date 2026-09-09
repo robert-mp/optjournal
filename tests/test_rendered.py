@@ -63,19 +63,23 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     dom = browser.dump_dom(served + "/", tmp_path / "profile")
     if dom is None:
         pytest.skip("no browser produced a DOM (environment, not the page)")
+    assert not browser.last_console_errors(), (
+        "the page raised in the browser: " + "; ".join(browser.last_console_errors())
+    )
 
     with urllib.request.urlopen(served + "/api/state") as res:
         payload = json.load(res)
+    markup = browser.markup(dom)
     text = browser.rendered_text(dom)
 
     # The tab bar is the first thing draw() emits; its absence means the
     # page JS threw before rendering anything at all.
-    assert dom.count('data-tab="') >= 5, "tab bar missing -- page JS crashed on load"
+    assert markup.count('data-tab="') >= 5, "tab bar missing -- page JS crashed on load"
 
     # Data binding: the month dropdown holds exactly the browsable range,
     # plus its one "All time" head. An off-by-anything here is the render
     # disagreeing with the payload it was handed.
-    sel = re.search(r'<select id="month">(.*?)</select>', dom, re.S)
+    sel = re.search(r'<select id="month">(.*?)</select>', markup, re.S)
     assert sel, "the filter bar never rendered"
     assert sel.group(1).count("<option") == len(payload["month_range"]) + 1
 
@@ -84,11 +88,11 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     # exactly the base plus each quote; no quotes means no toggle. This is
     # the class the source-analysis tests are structurally blind to.
     if payload["fx"]["quotes"]:
-        assert '<div class="ccytog">' in dom
+        assert '<div class="ccytog">' in markup
         for code in {payload["fx"]["base"], *(q["code"] for q in payload["fx"]["quotes"])}:
             assert code in text, f"currency toggle is missing {code}"
     else:
-        assert '<div class="ccytog">' not in dom
+        assert '<div class="ccytog">' not in markup
 
     # Catastrophic binding failures do not throw in a template literal --
     # they render as literal junk text. None of these words belong on the
@@ -105,7 +109,7 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     # that never runs, or throws, leaves the page's most prominent small line
     # blank and every other assertion here still passes. Oracle-driven from the
     # payload the page itself fetched.
-    kicker = re.search(r'<div class="kicker" id="kicker">(.*?)</div>', dom, re.S)
+    kicker = re.search(r'<div class="kicker" id="kicker">(.*?)</div>', markup, re.S)
     assert kicker, "the kicker slot is gone from the header"
     line = kicker.group(1).strip()
     assert line, "the kicker rendered EMPTY -- nothing filled the slot"
@@ -129,11 +133,11 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     # come back with the attribute set -- if `applyTheme` never ran, `:root` would
     # still style the page and every colour assertion would pass while the chip
     # and the switcher were dead.
-    assert 'data-theme="leather"' in dom, (
+    assert 'data-theme="leather"' in markup, (
         "the default theme was never applied to <html>, so the edition chip and "
         "the palette can disagree"
     )
-    assert re.search(r'<button class="edition" id="edition"', dom), (
+    assert re.search(r'<button class="edition" id="edition"', markup), (
         "the edition chip is not a <button>, so switching themes is unreachable "
         "by keyboard"
     )

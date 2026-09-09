@@ -191,7 +191,7 @@ class IbkrSource:
     def _fill(t: Any, account_id: str) -> NormalisedFill:
         return NormalisedFill(
             trade_id=_s(t.tradeID) or "",
-            exec_id=_s(t.ibExecID) or "",
+            exec_id=_s(t.ibExecID),
             transaction_id=_s(t.transactionID) or "",
             order_id=_s(t.ibOrderID),
             account_id=account_id,

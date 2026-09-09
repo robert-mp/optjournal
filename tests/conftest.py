@@ -32,16 +32,21 @@ from optjournal.db import connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal.mutate import CLONE_ENV
 
-#: The real archive, which the suite uses as its fixture corpus: these are
-#: statements IBKR actually served, so they are the only source of true rates,
-#: mixed currencies and IBKR's own spelling of every field.
-RAW_DIR = Path(__file__).resolve().parent.parent / "raw"
+#: The deterministic, redacted corpus used by the normal suite and CI.
+RAW_DIR = Path(__file__).resolve().parent / "fixtures" / "statements"
 
 #: Sorted so a test that takes "the newest" gets the same file on every machine.
 STATEMENTS = sorted(RAW_DIR.glob("activity-*.xml"))
 
 #: The project root, for tests reaching source files rather than data.
 ROOT = Path(__file__).resolve().parent.parent
+
+#: Optional acceptance corpus from the developer's account. Tests that make
+#: claims about specific live rows opt into this explicitly; the normal suite
+#: never changes when another statement is fetched.
+LIVE_RAW_DIR = ROOT / "raw"
+LIVE_STATEMENTS = sorted(LIVE_RAW_DIR.glob("activity-*.xml"))
+
 
 def _is_copy() -> bool:
     """Whether this tree is a COPY of the checkout rather than the checkout itself.
@@ -67,12 +72,9 @@ def _is_copy() -> bool:
 
 #: Skip marker for assertions that pin the ORIGINAL checkout's absolute paths.
 #:
-#: Two tests do, and both are correct to: `test_launchd` asserts the plist execs
-#: THIS checkout's console script (launchd stores absolute paths, so a moved repo
-#: is exactly the failure it guards), and `test_flex.test_raw_dir_is_populated`
-#: asserts the real archive is present. Neither can hold in a copy: the plist
-#: still points at the original, which is right, and a fresh worktree has no
-#: `raw/`.
+#: `test_launchd` asserts the plist execs THIS checkout's console script.
+#: launchd stores absolute paths, so a moved repo is exactly the failure it
+#: guards; the assertion cannot hold in a worktree or mutation clone.
 #:
 #: They were the reason `optjournal mutate` reported `dirty-baseline` and measured
 #: NOTHING -- it runs the suite in a `copytree` clone, so the baseline could never
@@ -131,7 +133,7 @@ def _populated_master(tmp_path_factory) -> Path:
     free while paying for the ingest once.
     """
     if not STATEMENTS:
-        pytest.skip("needs an archived statement")
+        pytest.skip("needs a tracked statement fixture")
     db = tmp_path_factory.mktemp("master") / "journal.db"
     c = connect_migrated(db)
     for path in STATEMENTS:
@@ -142,7 +144,7 @@ def _populated_master(tmp_path_factory) -> Path:
 
 @pytest.fixture
 def populated_db(tmp_path, _populated_master) -> Path:
-    """A database with every archived statement ingested, as the CLI leaves it.
+    """A database with every tracked statement fixture ingested.
 
     Returns the PATH, not a connection: the web layer opens its own connection
     per request (sqlite3 handles cannot cross threads), so a test that handed it

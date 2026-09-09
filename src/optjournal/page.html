@@ -117,6 +117,10 @@ import {
    node can run them and this file keeps the markup they position. */
 import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
   shownPrice} from '/static/watch.js';
+import {cls, dayLabel, dp, esc, money, monthLabel, num, pct, strike, sym}
+  from '/static/format.js';
+import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
+  from '/static/market.js';
 
 /* ===================== the payload contract =====================
    Everything this page reads, declared beside the code that reads it. The
@@ -1141,10 +1145,10 @@ import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
  * @local odtes open opts out ps pts range rows yrs active shown
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
  * @local play scrub speed loop ev reached stops at dismiss
- * @local chosen withEvents ws opts thin px tile
- * @local countries impacts shownByDay next want picked
- * @local JSON Object ages input mine qb wf behind was
- * @local when button parts names y
+ * @local chosen ws opts thin px tile
+ * @local shownByDay next picked
+ * @local JSON Object ages input mine qb wf was
+ * @local when button parts names
  * @local COST_OPTIONS bits cost fees on wh
  * @local STATS_KEYS_REQUIRED missing state
  * @local SCORINGS qidsave tokcheck
@@ -1270,31 +1274,6 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      "asked, and nothing came back", which the empty-state prose distinguishes. */
   ivr:null};
 
-const esc=s=>String(s??'').replace(/[&<>"]/g,c=>
-  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const num=(v,d=2)=>v==null?null:Number(v).toLocaleString(undefined,
-  {minimumFractionDigits:d,maximumFractionDigits:d});
-/* Currency glyphs for the majors. Anything else prefixes its ISO code, which
-   reads better than an obscure glyph -- "SEK 1,921.39" beats "kr 1,921.39". */
-const CCY={EUR:'€',USD:'$',GBP:'£',JPY:'¥',KRW:'₩'};
-const sym=c=>{const k=String(c||'').toUpperCase();return CCY[k]||(k?k+' ':'');};
-
-/* Two decimals. Four on a headline card is noise -- that precision belongs in
-   the source data, not the display. One exception: an amount small enough to
-   round to zero keeps enough digits to stay visible, because rendering a real
-   0.004 fee as "0.00" would assert it was free. */
-const dp=n=>Math.abs(n)>0&&Math.abs(n)<0.005?4:2;
-
-/* Minus sits OUTSIDE the symbol -- −€1.84, not €−1.84.
-   `ccy` is required in practice: omitting it yields a bare number, which is
-   how every call site used to behave and is never what we want now. */
-const money=(v,ccy,d)=>{
-  if(v==null)return '—';
-  const n=Number(v);
-  if(!Number.isFinite(n))return '—';
-  return (n<0?'−':'')+sym(ccy)+num(Math.abs(n),d==null?dp(n):d);
-};
-
 /* ---- display currency -------------------------------------------------
    Base is canonical: every *_base figure is IBKR's own conversion, performed
    at that row's own trade or snapshot date. Choosing another display currency
@@ -1364,42 +1343,6 @@ const isNative=mo=>mo!=null&&isNativeCharge(mo.native,mo.ccy);
    otherwise undersells it. */
 const basisOf=m=>isNative(m)?'as charged'
   :DISP()===BASE()?`IBKR's figure in ${BASE()}`:`restated from ${BASE()}`;
-
-/* Sign class for a value, plus `signed` so CSS can prefix the glyph -- see
-   `.pos.signed` in the stylesheet for why the glyph rather than the hue is the
-   thing that makes a gain legible. Zero and null stay unmarked: an unsigned
-   zero is the truth, and "+0.00" reads as a gain that did not happen.
-   Call sites that hardcode 'pos'/'neg' for emphasis rather than for arithmetic
-   (Commissions, Losing Trades) do not come through here and so get no glyph. */
-const cls=v=>v==null||Number(v)===0?'':Number(v)>0?'pos signed':'neg signed';
-/* A strike is an identifier as much as a number: 267.5 and 268 are different
-   contracts. `num(v,0)` rounded, so a half-strike rendered as a contract that
-   does not exist -- latent on this account only because every strike it has
-   ever held is whole. Whole strikes still render bare ("270", not "270.00"),
-   because padding every strike to two places to accommodate the rare half is
-   noise on the common case. */
-const strike=v=>v==null?'':Number.isInteger(Number(v))?num(v,0)
-  :num(v,String(v).split('.')[1].length>2?2:String(v).split('.')[1].length);
-const pct=(v,d=1)=>v==null?'—':num(v,d)+'%';
-const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-const monthLabel=m=>{if(!m||m==='ALL')return 'All time';
-  const[y,mm]=m.split('-');return MONTHS[+mm-1]+' '+y;};
-/* A stored ISO day as a chart axis reads it: "24 Jul", or "24 Jul '25" when the
-   year is worth stating. The axis used to print the raw `2026-07-24`, which is
-   ten characters of which four are punctuation and four are a year the card's own
-   title already establishes.
-   Day-then-month rather than DD/MM/YY, because a purely numeric date is read two
-   ways -- 07/08 is August 7th to half the world -- and because the header dateline
-   and the month picker already spell the month ("SINCE 28 AUG 2025", "Aug 2026"),
-   so this is the page's existing vocabulary rather than a fourth date format.
-   `withYear` is passed by the caller, which knows whether its span crosses one:
-   the year is noise on a two-week chart and load-bearing on one that straddles
-   December. */
-const dayLabel=(iso,withYear)=>{
-  const[y,m,d]=String(iso||'').split('-');
-  if(!y||!m||!d) return String(iso||'');
-  return (+d)+' '+MONTHS[+m-1]+(withYear?" '"+y.slice(2):'');
-};
 
 /* ------------------------------------------------ tabs */
 /* [id, label]. There used to be a third slot carrying a per-tab "disabled
@@ -1492,7 +1435,7 @@ function logbookLine(){
   const parts=['Log day '+lb.day];
   if(lb.opened){
     const[y,m,d]=String(lb.opened).split('-');
-    if(y&&m&&d) parts.push('since '+(+d)+' '+MONTHS[+m-1]+' '+y);
+    if(y&&m&&d) parts.push('since '+dayLabel(lb.opened)+' '+y);
   }
   /* Distinct, in first-appearance order. `positions_data` sorts its rows by
      expiry then strike, so the name holding the nearest expiry lands first and
@@ -3591,17 +3534,13 @@ function market(){
      which currencies exist or which ones matter -- both would drift from the feed
      the moment either side changed. `seed()` takes those defaults on first draw
      and respects an empty Set thereafter; see `S.mkcountries`. */
-  const seed=(chosen,facets)=>chosen instanceof Set?chosen
-    :new Set((facets||[]).filter(mf=>mf.default).map(mf=>mf.value));
-  const countries=seed(S.mkcountries,mk.countries);
-  const impacts=seed(S.mkimpacts,mk.impacts);
+  const countries=seedFacets(S.mkcountries,mk.countries);
+  const impacts=seedFacets(S.mkimpacts,mk.impacts);
   /* An axis with nothing selected filters nothing OUT, rather than emptying the
      calendar: "no currency chosen" reads as a question not yet asked, and a blank
      panel with every button dark looks broken. Same convention as
      `events.upcoming`, where an empty filter tuple means no filter. */
-  const passes=mev=>(countries.size===0||countries.has(mev.country))
-    &&(impacts.size===0||impacts.has(mev.impact));
-  const evs=(mk.events||[]).filter(passes);
+  const evs=(mk.events||[]).filter(mev=>eventPasses(mev,countries,impacts));
   /* Counted from the FILTERED events rather than from a per-filter total the
      server precomputed. There are 2^n filter combinations and the page already
      holds every row, so counting here is both cheaper and the only way the strip
@@ -3612,11 +3551,8 @@ function market(){
   /* Whether this is still the server's default view, so the reset control can be
      disabled rather than offered as a no-op. Compared by value: same size, same
      members, on both axes. */
-  const isDefault=(chosen,facets)=>{
-    const want=(facets||[]).filter(mf=>mf.default).map(mf=>mf.value);
-    return chosen.size===want.length&&want.every(v=>chosen.has(v));
-  };
-  const atDefault=isDefault(countries,mk.countries)&&isDefault(impacts,mk.impacts);
+  const atDefault=facetsAtDefault(countries,mk.countries)
+    &&facetsAtDefault(impacts,mk.impacts);
 
   /* Which day is expanded, chosen from the days that have events UNDER THE
      CURRENT FILTER -- otherwise switching to Key could leave a day selected that
@@ -3630,10 +3566,7 @@ function market(){
      past day rather than the earliest also means a week whose events have all
      happened opens on the most recent one. */
   const withEvents=(mk.week||[]).filter(d=>countOf(d)>0).map(d=>d.day);
-  const ahead=withEvents.filter(d=>d>=mk.today);
-  const behind=withEvents.filter(d=>d<mk.today);
-  const sel=S.marketday&&withEvents.includes(S.marketday)?S.marketday
-    :(ahead[0]||behind[behind.length-1]||null);
+  const sel=chooseMarketDay(withEvents,mk.today,S.marketday);
 
   const cells=(mk.week||[]).map(d=>{
     /* The dot row is a preview, capped at three: a 20-event day would otherwise

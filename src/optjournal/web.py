@@ -732,6 +732,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._json(404, {"error": "not found"})
         elif path == "/api/state":
             try:
+                month = params.get("month")
+                trade_type = params.get("type")
+                scoring = params.get("scoring")
                 self._json(200, build_state(
                     db_path=self.cfg.db_path,
                     archive_dir=self.cfg.archive_dir,
@@ -740,8 +743,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     # reading `cfg.query_id` here left the page showing "no query
                     # id" immediately after a save that had genuinely worked.
                     query_id=self._effective_query_id(),
-                    month=(params.get("month") or [None])[0],
-                    trade_type=(params.get("type") or [None])[0],
+                    month=month[0] if month else None,
+                    trade_type=trade_type[0] if trade_type else None,
                     # Repeatable, so `?cost=OPT&cost=CASH` is a multi-select
                     # rather than a delimiter this layer has to invent and the
                     # page has to match. parse_qs already hands us the list.
@@ -750,7 +753,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     # owns the vocabulary, and a second check in this layer is a
                     # second place for the two to disagree about what a valid
                     # unit is.
-                    scoring=(params.get("scoring") or [None])[0],
+                    scoring=scoring[0] if scoring else None,
                 ))
             except sqlite3.OperationalError as exc:
                 self._json(500, {"error": f"database not readable: {exc}"})

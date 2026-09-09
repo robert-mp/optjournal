@@ -8,11 +8,13 @@ offline and deterministic.
 from __future__ import annotations
 
 import sqlite3
+import urllib.error
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from conftest import add_statement, connect_migrated
 
+from optjournal import marketdata
 from optjournal.bars import (
     CONTEXT_MAX_BARS,
     CONTEXT_MIN_BARS,
@@ -34,6 +36,7 @@ from optjournal.clock import MARKET_TZ
 from optjournal.marketdata import (
     Bar,
     BarFetchError,
+    BarNotFound,
     occ_symbol,
     parse_chart,
     parse_quote,
@@ -142,6 +145,17 @@ def test_a_source_error_is_raised():
     payload = {"chart": {"error": {"code": "Not Found"}, "result": None}}
     with pytest.raises(BarFetchError, match="Not Found"):
         parse_chart(payload, symbol="X", bar_size="1d")
+
+
+def test_an_http_404_is_preserved_as_not_found(monkeypatch):
+    """The journal needs to distinguish a vanished contract from an outage."""
+
+    def missing(*_args, **_kwargs):
+        raise urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(marketdata.urllib.request, "urlopen", missing)
+    with pytest.raises(BarNotFound, match="HTTP Error 404"):
+        marketdata.fetch_bars("SPY   260825C00769000", bar_size="1d", start=1, end=2)
 
 
 def test_a_short_column_pads_rather_than_raising():
@@ -999,6 +1013,77 @@ def test_backfill_counts_an_empty_series_as_skipped_not_failed(conn):
     assert outcome.skipped == outcome.requested
 
 
+def test_backfill_treats_a_past_option_404_as_unavailable(conn):
+    """An expired contract removed by the source must not fail forever."""
+    for trade_id, day, open_close, quantity in (
+        ("open", "2026-01-05", "O", -1),
+        ("close", "2026-01-06", "C", 1),
+    ):
+        _option_trade(
+            conn, conid="C1", symbol="AAA  260109P00100000",
+            underlying="AAA", ucid="U1", date=day, trade_id=trade_id,
+            open_close=open_close, quantity=quantity,
+        )
+
+    def fetch(symbol, *, bar_size, start, end, source):
+        if symbol.startswith("AAA "):
+            raise BarNotFound("AAA260109P00100000 1d: HTTP Error 404")
+        return [_bar(start + DAY)]
+
+    outcome = backfill_bars(
+        conn, fetch=fetch, now=datetime(2026, 2, 1, tzinfo=UTC)
+    )
+    assert outcome.ok
+    assert outcome.skipped == 1
+    assert outcome.written >= 1, "the unavailable option abandoned its underlying"
+
+
+def test_backfill_keeps_a_current_option_404_loud(conn):
+    """A live contract missing from the source may be malformed or an outage."""
+    _option_trade(
+        conn, conid="C1", symbol="AAA  261001P00100000",
+        underlying="AAA", ucid="U1", date="2026-09-08", trade_id="open",
+    )
+
+    def fetch(symbol, *, bar_size, start, end, source):
+        if symbol.startswith("AAA "):
+            raise BarNotFound(f"{symbol} {bar_size}: HTTP Error 404")
+        return [_bar(start + DAY)]
+
+    outcome = backfill_bars(
+        conn, fetch=fetch, now=datetime(2026, 9, 9, tzinfo=UTC)
+    )
+    assert not outcome.ok
+    assert outcome.failures
+
+
+def test_backfill_keeps_an_underlying_404_loud(conn):
+    """Only expired option endpoints receive the unavailable treatment."""
+    for trade_id, day, open_close, quantity in (
+        ("open", "2026-01-05", "O", -1),
+        ("close", "2026-01-06", "C", 1),
+    ):
+        _option_trade(
+            conn, conid="C1", symbol="AAA  260109P00100000",
+            underlying="AAA", ucid="U1", date=day, trade_id=trade_id,
+            open_close=open_close, quantity=quantity,
+        )
+
+    def fetch(symbol, *, bar_size, start, end, source):
+        if symbol == "AAA":
+            raise BarNotFound(f"AAA {bar_size}: HTTP Error 404")
+        return []
+
+    outcome = backfill_bars(
+        conn, fetch=fetch, now=datetime(2026, 2, 1, tzinfo=UTC)
+    )
+    assert not outcome.ok
+    assert set(outcome.failures) == {
+        "AAA 1h: HTTP Error 404",
+        "AAA 1d: HTTP Error 404",
+    }
+
+
 # --------------------------------------------------------------------------
 # the session audit: noticing a session whose perishable bars never landed
 # --------------------------------------------------------------------------
@@ -1013,7 +1098,7 @@ def _session_bars(conn, conid, symbol, day, *, bar_size="1h", hours=(14, 15, 16)
 
 def _open_short_option(conn, *, date="2026-08-03", conid="C1"):
     """An open short-dated short option: the one shape that is collected live."""
-    _option_trade(conn, conid=conid, symbol="AAA  260901P00100000",
+    _option_trade(conn, conid=conid, symbol="AAA  271001P00100000",
                   underlying="AAA", ucid="UAAA", date=date, trade_id=f"t{conid}")
 
 
@@ -1042,17 +1127,17 @@ def test_a_traded_day_with_no_option_bars_is_reported(conn):
     audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
     assert audited.market_traded, "the underlying's own bars say it traded"
     assert not audited.ok
-    assert audited.missing == ("AAA  260901P00100000",)
+    assert audited.missing == ("AAA  271001P00100000",)
     assert not audited.covered
 
 
 def test_a_covered_session_is_silent(conn):
     _open_short_option(conn)
     _session_bars(conn, "UAAA", "AAA", "2026-08-05")
-    _session_bars(conn, "C1", "AAA  260901P00100000", "2026-08-05")
+    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-05")
     audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
     assert audited.ok
-    assert audited.covered == ("AAA  260901P00100000",)
+    assert audited.covered == ("AAA  271001P00100000",)
     assert not audited.missing
 
 
@@ -1114,10 +1199,10 @@ def test_a_bar_from_a_neighbouring_session_does_not_count_as_coverage(conn):
     """
     _open_short_option(conn)
     _session_bars(conn, "UAAA", "AAA", "2026-08-05")
-    _session_bars(conn, "C1", "AAA  260901P00100000", "2026-08-04")
+    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-04")
     audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
     assert not audited.ok, "yesterday's bars were counted as today's"
-    assert audited.missing == ("AAA  260901P00100000",)
+    assert audited.missing == ("AAA  271001P00100000",)
 
 
 def test_the_audit_exit_codes_separate_all_three_outcomes(tmp_path, capsys):
@@ -1131,25 +1216,21 @@ def test_the_audit_exit_codes_separate_all_three_outcomes(tmp_path, capsys):
     db = tmp_path / "audit.db"
     conn = connect_migrated(db)
     add_statement(conn)
-    _open_short_option(conn)
+
+    moment = datetime.now(UTC).astimezone(MARKET_TZ)
+    yesterday = (moment - timedelta(days=1)).strftime("%Y-%m-%d")
+    opened = (moment - timedelta(days=2)).strftime("%Y-%m-%d")
+    _open_short_option(conn, date=opened)
 
     argv = ["bars", "--audit", "--db", str(db)]
     assert main(argv) == 3, "an un-backfilled journal is not a lost session"
-
-    # Derived exactly as last_traded_day derives it. Computing it as
-    # et_day(now - 86400) instead would agree almost always and disagree in a
-    # narrow window around a DST transition -- the same trap that already put a
-    # January fixture on the wrong trading day earlier in this module.
-    yesterday = (
-        datetime.now(UTC).astimezone(MARKET_TZ) - timedelta(days=1)
-    ).strftime("%Y-%m-%d")
 
     _session_bars(conn, "UAAA", "AAA", yesterday)
     conn.commit()
     assert main(argv) == 1, "a traded day with no option bars must report"
     assert "MISSING" in capsys.readouterr().out
 
-    _session_bars(conn, "C1", "AAA  260901P00100000", yesterday)
+    _session_bars(conn, "C1", "AAA  271001P00100000", yesterday)
     conn.commit()
     assert main(argv) == 0, "a covered session must be silent"
 

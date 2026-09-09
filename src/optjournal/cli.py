@@ -558,7 +558,7 @@ def cmd_market(args) -> int:
 
         if args.fetch:
             try:
-                events = fetch_events()
+                fetched_events = fetch_events()
             except EventRateLimited as exc:
                 # EXIT_THROTTLED, not EXIT_ERROR: the same distinction the IBKR
                 # path draws, so a nightly cron stays silent on a back-off and
@@ -575,13 +575,15 @@ def cmd_market(args) -> int:
                 print(f"calendar fetch failed: {exc}", file=sys.stderr)
                 record_run(conn, "market", status="failed", detail=str(exc)[:400])
                 return EXIT_ERROR
-            stored = store_events(conn, events)
-            result["fetched"] = len(events)
+            stored = store_events(conn, fetched_events)
+            result["fetched"] = len(fetched_events)
             result["stored"] = stored
-            lines.append(f"calendar {len(events)} event(s) -> {stored} stored")
+            lines.append(
+                f"calendar {len(fetched_events)} event(s) -> {stored} stored"
+            )
             record_run(conn, "market", status="ok" if stored else "nothing",
-                       detail=f"{len(events)} fetched, {stored} stored",
-                       done=stored, total=len(events))
+                       detail=f"{len(fetched_events)} fetched, {stored} stored",
+                       done=stored, total=len(fetched_events))
 
         now = datetime.now(UTC)
         start = int(now.timestamp())
@@ -673,7 +675,7 @@ def cmd_bars(args) -> int:
 
         if args.dry_run:
             requests = bars_manifest(conn, perishable_only=live)
-            data = [dataclasses.asdict(r) for r in requests]
+            dry_run_data = [dataclasses.asdict(r) for r in requests]
             lines = [f"{len(requests)} window(s) derived, nothing fetched"]
             lines += [
                 f"  {r.kind:<10} {r.symbol:<20} {r.bar_size}  "
@@ -681,7 +683,7 @@ def cmd_bars(args) -> int:
                 + ("  live-only" if r.perishable else "")
                 for r in requests
             ]
-            _emit(data, "\n".join(lines), args.json)
+            _emit(dry_run_data, "\n".join(lines), args.json)
             return EXIT_OK if requests else EXIT_NO_DATA
 
         outcome = backfill_bars(conn, perishable_only=live)

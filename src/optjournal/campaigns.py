@@ -261,11 +261,11 @@ def link(
     orders_of_episode: dict[int, set[str]] = {}
     for i, episode in enumerate(episodes):
         for tid in getattr(episode, "trade_ids", ()) or ():
-            oid = order_of_trade.get(str(tid))
-            if oid is None:
+            order_id = order_of_trade.get(str(tid))
+            if order_id is None:
                 continue
-            orders_of_episode.setdefault(i, set()).add(str(oid))
-            group = group_of_order.get(str(oid))
+            orders_of_episode.setdefault(i, set()).add(order_id)
+            group = group_of_order.get(order_id)
             if group is None:
                 continue
             # Every order in the group, not just this fill's: a spread leg that

@@ -13,7 +13,7 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
-from conftest import STATEMENTS, add_statement, connect_migrated
+from conftest import LIVE_STATEMENTS, STATEMENTS, add_statement, connect_migrated
 
 from optjournal.history import (
     NON_POSITION_CATEGORIES,
@@ -411,7 +411,7 @@ def test_empty_database_yields_empty_report(conn):
 # ----------------------------------------------- end-to-end against real data
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="no archived statements")
+@pytest.mark.skipif(not LIVE_STATEMENTS, reason="needs the optional live corpus")
 def test_real_sive_round_trip(tmp_path):
     """SIVE: bought twice, fully sold, re-entered. IBKR states the P&L itself.
 
@@ -420,7 +420,7 @@ def test_real_sive_round_trip(tmp_path):
     exactly IBKR's fifoPnlRealized. That makes this an independent oracle.
     """
     conn = connect_migrated(tmp_path / "all.db")
-    for path in STATEMENTS:
+    for path in LIVE_STATEMENTS:
         ingest_file(conn, path, assets=ASSET_FILTER_ALL)
 
     report = build_history(conn, asset_category=None)
@@ -454,7 +454,12 @@ def test_real_option_book_matches_snapshot(tmp_path):
     assert {e.conid for e in report.open} == held
     snapshot_only = [e for e in report.open if e.snapshot_only]
     assert len(snapshot_only) == 1
-    assert snapshot_only[0].cost_basis == pytest.approx(3000.807, abs=0.01)
+    snapshot_basis = conn.execute(
+        "SELECT ABS(cost_basis_money) FROM current_option_positions"
+        " WHERE conid = ?",
+        (snapshot_only[0].conid,),
+    ).fetchone()[0]
+    assert snapshot_only[0].cost_basis == pytest.approx(snapshot_basis, abs=0.01)
 
 
 # --- re-entry after a pre-archive close ---------------------------------------
@@ -665,7 +670,7 @@ def _fifo_realized(rows: list[dict]) -> dict[str, float]:
     return dict(pnl)
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+@pytest.mark.skipif(not LIVE_STATEMENTS, reason="needs the optional live corpus")
 def test_computed_fifo_pnl_agrees_with_the_brokers_own_figure(tmp_path):
     """The oracle for task 9: can this journal derive what IBKR reports?
 
@@ -684,7 +689,7 @@ def test_computed_fifo_pnl_agrees_with_the_brokers_own_figure(tmp_path):
     FIFO walk to the cent -- exactly the false reassurance this guards against.
     """
     conn = connect_migrated(tmp_path / "fifo.db")
-    for path in STATEMENTS:
+    for path in LIVE_STATEMENTS:
         ingest_file(conn, path, assets=ASSET_FILTER_ALL)
 
     rows = [dict(r) for r in conn.execute(
@@ -752,7 +757,7 @@ def _partially_closed(rows: list[dict]) -> set[str]:
     return partial
 
 
-@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+@pytest.mark.skipif(not LIVE_STATEMENTS, reason="needs the optional live corpus")
 def test_specific_lot_selection_leaves_no_trace_this_journal_can_follow():
     """The limitation, pinned so it is discovered here rather than in April.
 
@@ -781,7 +786,7 @@ def test_specific_lot_selection_leaves_no_trace_this_journal_can_follow():
     seen_sl = False
     populated: list[str] = []
 
-    for path in STATEMENTS:
+    for path in LIVE_STATEMENTS:
         for stmt in load(path).FlexStatements:
             for trade in stmt.Trades or ():
                 # Through `sources._notes`, because py_ibkr hands back a LIST of

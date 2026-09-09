@@ -592,16 +592,16 @@ def analyse(
 
         if "FEES" in kind:
             name = categorise_fee(c.description)
-            cat = fees.setdefault(name, FeeCategory(name=name))
-            cat.count += 1
-            cat.total_base += abs(amount_base)
+            fee_category = fees.setdefault(name, FeeCategory(name=name))
+            fee_category.count += 1
+            fee_category.total_base += abs(amount_base)
             fee_ccy = str(getattr(c, "currency", None) or "") or base_currency
             if c.amount:
-                cat.native_by_ccy[fee_ccy] = (
-                    cat.native_by_ccy.get(fee_ccy, ZERO) + abs(c.amount)
+                fee_category.native_by_ccy[fee_ccy] = (
+                    fee_category.native_by_ccy.get(fee_ccy, ZERO) + abs(c.amount)
                 )
-            if len(cat.examples) < 3 and c.description:
-                cat.examples.append(c.description)
+            if len(fee_category.examples) < 3 and c.description:
+                fee_category.examples.append(c.description)
         elif "WHTAX" in kind:
             key = str(c.symbol or "(non-dividend)")
             withheld[key] += abs(amount_base)

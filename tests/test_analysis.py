@@ -366,7 +366,7 @@ def _real_report():
 
 
 def test_costs_data_includes_every_computed_total():
-    data = costs_data(_real_report())
+    data = costs_data(analyse(_stmt([_conv("EUR.USD", "-10000")])))
     for key in (
         "commission", "fees", "taxes", "autofx_notional_base",
         "autofx_spread_base", "stated_friction", "friction_base",
@@ -390,7 +390,7 @@ def test_costs_data_totals_are_self_consistent():
 def test_costs_data_money_is_numeric_not_string():
     """Decimal + json.dumps(default=str) silently emits money as strings."""
     import json
-    data = costs_data(_real_report())
+    data = costs_data(analyse(_stmt([_conv("EUR.USD", "-10000")])))
     assert isinstance(data["totals"]["friction_base"], float)
     assert isinstance(data["fx"][0]["notional_base"], float)
     round_tripped = json.loads(json.dumps(data))
@@ -399,7 +399,7 @@ def test_costs_data_money_is_numeric_not_string():
 
 def test_costs_data_includes_per_pair_properties():
     """autofx_spread_base and commission_bps are properties, so asdict drops them."""
-    data = costs_data(_real_report())
+    data = costs_data(analyse(_stmt([_conv("EUR.USD", "-10000")])))
     assert data["fx"], "expected at least one FX pair"
     for pair in data["fx"]:
         assert "autofx_spread_base" in pair
@@ -407,7 +407,7 @@ def test_costs_data_includes_per_pair_properties():
 
 
 def test_costs_data_autofx_spread_sums_to_total():
-    data = costs_data(_real_report())
+    data = costs_data(analyse(_stmt([_conv("EUR.USD", "-10000")])))
     assert sum(p["autofx_spread_base"] for p in data["fx"]) == pytest.approx(
         data["totals"]["autofx_spread_base"]
     )

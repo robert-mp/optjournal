@@ -50,6 +50,7 @@ __all__ = [
     "SOURCE_RANK",
     "Bar",
     "BarFetchError",
+    "BarNotFound",
     "Quote",
     "fetch_bars",
     "fetch_quote",
@@ -84,6 +85,17 @@ class BarFetchError(RuntimeError):
 
     Deliberately not raised for an empty result: a known symbol with no bars
     at the requested granularity is an answer, not a failure.
+    """
+
+
+class BarNotFound(BarFetchError):
+    """The source has no chart endpoint for this symbol.
+
+    Kept distinct from transport and parse failures because an expired option
+    can disappear from a public source after its history is no longer
+    recoverable. The journal layer decides whether that absence is expected for
+    the window it requested; live contracts and underlyings still treat it as a
+    failure.
     """
 
 
@@ -207,6 +219,11 @@ def _get_chart(symbol: str, query: str, *, what: str, timeout: int) -> Any:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             return json.load(response)
+    except urllib.error.HTTPError as exc:
+        error = f"{occ_symbol(symbol)} {what}: HTTPError: {exc}"
+        if exc.code == 404:
+            raise BarNotFound(error) from exc
+        raise BarFetchError(error) from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise BarFetchError(
             f"{occ_symbol(symbol)} {what}: {type(exc).__name__}: {exc}"

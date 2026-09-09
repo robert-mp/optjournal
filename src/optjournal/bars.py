@@ -44,7 +44,14 @@ from typing import Any
 
 from optjournal.clock import MARKET_TZ, epoch_et, et_day
 from optjournal.history import build_history
-from optjournal.marketdata import BAR_SIZES, SOURCE_RANK, Bar, BarFetchError, fetch_bars
+from optjournal.marketdata import (
+    BAR_SIZES,
+    SOURCE_RANK,
+    Bar,
+    BarFetchError,
+    BarNotFound,
+    fetch_bars,
+)
 
 __all__ = [
     "BackfillOutcome",
@@ -223,8 +230,12 @@ class BarRequest:
 
 @dataclass(frozen=True)
 class BackfillOutcome:
-    """What a backfill run did. ``skipped`` counts requests the source knew but
-    held no bars for -- the option-intraday case -- which is not a failure.
+    """What a backfill run did.
+
+    ``skipped`` counts requests with no obtainable bars: either the source
+    returned an empty series, or a historical option endpoint has disappeared
+    after the requested window ended. Neither is repaired by retrying the rest
+    of the same run.
     """
 
     requested: int = 0
@@ -484,7 +495,9 @@ def backfill_bars(
     ``perishable_only`` restricts the run to the intraday bars of open options --
     the market-hours poll. See :func:`bars_manifest`.
     """
-    requests = bars_manifest(conn, now=now, perishable_only=perishable_only)
+    moment = now or datetime.now(UTC)
+    requests = bars_manifest(conn, now=moment, perishable_only=perishable_only)
+    cutoff = int(moment.timestamp())
     written = skipped = 0
     failures: list[str] = []
     for request in requests:
@@ -496,6 +509,17 @@ def backfill_bars(
                 end=request.end,
                 source=source,
             )
+        except BarNotFound as exc:
+            # Public sources eventually remove expired option endpoints. Once
+            # the requested window is wholly historical, that data is
+            # unavailable rather than a broken run. Keep 404 loud for a live
+            # option or any underlying: those can indicate a malformed symbol
+            # or a provider outage and should still fail the job.
+            if request.kind == "option" and request.end <= cutoff:
+                skipped += 1
+                continue
+            failures.append(str(exc))
+            continue
         except BarFetchError as exc:
             failures.append(str(exc))
             continue

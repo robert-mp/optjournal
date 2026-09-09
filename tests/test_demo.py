@@ -19,7 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from conftest import RAW_DIR, ROOT, add_statement, connect_migrated
+from conftest import LIVE_RAW_DIR, ROOT, add_statement, connect_migrated
 
 from optjournal.campaigns import Campaign
 from optjournal.demo import (
@@ -127,7 +127,7 @@ def test_refuses_to_touch_real_data_wherever_it_sits(tmp_path):
     Built from the real archive rather than a fixture, because the property under
     test is "recognises real data", and only real data proves it.
     """
-    real_statements = sorted(RAW_DIR.glob("activity-*.xml"))
+    real_statements = sorted(LIVE_RAW_DIR.glob("activity-*.xml"))
     if not real_statements:
         pytest.skip("needs an archived statement")
 

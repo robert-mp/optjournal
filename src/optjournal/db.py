@@ -47,7 +47,7 @@ __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -107,7 +107,7 @@ _TRADES_DDL = f"""
 CREATE TABLE IF NOT EXISTS trades (
   broker                  TEXT    NOT NULL DEFAULT '{DEFAULT_BROKER}',
   trade_id                TEXT    NOT NULL,
-  ib_exec_id              TEXT    NOT NULL,
+  ib_exec_id              TEXT,
   transaction_id          TEXT    NOT NULL,
   ib_order_id             TEXT,
   account_id              TEXT    NOT NULL,
@@ -273,9 +273,12 @@ CREATE TABLE IF NOT EXISTS securities (
 #: pre-migration journal that is "no such column: broker".
 #:
 #: Per broker, like the primary key: an execution id is unique within the broker
-#: that issued it, not across brokers.
+#: that issued it, not across brokers. Missing execution ids stay NULL. SQLite
+#: permits multiple NULLs in a unique index, and the predicate documents that
+#: they are absences rather than one shared empty identifier.
 _LATE_INDEXES = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS trades_exec ON trades(broker, ib_exec_id)",
+    "CREATE UNIQUE INDEX trades_exec ON trades(broker, ib_exec_id)"
+    " WHERE ib_exec_id IS NOT NULL",
 )
 
 _SCHEMA = f"""
@@ -771,10 +774,11 @@ _REKEYED_TABLES: tuple[tuple[str, tuple[str, ...], str], ...] = (
 
 def _rekey_by_broker(conn: sqlite3.Connection, table: str,
                      want_pk: tuple[str, ...], ddl: str) -> bool:
-    """Put `broker` at the front of `table`'s PRIMARY KEY.
+    """Bring a table that needs a rebuild to its shipped definition.
 
     Returns True when a rebuild happened. Idempotent: the current key is read
-    first, so re-running is free.
+    first, and the trades table's optional execution id is checked, so re-running
+    is free.
 
     Why a rebuild at all: SQLite cannot alter a PRIMARY KEY, and each of these
     tables was keyed on an identifier that is IBKR's rather than universal --
@@ -797,7 +801,8 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
       `SELECT *`, so a column added later cannot silently shift into the wrong
       position.
     """
-    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    info = list(conn.execute(f"PRAGMA table_info({table})"))
+    cols = {r["name"] for r in info}
     if not cols:
         return False  # table does not exist yet; _SCHEMA will create it keyed
     if "broker" not in cols:
@@ -805,12 +810,13 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
     # `pk` is 1-based rank in the key, not a boolean, so a composite key must be
     # ordered by it -- sorting by name would compare ("broker","trade_id")
     # against a key that is really (trade_id, broker) and call them equal.
-    keyed = sorted(
-        ((r["pk"], r["name"]) for r in conn.execute(f"PRAGMA table_info({table})")
-         if r["pk"]),
+    keyed = sorted((r["pk"], r["name"]) for r in info if r["pk"])
+    key_is_current = tuple(name for _rank, name in keyed) == want_pk
+    exec_id_is_required = table == "trades" and any(
+        r["name"] == "ib_exec_id" and r["notnull"] for r in info
     )
-    if tuple(name for _rank, name in keyed) == want_pk:
-        return False  # already rekeyed
+    if key_is_current and not exec_id_is_required:
+        return False
 
     before = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
     # Only the columns BOTH tables have. The old table can be missing one the
@@ -818,7 +824,7 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
     # in this process, or any column added by a later _ADDED_COLUMNS entry -- and
     # naming it in the SELECT is "no such column". Anything absent takes its DDL
     # default, which for `broker` is exactly the fact we want recorded.
-    live = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
+    live = [r["name"] for r in info]
     shipped = {
         line.strip().split()[0]
         for line in ddl.splitlines()
@@ -826,6 +832,11 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
     }
     ordered = [c for c in live if c in shipped]
     names = ", ".join(ordered)
+    selected = ", ".join(
+        f"NULLIF({column}, '')" if table == "trades" and column == "ib_exec_id"
+        else column
+        for column in ordered
+    )
     scratch = f"{table}_rekeyed"
     # Rebuilt from the shipped DDL rather than from the live table, so the new
     # table is exactly what a fresh journal gets -- otherwise a journal migrated
@@ -845,7 +856,9 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
             conn.execute(f"DROP VIEW IF EXISTS {view}")
         conn.execute(f"DROP TABLE IF EXISTS {scratch}")
         conn.executescript(new_ddl)
-        conn.execute(f"INSERT INTO {scratch} ({names}) SELECT {names} FROM {table}")
+        conn.execute(
+            f"INSERT INTO {scratch} ({names}) SELECT {selected} FROM {table}"
+        )
         after = conn.execute(f"SELECT COUNT(*) AS n FROM {scratch}").fetchone()["n"]
         if after != before:
             raise RuntimeError(
@@ -863,6 +876,43 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
     conn.commit()
     log.info("rekeyed %d %s rows on %s", before, table, want_pk)
     return True
+
+
+def _late_indexes_current(conn: sqlite3.Connection) -> bool:
+    """Whether indexes created after column migrations match the shipped SQL."""
+    stored = {
+        row["name"]: " ".join((row["sql"] or "").split())
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    for statement in _LATE_INDEXES:
+        match = re.search(r"CREATE UNIQUE INDEX (\w+)", statement)
+        if match is None:
+            raise RuntimeError(f"cannot determine index name from {statement!r}")
+        if stored.get(match.group(1)) != " ".join(statement.split()):
+            return False
+    return True
+
+
+def _refresh_late_indexes(conn: sqlite3.Connection) -> None:
+    """Create or replace indexes whose definition changed."""
+    stored = {
+        row["name"]: " ".join((row["sql"] or "").split())
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    for statement in _LATE_INDEXES:
+        match = re.search(r"CREATE UNIQUE INDEX (\w+)", statement)
+        if match is None:
+            raise RuntimeError(f"cannot determine index name from {statement!r}")
+        name = match.group(1)
+        wanted = " ".join(statement.split())
+        if stored.get(name) == wanted:
+            continue
+        conn.execute(f"DROP INDEX IF EXISTS {name}")
+        conn.execute(statement)
 
 
 def _lock_path(conn: sqlite3.Connection) -> Path | None:
@@ -970,6 +1020,8 @@ def schema_is_current(conn: sqlite3.Connection) -> bool:
         return False
     if _stale_views(conn):
         return False
+    if not _late_indexes_current(conn):
+        return False
     for table in {table for table, _column, _decl in _ADDED_COLUMNS}:
         columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if not columns:
@@ -1053,8 +1105,7 @@ def _migrate_unlocked(conn: sqlite3.Connection) -> int:
     # they write lands in the rebuilt table rather than in one about to be dropped.
     for table, want_pk, ddl in _REKEYED_TABLES:
         _rekey_by_broker(conn, table, want_pk, ddl)
-    for statement in _LATE_INDEXES:
-        conn.execute(statement)
+    _refresh_late_indexes(conn)
     _backfill_commission_currency(conn)
     # After the backfill, which is what makes the mismatch detectable: the
     # repair's WHERE compares ib_commission_currency, so on a journal that has

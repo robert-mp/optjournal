@@ -92,9 +92,15 @@ class Leg:
     open_close: str        #: "O" or "C"
     realized: Decimal = Decimal("0")
     notes: str = ""
-    #: "OPT" or "STK". A stock leg has no expiry, put/call or strike, trades
-    #: at multiplier 1, and is its own underlying.
+    #: "OPT", "STK" or "CASH". Non-options have no expiry, put/call or strike
+    #: and trade at multiplier 1.
     asset: str = "OPT"
+    #: Instrument and commission currency. Cash conversions in the base
+    #: currency use EUR; exchange-listed demo instruments use USD.
+    currency: str = "USD"
+    #: Explicit commission for rows whose economics are not option contracts.
+    #: None applies the option order minimum model above.
+    commission: Decimal | None = None
     #: Split this leg across several fills. Exercises the per-order commission
     #: minimum being charged once and adjusted across fills, which is the case
     #: that produced a commission *credit* in the real data.
@@ -296,6 +302,18 @@ def _script() -> tuple[list[Order], list[Position], list[Cash]]:
         Leg("SPY", None, "", None, 6, Decimal("571.40"), "O", asset="STK"),
     ]))
 
+    # 11. Currency conversions, one automatic and one manual. The distinction
+    # is load-bearing: AutoFX has no stated commission and carries an estimated
+    # spread, while a manual conversion carries the commission IBKR charged.
+    orders.append(Order(d(2025, 7, 2), label="autofx conversion", legs=[
+        Leg("USD.EUR", None, "", None, 1000, Decimal("0.90"), "",
+            notes="AFx", asset="CASH", currency="EUR", commission=Decimal("0")),
+    ]))
+    orders.append(Order(d(2025, 7, 3), label="manual fx conversion", legs=[
+        Leg("USD.EUR", None, "", None, -500, Decimal("0.92"), "",
+            asset="CASH", currency="EUR", commission=Decimal("-2")),
+    ]))
+
     # Still open at period end. The second has no opening fill in the
     # period at all, so its basis exists only in the snapshot.
     #
@@ -340,7 +358,7 @@ def _script() -> tuple[list[Order], list[Position], list[Cash]]:
 #: Every attribute IBKR emits on a Trade that anything downstream reads. Copied
 #: from a real element so the synthetic one parses through the same models
 #: rather than through a lenient subset.
-_TRADE_TEMPLATE = {
+_TRADE_TEMPLATE: dict[str, str] = {
     "accountId": DEMO_ACCOUNT, "acctAlias": "", "currency": "USD",
     "assetCategory": "OPT", "subCategory": "", "symbol": "", "description": "",
     "conid": "", "securityID": "", "securityIDType": "", "cusip": "", "isin": "",
@@ -398,15 +416,34 @@ def _trade_elements(orders: list[Order]) -> list[dict[str, str]]:
     seq = 0
     for order_no, order in enumerate(orders, start=1):
         order_id = str(1_100_000_000 + order_no * 137)
-        rate = fx_for(order.day)
         for leg in order.legs:
             stock = leg.asset == "STK"
-            sym = leg.underlying if stock else _occ(
-                leg.underlying, leg.expiry, leg.put_call, leg.strike
-            )
-            mult = Decimal("1") if stock else MULTIPLIER
+            cash = leg.asset == "CASH"
+            rate = Decimal("1") if leg.currency == BASE_CURRENCY else fx_for(order.day)
+            if stock or cash:
+                sym = leg.underlying
+                description = sym
+                strike_text = ""
+                expiry_text = ""
+            else:
+                assert leg.expiry is not None
+                assert leg.strike is not None
+                sym = _occ(
+                    leg.underlying, leg.expiry, leg.put_call, leg.strike
+                )
+                description = (
+                    f"{leg.underlying} {leg.expiry:%d%b%y} "
+                    f"{_q(leg.strike)} {leg.put_call}"
+                ).upper()
+                strike_text = _q(leg.strike)
+                expiry_text = f"{leg.expiry:%Y%m%d}"
+            mult = Decimal("1") if stock or cash else MULTIPLIER
             splits = leg.fills or (leg.quantity,)
-            comms = commission_for(leg.quantity, leg.fills)
+            if leg.commission is None:
+                comms = commission_for(leg.quantity, leg.fills)
+            else:
+                assert not leg.fills, "an explicit commission is one fill"
+                comms = [leg.commission]
             for i, (qty, comm) in enumerate(zip(splits, comms, strict=True)):
                 seq += 1
                 proceeds = -Decimal(qty) * leg.price * mult
@@ -417,23 +454,22 @@ def _trade_elements(orders: list[Order]) -> list[dict[str, str]]:
                 a = dict(_TRADE_TEMPLATE)
                 a.update(
                     symbol=sym,
-                    description=(sym if stock else
-                                 f"{leg.underlying} {leg.expiry:%d%b%y} "
-                                 f"{_q(leg.strike)} {leg.put_call}").upper(),
+                    description=description,
                     conid=_conid(sym),
+                    currency=leg.currency,
                     assetCategory=leg.asset,
-                    subCategory="COMMON" if stock else leg.put_call,
+                    subCategory="COMMON" if stock else "" if cash else leg.put_call,
                     multiplier=_q(mult),
-                    listingExchange="NASDAQ" if stock else "CBOE",
+                    listingExchange="NASDAQ" if stock else "" if cash else "CBOE",
                     # Real statements carry the ticker itself on a stock row;
                     # emitting "" made the demo LESS faithful than reality and
                     # hid a nameless-lifecycle bug the real data cannot reach.
-                    underlyingSymbol=sym if stock else leg.underlying,
-                    underlyingConid="" if stock
+                    underlyingSymbol=sym if stock else "" if cash else leg.underlying,
+                    underlyingConid="" if stock or cash
                         else _UNDERLYING_CONID[leg.underlying],
-                    strike="" if stock else _q(leg.strike),
-                    expiry="" if stock else f"{leg.expiry:%Y%m%d}",
-                    putCall="" if stock else leg.put_call,
+                    strike=strike_text,
+                    expiry=expiry_text,
+                    putCall="" if stock or cash else leg.put_call,
                     reportDate=f"{order.day:%Y%m%d}", tradeDate=f"{order.day:%Y%m%d}",
                     dateTime=f"{order.day:%Y%m%d};{order.time}",
                     orderTime=f"{order.day:%Y%m%d};{order.time}",
@@ -441,10 +477,12 @@ def _trade_elements(orders: list[Order]) -> list[dict[str, str]]:
                     quantity=_q(qty), tradePrice=_q(leg.price),
                     tradeMoney=_q(money), proceeds=_q(proceeds),
                     ibCommission=_q(comm), netCash=_q(proceeds + comm),
+                    ibCommissionCurrency=leg.currency,
                     cost=_q(-(proceeds + comm)),
                     closePrice=_q(leg.price), openCloseIndicator=leg.open_close,
                     notes=leg.notes, fifoPnlRealized=_q(realized),
                     buySell="BUY" if qty > 0 else "SELL",
+                    exchange="IDEALFX" if cash else "NASDAQ" if stock else "CBOE",
                     ibOrderID=order_id,
                     tradeID=str(1_500_000_000 + seq),
                     transactionID=str(6_300_000_000 + seq),
@@ -462,18 +500,27 @@ def _position_elements(positions: list[Position]) -> list[dict[str, str]]:
     out = []
     for p in positions:
         stock = p.asset == "STK"
-        sym = p.underlying if stock else _occ(
-            p.underlying, p.expiry, p.put_call, p.strike
-        )
+        if stock:
+            sym = p.underlying
+            description = sym
+            strike_text = ""
+            expiry_text = ""
+        else:
+            assert p.expiry is not None
+            assert p.strike is not None
+            sym = _occ(p.underlying, p.expiry, p.put_call, p.strike)
+            description = (
+                f"{p.underlying} {p.expiry:%d%b%y} {_q(p.strike)} {p.put_call}"
+            ).upper()
+            strike_text = _q(p.strike)
+            expiry_text = f"{p.expiry:%Y%m%d}"
         mult = Decimal("1") if stock else MULTIPLIER
         value = Decimal(p.quantity) * p.mark * mult
         out.append({
             "accountId": DEMO_ACCOUNT, "acctAlias": "", "currency": "USD",
             "fxRateToBase": _q(rate), "assetCategory": p.asset,
             "subCategory": "COMMON" if stock else p.put_call, "symbol": sym,
-            "description": (sym if stock else
-                            f"{p.underlying} {p.expiry:%d%b%y} {_q(p.strike)} "
-                            f"{p.put_call}").upper(),
+            "description": description,
             "conid": _conid(sym), "securityID": "", "securityIDType": "",
             "cusip": "", "isin": "", "figi": "",
             "listingExchange": "NASDAQ" if stock else "CBOE",
@@ -482,8 +529,8 @@ def _position_elements(positions: list[Position]) -> list[dict[str, str]]:
             "underlyingSecurityID": "",
             "underlyingListingExchange": "" if stock else "NASDAQ", "issuer": "",
             "multiplier": _q(mult),
-            "strike": "" if stock else _q(p.strike),
-            "expiry": "" if stock else f"{p.expiry:%Y%m%d}",
+            "strike": strike_text,
+            "expiry": expiry_text,
             "putCall": "" if stock else p.put_call,
             "reportDate": f"{TO_DATE:%Y%m%d}", "position": _q(p.quantity),
             "markPrice": _q(p.mark), "positionValue": _q(value),
@@ -528,25 +575,34 @@ def _cash_elements(cash: list[Cash]) -> list[dict[str, str]]:
 def _security_elements(trades, positions) -> list[dict[str, str]]:
     seen: dict[str, dict[str, str]] = {}
     for a in trades:
+        if a["assetCategory"] == "CASH":
+            continue
+        stock = a["assetCategory"] == "STK"
         seen.setdefault(a["conid"], {
-            "assetCategory": "OPT", "subCategory": a["subCategory"],
+            "assetCategory": a["assetCategory"], "subCategory": a["subCategory"],
             "symbol": a["symbol"], "description": a["description"],
             "conid": a["conid"], "securityID": "", "securityIDType": "",
             "cusip": "", "isin": "", "figi": "", "underlyingConid":
             a["underlyingConid"], "underlyingSymbol": a["underlyingSymbol"],
-            "underlyingSecurityID": "", "underlyingListingExchange": "NASDAQ",
-            "listingExchange": "CBOE", "maturity": "", "issueDate": "",
-            "issuer": "", "multiplier": "100", "strike": a["strike"],
+            "underlyingSecurityID": "",
+            "underlyingListingExchange": "" if stock else "NASDAQ",
+            "listingExchange": "NASDAQ" if stock else "CBOE",
+            "maturity": "", "issueDate": "",
+            "issuer": "", "multiplier": "1" if stock else "100",
+            "strike": a["strike"],
             "expiry": a["expiry"], "putCall": a["putCall"],
-            "currency": "USD", "settlementPolicyMethod": "",
+            "currency": a["currency"], "settlementPolicyMethod": "",
         })
     for a in positions:
+        stock = a["assetCategory"] == "STK"
         seen.setdefault(a["conid"], dict(seen.get(a["conid"], {}), **{
-            "assetCategory": "OPT", "subCategory": a["subCategory"],
+            "assetCategory": a["assetCategory"], "subCategory": a["subCategory"],
             "symbol": a["symbol"], "description": a["description"],
             "conid": a["conid"], "underlyingConid": a["underlyingConid"],
-            "underlyingSymbol": a["underlyingSymbol"], "listingExchange": "CBOE",
-            "multiplier": "100", "strike": a["strike"], "expiry": a["expiry"],
+            "underlyingSymbol": a["underlyingSymbol"],
+            "listingExchange": "NASDAQ" if stock else "CBOE",
+            "multiplier": "1" if stock else "100",
+            "strike": a["strike"], "expiry": a["expiry"],
             "putCall": a["putCall"], "currency": "USD",
         }))
     return list(seen.values())
@@ -579,7 +635,7 @@ def build_demo_statement() -> str:
     ):
         parent = ET.SubElement(st, container)
         for row in rows:
-            ET.SubElement(parent, tag, **row)
+            ET.SubElement(parent, tag, attrib=row)
     for empty in ("CorporateActions", "Transfers"):
         ET.SubElement(st, empty)
 
