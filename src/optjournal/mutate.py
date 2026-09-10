@@ -99,6 +99,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 __all__ = [
     "MUTANTS",
@@ -647,7 +648,12 @@ def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
             proc.kill()
         return
     with contextlib.suppress(ProcessLookupError):
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        # Dynamic for the same reason as locks.py's backend import: Windows mypy
+        # correctly omits these POSIX-only names even though this branch never
+        # executes there.
+        platform_os: Any = os
+        platform_signal: Any = signal
+        platform_os.killpg(platform_os.getpgid(proc.pid), platform_signal.SIGKILL)
 
 
 def _pytest(clone: Path, *args: str) -> subprocess.CompletedProcess[str]:

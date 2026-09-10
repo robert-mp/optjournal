@@ -47,10 +47,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, BinaryIO
 
-if os.name == "nt":
-    _msvcrt: Any = importlib.import_module("msvcrt")
-else:
-    import fcntl
+# Dynamic because mypy validates this module on both platforms. A normal
+# conditional import still makes Windows mypy inspect POSIX-only `fcntl` (and
+# POSIX mypy inspect Windows-only `msvcrt`) against the wrong platform stubs.
+_locker: Any = importlib.import_module("msvcrt" if os.name == "nt" else "fcntl")
 
 __all__ = ["LockTimeout", "locked"]
 
@@ -87,7 +87,7 @@ def _try_lock(handle: BinaryIO) -> bool:
     if os.name == "nt":
         handle.seek(0)
         try:
-            _msvcrt.locking(handle.fileno(), _msvcrt.LK_NBLCK, 1)
+            _locker.locking(handle.fileno(), _locker.LK_NBLCK, 1)
         except OSError as exc:
             if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
                 return False
@@ -95,7 +95,7 @@ def _try_lock(handle: BinaryIO) -> bool:
         return True
 
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _locker.flock(handle.fileno(), _locker.LOCK_EX | _locker.LOCK_NB)
     except BlockingIOError:
         return False
     return True
@@ -104,9 +104,9 @@ def _try_lock(handle: BinaryIO) -> bool:
 def _unlock(handle: BinaryIO) -> None:
     if os.name == "nt":
         handle.seek(0)
-        _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+        _locker.locking(handle.fileno(), _locker.LK_UNLCK, 1)
     else:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        _locker.flock(handle.fileno(), _locker.LOCK_UN)
 
 
 @contextlib.contextmanager

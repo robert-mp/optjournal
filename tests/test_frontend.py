@@ -47,8 +47,10 @@ def test_the_module_exists_where_the_page_and_the_tests_both_expect_it(module):
 @pytest.mark.skipif(shutil.which("node") is None, reason="no node runtime")
 def test_the_javascript_suite_passes():
     """One `pytest` covers both languages, so neither half can rot unnoticed."""
+    files = sorted(SUITE.glob("*.test.mjs"))
+    assert files, f"no JavaScript tests found in {SUITE}"
     result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [shutil.which("node") or "node", "--test", str(SUITE)],
+        [shutil.which("node") or "node", "--test", *(str(path) for path in files)],
         capture_output=True, text=True, cwd=ROOT, timeout=120, check=False,
     )
     assert result.returncode == 0, (
