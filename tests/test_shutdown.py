@@ -33,6 +33,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -80,10 +81,20 @@ def journal(tmp_path) -> Path:
 
 
 def _serve(journal: Path, port: int) -> subprocess.Popen[str]:
-    if not CLI.exists():
+    if os.name != "nt" and not CLI.exists():
         pytest.skip(f"{CLI} is not installed; run `uv sync`")
+    # Windows console scripts are small .exe launchers which start Python as a
+    # child. GenerateConsoleCtrlEvent targets a process group, and targeting the
+    # launcher does not guarantee its child receives Ctrl+Break. Exercise the
+    # application process directly there; on POSIX retain the installed script
+    # because that is what launchd invokes.
+    command = (
+        [sys.executable, "-m", "optjournal.cli"]
+        if os.name == "nt"
+        else [str(CLI)]
+    )
     return subprocess.Popen(  # noqa: S603 - a fixed argv, no shell
-        [str(CLI), "serve", "--port", str(port), "--db", str(journal),
+        [*command, "serve", "--port", str(port), "--db", str(journal),
          "--archive", str(journal.parent / "raw")],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         # Unbuffered, or `print()` to a pipe is block-buffered and the startup
