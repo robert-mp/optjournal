@@ -15,7 +15,7 @@ run their own copy; an install is never shared between them.
 
 ## Requirements
 
-- macOS or Linux, Python 3.12+
+- Windows 10/11, macOS or Linux, Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
 - An IBKR account with a **Flex Web Service** token and an **Activity
   Statement** Flex query (Client Portal → Performance & Reports → Flex Queries)
@@ -29,6 +29,11 @@ uv run optjournal setup      # asks for the token and query id, then verifies
 uv run optjournal sync       # fetch + ingest + report what is new
 uv run optjournal serve      # dashboard on http://127.0.0.1:8765
 ```
+
+The commands are identical in PowerShell, Command Prompt and Unix shells because
+`uv run` selects the virtual environment's platform-specific executable. On
+Windows, the app uses Windows Credential Manager for the Flex token and includes
+the timezone data Python needs for US market hours.
 
 `setup` asks for two things: the Flex token, which it writes to the OS keyring
 without echoing it, and the Flex Query ID, which it stores in

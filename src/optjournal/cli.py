@@ -1365,8 +1365,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="inject known defects, report which tests catch each")
     p.add_argument("--only", action="append", metavar="KEY",
                    help="run just this defect (repeatable); default is all")
-    p.add_argument("--workdir", type=Path, default=Path("/tmp/optjournal-mutants"),
-                   help="where clones are built (default: /tmp/optjournal-mutants)")
+    mutant_workdir = Path(tempfile.gettempdir()) / "optjournal-mutants"
+    p.add_argument("--workdir", type=Path, default=mutant_workdir,
+                   help=f"where clones are built (default: {mutant_workdir})")
     # Serial by default: a concurrent run interleaves the per-mutant progress
     # lines, and a hang is easier to read about alone. Measured 3.8x at 4 and a
     # further 1.8x at 8, with identical outcomes -- see `mutate.run_all`.

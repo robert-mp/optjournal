@@ -382,8 +382,8 @@ def build_state(
         # stops when the scheduler does, and this project has already watched three
         # cron jobs report health for two days while collecting nothing.
         #
-        # The KERNEL answers it -- a `running` row whose per-job flock can be
-        # acquired has no live holder, because flock releases on process death
+        # The KERNEL answers it -- a `running` row whose per-job file lock can be
+        # acquired has no live holder, because OS locks release on process death
         # including SIGKILL. No PID, no staleness threshold, and correct across
         # laptop sleep, where every wall-clock rule is wrong (44.6 hours of sleep
         # measured as excluded from `monotonic` on this machine). Four
@@ -1212,7 +1212,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """One ledger row by id. Read-only, no migrate, ~1 ms.
 
         NO MIGRATE, deliberately: this is polled every second or two while a job
-        runs, and `migrate` takes the cross-process flock the job's own writes need.
+        runs, and `migrate` takes the cross-process lock the job's own writes need.
         `open_journal` is not used for the same reason.
         """
         try:
@@ -1420,7 +1420,12 @@ def serve(
 
         # Installed only when this is the main thread. `signal.signal` raises
         # ValueError elsewhere, and `serve` is importable and callable from a test.
-        for sig in (signal.SIGTERM, signal.SIGINT):
+        stop_signals = [signal.SIGTERM, signal.SIGINT]
+        if hasattr(signal, "SIGBREAK"):
+            # Ctrl+Break is the Windows console event a parent process can send
+            # to a new process group. Ctrl+C still arrives as SIGINT.
+            stop_signals.append(signal.SIGBREAK)
+        for sig in stop_signals:
             with contextlib.suppress(ValueError):
                 signal.signal(sig, _bye)
 

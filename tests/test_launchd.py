@@ -14,12 +14,17 @@ plan step 2), which is why this is a test and not a comment.
 from __future__ import annotations
 
 import plistlib
+import sys
 from pathlib import Path
 
 import pytest
 from conftest import ROOT, skip_if_copy
 
 PLIST = ROOT / "launchd" / "com.optjournal.serve.plist"
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="launchd integration is macOS-specific",
+)
 
 
 @pytest.fixture(scope="module")

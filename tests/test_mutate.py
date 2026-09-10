@@ -15,8 +15,8 @@ asserting is the parsing, not pytest.
 
 from __future__ import annotations
 
-import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -26,6 +26,7 @@ from optjournal import mutate
 from optjournal.mutate import (
     _SUITE_TIMEOUT_S,
     MUTANTS,
+    MUTATION_TIMEOUT_RETURN_CODE,
     MutationOutcome,
     Report,
     format_report,
@@ -66,7 +67,7 @@ def test_run_mutant_reports_a_timed_out_suite_as_hung(tmp_path, monkeypatch):
         if len(calls) == 1:
             return subprocess.CompletedProcess(args, 0, "1 passed", "")
         return subprocess.CompletedProcess(
-            args, -signal.SIGKILL, "\nTIMEOUT after 500s", "",
+            args, MUTATION_TIMEOUT_RETURN_CODE, "\nTIMEOUT after 500s", "",
         )
 
     monkeypatch.setattr(mutate, "_prepare", lambda source, clone: None)
@@ -168,7 +169,9 @@ def _counting_run_all(monkeypatch, jobs):
 
     monkeypatch.setattr(mutate, "run_mutant", _fake)
     outcomes = mutate.run_all(
-        source=Path("/nonexistent"), workdir=Path("/tmp"), jobs=jobs,
+        source=Path("nonexistent"),
+        workdir=Path(tempfile.gettempdir()) / "optjournal-test-mutants",
+        jobs=jobs,
     )
     return outcomes, peak, seen
 
@@ -221,17 +224,18 @@ def test_a_parallel_report_still_reads_in_registry_order(monkeypatch):
     assert seen != [m.key for m in MUTANTS] or len(MUTANTS) < 2
 
 
-def test_a_sigkill_return_code_is_what_the_runner_signals():
+def test_the_timeout_return_code_is_what_the_runner_signals():
     """Guards the contract between `_pytest`'s timeout path and `run_mutant`.
 
-    `run_mutant` recognises a hang by `returncode == -signal.SIGKILL`. If the
+    `run_mutant` recognises a hang by `MUTATION_TIMEOUT_RETURN_CODE`. If the
     timeout path is ever changed to return something else, the two halves stop
     agreeing silently and hangs become measured zeros again.
     """
     killed = subprocess.CompletedProcess(
-        args=[], returncode=-signal.SIGKILL, stdout="\nTIMEOUT after 500s", stderr="",
+        args=[], returncode=MUTATION_TIMEOUT_RETURN_CODE,
+        stdout="\nTIMEOUT after 500s", stderr="",
     )
-    assert killed.returncode == -signal.SIGKILL
+    assert killed.returncode == MUTATION_TIMEOUT_RETURN_CODE
     assert not any(
         line.startswith(("FAILED ", "ERROR "))
         for line in killed.stdout.splitlines()

@@ -511,7 +511,7 @@ CREATE TABLE IF NOT EXISTS job_state (
 --                data this is permanent, which is why it is not `nothing`.
 --   failed       raised.
 --   interrupted  a `running` row whose per-job lock is free, so the process
---                holding it is gone. Resolved by the KERNEL releasing an flock
+--                holding it is gone. Resolved by the KERNEL releasing an OS lock
 --                rather than by a staleness heuristic -- correct across sleep
 --                and SIGKILL alike. See locks.py.
 CREATE TABLE IF NOT EXISTS job_runs (

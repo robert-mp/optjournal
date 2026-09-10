@@ -746,9 +746,9 @@ def test_a_job_that_raises_is_recorded_failed_and_the_error_still_travels(
 
 
 def test_an_interrupted_run_is_resolved_by_the_kernel_not_by_a_timeout(conn, ctx):
-    """(b) A `running` row whose flock is free had its process killed.
+    """(b) A `running` row whose file lock is free had its process killed.
 
-    `flock` releases on process death, including SIGKILL, so this needs no PID, no
+    OS locks release on process death, including a forced kill, so this needs no PID, no
     heartbeat and no staleness threshold -- and it is correct across laptop sleep,
     where every wall-clock rule is wrong: this machine measured 44.6 hours of sleep
     excluded from `monotonic`.
@@ -849,7 +849,7 @@ def test_the_sync_job_reads_the_result_it_was_handed(conn, ctx, monkeypatch,
 def test_the_sync_job_calls_the_shared_path_rather_than_reimplementing_it(ctx):
     """THE NEGATIVE OBLIGATION from the plan, and it needs an assertion.
 
-    `flex.fetch` owns the cooldown, holds the fetch flock and stamps
+    `flex.fetch` owns the cooldown, holds the fetch file lock and stamps
     `.fetch-state.json`. A job that reimplemented that sequence would be a second
     thing to keep in step with a lockout budget -- and this project has already
     paid for two implementations of sync drifting apart (`new_trades` was a COUNT
@@ -1688,7 +1688,7 @@ def test_the_scheduler_stops_when_asked_and_does_not_wait_out_its_tick(ctx, tmp_
 def test_starting_a_running_scheduler_is_refused(tmp_path):
     """Two loops on one journal would double every claim attempt.
 
-    Not fatal -- the flock and the unique index would refuse the duplicates -- but
+    Not fatal -- the file lock and the unique index would refuse the duplicates -- but
     it is a bug that presents as mysterious 409s, so it fails at the call.
     """
     from optjournal.jobs import Context, Scheduler

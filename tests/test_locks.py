@@ -70,12 +70,12 @@ def test_the_lock_is_released_for_the_next_process(tmp_path):
 
 
 def test_a_crashed_holder_does_not_wedge_the_journal():
-    """The reason this is flock and not a lock table or a pid file.
+    """The reason this is an OS lock and not a lock table or a pid file.
 
     A row in SQLite or a pid file survives the process that wrote it, so a crash
     leaves the journal locked until someone works out how to clear it -- and the
     staleness heuristic that avoids that is itself a source of bugs. The KERNEL
-    releases an flock when the fd closes, including on SIGKILL.
+    releases the file lock when the process exits abruptly.
     """
     import tempfile
 
@@ -83,12 +83,12 @@ def test_a_crashed_holder_does_not_wedge_the_journal():
     lock = d / "x.lock"
     child = _run(
         """
-        import os, signal, sys, time
+        import os, sys
         from pathlib import Path
         from optjournal.locks import locked
         with locked(Path(sys.argv[1])):
             print("HOLDING", flush=True)
-            os.kill(os.getpid(), signal.SIGKILL)   # die still holding it
+            os._exit(9)  # no finally blocks or graceful cleanup
         """,
         str(lock),
         timeout=30,

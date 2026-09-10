@@ -140,7 +140,7 @@ POLL_WORST_CASE_S = 2 * sum(
 #: `socket.getdefaulttimeout()` is None -- both verified -- so a connection that
 #: opens and then stalls blocks forever. Today the only killer is the MeshClaw
 #: cron's 720s subprocess timeout, and SCHEDULER_PLAN.md deletes the cron. In the
-#: app the same stall would hold a job thread, its `flock` and its `running` row
+#: app the same stall would hold a job thread, its file lock and its `running` row
 #: indefinitely, and Python cannot interrupt a thread blocked in a syscall -- so no
 #: `timeout_s` on a job spec could help. It has to be on the socket.
 #:

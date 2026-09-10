@@ -27,28 +27,30 @@ The three bugs this exists for, each reproduced before being fixed:
    touching one SQLite file and one archive directory. A single audited primitive
    is what keeps that from becoming a fourth bug.
 
-WHY flock RATHER THAN A LOCK TABLE OR A PID FILE. `fcntl.flock` is released by the
-KERNEL when the holder dies, so a crashed process cannot leave the journal wedged
--- a lock row in SQLite or a pid file both can, and both then need a staleness
-heuristic that is itself a source of bugs. It is advisory, which is fine: every
-writer here is this project's own code.
-
-NOT PORTABLE TO WINDOWS, deliberately and with the cost stated. `fcntl` is POSIX;
-this project is a personal tool developed and run on macOS, `raw/` is the
-provenance root on one machine, and there is no Windows user to break. A
-`msvcrt.locking` branch would be untested code carrying a correctness guarantee,
-which is worse than an honest import error. If Windows ever matters, the seam is
-this module and nothing else.
+WHY AN OS FILE LOCK RATHER THAN A LOCK TABLE OR A PID FILE. Both supported
+backends -- POSIX `flock` and Windows `msvcrt.locking` -- are released by the
+kernel when the holder dies, so a crashed process cannot leave the journal
+wedged. A lock row in SQLite or a pid file both can, and both then need a
+staleness heuristic that is itself a source of bugs. The locks are advisory,
+which is fine: every writer here is this project's own code.
 """
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
+import errno
+import importlib
 import logging
+import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, BinaryIO
+
+if os.name == "nt":
+    _msvcrt: Any = importlib.import_module("msvcrt")
+else:
+    import fcntl
 
 __all__ = ["LockTimeout", "locked"]
 
@@ -74,6 +76,39 @@ class LockTimeout(RuntimeError):
     """
 
 
+def _try_lock(handle: BinaryIO) -> bool:
+    """Acquire the first byte without waiting; False means another holder.
+
+    `msvcrt.locking` locks bytes from the current file position, while `flock`
+    locks the file as a whole. The sidecar is created with one byte below so the
+    Windows range always exists. Keeping that difference inside this module is
+    what lets every caller retain the same crash-release and timeout contract.
+    """
+    if os.name == "nt":
+        handle.seek(0)
+        try:
+            _msvcrt.locking(handle.fileno(), _msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise
+        return True
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _unlock(handle: BinaryIO) -> None:
+    if os.name == "nt":
+        handle.seek(0)
+        _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
 def locked(path: Path, *, timeout_s: int = DEFAULT_TIMEOUT_S) -> Iterator[None]:
     """Hold an exclusive cross-process lock on `path` for the block.
@@ -85,33 +120,36 @@ def locked(path: Path, *, timeout_s: int = DEFAULT_TIMEOUT_S) -> Iterator[None]:
     Blocking with a timeout rather than `LOCK_NB`, because the callers genuinely
     want to WAIT. A sync that returns "busy, try later" because a bars fill held
     the lock for two seconds is a worse answer than one that takes two seconds.
-    Implemented with SIGALRM-free polling: `flock` has no timeout of its own, and
-    an alarm would not be safe on a non-main thread -- which the web server's
-    handlers are.
+    Implemented with signal-free polling: neither backend provides the timeout
+    contract this application needs, and an alarm would not be safe on a
+    non-main thread -- which the web server's handlers are.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    # `a+` never truncates, so two processes racing to create the file cannot
-    # blank each other's; the contents are irrelevant, only the inode's lock is.
-    with open(path, "a+") as handle:  # noqa: SIM115 - closed by the with
+    # Append mode never truncates, so two processes racing to create the file
+    # cannot blank each other's. Windows locks a byte range rather than an inode,
+    # so ensure byte zero exists; its value is otherwise irrelevant.
+    with open(path, "a+b") as handle:  # noqa: SIM115 - closed by the with
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
         waited = 0.0
         while True:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if _try_lock(handle):
                 break
-            except BlockingIOError:
-                if waited >= timeout_s:
-                    raise LockTimeout(
-                        f"another process held {path.name} for more than "
-                        f"{timeout_s}s. If nothing else is running, delete the "
-                        f"file to clear it."
-                    ) from None
-                if waited == 0.0:
-                    log.debug("waiting for %s", path.name)
-                # 50ms: fast enough that contention is invisible to a person,
-                # slow enough not to spin a core while a fetch runs.
-                time.sleep(_POLL_S)
-                waited += _POLL_S
+            if waited >= timeout_s:
+                raise LockTimeout(
+                    f"another process held {path.name} for more than "
+                    f"{timeout_s}s. Stop the other optjournal process or wait "
+                    f"for its current operation to finish."
+                )
+            if waited == 0.0:
+                log.debug("waiting for %s", path.name)
+            # 50ms: fast enough that contention is invisible to a person,
+            # slow enough not to spin a core while a fetch runs.
+            time.sleep(_POLL_S)
+            waited += _POLL_S
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock(handle)

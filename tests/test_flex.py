@@ -292,7 +292,7 @@ def test_an_unparseable_timestamp_does_not_wedge_fetching(tmp_path):
 #
 # Today the only thing that kills such a stall is the MeshClaw cron's 720s
 # subprocess timeout, and the scheduler plan DELETES the cron. In the app the same
-# stall would hold a job thread, its `flock` and its `running` row indefinitely --
+# stall would hold a job thread, its file lock and its `running` row indefinitely --
 # and Python cannot interrupt a thread blocked in a syscall, so no amount of
 # `timeout_s` on the job spec would help. It has to be on the socket.
 # --------------------------------------------------------------------------
@@ -340,7 +340,7 @@ def test_a_stalled_response_times_out_instead_of_hanging_forever():
     assert elapsed < 10, (
         f"the request took {elapsed:.1f}s against a 1s timeout, so the timeout is "
         "not reaching urlopen -- a stalled Flex fetch would hold a job thread, its "
-        "flock and its `running` row forever"
+        "file lock and its `running` row forever"
     )
     # And it arrives as the same exception every other transport failure does, so
     # `fetch`'s callers are unchanged.

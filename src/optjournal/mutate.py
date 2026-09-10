@@ -100,7 +100,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__all__ = ["MUTANTS", "Mutant", "MutationOutcome", "run_mutant", "run_all"]
+__all__ = [
+    "MUTANTS",
+    "MUTATION_TIMEOUT_RETURN_CODE",
+    "Mutant",
+    "MutationOutcome",
+    "run_mutant",
+    "run_all",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -615,6 +622,33 @@ CLONE_ENV = "OPTJOURNAL_TREE_IS_COPY"
 #: a slow machine reporting "hung" would be worse than waiting.
 _SUITE_TIMEOUT_S = 500
 
+#: An internal sentinel rather than `-SIGKILL`: Windows has no SIGKILL and
+#: reports forced process termination differently from POSIX. The stdout marker
+#: remains human-readable; this code is the machine-readable contract between
+#: `_pytest` and `run_mutant`.
+MUTATION_TIMEOUT_RETURN_CODE = 124
+
+
+def _venv_python(clone: Path) -> Path:
+    if os.name == "nt":
+        return clone / ".venv" / "Scripts" / "python.exe"
+    return clone / ".venv" / "bin" / "python"
+
+
+def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Force the timed-out suite and any server it spawned to exit."""
+    if os.name == "nt":
+        killed = subprocess.run(  # noqa: S603 - fixed Windows system command
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+            check=False,
+        )
+        if killed.returncode != 0:
+            proc.kill()
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+
 
 def _pytest(clone: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Run the CLONE's pytest, with the parent environment stripped.
@@ -630,22 +664,31 @@ def _pytest(clone: Path, *args: str) -> subprocess.CompletedProcess[str]:
     group and not just the child: pytest's own process died, the server it spawned
     did not.
     """
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("VIRTUAL_ENV", None)
+    env[CLONE_ENV] = "1"
     proc = subprocess.Popen(
-        [str(clone / ".venv" / "bin" / "python"), "-m", "pytest",
+        [str(_venv_python(clone)), "-m", "pytest",
          "-q", "--tb=no", "-p", "no:cacheprovider", *args],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         cwd=str(clone),
-        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), CLONE_ENV: "1"},
-        start_new_session=True,      # its own group, so the kill reaches children
+        env=env,
+        # A distinct process group lets the timeout reach child servers. Windows
+        # uses taskkill /T below; POSIX uses killpg.
+        start_new_session=os.name != "nt",
+        creationflags=(
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if os.name == "nt" else 0
+        ),
     )
     try:
         out, err = proc.communicate(timeout=_SUITE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        _kill_process_tree(proc)
         out, err = proc.communicate()
         return subprocess.CompletedProcess(
-            proc.args, returncode=-signal.SIGKILL,
+            proc.args, returncode=MUTATION_TIMEOUT_RETURN_CODE,
             stdout=(out or "") + f"\nTIMEOUT after {_SUITE_TIMEOUT_S}s",
             stderr=err or "",
         )
@@ -716,7 +759,7 @@ def run_mutant(mutant: Mutant, *, source: Path, workdir: Path) -> MutationOutcom
     # test then serves forever, and the survey called the security guard untested.
     # A hang is a MEASUREMENT FAILURE, not a result, so it belongs with the other
     # untrustworthy statuses that `Report.ok` refuses.
-    if result.returncode == -signal.SIGKILL:
+    if result.returncode == MUTATION_TIMEOUT_RETURN_CODE:
         shutil.rmtree(clone, ignore_errors=True)
         return MutationOutcome(
             mutant, "hung",

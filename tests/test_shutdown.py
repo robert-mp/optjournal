@@ -46,7 +46,11 @@ from optjournal.ingest import ingest_file
 #: entry point rather than `python -c "serve(...)"` is deliberate: the signal
 #: handling is installed by `serve`, but whether the MAIN thread reaches it is a
 #: property of how the process was started.
-CLI = ROOT / ".venv" / "bin" / "optjournal"
+CLI = (
+    ROOT / ".venv" / "Scripts" / "optjournal.exe"
+    if os.name == "nt"
+    else ROOT / ".venv" / "bin" / "optjournal"
+)
 
 #: Generous. The fix exits in ~0.5s and the broken shape never exits at all, so
 #: anything in between is a clear verdict rather than a flake.
@@ -86,6 +90,10 @@ def _serve(journal: Path, port: int) -> subprocess.Popen[str]:
         # banner never arrives -- the same reason the launchd plist will need
         # PYTHONUNBUFFERED. Measured: a redirected serve log sat at 0 bytes.
         env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        creationflags=(
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if os.name == "nt" else 0
+        ),
     )
 
 
@@ -103,8 +111,26 @@ def _wait_until_bound(proc: subprocess.Popen[str], port: int) -> None:
     pytest.fail("serve never bound its port")
 
 
-@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
-def test_serve_exits_promptly_on_a_signal(journal, sig):
+if os.name == "nt":
+    _STOP_CASES = [
+        pytest.param(signal.SIGBREAK, signal.CTRL_BREAK_EVENT, id="CTRL_BREAK")
+    ]
+else:
+    _STOP_CASES = [
+        pytest.param(signal.SIGTERM, signal.SIGTERM, id="SIGTERM"),
+        pytest.param(signal.SIGINT, signal.SIGINT, id="SIGINT"),
+    ]
+
+
+def _stop(proc: subprocess.Popen[str]) -> None:
+    if os.name == "nt":
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        proc.send_signal(signal.SIGTERM)
+
+
+@pytest.mark.parametrize(("handled", "sent"), _STOP_CASES)
+def test_serve_exits_promptly_on_a_signal(journal, handled, sent):
     """BOTH signals, because they arrive from different places and one is new.
 
     `SIGINT` is Ctrl-C, which `serve` has always handled through
@@ -118,13 +144,13 @@ def test_serve_exits_promptly_on_a_signal(journal, sig):
     _wait_until_bound(proc, port)
 
     started = time.monotonic()
-    proc.send_signal(sig)
+    proc.send_signal(sent)
     try:
         output = proc.communicate(timeout=EXIT_BUDGET_S)[0]
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
-            f"serve was still alive {EXIT_BUDGET_S}s after {sig.name}. That is the "
+            f"serve was still alive {EXIT_BUDGET_S}s after {handled.name}. That is the "
             "socketserver deadlock: shutdown() called from a signal handler waits "
             "on an event only serve_forever can set, and serve_forever is on the "
             "main thread. Run it on a thread and block the main thread on an Event."
@@ -132,7 +158,7 @@ def test_serve_exits_promptly_on_a_signal(journal, sig):
     elapsed = time.monotonic() - started
 
     assert proc.returncode == 0, (
-        f"serve exited {proc.returncode} on {sig.name}, not 0 -- launchd's KeepAlive "
+        f"serve exited {proc.returncode} on {handled.name}, not 0 -- its supervisor "
         f"reads a non-zero exit as a crash and respawns:\n{output}"
     )
     assert elapsed < EXIT_BUDGET_S, f"took {elapsed:.1f}s"
@@ -148,7 +174,7 @@ def test_the_port_is_released_so_a_respawn_can_bind(journal):
     port = _free_port()
     proc = _serve(journal, port)
     _wait_until_bound(proc, port)
-    proc.send_signal(signal.SIGTERM)
+    _stop(proc)
     try:
         proc.communicate(timeout=EXIT_BUDGET_S)
     except subprocess.TimeoutExpired:
@@ -234,6 +260,7 @@ def test_a_signal_handler_is_installed_for_both_stop_signals():
     assert "signal.SIGTERM" in body and "signal.SIGINT" in body, (
         "one of the two stop signals is unhandled"
     )
+    assert "signal.SIGBREAK" in body, "Windows Ctrl+Break is unhandled"
     assert "suppress(ValueError)" in body, (
         "installing the handler off the main thread would raise; serve must "
         "tolerate being called from a thread"

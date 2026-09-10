@@ -14,6 +14,8 @@ dependencies = [
     # dropped silently rather than raising. tests/test_flex.py guards that.
     "py-ibkr==0.1.7",
     "keyring==25.7.0",
+    # Windows does not ship the IANA timezone database used by zoneinfo.
+    "tzdata>=2025.2; sys_platform == 'win32'",
 ]
 
 [project.scripts]

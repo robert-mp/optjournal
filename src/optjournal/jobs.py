@@ -407,7 +407,7 @@ def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     """Fetch the newest statement and fold it in.
 
     THE COOLDOWN IS NOT REIMPLEMENTED HERE. `flex.fetch` owns it, holds the fetch
-    flock, and stamps `.fetch-state.json`; a second copy of that sequence would be
+    OS file lock, and stamps `.fetch-state.json`; a second copy of that sequence would be
     a second thing to keep in step with the lockout budget.
     """
     if not ctx.query_id:
@@ -530,7 +530,7 @@ def run_job(
     next reconcile finds the slot unclaimed and spends a SECOND IBKR request,
     deterministically, with no concurrency involved. So: claim, commit, then work.
 
-    THE LOCK IS A `flock`, NOT A THREADING LOCK OR A TABLE, for one reason: the
+    THE LOCK IS AN OS FILE LOCK, NOT A THREADING LOCK OR A TABLE, for one reason: the
     kernel releases it when the process dies. That is what makes an interrupted
     run detectable without a PID, a heartbeat or a staleness guess -- see
     `interrupted_runs`. Non-blocking (`timeout_s=0`): every job here is idempotent
@@ -626,7 +626,7 @@ def interrupted_runs(conn: sqlite3.Connection, *, archive_dir: Path) -> int:
     """Resolve `running` rows whose process is gone. Returns rows updated.
 
     THE KERNEL ANSWERS THIS, NOT A HEURISTIC. A `running` row whose per-job
-    `flock` can be acquired has no live holder: `flock` releases on process death,
+    file lock can be acquired has no live holder: OS locks release on process death,
     including `SIGKILL`, so there is no PID to check, no timeout to tune, and the
     answer is correct across laptop sleep -- where every wall-clock staleness rule
     is wrong, because this machine measured 44.6 hours of sleep excluded from
@@ -986,7 +986,7 @@ def reconcile(
                 conn.commit()
         except JobBusy:
             # Another runner has it -- the page, or a previous tick still working.
-            # Not an error: the flock and the unique index are doing their job.
+            # Not an error: the file lock and the unique index are doing their job.
             log.info("%s is already running", due.job.name)
         except Exception:                     # noqa: BLE001 - see the docstring
             # `run_job` already recorded `failed` with the cause before re-raising.

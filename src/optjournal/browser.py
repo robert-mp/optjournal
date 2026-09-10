@@ -23,9 +23,12 @@ loudly instead of failing a page that was never rendered.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 #: Long enough for the page's /api/state fetch and render, then the browser
@@ -38,6 +41,19 @@ _VIRTUAL_TIME_BUDGET_MS = 8000
 _ATTEMPT_TIMEOUT_S = 12
 
 
+def _windows_install_paths(environ: Mapping[str, str]) -> list[Path]:
+    """Conventional Chromium locations supplied by a Windows environment."""
+    roots = [
+        (environ.get("PROGRAMFILES"), Path("Google/Chrome/Application/chrome.exe")),
+        (environ.get("PROGRAMFILES(X86)"), Path("Google/Chrome/Application/chrome.exe")),
+        (environ.get("LOCALAPPDATA"), Path("Google/Chrome/Application/chrome.exe")),
+        (environ.get("PROGRAMFILES"), Path("Microsoft/Edge/Application/msedge.exe")),
+        (environ.get("PROGRAMFILES(X86)"), Path("Microsoft/Edge/Application/msedge.exe")),
+        (environ.get("LOCALAPPDATA"), Path("Chromium/Application/chrome.exe")),
+    ]
+    return [Path(root) / tail for root, tail in roots if root]
+
+
 def browsers() -> list[str]:
     """Candidate binaries, best first. Empty list means skip, never fail.
 
@@ -47,25 +63,48 @@ def browsers() -> list[str]:
     always tried first. PATH names cover Linux/CI.
     """
     out: list[str] = []
-    caches = Path.home() / "Library" / "Caches" / "ms-playwright"
-    for pattern in (
-        "chromium_headless_shell-*/chrome-headless-shell-mac-*/chrome-headless-shell",
-        "chromium-*/chrome-mac-*/Chromium.app/Contents/MacOS/Chromium",
-    ):
+    if sys.platform == "win32":
+        cache = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
+        caches = cache / "ms-playwright"
+        patterns = (
+            "chromium_headless_shell-*/chrome-headless-shell-win64/"
+            "chrome-headless-shell.exe",
+            "chromium-*/chrome-win64/chrome.exe",
+        )
+    elif sys.platform == "darwin":
+        caches = Path.home() / "Library" / "Caches" / "ms-playwright"
+        patterns = (
+            "chromium_headless_shell-*/chrome-headless-shell-mac-*/chrome-headless-shell",
+            "chromium-*/chrome-mac-*/Chromium.app/Contents/MacOS/Chromium",
+        )
+    else:
+        caches = Path.home() / ".cache" / "ms-playwright"
+        patterns = (
+            "chromium_headless_shell-*/chrome-headless-shell-linux/"
+            "chrome-headless-shell",
+            "chromium-*/chrome-linux/chrome",
+        )
+    for pattern in patterns:
         hits = sorted(caches.glob(pattern))
         if hits:
             out.append(str(hits[-1]))
-    for path in (
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    installed = (
+        _windows_install_paths(os.environ)
+        if sys.platform == "win32"
+        else [
+            Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ] if sys.platform == "darwin" else []
+    )
+    out.extend(str(path) for path in installed if path.is_file())
+    for name in (
+        "chromium", "chromium-browser", "google-chrome", "chrome",
+        "chrome.exe", "msedge.exe",
     ):
-        if Path(path).is_file():
-            out.append(path)
-    for name in ("chromium", "chromium-browser", "google-chrome", "chrome"):
         found = shutil.which(name)
         if found:
             out.append(found)
-    return out
+    return list(dict.fromkeys(out))
 
 
 def dump_dom(url: str, profile: Path) -> str | None:
