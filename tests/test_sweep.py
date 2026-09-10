@@ -518,7 +518,7 @@ def test_no_check_reads_the_raw_dom():
     having when a failure needs explaining -- so nothing but this test stops a
     check reaching for it.
     """
-    source = Path(sweep.__file__).read_text()
+    source = Path(sweep.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     offenders: list[str] = []
     for node in ast.walk(tree):

@@ -94,7 +94,7 @@ def test_reingesting_same_file_is_a_noop(conn):
 def _overlapping_statement(tmp_path: Path) -> Path:
     """A second statement file carrying the same fills under a new digest."""
     source = STATEMENTS[0]
-    text = source.read_text()
+    text = source.read_text(encoding="utf-8")
     old = 'whenGenerated="20260227;060000"'
     assert old in text, "fixture generation stamp changed; update this seam"
     path = tmp_path / "activity-overlap.xml"
@@ -451,7 +451,7 @@ def test_a_commission_billed_in_another_currency_warns_without_aborting(tmp_path
 
     src = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     doctored = tmp_path / "doctored.xml"
-    raw = src.read_text()
+    raw = src.read_text(encoding="utf-8")
     # Bill one USD option's commission in GBP, leaving everything else intact.
     # The demo emits a Flex XML statement, so this is an attribute, not JSON.
     assert 'ibCommissionCurrency="USD"' in raw
@@ -490,7 +490,7 @@ def test_the_commission_warning_does_not_repeat_on_every_re_ingest(tmp_path):
 
     src = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     doctored = tmp_path / "doctored.xml"
-    raw = src.read_text()
+    raw = src.read_text(encoding="utf-8")
     assert 'ibCommissionCurrency="USD"' in raw
     doctored.write_text(raw.replace('ibCommissionCurrency="USD"',
                                     'ibCommissionCurrency="GBP"', 1))
@@ -1094,7 +1094,7 @@ def _confirm_shaped(statement, target):
     """
     import re
 
-    raw = statement.read_text()
+    raw = statement.read_text(encoding="utf-8")
     assert 'fifoPnlRealized="907.4"' in raw, "the demo statement stopped settling"
     # `ibCommission="` and not `ibCommission`, so ibCommissionCurrency survives.
     raw = re.sub(r'fifoPnlRealized="[^"]*"', 'fifoPnlRealized=""', raw)

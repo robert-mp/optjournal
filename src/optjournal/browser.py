@@ -130,7 +130,8 @@ def dump_dom(url: str, profile: Path) -> str | None:
             ]
             try:
                 proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=_ATTEMPT_TIMEOUT_S
+                    cmd, capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=_ATTEMPT_TIMEOUT_S,
                 )
             except (subprocess.TimeoutExpired, OSError):
                 continue

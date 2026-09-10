@@ -257,7 +257,7 @@ def test_money_stays_a_leaf_module():
     import ast
     import pathlib
 
-    src = pathlib.Path("src/optjournal/money.py").read_text()
+    src = pathlib.Path("src/optjournal/money.py").read_text(encoding="utf-8")
     internal = [
         node
         for node in ast.walk(ast.parse(src))

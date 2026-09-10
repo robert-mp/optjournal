@@ -1363,6 +1363,27 @@ def serve(
         assets=tuple(assets),
     )) if scheduler else None
 
+    # Install stop handlers BEFORE binding the listener. A parent process can
+    # observe the bound socket immediately, and the shutdown tests do exactly
+    # that; installing below `_Server(...)` left a real interval where SIGINT,
+    # SIGTERM or Windows Ctrl+Break took its default action or was missed.
+    stop = threading.Event()
+
+    def _bye(signum: int, _frame: Any) -> None:
+        print(f"\nsignal {signum}, stopping")
+        stop.set()
+
+    # Installed only when this is the main thread. `signal.signal` raises
+    # ValueError elsewhere, and `serve` is importable and callable from a test.
+    stop_signals = [signal.SIGTERM, signal.SIGINT]
+    if hasattr(signal, "SIGBREAK"):
+        # Ctrl+Break is the Windows console event a parent process can send
+        # to a new process group. Ctrl+C still arrives as SIGINT.
+        stop_signals.append(signal.SIGBREAK)
+    for sig in stop_signals:
+        with contextlib.suppress(ValueError):
+            signal.signal(sig, _bye)
+
     with _Server((host, port), partial(_Handler, cfg)) as httpd:
         actual = httpd.socket.getsockname()[1]
         print(f"optjournal UI on http://{host}:{actual}")
@@ -1412,23 +1433,6 @@ def serve(
         # `serve_ephemeral` has always had this shape, which is why the suite never
         # saw the problem: it exercised the safe arrangement and shipped the unsafe
         # one.
-        stop = threading.Event()
-
-        def _bye(signum: int, _frame: Any) -> None:
-            print(f"\nsignal {signum}, stopping")
-            stop.set()
-
-        # Installed only when this is the main thread. `signal.signal` raises
-        # ValueError elsewhere, and `serve` is importable and callable from a test.
-        stop_signals = [signal.SIGTERM, signal.SIGINT]
-        if hasattr(signal, "SIGBREAK"):
-            # Ctrl+Break is the Windows console event a parent process can send
-            # to a new process group. Ctrl+C still arrives as SIGINT.
-            stop_signals.append(signal.SIGBREAK)
-        for sig in stop_signals:
-            with contextlib.suppress(ValueError):
-                signal.signal(sig, _bye)
-
         threading.Thread(target=httpd.serve_forever, name="optjournal-http",
                          daemon=True).start()
         try:

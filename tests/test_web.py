@@ -1414,7 +1414,7 @@ def test_page_escapes_interpolated_values():
     js = _code_only(_js())
     formatter = (
         ROOT / "src" / "optjournal" / "static" / "format.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
     assert "export const esc" in formatter, "no escaping helper defined"
 
     untrusted = ("pos.symbol", "stm.file", "l.underlying_symbol", "l.expiry",
@@ -1541,7 +1541,9 @@ def test_the_origin_guard_runs_before_every_route_so_new_endpoints_inherit_it():
     nothing about them. A guard test that only covers the oldest route is the
     shape of test that rots silently as the file grows.
     """
-    body = code_only((ROOT / "src" / "optjournal" / "web.py").read_text())
+    body = code_only(
+        (ROOT / "src" / "optjournal" / "web.py").read_text(encoding="utf-8")
+    )
     post = body[body.index("def do_POST"):]
     guard = post.index("_same_origin")
     routes = [m.start() for m in re.finditer(r'path (?:==|!=) "', post)]
@@ -2606,7 +2608,9 @@ def _css() -> str:
     read -- so the extraction had to keep the rules reachable through a single seam
     rather than through thirteen splits on markup.
     """
-    return (ROOT / "src" / "optjournal" / "static" / "app.css").read_text()
+    return (
+        ROOT / "src" / "optjournal" / "static" / "app.css"
+    ).read_text(encoding="utf-8")
 
 
 def _fn(name: str) -> str:
@@ -2933,7 +2937,9 @@ def test_strike_keeps_a_half_and_stays_bare_when_whole():
     also why whole strikes must keep rendering bare rather than being padded
     to two places for the rare half.
     """
-    source = (ROOT / "src" / "optjournal" / "static" / "format.js").read_text()
+    source = (
+        ROOT / "src" / "optjournal" / "static" / "format.js"
+    ).read_text(encoding="utf-8")
     assert "export function strike" in source, "the strike helper is gone"
     assert "Number.isInteger(amount)" in source
     leg = _fn("legRow").replace(" ", "")
@@ -3146,7 +3152,7 @@ def test_a_gain_carries_a_sign_glyph_and_not_only_a_hue():
     """
     formatter = (
         ROOT / "src" / "optjournal" / "static" / "format.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
     assert '"pos signed"' in formatter and '"neg signed"' in formatter, (
         "cls() no longer marks signed values, so no gain gets a + and the sign "
         "is carried by hue alone again"
@@ -3682,7 +3688,7 @@ def test_the_chart_axis_dates_are_short_and_unambiguous():
     """
     source = (
         ROOT / "src" / "optjournal" / "static" / "format.js"
-    ).read_text().replace(" ", "")
+    ).read_text(encoding="utf-8").replace(" ", "")
     assert "exportfunctiondayLabel" in source, "the short date formatter is gone"
     chart = _fn("chart").replace(" ", "")
     assert "dayLabel(pt.x,spansYears)" in chart, (

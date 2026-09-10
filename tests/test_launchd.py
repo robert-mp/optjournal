@@ -175,7 +175,7 @@ def test_the_plist_documents_how_to_install_and_stop_it():
     `load`/`unload`: the latter are deprecated and fail confusingly under a user
     domain on current macOS.
     """
-    text = PLIST.read_text()
+    text = PLIST.read_text(encoding="utf-8")
     for command in ("launchctl bootstrap", "launchctl bootout", "launchctl print"):
         assert command in text, f"the plist does not say how to {command.split()[-1]}"
     assert "load " not in text.replace("bootstrap", ""), (
@@ -218,7 +218,7 @@ def test_the_log_rotates_because_macos_will_not(tmp_path):
         # It really writes.
         logging.getLogger("optjournal.test").info("a line for the log")
         handler.flush()
-        assert "a line for the log" in target.read_text()
+        assert "a line for the log" in target.read_text(encoding="utf-8")
     finally:
         logging.getLogger().removeHandler(handler)
         handler.close()
@@ -295,7 +295,7 @@ def test_a_running_scheduler_leaves_evidence_in_the_log(tmp_path, monkeypatch):
         clock.start()
         clock.stop()
         handler.flush()
-        written = target.read_text()
+        written = target.read_text(encoding="utf-8")
     finally:
         logging.getLogger().removeHandler(handler)
         handler.close()

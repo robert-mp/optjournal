@@ -51,7 +51,8 @@ def test_the_javascript_suite_passes():
     assert files, f"no JavaScript tests found in {SUITE}"
     result = subprocess.run(  # noqa: S603 - fixed argv, no shell
         [shutil.which("node") or "node", "--test", *(str(path) for path in files)],
-        capture_output=True, text=True, cwd=ROOT, timeout=120, check=False,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=ROOT, timeout=120, check=False,
     )
     assert result.returncode == 0, (
         "the JS unit suite failed:\n"
@@ -83,7 +84,7 @@ _BROWSER_ONLY = (
 @pytest.mark.parametrize("module", MODULES, ids=lambda p: p.name)
 @pytest.mark.parametrize("token", _BROWSER_ONLY)
 def test_the_pure_module_touches_no_browser_api(token, module):
-    source = code_only(module.read_text())
+    source = code_only(module.read_text(encoding="utf-8"))
     assert token not in source, (
         f"{module.name} references {token!r}. Move it to page.html: these modules "
         "have to stay importable by node, with no DOM and no globals."
@@ -95,7 +96,7 @@ def test_the_page_imports_the_module_rather_than_duplicating_it(module):
     """Two copies of the same scale is worse than one untested copy: the tests
     would pass against a function the page no longer runs.
     """
-    page = PAGE.read_text()
+    page = PAGE.read_text(encoding="utf-8")
     assert f"/static/{module.name}" in page, f"page.html does not import {module.name}"
     assert 'type="module"' in page, "an ES module needs a module script tag"
 
@@ -113,7 +114,7 @@ def test_the_page_imports_exactly_what_it_calls(module):
     watchlist is one tab of nine, so a browser render of the Dashboard would not
     reach it either.
     """
-    page = PAGE.read_text()
+    page = PAGE.read_text(encoding="utf-8")
     block = re.search(
         rf"import\s*\{{([^}}]*)\}}\s*from\s*'/static/{re.escape(module.name)}'", page
     )
@@ -132,7 +133,11 @@ def test_the_page_imports_exactly_what_it_calls(module):
     )
     # The other direction: every exported name the page references must be
     # imported, or it is an undefined identifier at runtime.
-    exported = set(re.findall(r"^export (?:function|const) (\w+)", module.read_text(), re.M))
+    exported = set(re.findall(
+        r"^export (?:function|const) (\w+)",
+        module.read_text(encoding="utf-8"),
+        re.M,
+    ))
     referenced = {
         name for name in exported
         if re.search(rf"(?<![\w.]){name}\s*\(", body) or re.search(rf"\b{name}\b", body)
@@ -148,9 +153,11 @@ def test_the_page_does_not_redefine_what_the_module_exports(module):
     """Catches the specific rot this seam exists to prevent -- a helper copied
     back into the page during a quick fix, leaving the tested version orphaned.
     """
-    exported = set(re.findall(r"^export function (\w+)", module.read_text(), re.M))
+    exported = set(re.findall(
+        r"^export function (\w+)", module.read_text(encoding="utf-8"), re.M
+    ))
     assert exported, "no exports found; the extraction regex is wrong"
-    page = PAGE.read_text()
+    page = PAGE.read_text(encoding="utf-8")
     duplicated = sorted(
         name for name in exported if re.search(rf"\bfunction {name}\s*\(", page)
     )

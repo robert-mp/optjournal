@@ -248,7 +248,7 @@ def _read_state(archive_dir: Path) -> dict[str, dict[str, str]]:
     """
     path = _state_path(archive_dir)
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}

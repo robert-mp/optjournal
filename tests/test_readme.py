@@ -43,7 +43,9 @@ def _table_body() -> str:
     # table is the last thing in the file, and without it this regex matched
     # nothing and the guard failed as though the table were gone.
     match = re.search(
-        r"\| module \| owns \|(.*?)(?:\n\n|\n#|\Z)", ARCHITECTURE.read_text(), re.S
+        r"\| module \| owns \|(.*?)(?:\n\n|\n#|\Z)",
+        ARCHITECTURE.read_text(encoding="utf-8"),
+        re.S,
     )
     assert match, (
         f"{ARCHITECTURE.relative_to(ROOT)} no longer has a `| module | owns |` "
@@ -99,13 +101,13 @@ def test_the_test_count_in_the_development_section_is_not_wildly_stale():
     that adds a test and would be deleted for noise. An order-of-magnitude drift
     means the number has stopped describing the suite at all.
     """
-    text = README.read_text()
+    text = README.read_text(encoding="utf-8")
     quoted = re.search(r"uv run pytest -q\s+#\s*(\d+) tests", text)
     if quoted is None:
         return  # the README stopped quoting a count; nothing to check
     claimed = int(quoted.group(1))
     actual = sum(
-        len(re.findall(r"^def test_", path.read_text(), re.M))
+        len(re.findall(r"^def test_", path.read_text(encoding="utf-8"), re.M))
         for path in (ROOT / "tests").glob("test_*.py")
     )
     # Generous: parametrized cases make the real total higher than the count of
