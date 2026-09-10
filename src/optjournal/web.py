@@ -1351,9 +1351,21 @@ def serve(
         assets=tuple(assets),
     )
 
+    # `ThreadingHTTPServer(...)` binds and starts listening in its constructor,
+    # before `serve_forever()` has entered its loop. A supervisor can therefore
+    # observe the port and send a stop signal while socketserver's private
+    # shutdown event is still unset; calling `shutdown()` in that interval waits
+    # forever. `service_actions()` is first called only after `serve_forever()` has
+    # cleared that event and entered its selector loop, so it is a safe readiness
+    # barrier for the shutdown path.
+    serving = threading.Event()
+
     class _Server(http.server.ThreadingHTTPServer):
         daemon_threads = True
         address_family = socket.AF_INET
+
+        def service_actions(self) -> None:
+            serving.set()
 
     # ThreadingHTTPServer instantiates its handler class per request; partial
     # prepends the config, which is the stdlib-sanctioned way to inject
@@ -1433,8 +1445,15 @@ def serve(
         # `serve_ephemeral` has always had this shape, which is why the suite never
         # saw the problem: it exercised the safe arrangement and shipped the unsafe
         # one.
-        threading.Thread(target=httpd.serve_forever, name="optjournal-http",
-                         daemon=True).start()
+        server_thread = threading.Thread(
+            target=httpd.serve_forever,
+            name="optjournal-http",
+            daemon=True,
+        )
+        server_thread.start()
+        while not serving.wait(0.1):
+            if not server_thread.is_alive():
+                raise RuntimeError("HTTP serving thread exited during startup")
         try:
             stop.wait()
         except KeyboardInterrupt:

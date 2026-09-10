@@ -254,6 +254,10 @@ def test_serve_forever_runs_on_a_thread_not_the_main_one():
         "the main thread no longer blocks on an event, so it has nothing to be "
         "interrupted by a signal"
     )
+    assert body.index("serving.wait(") < body.index("stop.wait()"), (
+        "the main thread can enter shutdown before serve_forever has entered its "
+        "loop; socketserver.shutdown() deadlocks in that startup interval"
+    )
 
 
 def test_a_signal_handler_is_installed_for_both_stop_signals():
