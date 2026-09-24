@@ -1650,7 +1650,23 @@ def serve(
             if not server_thread.is_alive():
                 raise RuntimeError("HTTP serving thread exited during startup")
         try:
-            stop.wait()
+            # LOOPED WITH A TIMEOUT, for the same reason the `serving` barrier above
+            # is, and this asymmetry was a real bug: a bare `Event.wait()` parks the
+            # main thread in a lock acquire that Windows does not interrupt, so
+            # CPython -- which runs signal and console-control handlers on the main
+            # thread only -- could not run `_bye` until the wait returned. Nothing
+            # returns it but `_bye`. Whether that deadlocked depended purely on
+            # whether Ctrl+Break arrived before or after the main thread entered the
+            # wait, which is why it presented as flakiness: three consecutive
+            # windows-latest runs failed `tests/test_shutdown.py`, each on a
+            # different test in the file, while the same suite passed on ubuntu and
+            # on the commit before. Adding imports to the startup path was enough to
+            # move the window.
+            #
+            # Waking five times a second costs nothing measurable and makes the stop
+            # deterministic on every platform.
+            while not stop.wait(0.2):
+                pass
         except KeyboardInterrupt:
             print("\nstopped")
         finally:

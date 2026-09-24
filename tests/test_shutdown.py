@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import ROOT, connect_migrated
+from conftest import ROOT, code_only, connect_migrated
 
 from optjournal.demo import write_demo_statement
 from optjournal.ingest import ingest_file
@@ -189,8 +189,17 @@ def test_the_port_is_released_so_a_respawn_can_bind(journal):
     try:
         proc.communicate(timeout=EXIT_BUDGET_S)
     except subprocess.TimeoutExpired:
+        # THE OUTPUT, not just the fact. This failed three times on windows-latest
+        # saying only "did not exit", which named neither the stage nor the cause --
+        # the startup banner and the scheduler's stop line are both in here, and
+        # which of them is missing is the whole diagnosis. Killed first so
+        # `communicate` returns rather than blocking a second time.
         proc.kill()
-        pytest.fail("serve did not exit; see test_serve_exits_promptly_on_a_signal")
+        output = (proc.communicate()[0] or "").strip()
+        pytest.fail(
+            f"serve did not exit {EXIT_BUDGET_S}s after the stop signal; see "
+            f"test_serve_exits_promptly_on_a_signal. Its output was:\n{output}"
+        )
 
     with socket.socket() as sock:
         try:
@@ -250,11 +259,16 @@ def test_serve_forever_runs_on_a_thread_not_the_main_one():
         "serve_forever is not being run on a thread, so any shutdown() from a "
         "signal handler will deadlock (socketserver's own docstring says so)"
     )
-    assert "stop.wait()" in body, (
+    # `stop.wait(` rather than `stop.wait()`: the wait is LOOPED on a short
+    # timeout now, because a bare one is not interruptible on Windows -- see
+    # test_the_stop_wait_is_interruptible_rather_than_bare. The claim this makes is
+    # unchanged, that the main thread blocks on an event and so has something a
+    # signal can interrupt.
+    assert "stop.wait(" in body, (
         "the main thread no longer blocks on an event, so it has nothing to be "
         "interrupted by a signal"
     )
-    assert body.index("serving.wait(") < body.index("stop.wait()"), (
+    assert body.index("serving.wait(") < body.index("stop.wait("), (
         "the main thread can enter shutdown before serve_forever has entered its "
         "loop; socketserver.shutdown() deadlocks in that startup interval"
     )
@@ -280,3 +294,29 @@ def test_a_signal_handler_is_installed_for_both_stop_signals():
         "installing the handler off the main thread would raise; serve must "
         "tolerate being called from a thread"
     )
+
+
+def test_the_stop_wait_is_interruptible_rather_than_bare():
+    """A bare `Event.wait()` on the main thread is not interruptible on Windows.
+
+    CPython runs signal and console-control handlers on the main thread only, so a
+    main thread parked in an uninterruptible lock acquire cannot run the handler --
+    and nothing but the handler sets the event it is waiting on. Whether that
+    deadlocked depended on whether the signal arrived before or after the wait was
+    entered, so it presented as flakiness: three consecutive windows-latest runs
+    failed this file, each on a different test, while ubuntu passed.
+
+    Pinned as SOURCE because the race is unreproducible on POSIX, where the wait is
+    interruptible and every one of these tests passes either way. A platform-specific
+    hazard that only one platform can demonstrate needs the guard on both.
+    """
+    import re
+
+    body = code_only((ROOT / "src" / "optjournal" / "web.py").read_text(
+        encoding="utf-8"))
+    assert re.search(r"while not stop\.wait\(0?\.\d+\):", body), (
+        "serve() waits on its stop event without a timeout. On Windows that parks "
+        "the main thread where the console-control handler cannot run, so Ctrl+Break "
+        "never stops the process -- loop on a short timeout instead"
+    )
+    assert "stop.wait()\n" not in body, "a bare stop.wait() is back"
