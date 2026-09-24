@@ -156,6 +156,12 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
         row.pop("first_seen_at", None)
         row.pop("broker", None)
         row.pop("source_kind", None)
+        # Provenance added after the baseline, like `source_kind` above: it records
+        # whether the FX rate came from the broker, and for an Activity Statement
+        # it is always 0. Popped rather than re-baselined, because the claim under
+        # test is that the seam produces the same FIGURES, and a column the
+        # pre-seam code had no concept of is not one of them.
+        row.pop("fx_rate_estimated", None)
         actual = hashlib.sha256(
             json.dumps(row, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]

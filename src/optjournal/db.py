@@ -47,7 +47,7 @@ __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -101,14 +101,41 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # this column did came from one. That default is what makes the backfill a
     # no-op instead of a guess.
     ("trades", "source_kind", f"TEXT NOT NULL DEFAULT '{ACTIVITY_SOURCE}'"),
+    # WHETHER `fx_rate_to_base` ON THIS ROW CAME FROM THE BROKER OR FROM US.
+    #
+    # A Trade Confirmation carries no FX rate -- verified against a real payload,
+    # 82 attributes and no `fxRateToBase` among them -- so a same-session fill in
+    # a non-base currency has no broker-stated conversion. This journal fetches a
+    # live rate instead, which makes every `*_base` figure on that row an ESTIMATE
+    # until the Activity Statement supersedes it with IBKR's own.
+    #
+    # Its own column rather than inferred from `source_kind`, because the two are
+    # not the same fact: a confirm already quoted in the base currency has a rate
+    # of exactly 1.0 and nothing is estimated about it. Defaulted to 0, which is
+    # true of every row that existed before this column: they all came from an
+    # Activity Statement.
+    ("trades", "fx_rate_estimated", "INTEGER NOT NULL DEFAULT 0"),
 )
+
+#: Columns on `trades` that shipped `NOT NULL` and have to become optional.
+#:
+#: A Trade Confirmation carries neither -- checked against a real payload rather
+#: than inferred. `transaction_id` is IBKR's settled-record id and a confirm is
+#: not settled; `ib_exec_id` was relaxed earlier for its own reason. Keeping them
+#: required would mean inventing values, and an invented id is worse than an
+#: absent one: it looks like the broker's.
+#:
+#: Listed here because their being NOT NULL is what TRIGGERS the rebuild --
+#: SQLite cannot relax a constraint in place, so the whole table is rebuilt from
+#: the shipped DDL. See `_rekey_by_broker`.
+_RELAXED_TRADE_COLUMNS = ("ib_exec_id", "transaction_id")
 
 _TRADES_DDL = f"""
 CREATE TABLE IF NOT EXISTS trades (
   broker                  TEXT    NOT NULL DEFAULT '{DEFAULT_BROKER}',
   trade_id                TEXT    NOT NULL,
   ib_exec_id              TEXT,
-  transaction_id          TEXT    NOT NULL,
+  transaction_id          TEXT,
   ib_order_id             TEXT,
   account_id              TEXT    NOT NULL,
   trade_date              TEXT    NOT NULL,
@@ -153,6 +180,14 @@ CREATE TABLE IF NOT EXISTS trades (
   -- so the writer RANKS them rather than taking whichever arrived first. See
   -- `ingest.SOURCE_RANK`.
   source_kind             TEXT    NOT NULL DEFAULT '{ACTIVITY_SOURCE}',
+  -- Whether `fx_rate_to_base` came from the broker or from this journal. A Trade
+  -- Confirmation carries no rate, so a same-session fill in a non-base currency
+  -- is converted at a live rate and every `*_base` figure on the row is an
+  -- estimate until the Activity Statement supersedes it. MUST be declared here
+  -- as well as in `_ADDED_COLUMNS`: the rebuild in `_rekey_by_broker` copies only
+  -- the columns the shipped DDL names, so a column that lives in the ALTER list
+  -- alone is added and then silently dropped again by the next rebuild.
+  fx_rate_estimated       INTEGER NOT NULL DEFAULT 0,
   -- Identity is per broker: two brokers may both number a fill 1.
   PRIMARY KEY (broker, trade_id)
 );
@@ -586,7 +621,16 @@ SELECT
   SUM(ib_commission)                                  AS commission,
   SUM(ib_commission_base)                             AS commission_base,
   SUM(fifo_pnl_realized)                              AS realized_pnl,
-  SUM(fifo_pnl_realized_base)                          AS realized_pnl_base
+  SUM(fifo_pnl_realized_base)                          AS realized_pnl_base,
+  -- PROVISIONAL, and the page has to be able to say so. MAX over the group
+  -- because one estimated fill makes the leg's base figures an estimate: these
+  -- columns are SUMs, so a single unconverted row taints the total it lands in.
+  MAX(fx_rate_estimated)                              AS fx_rate_estimated,
+  -- A leg whose fills came only from a Trade Confirmation has no realised P&L at
+  -- all -- IBKR does not send one until the statement -- so a zero here means
+  -- "not known yet" rather than "broke even". MIN, so a leg holding one settled
+  -- fill and one same-session fill reads as settled=0: the mix is not settled.
+  MIN(CASE WHEN source_kind = 'activity' THEN 1 ELSE 0 END) AS settled
 FROM trades
 GROUP BY broker, ib_order_id, conid;
 
@@ -611,7 +655,11 @@ SELECT
   SUM(commission)                AS commission,
   SUM(commission_base)           AS commission_base,
   SUM(realized_pnl)              AS realized_pnl,
-  SUM(realized_pnl_base)         AS realized_pnl_base
+  SUM(realized_pnl_base)         AS realized_pnl_base,
+  -- Carried up from the legs, same rule: one estimated leg makes the order's
+  -- totals estimated, and one unsettled leg makes the order unsettled.
+  MAX(fx_rate_estimated)         AS fx_rate_estimated,
+  MIN(settled)                   AS settled
 FROM trade_legs
 GROUP BY broker, ib_order_id;
 
@@ -812,10 +860,13 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
     # against a key that is really (trade_id, broker) and call them equal.
     keyed = sorted((r["pk"], r["name"]) for r in info if r["pk"])
     key_is_current = tuple(name for _rank, name in keyed) == want_pk
-    exec_id_is_required = table == "trades" and any(
-        r["name"] == "ib_exec_id" and r["notnull"] for r in info
+    # A column that must now be optional but is still NOT NULL means this table
+    # predates the Trade Confirmation work, and SQLite cannot relax a constraint
+    # in place -- so the rebuild below is the only way to get there.
+    relaxed_still_required = table == "trades" and any(
+        r["name"] in _RELAXED_TRADE_COLUMNS and r["notnull"] for r in info
     )
-    if key_is_current and not exec_id_is_required:
+    if key_is_current and not relaxed_still_required:
         return False
 
     before = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
@@ -833,7 +884,8 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
     ordered = [c for c in live if c in shipped]
     names = ", ".join(ordered)
     selected = ", ".join(
-        f"NULLIF({column}, '')" if table == "trades" and column == "ib_exec_id"
+        f"NULLIF({column}, '')"
+        if table == "trades" and column in _RELAXED_TRADE_COLUMNS
         else column
         for column in ordered
     )

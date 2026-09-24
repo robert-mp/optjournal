@@ -195,10 +195,26 @@ import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
  *   `costs`, which is one statement's own 30-day window (serialize.broker_costs_data)
  * @property {Sync} sync
  * @property {Settings} settings -- what the settings page edits
+ * @property {Provisional} provisional -- how much of this journal is same-session
+ *   rather than settled (web._provisional). Whole-journal, deliberately: a caption
+ *   that came and went with the month filter would read as a glitch
+ */
+
+/** @typedef {Object} Provisional -- same-session fills, and what they cost in
+ *  certainty (web._provisional)
+ * @property {number} fills -- rows whose FX rate was ESTIMATED, so every
+ *   base-currency total that sums them is approximate
+ * @property {number} unsettled -- rows from a Trade Confirmation at all. A fill
+ *   quoted in the base currency needs no conversion and is still missing its
+ *   realised P&L until the Activity Statement lands, so this is the larger set
+ * @property {string|null} newest -- the newest such trade date, for the caption
  */
 
 /** @typedef {Object} Settings -- editable preferences (web.build_state)
  * @property {string|null} query_id -- the id a sync would actually use
+ * @property {string|null} confirm_query_id -- the Trade Confirmation query, or
+ *   null when no intraday feed is configured. Absent is the normal state: only the
+ *   Activity Statement is required for this journal to work
  * @property {string} query_id_source -- 'stored', 'override' or 'unset'.
  *   'override' means a --query-id flag or $OPTJOURNAL_QUERY_ID outranks the
  *   stored value, so the form must not offer to edit what would not take effect
@@ -433,9 +449,17 @@ import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
  * @property {Money} commission
  * @property {Money} realized_pnl
  * @property {Array} legs -- Leg rows
+ * @property {number} fx_rate_estimated -- 1 when any fill in this order had its
+ *   FX rate estimated rather than stated by the broker, so the order's base
+ *   figures are approximate. MAX over the legs: one tainted fill taints the sum
+ * @property {number} settled -- 0 when any fill is still same-session only, which
+ *   also means its realised P&L is not known rather than zero
  */
 
 /** @typedef {Object} Leg -- one contract's fills within an order
+ * @property {number} fx_rate_estimated -- 1 when a fill here had its FX rate
+ *   estimated rather than stated by the broker; see Order.fx_rate_estimated
+ * @property {number} settled -- 0 while any fill is same-session only
  * @property {string} broker -- see Order.broker; the leg is grouped per broker too
  * @property {string} ib_order_id
  * @property {string} conid
@@ -1125,7 +1149,7 @@ import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
  *  the guard to both. Declared here, in the file being edited, in the same
  *  diff as the code that introduces the name.
  * @payload st:State s:Stats best:Stats alt:Stats x:Episode ep:Episode dy:Day
- * @payload se:Settings tok:TokenStatus
+ * @payload se:Settings tok:TokenStatus pv:Provisional
  * @payload pos:Position o:Order l:Leg h:History
  * @payload stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
  * @payload mo:Money
@@ -1152,10 +1176,10 @@ import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
  * @local chosen ws opts thin px tile
  * @local shownByDay next picked
  * @local JSON Object ages input mine qb wf was
- * @local when button parts names
+ * @local when button parts names raw
  * @local COST_OPTIONS bits cost fees on wh
  * @local STATS_KEYS_REQUIRED missing state
- * @local SCORINGS qidsave tokcheck toksave
+ * @local SCORINGS qidsave cqidsave tokcheck toksave
  * @local WBX_LABEL WIVR_LABEL WMETER WRING items it arc tin tout sb
  * @local events
  */
@@ -1836,7 +1860,7 @@ function dashboard(){
       per-fill realisation, net of commission.`}</span>i</span></h2>
       <div class="sub">${esc(s.asset_category)} trades and commission only —
       account-level fees and other instruments live on the Costs tab.
-      ${esc(ccyNote())}${scoringBanner(s)}</div></div>
+      ${esc(ccyNote())}${scoringBanner(s)}${provisionalBanner()}</div></div>
       <div class="pills">
         ${S.type?`<span class="pill" title="Every trade-derived figure below is
           restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
@@ -4672,6 +4696,37 @@ function odte(){
    a <details> because their audience is someone debugging, not someone
    configuring -- and the archive table is 25 rows on this journal, which is a
    scroll nobody asked for on the way to two buttons. */
+/* SAYS SO WHEN A HEADLINE CONTAINS AN ESTIMATE.
+
+   Every other figure this journal reports is broker-stated -- see
+   docs/design-notes.md, which quarantines modelled numbers so none can reach a
+   card. Same-session fills are the sanctioned exception: a Trade Confirmation
+   carries no FX rate, so their base-currency figures are converted at a live rate
+   fetched at ingest. The exception is only defensible if the page admits it, which
+   is what this is.
+
+   Silent when there is nothing provisional, which is the steady state: a journal
+   whose confirms have all been superseded shows no banner at all. */
+function provisionalBanner(){
+  const pv=(S.state&&S.state.provisional)||{};
+  if(!pv.unsettled) return '';
+  /* IBKR sends `20260924`; every other date on this page is dashed, and a caption
+     mixing the two spellings reads like a leaked internal field. */
+  const raw=String(pv.newest||'');
+  const iso=/^\d{8}$/.test(raw)
+    ? `${raw.slice(0,4)}-${raw.slice(4,6)}-${raw.slice(6,8)}` : raw.slice(0,10);
+  const day=iso?` (newest ${esc(iso)})`:'';
+  /* TWO COUNTS, and the wording follows whichever is the stronger claim. An
+     estimated rate makes the money approximate; an unsettled fill merely has no
+     realised P&L yet. Reporting only the second would understate it. */
+  return pv.fills
+    ? ` <b class="warn2">${pv.fills} same-session fill(s)${day}</b> —
+      base-currency figures are estimated at a live FX rate and no realised P&L
+      exists yet; tomorrow's statement restates them.`
+    : ` <b class="warn2">${pv.unsettled} same-session fill(s)${day}</b> —
+      no realised P&L exists for these yet; tomorrow's statement settles them.`;
+}
+
 function settingsPanel(){
   const st=S.state, se=st.settings||{};
   const src=se.query_id_source;
@@ -4714,6 +4769,20 @@ function settingsPanel(){
       :src==='unset'?`<div class="note"><b>No query id yet.</b> Client Portal →
         Performance &amp; Reports → Flex Queries. Sync stays disabled until this
         is set.</div>`:''}
+    <div class="setrow mt-4">
+      <label class="flabel" for="cqid">Confirms Query ID</label>
+      <input id="cqid" class="tin mono" inputmode="numeric" maxlength="32"
+        value="${esc(se.confirm_query_id||'')}" placeholder="optional">
+      <button id="cqidsave">Save</button>
+      <span id="cqidmsg" class="dim"></span>
+    </div>
+    <div class="note">A <b>Trade Confirmation</b> query, which reports fills the
+    same session where the Activity Statement above is next-day. With one set, the
+    journal polls it through market hours and today's trades appear within minutes
+    — marked provisional, because a confirm carries no realised P&L and no FX rate.
+    Leave it empty for statement-only, which is what every figure here was built
+    on.</div>
+
     <div class="setrow mt-4">
       <label class="flabel" for="tok">Flex token</label>
       <input id="tok" class="tin mono" type="password" autocomplete="off"
@@ -4994,6 +5063,16 @@ function draw(push){
     const res=await save({query_id:(el&&el.value||'').trim()});
     /* The SERVER's message, not a local guess: it holds the shape rule (digits,
        length) and repeating it here would be two rules to keep in step. */
+    if(msg) msg.textContent=res&&res.ok?'saved':((res&&res.message)||'failed');
+    if(res&&res.ok) load();
+  };
+  const cqidsave=$('#cqidsave');
+  if(cqidsave) cqidsave.onclick=async()=>{
+    const el=$('#cqid'), msg=$('#cqidmsg');
+    if(msg) msg.textContent='saving...';
+    /* An EMPTY value is a real choice -- it turns the intraday poll off -- so this
+       sends the blank rather than refusing it the way the token field does. */
+    const res=await save({confirm_query_id:(el&&el.value||'').trim()});
     if(msg) msg.textContent=res&&res.ok?'saved':((res&&res.message)||'failed');
     if(res&&res.ok) load();
   };

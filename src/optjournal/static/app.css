@@ -292,6 +292,11 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    the glyph follows the arithmetic and the tint keeps carrying the emphasis.
    `money()` already renders its own minus, hence `.pos.signed` only. */
 .pos{color:var(--ok)} .neg{color:var(--bad)}
+/* A caption that has to admit an estimate. Foreground only -- it sits INSIDE a
+   `.sub` line rather than owning a row, so a filled pill would pull the eye away
+   from the figure it is qualifying. `--warnfg` is the token every warning surface
+   already uses, so this inherits each theme's contrast check for free. */
+.warn2{color:var(--warnfg)}
 .pos.signed::before{content:"+"}
 .wrap{max-width:1480px;margin:0 auto;padding:22px}
 

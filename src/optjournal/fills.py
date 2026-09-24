@@ -63,7 +63,12 @@ class NormalisedFill:
     # Some IBKR executions legitimately omit ibExecID. The trade id remains the
     # row identity; exec_id is an optional secondary dedupe key.
     exec_id: str | None
-    transaction_id: str
+    #: IBKR's settled-record id. Optional because a Trade Confirmation carries no
+    #: `transactionID` -- verified against a real payload -- and a same-session
+    #: fill is exactly the case where it does not exist yet. Not an identity here
+    #: either way: that is `(broker, trade_id)`. `cash_transactions` keys on its
+    #: own transaction id and is unaffected.
+    transaction_id: str | None
     order_id: str | None
 
     account_id: str

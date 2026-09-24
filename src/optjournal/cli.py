@@ -57,13 +57,22 @@ from optjournal.flex import (
     TokenRejected,
     TokenWriteRefused,
     fetch,
+    fetch_confirms,
     load,
     read_token,
     write_token,
 )
 from optjournal.history import build_history
-from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
-from optjournal.jobs import record_manual_sync, record_run
+from optjournal.ingest import (
+    ASSET_FILTER_ALL,
+    ingest_confirms,
+    ingest_file,
+)
+from optjournal.jobs import (
+    CONFIRM_COOLDOWN_S,
+    record_manual_sync,
+    record_run,
+)
 from optjournal.render import (
     render_friction,
     render_history,
@@ -1092,6 +1101,84 @@ def cmd_setup(args) -> int:
     return EXIT_OK
 
 
+def cmd_confirms(args) -> int:
+    """Fetch today's Trade Confirmations and fold them in. Same-session fills.
+
+    The intraday counterpart to `sync`: the Activity Statement is T+1, so a fill
+    made this morning reaches the journal tomorrow, where a confirm reaches it
+    within minutes. Both write the same `trades` rows and `ingest.SOURCE_RANK`
+    decides which wins, so running this never costs you settled figures.
+
+    A separate command rather than a flag on `sync`, because the two are different
+    queries on different cadences with different budgets -- and because a cron that
+    wants one must not be able to accidentally get the other.
+    """
+    query_id = settings.confirm_query_id(args.query_id)
+    if not query_id:
+        print(
+            "No Trade Confirmation query ID. Create the query in Client Portal "
+            "(Performance & Reports -> Flex Queries -> the + under Trade "
+            "Confirmation Flex Query Templates), then set it in the page under "
+            "Settings, pass it as an argument, or export "
+            "$OPTJOURNAL_CONFIRM_QUERY_ID.",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    with open_journal(args.db) as conn:
+        base = _journal_base_currency(conn)
+        if not base:
+            print(
+                "No ingested statement to read the base currency from. Run "
+                "`optjournal sync` first: a confirm carries no base-currency "
+                "conversion, so the journal has to know what it is converting to.",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIG
+        result = fetch_confirms(
+            query_id, archive_dir=args.archive,
+            from_date=args.from_date, to_date=args.to_date, force=args.force,
+            cooldown_s=0 if args.force else CONFIRM_COOLDOWN_S,
+        )
+        ingested = ingest_confirms(
+            conn, result.raw_path, base_currency=base,
+            assets=_asset_filter(args.assets),
+        )
+
+    data = {
+        "query_id": query_id,
+        "archive": result.raw_path.name,
+        "raw_bytes": result.raw_bytes,
+        "reused_archive": result.is_duplicate,
+        "new_trades": ingested.trades_inserted,
+        "updated_trades": ingested.trades_superseded,
+        "already_known": ingested.trades_skipped_existing,
+        "warnings": ingested.warnings,
+    }
+    lines = [
+        f"confirms {query_id}  {result.raw_bytes:,} bytes -> {result.raw_path.name}",
+        f"  {ingested.trades_inserted} new, {ingested.trades_superseded} updated, "
+        f"{ingested.trades_skipped_existing} already known",
+    ]
+    # Every same-session fill is PROVISIONAL, and saying so once here is cheaper
+    # than a reader discovering tomorrow that a figure moved.
+    if ingested.trades_inserted:
+        lines.append("  same-session fills: base-currency figures are estimated at "
+                     "a live FX rate until the Activity Statement lands")
+    lines.extend(f"  ! {w}" for w in ingested.warnings)
+    _emit(data, "\n".join(lines), args.json)
+    return EXIT_OK
+
+
+def _journal_base_currency(conn) -> str | None:
+    """The account's base currency, from the newest ingested statement."""
+    row = conn.execute(
+        "SELECT base_currency FROM statements WHERE base_currency IS NOT NULL"
+        " ORDER BY ingested_at DESC LIMIT 1"
+    ).fetchone()
+    return str(row["base_currency"]) if row and row["base_currency"] else None
+
+
 def cmd_sync(args) -> int:
     """Fetch the latest statement, fold it in, and report only what is new.
 
@@ -1341,6 +1428,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true",
                    help="bypass the local per-query fetch cooldown")
     p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("confirms", parents=[common, archive, database],
+                       help="fetch today's Trade Confirmations (same-session fills)")
+    p.add_argument("query_id", nargs="?",
+                   help="Trade Confirmation Flex Query ID; falls back to "
+                        "$OPTJOURNAL_CONFIRM_QUERY_ID or the stored setting")
+    p.add_argument("--from", dest="from_date", metavar="DATE",
+                   help="YYYYMMDD or YYYY-MM-DD period override")
+    p.add_argument("--to", dest="to_date", metavar="DATE",
+                   help="YYYYMMDD or YYYY-MM-DD period override")
+    p.add_argument("--assets", default="ALL", metavar="LIST",
+                   help="asset categories to store, or ALL (default: ALL)")
+    p.add_argument("--force", action="store_true",
+                   help="bypass the local per-query fetch cooldown")
+    p.set_defaults(func=cmd_confirms)
 
     p = sub.add_parser("serve", parents=[common],
                        help="local web UI (loopback only, no auth)")

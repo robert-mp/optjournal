@@ -61,7 +61,12 @@ from optjournal.archive import newest_statement
 from optjournal.campaigns import position_count
 from optjournal.clock import parse_day
 from optjournal.costs import CostScope, build_costs
-from optjournal.db import DEFAULT_BROKER, connect, open_journal
+from optjournal.db import (
+    CONFIRM_SOURCE,
+    DEFAULT_BROKER,
+    connect,
+    open_journal,
+)
 from optjournal.events import (
     EventFetchError,
     EventRateLimited,
@@ -559,6 +564,12 @@ def build_state(
         odte, rest, unknown_dte = odte_cohorts(
             conn, asset_category=asset_category, report=report
         )
+        # Inside the connection block, unlike where it is ASSIGNED below: the
+        # journal closes before the settings and sync blocks are built, and reading
+        # a closed connection there raised `Cannot operate on a closed database`
+        # across 24 tests at once. Computed here, attached there, so the payload's
+        # reading order still matches how a reader thinks about it.
+        provisional = _provisional(conn)
         state["odte"] = {
             "cohort": cohort_data(odte),
             "rest": cohort_data(rest),
@@ -614,6 +625,10 @@ def build_state(
     state["settings"] = {
         "query_id": query_id,
         "query_id_source": source,
+        # The intraday query. No `_source` twin: it has no `--confirm-query-id`
+        # flag, so the stored value is the only thing that can be in force and a
+        # form offering to edit it can never be lying about taking effect.
+        "confirm_query_id": prefs.confirm_query_id(),
         "scoring": state["stats"]["scoring"],
         # Deliberately NOT a keyring lookup. `flex.read_token` reaches the OS
         # credential store, which has been measured at 8.2s on this machine when
@@ -622,6 +637,17 @@ def build_state(
         # is paid by someone who wants the answer.
         "token": None,
     }
+    # WHAT IN THIS PAYLOAD IS NOT SETTLED YET.
+    #
+    # Same-session fills reach the journal through the Trade Confirmation query,
+    # which carries no realised P&L and no FX rate -- so their base-currency
+    # figures are converted at a live rate and every headline that sums them
+    # contains an estimate. `docs/design-notes.md` otherwise forbids a modelled
+    # number reaching a headline card; this is the one sanctioned exception, and
+    # the price of it is that the page must SAY SO. Hence a payload block rather
+    # than a detail buried in a row: the caption needs one number to decide
+    # whether to warn at all.
+    state["provisional"] = provisional
     state["sync"] = {
         "query_id": query_id,
         "configured": bool(query_id),
@@ -632,6 +658,34 @@ def build_state(
         ),
     }
     return state
+
+
+def _provisional(conn: sqlite3.Connection) -> dict[str, Any]:
+    """How much of this journal is same-session rather than settled.
+
+    Two counts, because they answer different questions. `fills` is how many rows
+    carry an ESTIMATED FX rate, which is what makes a base-currency total
+    approximate. `unsettled` is how many came from a Trade Confirmation at all,
+    estimated or not -- a fill quoted in the base currency needs no conversion and
+    is still missing its realised P&L until the statement lands.
+
+    Whole-journal rather than scoped to the current filter. A caption that appeared
+    and vanished as the reader changed month would be read as a glitch, and the
+    claim being made is about the DATA, not about the selection.
+    """
+    row = conn.execute(
+        "SELECT"
+        " COALESCE(SUM(fx_rate_estimated), 0)                        AS fills,"
+        " COALESCE(SUM(source_kind = ?), 0)                          AS unsettled,"
+        " MAX(trade_date)                                            AS newest"
+        " FROM trades WHERE source_kind = ? OR fx_rate_estimated = 1",
+        (CONFIRM_SOURCE, CONFIRM_SOURCE),
+    ).fetchone()
+    return {
+        "fills": int(row["fills"] or 0) if row else 0,
+        "unsettled": int(row["unsettled"] or 0) if row else 0,
+        "newest": str(row["newest"]) if row and row["newest"] else None,
+    }
 
 
 def _do_sync(
@@ -1104,6 +1158,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                              "message": f"{raw!r} is not a Flex query id: "
                                         "Client Portal shows it as digits."}
             changes["query_id"] = raw or None
+        if "confirm_query_id" in body:
+            raw = str(body.get("confirm_query_id") or "").strip()
+            # Same shape rule as the statement's, and the same reasoning: only IBKR
+            # can say whether a well-formed id exists. Absence is a real choice here
+            # rather than an error -- clearing the field turns the intraday poll off,
+            # which is the supported way to stop it.
+            if raw and (len(raw) > 32 or not raw.isdigit()):
+                return 400, {"ok": False, "kind": "confirm_query_id",
+                             "message": f"{raw!r} is not a Flex query id: "
+                                        "Client Portal shows it as digits."}
+            changes["confirm_query_id"] = raw or None
         if "scoring" in body:
             raw = str(body.get("scoring") or "").strip()
             if raw and raw not in SCORINGS:

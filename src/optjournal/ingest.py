@@ -31,6 +31,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from optjournal.confirms import base_rate, parse_confirms
+from optjournal.confirms import statement_meta as confirm_meta
 from optjournal.db import ACTIVITY_SOURCE, CONFIRM_SOURCE, DEFAULT_BROKER
 from optjournal.sources import source_for
 
@@ -77,7 +79,7 @@ _TRADE_COLUMNS: tuple[str, ...] = (
     "proceeds", "proceeds_base",
     "ib_commission", "ib_commission_base", "ib_commission_currency", "taxes",
     "fifo_pnl_realized", "fifo_pnl_realized_base", "mtm_pnl",
-    "raw", "source_file", "first_seen_at", "source_kind",
+    "raw", "source_file", "first_seen_at", "source_kind", "fx_rate_estimated",
 )
 
 #: The three columns a supersede leaves alone.
@@ -276,6 +278,87 @@ def ingest_file(
     return result
 
 
+def ingest_confirms(
+    conn: sqlite3.Connection,
+    path: Path,
+    *,
+    base_currency: str,
+    assets: Iterable[str] = DEFAULT_ASSET_FILTER,
+    broker: str = DEFAULT_BROKER,
+    rate_for: Any = None,
+) -> IngestResult:
+    """Ingest one archived Trade Confirmation payload. Safe to call repeatedly.
+
+    A confirm is FILLS ONLY. It carries no cash transactions, no position
+    snapshot, no securities and no NAV, so this writes the provenance row and the
+    trades and nothing else -- rather than calling `ingest_file`, which would ask
+    a confirm reader for five sections it does not have.
+
+    IDEMPOTENT BY RANK, not by digest. `ingest_file` short-circuits on unchanged
+    bytes; that is wrong here, because the useful case is the SAME query polled
+    again through the session, where the payload grows by a fill and re-reading the
+    earlier ones must be free. `_ingest_trades` already does that: a fill whose
+    stored row came from an equal-or-better source is skipped, so re-ingesting
+    costs a few primary-key lookups and changes nothing.
+
+    `base_currency` is passed in because a confirm has no AccountInformation
+    section to read it from -- the journal's own statements are the only honest
+    source. `rate_for` is injected so the fetch of a live FX rate is the caller's
+    to make, cache and test.
+    """
+    path = Path(path)
+    result = IngestResult(source_file=path.name)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if rate_for is None:
+        rate_for = _live_rate_for(base_currency)
+
+    # Provenance first: `statements.source_file` is a foreign key from `trades`,
+    # so the row has to exist before any fill can reference it. A confirm IS a
+    # source file, and recording it keeps every trade row's provenance answerable.
+    for meta in confirm_meta(path, base_currency=base_currency):
+        conn.execute(
+            "INSERT INTO statements (broker, source_file, sha256, account_id,"
+            " from_date, to_date, when_generated, base_currency, asset_filter,"
+            " ingested_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(source_file) DO UPDATE SET"
+            " sha256=excluded.sha256, ingested_at=excluded.ingested_at",
+            (
+                broker, path.name, digest, meta.account_id, meta.from_date,
+                meta.to_date, meta.generated_at, meta.base_currency,
+                ",".join(assets) or "ALL", _now(),
+            ),
+        )
+
+    pairs = parse_confirms(path, rate_for=lambda ccy: rate_for(ccy)[0])
+    for _account_id, fill in pairs:
+        estimated = rate_for(fill.currency)[1]
+        _ingest_trades(conn, [fill], path.name, assets, result,
+                       base_currency=base_currency, broker=broker,
+                       source_kind=CONFIRM_SOURCE, fx_rate_estimated=estimated)
+    conn.commit()
+    return result
+
+
+def _live_rate_for(base_currency: str) -> Any:
+    """A memoised `currency -> (rate, estimated)` for one ingest.
+
+    ONE FETCH PER CURRENCY, not per fill: a session with fourteen USD fills must
+    not make fourteen identical HTTP requests, and a rate that moved between the
+    first and the last would also store fills converted at different rates for the
+    same minute. Memoised per call rather than globally, so a long-running server
+    re-reads the rate on the next poll instead of holding one from the open.
+    """
+    cache: dict[str | None, tuple[float, bool]] = {}
+
+    def resolve(currency: str | None) -> tuple[float, bool]:
+        if currency not in cache:
+            cache[currency] = base_rate(currency, base_currency)
+        return cache[currency]
+
+    return resolve
+
+
 def _commission_base(
     commission: float | None,
     commission_ccy: str | None,
@@ -332,7 +415,8 @@ def _stored_rank(conn, broker: str, trade_id: Any) -> int | None:
 def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
                    base_currency: str | None = None,
                    broker: str = DEFAULT_BROKER,
-                   source_kind: str = ACTIVITY_SOURCE) -> None:
+                   source_kind: str = ACTIVITY_SOURCE,
+                   fx_rate_estimated: bool = False) -> None:
     """Write broker-neutral fills into the trades table.
 
     Reads `NormalisedFill`s (sources.py), never a broker's own model, so this
@@ -350,6 +434,13 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
     `source_kind` says WHICH Flex query these fills came from, and ranks them
     (`SOURCE_RANK`): a same-session Trade Confirmation may be superseded by the
     next day's Activity Statement, never the other way round.
+
+    `fx_rate_estimated` records that `fill.fx_rate_to_base` did not come from the
+    broker. A confirm carries no rate, so the caller fetched a live one and every
+    `*_base` figure written here is an estimate until the statement supersedes it.
+    Stamped per row rather than derived from `source_kind`, because a confirm
+    already quoted in the base currency has a rate of exactly 1.0 and nothing
+    about it is estimated.
     """
     incoming_rank = SOURCE_RANK.get(source_kind, 0)
     for fill in fills:
@@ -409,7 +500,7 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
                 None if realized is None else realized * rate,
                 fill.mtm_pnl,
                 json.dumps(fill.raw, default=str, sort_keys=True),
-                source_file, _now(), source_kind,
+                source_file, _now(), source_kind, int(fx_rate_estimated),
             ),
         )
         if stored_rank is None:

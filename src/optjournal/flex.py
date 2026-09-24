@@ -42,6 +42,7 @@ __all__ = [
     "FETCH_COOLDOWN_S",
     "POLL_WORST_CASE_S",
     "FetchCooldown",
+    "ConfirmFetch",
     "FetchResult",
     "TokenMissing",
     "TokenRejected",
@@ -49,6 +50,7 @@ __all__ = [
     "archive_digest",
     "cooldown_remaining",
     "fetch",
+    "fetch_confirms",
     "last_fetch",
     "load",
     "read_token",
@@ -76,6 +78,12 @@ FETCH_COOLDOWN_S = 900
 #: rather than in the database, so `fetch` stays usable with no DB present
 #: and the guard survives a database rebuild.
 STATE_FILE = ".fetch-state.json"
+
+#: Archive filename prefixes, one per Flex query type. `activity-*.xml` is what
+#: every archive walker globs, so a confirm MUST NOT land under it -- see
+#: `_archive`.
+ACTIVITY_PREFIX = "activity"
+CONFIRM_PREFIX = "confirm"
 
 #: Sibling lock file for the whole check-download-record sequence. Beside the
 #: state file it guards, in the archive directory, so one journal's fetches do
@@ -504,22 +512,117 @@ def _find_identical(raw: bytes, archive_dir: Path) -> Path | None:
     return None
 
 
-def _archive(raw: bytes, archive_dir: Path) -> tuple[Path, Path | None]:
+def _archive(
+    raw: bytes,
+    archive_dir: Path,
+    *,
+    prefix: str = ACTIVITY_PREFIX,
+    stamp_format: str = "%Y%m%dT%H%M%SZ",
+) -> tuple[Path, Path | None]:
     """Archive raw XML, reusing an identical existing file if there is one.
 
     Returns (path_to_use, duplicate_of). When a duplicate is found nothing is
     written and `path_to_use` is the pre-existing file, so the archive holds
     exactly one copy of each distinct statement.
+
+    `prefix` names the query TYPE, and the two must not share one: everything that
+    walks the archive -- `archive.newest_statement`, the statements inventory, the
+    ingest -- globs `activity-*.xml` and would try to read a confirm as a
+    statement. A confirm is a different schema, not a smaller statement.
     """
     existing = _find_identical(raw, archive_dir)
     if existing is not None:
         return existing, existing
 
     archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    dest = archive_dir / f"activity-{stamp}.xml"
+    stamp = datetime.now(UTC).strftime(stamp_format)
+    dest = archive_dir / f"{prefix}-{stamp}.xml"
     dest.write_bytes(raw)
     return dest, None
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmFetch:
+    """A downloaded Trade Confirmation payload, archived and unparsed.
+
+    Deliberately NOT a `FetchResult`. That type carries a parsed
+    `FlexQueryResponse`, and py_ibkr models the Activity Statement only -- there is
+    no `TCF` model to put there. Making its `response` optional would push a
+    `None` check into every Activity caller to serve a query type they never see.
+    `confirms.parse_confirms` reads the file this points at.
+    """
+
+    raw_path: Path
+    raw_bytes: int
+    duplicate_of: Path | None = None
+
+    @property
+    def is_duplicate(self) -> bool:
+        return self.duplicate_of is not None
+
+
+def fetch_confirms(
+    query_id: str,
+    *,
+    archive_dir: Path,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    account: str | None = None,
+    force: bool = False,
+    cooldown_s: int = FETCH_COOLDOWN_S,
+) -> ConfirmFetch:
+    """Download a Trade Confirmation query and archive it. No parse.
+
+    Everything `fetch` protects is protected here too, and by the same code: the
+    cross-process lock, the per-query cooldown, the content dedupe and the state
+    stamp. The cooldown is keyed by QUERY ID, so the confirm query gets its own
+    budget rather than sharing the statement's -- which is what makes polling this
+    every half hour compatible with a daily statement sync.
+
+    A shorter `cooldown_s` than the statement's default is the point of the
+    parameter: confirms change through the session, where an Activity Statement is
+    regenerated once a day. See `jobs.CONFIRM_COOLDOWN_S`.
+    """
+    with locked(archive_dir / FETCH_LOCK):
+        if not force:
+            _check_cooldown(archive_dir, query_id, cooldown_s)
+        token = read_token(account)
+        client = _client_factory(user_agent=USER_AGENT)
+        log.info("requesting Flex confirms query %s", query_id)
+        try:
+            raw = client.download(
+                token,
+                query_id,
+                max_retries=MAX_RETRIES,
+                retry_interval=RETRY_INTERVAL,
+                max_retry_interval=MAX_RETRY_INTERVAL,
+                from_date=_norm_date(from_date),
+                to_date=_norm_date(to_date),
+            )
+        except FlexError as exc:
+            _reraise_if_token_rejected(exc)
+            raise
+        # ONE FILE PER DAY, overwritten by each poll, where the statement gets one
+        # per fetch. The reason is in the payload: `whenGenerated` changes on every
+        # request, so the bytes are never identical and the content dedupe cannot
+        # collapse them -- polling every 25 minutes would archive fifteen files a
+        # session and open fifteen `statements` rows for one day of fills.
+        #
+        # Nothing is lost by overwriting. A confirm payload is CUMULATIVE for its
+        # period, so the last poll of the day is a superset of every earlier one,
+        # and the Activity Statement supersedes all of it tomorrow anyway.
+        path, duplicate_of = _archive(
+            raw, archive_dir, prefix=CONFIRM_PREFIX, stamp_format="%Y%m%d",
+        )
+        if duplicate_of is not None:
+            log.info("confirms identical to %s; not archiving a second copy",
+                     path.name)
+        else:
+            log.info("archived %d bytes to %s", len(raw), path)
+        _record_fetch(archive_dir, query_id, hashlib.sha256(raw).hexdigest(), path)
+        return ConfirmFetch(
+            raw_path=path, raw_bytes=len(raw), duplicate_of=duplicate_of,
+        )
 
 
 def _norm_date(value: str | None) -> str | None:

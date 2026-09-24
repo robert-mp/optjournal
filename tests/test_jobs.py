@@ -439,7 +439,12 @@ def test_only_the_sync_spends_a_broker_request():
     """
     from optjournal.jobs import JOBS
 
-    assert {job.name for job in JOBS if job.spends_broker_request} == {"sync"}
+    # TWO, since Trade Confirmations: the daily statement and the intraday poll
+    # each spend against the same token's lockout allowance. Pinned as a SET rather
+    # than loosened to "at least sync", so a third spender still has to be declared
+    # here deliberately -- which is the whole point of the flag.
+    assert {job.name for job in JOBS if job.spends_broker_request} == {
+        "sync", "confirm"}
 
 
 def test_the_live_poll_is_a_window_and_the_rest_are_wall_clock():
@@ -454,7 +459,12 @@ def test_the_live_poll_is_a_window_and_the_rest_are_wall_clock():
     from optjournal.jobs import JOBS, Catchup, job_by_name
 
     assert job_by_name("bars_live").catchup is Catchup.WINDOW
-    assert {j.name for j in JOBS if j.catchup is Catchup.WINDOW} == {"bars_live"}
+    assert {j.name for j in JOBS if j.catchup is Catchup.WINDOW} == {
+        "bars_live", "confirm"}, (
+        "the window jobs are the two intraday ones: bars_live and the Trade "
+        "Confirmation poll. Both ask 'is it session time, and is the last success "
+        "stale' rather than claiming a wall-clock minute"
+    )
     # And nothing is NONE: a job that silently drops a missed instant would have
     # to earn that, and none of the four has.
     assert not [j for j in JOBS if j.catchup is Catchup.NONE]
@@ -933,7 +943,11 @@ def test_the_payload_says_which_jobs_spend_a_broker_request(conn):
     spends = {row["job"]: row["spends_request"]
               for row in jobs_data(conn, now=datetime.now(UTC))["jobs"]}
     assert spends["sync"] is True
-    assert not any(v for k, v in spends.items() if k != "sync"), (
+    assert spends["confirm"] is True, (
+        "the Trade Confirmation poll spends a request too, and the page has to say "
+        "so -- it is the one that fires every half hour"
+    )
+    assert not any(v for k, v in spends.items() if k not in ("sync", "confirm")), (
         f"a job other than sync claims to spend a broker request: {spends}"
     )
 
@@ -1371,7 +1385,12 @@ def test_the_live_poll_ignores_the_empty_ledger_rule_and_that_is_correct():
         "market hours silently loses that session's perishable bars"
     )
     # And the instant-claiming jobs at the SAME clock are still held back.
-    assert _names(_due(mid, ever_ran=set())) == ["bars_live"], (
+    # Sorted by `_names`, so this is a SET claim rather than an execution order.
+    # The Trade Confirmation poll shares the exemption and the reasoning: a rebuilt
+    # journal in market hours should collect today's fills rather than wait, and the
+    # statement supersedes whatever it collects. Everything that claims a
+    # wall-clock instant is still held back.
+    assert _names(_due(mid, ever_ran=set())) == ["bars_live", "confirm"], (
         "a job that catches up fired on an empty ledger"
     )
 
@@ -1990,3 +2009,69 @@ def test_a_bars_run_that_collected_nothing_at_all_still_fails(conn, monkeypatch)
     outcome = jobs._bars(conn, None, live=False)
     assert outcome.status == "failed"
     assert "TSLA 1d" in outcome.detail
+
+
+# --------------------------------------------------------------------------
+# The Trade Confirmation poll. Same-session fills, every 25 minutes in session.
+# --------------------------------------------------------------------------
+
+def test_no_confirm_query_configured_is_nothing_not_a_failure(conn, monkeypatch):
+    """The common case, and it must not accumulate failures.
+
+    Only the Activity Statement is required for this journal to work, so a reader
+    who never creates a confirm query has an idle job -- not a red Collection card
+    and not a job backed off after five ticks of a feature nobody enabled.
+    """
+    from pathlib import Path  # noqa: PLC0415 - local to this test
+
+    from optjournal import jobs
+
+    monkeypatch.setattr(jobs.prefs, "confirm_query_id", lambda *a, **k: None)
+    ctx = jobs.Context(archive_dir=Path("."), db_path=Path("."))
+    outcome = jobs._confirm(conn, ctx)
+    assert outcome.status == "nothing"
+    assert "no Trade Confirmation query configured" in outcome.detail
+
+
+def test_a_journal_with_no_statement_yet_waits_rather_than_failing(conn, monkeypatch):
+    """A confirm carries no base currency, so the journal has to supply it.
+
+    `nothing`, because the precondition is unmet rather than broken and the daily
+    sync resolves it on its own. Counting it would back the poll off five ticks into
+    a fresh clone's first market session -- exactly when it should be waiting.
+    """
+    from pathlib import Path  # noqa: PLC0415 - local to this test
+
+    from optjournal import jobs
+
+    monkeypatch.setattr(jobs.prefs, "confirm_query_id", lambda *a, **k: "1621016")
+    ctx = jobs.Context(archive_dir=Path("."), db_path=Path("."))
+    outcome = jobs._confirm(conn, ctx)
+    assert outcome.status == "nothing"
+    assert "sync has to land first" in outcome.detail
+
+
+def test_the_confirm_poll_has_its_own_cooldown_well_under_the_statements(conn):
+    """Two query types, two cadences, and the budgets do not share.
+
+    A statement is regenerated once a day, so its 15-minute cooldown costs nothing;
+    a confirm payload grows with every fill, so the same window would make an
+    intraday feed pointless. `flex._check_cooldown` is keyed by query id, which is
+    what lets these differ without the shorter one loosening the longer.
+    """
+    from optjournal.flex import FETCH_COOLDOWN_S
+    from optjournal.jobs import CONFIRM_COOLDOWN_S, job_by_name
+
+    assert CONFIRM_COOLDOWN_S < FETCH_COOLDOWN_S
+    job = job_by_name("confirm")
+    assert job.window_s <= 30 * 60, (
+        "the poll window is wider than half an hour, which is not an hourly feed"
+    )
+    assert job.window_s * 60 >= CONFIRM_COOLDOWN_S, (
+        "the cooldown is longer than the poll window, so every scheduled run would "
+        "be refused before it sent anything"
+    )
+    assert job.spends_broker_request is True
+    assert job.zone == "America/New_York", (
+        "the poll is scheduled off the session, not off the reader's wall clock"
+    )

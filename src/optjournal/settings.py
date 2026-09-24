@@ -44,6 +44,7 @@ __all__ = [
     "DEV_ENV",
     "FILENAME",
     "HOME_ENV",
+    "confirm_query_id",
     "dev",
     "path_for",
     "read",
@@ -65,7 +66,7 @@ FILENAME = ".optjournal.json"
 #: hand and writes nothing else. So the unauthenticated HTTP surface cannot turn
 #: dev mode on: it is set out-of-band, the way IAG's `is_admin` is a server
 #: decision the client can only read -- see `dev` below.
-_KEYS = frozenset({"query_id", "scoring", "dev"})
+_KEYS = frozenset({"query_id", "confirm_query_id", "scoring", "dev"})
 
 #: The environment channel for the dev flag. `OPTJOURNAL_DEV=1 optjournal serve`
 #: turns developer-only surfaces on for one session without touching the file.
@@ -161,6 +162,32 @@ def query_id(
         explicit,
         os.environ.get("OPTJOURNAL_QUERY_ID"),
         read(root).get("query_id"),
+    ):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+    return None
+
+
+def confirm_query_id(
+    explicit: str | None = None, *, root: Path | None = None
+) -> str | None:
+    """The Trade Confirmation query id, by the same precedence as `query_id`.
+
+    A SECOND id rather than a mode on the first, because they are two different
+    saved queries in Client Portal returning two different schemas: the Activity
+    Statement is T+1 and settled, a confirm is same-session and provisional. One
+    id doing both would mean the journal could not hold them at once, which is the
+    whole arrangement -- the daily sync keeps the statement, the intraday poll
+    keeps the confirms, and `ingest.SOURCE_RANK` decides which wins per fill.
+
+    Absent is a SUPPORTED state, and the common one: a journal with no confirm
+    query configured simply has no intraday feed, and the job that polls it stays
+    idle rather than failing. Only the Activity Statement is required to work.
+    """
+    for candidate in (
+        explicit,
+        os.environ.get("OPTJOURNAL_CONFIRM_QUERY_ID"),
+        read(root).get("confirm_query_id"),
     ):
         if candidate and str(candidate).strip():
             return str(candidate).strip()

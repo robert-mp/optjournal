@@ -40,9 +40,16 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from optjournal import settings as prefs
 from optjournal.bars import backfill_bars
 from optjournal.events import EventFetchError, EventRateLimited, fetch_events, store_events
-from optjournal.flex import FetchCooldown, TokenMissing, TokenRejected
+from optjournal.flex import (
+    FetchCooldown,
+    TokenMissing,
+    TokenRejected,
+    fetch_confirms,
+)
+from optjournal.ingest import ASSET_FILTER_ALL, ingest_confirms
 from optjournal.locks import LockTimeout, locked
 from optjournal.sync import sync_journal
 
@@ -83,7 +90,7 @@ RUN_HISTORY = 200
 #: A CHECKED SET rather than free text, because a typo'd job name is invisible: it
 #: would write rows nothing reads and leave the real job looking as if it never ran
 #: -- the exact failure this ledger exists to make visible.
-KNOWN_JOBS = frozenset({"sync", "bars_live", "bars_daily", "market"})
+KNOWN_JOBS = frozenset({"sync", "confirm", "bars_live", "bars_daily", "market"})
 
 #: Statuses a run may end in. `running` is written BEFORE the work starts (step 5),
 #: so a killed process leaves evidence rather than an unclaimed slot.
@@ -444,6 +451,92 @@ def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     return sync_outcome(result)
 
 
+#: How long a Trade Confirmation poll waits before asking again.
+#:
+#: Far below the Activity Statement's 15 minutes, and for a reason specific to the
+#: query TYPE: a statement is regenerated once a day, so a second fetch inside the
+#: window cannot return new information, where a confirm payload grows with every
+#: fill. The cooldown in `flex._check_cooldown` is keyed by query id, so the two
+#: budgets are independent and this does not loosen the statement's.
+#:
+#: Ten minutes against IBKR's published pacing of 10 requests/minute per token is
+#: roughly 0.6% of the allowance, so the poll cadence is bounded by usefulness
+#: rather than by the budget.
+CONFIRM_COOLDOWN_S = 600
+
+
+def _confirm(conn: sqlite3.Connection, ctx: Context) -> Outcome:
+    """Fetch same-session fills from the Trade Confirmation query and ingest them.
+
+    NOT CONFIGURED IS `nothing`, NOT `failed`. A journal with no confirm query is
+    the normal case -- only the Activity Statement is required for this app to
+    work -- so an absent id must not accumulate failures and back a job off, and
+    must not colour the page's Collection card red for a feature nobody enabled.
+
+    The id is read from settings HERE rather than carried on `Context`, so saving
+    it in the page takes effect on the next tick instead of on the next restart --
+    the same reason `web._effective_query_id` resolves per request.
+
+    The base currency comes from the journal, because a confirm payload has no
+    AccountInformation section to state it. With no statement ingested yet there is
+    nothing to convert against, and that is reported rather than guessed at.
+    """
+    query_id = prefs.confirm_query_id()
+    if not query_id:
+        return Outcome("nothing", "no Trade Confirmation query configured")
+
+    base = _base_currency(conn)
+    if not base:
+        # `nothing`, not `failed`, for the same reason an absent query id is: the
+        # precondition is unmet rather than broken, and the daily sync resolves it
+        # on its own. Counting it would back this job off five ticks into a fresh
+        # clone's first market session -- exactly when it should be waiting.
+        return Outcome(
+            "nothing",
+            "no ingested statement to read the base currency from; a sync has to "
+            "land first",
+        )
+    try:
+        result = fetch_confirms(
+            query_id, archive_dir=ctx.archive_dir, cooldown_s=CONFIRM_COOLDOWN_S,
+        )
+    except FetchCooldown as exc:
+        return Outcome("nothing", f"cooldown: {exc}")
+    except (TokenMissing, TokenRejected) as exc:
+        return Outcome("failed", f"credentials: {exc}")
+
+    ingested = ingest_confirms(
+        conn, result.raw_path, base_currency=base, assets=ctx.assets or ASSET_FILTER_ALL,
+    )
+    wrote = ingested.trades_inserted + ingested.trades_superseded
+    detail = (f"{ingested.trades_inserted} new, {ingested.trades_superseded} "
+              f"updated, {ingested.trades_skipped_existing} already known")
+    if ingested.warnings:
+        detail += "; " + "; ".join(ingested.warnings)[:200]
+    # `total` is every execution the payload held, which is the sum of the
+    # dispositions -- `IngestResult` counts what it WROTE, and a progress bar wants
+    # the denominator.
+    seen = (ingested.trades_inserted + ingested.trades_superseded
+            + ingested.trades_skipped_existing + ingested.trades_filtered_out)
+    return Outcome("ok" if wrote else "nothing", detail, wrote, seen)
+
+
+def _base_currency(conn: sqlite3.Connection) -> str | None:
+    """The account's base currency, from the newest ingested statement.
+
+    A confirm payload carries no AccountInformation section, so the journal's own
+    statements are the only honest source. `None` when nothing is ingested yet, and
+    the caller reports that rather than defaulting: converting a USD fill into a
+    currency this account may not even use would be a guess wearing a figure's
+    clothes, and it would reach the scoreboard.
+    """
+    row = conn.execute(
+        "SELECT base_currency FROM statements WHERE base_currency IS NOT NULL"
+        " ORDER BY ingested_at DESC LIMIT 1"
+    ).fetchone()
+    return str(row["base_currency"]) if row and row["base_currency"] else None
+
+
 def sync_outcome(result: dict[str, Any] | Exception) -> Outcome:
     """The ledger's reading of one sync, from its reply or from what it raised.
 
@@ -501,6 +594,22 @@ JOBS: tuple[Job, ...] = (
         # badly-timed sync missing Monday's fills twice.
         catchup=Catchup.LATEST, window_s=12 * 3600,
         timeout_s=900,
+        spends_broker_request=True,
+    ),
+    Job(
+        name="confirm",
+        run=_confirm,
+        # SAME SHAPE AS `bars_live`, for the same reason: due-ness is "inside the
+        # session AND the last success is over 25 minutes old", so one predicate
+        # replaces a row of cron slots and a laptop that slept through two hours
+        # collects on its first tick awake rather than waiting for the next slot.
+        #
+        # US market hours, because that is when a fill can happen on this account.
+        # Outside them the payload cannot change, and polling it would spend
+        # requests to re-read the morning.
+        minute=35, hour=9, weekdays=(1, 2, 3, 4, 5), zone="America/New_York",
+        catchup=Catchup.WINDOW, window_s=25 * 60,
+        timeout_s=300,
         spends_broker_request=True,
     ),
     Job(

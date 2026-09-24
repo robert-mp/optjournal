@@ -73,6 +73,7 @@ tells you about.
 |---|---|
 | `setup` | store the Flex token and query id, then verify them |
 | `sync` | fetch the newest statement, ingest it, report what is new |
+| `confirms` | fetch today's fills from a Trade Confirmation query (same session, not next-day) |
 | `serve` | the dashboard, plus the in-process scheduler |
 | `update` | fast-forward this install to the latest published commit |
 | `history` | closed-position P&L, round trip by round trip |
@@ -101,6 +102,7 @@ optjournal friction --month 2026-08       one month (or a year: 2026)
 |---|---|---|
 | Flex token | OS keyring | `optjournal setup`, or Settings in the page |
 | Flex Query ID | `.optjournal.json` | `optjournal setup`, or Settings in the page |
+| Confirms Query ID | `.optjournal.json` | Settings in the page, or `$OPTJOURNAL_CONFIRM_QUERY_ID`. Optional |
 | Scoreboard unit | `.optjournal.json` | Settings in the page |
 | Database, archive | beside the code (`journal.db`, `raw/`) | `--db` / `--archive` |
 
@@ -149,7 +151,7 @@ should get you running, not explain every decision.
 | [docs/money.md](docs/money.md) | the `Money` model: base vs as-charged, and when the native figure is withheld |
 | [docs/testing.md](docs/testing.md) | what the suite measures, and mutation testing |
 | [docs/theming.md](docs/theming.md) | the theme registry and the contrast rules |
-| [docs/trade-confirmations.md](docs/trade-confirmations.md) | same-day fills: what IBKR documents about the confirm query, what is only inferred, and the two columns that block it |
+| [docs/trade-confirmations.md](docs/trade-confirmations.md) | same-session fills: the confirm query's real attribute names, the FX estimate they force, and how the two queries are ranked |
 | [docs/contributing.md](docs/contributing.md) | adding functionality, data safety, local development |
 | `PLAN.md`, `SCHEDULER_PLAN.md` | open work, with the measured scope for each step |
 

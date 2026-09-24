@@ -35,7 +35,8 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 |---|---|
 | `config.py` | filesystem defaults (`raw/`, `journal.db`, `demo/`) |
 | `settings.py` | preferences that outlive a process: the Flex query id and the scoreboard unit, in a gitignored `.optjournal.json`. Owns the query id's precedence (argument, then `$OPTJOURNAL_QUERY_ID`, then stored) so `serve`, `sync` and the cron cannot disagree about it. Fails open on damage, like the fetch sidecar: a preference file must never stop the journal reading itself. The SECRET is not here -- that is the keyring, via `flex.py` |
-| `flex.py` | IBKR Flex fetch: token, retries, lockout budget, cooldown |
+| `flex.py` | IBKR Flex fetch: token, retries, lockout budget, cooldown. Two query types, one transport — `fetch` for the Activity Statement and `fetch_confirms` for a Trade Confirmation, sharing the lock, the cooldown and the archive. The cooldown is keyed by query id, so an intraday confirm poll cannot loosen the daily statement's budget |
+| `confirms.py` | Trade Confirmations: same-session fills, parsed from the `TCF` payload py_ibkr does not model, and the one FX estimate they force. Its own module rather than a second `sources.py` reader because it parses XML directly and reaches the network for a rate — neither of which belongs in a parse seam. Every attribute name in it was read off a real payload; the inferred table in `docs/trade-confirmations.md` was wrong in three places |
 | `fills.py` | `NormalisedFill`: one executed fill in broker-neutral terms. A leaf, like `money.py` -- the seam between a broker's statement and the database |
 | `sources.py` | `StatementSource` Protocol and the `SOURCES` registry: reads a broker's statement into `NormalisedFill`s. `IbkrSource` is the only implementation today and the one place that knows py_ibkr's attribute names |
 | `archive.py` | statement store: content-hash dedupe, prune |

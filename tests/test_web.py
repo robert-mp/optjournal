@@ -393,6 +393,10 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "CostsTotals": costs["totals"] if costs else None,
         "FxRow": first(costs["fx"]) if costs else None,
         "Statement": first(state["statements"]),
+        # Always present and always three keys, even on a journal with no confirms
+        # -- so it anchors properly rather than needing an exemption. The counts
+        # being zero is the steady state, not an absent shape.
+        "Provisional": state["provisional"],
         "Market": state["market"],
         # The strip is always seven days, so [0] is always real. The event list
         # is empty until the calendar has been fetched, which is why the sampler
@@ -5790,3 +5794,149 @@ def test_both_hand_run_sync_paths_record_what_they_did():
             f"{fn.__name__} no longer records its run, so a sync through it "
             f"leaves the scheduler's backoff counter untouched"
         )
+
+
+# --------------------------------------------------------------------------
+# Same-session fills on the page: the estimate has to be visible.
+# --------------------------------------------------------------------------
+
+def test_the_payload_reports_how_much_of_the_journal_is_provisional(tmp_path):
+    """Two counts, because they are two different claims.
+
+    `fills` is what makes a base-currency TOTAL approximate; `unsettled` is what has
+    no realised P&L yet. A journal with a EUR confirm on a EUR account has the second
+    without the first, so collapsing them into one number would either overstate the
+    uncertainty or hide it.
+    """
+    from conftest import connect_migrated  # noqa: PLC0415
+
+    db = tmp_path / "j.db"
+    conn = connect_migrated(db)
+    conn.execute(
+        "INSERT INTO statements (broker, source_file, sha256, account_id, from_date,"
+        " to_date, when_generated, base_currency, asset_filter, ingested_at)"
+        " VALUES ('ibkr','confirm-20260924.xml','d','U1','20260924','20260924',"
+        " '20260924;1112','EUR','ALL','2026-09-24T12:00:00+00:00')"
+    )
+    for trade_id, kind, estimated in (("1", "confirm", 1), ("2", "confirm", 0),
+                                      ("3", "activity", 0)):
+        conn.execute(
+            "INSERT INTO trades (broker, trade_id, account_id, trade_date,"
+            " asset_category, symbol, quantity, currency, fx_rate_to_base, raw,"
+            " source_file, first_seen_at, source_kind, fx_rate_estimated)"
+            " VALUES ('ibkr',?,'U1','20260924','OPT','GOOG',1,'USD',0.88,'{}',"
+            " 'confirm-20260924.xml','2026-09-24T12:00:00+00:00',?,?)",
+            (trade_id, kind, estimated),
+        )
+    conn.commit()
+    conn.close()
+
+    state = build_state(db_path=db, archive_dir=RAW_DIR, query_id=None)
+    pv = state["provisional"]
+    assert pv["fills"] == 1, "the estimated-rate count is wrong"
+    assert pv["unsettled"] == 2, "a base-currency confirm was not counted unsettled"
+    assert pv["newest"] == "20260924"
+
+
+def test_a_settled_journal_reports_nothing_provisional(populated):
+    """The steady state, and the banner must be silent in it.
+
+    Every row in the fixture came from an Activity Statement, so a page that warned
+    about estimates here would be crying wolf on a journal with none -- which is how
+    a warning stops being read.
+    """
+    state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    assert state["provisional"] == {"fills": 0, "unsettled": 0, "newest": None}
+
+
+def test_the_stats_caption_warns_only_when_something_is_provisional():
+    """The estimate reaches a headline card, so the card has to admit it.
+
+    `docs/design-notes.md` quarantines modelled numbers precisely so none can reach
+    one. Same-session fills are the sanctioned exception, and the condition of the
+    exception is this banner -- so it is pinned: silent at zero, and naming the
+    estimate when there is one.
+    """
+    banner = _fn("provisionalBanner")
+    assert "if(!pv.unsettled) return ''" in banner, (
+        "the banner is not silent on a journal with no provisional fills"
+    )
+    assert "pv.fills" in banner, "the banner ignores the estimated-rate count"
+    assert "estimated" in banner and "FX" in banner, (
+        "the banner does not say that the base-currency figures are estimated"
+    )
+    # And it is actually rendered into the stats caption, not merely defined.
+    assert "provisionalBanner()" in _code_only(_js()).replace(banner, ""), (
+        "provisionalBanner is defined but never called"
+    )
+
+
+def test_the_order_views_carry_provisionality_up_from_the_fills(tmp_path):
+    """One estimated fill makes the order's totals estimated.
+
+    The view columns are SUMs, so a single unconverted row taints the total it lands
+    in -- MAX over the group is what lets the page mark the order rather than
+    silently presenting a mixed figure as settled.
+    """
+    from conftest import connect_migrated  # noqa: PLC0415
+
+    conn = connect_migrated(tmp_path / "j.db")
+    conn.execute(
+        "INSERT INTO statements (broker, source_file, sha256, account_id, from_date,"
+        " to_date, when_generated, base_currency, asset_filter, ingested_at)"
+        " VALUES ('ibkr','f.xml','d','U1','20260924','20260924','g','EUR','ALL','t')"
+    )
+    # One order, two fills on one contract: one settled, one same-session.
+    for trade_id, kind, estimated in (("1", "activity", 0), ("2", "confirm", 1)):
+        conn.execute(
+            "INSERT INTO trades (broker, trade_id, ib_order_id, conid, account_id,"
+            " trade_date, date_time, asset_category, symbol, quantity, trade_price,"
+            " currency, fx_rate_to_base, raw, source_file, first_seen_at,"
+            " source_kind, fx_rate_estimated)"
+            " VALUES ('ibkr',?, 'O1','C1','U1','20260924','20260924;10','OPT','GOOG',"
+            " 1, 4.9, 'USD', 0.88, '{}', 'f.xml', 't', ?, ?)",
+            (trade_id, kind, estimated),
+        )
+    conn.commit()
+
+    leg = conn.execute("SELECT * FROM trade_legs").fetchone()
+    order = conn.execute("SELECT * FROM trade_orders").fetchone()
+    assert leg["fx_rate_estimated"] == 1, "an estimated fill did not taint its leg"
+    assert leg["settled"] == 0, "a leg holding a same-session fill reads as settled"
+    assert order["fx_rate_estimated"] == 1
+    assert order["settled"] == 0
+
+
+def test_the_settings_endpoint_stores_and_clears_the_confirm_query(populated):
+    """Clearing it is how the intraday poll is turned off, so a blank must save.
+
+    Unlike the token field, which refuses an empty value: an absent confirm query is
+    a supported configuration and the only way to say "statement only" from the page.
+    """
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, saved = _post(base, "/api/settings",
+                              {"confirm_query_id": "1621016"})
+        assert (status, saved["ok"]) == (200, True)
+        assert saved["stored"]["confirm_query_id"] == "1621016"
+
+        status, bad = _post(base, "/api/settings", {"confirm_query_id": "not-an-id"})
+        assert (status, bad["kind"]) == (400, "confirm_query_id")
+
+        status, cleared = _post(base, "/api/settings", {"confirm_query_id": ""})
+        assert (status, cleared["ok"]) == (200, True)
+        assert cleared["stored"].get("confirm_query_id") is None, (
+            "an empty confirm query id was not stored as absent, so the poll "
+            "cannot be turned off from the page"
+        )
+
+
+def test_the_provisional_banner_dashes_ibkrs_date():
+    """IBKR sends `20260924`; every other date on this page is dashed.
+
+    A caption mixing the two spellings reads like a leaked internal field, which is
+    exactly the impression a provisional-data warning must not give.
+    """
+    banner = _fn("provisionalBanner")
+    assert "raw.slice(0,4)" in banner and "raw.slice(4,6)" in banner, (
+        "the banner renders IBKR's compact date without reformatting it"
+    )
