@@ -320,3 +320,105 @@ def test_the_stop_wait_is_interruptible_rather_than_bare():
         "never stops the process -- loop on a short timeout instead"
     )
     assert "stop.wait()\n" not in body, "a bare stop.wait() is back"
+
+
+#: How long the injected job sleeps. Comfortably past `Scheduler.stop()`'s 10s
+#: join AND past `EXIT_BUDGET_S`, so a `serve` that waits for the job to finish
+#: cannot pass this test by being quick.
+_SLOW_JOB_S = 40
+
+#: Bootstraps a `serve` whose scheduler has exactly one job, which sleeps.
+#:
+#: A SUBPROCESS WITH THE REGISTRY SWAPPED, rather than an in-process call, for the
+#: reason the rest of this file is subprocesses: CPython delivers signals to the
+#: main thread, and whether the main thread is reachable is a property of how the
+#: process was started. Only the job's WORK is faked -- the scheduler, the tick, the
+#: signal handler, the join and the listener are all the real ones.
+#:
+#: `_in_session` is forced open so due-ness does not depend on the wall clock. That
+#: dependency is exactly what made this gap invisible: every CI run this repo had
+#: ever done happened outside US market hours, so no test had ever signalled a
+#: server with a job in flight.
+_SLOW_SERVE = """
+import time
+from pathlib import Path
+
+from optjournal import jobs, web
+
+jobs._in_session = lambda now: True
+jobs.JOBS = (
+    jobs.Job(
+        name="market",
+        run=lambda conn, ctx: (time.sleep({sleep}), jobs.Outcome("ok", "slept"))[1],
+        minute=0, hour=0, weekdays=(1, 2, 3, 4, 5, 6, 7), zone="UTC",
+        catchup=jobs.Catchup.WINDOW, window_s=60, timeout_s=300,
+    ),
+)
+web.serve(db_path=Path({db!r}), archive_dir=Path({archive!r}),
+          port={port}, scheduler=True)
+"""
+
+
+def test_serve_exits_promptly_with_a_job_still_running(journal):
+    """A BUSY SCHEDULER MUST NOT WEDGE THE STOP, and nothing asserted that.
+
+    All three tests above signal an IDLE server: the demo fixture has no perishable
+    bar windows and no confirm query, so the first tick finds nothing to do. The
+    interesting case is the one that only happens during a trading session -- a tick
+    mid-fetch when the signal arrives -- and this repo's CI had never once run inside
+    US market hours, so it had never been exercised anywhere.
+
+    That absence cost real debugging: when windows-latest started failing, "a job is
+    in flight and eats the scheduler join" was the leading theory for a while,
+    unfalsifiable because no test could produce the state. Now one can.
+
+    `Scheduler.stop()` joins for 10s and then abandons the thread, which is safe
+    because it is a daemon: the process exits and the OS reclaims it. The job here
+    sleeps four times that, so a `serve` that waited for the work would blow the
+    budget and fail.
+    """
+    port = _free_port()
+    script = _SLOW_SERVE.format(
+        sleep=_SLOW_JOB_S, db=str(journal),
+        archive=str(journal.parent / "raw"), port=port,
+    )
+    proc = subprocess.Popen(  # noqa: S603 - a fixed argv, no shell
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        creationflags=(
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if os.name == "nt" else 0
+        ),
+    )
+    _wait_until_bound(proc, port)
+    # Let the tick claim the job and enter its sleep, so the signal genuinely
+    # arrives mid-work rather than before the scheduler has started anything.
+    time.sleep(2)
+
+    started = time.monotonic()
+    _stop(proc)
+    try:
+        output = proc.communicate(timeout=EXIT_BUDGET_S)[0]
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        output = (proc.communicate()[0] or "").strip()
+        pytest.fail(
+            f"serve did not exit {EXIT_BUDGET_S}s after the stop signal while a job "
+            f"was running. A busy tick must not hold the process open: the "
+            f"scheduler's join is bounded and its thread is a daemon. Output:\n"
+            f"{output}"
+        )
+    elapsed = time.monotonic() - started
+    assert elapsed < EXIT_BUDGET_S, f"took {elapsed:.1f}s with a job in flight"
+    # The scheduler's own stop line is a LOG record, which `serve` routes to
+    # logs/, so stdout cannot carry it. The banner can, and it is what proves this
+    # ran with a live scheduler rather than passing as an idle server would.
+    assert "scheduler on" in output, (
+        "this serve had no scheduler, so a job was never in flight and the test "
+        f"proves nothing:\n{output}"
+    )
+    assert proc.returncode == 0, (
+        f"serve exited {proc.returncode} with a job in flight, not 0 -- a supervisor "
+        f"reads that as a crash and respawns:\n{output}"
+    )
