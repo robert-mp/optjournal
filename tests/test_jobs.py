@@ -1007,7 +1007,7 @@ def _due(now, **kw):
     from optjournal.jobs import JOBS, due_jobs
 
     kw.setdefault("claimed", {})
-    kw.setdefault("last_success", {})
+    kw.setdefault("last_poll", {})
     kw.setdefault("ever_ran", {job.name for job in JOBS})
     return due_jobs(now, **kw)
 
@@ -1063,7 +1063,7 @@ def test_a_claimed_instant_is_not_due_again():
     from zoneinfo import ZoneInfo
 
     # After the US close, so only instant-claiming jobs are in play: a WINDOW job
-    # claims no instant at all and is braked by `last_success` instead.
+    # claims no instant at all and is braked by `last_poll` instead.
     now = datetime(2026, 8, 12, 22, 0, tzinfo=ZoneInfo("Europe/Dublin"))
     first = _due(now)
     assert first, "premise: something is due at this clock"
@@ -1164,10 +1164,10 @@ def test_the_live_poll_waits_out_its_window_after_a_success():
     window = job_by_name("bars_live").window_s
     fresh = int(now.timestamp()) - (window - 60)
     stale = int(now.timestamp()) - (window + 60)
-    assert "bars_live" not in _names(_due(now, last_success={"bars_live": fresh})), (
+    assert "bars_live" not in _names(_due(now, last_poll={"bars_live": fresh})), (
         "the live poll fired again inside its own window"
     )
-    assert "bars_live" in _names(_due(now, last_success={"bars_live": stale})), (
+    assert "bars_live" in _names(_due(now, last_poll={"bars_live": stale})), (
         "the live poll stopped firing once its window had elapsed"
     )
 
@@ -1192,7 +1192,7 @@ def test_the_live_poll_claims_no_instant():
     # instant survived a version of this test that exercised the first alone.
     for label, ledger in (("no success yet", {}),
                           ("an expired success", {"bars_live": stale})):
-        live = next(d for d in _due(now, last_success=ledger)
+        live = next(d for d in _due(now, last_poll=ledger)
                     if d.job.name == "bars_live")
         assert live.fired_for is None, (
             f"with {label} the live poll claims a scheduled instant, so the unique "
@@ -1232,7 +1232,7 @@ def test_the_repeated_hour_at_the_dst_fall_back_cannot_fire_twice():
 
     stamps = set()
     for probe in (early, late, datetime(2026, 10, 25, 3, 0, tzinfo=dublin)):
-        found = due_jobs(probe, claimed={}, last_success={},
+        found = due_jobs(probe, claimed={}, last_poll={},
                          ever_ran={"market"}, registry=(nightly,))
         stamps |= {d.fired_for for d in found}
     assert len(stamps) == 1, (
@@ -1264,7 +1264,7 @@ def test_a_schedule_in_the_missing_spring_forward_hour_still_runs():
     )
     # Mid-morning on the spring-forward day: the 01:30 slot is behind us.
     found = due_jobs(datetime(2026, 3, 29, 9, 0, tzinfo=dublin),
-                     claimed={}, last_success={}, ever_ran={"market"},
+                     claimed={}, last_poll={}, ever_ran={"market"},
                      registry=(nightly,))
     assert found, (
         "a schedule inside the missing hour produced no due instant, so that day "
@@ -1400,7 +1400,7 @@ def test_a_claimed_instant_does_not_brake_the_live_poll():
 
     `claimed` cannot hold a WINDOW job's instants because it has none, so if the
     poll were braked by `claimed` it would be braked by nothing at all -- one poll
-    per session instead of one per window. Its brake is `last_success` plus
+    per session instead of one per window. Its brake is `last_poll` plus
     `window_s`, which `test_the_live_poll_waits_out_its_window_after_a_success`
     pins from the other side.
     """
@@ -1747,7 +1747,7 @@ def test_replacing_the_registry_actually_reaches_due_jobs(monkeypatch):
         minute=0, hour=0, weekdays=(1, 2, 3, 4, 5, 6, 7), zone="Europe/Dublin",
     )
     monkeypatch.setattr(mod, "JOBS", (only,))
-    found = mod.due_jobs(datetime.now(UTC), claimed={}, last_success={},
+    found = mod.due_jobs(datetime.now(UTC), claimed={}, last_poll={},
                          ever_ran={"market"})
     assert [d.job.hour for d in found] == [0], (
         f"due_jobs ignored the replaced registry and used the import-time one: "
@@ -2067,11 +2067,75 @@ def test_the_confirm_poll_has_its_own_cooldown_well_under_the_statements(conn):
     assert job.window_s <= 30 * 60, (
         "the poll window is wider than half an hour, which is not an hourly feed"
     )
-    assert job.window_s * 60 >= CONFIRM_COOLDOWN_S, (
+    assert job.window_s >= CONFIRM_COOLDOWN_S, (
         "the cooldown is longer than the poll window, so every scheduled run would "
         "be refused before it sent anything"
     )
     assert job.spends_broker_request is True
     assert job.zone == "America/New_York", (
         "the poll is scheduled off the session, not off the reader's wall clock"
+    )
+
+
+def test_a_window_job_that_found_nothing_is_still_braked(conn):
+    """THE BUG THIS CLOSES COST REAL IBKR REQUESTS.
+
+    A poll that fetched cleanly and found nothing new records `nothing` -- the
+    honest status, because an empty run is not a success. But the WINDOW brake keyed
+    on `ok` alone, so such a job stayed due on EVERY 60-second tick for the rest of
+    the session. Measured on the real journal before the fix: 127 `confirm` runs in
+    four hours, 125 of them `nothing`, one IBKR request spent each time the
+    10-minute cooldown lapsed rather than once per 25-minute window.
+
+    `due_jobs`' own docstring had already reasoned this out for the instant-claiming
+    brake -- "RECORDED, not succeeded, and that distinction is the brake" -- and the
+    window path never got it.
+    """
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import _ledger_snapshot, due_jobs, record_run
+
+    # A poll that asked and found nothing, three minutes ago.
+    now = datetime(2026, 9, 24, 13, 0, tzinfo=ZoneInfo("America/New_York"))
+    stamp = (now.astimezone(UTC) - timedelta(minutes=3)).isoformat(timespec="seconds")
+    record_run(conn, "confirm", status="nothing", detail="cooldown",
+               started_at=stamp)
+    conn.execute("UPDATE job_runs SET finished_at = ? WHERE job = 'confirm'", (stamp,))
+    conn.commit()
+
+    _claimed, last_poll, ever_ran, _failures = _ledger_snapshot(conn)
+    assert "confirm" in last_poll, (
+        "a completed-but-empty run did not register as a poll, so the window brake "
+        "has nothing to measure against"
+    )
+    due = due_jobs(now, claimed={}, last_poll=last_poll, ever_ran=ever_ran)
+    assert "confirm" not in [d.job.name for d in due], (
+        "a window job polled three minutes ago is due again, so it fires every tick"
+    )
+
+
+def test_a_window_job_that_failed_is_not_braked(conn):
+    """The other half, and it must stay asymmetric.
+
+    A transient failure -- a dropped connection, a locked keychain -- should retry
+    inside the session rather than sit out the whole window, and repeated failures
+    are what `FAILURE_BACKOFF` exists to stop. So `failed` does not count as a poll.
+    """
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import _ledger_snapshot, due_jobs, record_run
+
+    now = datetime(2026, 9, 24, 13, 0, tzinfo=ZoneInfo("America/New_York"))
+    stamp = (now.astimezone(UTC) - timedelta(minutes=3)).isoformat(timespec="seconds")
+    record_run(conn, "confirm", status="failed", detail="URLError", started_at=stamp)
+    conn.execute("UPDATE job_runs SET finished_at = ? WHERE job = 'confirm'", (stamp,))
+    conn.commit()
+
+    _claimed, last_poll, ever_ran, _failures = _ledger_snapshot(conn)
+    assert "confirm" not in last_poll, "a failed run braked the window"
+    due = due_jobs(now, claimed={}, last_poll=last_poll, ever_ran=ever_ran)
+    assert "confirm" in [d.job.name for d in due], (
+        "a failed poll sits out the whole window instead of retrying"
     )

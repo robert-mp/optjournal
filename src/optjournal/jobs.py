@@ -928,8 +928,8 @@ def _in_session(now: datetime) -> bool:
     return opens <= local <= closes
 
 
-def _window_due(job: Job, now: datetime, last_success: int | None) -> Due | None:
-    """`Catchup.WINDOW`: inside the session, and the last success is old enough.
+def _window_due(job: Job, now: datetime, last_poll: int | None) -> Due | None:
+    """`Catchup.WINDOW`: inside the session, and the last POLL is old enough.
 
     SEVEN CRON SLOTS COLLAPSE INTO THIS ONE PREDICATE, and it is sound only because
     the intraday series is CUMULATIVE within a session: a 13:00 poll returns every
@@ -947,19 +947,19 @@ def _window_due(job: Job, now: datetime, last_success: int | None) -> Due | None
     """
     if not _in_session(now):
         return None
-    if last_success is not None:
-        age = int(now.timestamp()) - last_success
+    if last_poll is not None:
+        age = int(now.timestamp()) - last_poll
         if age < job.window_s:
             return None
-        return Due(job, None, f"in session, last success {age}s ago")
-    return Due(job, None, "in session, no successful poll yet today")
+        return Due(job, None, f"in session, last poll {age}s ago")
+    return Due(job, None, "in session, no completed poll yet today")
 
 
 def due_jobs(
     now: datetime,
     *,
     claimed: dict[str, set[int]],
-    last_success: dict[str, int],
+    last_poll: dict[str, int],
     ever_ran: set[str],
     registry: tuple[Job, ...] | None = None,
 ) -> list[Due]:
@@ -974,7 +974,8 @@ def due_jobs(
       happened) due again on the very next tick and for its whole 12-hour window --
       roughly 48 real IBKR requests in twelve hours against a lockout budget.
       `consecutive_failures` on `job_state` is what a human reads instead.
-    * `last_success` -- newest `ok` epoch per job, for `WINDOW` jobs only.
+    * `last_poll` -- newest COMPLETED (`ok` or `nothing`) epoch per job, for
+      `WINDOW` jobs only. Not `ok` alone: see `_ledger_snapshot`.
     * `ever_ran` -- jobs with ANY recorded run.
 
     EMPTY LEDGER MEANS UNKNOWN, NOT OVERDUE. `job_runs` lives in `journal.db`,
@@ -999,7 +1000,7 @@ def due_jobs(
     out: list[Due] = []
     for job in (JOBS if registry is None else registry):
         if job.catchup is Catchup.WINDOW:
-            found = _window_due(job, now, last_success.get(job.name))
+            found = _window_due(job, now, last_poll.get(job.name))
             if found is not None:
                 out.append(found)
             continue
@@ -1061,15 +1062,15 @@ SLEPT_THRESHOLD_S = 90
 def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
     dict[str, set[int]], dict[str, int], set[str], dict[str, int]
 ]:
-    """(claimed, last_success, ever_ran, failures) in ONE pass over the ledger.
+    """(claimed, last_poll, ever_ran, failures) in ONE pass over the ledger.
 
     One query rather than four per job, because this runs every 60 seconds against
     the same database a job may be writing. `fired_for IS NOT NULL` is the only
     filter that matters: a NULL claim belongs to a WINDOW job, which is braked by
-    `last_success` instead.
+    `last_poll` instead.
     """
     claimed: dict[str, set[int]] = {}
-    last_success: dict[str, int] = {}
+    last_poll: dict[str, int] = {}
     ever_ran: set[str] = set()
     for row in conn.execute(
         "SELECT job, fired_for, status, finished_at FROM job_runs"
@@ -1078,15 +1079,31 @@ def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
         ever_ran.add(job)
         if row["fired_for"] is not None:
             claimed.setdefault(job, set()).add(int(row["fired_for"]))
-        if row["status"] == "ok" and row["finished_at"]:
+        # `ok` OR `nothing`, and the distinction is the brake -- the same
+        # distinction `claimed` above already draws for the instant-claiming jobs,
+        # never applied here until a WINDOW job started spending IBKR requests.
+        #
+        # A poll that fetched cleanly and found nothing new reports `nothing`,
+        # which is the honest status and must stay so: an empty run is not a
+        # success. But it DID ask, so braking on `ok` alone left the job due on
+        # every 60s tick for the rest of the session. Measured on the real journal:
+        # 127 `confirm` runs in four hours, 125 of them `nothing`, one IBKR request
+        # spent every time the 10-minute cooldown lapsed instead of every 25
+        # minutes. `due_jobs`' own docstring predicted this for `claimed`: "keying
+        # on status='ok' would make a job ... due again on the very next tick ...
+        # roughly 48 real IBKR requests in twelve hours against a lockout budget."
+        #
+        # `failed` deliberately does NOT brake: a transient failure should retry
+        # inside the session, and repeated ones are what FAILURE_BACKOFF is for.
+        if row["status"] in ("ok", "nothing") and row["finished_at"]:
             stamp = _epoch_of(str(row["finished_at"]))
             if stamp is not None:
-                last_success[job] = max(last_success.get(job, 0), stamp)
+                last_poll[job] = max(last_poll.get(job, 0), stamp)
     failures = {
         str(r["job"]): int(r["consecutive_failures"] or 0)
         for r in conn.execute("SELECT job, consecutive_failures FROM job_state")
     }
-    return claimed, last_success, ever_ran, failures
+    return claimed, last_poll, ever_ran, failures
 
 
 def _epoch_of(stamp: str) -> int | None:
@@ -1147,9 +1164,9 @@ def reconcile(
     at a DST boundary is testable without waiting for October.
     """
     moment = now or datetime.now(UTC)
-    claimed, last_success, ever_ran, failures = _ledger_snapshot(conn)
+    claimed, last_poll, ever_ran, failures = _ledger_snapshot(conn)
     started: list[str] = []
-    for due in due_jobs(moment, claimed=claimed, last_success=last_success,
+    for due in due_jobs(moment, claimed=claimed, last_poll=last_poll,
                         ever_ran=ever_ran):
         if failures.get(due.job.name, 0) >= FAILURE_BACKOFF:
             # Backed off, not disabled: still runnable by hand from the page, and
