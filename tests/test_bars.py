@@ -1244,3 +1244,62 @@ def test_the_audit_refuses_to_be_combined_with_a_fetch(tmp_path):
 
     with pytest.raises(SystemExit):
         build_parser().parse_args(["bars", "--audit", "--live"])
+
+
+# --------------------------------------------------------------------------
+# Index symbols: two vocabularies for one instrument.
+# --------------------------------------------------------------------------
+
+def test_an_index_root_is_translated_to_the_sources_spelling():
+    """IBKR's `SPX` is not a ticker at the price source, and nothing translated.
+
+    Measured rather than reasoned: `SPX` answered 404 on every request while
+    `^GSPC` returned bars, so an account holding SPX options collected no
+    underlying history at all. The whole symbol is matched, so an OPTION on the
+    same root is left alone -- that distinction is the one way this could break
+    working symbols.
+    """
+    from optjournal.marketdata import source_symbol
+
+    assert source_symbol("SPX") == "^GSPC"
+    assert source_symbol("XSP") == "^XSP", "the mini-SPX is its own instrument"
+    assert source_symbol("VIX") == "^VIX"
+    # An option on an index root keeps its OCC spelling: the padding goes, the
+    # translation does not apply, because `SPX   261120C07000000` is not `SPX`.
+    assert source_symbol("SPX   261120C07000000") == "SPX261120C07000000"
+    # A plain equity is untouched, which is every other symbol in the manifest.
+    assert source_symbol("TSLA") == "TSLA"
+    assert source_symbol("^GSPC") == "^GSPC", "an already-correct symbol is stable"
+
+
+def test_the_index_map_holds_only_spellings_that_were_probed():
+    """A guessed ticker here is a symbol that 404s forever, silently.
+
+    Every value in the map was requested against the live endpoint while it was
+    written. This pins the SHAPE of that promise -- each target is a caret symbol,
+    and each key is a bare root -- so a later addition by pattern-matching rather
+    than by probing is at least visibly different.
+    """
+    from optjournal.marketdata import INDEX_SYMBOLS
+
+    assert INDEX_SYMBOLS, "the index map is empty, so no index resolves"
+    for root, target in INDEX_SYMBOLS.items():
+        assert not root.startswith("^"), f"{root} is already a source symbol"
+        assert target.startswith("^"), f"{target} is not an index spelling"
+        assert root == root.upper()
+
+
+def test_the_translation_is_applied_where_bars_and_quotes_share_it():
+    """One choke point, so a watchlisted index cannot work in one column and 404
+    in the other. `_get_chart` is what both `fetch_bars` and `fetch_quote` call,
+    and the symbol in the ERROR text is translated too -- a failure naming a symbol
+    nobody requested is how the original 404 read as a mystery."""
+    import inspect
+
+    from optjournal import marketdata
+
+    chart = inspect.getsource(marketdata._get_chart)
+    assert "source_symbol(symbol)" in chart
+    assert "occ_symbol(symbol)" not in chart, (
+        "the chart fetch bypasses the index translation"
+    )

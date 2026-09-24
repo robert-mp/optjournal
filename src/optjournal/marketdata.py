@@ -51,12 +51,14 @@ __all__ = [
     "Bar",
     "BarFetchError",
     "BarNotFound",
+    "INDEX_SYMBOLS",
     "Quote",
     "fetch_bars",
     "fetch_quote",
     "occ_symbol",
     "parse_chart",
     "parse_quote",
+    "source_symbol",
 ]
 
 #: Bar sizes this journal stores. Hourly for a position held days, daily for
@@ -176,6 +178,50 @@ def occ_symbol(symbol: str) -> str:
     return "".join(symbol.split())
 
 
+#: Index roots as IBKR names them, mapped to the price source's spelling of the
+#: SAME index. Two vocabularies for one instrument, and nothing translated
+#: between them: `SPX` reached the endpoint verbatim and answered 404 for every
+#: request, so an account holding SPX options collected no underlying bars at all
+#: -- and because one dead window failed the whole run, five of them backed the
+#: daily job off entirely. Fourteen days of index history missing from a journal
+#: whose 0DTE planner is built on it.
+#:
+#: EVERY ENTRY WAS PROBED against the live endpoint rather than inferred from the
+#: ticker's shape: `^GSPC`, `^VIX`, `^NDX`, `^RUT`, `^XSP` and `^DJI` all return
+#: daily bars, `SPX` and `SPX.INDX` do not. `^SPX` also resolves and is
+#: byte-identical to `^GSPC` over 32 sessions -- open, high, low, close and
+#: volume -- so the choice between them is consistency, not correctness, and
+#: `^GSPC` is the spelling `bars.CONTEXT_SYMBOLS` already stores.
+#:
+#: `XSP` is a mapping, not an alias: the mini-SPX is a different instrument at a
+#: tenth of the index (measured: 770.60 against 7706.03 the same session), and it
+#: gets its own series.
+#:
+#: Matched on the WHOLE symbol, so an option on one of these roots is untouched:
+#: `SPX   261120C07000000` is not `SPX`. A stock ticker colliding with an index
+#: root would be mistranslated here, which is why this is an explicit list of six
+#: rather than a rule about leading carets.
+INDEX_SYMBOLS = {
+    "SPX": "^GSPC",
+    "VIX": "^VIX",
+    "NDX": "^NDX",
+    "RUT": "^RUT",
+    "XSP": "^XSP",
+    "DJX": "^DJI",
+}
+
+
+def source_symbol(symbol: str) -> str:
+    """The journal's symbol as the price source spells it, indices included.
+
+    The one translation point between the two vocabularies, applied in `_get_chart`
+    so bars and quotes cannot disagree about it -- a watchlist row for an index
+    would otherwise 404 in the quote column while its bars worked, or the reverse.
+    """
+    trimmed = occ_symbol(symbol)
+    return INDEX_SYMBOLS.get(trimmed.upper(), trimmed)
+
+
 def fetch_bars(
     symbol: str,
     *,
@@ -214,19 +260,19 @@ def _get_chart(symbol: str, query: str, *, what: str, timeout: int) -> Any:
     would mean two places to fix a timeout, a user agent or an error message. The
     parsers stay separate because they read different parts of the response.
     """
-    url = _CHART_URL.format(symbol=occ_symbol(symbol))
+    url = _CHART_URL.format(symbol=source_symbol(symbol))
     request = urllib.request.Request(url + query, headers={"User-Agent": _USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             return json.load(response)
     except urllib.error.HTTPError as exc:
-        error = f"{occ_symbol(symbol)} {what}: HTTPError: {exc}"
+        error = f"{source_symbol(symbol)} {what}: HTTPError: {exc}"
         if exc.code == 404:
             raise BarNotFound(error) from exc
         raise BarFetchError(error) from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise BarFetchError(
-            f"{occ_symbol(symbol)} {what}: {type(exc).__name__}: {exc}"
+            f"{source_symbol(symbol)} {what}: {type(exc).__name__}: {exc}"
         ) from exc
 
 

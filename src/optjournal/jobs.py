@@ -377,12 +377,28 @@ def _bars(conn: sqlite3.Connection, _ctx: Context, *, live: bool) -> Outcome:
     the outcome rather than from an exception.
     """
     outcome = backfill_bars(conn, perishable_only=live)
-    if outcome.failures:
+    if outcome.failures and not outcome.written:
         return Outcome("failed", "; ".join(outcome.failures)[:400],
                        outcome.written, outcome.requested)
+    got = f"{outcome.written} bar(s), {outcome.skipped} empty"
+    if outcome.failures:
+        # A PARTIAL RUN IS NOT A FAILED RUN, and the difference was expensive: one
+        # index symbol the price source spells differently failed two windows out
+        # of twenty-two, the run reported `failed` while writing 8,889 bars, and
+        # five of those backed the whole daily job off. The book stopped being
+        # collected over a symbol that was never going to work.
+        #
+        # Still not silently green: the failures are named in the detail the page
+        # shows and the backoff warning reads, and a perishable window that did not
+        # land is `audit_perishable`'s question rather than this status's.
+        return Outcome(
+            "ok" if outcome.written else "nothing",
+            f"{got}; {len(outcome.failures)} window(s) failed: "
+            + "; ".join(outcome.failures)[:300],
+            outcome.written, outcome.requested,
+        )
     return Outcome(
-        "ok" if outcome.written else "nothing",
-        f"{outcome.written} bar(s), {outcome.skipped} empty",
+        "ok" if outcome.written else "nothing", got,
         outcome.written, outcome.requested,
     )
 

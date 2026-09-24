@@ -1942,3 +1942,51 @@ def test_the_backoff_warning_names_the_reason_not_just_the_count(conn, ctx,
     assert "Token has expired" in caplog.text, (
         "the backoff warning still does not say why the job is backed off"
     )
+
+
+def test_a_bars_run_that_collected_most_of_the_book_is_not_a_failure(conn, monkeypatch):
+    """The asymmetry that disabled bar collection over one bad symbol.
+
+    Measured: one index root the price source spells differently failed two windows
+    out of twenty-two, the run reported `failed` while writing 8,889 bars, and five
+    of those backed the whole daily job off -- so the book stopped being collected
+    because of a symbol that was never going to work.
+
+    `ok`, therefore, when anything landed. NOT silently green: the count and the
+    failures are in the detail, which is what the page shows and what the backoff
+    warning now reads back.
+    """
+    from optjournal import jobs
+
+    class _Result:
+        written, skipped, requested = 8889, 20, 22
+        failures = ["SPX 1d: HTTPError: HTTP Error 404: Not Found",
+                    "SPX 1h: HTTPError: HTTP Error 404: Not Found"]
+
+    monkeypatch.setattr(jobs, "backfill_bars", lambda conn, perishable_only: _Result())
+    outcome = jobs._bars(conn, None, live=False)
+    assert outcome.status == "ok", (
+        "a run that wrote 8,889 bars still reports failed, which backs the job off"
+    )
+    assert "8889 bar(s)" in outcome.detail, "the work done is not reported"
+    assert "2 window(s) failed" in outcome.detail, "the failures are hidden"
+    assert "SPX 1d" in outcome.detail, "the failing symbol is not named"
+
+
+def test_a_bars_run_that_collected_nothing_at_all_still_fails(conn, monkeypatch):
+    """The other side of the same line, which is what stops this being a whitewash.
+
+    Nothing written and something broken is the state the ledger exists to catch --
+    three cron jobs read `ok` for two days while collecting nothing, which is why
+    `ok` may never mean "we tried".
+    """
+    from optjournal import jobs
+
+    class _Result:
+        written, skipped, requested = 0, 0, 3
+        failures = ["TSLA 1d: URLError: nodename nor servname provided"]
+
+    monkeypatch.setattr(jobs, "backfill_bars", lambda conn, perishable_only: _Result())
+    outcome = jobs._bars(conn, None, live=False)
+    assert outcome.status == "failed"
+    assert "TSLA 1d" in outcome.detail
