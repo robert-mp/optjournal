@@ -54,13 +54,16 @@ from optjournal.flex import (
     KEYRING_SERVICE,
     FetchCooldown,
     TokenMissing,
+    TokenRejected,
+    TokenWriteRefused,
     fetch,
     load,
     read_token,
+    write_token,
 )
 from optjournal.history import build_history
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
-from optjournal.jobs import record_run
+from optjournal.jobs import record_manual_sync, record_run
 from optjournal.render import (
     render_friction,
     render_history,
@@ -1042,7 +1045,11 @@ def cmd_setup(args) -> int:
         token = _prompt_token(bool(stored_token))
 
     if token:
-        keyring.set_password(KEYRING_SERVICE, account, token)
+        # Through `flex.write_token`, not `keyring` directly: the settings page
+        # writes the same entry, and two callers spelling the service name for
+        # themselves is how one of them ends up storing a token the other cannot
+        # find. It also strips the newline a pasted token arrives with.
+        write_token(token, account)
 
     query_id = args.query_id
     if not query_id and sys.stdin.isatty():
@@ -1107,15 +1114,24 @@ def cmd_sync(args) -> int:
     # name, two types, computed from the same table. Nothing broke only because
     # each consumer had met just one producer.
     with open_journal(args.db) as conn:
-        data = sync_journal(
-            conn=conn,
-            archive_dir=args.archive,
-            query_id=query_id,
-            assets=_asset_filter(args.assets),
-            from_date=args.from_date,
-            to_date=args.to_date,
-            force=args.force,
-        )
+        try:
+            data = sync_journal(
+                conn=conn,
+                archive_dir=args.archive,
+                query_id=query_id,
+                assets=_asset_filter(args.assets),
+                from_date=args.from_date,
+                to_date=args.to_date,
+                force=args.force,
+            )
+        except (FetchCooldown, TokenMissing, TokenRejected) as exc:
+            # RECORDED BEFORE RE-RAISING, so `main`'s handlers still decide the exit
+            # code and the message. A hand-run sync used to be invisible to the
+            # ledger, which is how a backed-off job stayed backed off while the
+            # command line was syncing perfectly.
+            record_manual_sync(conn, exc)
+            raise
+        record_manual_sync(conn, data)
     new_trade_rows = data["new_trade_rows"]
 
     lines = [f"sync {query_id}  {data['raw_bytes']:,} bytes -> {data['archive']}"]
@@ -1411,6 +1427,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         code = args.func(args)
     except TokenMissing as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    except (TokenRejected, TokenWriteRefused) as exc:
+        # Alongside TokenMissing, and a config exit for the same reason: the
+        # environment needs one thing from the reader -- a new token, or one
+        # command -- and the message says which. A traceback here would bury it,
+        # and EXIT_ERROR would tell a cron to retry something no retry can fix.
         print(f"\n{exc}", file=sys.stderr)
         return EXIT_CONFIG
     except FetchCooldown as exc:

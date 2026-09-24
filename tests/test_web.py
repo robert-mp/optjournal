@@ -1119,6 +1119,12 @@ def test_endpoint_reply_shapes_match_what_the_page_reads():
         # make four of them look absent, which is why it is source-pinned.
         _Handler._job_run: ("ok", "kind", "message", "jobs", "run_id", "job"),
         _Handler._job_status: ("ok", "kind", "message"),
+        # Both verbs of /api/settings/token, which answer in ONE shape on purpose:
+        # a save's reply is a token status, so the page assigns it exactly where
+        # the check button's answer goes. Pinning both against the same key list is
+        # what stops one of them drifting out of that arrangement.
+        _Handler._token_status: ("ok", "kind", "present", "account", "message"),
+        _Handler._token_write: ("ok", "kind", "present", "account", "message"),
     }
     for handler, keys in expected.items():
         src = inspect.getsource(handler)
@@ -5507,3 +5513,280 @@ def test_dev_mode_opens_the_diagnostics_block_rather_than_hiding_it():
     )
     # The block itself is unconditional: its content shows for everyone.
     assert "Advanced — journal details and archive" in panel
+
+
+# --------------------------------------------------------------------------
+# POST /api/settings/token -- the settings page storing a Flex token.
+#
+# The credential path, so these tests are written to a different standard than
+# the rest of this file: every one of them either proves the value goes where it
+# is supposed to, or proves it does NOT go somewhere it must not. A test suite
+# that only checked the happy path here would be green while the token sat in a
+# log file.
+#
+# `keyring.set_password` is patched in every test that reaches it. Not for speed:
+# the suite must never write to the developer's own credential store, which is
+# the one piece of state on this machine that `tmp_path` cannot isolate.
+# --------------------------------------------------------------------------
+
+def _no_keyring_writes(monkeypatch) -> list[tuple[str, str, str]]:
+    """Capture keyring writes instead of performing them. Returns the log."""
+    import keyring  # noqa: PLC0415 - local to the credential tests
+
+    wrote: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        keyring, "set_password",
+        lambda service, account, token: wrote.append((service, account, token)),
+    )
+    return wrote
+
+
+@pytest.mark.parametrize(("body", "expected"), [
+    ({}, "no token in the request"),
+    ({"token": ""}, "no token in the request"),
+    ({"token": "   \n  "}, "no token in the request"),
+    ({"token": "1" * 129}, "characters"),
+])
+def test_the_token_endpoint_refuses_a_request_without_storing_anything(
+    populated, monkeypatch, body, expected,
+):
+    """A refusal must leave the PREVIOUS token alone.
+
+    The failure this rules out is the ugly one: a blank Save press overwriting a
+    working token with an empty string, so the journal stops syncing because
+    somebody clicked the wrong button. Hence `present: null` rather than `false` --
+    nothing was written, so this reply knows nothing about what is stored, and
+    saying `false` would send the reader off to re-enter a credential that is
+    still there and still fine.
+    """
+    wrote = _no_keyring_writes(monkeypatch)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/settings/token", body)
+    assert status == 400
+    assert payload["ok"] is False
+    assert payload["kind"] == "token"
+    assert payload["present"] is None
+    assert expected in payload["message"]
+    assert wrote == [], "a refused request still wrote to the keyring"
+
+
+def test_the_token_endpoint_stores_a_pasted_token_stripped(populated, monkeypatch):
+    """The happy path, and the whitespace is the interesting half.
+
+    A token arrives PASTED -- out of Client Portal, into a browser field -- and a
+    paste carries a trailing newline often enough that IBKR rejecting the result
+    as invalid would read, to the person who just pasted it correctly, as the
+    token being wrong. Stripped once, in `flex.write_token`, so the terminal
+    prompt gets the same treatment.
+    """
+    import getpass  # noqa: PLC0415 - local to this test
+
+    wrote = _no_keyring_writes(monkeypatch)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/settings/token",
+                                {"token": "  123456789012345\n"})
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["present"] is True
+    assert payload["account"] == getpass.getuser()
+    assert wrote == [("ibkr-flex-token", getpass.getuser(), "123456789012345")]
+
+
+def test_storing_a_token_never_echoes_it_back(populated, monkeypatch):
+    """The reply is read by a browser and kept in devtools history.
+
+    Nothing about a save needs the value, so the reply must not carry it -- not in
+    a confirmation message, not as a masked prefix, not anywhere. Asserted over the
+    whole serialised body rather than key by key, because the next key added here
+    would not be covered by a per-key check.
+    """
+    _no_keyring_writes(monkeypatch)
+    secret = "987654321098765"
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _status, payload = _post(base, "/api/settings/token", {"token": secret})
+    assert secret not in json.dumps(payload)
+
+
+def test_storing_a_token_never_logs_it(populated, monkeypatch, caplog):
+    """A credential in `logs/optjournal.log` is a credential on disk in the clear.
+
+    This journal logs generously and the log is long-lived -- the real one carries
+    months of scheduler history -- so the one thing the token endpoint must never
+    do is mention its input. The account name it may log, and does: that is what
+    tells a reader which keyring entry to look at.
+    """
+    _no_keyring_writes(monkeypatch)
+    secret = "555000111222333"
+    with caplog.at_level("DEBUG"):
+        with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+            status, _payload = _post(base, "/api/settings/token",
+                                     {"token": secret})
+    assert status == 200
+    assert secret not in caplog.text
+
+
+def test_a_keyring_that_will_not_answer_reports_it_rather_than_hanging(
+    populated, monkeypatch,
+):
+    """The measured failure: a keychain waiting on an unlock blocks the call.
+
+    Unbounded, the request stays open with no reply and the Save button spins
+    until the tab is closed. So the write gets the same deadline as the read, and
+    the timeout says NOTHING WAS STORED -- with `present: null`, because a call
+    that never returned cannot report what is in the keyring.
+
+    The deadline is shortened here rather than the sleep lengthened: the point is
+    that the handler gives up, not how long four seconds takes.
+    """
+    import time  # noqa: PLC0415 - local to this test
+
+    import keyring  # noqa: PLC0415
+
+    monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(
+        keyring, "set_password",
+        lambda service, account, token: time.sleep(5),
+    )
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, payload = _post(base, "/api/settings/token", {"token": "12345"})
+    assert status == 503
+    assert payload["ok"] is False
+    assert payload["kind"] == "keyring"
+    assert payload["present"] is None
+    assert "Nothing was stored" in payload["message"]
+
+
+def test_the_settings_panel_offers_a_token_field_that_does_not_render_a_value():
+    """The page half, pinned where the copy cannot quietly diverge from it.
+
+    Three properties, each answering an objection that kept this out of the page
+    for a while: the input is a PASSWORD field so a shoulder or a screenshot does
+    not carry it, `autocomplete` is off so the browser does not offer it back in
+    another form, and the markup interpolates NO value -- a round trip through the
+    page would mean the server had sent the token, which no endpoint does.
+    """
+    panel = _fn("settingsPanel")
+    assert 'id="tok"' in panel, "the settings panel offers no token field"
+    assert 'id="toksave"' in panel, "the token field has no save button"
+    assert 'type="password"' in panel, "the token field is not masked"
+    assert 'autocomplete="off"' in panel
+    # The `value=` attribute is what a rendered credential would need. The query
+    # id row legitimately has one, so this is scoped to the token input's tag.
+    tag = panel[panel.index('id="tok"'):]
+    assert "value=" not in tag[:tag.index(">")], (
+        "the token input renders a value, which would mean the payload carries one"
+    )
+
+
+def test_the_token_save_handler_clears_the_field_and_reports_the_server():
+    """What happens after the POST, which is where a credential lingers.
+
+    The field is cleared ON SUCCESS ONLY -- keeping it on failure is deliberate,
+    so fixing a paste that picked up one stray character does not mean another
+    trip to Client Portal -- and the failure message is the SERVER's, because the
+    server holds the length rule and a copy here would be a second rule to keep in
+    step.
+    """
+    js = _code_only(_js())
+    handler = js[js.index("toksave.onclick"):js.index("const tokcheck")]
+    assert "'/api/settings/token'" in handler, "the save button posts elsewhere"
+    assert "method:'POST'" in handler
+    assert "el.value=''" in handler, "the token stays in the form field"
+    assert "tok.message" in handler, "the page invents its own failure message"
+    # Cleared after the ok check, not before it: the ordering IS the property.
+    assert handler.index("if(!tok.ok)") < handler.index("el.value=''")
+
+
+def test_a_sync_from_the_page_writes_the_ledger_row_the_scheduler_reads(
+    tmp_path, monkeypatch,
+):
+    """The endpoint half of the outage: work done, nothing recorded.
+
+    `POST /api/sync` fetched, ingested and reported -- and wrote no `job_runs` row,
+    so `consecutive_failures` stayed where a backed-off scheduler had left it. The
+    journal was syncing on demand and the schedule stayed dead, which is the
+    hardest version of this bug to notice: everything a person touches works.
+
+    `sync_journal` is patched out rather than reached: the real one spends an IBKR
+    request, and what is under test is the bookkeeping around it.
+    """
+    from conftest import connect_migrated  # noqa: PLC0415 - local to this test
+
+    from optjournal.jobs import FAILURE_BACKOFF  # noqa: PLC0415
+    from optjournal.web import _do_sync  # noqa: PLC0415 - private by design
+
+    db = tmp_path / "j.db"
+    conn = connect_migrated(db)
+    conn.execute("INSERT OR REPLACE INTO job_state (job, last_status,"
+                 " consecutive_failures) VALUES ('sync', 'failed', ?)",
+                 (FAILURE_BACKOFF,))
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(web, "sync_journal", lambda **kw: {
+        "changed": True, "summary": "3 new trade(s), 1 new cash row(s)",
+        "new_trades": 3, "new_cash": 1,
+    })
+    reply = _do_sync(db_path=db, archive_dir=RAW_DIR, query_id="1591754",
+                     assets=("OPT",))
+    assert reply["new_trades"] == 3, "the page's own reply changed shape"
+
+    after = connect_migrated(db)
+    assert after.execute(
+        "SELECT consecutive_failures FROM job_state WHERE job='sync'"
+    ).fetchone()[0] == 0, (
+        "a sync from the page did not clear the scheduler's backoff"
+    )
+    row = after.execute(
+        "SELECT job, status, fired_for FROM job_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert (row["job"], row["status"], row["fired_for"]) == ("sync", "ok", None)
+
+
+def test_a_refused_sync_from_the_page_is_recorded_too(tmp_path, monkeypatch):
+    """A cooldown and a rejected token are outcomes, not silences.
+
+    Recording only the successes would leave the ledger describing a job that
+    apparently never fails -- and `job_runs.detail` is where the reason has to be,
+    because it is what the backoff warning now reads back.
+    """
+    from conftest import connect_migrated  # noqa: PLC0415
+
+    from optjournal.flex import TokenRejected  # noqa: PLC0415
+    from optjournal.web import _do_sync  # noqa: PLC0415
+
+    db = tmp_path / "j.db"
+    connect_migrated(db).close()
+
+    def rejected(**kwargs):
+        raise TokenRejected("IBKR says your Flex token is expired")
+
+    monkeypatch.setattr(web, "sync_journal", rejected)
+    reply = _do_sync(db_path=db, archive_dir=RAW_DIR, query_id="1591754",
+                     assets=("OPT",))
+    assert reply["kind"] == "config" and reply["ok"] is False
+
+    row = connect_migrated(db).execute(
+        "SELECT status, detail FROM job_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "failed"
+    assert "credentials:" in row["detail"]
+
+
+def test_both_hand_run_sync_paths_record_what_they_did():
+    """The page and the CLI, pinned together, because they failed together.
+
+    Two entry points to one piece of work, and both were invisible to the ledger.
+    A pin on each is cheap insurance that a future edit to one does not quietly
+    reintroduce the asymmetry that made a two-week outage look like a working
+    journal.
+    """
+    import inspect  # noqa: PLC0415
+
+    from optjournal.cli import cmd_sync  # noqa: PLC0415
+    from optjournal.web import _do_sync  # noqa: PLC0415
+
+    for fn in (_do_sync, cmd_sync):
+        assert "record_manual_sync" in inspect.getsource(fn), (
+            f"{fn.__name__} no longer records its run, so a sync through it "
+            f"leaves the scheduler's backoff counter untouched"
+        )

@@ -43,6 +43,12 @@ still fail together, and finding that out later from a scheduled sync is worse.
 `--no-verify` skips that check; `--query-id` and `--token-stdin` make it
 scriptable.
 
+A token expires, and replacing it does not need a terminal: Settings in the page
+takes a new one and writes it to the same keyring entry. The page can replace the
+token but never read it back, so it reports presence and never a value — and
+since only a real fetch can tell whether IBKR still accepts what it was given,
+press **Sync** after saving.
+
 No IBKR account handy? `uv run optjournal demo` writes synthetic data to
 `demo/`, and `uv run optjournal serve --demo` browses it.
 
@@ -93,7 +99,7 @@ optjournal friction --month 2026-08       one month (or a year: 2026)
 
 | what | where | set by |
 |---|---|---|
-| Flex token | OS keyring | `optjournal setup` |
+| Flex token | OS keyring | `optjournal setup`, or Settings in the page |
 | Flex Query ID | `.optjournal.json` | `optjournal setup`, or Settings in the page |
 | Scoreboard unit | `.optjournal.json` | Settings in the page |
 | Database, archive | beside the code (`journal.db`, `raw/`) | `--db` / `--archive` |

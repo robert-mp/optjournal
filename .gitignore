@@ -61,6 +61,10 @@ journal-*.db
 # Cross-process lock files. Empty, per-database, and recreated on demand --
 # see locks.py. Committing one would be committing a runtime artifact.
 *.migrate.lock
+# The fetch lock is the same kind of thing, and it lands in whichever directory
+# is serving as an archive -- including tests/fixtures/statements/, which IS
+# tracked, so a test run would otherwise leave a file to commit.
+.fetch.lock
 
 # Synthetic data from `optjournal demo`. Regenerated deterministically, and
 # kept out of raw/ so a fake statement can never be mistaken for a real one.

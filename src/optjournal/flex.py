@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,6 +33,7 @@ from urllib.request import Request, urlopen
 
 import keyring
 from py_ibkr import FlexClient, FlexError, FlexQueryResponse
+from py_ibkr.flex.client import FlexAuthError
 from py_ibkr.flex.parser import parse_xml_file
 
 from optjournal.locks import locked
@@ -42,12 +44,15 @@ __all__ = [
     "FetchCooldown",
     "FetchResult",
     "TokenMissing",
+    "TokenRejected",
+    "TokenWriteRefused",
     "archive_digest",
     "cooldown_remaining",
     "fetch",
     "last_fetch",
     "load",
     "read_token",
+    "write_token",
 ]
 
 log = logging.getLogger(__name__)
@@ -198,6 +203,39 @@ class TokenMissing(RuntimeError):
     """No usable Flex token in the OS keyring."""
 
 
+class TokenRejected(RuntimeError):
+    """IBKR refused the TOKEN, rather than the request made with it.
+
+    Separated from every other `FlexError` because the remedy is different in
+    kind: nothing about the journal, the query or the network will fix it, and no
+    retry will either -- somebody has to generate a new token. The scheduler
+    treats it as a credentials failure, the same as a missing one, so it stops
+    spending requests on a token IBKR has already rejected.
+    """
+
+
+class TokenWriteRefused(RuntimeError):
+    """The OS credential store would not store the token.
+
+    Its own type because the remedy is not the caller's to guess and the
+    underlying error does not state it: `keyring` reports a numeric OS status
+    with the text "Unknown Error", which tells the reader nothing about what to
+    do next. `write_token` translates the statuses that HAVE a remedy.
+    """
+
+
+#: macOS keychain statuses that mean "an entry is here and this program may not
+#: replace it", as opposed to "the store is broken". Both are refusals to change
+#: an item's OWNERSHIP rather than to write at all -- adding a brand new entry
+#: from the same process succeeds, which is what makes the distinction worth
+#: drawing. Named from Security/SecBase.h, because a bare -25244 in a log is a
+#: number nobody can look up from memory.
+_KEYCHAIN_NOT_OURS = {
+    -25244: "errSecInvalidOwnerEdit",
+    -25243: "errSecNoAccessForItem",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class FetchResult:
     """A parsed statement plus the path of the raw XML it came from."""
@@ -234,6 +272,128 @@ def read_token(account: str | None = None) -> str:
             f"-s {KEYRING_SERVICE} -w"
         )
     return token.strip()
+
+
+#: Longest token this will store. IBKR's tokens are short numeric strings, but
+#: the FORMAT is not documented, so this bounds the write without asserting a
+#: shape: a length rule cannot reject a valid token IBKR decides to lengthen,
+#: where an `isdigit` rule could. A paste that is not a token fails at IBKR with
+#: a message that says so, which is a better teacher than a guess here.
+TOKEN_MAX_LEN = 128
+
+
+def write_token(token: str, account: str | None = None) -> str:
+    """Store the Flex token in the OS keyring. Returns the account it is under.
+
+    One place writes the credential, for the same reason one place reads it: the
+    service name and the account rule have to agree between `optjournal setup`
+    and the settings page, and they were two `keyring` calls in two modules
+    before this. A second spelling of either is an entry nothing can find.
+
+    Whitespace-stripped because the value arrives PASTED -- from Client Portal,
+    through a terminal prompt or a browser field, all three of which pick up a
+    trailing newline or a leading space that IBKR then rejects as an invalid
+    token. Nothing here echoes, logs or returns the value.
+    """
+    token = token.strip()
+    if not token:
+        raise ValueError("refusing to store an empty Flex token")
+    if len(token) > TOKEN_MAX_LEN:
+        raise ValueError(
+            f"refusing to store a {len(token)}-character Flex token: "
+            f"IBKR's are under {TOKEN_MAX_LEN}, so this is not one"
+        )
+    if account is None:
+        import getpass
+
+        account = getpass.getuser()
+    try:
+        keyring.set_password(KEYRING_SERVICE, account, token)
+    except Exception as exc:
+        raise TokenWriteRefused(_write_refusal(exc, account)) from exc
+    return account
+
+
+#: IBKR error codes that mean "this token is no good", with what each one is
+#: actually telling you. Measured against the live endpoint on 2026-09-24: a token
+#: past its lifetime answered 1012, and the same token after being regenerated in
+#: Client Portal answered 1015 -- so the pair is how you tell "it aged out" from
+#: "it was replaced", which is worth keeping distinct in the message.
+_TOKEN_CODES = {
+    "1012": "expired",
+    "1015": "invalid, which is also what a token reads as once it has been "
+            "regenerated in Client Portal",
+    "1009": "not accepted",
+}
+
+#: How py_ibkr renders an IBKR error code it has no specific class for:
+#: `f"Flex API Error {code}: {msg}"`. Parsed rather than read off an attribute
+#: because `FlexError` carries no code -- checked in the installed source, and
+#: pinned by a test, so an upstream wording change fails loudly here instead of
+#: quietly losing the remedy.
+_FLEX_CODE = re.compile(r"Flex API Error (\d+)")
+
+
+def _reraise_if_token_rejected(exc: FlexError) -> None:
+    """Raise `TokenRejected` if IBKR's complaint is about the token. Else return.
+
+    TWO DETECTIONS, because py_ibkr reports the same class of problem two ways:
+    1009 and 1012 arrive as `FlexAuthError` with the code stripped out of the
+    message, while 1015 falls through to a bare `FlexError` whose text still
+    carries "Flex API Error 1015". Matching on the class alone missed 1015 -- the
+    code this journal actually hit -- and matching on the text alone would miss
+    1012.
+    """
+    code = None
+    found = _FLEX_CODE.search(str(exc))
+    if found:
+        code = found.group(1)
+    if code not in _TOKEN_CODES and not isinstance(exc, FlexAuthError):
+        return
+    reads_as = _TOKEN_CODES.get(code or "", "not accepted")
+    raise TokenRejected(
+        f"IBKR says your Flex token is {reads_as}. Nothing here can retry past "
+        f"that: generate a new one in Client Portal (Settings → Flex Web "
+        f"Service), then store it in the page under Settings → Flex token, or "
+        f"run `optjournal setup`.\n  IBKR said: {exc}"
+    ) from exc
+
+
+def _write_refusal(exc: Exception, account: str) -> str:
+    """Why the credential store said no, and what to do about it.
+
+    THE MESSAGE IS THE FEATURE. Measured on this machine: replacing a token that
+    `security add-generic-password` had created in August failed with
+    `Can't store password on keychain: (-25244, 'Unknown Error')`, three times,
+    with no indication that the remedy is one command. `keyring` writes on macOS
+    by DELETING the existing item and adding a fresh one, and the delete is what
+    an item created by another program refuses -- so an entry that reads back
+    perfectly cannot be replaced, which is the least guessable failure here.
+
+    The status is read off the CAUSE rather than parsed out of the message text:
+    `keyring.backends.macOS` raises `PasswordSetError(...) from api.Error(status,
+    ...)`, so the number is a real attribute one link down the chain, and matching
+    on the rendered string would break on a wording change.
+
+    Anything else is passed through with its own text. A guess dressed as advice
+    is worse than the original error, and this only knows about two statuses.
+    """
+    status = None
+    cause = exc.__cause__
+    if cause is not None and cause.args and isinstance(cause.args[0], int):
+        status = cause.args[0]
+    if status in _KEYCHAIN_NOT_OURS:
+        return (
+            f"the keychain will not let this program replace the existing "
+            f"{KEYRING_SERVICE!r} entry ({_KEYCHAIN_NOT_OURS[status]}, {status}): "
+            f"it was created by a different program, and macOS refuses to change "
+            f"an item's owner. Delete it once and store the new token:\n"
+            f"  security delete-generic-password -s {KEYRING_SERVICE} "
+            f"-a {account}\n"
+            f"Nothing else is lost -- the entry holds only the token you are "
+            f"replacing."
+        )
+    return str(exc)
 
 
 def _state_path(archive_dir: Path) -> Path:
@@ -463,15 +623,19 @@ def _fetch_locked(
     client = _client_factory(user_agent=USER_AGENT)
 
     log.info("requesting Flex query %s", query_id)
-    raw = client.download(
-        token,
-        query_id,
-        max_retries=MAX_RETRIES,
-        retry_interval=RETRY_INTERVAL,
-        max_retry_interval=MAX_RETRY_INTERVAL,
-        from_date=_norm_date(from_date),
-        to_date=_norm_date(to_date),
-    )
+    try:
+        raw = client.download(
+            token,
+            query_id,
+            max_retries=MAX_RETRIES,
+            retry_interval=RETRY_INTERVAL,
+            max_retry_interval=MAX_RETRY_INTERVAL,
+            from_date=_norm_date(from_date),
+            to_date=_norm_date(to_date),
+        )
+    except FlexError as exc:
+        _reraise_if_token_rejected(exc)
+        raise
 
     path, duplicate_of = _archive(raw, archive_dir)
     if duplicate_of is not None:

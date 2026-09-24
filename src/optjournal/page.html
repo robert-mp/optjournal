@@ -205,11 +205,15 @@ import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
  * @property {string} scoring -- the scoreboard unit in force, same value as
  *   stats.scoring; here so the settings form reads its own block
  * @property {Object|null} token -- ALWAYS null on load. The keyring has been
- *   measured at 8.2s with a locked keychain, so presence is fetched from
- *   /api/settings/token by a button and held here afterwards
+ *   measured at 8.2s with a locked keychain, so presence is never read on a page
+ *   load: it arrives from /api/settings/token, either from the check button or as
+ *   a save's reply, and is held here afterwards
  */
 
-/** @typedef {Object} TokenStatus -- GET /api/settings/token (web._token_status)
+/** @typedef {Object} TokenStatus -- /api/settings/token: the GET's reply
+ *  (web._token_status) and the POST's (web._token_write). ONE SHAPE FOR BOTH, so
+ *  saving a token updates the same line that checking for one does, and there is
+ *  no second reply for the page to keep in step.
  * @property {boolean} ok
  * @property {string} kind
  * @property {boolean|null} present -- true, false, or NULL when the keyring
@@ -1151,7 +1155,7 @@ import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
  * @local when button parts names
  * @local COST_OPTIONS bits cost fees on wh
  * @local STATS_KEYS_REQUIRED missing state
- * @local SCORINGS qidsave tokcheck
+ * @local SCORINGS qidsave tokcheck toksave
  * @local WBX_LABEL WIVR_LABEL WMETER WRING items it arc tin tout sb
  * @local events
  */
@@ -4689,9 +4693,9 @@ function settingsPanel(){
   return `<div class="card">
     <div class="crow"><div><h2>Settings</h2>
       <div class="sub">Stored beside the journal in <code>.optjournal.json</code>,
-      so they survive a restart. The Flex <b>token</b> is never here — it lives in
-      the OS keyring, and <code>optjournal setup</code> is the only thing that
-      writes it.</div></div></div>
+      so they survive a restart. The Flex <b>token</b> is the exception: it goes to
+      the OS keyring, and this page can replace it but never read it back.
+      </div></div></div>
 
     <h2 class="sub3 mt-5">IBKR connection</h2>
     <div class="setrow">
@@ -4711,11 +4715,22 @@ function settingsPanel(){
         Performance &amp; Reports → Flex Queries. Sync stays disabled until this
         is set.</div>`:''}
     <div class="setrow mt-4">
-      <span class="flabel">Flex token</span>
+      <label class="flabel" for="tok">Flex token</label>
+      <input id="tok" class="tin mono" type="password" autocomplete="off"
+        placeholder="paste to replace">
+      <button id="toksave">Save</button>
+      <span id="tokmsg" class="dim"></span>
+    </div>
+    <div class="setrow">
+      <span class="flabel"></span>
       <span>${tokLine}</span>
       <button id="tokcheck">Check keyring</button>
       <span class="dim">presence only, and never the value</span>
     </div>
+    <div class="note">Client Portal → Settings → Flex Web Service. A token that
+    has expired reads as <b>stored</b> here — the keyring holds whatever it was
+    given, and only a real fetch can say whether IBKR still accepts it, so press
+    <b>Sync</b> after saving.</div>
 
     ${scoringRow()}
 
@@ -4981,6 +4996,42 @@ function draw(push){
        length) and repeating it here would be two rules to keep in step. */
     if(msg) msg.textContent=res&&res.ok?'saved':((res&&res.message)||'failed');
     if(res&&res.ok) load();
+  };
+  const toksave=$('#toksave');
+  if(toksave) toksave.onclick=async()=>{
+    const el=$('#tok'), msg=$('#tokmsg');
+    const token=(el&&el.value||'').trim();
+    if(!token){if(msg) msg.textContent='paste a token first';return;}
+    toksave.disabled=true;
+    if(msg) msg.textContent='storing...';
+    try{
+      /* NOT through `save()`: that helper posts to /api/settings, and this is a
+         different endpoint with a different reply. Its own path because it writes
+         a credential to the OS keyring rather than a preference to a file. */
+      const r=await fetch('/api/settings/token',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({token:token})});
+      const tok=await r.json();
+      if(!tok.ok){
+        /* The SERVER's message, and no `draw()`: a redraw rebuilds this panel
+           from state and would wipe the one thing the reader needs to read. */
+        if(msg) msg.textContent=tok.message||'failed';
+        return;
+      }
+      /* CLEARED, so the credential is not still sitting in a form field in a tab
+         left open for the rest of the day. Kept on failure, above: the reader
+         would otherwise go back to Client Portal to fix one stray character. */
+      if(el) el.value='';
+      /* The reply IS a token status, so it lands where the Check button's answer
+         lands and the line below reports "stored" for itself -- rather than the
+         page claiming it from the fact that a request came back. */
+      if(S.state&&S.state.settings) S.state.settings.token=tok;
+      draw();
+    }catch(err){
+      if(msg) msg.textContent='could not reach the journal: '+err;
+    }finally{
+      toksave.disabled=false;
+    }
   };
   const tokcheck=$('#tokcheck');
   if(tokcheck) tokcheck.onclick=async()=>{

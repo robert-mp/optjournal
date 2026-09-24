@@ -37,11 +37,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from optjournal.bars import backfill_bars
 from optjournal.events import EventFetchError, EventRateLimited, fetch_events, store_events
-from optjournal.flex import FetchCooldown, TokenMissing
+from optjournal.flex import FetchCooldown, TokenMissing, TokenRejected
 from optjournal.locks import LockTimeout, locked
 from optjournal.sync import sync_journal
 
@@ -60,8 +61,10 @@ __all__ = [
     "interrupted_runs",
     "job_by_name",
     "prune_runs",
+    "record_manual_sync",
     "record_run",
     "run_job",
+    "sync_outcome",
 ]
 
 log = logging.getLogger(__name__)
@@ -420,16 +423,50 @@ def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:
             conn=conn, archive_dir=ctx.archive_dir, query_id=ctx.query_id,
             assets=ctx.assets,
         )
-    except FetchCooldown as exc:
-        # `nothing`: the cooldown is the system working. Retrying is what it
-        # exists to prevent.
-        return Outcome("nothing", f"cooldown: {exc}")
-    except TokenMissing as exc:
-        return Outcome("failed", f"credentials: {exc}")
+    except (FetchCooldown, TokenMissing, TokenRejected) as exc:
+        return sync_outcome(exc)
+    return sync_outcome(result)
+
+
+def sync_outcome(result: dict[str, Any] | Exception) -> Outcome:
+    """The ledger's reading of one sync, from its reply or from what it raised.
+
+    ONE MAPPING, THREE CALLERS, and it is shared because the alternative was
+    measured: `POST /api/sync` and `optjournal sync` did the work and wrote no
+    ledger row at all, so a hand-run sync that fixed the journal left
+    `consecutive_failures` where it was -- and the reconciler went on refusing to
+    start a job that had been working for hours. Two "sync now" controls on one
+    page, only one of which the scheduler could learn from.
+
+    `nothing` for a cooldown: the cooldown is the system working, and retrying is
+    what it exists to prevent. It DOES clear a backoff, which is deliberate -- the
+    counter means "consecutive failures", and being told to wait is not one.
+    """
+    if isinstance(result, FetchCooldown):
+        return Outcome("nothing", f"cooldown: {result}")
+    if isinstance(result, TokenMissing | TokenRejected):
+        return Outcome("failed", f"credentials: {result}")
+    if isinstance(result, Exception):  # pragma: no cover - callers narrow first
+        return Outcome("failed", str(result)[:400])
     return Outcome(
         "ok" if result["changed"] else "nothing",
         result["summary"], result["new_trades"], result["new_trades"],
     )
+
+
+def record_manual_sync(
+    conn: sqlite3.Connection, result: dict[str, Any] | Exception
+) -> None:
+    """Write the ledger row for a sync no schedule claimed.
+
+    For the page's Sync button and for `optjournal sync`, which run the same work
+    as the scheduled job and were invisible to the ledger until this existed. It
+    goes through `record_run`, so it inherits that function's policy of logging and
+    swallowing its own failures: bookkeeping must not fail the work it describes.
+    """
+    outcome = sync_outcome(result)
+    record_run(conn, "sync", status=outcome.status, detail=outcome.detail,
+               done=outcome.done, total=outcome.total)
 
 
 #: Every job, in DECLARATION ORDER, and the order is load-bearing. Step 6's
@@ -943,6 +980,26 @@ def _epoch_of(stamp: str) -> int | None:
     return int(parsed.timestamp())
 
 
+def _last_failure(conn: sqlite3.Connection, job: str) -> str | None:
+    """The detail of this job's most recent failed run, for the backoff warning.
+
+    Its own query rather than a column on `_ledger_snapshot`, because it is needed
+    only on the branch that logs -- at most once per backed-off job per tick, where
+    the snapshot runs every tick for every job. Failing quietly is right here: this
+    exists to enrich a log line, and a broken read of the ledger must not stop the
+    reconciler from running the work.
+    """
+    try:
+        row = conn.execute(
+            "SELECT detail FROM job_runs WHERE job = ? AND status = 'failed'"
+            " ORDER BY id DESC LIMIT 1",
+            (job,),
+        ).fetchone()
+    except sqlite3.Error:  # pragma: no cover - a broken ledger must not stop work
+        return None
+    return str(row["detail"]) if row and row["detail"] else None
+
+
 def reconcile(
     conn: sqlite3.Connection,
     *,
@@ -972,8 +1029,15 @@ def reconcile(
         if failures.get(due.job.name, 0) >= FAILURE_BACKOFF:
             # Backed off, not disabled: still runnable by hand from the page, and
             # the count resets on any healthy outcome.
-            log.warning("%s: backed off after %d consecutive failures",
-                        due.job.name, failures[due.job.name])
+            #
+            # THE REASON IS LOGGED WITH IT, because the version that logged only
+            # the count produced 344 identical lines across two weeks of a real
+            # outage and named the cause in none of them -- the cause was sitting in
+            # `job_runs.detail`, which takes a SQL client to read. One extra query
+            # per backed-off job per tick, on a table this loop already reads.
+            log.warning("%s: backed off after %d consecutive failures; last: %s",
+                        due.job.name, failures[due.job.name],
+                        _last_failure(conn, due.job.name) or "reason not recorded")
             continue
         log.info("%s is due (%s)", due.job.name, due.reason)
         try:

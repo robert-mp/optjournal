@@ -46,7 +46,7 @@ import socket
 import sqlite3
 import threading
 import urllib.parse
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -70,12 +70,15 @@ from optjournal.events import (
 )
 from optjournal.flex import (
     FETCH_COOLDOWN_S,
+    TOKEN_MAX_LEN,
     FetchCooldown,
     TokenMissing,
+    TokenRejected,
     cooldown_remaining,
     last_fetch,
     load,
     read_token,
+    write_token,
 )
 from optjournal.history import build_history
 from optjournal.ingest import DEFAULT_ASSET_FILTER
@@ -87,6 +90,7 @@ from optjournal.jobs import (
     Scheduler,
     UnknownJob,
     interrupted_runs,
+    record_manual_sync,
     run_job,
 )
 from optjournal.jobs import (
@@ -640,20 +644,61 @@ def _do_sync(
     is not an error the way a missing token is. `sync_journal` raises so that each
     caller can make that distinction in its own vocabulary.
     """
-    try:
-        with open_journal(db_path) as conn:
-            return sync_journal(
+    with open_journal(db_path) as conn:
+        try:
+            reply = sync_journal(
                 conn=conn, archive_dir=archive_dir, query_id=query_id, assets=assets,
             )
-    except FetchCooldown as exc:
-        return {
-            "ok": False,
-            "kind": "cooldown",
-            "retry_after_s": exc.retry_after_s,
-            "message": str(exc),
-        }
-    except TokenMissing as exc:
-        return {"ok": False, "kind": "config", "message": str(exc)}
+        except FetchCooldown as exc:
+            # RECORDED, not just reported. Until this call existed, a sync from the
+            # page wrote no ledger row, so pressing Sync could fix the journal and
+            # leave the scheduler's backoff counter exactly where it was.
+            record_manual_sync(conn, exc)
+            return {
+                "ok": False,
+                "kind": "cooldown",
+                "retry_after_s": exc.retry_after_s,
+                "message": str(exc),
+            }
+        except (TokenMissing, TokenRejected) as exc:
+            record_manual_sync(conn, exc)
+            return {"ok": False, "kind": "config", "message": str(exc)}
+        record_manual_sync(conn, reply)
+        return reply
+
+
+def _keyring_call(
+    work: Callable[[], tuple[str, str]],
+) -> tuple[str, str] | None:
+    """Run one keyring operation with a deadline. `None` means it never answered.
+
+    THE DEADLINE IS THE POINT, and it is measured rather than defensive:
+    `keyring.get_password` on this machine did not return at all within 10s while
+    the keychain waited for an unlock the HTTP caller could not provide. Without a
+    cap the request stays open with no reply and the button in the page spins
+    forever -- so both token endpoints borrow this, and a new one gets it for free.
+
+    The worker is a DAEMON so a still-blocked call cannot keep the process alive;
+    the OS resolves or cancels its own prompt in its own time. A late answer lands
+    in a list nobody reads any more, which is why `work` must not have a side
+    effect the caller reports as not having happened. Storing is idempotent, so a
+    write that lands after the deadline is reported as a timeout and is still
+    stored -- the page's advice, try again, costs nothing in that case.
+
+    `work` returns its own (kind, message); any exception becomes ('error', str).
+    """
+    outcome: list[tuple[str, str]] = []
+
+    def run() -> None:
+        try:
+            outcome.append(work())
+        except Exception as exc:  # pragma: no cover - backend failures
+            outcome.append(("error", str(exc)))
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(KEYRING_TIMEOUT_S)
+    return outcome[0] if outcome else None
 
 
 @dataclass(frozen=True)
@@ -907,15 +952,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         answer. On `/api/state` that would hold the whole page hostage to a
         system dialog; here a button asks and a page load never does.
 
-        Bounded by a thread with a deadline for the same measurement. A blocking
-        read left the HTTP request open with no reply and the button spinning
-        forever, so the wait is capped and a timeout is reported as
-        `present: null` -- UNREADABLE, which is a different answer from missing.
-        Telling someone their stored token is gone because a dialog was pending
-        would send them to re-enter a credential that is already there.
-
-        The worker is a daemon so a still-blocked read cannot keep the process
-        alive; the OS resolves or cancels its own prompt in its own time.
+        A timeout is reported as `present: null` -- UNREADABLE, which is a
+        different answer from missing. Telling someone their stored token is gone
+        because a dialog was pending would send them to re-enter a credential
+        that is already there.
 
         Reports PRESENCE, never the value, and never whether IBKR accepts it:
         only a real fetch can answer that, and that costs a request.
@@ -923,22 +963,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         import getpass
 
         account = getpass.getuser()
-        outcome: list[tuple[str, str]] = []
 
-        def probe() -> None:
+        def probe() -> tuple[str, str]:
             try:
                 read_token(account)
             except TokenMissing as exc:
-                outcome.append(("absent", str(exc)))
-            except Exception as exc:  # pragma: no cover - backend failures
-                outcome.append(("error", str(exc)))
-            else:
-                outcome.append(("present", "a token is stored for this account"))
+                return "absent", str(exc)
+            return "present", "a token is stored for this account"
 
-        worker = threading.Thread(target=probe, daemon=True)
-        worker.start()
-        worker.join(KEYRING_TIMEOUT_S)
-        if not outcome:
+        answer = _keyring_call(probe)
+        if answer is None:
             log.warning("keyring did not answer within %ss", KEYRING_TIMEOUT_S)
             return 200, {
                 "ok": False, "kind": "keyring", "present": None,
@@ -948,13 +982,103 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                            f"for you to unlock it. Check for a system prompt, or "
                            f"run `optjournal setup` in a terminal.",
             }
-        kind, message = outcome[0]
+        kind, message = answer
         if kind == "error":  # pragma: no cover - backend failures
             log.warning("keyring unreadable: %s", message)
             return 200, {"ok": False, "kind": "keyring", "present": None,
                          "account": account, "message": message}
         return 200, {"ok": True, "kind": "token", "present": kind == "present",
                      "account": account, "message": message}
+
+    def _token_write(self) -> tuple[int, dict[str, Any]]:
+        """Store a new Flex token from the settings page.
+
+        THIS REVERSES A DELIBERATE REFUSAL, so the reasoning that refused it is
+        answered rather than deleted. `_settings_write` still declines the token,
+        and used to say that putting a brokerage credential in an HTTP body on a
+        server with no authentication was reason enough not to have this at all.
+        What changed:
+
+        1. NO AUTHENTICATION, but not no guard. `do_POST` checks `Origin` against
+           the socket this server bound before it routes anything, so a page you
+           have open cannot post here -- the concrete attack that objection was
+           about. A local process can, and a local process running as you can
+           read the keyring directly anyway; what it still cannot do is READ the
+           token back, because no endpoint returns it.
+        2. FORM STATE was a real cost, and is paid down rather than argued with:
+           the field is `type=password`, `autocomplete=off`, and the page clears
+           it on success, so the value is not sitting in a tab hours later.
+        3. DEVTOOLS HISTORY is unfixable for anything a browser submits, and is
+           local to the machine that already stores the token. Named here so the
+           trade is on the record instead of implied.
+
+        What it buys: rotating an expired token is a paste into the page, not a
+        terminal command. That case is not hypothetical -- this journal sat dead
+        for two weeks on an expired token, and `optjournal setup` is a poor answer
+        to hand somebody you gave a trading journal to.
+
+        Storing is NOT verifying, and this deliberately does not spend an IBKR
+        request to find out. The Sync button asks for confirmation first because
+        IBKR locks out clients that ask too often; firing a fetch off a settings
+        save would route around a guard that exists on purpose. So the reply says
+        stored, and the reader presses Sync.
+        """
+        import getpass
+
+        account = getpass.getuser()
+        token = str(self._body().get("token") or "").strip()
+        # Shape-checked only for length, and the reasoning is `write_token`'s:
+        # IBKR does not document the format, so a stricter rule here could refuse
+        # a token that works. Both limbs answer with `present: null` -- nothing
+        # was written, so the previous token is untouched and this endpoint has
+        # learned nothing about it.
+        if not token:
+            return 400, {
+                "ok": False, "kind": "token", "present": None, "account": account,
+                "message": "no token in the request: paste the one from Client "
+                           "Portal → Settings → Flex Web Service.",
+            }
+        if len(token) > TOKEN_MAX_LEN:
+            return 400, {
+                "ok": False, "kind": "token", "present": None, "account": account,
+                "message": f"that is {len(token)} characters; IBKR's tokens are "
+                           f"under {TOKEN_MAX_LEN}, so it is not one.",
+            }
+
+        def store() -> tuple[str, str]:
+            write_token(token, account)
+            return "stored", "the token is in the OS keyring"
+
+        # Bounded like the read, and for the same measurement: a keychain waiting
+        # on an unlock dialog blocks the call, and an unbounded write would hold
+        # this request open with the Save button spinning forever.
+        answer = _keyring_call(store)
+        if answer is None:
+            log.warning("keyring did not accept a write within %ss",
+                        KEYRING_TIMEOUT_S)
+            return 503, {
+                "ok": False, "kind": "keyring", "present": None,
+                "account": account,
+                "message": f"the OS keyring did not answer within "
+                           f"{KEYRING_TIMEOUT_S}s, usually because it is waiting "
+                           f"for you to unlock it. Nothing was stored. Check for "
+                           f"a system prompt and try again.",
+            }
+        kind, message = answer
+        if kind == "error":  # pragma: no cover - backend failures
+            # The MESSAGE, never the token: a keyring backend that echoes its
+            # input into an exception string would otherwise put the credential
+            # in this log line.
+            log.warning("keyring refused a write: %s", message)
+            return 503, {"ok": False, "kind": "keyring", "present": None,
+                         "account": account,
+                         "message": f"the OS keyring refused the write: {message}"}
+        log.info("stored a new Flex token for account %s", account)
+        return 200, {
+            "ok": True, "kind": "token", "present": True, "account": account,
+            "message": "stored in the OS keyring — press Sync to try it against "
+                       "IBKR, which is the only thing that can confirm it works",
+        }
 
     def _settings_write(self) -> tuple[int, dict[str, Any]]:
         """Save preferences from the settings page.
@@ -963,11 +1087,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         renamed field fails loudly here instead of silently storing a preference
         nothing reads.
 
-        The token is NOT settable through this endpoint, and that is deliberate:
-        it would put a brokerage credential in an HTTP body on a server with no
-        authentication, where the browser would also keep it in form state and
-        the request in devtools history. `optjournal setup` reads it from a
-        no-echo prompt instead.
+        The token is not settable HERE, which is now a matter of shape rather than
+        of principle: it goes to the OS keyring instead of `.optjournal.json`, the
+        call needs a deadline, and the reply is a token status. `POST
+        /api/settings/token` does it, and carries the reasoning.
         """
         body = self._body()
         changes: dict[str, Any] = {}
@@ -1285,6 +1408,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/settings":
             self._json(*self._settings_write())
+            return
+        # Its own path rather than a key on /api/settings, because it is a
+        # different KIND of write: a credential to the OS keyring, bounded by a
+        # deadline, with a reply shaped like the token status rather than like a
+        # preferences save. See `_token_write` and `_settings_write`.
+        if path == "/api/settings/token":
+            self._json(*self._token_write())
             return
         if path != "/api/sync":
             self._json(404, {"error": "not found"})

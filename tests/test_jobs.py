@@ -1797,3 +1797,148 @@ def test_the_loop_really_drives_a_job_once_and_then_stops(tmp_path, monkeypatch)
     check.close()
     assert claimed == 1, f"{claimed} claimed instants, expected exactly 1"
     assert beat, "the loop never wrote a heartbeat, so the page reads it as dead"
+
+
+# --------------------------------------------------------------------------
+# A sync nobody scheduled still belongs in the ledger.
+#
+# The outage this closes: `POST /api/sync` and `optjournal sync` did the work and
+# wrote no row, so a hand-run sync that fixed the journal left
+# `consecutive_failures` untouched and the reconciler went on refusing to start a
+# job that had been working for hours. Two "sync now" controls on one page, only
+# one of which the scheduler could learn from.
+# --------------------------------------------------------------------------
+
+def test_a_manual_sync_clears_the_backoff_the_scheduler_is_holding(conn):
+    """The whole point, asserted end to end over the ledger.
+
+    A journal sitting at the failure threshold is the state a real one reached and
+    stayed in for two weeks. Recording a manual sync is what lets it out, and
+    without a restart -- which matters, because the person fixing it is looking at
+    a page, not at a process.
+    """
+    from optjournal.jobs import FAILURE_BACKOFF, record_manual_sync
+
+    conn.execute("INSERT OR REPLACE INTO job_state (job, last_status,"
+                 " consecutive_failures) VALUES ('sync', 'failed', ?)",
+                 (FAILURE_BACKOFF,))
+    conn.commit()
+
+    record_manual_sync(conn, {
+        "changed": True, "summary": "2 new trade(s), 0 new cash row(s)",
+        "new_trades": 2,
+    })
+
+    state = conn.execute(
+        "SELECT last_status, consecutive_failures FROM job_state WHERE job='sync'"
+    ).fetchone()
+    assert state["consecutive_failures"] == 0, (
+        "a successful manual sync left the scheduler's backoff in place"
+    )
+    assert state["last_status"] == "ok"
+    row = conn.execute(
+        "SELECT job, fired_for, status, detail FROM job_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert (row["job"], row["status"]) == ("sync", "ok")
+    assert row["fired_for"] is None, (
+        "a manual run claimed a scheduled slot, which would make the schedule "
+        "think that minute had been served"
+    )
+    assert "2 new trade(s)" in row["detail"]
+
+
+def test_a_manual_sync_that_failed_on_credentials_counts_as_a_failure(conn):
+    """Recording must not be a way to launder a failure into a reset.
+
+    A token IBKR rejects is the case that matters: it arrives at the same call
+    site as a success, and reporting it as anything but `failed` would clear the
+    backoff on a sync that fetched nothing -- turning the brake off precisely when
+    it is right.
+    """
+    from optjournal.flex import TokenRejected
+    from optjournal.jobs import record_manual_sync
+
+    record_manual_sync(conn, TokenRejected("IBKR says your Flex token is expired"))
+
+    row = conn.execute(
+        "SELECT status, detail FROM job_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "failed"
+    assert "credentials:" in row["detail"], "the detail does not name the cause"
+    assert conn.execute(
+        "SELECT consecutive_failures FROM job_state WHERE job='sync'"
+    ).fetchone()[0] == 1
+
+
+def test_a_cooldown_is_nothing_rather_than_a_failure(conn):
+    """`nothing`, and it DOES clear a backoff -- both deliberate.
+
+    The counter means consecutive FAILURES, and being told to wait is not one:
+    the cooldown is this journal's own guard working, so counting it would let the
+    guard eventually disable the job it is protecting.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal.flex import FetchCooldown
+    from optjournal.jobs import record_manual_sync, sync_outcome
+
+    cooldown = FetchCooldown("1591754", datetime(2026, 9, 24, tzinfo=UTC), 480)
+    assert sync_outcome(cooldown).status == "nothing"
+
+    record_manual_sync(conn, cooldown)
+    row = conn.execute(
+        "SELECT status, detail FROM job_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "nothing"
+    assert "cooldown:" in row["detail"]
+
+
+def test_the_scheduled_and_manual_paths_read_a_sync_the_same_way():
+    """One mapping, not two that agree today.
+
+    `_sync` (scheduled, recorded by `run_job`) and `record_manual_sync` (the page
+    and the CLI) must agree about what `ok`, `nothing` and `failed` mean, or the
+    same sync reads two ways depending on who started it -- which is how the
+    ledger stops describing the work.
+    """
+    import inspect
+
+    from optjournal import jobs
+
+    assert "sync_outcome" in inspect.getsource(jobs._sync), (
+        "the scheduled sync no longer shares the ledger's mapping"
+    )
+    assert "sync_outcome" in inspect.getsource(jobs.record_manual_sync), (
+        "the manual sync no longer shares the ledger's mapping"
+    )
+    empty = jobs.sync_outcome({"changed": False, "summary": "nothing new",
+                               "new_trades": 0})
+    assert empty.status == "nothing", "an empty sync is not a success"
+
+
+def test_the_backoff_warning_names_the_reason_not_just_the_count(conn, ctx,
+                                                                monkeypatch, caplog):
+    """344 identical lines over a two-week outage, naming the cause in none.
+
+    The reason was in `job_runs.detail` the whole time, which takes a SQL client to
+    read -- so the log said a job was backed off and never why. A warning a human
+    cannot act on is the same as no warning.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import FAILURE_BACKOFF, reconcile
+
+    _registry(monkeypatch, "market")
+    conn.execute("INSERT INTO job_runs (job, started_at, status, detail) VALUES"
+                 " ('market', '2026-08-11T11:00:00+00:00', 'failed',"
+                 " 'FlexAuthError: Token has expired.')")
+    conn.execute("INSERT OR REPLACE INTO job_state (job, last_status,"
+                 " consecutive_failures) VALUES ('market', 'failed', ?)",
+                 (FAILURE_BACKOFF,))
+    conn.commit()
+    now = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+
+    with caplog.at_level("WARNING"):
+        assert reconcile(conn, ctx=ctx, now=now) == []
+    assert "Token has expired" in caplog.text, (
+        "the backoff warning still does not say why the job is backed off"
+    )

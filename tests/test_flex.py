@@ -427,3 +427,212 @@ def test_the_socket_timeout_sits_below_the_polling_ceiling():
         f"the per-request timeout ({FETCH_SOCKET_TIMEOUT_S}s) is not inside the "
         f"polling ceiling ({POLL_WORST_CASE_S}s)"
     )
+
+
+# --------------------------------------------------------------------------
+# write_token -- the one writer of the keyring entry.
+#
+# `keyring.set_password` is patched throughout. The suite must never touch the
+# developer's real credential store: it is the one piece of state on the machine
+# that no fixture can isolate, and a test that stored a fake token there would
+# break the journal it was run from.
+# --------------------------------------------------------------------------
+
+def _captured_keyring(monkeypatch) -> list[tuple[str, str, str]]:
+    wrote: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        flex.keyring, "set_password",
+        lambda service, account, token: wrote.append((service, account, token)),
+    )
+    return wrote
+
+
+def test_write_token_strips_what_a_paste_carries(monkeypatch):
+    """A pasted token brings whitespace, and IBKR rejects it as invalid.
+
+    Stripped HERE rather than in each caller, which is the reason this function
+    exists at all: the terminal prompt and the settings page both hand it a value
+    somebody pasted, and the failure it prevents -- "Token is invalid" for a token
+    that is perfectly valid -- is indistinguishable from a wrong token to the
+    person reading it.
+    """
+    wrote = _captured_keyring(monkeypatch)
+    account = flex.write_token("  123456789012345\n", "tester")
+    assert account == "tester"
+    assert wrote == [(flex.KEYRING_SERVICE, "tester", "123456789012345")]
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "\n", "\t "])
+def test_write_token_refuses_an_empty_token_rather_than_storing_one(
+    monkeypatch, bad,
+):
+    """Storing "" would be worse than doing nothing: `read_token` treats a falsey
+    entry as MISSING, so an empty write silently replaces a working token with a
+    state whose error message tells the reader to create an entry that already
+    exists."""
+    wrote = _captured_keyring(monkeypatch)
+    with pytest.raises(ValueError, match="empty"):
+        flex.write_token(bad, "tester")
+    assert wrote == []
+
+
+def test_write_token_refuses_something_far_too_long_to_be_a_token(monkeypatch):
+    """A length bound, not a format one, and the distinction is deliberate: IBKR
+    does not document the token's shape, so a digits-only rule could refuse a
+    token that works, while a length rule can only refuse one that IBKR has never
+    issued. What it catches is a whole page pasted into the field."""
+    wrote = _captured_keyring(monkeypatch)
+    with pytest.raises(ValueError, match="not one"):
+        flex.write_token("1" * (flex.TOKEN_MAX_LEN + 1), "tester")
+    assert wrote == []
+
+
+def test_write_token_and_read_token_agree_on_where_the_entry_lives(monkeypatch):
+    """The round trip, through the service name and account rule BOTH use.
+
+    This is the defect the shared writer exists to prevent: two modules spelling
+    the keyring coordinates for themselves, one storing an entry the other cannot
+    find -- which presents as a token that was definitely saved and is definitely
+    missing.
+    """
+    store: dict[tuple[str, str], str] = {}
+    monkeypatch.setattr(
+        flex.keyring, "set_password",
+        lambda service, account, token: store.__setitem__((service, account), token),
+    )
+    monkeypatch.setattr(
+        flex.keyring, "get_password",
+        lambda service, account: store.get((service, account)),
+    )
+    flex.write_token("123456789012345", "tester")
+    assert flex.read_token("tester") == "123456789012345"
+
+
+def test_a_keychain_that_refuses_to_replace_an_entry_says_how_to_fix_it(monkeypatch):
+    """The measured failure, and the one with the least guessable remedy.
+
+    `keyring` writes on macOS by DELETING the existing item and adding a fresh
+    one, and an item created by a different program refuses the delete with
+    errSecInvalidOwnerEdit. So an entry that reads back perfectly cannot be
+    replaced -- and the raw error says only `(-25244, 'Unknown Error')`, which
+    names neither the cause nor the one command that fixes it.
+
+    The status is read off the exception CHAIN, the way the macOS backend reports
+    it, rather than scraped out of the rendered message.
+    """
+    cause = Exception(-25244, "Unknown Error")
+
+    def refuse(service, account, token):
+        raise RuntimeError("Can't store password on keychain") from cause
+
+    monkeypatch.setattr(flex.keyring, "set_password", refuse)
+    with pytest.raises(flex.TokenWriteRefused) as caught:
+        flex.write_token("123456789012345", "tester")
+    message = str(caught.value)
+    assert "errSecInvalidOwnerEdit" in message, "the status is not named"
+    assert "security delete-generic-password" in message, "no remedy is offered"
+    assert flex.KEYRING_SERVICE in message
+    assert "-a tester" in message, "the remedy does not name the account"
+
+
+def test_an_unrecognised_keyring_failure_is_passed_through_not_guessed_at(
+    monkeypatch,
+):
+    """Advice invented for a status this does not know would be worse than the
+    original error. Only the two ownership refusals get a remedy; everything else
+    keeps its own text, and still arrives as TokenWriteRefused so callers have one
+    thing to catch."""
+    def refuse(service, account, token):
+        raise RuntimeError("the keychain is on fire")
+
+    monkeypatch.setattr(flex.keyring, "set_password", refuse)
+    with pytest.raises(flex.TokenWriteRefused, match="on fire") as caught:
+        flex.write_token("123456789012345", "tester")
+    assert "security delete-generic-password" not in str(caught.value), (
+        "a remedy was offered for a status whose remedy is unknown"
+    )
+
+
+# --------------------------------------------------------------------------
+# A token IBKR refuses, told apart from a request it refuses.
+# --------------------------------------------------------------------------
+
+def test_an_expired_token_is_named_as_such_with_the_remedy(monkeypatch):
+    """1012 arrives as `FlexAuthError` with the code stripped OUT of the message.
+
+    py_ibkr's template for 1009/1012 is "IBKR Authentication Error: {msg}", so the
+    number is gone by the time it reaches us and only the class identifies it. This
+    is the failure this journal actually hit: two weeks of `sync` reporting
+    `FlexAuthError` and never that the fix is a new token.
+    """
+    from py_ibkr.flex.client import FlexAuthError
+
+    def expired(*args, **kwargs):
+        raise FlexAuthError("IBKR Authentication Error: Token has expired.")
+
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory",
+                        lambda **kw: type("C", (), {"download": expired})())
+    with pytest.raises(flex.TokenRejected) as caught:
+        flex.fetch("1591754", archive_dir=RAW_DIR, force=True)
+    message = str(caught.value)
+    assert "expired" in message
+    assert "Client Portal" in message, "the remedy is not stated"
+    assert "optjournal setup" in message
+
+
+def test_a_regenerated_token_reads_as_invalid_and_still_gets_the_remedy(monkeypatch):
+    """1015 falls through py_ibkr's table to a BARE `FlexError`.
+
+    So a class check alone misses it -- and 1015 is what the same token answered
+    after being regenerated in Client Portal, measured against the live endpoint.
+    The code is recovered from the message, which is the only place py_ibkr puts it.
+    """
+    from py_ibkr import FlexError
+
+    def invalid(*args, **kwargs):
+        raise FlexError("Flex API Error 1015: Token is invalid.")
+
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory",
+                        lambda **kw: type("C", (), {"download": invalid})())
+    with pytest.raises(flex.TokenRejected, match="regenerated"):
+        flex.fetch("1591754", archive_dir=RAW_DIR, force=True)
+
+
+def test_an_error_that_is_not_about_the_token_is_left_alone(monkeypatch):
+    """Statement-not-ready, throttling and a bad query id are NOT credential
+    problems, and dressing them as one would send the reader to Client Portal to
+    replace a token that works. They keep their own class so the existing
+    handlers -- and the retry policy -- still see them."""
+    from py_ibkr import FlexError
+
+    def other(*args, **kwargs):
+        raise FlexError("Flex API Error 1003: Statement is not available.")
+
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory",
+                        lambda **kw: type("C", (), {"download": other})())
+    with pytest.raises(FlexError) as caught:
+        flex.fetch("1591754", archive_dir=RAW_DIR, force=True)
+    assert not isinstance(caught.value, flex.TokenRejected)
+
+
+def test_the_error_code_pattern_still_matches_what_py_ibkr_writes():
+    """A pin on somebody else's message format, because that is what we parse.
+
+    `FlexError` carries no code attribute -- checked in the installed source -- so
+    the code is recovered from the rendered text. If py_ibkr rewords that string,
+    this fails loudly here instead of quietly dropping the remedy for 1015 and
+    leaving a reader with "Unknown Error" again.
+    """
+    import inspect
+
+    import py_ibkr.flex.client as client
+
+    source = inspect.getsource(client)
+    assert 'f"Flex API Error {error_code}: {error_msg}"' in source, (
+        "py_ibkr changed how it renders an unmapped error code; "
+        "flex._FLEX_CODE no longer matches it"
+    )
+    assert flex._FLEX_CODE.search("Flex API Error 1015: Token is invalid.")
