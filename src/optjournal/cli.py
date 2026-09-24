@@ -1138,7 +1138,10 @@ def cmd_confirms(args) -> int:
         result = fetch_confirms(
             query_id, archive_dir=args.archive,
             from_date=args.from_date, to_date=args.to_date, force=args.force,
-            cooldown_s=0 if args.force else CONFIRM_COOLDOWN_S,
+            # `force` already skips the cooldown check; zeroing the window as well
+            # said the same thing twice, and two spellings of one intent are how
+            # they eventually disagree.
+            cooldown_s=CONFIRM_COOLDOWN_S,
         )
         ingested = ingest_confirms(
             conn, result.raw_path, base_currency=base,

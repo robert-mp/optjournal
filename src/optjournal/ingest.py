@@ -34,11 +34,13 @@ from typing import Any
 from optjournal.confirms import base_rate, parse_confirms
 from optjournal.confirms import statement_meta as confirm_meta
 from optjournal.db import ACTIVITY_SOURCE, CONFIRM_SOURCE, DEFAULT_BROKER
+from optjournal.fills import NormalisedFill
 from optjournal.sources import source_for
 
 __all__ = [
     "ASSET_FILTER_ALL",
     "IngestResult",
+    "ingest_confirms",
     "ingest_file",
 ]
 
@@ -330,10 +332,18 @@ def ingest_confirms(
             ),
         )
 
-    pairs = parse_confirms(path, rate_for=lambda ccy: rate_for(ccy)[0])
-    for _account_id, fill in pairs:
-        estimated = rate_for(fill.currency)[1]
-        _ingest_trades(conn, [fill], path.name, assets, result,
+    # GROUPED BY WHETHER THE RATE WAS ESTIMATED, rather than one call per fill.
+    # `fx_rate_estimated` is a property of the CURRENCY, not of the fill, so a
+    # session's fills fall into at most two batches -- and the writer takes a list
+    # for a reason. One call per fill worked and read as though the flag varied
+    # per row, which is the kind of shape that invites someone to make it true.
+    batched: dict[bool, list[NormalisedFill]] = {}
+    for _account_id, fill in parse_confirms(
+        path, rate_for=lambda ccy: rate_for(ccy)[0]
+    ):
+        batched.setdefault(rate_for(fill.currency)[1], []).append(fill)
+    for estimated, fills in batched.items():
+        _ingest_trades(conn, fills, path.name, assets, result,
                        base_currency=base_currency, broker=broker,
                        source_kind=CONFIRM_SOURCE, fx_rate_estimated=estimated)
     conn.commit()
