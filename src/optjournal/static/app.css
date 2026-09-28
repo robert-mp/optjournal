@@ -1736,6 +1736,13 @@ stop.gneg{stop-color:var(--bad)}
   cursor:pointer;white-space:nowrap}
 .jbtn:hover{border-color:var(--dim2)}
 .jbtns{display:flex;gap:var(--s4);flex-wrap:wrap}
+/* Allocation: the bar column takes what the figures leave. */
+.alloc .abcell{width:30%;min-width:calc(var(--s8) * 4)}
+.alloc td{white-space:nowrap}
+.abar{display:block;width:100%;height:var(--s3)}
+.abtrack{fill:var(--bg2)}
+.abfill{fill:var(--ok)}
+.abfill.neg{fill:var(--bad)}
 /* The roll-link picker: one sentence, a select and a button, under the row. */
 .lform{display:flex;align-items:center;gap:var(--s4);flex-wrap:wrap;margin-top:var(--s5)}
 .lform select{width:auto;max-width:100%}

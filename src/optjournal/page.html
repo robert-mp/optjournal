@@ -212,6 +212,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Stats} stats -- the selected period
  * @property {Stats} all_time
  * @property {Array} positions -- Position rows, newest snapshot
+ * @property {Allocation} allocation -- the account by holding (serialize.allocation_data)
  * @property {Array} orders -- Order rows in scope
  * @property {Array} strategies -- StrategyGroup rows: same orders, grouped
  * @property {Array} lifecycles -- Lifecycle rows: strategies linked by episode
@@ -458,6 +459,26 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} day
  * @property {number} trades
  * @property {Money} realized
+ */
+
+/** @typedef {Object} Allocation -- what the account holds, by name, against net
+ *  liquidation (serialize.allocation_data). Rows plus cash sum to `nav`
+ * @property {string|null} as_of -- the newest snapshot read
+ * @property {number|null} nav -- the broker's net liquidation, base currency
+ * @property {string|null} nav_date
+ * @property {number|null} cash
+ * @property {number|null} cash_share -- null without a net liquidation figure
+ * @property {Array} rows -- AllocationRow, largest absolute net first
+ */
+
+/** @typedef {Object} AllocationRow -- one holding: the stock, or the underlying an
+ *  option is written on
+ * @property {string} holding
+ * @property {number} stock -- base currency
+ * @property {number} options -- base; a short option is negative, a liability
+ * @property {number} net -- stock plus options
+ * @property {number|null} share -- net over net liquidation; negative for a short
+ * @property {number} lines -- snapshot rows folded in
  */
 
 /** @typedef {Object} Position -- one open-position snapshot row (serialize.positions_data)
@@ -1281,7 +1302,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload st:State s:Stats best:Stats alt:Stats x:Episode ep:Episode dy:Day
  * @payload se:Settings tok:TokenStatus pv:Provisional
  * @payload rk:StrategyRank
- * @payload pos:Position o:Order l:Leg h:History
+ * @payload pos:Position o:Order l:Leg h:History al:Allocation ar:AllocationRow
  * @payload stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
  * @payload mo:Money
  * @payload bc:BrokerCosts CT:CostTotals F:FrictionTotals A:AutoFx ch:Charge
@@ -3756,7 +3777,7 @@ function positions(){
     return `<tr class="grp"><td colspan="4" class="dim">${esc(label)}</td>
       <td class="n ${cls(uv)}">${cash(uv)}</td>
       <td colspan="4"></td></tr>${bkt.rows.map(row).join('')}`;};
-  return `<div class="card">
+  return allocationCard()+`<div class="card">
     <div class="crow"><div><h2>Option book${infoTip(
       `A position snapshot is the only cost-basis source for anything opened before
        the archive starts, which is why this panel is dated rather than live.
@@ -3772,6 +3793,39 @@ function positions(){
       <b>snapshot only</b> was opened before the earliest archived statement, so no
       opening fill exists anywhere and its entry price and holding period are
       unknown. The cost basis shown comes from the snapshot.</div>`:''}
+  </div>`;
+}
+
+/* How much of the account rides on each name. Stocks are here and the option
+   book below is not all of it, which is why this card leads the tab: a TSLA put
+   reads differently beside the TSLA shares it is written against. The bar is the
+   share's size on a fixed 0-100% scale, drawn in SVG units so no style is set. */
+function allocationCard(){
+  const al=S.state.allocation;
+  if(!al||!al.rows.length) return '';
+  const bar=share=>share==null?'':`<svg class="abar" viewBox="0 0 100 6"
+    preserveAspectRatio="none" aria-hidden="true"><rect class="abtrack" x="0" y="0"
+    width="100" height="6"/><rect class="abfill${share<0?' neg':''}" x="0" y="0"
+    width="${Math.min(100,Math.abs(share)*100).toFixed(2)}" height="6"/></svg>`;
+  const line=(name,stock,opts,net,share)=>`<tr><td class="mono">${esc(name)}</td>
+    <td class="n ${cls(stock)}">${stock==null?'':stock?cash(stock):'—'}</td>
+    <td class="n ${cls(opts)}">${opts==null?'':opts?cash(opts):'—'}</td>
+    <td class="n ${cls(net)}">${cash(net)}</td>
+    <td class="n">${share==null?'—':pct(share*100)}</td><td class="abcell">${bar(share)}</td></tr>`;
+  return `<div class="card">
+    <div class="crow"><div><h2>Allocation${infoTip(
+      `Each stock, and the underlying each option is written on, as a share of net
+       liquidation. A short option is money the account owes back, so its share is
+       negative. The rows and cash sum to net liquidation.`)}</h2>
+      <div class="sub">From the ${esc(al.as_of||'latest')} snapshot.</div></div>
+      ${al.nav!=null?`<div class="pills"><span class="pill">net liquidation
+        <b>${cash(al.nav)}</b></span></div>`:''}</div>
+    <table class="alloc"><thead><tr><th>holding</th><th class="n">stock</th>
+      <th class="n">options</th><th class="n">net</th><th class="n">share</th><th></th>
+      </tr></thead><tbody>
+      ${al.rows.map(ar=>line(ar.holding,ar.stock,ar.options,ar.net,ar.share)).join('')}
+      ${al.cash!=null?line('Cash',null,null,al.cash,al.cash_share):''}
+    </tbody></table>
   </div>`;
 }
 

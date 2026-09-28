@@ -401,10 +401,15 @@ def check_positions_subtotal_column(p: Page) -> Verdict:
     """
     if p.tab != "positions":
         return skip("not the positions tab")
-    rows = re.findall(r'<tr class="grp">(.*?)</tr>', p.markup, re.S)
+    # The table that HOLDS the subtotal rows, not the page's headers: the tab
+    # also carries the allocation table, and pooling both header rows put
+    # `value` at column 10 of a fifteen-column table that does not exist.
+    book = next((t for t in re.findall(r"<table[^>]*>(.*?)</table>", p.markup, re.S)
+                 if '<tr class="grp">' in t), "")
+    rows = re.findall(r'<tr class="grp">(.*?)</tr>', book, re.S)
     if not rows:
         return skip("no position groups on this page")
-    headers = re.findall(r"<th[^>]*>(.*?)</th>", p.markup)
+    headers = re.findall(r"<th[^>]*>(.*?)</th>", book)
     if "value" not in headers:
         return bad(f"no `value` column in the positions header: {headers}")
     before = headers.index("value")

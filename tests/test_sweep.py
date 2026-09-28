@@ -170,15 +170,22 @@ _POS_HEAD = (
     "<th>value</th><th>cost basis</th><th>unrealised</th><th>price ccy</th>"
     "<th>record</th></tr>"
 )
+#: The allocation table sits above the book on the same tab, with a `value`-less
+#: header of its own. Pooled with the book's, it moved `value` to column 10.
+_ALLOC_TABLE = (
+    '<table class="alloc"><thead><tr><th>holding</th><th>stock</th>'
+    "<th>options</th><th>net</th><th>share</th><th></th></tr></thead></table>"
+)
 _POS_OK = (
-    _POS_HEAD
+    _ALLOC_TABLE + "<table>" + _POS_HEAD
     + '<tr class="grp"><td colspan="4" class="dim">x</td><td></td>'
-      '<td colspan="4"></td></tr>'
+      '<td colspan="4"></td></tr></table>'
 )
 #: The original: a colspan=8 label put the subtotal in the last column, under
 #: `record` -- four columns left of the value it totalled.
 _POS_WRONG_COLUMN = (
-    _POS_HEAD + '<tr class="grp"><td colspan="8" class="dim">x</td><td></td></tr>'
+    _ALLOC_TABLE + "<table>" + _POS_HEAD
+    + '<tr class="grp"><td colspan="8" class="dim">x</td><td></td></tr></table>'
 )
 
 _REPLAY_PAYLOAD = {

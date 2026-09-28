@@ -103,6 +103,7 @@ from optjournal.jobs import (
 )
 from optjournal.marketdata import BarFetchError, fetch_quote
 from optjournal.serialize import (
+    allocation_data,
     audit_data,
     broker_costs_data,
     costs_data,
@@ -524,6 +525,7 @@ def build_state(
                             campaign_list=view_campaigns, scoring=scoring)
             ),
             "positions": positions_data(conn),
+            "allocation": allocation_data(conn),
             "orders": orders,
             # The same orders folded into the strategies they were placed
             # as -- a strangle sold as two same-second orders is one group.

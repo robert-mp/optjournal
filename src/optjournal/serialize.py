@@ -245,6 +245,71 @@ def positions_data(conn: sqlite3.Connection) -> list[Row]:
         out.append(row)
     return out
 
+def allocation_data(conn: sqlite3.Connection) -> Row:
+    """What the account holds, by holding, as a share of net liquidation.
+
+    A HOLDING is the stock, or the underlying an option is written on, so TSLA
+    stock and a TSLA put are one line: the question is how much of the account
+    rides on one name. Stocks and options are kept apart within the line because
+    they are different kinds of exposure, and summed into `net` because that is
+    what the name contributes to the account's value.
+
+    Each category from its OWN latest snapshot, the rule `current_option_positions`
+    already applies, because IBKR can report the two on different days and a
+    date shared across both would drop whichever lagged.
+
+    The denominator is the broker's own net liquidation (`equity_summaries`), so
+    the rows plus `cash` sum to it and a share can be read against the figure the
+    statement prints. A short option is a liability and its share is negative,
+    which is true: it is money the account owes back. Without an equity summary
+    the shares are None rather than a share of some other total.
+    """
+    holdings: dict[str, Row] = {}
+    as_of: str | None = None
+    for cat, key in (("STK", "stock"), ("OPT", "options")):
+        latest = conn.execute(
+            "SELECT MAX(report_date) FROM position_snapshots WHERE asset_category = ?",
+            (cat,),
+        ).fetchone()[0]
+        if latest is None:
+            continue
+        as_of = max(as_of or latest, latest)
+        for r in conn.execute(
+            "SELECT COALESCE(underlying_symbol, symbol) AS holding,"
+            " SUM(position_value * fx_rate_to_base) AS value, COUNT(*) AS n"
+            " FROM position_snapshots WHERE asset_category = ? AND report_date = ?"
+            " GROUP BY 1", (cat, latest),
+        ):
+            row = holdings.setdefault(r["holding"], {
+                "holding": r["holding"], "stock": 0.0, "options": 0.0, "lines": 0})
+            row[key] += r["value"] or 0.0
+            row["lines"] += r["n"]
+    nav = conn.execute(
+        "SELECT total_base, cash_base, report_date FROM equity_summaries"
+        " ORDER BY report_date DESC LIMIT 1"
+    ).fetchone()
+    total = nav["total_base"] if nav else None
+
+    def share(value: float | None) -> float | None:
+        return value / total if total and value is not None else None
+
+    rows = []
+    for row in holdings.values():
+        row["net"] = row["stock"] + row["options"]
+        row["share"] = share(row["net"])
+        rows.append(row)
+    rows.sort(key=lambda r: (-abs(r["net"]), r["holding"]))
+    cash = nav["cash_base"] if nav else None
+    return {
+        "as_of": as_of,
+        "nav": total,
+        "nav_date": nav["report_date"] if nav else None,
+        "cash": cash,
+        "cash_share": share(cash),
+        "rows": rows,
+    }
+
+
 def _money(base: Any, ledger: dict) -> Money:
     """A cost figure: the base total, plus the as-charged amount where one exists.
 

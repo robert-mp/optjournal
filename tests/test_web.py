@@ -419,6 +419,8 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "Money": state["stats"]["commissions"],
         "Day": first(state["stats"]["days"]),
         "Position": first(state["positions"]),
+        "Allocation": state["allocation"],
+        "AllocationRow": first(state["allocation"]["rows"]),
         "Order": first(orders),
         "Leg": first(orders[0]["legs"]) if orders else None,
         "LegMoney": first(orders[0]["legs"])["money"] if orders else None,
