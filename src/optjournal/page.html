@@ -15,7 +15,24 @@
      that mentions the tag defeats both -- see browser._strip_code.) -->
 <link rel="icon" href="/static/mark.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/app.css"></head><body>
-<div class="wrap">
+<!-- THE RAIL SITS OUTSIDE THE CONTENT COLUMN, which is the whole reason this
+     wrapper exists. `.wrap` caps content at 1480px and that cap is a page-wide
+     measurement -- every table on every tab is laid out against it. A rail
+     nested inside would have taken its ~96px out of that 1480, narrowing the
+     Trades and Costs tables that docs/design-notes.md already records as
+     overflowing at the narrow end. So the shell is a two-column grid, the rail
+     takes its own gutter, and the content column is the width it always was. -->
+<div class="shell">
+
+  <!-- A <nav> rather than the <div> the horizontal strip used, because a landmark
+       is worth what it costs here: the rail is now the page's only navigation and
+       a screen reader can jump to it. `aria-label` because there is no heading
+       inside to name it. Filled by `renderRail`, empty in the markup for the
+       kicker's reason -- placeholder nav that flashes and is replaced is a wrong
+       answer on screen, however briefly. -->
+  <nav class="rail" id="rail" aria-label="Sections"></nav>
+
+  <div class="wrap">
 
   <div class="brand">
     <!-- Decorative: the name sits in text immediately beside it, so an alt
@@ -86,18 +103,12 @@
         <button class="icobtn" id="cog" title="Journal details">⚙</button>
       </div>
     </div>
-    <!-- OUT of the title column, and last in the DOM, because `.brand` is a grid
-         whose second row is the tab strip's alone (see app.css). Nested beside the
-         title it was boxed into that column's width: the strip ended at the ninth
-         tab with ~500px of empty slab to its right, and the header stood 140px
-         tall to hold a stack that was half air. A full-width row also means a
-         tenth tab widens the strip instead of wrapping under the eighth. -->
-    <div class="tabs" id="tabs"></div>
   </div>
 
   <div id="msg"></div>
   <div id="body"></div>
   <div class="note" id="foot"></div>
+  </div>
 </div>
 
 <!-- A module, not a classic script: the chart's arithmetic lives in
@@ -1241,7 +1252,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite
- * @local Math S TABS THEMES b sel m r el location window qs hs ids
+ * @local Math S TABS RAIL THEMES b sel m r el location window qs hs ids
+ * @local leaves
  * @local JFIELDS entered closed options STATE_KEYS_REQUIRED
  * @local cells days buckets evs glegs lcs legs mons month months
  * @local open opts out ps pts range rows yrs active shown
@@ -1476,7 +1488,15 @@ const basisOf=m=>isNative(m)?'as charged'
    gating a FILTER, and only the filter bar can answer it, because only it is
    re-derived from the payload on every render. The slot, the `disabled?` branch
    it fed, HASH_TABS' filter over it and `.tab:disabled` all went together; a
-   mechanism kept "in case" is a mechanism nobody has tested. */
+   mechanism kept "in case" is a mechanism nobody has tested.
+
+   THIS LIST IS STILL THE NINE LEAVES, and that is what makes the rail below a
+   cheap change rather than a routing rewrite. `views` dispatches on these keys,
+   `HASH_TABS` validates the URL against them and `sweep.TABS` mirrors them, so
+   folding nine views into seven destinations left every `#tab=costs` link
+   resolving and every one of the nine renders still visited by the browser
+   sweep. A second registry naming the destinations was the smaller change than
+   teaching this one to be a tree. */
 const TABS=[
   ['dashboard','Dashboard'],
   ['calendar','Calendar'],
@@ -1488,12 +1508,86 @@ const TABS=[
   ['market','Market'],
   ['watchlist','Watchlist'],
 ];
-function renderTabs(){
-  $('#tabs').innerHTML=TABS.map(([id,label])=>
-    `<button class="tab${S.tab===id?' on':''}" data-tab="${id}"
-      >${esc(label)}</button>`).join('');
-  document.querySelectorAll('.tab[data-tab]').forEach(b=>
-    b.onclick=()=>{S.tab=b.dataset.tab;draw(true);});
+
+/* ------------------------------------------------ the rail
+
+   [id, label, leaves]. Seven destinations, two of which carry more than one leaf:
+   Trades holds the book closed and open, Analysis holds the two whole-history
+   aggregates. Those are the two pairs that answer one question between them,
+   which is the test a fold has to pass -- Calendar and Annual are both time
+   views and were NOT folded, because "this month day by day" and "every year
+   side by side" are two questions, not one asked twice.
+
+   Seven is what fits a vertical rail. Nine items read as a list to be scanned;
+   seven with two of them grouped reads as a shape to be learned, which is the
+   whole point of moving the navigation off the header's second row.
+
+   The icons sit in their own table rather than a fourth slot here, so this stays
+   a list a reader can check against the rail in front of them. */
+const RAIL=[
+  ['dashboard','Dashboard',['dashboard']],
+  ['calendar','Calendar',['calendar']],
+  ['trades','Trades',['trades','positions']],
+  ['analysis','Analysis',['costs','annual']],
+  ['odte','0DTE',['odte']],
+  ['market','Market',['market']],
+  ['watchlist','Watchlist',['watchlist']],
+];
+
+/* Path data on a 24x24 grid, stroked and unfilled, drawn from the same two
+   primitives throughout (a box and a rule) so seven glyphs read as one set.
+   Deliberately NOT a <symbol> + <use> sprite: `<use>` clones into a shadow tree
+   that only inherited properties cross, so the glyphs take their colour by
+   inheritance either way, and a sprite would buy nothing while adding a second
+   place to look for the shape. No fill or stroke attribute on the paths -- the
+   colour is `.railico`'s in app.css, which is what keeps every colour in this
+   page inside a theme block. */
+const RAIL_ICONS={
+  dashboard:'M4 4h6v6H4z M14 4h6v6h-6z M4 14h6v6H4z M14 14h6v6h-6z',
+  calendar:'M4 6h16v14H4z M4 11h16 M9 3v4 M15 3v4',
+  trades:'M4 9h13 M14 6l3 3-3 3 M20 15H7 M10 12l-3 3 3 3',
+  analysis:'M4 20h16 M7 20v-5 M12 20V8 M17 20v-9',
+  odte:'M6 3h12v18H6z M9 7h6 M9 11h1 M14 11h1 M9 15h1 M14 15h1',
+  market:'M4 9h16v11H4z M3 9l2-5h14l2 5 M9 20v-6h6v6',
+  watchlist:'M2 12s4-6 10-6 10 6 10 6-4 6-10 6-10-6-10-6z M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0z',
+};
+/* A leaf's label, read from TABS rather than restated, so a rename lands once. */
+const LEAF_LABEL=id=>(TABS.find(t=>t[0]===id)||[id,id])[1];
+/* Which destination owns a leaf. Falls back to the first rather than throwing:
+   `S.tab` is already validated against HASH_TABS, so an unowned leaf means a leaf
+   was added to TABS and not to RAIL, and the rail rendering with nothing marked
+   is a quieter failure than the page not rendering at all. */
+const RAIL_OF=id=>RAIL.find(r=>r[2].includes(id))||RAIL[0];
+
+function renderRail(){
+  const here=RAIL_OF(S.tab)[0];
+  $('#rail').innerHTML=RAIL.map(([id,label,leaves])=>{
+    const on=id===here;
+    /* An ACTIVE destination points at the leaf you are on, so clicking it is the
+       no-op `syncHash` already guards against minting a history entry for. An
+       inactive one points at its first leaf, which is the view that names it.
+       Derived, not remembered: a stored "last sub-view per destination" is state
+       the URL cannot express, and this page keeps its view coordinates in the
+       hash for exactly that reason. */
+    return `<button class="tab${on?' on':''}" data-tab="${on?S.tab:leaves[0]}"${
+      on?' aria-current="page"':''}><svg class="railico" viewBox="0 0 24 24"
+      aria-hidden="true" focusable="false"><path d="${RAIL_ICONS[id]}"/></svg>${
+      esc(label)}</button>`;
+  }).join('');
+}
+
+/* The sub-view switcher, shown only where a destination has more than one leaf.
+   `.seg` rather than a second row of tabs, because that shape already means "pick
+   one" everywhere else on this page and a reader should not have to learn that
+   two controls with different silhouettes do the same thing. Empty string, not a
+   hidden element, for the five destinations that have one leaf: a control that is
+   always there and sometimes inert is a control a reader has to test. */
+function subnav(){
+  const leaves=RAIL_OF(S.tab)[2];
+  if(leaves.length<2) return '';
+  return `<div class="seg subnav">${leaves.map(id=>
+    `<button data-tab="${id}" class="${S.tab===id?'on':''}"
+      >${esc(LEAF_LABEL(id))}</button>`).join('')}</div>`;
 }
 
 /* ------------------------------------------------ themes
@@ -5540,7 +5634,7 @@ function draw(push){
      replace, so it has to die with them. */
   replayStop();
   syncHash(push);
-  renderTabs();
+  renderRail();
   /* Before the body renders, not after: the attribute drives every colour on the
      page, so setting it later would paint one frame in the old palette. */
   applyTheme();
@@ -5579,7 +5673,7 @@ function draw(push){
    * silence, here, looks like "there is no data", which is a different claim. */
   let html;
   try{
-    html=(S.showCog?settingsPanel():'')+(v?v():
+    html=(S.showCog?settingsPanel():'')+subnav()+(v?v():
       `<div class="card"><div class="empty">nothing here yet</div></div>`);
   }catch(err){
     note(`Could not render the ${esc(S.tab)} tab: ${esc(String(err&&err.message||err))}`
@@ -5591,6 +5685,12 @@ function draw(push){
   }
   $('#body').innerHTML=html;
   restoreInputs(keep);
+  /* One binder for the rail and the sub-view switcher, bound HERE rather than in
+     `renderRail` because the switcher is part of the body that has only just been
+     written. Both are navigation, so both push a history entry and the back button
+     walks them. */
+  document.querySelectorAll('[data-tab]').forEach(b=>
+    b.onclick=()=>{S.tab=b.dataset.tab;draw(true);});
   const sel=$('#month');
   if(sel) sel.onchange=()=>{S.month=sel.value||null;load();};
   document.querySelectorAll('button[data-calmonth]').forEach(b=>

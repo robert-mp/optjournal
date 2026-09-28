@@ -420,30 +420,86 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    already uses, so this inherits each theme's contrast check for free. */
 .warn2{color:var(--warnfg)}
 .pos.signed::before{content:"+"}
-.wrap{max-width:1480px;margin:0 auto;padding:var(--s8)}
+/* `width:100%` is load-bearing now that this is a grid item. `margin:0 auto` in the
+   inline axis OVERRIDES a grid item's default stretch -- auto margins absorb the
+   free space and the box falls back to fit-content -- so the column measured 1477px
+   while the content sat at 930px, centred, with a 278px gutter either side of it.
+   Measured in a browser at a 1600px viewport, not reasoned about. Stating the width
+   makes `max-width` the thing that caps it and the auto margins the thing that
+   centres what is left over, which is what they were always meant to do here. */
+.wrap{width:100%;max-width:1480px;margin:0 auto;padding:var(--s8)}
+
+/* ---- the shell ----
+   Two columns: the rail, then everything else. The rail is OUTSIDE `.wrap`, and
+   that is the whole reason this wrapper exists rather than the rail being a third
+   grid area inside the header. `.wrap`'s 1480px cap is a page-wide measurement --
+   every table on every tab is laid out against it, and the Trades and Costs tables
+   are already the ones that overflow first at the narrow end. A rail nested inside
+   would have taken its width out of that 1480 and made the worst case worse, on
+   every tab, to fix the navigation on none of them.
+
+   `auto 1fr` so the rail is as wide as its widest label and the content takes the
+   rest; `.wrap` keeps `margin:0 auto`, so the content column still centres in what
+   is left and is never narrower than it was. */
+.shell{display:grid;grid-template-columns:auto 1fr;align-items:start}
+
+/* ---- the rail ----
+   Sticky rather than fixed, which is the CSS-only way to keep it in view: `fixed`
+   takes it out of flow and the shell's first track then collapses, so the content
+   slides underneath it and every tab needs a left padding that agrees with a width
+   declared somewhere else. The shell's `align-items:start` is what gives `sticky`
+   somewhere to travel -- under the grid's default `stretch` the rail would already
+   be as tall as its area and have no slack to move within.
+
+   No scroll of its own. Seven items plus the header's height fit any viewport this
+   page supports, and a nav that scrolls independently of the page is a second
+   scrollbar to discover. */
+.rail{display:flex;flex-direction:column;gap:var(--s2);
+  position:sticky;top:0;
+  padding:var(--s8) var(--s3) var(--s8) var(--s8)}
+/* Icon ABOVE label, centred, which is what makes a 7-item column read as a set of
+   destinations rather than a list of links. The glyph carries no information the
+   label does not -- it is there so the shape of the rail is memorable, and that is
+   why the label stays: an icon-only rail would need a tooltip to be usable and a
+   title attribute to be announced, which is two mechanisms to replace one word. */
+.tab{font:inherit;font-weight:var(--w-label);font-size:var(--t1);cursor:pointer;
+  display:flex;flex-direction:column;align-items:center;gap:var(--s1);
+  width:76px;padding:var(--s4) var(--s1);
+  border-radius:var(--r2);background:transparent;border:1px solid transparent;
+  color:var(--dim)}
+.tab:hover:not(:disabled){background:var(--panel2);border-color:var(--line);color:var(--fg)}
+.tab.on{background:linear-gradient(160deg,var(--accent),var(--accent2));
+  border-color:var(--accentedge);color:var(--accentfg);
+  box-shadow:0 1px 0 var(--bevelon) inset,0 2px 10px var(--dropsoft)}
+/* `stroke:currentColor` so one declaration tracks the button's three states, and
+   no colour name is repeated here. `fill:none` is not a colour -- these are stroked
+   outlines, and without it the browser's default black fill floods every closed
+   path. The stroke width is on the svg rather than the paths so the glyphs cannot
+   drift apart from each other. */
+.railico{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.6;
+  stroke-linecap:round;stroke-linejoin:round}
+/* The sub-view switcher sits above the card it switches, with the card's own top
+   margin below it. `width:max-content` because `.seg` is a flex row that would
+   otherwise stretch to the body's full width, putting two buttons at 700px each. */
+.subnav{width:max-content;margin-bottom:var(--s6)}
 
 /* ---- branded header ----
-   A GRID of three columns and two rows, which is what the header always wanted
-   to be and could not say as a flex row. The mark spans both rows; the dateline
-   and title take the middle of row one; the actions take its right; the tab
-   strip owns the whole of row two.
+   A GRID of three columns and ONE row now. The mark, then the dateline and title,
+   then the actions.
 
-   As a flex row the strip was nested inside the title's column, so it inherited
-   that column's width -- it stopped at the ninth tab and left roughly 500px of
-   empty slab beside it, under a right-hand stack (currency toggle, then the two
-   icon buttons on a second line) that was itself mostly air. The slab stood
-   ~140px tall to contain an arrangement whose right half held nothing. Both
-   problems were the same problem: the only axis a flex row could give the strip
-   was the one the title was already using.
+   It used to carry a second row for the tab strip, and that row was the fix for a
+   real defect: as a flex row nested in the title's column the strip inherited that
+   column's width, stopped at the ninth tab and left ~500px of empty slab beside it
+   under a right-hand stack that was itself mostly air. Giving the strip a full row
+   of its own solved it. What replaced both is the rail: navigation off the header
+   entirely, which is the version of that fix that does not cost a header row.
 
-   `align-items:start` so a short actions column does not stretch, and the areas
-   rather than line numbers because the two rows are named things -- a reader
-   should not have to count tracks to learn that the tabs are the second row. */
+   `align-items:start` so a short actions column does not stretch. The areas stay
+   named rather than numbered -- a reader should not have to count tracks. */
 .brand{display:grid;grid-template-columns:auto 1fr auto;
-  grid-template-areas:"mark head actions"
-                      "mark tabs tabs";
+  grid-template-areas:"mark head actions";
   align-items:start;
-  column-gap:var(--s7);row-gap:var(--s5);
+  column-gap:var(--s7);
   padding:var(--s6) var(--s8);border-radius:var(--r3);
   background:linear-gradient(150deg,var(--brand1) 0%,var(--brand2) 55%,var(--brand3) 100%);
   border:1px solid var(--line2);box-shadow:0 1px 0 var(--bevelfaint) inset}
@@ -494,15 +550,6 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    at 10.5px a background change reads as the label having been selected. */
 .edition:hover{border-color:var(--accentedge);color:var(--fg)}
 .brandhead{grid-area:head;min-width:0}
-/* No `margin-top`: the grid's `row-gap` is what separates the strip from the
-   title now, and keeping both stacked two spacings on one edge. */
-.tabs{grid-area:tabs;display:flex;gap:var(--s3);flex-wrap:wrap}
-.tab{font:inherit;font-weight:var(--w-label);font-size:var(--t3);cursor:pointer;padding:var(--s3) var(--s6);
-  border-radius:var(--r2);background:var(--panel2);border:1px solid var(--line);color:var(--fg)}
-.tab:hover:not(:disabled){border-color:var(--line2)}
-.tab.on{background:linear-gradient(160deg,var(--accent),var(--accent2));
-  border-color:var(--accentedge);color:var(--accentfg);
-  box-shadow:0 1px 0 var(--bevelon) inset,0 2px 10px var(--dropsoft)}
 /* A ROW now, not a column. Stacked, the currency toggle and the two icon buttons
    made a three-deep pile against the right edge that set the header's height on
    its own -- and read as three unrelated things, since nothing but proximity

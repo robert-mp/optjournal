@@ -3559,24 +3559,32 @@ def test_text_on_an_accent_fill_is_readable_in_every_theme():
 
 
 def test_the_selected_tab_separates_from_an_unselected_one_in_every_theme():
-    """A tab strip where the current tab does not stand out is a navigation bar
+    """A rail where the current destination does not stand out is a navigation bar
     that has stopped saying where you are.
 
-    `.tab` is --panel2 and `.tab.on` fills with --accent, so the separation IS
-    the ratio between those two. Found by SCREENSHOT, not by arithmetic: every
-    text-contrast figure passed while Admiralty's selected tab sat at 2.42:1
-    against its neighbours and read as barely selected. Leather manages 3.12, so
-    that is the bar the other themes are held to.
+    `.tab` at rest is TRANSPARENT and `.tab.on` fills with --accent, so the
+    separation is the ratio between --accent and the ground the rail sits on,
+    --bg. It was --panel2 while the tabs were a horizontal strip of filled
+    buttons; the rail draws no fill until hover, because seven stacked panels
+    read as seven cards rather than one list.
 
-    2.8 rather than 3.12 exactly, because this is a floor for a decorative
-    separation rather than a legibility threshold, and pinning a theme to another
-    theme's precise number would make retuning Leather fail everything else.
+    Found by SCREENSHOT, not by arithmetic: every text-contrast figure passed
+    while Admiralty's selected tab sat at 2.42:1 against its neighbours and read
+    as barely selected. Leather managed 3.12 against --panel2, so 2.8 became the
+    bar. Against --bg every theme clears it by more (Leather 3.43, Admiralty
+    3.71, Ledger 4.00), which is the one thing the transparent rest state bought
+    besides the lighter look.
+
+    2.8 rather than any of those exactly, because this is a floor for a
+    decorative separation rather than a legibility threshold, and pinning a theme
+    to another theme's precise number would make retuning Leather fail
+    everything else.
     """
     for selector, palette in _themes().items():
-        ratio = _ratio(palette["accent"], palette["panel2"])
+        ratio = _ratio(palette["accent"], palette["bg"])
         assert ratio >= 2.8, (
             f"{selector}: --accent ({palette['accent']}) is only {ratio:.2f}:1 "
-            f"against --panel2 ({palette['panel2']}), so a selected tab barely "
+            f"against --bg ({palette['bg']}), so a selected rail item barely "
             f"differs from an unselected one. Lighten --accent -- but check "
             f"--accentfg still clears 4.5 on it, the two pull opposite ways"
         )
