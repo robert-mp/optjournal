@@ -1124,11 +1124,37 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} replay_key -- index into State.replays
  */
 
+/** @typedef {Object} JournalReview -- the write-ups counted (serialize.journal_review),
+ *  over the closed cards in the current trade-type scope
+ * @property {number} closed -- closed cards with an anchor
+ * @property {number} written -- of those, with any field written
+ * @property {number} planned -- with a target or an invalidation written at entry
+ * @property {number} reviewed -- with an adherence answer or an exit trigger
+ * @property {Object} adherence -- {target, invalidation}, each {yes, no, na} counts
+ * @property {Object} plan -- {held, broken, unreviewed}, each a Tally
+ * @property {Array} triggers -- TriggerTally, in journal.TRIGGERS order, used ones only
+ */
+
+/** @typedef {Object} Tally -- a group of closed cards and what they earned
+ * @property {number} count
+ * @property {number} wins
+ * @property {number} pnl -- realised, base currency
+ */
+
+/** @typedef {Object} TriggerTally -- one exit trigger's cards (a Tally with a name)
+ * @property {string} key
+ * @property {string} label
+ * @property {number} count
+ * @property {number} wins
+ * @property {number} pnl
+ */
+
 /** @typedef {Object} Journal -- the journal layer (serialize.journal_data)
  * @property {Object} entries -- JournalEntry by Lifecycle.anchor. The only table
  *   in this database a re-ingest cannot rebuild
  * @property {Array} triggers -- Trigger options, in the order they read
  * @property {Array} adherence -- the answers `followed_*` accepts
+ * @property {JournalReview} review -- set by web.build_state over the scoped cards
  */
 
 /** @typedef {Object} JField -- page-side: one row of the journal form. `name` is a
@@ -1320,6 +1346,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite lkres:LinkWrite
+ * @payload rv:JournalReview ty:Tally tt:TriggerTally
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
  * @local leaves PERIOD_TABS pop quotes steps TILES
  * @local draft dr order known tilesave tilereset Array
@@ -1339,7 +1366,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local events
  * @local zrows clean
  * @local rails sessions sigma
- * @local body others pair pick
+ * @local body others pair pick said
  */
 
 const $=s=>document.querySelector(s);
@@ -1577,6 +1604,7 @@ const TABS=[
   ['positions','Positions'],
   ['costs','Costs'],
   ['annual','Annual'],
+  ['review','Journal'],
   ['odte','0DTE'],
   ['market','Market'],
   ['watchlist','Watchlist'],
@@ -1601,7 +1629,7 @@ const RAIL=[
   ['dashboard','Dashboard',['dashboard']],
   ['calendar','Calendar',['calendar']],
   ['trades','Trades',['trades','positions']],
-  ['analysis','Analysis',['costs','annual']],
+  ['analysis','Analysis',['costs','annual','review']],
   ['odte','0DTE',['odte']],
   ['market','Market',['market']],
   ['watchlist','Watchlist',['watchlist']],
@@ -3686,6 +3714,57 @@ function bindJournal(){
       note(jnres.entry?'Written up.':'Entry deleted — every field was empty.','ok');
       await load();
     });
+}
+
+/* ------------------------------------------------ journal review */
+/* What the write-ups say, counted. The trigger list is fixed and adherence has
+   three answers precisely so this table can exist; before it, the journal was
+   written and never read back. Win rate and P&L sit beside each group because
+   the question is not only "did I follow the plan" but "did following it pay". */
+function review(){
+  const rv=(S.state.journal||{}).review;
+  const scope=S.type?` · ${esc(S.state.trade_type_label)} only`:'';
+  if(!rv||!rv.closed) return `<div class="card"><div class="empty">Nothing has
+    closed yet, so there is no outcome to set a plan against.</div></div>`;
+  const rate=ty=>ty.count?pct(ty.wins/ty.count*100,0):'—';
+  const row=(name,ty)=>`<tr><td>${esc(name)}</td><td class="n">${ty.count}</td>
+    <td class="n">${rate(ty)}</td><td class="n ${cls(ty.pnl)}">${cash(ty.pnl)}</td></tr>`;
+  const head=first=>`<thead><tr><th>${first}</th><th class="n">positions</th>
+    <th class="n">win rate</th><th class="n">realised</th></tr></thead>`;
+  const ans=half=>{const said=rv.adherence[half];
+    return `yes <b>${said.yes}</b> · no <b>${said.no}</b> · n/a <b>${said.na}</b>`;};
+  const coverage=`<div class="card">
+    <div class="crow"><div><h2>Journal review${infoTip(
+      `Closed positions only: a review is written at the close, and an open
+       position has no outcome yet. Follows the trade-type scope, like the Trades
+       tab whose cards these are.`)}</h2>
+      <div class="sub">Over ${rv.closed} closed position${rv.closed===1?'':'s'}${scope}.</div></div>
+      <div class="pills"><span class="pill">written up <b>${rv.written}</b></span>
+        <span class="pill">with a plan <b>${rv.planned}</b></span>
+        <span class="pill">reviewed <b>${rv.reviewed}</b></span></div></div>
+    ${rv.reviewed?'':`<div class="empty">Nothing reviewed yet. Open a closed
+      position on the Trades tab and write it up: whether the plan held, and
+      what took it off.</div>`}
+  </div>`;
+  if(!rv.reviewed) return coverage;
+  const plan=`<div class="card">
+    <div class="crow"><div><h2>Did the plan hold${infoTip(
+      `Held: neither half answered no, and at least one answered yes. Broken:
+       either half answered no. A position with no answer is not reviewed, which is
+       not the same as held.`)}</h2>
+      <div class="sub mono">target ${ans('target')} &nbsp; invalidation ${
+        ans('invalidation')}</div></div></div>
+    <table>${head('plan')}<tbody>
+      ${row('Plan held',rv.plan.held)}${row('Plan broken',rv.plan.broken)}
+      ${row('Not reviewed',rv.plan.unreviewed)}</tbody></table>
+  </div>`;
+  const triggers=rv.triggers.length?`<div class="card">
+    <div class="crow"><div><h2>What took them off</h2>
+      <div class="sub">The exit trigger each review named.</div></div></div>
+    <table>${head('trigger')}<tbody>
+      ${rv.triggers.map(tt=>row(tt.label,tt)).join('')}</tbody></table>
+  </div>`:'';
+  return coverage+plan+triggers;
 }
 
 /* ------------------------------------------------ positions */
@@ -6043,7 +6122,7 @@ function draw(push){
   renderKicker();
   renderPeriod();
   renderViewOptions();
-  const views={dashboard,calendar,trades,positions,costs,annual,odte,market,
+  const views={dashboard,calendar,trades,positions,costs,annual,review,odte,market,
     watchlist};
   const v=views[S.tab];
   /* WHAT THE USER WAS TYPING SURVIVES THE RENDER.

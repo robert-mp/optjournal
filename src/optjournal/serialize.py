@@ -52,6 +52,7 @@ from optjournal.events import (
 )
 from optjournal.history import HistoryReport
 from optjournal.journal import ADHERENCE as JOURNAL_ADHERENCE
+from optjournal.journal import FIELDS as JOURNAL_FIELDS
 from optjournal.journal import TRIGGERS as JOURNAL_TRIGGERS
 from optjournal.journal import entries as journal_entries
 from optjournal.money import FILL_MONEY_FIELDS, Money
@@ -1415,6 +1416,76 @@ def logbook_data(conn: sqlite3.Connection, *, today: date) -> Row:
         #: or a negative day -- nonsense a reader cannot interpret, where "day 1"
         #: is merely uninteresting.
         "day": max(1, (today - start).days + 1),
+    }
+
+
+def journal_review(lifecycles: list[Row], entries: dict[str, Row]) -> Row:
+    """What the write-ups say, counted: the reason the journal exists.
+
+    `journal.TRIGGERS` is a fixed list so "how often do I close on a time stop"
+    can be answered, and `followed_*` has three answers so the adherence count
+    is honest. This is the count. Over CLOSED cards only, because a review is
+    written at the close and an open position has no outcome to set a plan
+    against.
+
+    A plan HELD when neither half was answered `no` and at least one was
+    answered `yes`; BROKEN when either was `no`. Everything else is unreviewed,
+    which is not the same as held: counting silence as discipline is the error
+    the three-valued answer was built to avoid.
+
+    Read from the payload rows rather than the database, so the review is the
+    same reading of the same cards the Trades tab draws, trade-type scope
+    included.
+    """
+    closed = [lc for lc in lifecycles if lc.get("status") == "closed" and lc.get("anchor")]
+
+    def pnl(lc: Row) -> float:
+        return float((lc.get("realized_pnl") or {}).get("base") or 0.0)
+
+    def tally(cards: list[Row]) -> Row:
+        values = [pnl(lc) for lc in cards]
+        return {"count": len(cards), "wins": sum(v > 0 for v in values),
+                "pnl": sum(values)}
+
+    written, planned, reviewed = [], [], []
+    held, broken, unreviewed = [], [], []
+    by_trigger: dict[str, list[Row]] = {}
+    answers: dict[str, Counter[str]] = {"target": Counter(), "invalidation": Counter()}
+    for lc in closed:
+        je = entries.get(str(lc["anchor"])) or {}
+        if any(v not in (None, "") for k, v in je.items() if k in JOURNAL_FIELDS):
+            written.append(lc)
+        if je.get("plan_target") or je.get("plan_invalidation"):
+            planned.append(lc)
+        target, invalid = je.get("followed_target"), je.get("followed_invalidation")
+        for half, answer in (("target", target), ("invalidation", invalid)):
+            if answer:
+                answers[half][answer] += 1
+        if target or invalid or je.get("exit_trigger"):
+            reviewed.append(lc)
+        if "no" in (target, invalid):
+            broken.append(lc)
+        elif "yes" in (target, invalid):
+            held.append(lc)
+        else:
+            unreviewed.append(lc)
+        if je.get("exit_trigger"):
+            by_trigger.setdefault(str(je["exit_trigger"]), []).append(lc)
+    return {
+        "closed": len(closed),
+        "written": len(written),
+        "planned": len(planned),
+        "reviewed": len(reviewed),
+        "adherence": {half: {a: answers[half][a] for a in JOURNAL_ADHERENCE}
+                      for half in answers},
+        "plan": {"held": tally(held), "broken": tally(broken),
+                 "unreviewed": tally(unreviewed)},
+        # In `TRIGGERS` order, and only the ones used: an empty row per unused
+        # trigger is a table of zeroes that hides the two that matter.
+        "triggers": [
+            {"key": key, "label": label, **tally(by_trigger[key])}
+            for key, label in JOURNAL_TRIGGERS.items() if key in by_trigger
+        ],
     }
 
 

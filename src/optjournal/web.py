@@ -110,6 +110,7 @@ from optjournal.serialize import (
     history_data,
     jobs_data,
     journal_data,
+    journal_review,
     logbook_data,
     market_data,
     odte_context_data,
@@ -588,6 +589,10 @@ def build_state(
             ranking = strategy_ranking(state["lifecycles"], period)
             state[block]["best_strategy"] = ranking["best"]
             state[block]["worst_strategy"] = ranking["worst"]
+        # Over the same cards the Trades tab draws, so the review and the cards
+        # are one reading of one scope.
+        state["journal"]["review"] = journal_review(
+            state["lifecycles"], state["journal"]["entries"])
         # Annual is all-time by construction and ignores both filters. The month
         # selector because a year-by-year table filtered to one month would have
         # a single row -- and the trade-type scope because this tab renders no

@@ -340,6 +340,9 @@ _UNSAMPLED = frozenset({
     # the state payload like every other write reply here. `LinkWrite` is the
     # `/api/links` reply, for the same reason.
     "JField", "JournalWrite", "LinkWrite",
+    # A used exit trigger needs a written review, and the fixture archive has no
+    # journal rows. Exercised directly in test_serialize.
+    "TriggerTally",
     "MarketFetch", "WatchWrite", "QuoteReply", "Quote",
     # Reached only through `QuoteReply.ranks`, the `/api/quotes` reply, not the
     # state payload -- so no `/api/state` sample can carry it, exactly like
@@ -420,6 +423,8 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "Day": first(state["stats"]["days"]),
         "Position": first(state["positions"]),
         "Allocation": state["allocation"],
+        "JournalReview": state["journal"]["review"],
+        "Tally": state["journal"]["review"]["plan"]["held"],
         "AllocationRow": first(state["allocation"]["rows"]),
         "Order": first(orders),
         "Leg": first(orders[0]["legs"]) if orders else None,

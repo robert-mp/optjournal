@@ -653,3 +653,51 @@ def test_allocation_without_a_net_liquidation_figure_has_no_shares(tmp_path):
     al = allocation_data(conn)
     assert al["nav"] is None and al["cash"] is None
     assert all(r["share"] is None for r in al["rows"])
+
+
+# ------------------------------------------------------------ journal review
+
+
+def _card(anchor, pnl, status="closed"):
+    return {"anchor": anchor, "status": status,
+            "realized_pnl": {"base": pnl} if status == "closed" else None}
+
+
+def test_the_review_counts_held_broken_and_silent_plans_apart():
+    """Silence is not discipline: a card with only `na` answers, or none, is
+    unreviewed rather than held. Either half answered `no` breaks the plan even
+    when the other said `yes`. Open cards have no outcome and are left out."""
+    from optjournal.serialize import journal_review  # noqa: PLC0415
+
+    cards = [_card("1", 100.0), _card("2", -40.0), _card("3", 10.0),
+             _card("4", 5.0), _card("5", 0.0, status="open")]
+    entries = {
+        "1": {"plan_target": "50%", "followed_target": "yes", "exit_trigger": "target"},
+        "2": {"followed_target": "yes", "followed_invalidation": "no",
+              "exit_trigger": "max_loss"},
+        "3": {"followed_target": "na", "followed_invalidation": "na"},
+        "5": {"followed_target": "no"},
+    }
+    rv = journal_review(cards, entries)
+    assert (rv["closed"], rv["written"], rv["planned"], rv["reviewed"]) == (4, 3, 1, 3)
+    assert rv["plan"]["held"] == {"count": 1, "wins": 1, "pnl": 100.0}
+    assert rv["plan"]["broken"] == {"count": 1, "wins": 0, "pnl": -40.0}
+    assert rv["plan"]["unreviewed"]["count"] == 2
+    assert rv["adherence"]["target"] == {"yes": 2, "no": 0, "na": 1}
+
+
+def test_the_review_lists_only_used_triggers_in_the_journals_order():
+    from optjournal.journal import TRIGGERS  # noqa: PLC0415
+    from optjournal.serialize import journal_review  # noqa: PLC0415
+
+    cards = [_card("1", 1.0), _card("2", 2.0), _card("3", -3.0)]
+    # `max_loss` sorts before `target` alphabetically and after it in TRIGGERS,
+    # so this pins the journal's order rather than an accident of spelling.
+    entries = {"1": {"exit_trigger": "max_loss"}, "2": {"exit_trigger": "target"},
+               "3": {"exit_trigger": "max_loss"}}
+    rv = journal_review(cards, entries)
+    keys = [t["key"] for t in rv["triggers"]]
+    assert keys == [k for k in TRIGGERS if k in {"max_loss", "target"}]
+    assert keys == ["target", "max_loss"]
+    stop = next(t for t in rv["triggers"] if t["key"] == "max_loss")
+    assert (stop["count"], stop["wins"], stop["pnl"]) == (2, 1, -2.0)

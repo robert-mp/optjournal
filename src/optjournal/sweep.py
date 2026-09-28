@@ -769,8 +769,8 @@ CHECKS: tuple[Check, ...] = (
 # The matrix
 # ---------------------------------------------------------------------------
 
-TABS = ("dashboard", "calendar", "trades", "positions", "costs", "annual", "odte",
-        "market", "watchlist")
+TABS = ("dashboard", "calendar", "trades", "positions", "costs", "annual", "review",
+        "odte", "market", "watchlist")
 
 
 def page_coords(quote: str | None) -> list[tuple[str, str | None, str | None]]:
