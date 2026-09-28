@@ -519,15 +519,33 @@ Two consequences worth stating plainly:
 - **A nicer monospace cannot fix this.** Padding punctuation to a full cell is the
   definition of the genre, so every true monospace has the same defect. The fix has
   to be a proportional face with tabular figures.
-- **That costs nothing to ship.** `font-variant-numeric: tabular-nums` on the UI
-  sans the labels already use pins every digit to one width — measured, all ten
-  digits at 16.401px, so columns still align — while leaving the comma and stop
-  narrow at 6.525px. Verified on Positions: every numeric column has exactly one
-  right edge across rows. No webfont, no build step, no binary asset, no second
-  render-blocking request.
+- **The fix is a feature of the face, not a font of its own.**
+  `font-variant-numeric: tabular-nums` on the UI sans the labels already use pins
+  every digit to one width — measured, all ten digits at 16.401px, so columns
+  still align — while leaving the comma and stop narrow at 6.525px. Verified on
+  Positions: every numeric column has exactly one right edge across rows.
 
 The figure is also **shorter** than the monospace one despite its wider digits:
 138.29px against 150.51px. All the monospace width was going into the punctuation.
+
+### Geist, and what it changed
+
+Both faces are now Geist and Geist Mono (Vercel, SIL Open Font License), shipped as
+two variable `.woff2` files under `static/fonts/` with the license and a
+provenance note beside them. That reverses what this section first said, that the
+fix cost nothing to ship: no webfont, no binary asset. The reason to pay 140KB is
+that the system stack is a different font on every machine — SF on a Mac, Segoe
+on Windows — so a screenshot or a measurement from one described nothing about the
+other. The files are same-origin, so the CSP needed no exemption.
+
+The principle survived the swap, and was confirmed on the new faces rather than
+assumed. **Geist Mono has the monospace defect**: comma and stop 15.00px against a
+15.00px digit, which is why a journal setting its money in Geist Mono reads loose
+however good the type otherwise is. Money stays on `--fig`, now Geist with
+`tabular-nums`: digits 15.906px, all equal, comma and stop 5.914px. **The figure
+sizes stayed.** Geist's cap height is 18.15 at 25px, 1.2% above SF Pro; against the
+SF Mono reference below, 26px lands +1.7% (25px −2.2%) and 33px +0.9% (32px
+−2.2%), so `--t7` and `--t8` are still the nearest steps and did not move.
 
 ### `--fig` measures, `--mono` quotes
 

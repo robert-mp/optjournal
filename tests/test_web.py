@@ -1444,9 +1444,16 @@ def _css_classes() -> set[str]:
 
     Comments matter: app.css explains its own layout decisions, and prose about
     `.stats` would otherwise read as a definition of it.
+
+    SELECTORS ONLY, which is what the name always claimed and the regex did not
+    do: it scanned the whole file, declaration values included, and so read
+    `url(/static/fonts/Geist-Variable.woff2)` as defining a class `.woff2`. No
+    value had ever held a dot followed by a letter until the stylesheet gained a
+    font file, so the gap was invisible until then. `_css_rules` already splits
+    selector from body, so this reads the one half a class can live in.
     """
     return set(re.findall(r"\.([A-Za-z][A-Za-z0-9_-]*)",
-                          re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)))
+                          " ".join(sel for sel, _ in _css_rules())))
 
 
 def _dressed() -> list[str]:
@@ -6948,3 +6955,60 @@ def test_the_calendar_strip_shows_us_releases_only():
     # node runs them -- see tests/frontend/zdte.test.mjs.
     module = (ROOT / "src" / "optjournal" / "static" / "zdte.js").read_text(encoding="utf-8")
     assert 'SESSION_COUNTRY = "USD"' in module, "the country filter is gone"
+
+
+def test_every_font_the_stylesheet_names_is_shipped_served_and_licensed(populated):
+    """Each `@font-face` source is a file under static/, of a type the server
+    will send, with the Open Font License beside it.
+
+    Three failures, each silent. A missing file falls back to the system stack
+    with no error on screen, so the page just looks slightly different on every
+    machine again. A missing STATIC_TYPES entry is the same fallback, via a 404.
+    And OFL 1.1 permits redistributing Geist only with its license travelling
+    alongside, so shipping the files without it is the one way this change could
+    stop being allowed to ship at all.
+    """
+    css = _css()
+    sources = re.findall(r"@font-face\{[^}]*src:url\(([^)]+)\)", css.replace("\n", ""))
+    assert len(sources) == 2, f"expected the two faces' files, found {sources}"
+    static = Path(web.__file__).parent / "static"
+    for src in sources:
+        assert src.startswith("/static/"), f"{src} is not same-origin static"
+        path = static / src[len("/static/"):]
+        assert path.is_file(), f"{src} is named by app.css but not shipped"
+        assert path.suffix in web.STATIC_TYPES, f"{src} would be answered with a 404"
+        assert (path.parent / "OFL.txt").is_file(), (
+            f"{src} ships without the Open Font License beside it"
+        )
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        import urllib.request  # noqa: PLC0415 - local, like _post's
+        for src in sources:
+            with urllib.request.urlopen(base + src, timeout=10) as res:  # noqa: S310
+                assert res.headers["Content-Type"] == "font/woff2"
+
+
+def test_the_body_and_the_tooltip_name_the_same_face():
+    """The tooltip spells its family out rather than inheriting it -- its trigger
+    can be a monospace glyph -- so its stack has to track the body's by hand, and
+    a change to one that skips the other puts every tooltip in a different face
+    from the text around it. Both lead with Geist, and so does `--fig`, which is
+    the same face with tabular figures.
+    """
+    css = _css().replace("\n", "")
+    body = re.search(r"html,body\{[^}]*font:14px/1\.5 ([^;}]+)", css).group(1).strip()
+    tip = re.search(r"\.tip\{[^}]*font-family:([^;}]+)", css).group(1).strip()
+    fig = re.search(r"--fig:([^;]+);", css).group(1).strip()
+    assert body == tip == fig, f"body {body!r}, tooltip {tip!r} and --fig {fig!r} differ"
+    assert body.startswith('"Geist",')
+    assert re.search(r"--mono:([^;]+);", css).group(1).strip().startswith('"Geist Mono",')
+
+
+def test_the_header_figure_cannot_break_between_its_sign_and_its_number():
+    """The `+` is `.signed::before`, a separate box the line can break after, and at
+    a 1200px viewport it did: a lone `+` above `€3,695.08`. Invisible at the width
+    the page is usually built at, so pinned rather than remembered."""
+    css = _css().replace(" ", "").replace("\n", "")
+    assert "white-space:nowrap" in css.split(".pfig{", 1)[1].split("}", 1)[0]
+    # And the header gives the period its own row when one row cannot hold it --
+    # only when there IS a period, so the six tabs without one grow no dead row.
+    assert ".brand:has(.period:not(:empty)){" in css

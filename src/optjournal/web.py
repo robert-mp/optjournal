@@ -1850,6 +1850,11 @@ STATIC_TYPES = {
     # so the type has to be right or the browser drops it and the page renders
     # unstyled -- which is the loud failure this allowlist is for.
     ".css": "text/css; charset=utf-8",
+    # Geist and Geist Mono, self-hosted under static/fonts/ with their license.
+    # Same-origin like everything else here, so `default-src 'self'` covers
+    # them with no CSP change; the license and provenance note beside them are
+    # .txt and .md, which are absent from this table and therefore not served.
+    ".woff2": "font/woff2",
 }
 
 

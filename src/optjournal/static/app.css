@@ -302,7 +302,11 @@ html{
      25px -- so a same-px swap makes every number on the page read slightly
      smaller. 25 x 1.034 = 25.85 and 32 x 1.0268 = 32.86, hence 26 and 33.
      (An earlier estimate of "about 8%" was eyeballed and wrong by a factor of
-     three. It was worth measuring: at 8% these would have been 27 and 35.) */
+     three. It was worth measuring: at 8% these would have been 27 and 35.)
+     REMEASURED FOR GEIST, which replaced SF Pro in `--fig`: its cap height is
+     18.15 at 25px, 1.2% above SF Pro, so against the 18.55 SF Mono reference 26px
+     lands +1.7% and 25px -2.2%, and 33px lands +0.9% against 32px's -2.2%. The
+     same two steps are still the nearest, so the face changed and they did not. */
   --t7:26px;   /* a figure */
   --t8:33px;   /* display: the wordmark, and the one headline figure */
   /* Space. A 2px base, even throughout. Nine steps sounds like a lot until you
@@ -342,17 +346,29 @@ html{
      not right" was, and it is arithmetic, not taste.
 
      WHY A DIFFERENT MONO CANNOT FIX IT. Padding punctuation to a full cell is the
-     definition of the genre, so every true monospace has this defect. The fix has
+     definition of the genre, so every true monospace has this defect -- confirmed
+     again on Geist Mono, whose comma and stop measure 15.00px against a 15.00px
+     digit, which is why the reference app's money reads loose even though its type
+     is otherwise fine. The fix has
      to be a PROPORTIONAL face with tabular figures, which is what `--fig` is: the
      same UI sans the labels already use, with `font-variant-numeric:tabular-nums`.
-     Digits then come out all one width (16.401px at 25px, so columns still align
-     -- verified on Positions, every numeric column has exactly one right edge)
-     while the comma and stop stay narrow at 6.525px. The whole figure is also
-     SHORTER despite the wider digits: 138.29px against 150.51px.
+     Digits then come out all one width (16.401px at 25px in SF Pro, 15.906px in
+     Geist, so columns still align -- verified on Positions, every numeric column
+     has exactly one right edge) while the comma and stop stay narrow, at 6.525px
+     and 5.914px. At weight 700 the whole of `+€3,279.87` is 140.59px in Geist
+     against 150.52px in SF Mono.
 
-     It costs nothing to ship, which matters here. No webfont, no build step, no
-     binary asset, and no second render-blocking request -- the same constraints
-     that keep this stylesheet one plain file.
+     THE FACES ARE GEIST AND GEIST MONO, self-hosted under static/fonts/ with their
+     license, and that reverses a stated constraint on purpose. This comment used to
+     say the faces cost nothing to ship: no webfont, no binary asset. The two
+     variable files are 140KB together, same-origin (so `default-src 'self'` needs
+     no exemption), and one file per family covers every weight used here. What
+     they buy is the same letterforms on every machine: the system stack rendered
+     SF on a Mac and Segoe on Windows, so a screenshot from one did not describe
+     the other. The system stacks stay as fallbacks, and `font-display:fallback`
+     gives the files 100ms before the page draws in them -- a local file on a
+     loopback server arrives well inside that, and a missing one costs a tenth of
+     a second of blank text rather than a late reflow of every figure.
 
      WHAT KEEPS `--mono`. Anything that is a literal rather than a measurement: a
      ticker, an order id, a currency code, an ISO timestamp, a job name, the
@@ -361,9 +377,15 @@ html{
      us, character for character" -- and a fixed cell is a feature, because it is
      how `1100002192` stays scannable against `1100001918`. Two faces, one
      distinction: `--fig` measures, `--mono` quotes. */
-  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
-  --fig:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --fig:"Geist",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 }
+/* The two faces' files. Variable builds, so `font-weight` is a RANGE: one file
+   answers 400, 600 and 700 rather than three files each answering one. */
+@font-face{font-family:"Geist";src:url(/static/fonts/Geist-Variable.woff2) format("woff2");
+  font-weight:100 900;font-style:normal;font-display:fallback}
+@font-face{font-family:"Geist Mono";src:url(/static/fonts/GeistMono-Variable.woff2) format("woff2");
+  font-weight:100 900;font-style:normal;font-display:fallback}
 *{box-sizing:border-box}
 /* `color-scheme:dark` is not decoration and was MISSING, which is a gap no
    variable could close: the parts of a native control the OS draws -- an open
@@ -375,7 +397,7 @@ html{
    All three themes are dark, so this is unconditional today; a light theme would
    move it into the theme blocks as `--scheme` and read it here. */
 html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
-  font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+  font:14px/1.5 "Geist",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
 
 /* ONE focus ring for every control, because there was none: `.tab` and `.icobtn`
    both computed `outline-style:none`, so tabbing through the page left no way to
@@ -594,6 +616,21 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    either, so it reads as the page's subject and not as one more button. */
 .period{grid-area:period;justify-self:center;align-self:center;
   display:flex;align-items:center;gap:var(--s7)}
+/* BELOW 1320px THE PERIOD TAKES ITS OWN ROW, under the title and clear of the
+   actions. One row needs the four columns' natural widths side by side --
+   measured at 1227px of viewport with the demo journal's kicker -- and short of
+   that the grid squeezed the TITLE, whose `auto` track gave way to its narrowest
+   word: at 900px the kicker stood one word per line and the header was 256px
+   tall. On its own row the period stops competing, and the title gets the `1fr`
+   it had before the period existed. 1320 rather than 1227 because a real kicker
+   grows with every ticker the book carries; the demo's is a short one.
+   `:has()`, because on the six tabs the period does not drive it is empty, and
+   an empty second row still costs its `row-gap` -- a strip of dead slab under
+   every header that has nothing to put there. */
+@media(max-width:1320px){
+  .brand:has(.period:not(:empty)){grid-template-columns:auto 1fr auto;
+    grid-template-areas:"mark head actions" ". period period";row-gap:var(--s5)}
+  .period{justify-self:start}}
 .pstep{display:flex;align-items:center;gap:var(--s2)}
 /* The chevrons the calendar used to carry in its title, moved here with their
    look intact -- same box, same dimmed rest state -- because they are the same
@@ -606,11 +643,16 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
 /* A minimum width so the buttons do not move under the pointer as the label
    changes between "May 2025" and "All time". `em`, not px, so it scales with the
    label's own size rather than with a guess about it. */
-.plabel{min-width:8em;text-align:center;font-size:var(--t4);font-weight:var(--w-label);
+.plabel{min-width:8em;text-align:center;white-space:nowrap;
+  font-size:var(--t4);font-weight:var(--w-label);
   padding:var(--s2) var(--s5);border:1px solid var(--line);border-radius:var(--r2);
   background:var(--bg2)}
 .plabel.nofill{color:var(--dim)}
-.pfig{display:flex;flex-direction:column;line-height:1.1}
+/* `nowrap` on the figure is not tidiness. The `+` is `.signed::before`, and
+   without it the line broke between the glyph and the number -- a `+` alone on
+   one line above `€3,695.08`, measured at a 1200px viewport, where the header
+   first ran short of room. */
+.pfig{display:flex;flex-direction:column;line-height:1.1;white-space:nowrap}
 .plk{font-size:var(--t0);font-weight:var(--w-label);color:var(--dim);
   text-transform:uppercase;letter-spacing:var(--tr-caps)}
 .ppl{font-family:var(--fig);font-variant-numeric:tabular-nums;font-size:var(--t7);
@@ -855,8 +897,10 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
   text-align:left;font-size:var(--t1);line-height:1.55;font-weight:var(--w-body);
   /* Explicit, not inherited: the heading's trigger is a monospace glyph, so an
      inherited family rendered the same tooltip in two different typefaces
-     depending on which element opened it. */
-  font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+     depending on which element opened it. The body's stack, spelled out, so it has
+     to track that one: a change to the body that skips this line renders every
+     tooltip in a different face from the text around it. */
+  font-family:"Geist",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
   color:var(--dim);background:var(--panel2);border:1px solid var(--line2);
   box-shadow:0 8px 22px var(--shadow);
   opacity:0;visibility:hidden;transition:opacity .12s ease;pointer-events:none}
