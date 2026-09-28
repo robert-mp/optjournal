@@ -478,14 +478,20 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    drift apart from each other. */
 .railico{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.6;
   stroke-linecap:round;stroke-linejoin:round}
-/* The sub-view switcher sits above the card it switches, with the card's own top
-   margin below it. `width:max-content` because `.seg` is a flex row that would
+/* The sub-view switcher sits between the header and the card it switches. A TOP
+   margin, the same one `.card` carries, because on this page every block spaces
+   itself from the block above -- the first version put a bottom margin here
+   instead and sat flush against the header (the card's gap below it collapsed
+   into that margin, so nothing looked wrong there). `width:max-content` because
+   `.seg` is a flex row that would
    otherwise stretch to the body's full width, putting two buttons at 700px each. */
-.subnav{width:max-content;margin-bottom:var(--s6)}
+.subnav{width:max-content;margin-top:var(--s6)}
 
 /* ---- branded header ----
-   A GRID of three columns and ONE row now. The mark, then the dateline and title,
-   then the actions.
+   A GRID of four columns and ONE row now: the mark, the dateline and title, the
+   period, then the actions. The title is `auto` and the period takes the free
+   `1fr` track, so the stepper centres in the space the title leaves rather than
+   in the whole slab -- centred on the slab, a long kicker would run into it.
 
    It used to carry a second row for the tab strip, and that row was the fix for a
    real defect: as a flex row nested in the title's column the strip inherited that
@@ -496,8 +502,8 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
 
    `align-items:start` so a short actions column does not stretch. The areas stay
    named rather than numbered -- a reader should not have to count tracks. */
-.brand{display:grid;grid-template-columns:auto 1fr auto;
-  grid-template-areas:"mark head actions";
+.brand{display:grid;grid-template-columns:auto auto 1fr auto;
+  grid-template-areas:"mark head period actions";
   align-items:start;
   column-gap:var(--s7);
   padding:var(--s6) var(--s8);border-radius:var(--r3);
@@ -550,28 +556,25 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    at 10.5px a background change reads as the label having been selected. */
 .edition:hover{border-color:var(--accentedge);color:var(--fg)}
 .brandhead{grid-area:head;min-width:0}
-/* A ROW now, not a column. Stacked, the currency toggle and the two icon buttons
-   made a three-deep pile against the right edge that set the header's height on
-   its own -- and read as three unrelated things, since nothing but proximity
-   grouped them. Side by side they are one bar of controls, and the slab loses the
-   row it was standing tall to hold.
+/* A ROW, not a column: the view-options button and the two icon buttons are one
+   bar of controls. Stacked, they made a pile against the right edge that set the
+   header's height on its own and read as unrelated things.
 
-   `align-items:flex-start`, which is the OPPOSITE of what this rule carried as a
-   column and for a related reason. Down the cross axis of a row, `flex-end` would
-   seat the icons level with the BOTTOM of #ccywrap -- i.e. with .ccynote, the
-   explanatory note that only exists while a restated total is showing. The icons
-   would then move whenever that note appeared. Aligning to the start pins them to
-   the toggle, which is the control they belong beside.
-
-   `#ccywrap` keeps `align-items:flex-end`, and that one is unchanged and still
-   load-bearing: `.ccytog` has no width, so under the default `stretch` it
-   inflated to the wrap's width -- itself pushed to 210px by `.ccynote`'s
-   max-width -- and the rounded border ran well past $USD with dead space inside
-   it. Right-aligning the wrap makes the toggle shrink-wrap its own buttons,
-   which is the only width that means anything. */
+   `align-items:flex-start` is load-bearing, not neutral. The actions share a row
+   with the period, whose height is set by a 26px figure; under `stretch` the icon
+   buttons would grow to it, and under `center` they would drift off the title's
+   baseline whenever the period is absent. Start pins them where they have always
+   been. */
 .hdr-actions{grid-area:actions;display:flex;gap:var(--s6);
   align-items:flex-start}
-#ccywrap{display:flex;flex-direction:column;align-items:flex-end;gap:var(--s2)}
+/* Inside the view-options panel now, left-aligned like every other label and
+   control there. `align-items` is still load-bearing: `.ccytog` has no width, so
+   under the default `stretch` it inflated to the column's width -- measured once
+   as a rounded border running well past $USD with dead space inside it. Any
+   explicit alignment makes the toggle shrink-wrap its own buttons, which is the
+   only width that means anything; `flex-start` is the one that lines it up with
+   the Trade type control above it. */
+#ccywrap{display:flex;flex-direction:column;align-items:flex-start;gap:var(--s2)}
 /* The two icons are one control group, so they share a row rather than
    stacking -- stacked, they read as two unrelated affordances. */
 .hdr-icons{display:flex;gap:var(--s3)}
@@ -580,15 +583,58 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
   font-size:var(--t2);font-weight:var(--w-label);padding:var(--s2) var(--s4);cursor:pointer}
 .ccytog button.on{background:linear-gradient(180deg,var(--accentlit1),var(--accentlit2));color:var(--onaccent)}
 .ccytog button:disabled{opacity:.4;cursor:not-allowed}
-.calnav{display:inline-flex;gap:var(--s1);margin-left:var(--s4);vertical-align:2px}
-.calnav button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
-  border-radius:var(--r1);font:inherit;font-size:var(--t4);line-height:1;padding:var(--s1) var(--s3);cursor:pointer}
-.calnav button:hover:not(:disabled){color:var(--fg)}
-.calnav button:disabled{opacity:.35;cursor:not-allowed}
 /* A restated (non-base) total is not IBKR's own figure, so the toggle says so
    rather than letting the number pass as authoritative. */
-.ccynote{font-size:var(--t1);color:var(--dim2);text-align:right;max-width:210px;
-  line-height:1.35}
+.ccynote{font-size:var(--t1);color:var(--dim2);max-width:210px;line-height:1.35}
+
+/* ---- the period ----
+   The header's middle: a month stepper and the Net P&L it selects, the pair the
+   reference app keeps in view on every tab that responds to it. Centred in the
+   free track between the title and the actions rather than pushed against
+   either, so it reads as the page's subject and not as one more button. */
+.period{grid-area:period;justify-self:center;align-self:center;
+  display:flex;align-items:center;gap:var(--s7)}
+.pstep{display:flex;align-items:center;gap:var(--s2)}
+/* The chevrons the calendar used to carry in its title, moved here with their
+   look intact -- same box, same dimmed rest state -- because they are the same
+   control and a reader who knew one should recognise the other. */
+.pstep button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+  border-radius:var(--r2);font:inherit;font-size:var(--t5);line-height:1;
+  padding:var(--s2) var(--s4);cursor:pointer}
+.pstep button:hover:not(:disabled){color:var(--fg);border-color:var(--line2)}
+.pstep button:disabled{opacity:.35;cursor:not-allowed}
+/* A minimum width so the buttons do not move under the pointer as the label
+   changes between "May 2025" and "All time". `em`, not px, so it scales with the
+   label's own size rather than with a guess about it. */
+.plabel{min-width:8em;text-align:center;font-size:var(--t4);font-weight:var(--w-label);
+  padding:var(--s2) var(--s5);border:1px solid var(--line);border-radius:var(--r2);
+  background:var(--bg2)}
+.plabel.nofill{color:var(--dim)}
+.pfig{display:flex;flex-direction:column;line-height:1.1}
+.plk{font-size:var(--t0);font-weight:var(--w-label);color:var(--dim);
+  text-transform:uppercase;letter-spacing:var(--tr-caps)}
+.ppl{font-family:var(--fig);font-variant-numeric:tabular-nums;font-size:var(--t7);
+  font-weight:var(--w-fig);letter-spacing:var(--tr-tight)}
+
+/* ---- view options ----
+   The button carries `anchor-name`, and the panel places itself against it with
+   CSS anchor positioning -- no measurement in JavaScript, which this page forbids
+   (see the CSP note in web.py), and no guessed offset that goes wrong the moment
+   the header changes height. Where anchoring is unsupported the two `anchor()`
+   declarations are dropped as invalid, the popover's own `inset:0` keeps top and
+   right at zero, and the explicit `auto`s release the other two edges: the panel
+   lands in the top-right corner, near the button and never over the content. */
+.vbtn{anchor-name:--vbtn;white-space:nowrap}
+.vpop{position-anchor:--vbtn;top:anchor(bottom);right:anchor(right);
+  bottom:auto;left:auto;margin:var(--s2) 0 0 0;
+  padding:var(--s6);border-radius:var(--r3);border:1px solid var(--line2);
+  background:var(--overlay);color:var(--fg);box-shadow:0 8px 28px var(--shadow)}
+/* `display` only while OPEN. A popover is hidden by the browser's own
+   `:not(:popover-open){display:none}`, and a bare `.vpop{display:flex}` would
+   outrank it and paint the panel permanently -- the rule has to be scoped to the
+   state that should show it. */
+.vpop:popover-open{display:flex;flex-direction:column;gap:var(--s6)}
+.vacct{font-size:var(--t3);color:var(--dim)}
 .icobtn{width:38px;height:38px;border-radius:var(--r2);display:grid;place-items:center;
   background:var(--panel2);border:1px solid var(--line);color:var(--dim);
   cursor:pointer;font-size:var(--t5)}

@@ -2693,26 +2693,64 @@ def test_the_grid_shows_the_month_the_calday_names():
         "the calendar grid does not follow the calday from the URL"
 
 
-def test_calendar_chevrons_walk_the_range_through_load():
-    """Prev/next must mutate S.month and go through load(), the same path as
-    the dropdown -- a chevron that only redraws would show a month the server
-    never filtered for, and the two controls could disagree."""
+def test_the_month_stepper_walks_the_range_through_load():
+    """A step must mutate S.month and go through load(), never a bare redraw.
+
+    The stats are aggregated server-side per period, so a step that only redrew
+    would show a month the server never filtered for. This was pinned on the
+    calendar's own chevrons, which the stepper replaced: they and the old month
+    dropdown were two controls writing one state, and the guard was that both
+    took the same path. There is one control now and it has to take that path.
+    """
     js = _js()
-    assert "data-calmonth" in js
+    assert "data-month" in js
     binding = re.search(
-        r"data-calmonth.*?b\.onclick=\(\)=>\{.*?S\.month=b\.dataset\.calmonth;load\(\);",
+        r"button\[data-month\].*?b\.onclick=\(\)=>\{.*?"
+        r"S\.month=b\.dataset\.month\|\|null;load\(\);",
         js, re.S)
-    assert binding, "chevron click must set S.month from the button and call load()"
+    assert binding, "a step must set S.month from the button and call load()"
+    # A step clears the calendar's day selection: a day from the old month
+    # names nothing in the new one, and the chevrons it replaced did the same.
+    assert re.search(r"button\[data-month\].*?S\.calday=null;", js, re.S)
 
 
-def test_calendar_chevrons_disable_at_the_ends_of_the_range():
-    """At the account's first month and the current month there is nowhere to
-    go; a live button that does nothing reads as broken."""
+def test_the_month_stepper_disables_at_the_ends_of_the_range():
+    """At the account's first month there is nowhere back to go, and at All time
+    nowhere forward; a live button that does nothing reads as broken.
+
+    Walks month_range -- the account's life -- and not the fills-only months
+    list: with one traded month that list has one stop, and an empty month is a
+    real answer rendered as honest zeros. The walk is oldest first with All time
+    (the empty string) last, which is what makes a fresh page, whose default IS
+    All time, open with the forward button disabled.
+    """
+    js = _fn("renderPeriod") + _fn("monthSteps")
+    assert "const range=S.state.month_range||S.state.months||[];" in js
+    assert "[...range].reverse().concat([''])" in js, \
+        "the walk must run oldest to newest and end at All time"
+    assert re.search(r"data-month=\"\$\{prev\?\?''\}\"\s*\$\{prev===null\?'disabled':''\}", js)
+    assert re.search(r"data-month=\"\$\{next\?\?''\}\"\s*\$\{next===null\?'disabled':''\}", js)
+
+
+def test_the_period_controls_appear_only_on_the_tabs_they_drive():
+    """The invariant in docs/design-notes.md, in the direction easiest to break.
+
+    "A tab's numbers change only in response to a control that tab displays."
+    Moving the month and the trade type into the header made it tempting to show
+    them on every tab, the way the reference app does. But Positions, Costs,
+    Annual and 0DTE ignore both, so there they would be controls that move
+    nothing on screen. One list names the three tabs they drive, and both
+    renderers read it rather than each carrying its own.
+    """
     js = _js()
-    assert re.search(r"data-calmonth=\"\$\{prev\|\|''\}\"\s*\$\{prev\?'':'disabled'\}", js)
-    assert re.search(r"data-calmonth=\"\$\{next\|\|''\}\"\s*\$\{next\?'':'disabled'\}", js)
-    # Walks month_range (the browsable range), not the fills-only months list.
-    assert re.search(r"const range=S\.state\.month_range\|\|S\.state\.months", js)
+    assert "const PERIOD_TABS=['dashboard','calendar','trades'];" in js
+    assert "if(!PERIOD_TABS.includes(S.tab)" in _fn("renderPeriod")
+    view = _fn("renderViewOptions")
+    assert "const onPeriod=PERIOD_TABS.includes(S.tab);" in view
+    # The trade type is offered only where it applies; the currency, which
+    # restates every money tab, is offered everywhere it has somewhere to go.
+    assert re.search(r"onPeriod\?`<div><div class=\"flabel\">Trade type", view)
+    assert "+ccy" in view
 
 
 def test_hash_is_applied_before_the_first_load():
@@ -2828,26 +2866,23 @@ def _fn(name: str) -> str:
 
 
 def test_header_cluster_right_aligns_and_groups_its_icons():
-    """`align-items` is pinned at BOTH levels, and the two values DIFFER.
+    """`align-items` is pinned at BOTH levels, each against its own bug.
 
-    That asymmetry is the whole content of this test, because the obvious edit is
-    to make them match and it reintroduces a bug at whichever level loses.
+    `.hdr-actions` is a ROW: the view-options button and the two icon buttons
+    side by side, sharing the header with the period, whose 26px figure sets the
+    row's height. Under `stretch` the icons would grow to it; under `flex-end`
+    they would sink to its baseline. `flex-start` pins them where the title is.
+    (As a COLUMN this rule once wanted `flex-end`, for a different reason: the
+    icons' explicit width opted out of `stretch` and landed them hard left. That
+    layout is gone -- stacked, the groups set the header's height on their own
+    and read as unrelated.)
 
-    `.hdr-actions` is a ROW: the currency toggle and the two icon buttons side by
-    side. Down a row's cross axis `flex-end` would seat the icons level with the
-    BOTTOM of #ccywrap -- that is, with `.ccynote`, the note that appears only
-    while a restated (non-base) total is showing. The icons would then shift down
-    the moment a reader switched currency. `flex-start` pins them to the toggle.
-    (As a COLUMN this rule wanted `flex-end`, for a different reason again: the
-    default `stretch` was opted out of by .icobtn's explicit width, and a definite
-    cross-size lands an item at the cross-axis start, so the icons sat hard left
-    of the right-aligned note above them. That layout is gone -- stacked, the two
-    groups set the header's height on their own and read as unrelated.)
-
-    Inside `#ccywrap` `flex-end` is unchanged and still load-bearing: `stretch` is
-    NOT opted out of there, because `.ccytog` has no width, so it inflated to the
-    wrap's width -- itself widened to 210px by `.ccynote`'s max-width -- leaving
-    the rounded border extending past the active button with dead space inside it.
+    `#ccywrap` is pinned because `.ccytog` has no width, so under the default
+    `stretch` it inflated to its container, leaving the rounded border running
+    past the active button with dead space inside it. It used to be right-aligned
+    under the header's actions and is now left-aligned in the view-options panel;
+    the two values happen to match today, and the test says so rather than
+    claiming a difference that no longer exists.
     """
     css = _css().replace(" ", "").replace("\n", "")
     actions = css.split(".hdr-actions{")[1].split("}")[0]
@@ -2859,8 +2894,13 @@ def test_header_cluster_right_aligns_and_groups_its_icons():
         "the actions are stacked again, which is the three-deep pile that set the "
         "header's height and read as three unrelated controls"
     )
-    assert "align-items:flex-end" in css.split("#ccywrap{")[1].split("}")[0], \
-        "the currency toggle will stretch to the note's width again"
+    # Inside the view-options panel the toggle is left-aligned with the Trade
+    # type control above it, so the value moved from flex-end to flex-start. What
+    # the assertion protects did not move: `.ccytog` has no width, and under the
+    # default `stretch` it inflates to its column with dead space inside the
+    # border. Any explicit alignment prevents that; this one also lines it up.
+    assert "align-items:flex-start" in css.split("#ccywrap{")[1].split("}")[0], \
+        "the currency toggle will stretch to its column's width again"
     assert ".hdr-icons{display:flex" in css
     # Both icons in the row wrapper, or they stack again. Searched in the whole
     # page rather than after `</style>`: that split existed only to skip PAST the

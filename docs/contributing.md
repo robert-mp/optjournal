@@ -39,7 +39,8 @@ test forbids reading `p.dom`, which contains the page's own JS.
 
 **A new trade-type filter**: build a `TradeScope` (fill membership, not a
 predicate — see `odte_scope` for why) and register it in
-`stats.SCOPE_BUILDERS`. The button in `page.html`'s filter bar and the
+`stats.SCOPE_BUILDERS`. Its button in the view-options panel
+(`renderViewOptions` in `page.html`) and the
 `?type=` parameter use the same key. Unknown keys fail open to the whole
 journal.
 

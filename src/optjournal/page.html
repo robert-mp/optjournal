@@ -96,14 +96,34 @@
       <div class="title">Bitácora <button class="edition" id="edition"
         title="Switch theme">Leather Edition</button></div>
     </div>
+    <!-- The period and its result: a month stepper and the Net P&L it selects.
+         Empty on every tab it does not drive, and that is the invariant in
+         docs/design-notes.md rather than a layout choice -- a tab's numbers move
+         only with a control that tab displays, so a stepper on Positions would be
+         a control that changes nothing on screen. Filled by `renderPeriod`. -->
+    <div class="period" id="period"></div>
     <div class="hdr-actions">
-      <div id="ccywrap"></div>
+      <!-- The view-options button, which opens #vpop. Rendered rather than static
+           because its label IS the current state ("Options · €EUR"), so a reader
+           sees the choices in force without opening anything. -->
+      <div id="vbtn"></div>
       <div class="hdr-icons">
         <button class="icobtn" id="sync" title="Sync from IBKR">⟳</button>
         <button class="icobtn" id="cog" title="Journal details">⚙</button>
       </div>
     </div>
   </div>
+
+  <!-- The view options: display currency everywhere, trade type and account on
+       the three tabs they drive. A `popover` rather than a <dialog> or a
+       hand-rolled panel, because the platform then owns everything a panel like
+       this gets wrong: Escape closes it, a click outside closes it, the invoker
+       announces expanded/collapsed, and it paints in the top layer above every
+       card -- with no JavaScript for any of it and no `.style` write to position
+       it. It is outside #body so a redraw refills it without closing it:
+       choosing Equities reloads the payload and the panel stays open on the new
+       state rather than vanishing under the reader's pointer. -->
+  <div class="vpop" id="vpop" popover role="dialog" aria-label="View options"></div>
 
   <div id="msg"></div>
   <div id="body"></div>
@@ -1252,11 +1272,11 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite
- * @local Math S TABS RAIL THEMES b sel m r el location window qs hs ids
- * @local leaves
+ * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
+ * @local leaves PERIOD_TABS pop quotes steps
  * @local JFIELDS entered closed options STATE_KEYS_REQUIRED
- * @local cells days buckets evs glegs lcs legs mons month months
- * @local open opts out ps pts range rows yrs active shown
+ * @local cells days buckets evs glegs lcs legs mons month
+ * @local open opts out ps pts rows yrs active shown
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
  * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen ws opts thin px tile
@@ -1676,10 +1696,17 @@ function renderKicker(){
 }
 
 /* ------------------------------------------------ display-currency toggle */
-function renderCcy(){
-  const el=$('#ccywrap'); if(!el)return;
+/* The display-currency toggle, as markup for the view-options panel. It returns
+   a string rather than writing into the page because it no longer owns a slot:
+   `renderViewOptions` places it and binds it along with the controls beside it.
+
+   Nothing at all without a quote. A toggle offering only the base currency is a
+   control with one position, which reads as broken rather than as "there is
+   nothing to restate into" -- and the section's absence is what lets the panel's
+   button disappear on a tab where nothing else is left to choose. */
+function ccyControl(){
   const base=BASE(), quotes=QUOTES();
-  if(!base){el.innerHTML='';return;}
+  if(!base||!quotes.length) return '';
   const opts=[{code:base}].concat(quotes);
   const row=opts.map(qo=>{
     const on=qo.code===DISP();
@@ -1691,11 +1718,108 @@ function renderCcy(){
       title="${esc(tip)}">${esc(sym(qo.code)||'')}${esc(qo.code)}</button>`;
   }).join('');
   const q=QUOTE();
-  el.innerHTML=`<div class="ccytog">${row}</div>`+(q
+  return `<div><div class="flabel">Currency</div><div id="ccywrap">
+    <div class="ccytog">${row}</div>${q
     ? `<div class="ccynote">restated at ${esc(num(q.per_base,4))}
        ${esc(q.code)}/${esc(base)} · ${esc(q.as_of)}</div>`
-    : '');
-  el.querySelectorAll('button[data-ccy]').forEach(b=>
+    : ''}</div></div>`;
+}
+
+/* ------------------------------------------------ the period and view options
+
+   The three tabs whose figures the month and the trade type move. Named once,
+   because two things key on it: the period stepper appears only here, and the
+   view-options panel offers the trade type only here. Everywhere else those
+   controls would change nothing on screen, which is the invariant in
+   docs/design-notes.md -- a tab's numbers move only with a control it displays --
+   read in the direction it is easy to forget: a control it displays must move
+   its numbers. `trades` is the leaf, not the destination; Positions shares the
+   rail item and ignores both controls, so it gets neither. */
+const PERIOD_TABS=['dashboard','calendar','trades'];
+const TYPE_LABEL={'':'Options',equities:'Equities',odte:'0DTE'};
+
+/* THE MONTH STEPPER. It replaces the month dropdown and the calendar's own
+   chevrons, which were two controls writing the same `S.month` through the same
+   `load()` -- so on the Calendar there were two ways to do one thing, one of them
+   inside the card and one above it.
+
+   The walk is the account's life, oldest to newest, then All time at the end.
+   All time is the default view, so a fresh page opens with the forward button
+   disabled -- the reference app greys it at the current month, and "you are at
+   the most recent you can be" is the same statement. One step back lands on the
+   newest month. Walking `month_range` rather than the fills-only `months` for
+   the reason the dropdown did: with one traded month the walk would have one
+   stop, and an empty month is still a real answer, rendered as honest zeros.
+
+   A month with no fills in scope is dimmed, not skipped. The dropdown said
+   "— no fills" in words; a stepper label that grew and shrank would move both
+   buttons under the pointer, so the words went to the tooltip and the label
+   keeps its width. */
+function monthSteps(){
+  const range=S.state.month_range||S.state.months||[];
+  return [...range].reverse().concat(['']);
+}
+function renderPeriod(){
+  const el=$('#period');
+  if(!PERIOD_TABS.includes(S.tab)||!S.state){el.innerHTML='';return;}
+  const steps=monthSteps(), cur=S.month||'';
+  const i=steps.indexOf(cur);
+  /* A hand-edited month outside the range has no neighbours to step to. Both
+     buttons still lead somewhere sensible: back to the newest month, forward to
+     All time -- which is where the healed page is heading anyway. */
+  const prev=i>0?steps[i-1]:i<0?(steps[steps.length-2]??null):null;
+  const next=i>=0&&i<steps.length-1?steps[i+1]:i<0?'':null;
+  const has=!cur||(S.state.months||[]).includes(cur);
+  const label=cur?monthLabel(cur):'All time';
+  const tipFor=m=>m===''?'All time':monthLabel(m);
+  const s=S.state.stats;
+  el.innerHTML=`<div class="pstep">
+      <button data-month="${prev??''}" ${prev===null?'disabled':''}
+        title="${prev===null?'account start':esc(tipFor(prev))}"
+        aria-label="Previous period">‹</button>
+      <span class="plabel${has?'':' nofill'}"${has?'':' title="No fills in this month"'}
+        >${esc(label)}</span>
+      <button data-month="${next??''}" ${next===null?'disabled':''}
+        title="${next===null?'most recent':esc(tipFor(next))}"
+        aria-label="Next period">›</button>
+    </div>${s?`<div class="pfig"><span class="plk">Net P&amp;L</span>
+      <span class="ppl ${cls(s.net_pnl.base)}">${moneyOf(s.net_pnl)}</span></div>`:''}`;
+}
+
+/* The view options and the button that opens them. The button's LABEL is the
+   state in force -- "Options · €EUR" -- so the choices are on screen without the
+   panel being open, which is what keeps a restated page honest now that the
+   currency toggle is no longer permanently in view. No button at all when the
+   panel would be empty: one-currency accounts on a tab with no trade type. */
+function renderViewOptions(){
+  const pop=$('#vpop'), btn=$('#vbtn');
+  const onPeriod=PERIOD_TABS.includes(S.tab);
+  const ccy=ccyControl();
+  const parts=[];
+  if(onPeriod) parts.push(TYPE_LABEL[S.type||'']);
+  if(ccy) parts.push(`${sym(DISP())||''}${DISP()}`);
+  if(!parts.length){
+    btn.innerHTML=''; pop.innerHTML='';
+    if(pop.matches(':popover-open')) pop.hidePopover();
+    return;
+  }
+  btn.innerHTML=`<button class="btn vbtn" popovertarget="vpop"
+    title="View options">${esc(parts.join(' · '))} ▾</button>`;
+  pop.innerHTML=(onPeriod?`<div><div class="flabel">Trade type</div>
+      <div class="seg">
+        <button data-type="" class="${S.type?'':'on'}"
+          title="Every ${esc(S.state.asset_category)} trade in the journal."
+          >Options</button>
+        <button data-type="equities" class="${S.type==='equities'?'on':''}"
+          ${equitiesSelectable()?'':'disabled'} title="${esc(equitiesNote())}"
+          >Equities</button>
+        <button data-type="odte" class="${S.type==='odte'?'on':''}"
+          ${odteSelectable()?'':'disabled'} title="${esc(odteFilterNote())}">0DTE</button>
+      </div></div>`:'')
+    +ccy
+    +(onPeriod?`<div><div class="flabel">Account</div>
+      <div class="vacct">${esc(accountLabel())}</div></div>`:'');
+  pop.querySelectorAll('button[data-ccy]').forEach(b=>
     b.onclick=()=>{S.ccy=b.dataset.ccy;draw();});
 }
 
@@ -1824,47 +1948,13 @@ function ccyNote(){
     : '';
 }
 
-/* ------------------------------------------------ filter bar */
-function filters(){
-  const st=S.state, months=st.months||[], range=st.month_range||months;
-  /* The dropdown walks the account's whole life (month_range), not just months
-     with fills in scope. With one traded month the old list had one entry, so
-     "selecting different months" was impossible and the control looked broken.
-     Months without fills are offered but say so, and render as honest zeros. */
-  const opts=[`<option value="">All time</option>`].concat(
-    range.map(m=>{const has=months.includes(m);
-      return `<option value="${m}"${m===S.month?' selected':''}>${monthLabel(m)}${
-        has?'':' — no fills'}</option>`;}));
-  /* "Month", not "Select Month", and the same for Account. A <select> already
-     announces that it selects; the verb only pushed the noun a word to the right
-     and made three labels that name the same KIND of thing read as three
-     different lengths of sentence. Singular "Trade type" for the same reason the
-     other two are singular -- one is chosen at a time.
+/* ------------------------------------------------ filter bar
 
-     No `.center` on the middle cell any more. It was there to centre the
-     segmented control inside its `auto` track, where the control is already the
-     full width of the track and there was nothing to centre -- but it inherited
-     onto the label, so this one heading sat centred while its two neighbours were
-     left-aligned. Three labels on one baseline at three different x-offsets, for
-     no reason a reader could recover. */
-  return `<div class="filters">
-    <div><div class="flabel">Month</div>
-      <select id="month">${opts.join('')}</select></div>
-    <div><div class="flabel">Trade type</div>
-      <div class="seg">
-        <button data-type="" class="${S.type?'':'on'}"
-          title="Every ${esc(S.state.asset_category)} trade in the journal."
-          >Options</button>
-        <button data-type="equities" class="${S.type==='equities'?'on':''}"
-          ${equitiesSelectable()?'':'disabled'} title="${esc(equitiesNote())}"
-          >Equities</button>
-        <button data-type="odte" class="${S.type==='odte'?'on':''}"
-          ${odteSelectable()?'':'disabled'} title="${esc(odteFilterNote())}">0DTE</button>
-      </div></div>
-    <div><div class="flabel">Account</div>
-      <select disabled><option>${esc(accountLabel())}</option></select></div>
-  </div>${scopeNote()}`;
-}
+   There is no filter bar any more; the card that held Month, Trade type and
+   Account is gone. The month is the header's stepper and the other two are in the
+   view-options panel, so every tab starts at its own content instead of below a
+   row of chrome. What survives here is what the three controls need to describe
+   themselves. */
 function accountLabel(){
   const stm=(S.state.statements||[])[0];
   return stm? 'Single account' : 'No statements';
@@ -1892,8 +1982,9 @@ function equitiesNote(){
     : 'No stock trades in the journal. If some exist in the archive, run '
       +'`optjournal ingest` to fold them in.';
 }
-/* Rendered by `filters()`, so it appears on exactly the tabs that carry the
-   control -- Dashboard, Calendar and Trades. A filter that silently changes
+/* Rendered at the head of exactly the tabs the trade type drives -- Dashboard,
+   Calendar and Trades, PERIOD_TABS -- and more necessary than it was, now that the
+   control itself sits in a panel that is usually closed. A filter that silently changes
    every number is the same failure as a total that silently spans a wider
    scope than its label, and fees genuinely do not narrow, so naming which
    figures moved is the honest version. Equities gets its own wording: it is
@@ -2124,7 +2215,7 @@ function dashboard(){
    * reason -- and, found the hard way, a backtick inside one TERMINATES the
    * template literal it is sitting in. Two of them did, and the page died with
    * `Unexpected identifier 'i'` before any of it rendered. */
-  return `${filters()}
+  return `${scopeNote()}
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Statistics${infoTip(
       (opt?`Options P&amp;L counts fully closed round trips only, on the day they
@@ -2477,7 +2568,7 @@ function calendar(){
   const month=S.calday?S.calday.slice(0,7)
     :s.month!=='ALL'?s.month
     :(active[active.length-1]||(S.state.month_range||S.state.months||[])[0]);
-  if(!month) return `${filters()}<div class="card"><div class="empty">no months with trades</div></div>`;
+  if(!month) return `${scopeNote()}<div class="card"><div class="empty">no months with trades</div></div>`;
   const [Y,M]=month.split('-').map(Number);
   const first=new Date(Y,M-1,1), lead=first.getDay(), len=new Date(Y,M,0).getDate();
   /* Derived from the days actually ON the grid, not from the payload's
@@ -2509,19 +2600,13 @@ function calendar(){
       <div class="dpl ${dy&&!k?'dim':''}">${dy?(k?moneyOf(dy.realized):'—'):'<span class="dim2">—</span>'}</div>
     </div>`);
   }
-  /* Prev/next walk month_range -- the account's life -- not the fills-only
-     list. They mutate S.month through the same load() path as the dropdown, so
-     the two controls cannot disagree. At either end the chevron disables. */
-  const range=S.state.month_range||S.state.months||[];
-  const idx=range.indexOf(month);
-  const prev=idx>=0&&idx<range.length-1?range[idx+1]:null; /* newest-first */
-  const next=idx>0?range[idx-1]:null;
-  const nav=`<span class="calnav">
-    <button data-calmonth="${prev||''}" ${prev?'':'disabled'} title="${prev?monthLabel(prev):'account start'}">‹</button>
-    <button data-calmonth="${next||''}" ${next?'':'disabled'} title="${next?monthLabel(next):'current month'}">›</button></span>`;
-  return `${filters()}
+  /* No chevrons of its own. The calendar used to carry prev/next beside its
+     title, and they wrote `S.month` through `load()` exactly as the header's
+     stepper does -- two controls for one state, one of them inside the card.
+     The stepper walks the same `month_range`. */
+  return `${scopeNote()}
   <div class="card">
-    <div class="crow"><div><h2>${esc(monthLabel(month))} ${nav}${infoTip(
+    <div class="crow"><div><h2>${esc(monthLabel(month))}${infoTip(
       `An options outcome lands, whole, on the day the round trip CLOSED — so a day
        with only opening or partial-close fills shows the activity and a dash, not
        money.`)}</h2>
@@ -2532,7 +2617,7 @@ function calendar(){
         <span class="pill">Red days <b>${redDays}</b></span>
       </div></div>
     ${s.month==='ALL'&&active.length?`<div class="note">Showing <b>${esc(monthLabel(month))}</b>,
-      the most recent month with activity — use the chevrons to walk the rest.</div>`:''}
+      the most recent month with activity — step back from All time to walk the rest.</div>`:''}
     <div class="cal">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
       .map(d=>`<div class="dow">${d}</div>`).join('')}</div>
     <div class="cal mt-1">${cells.join('')}</div>
@@ -3082,8 +3167,8 @@ function trades(){
      Realised P&L and commission are episode-sourced and appear only once
      the lifecycle is closed -- the same rule the Dashboard follows. */
   const lcs=S.state.lifecycles||[];
-  if(!lcs.length) return `${filters()}<div class="card"><div class="empty">no option orders</div></div>`;
-  return filters()+lcs.map(lc=>{
+  if(!lcs.length) return `${scopeNote()}<div class="card"><div class="empty">no option orders</div></div>`;
+  return scopeNote()+lcs.map(lc=>{
     const evs=lc.events||[];
     const legs=evs.flatMap(g=>(g.orders||[]).flatMap(o=>o.legs||[]));
     const nat=legs[0]?legs[0].currency:'';
@@ -5639,7 +5724,8 @@ function draw(push){
      page, so setting it later would paint one frame in the old palette. */
   applyTheme();
   renderKicker();
-  renderCcy();
+  renderPeriod();
+  renderViewOptions();
   const views={dashboard,calendar,trades,positions,costs,annual,odte,market,
     watchlist};
   const v=views[S.tab];
@@ -5691,12 +5777,13 @@ function draw(push){
      walks them. */
   document.querySelectorAll('[data-tab]').forEach(b=>
     b.onclick=()=>{S.tab=b.dataset.tab;draw(true);});
-  const sel=$('#month');
-  if(sel) sel.onchange=()=>{S.month=sel.value||null;load();};
-  document.querySelectorAll('button[data-calmonth]').forEach(b=>
-    b.onclick=()=>{if(b.dataset.calmonth){
+  /* The month stepper goes through load(), never a redraw: the stats are
+     aggregated server-side per period, so a step that only redrew would show a
+     month the server never filtered for. An empty `data-month` is All time. */
+  document.querySelectorAll('button[data-month]').forEach(b=>
+    b.onclick=()=>{
       S.calday=null; /* a selection from the old month means nothing in the new */
-      S.month=b.dataset.calmonth;load();}});
+      S.month=b.dataset.month||null;load();});
   /* Day drill-down: pure redraw, no request -- the leg data is already in the
      payload. Clicking the selected day again clears it (toggle). */
   document.querySelectorAll('[data-calday]').forEach(el=>

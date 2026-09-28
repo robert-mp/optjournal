@@ -76,12 +76,20 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     # page JS threw before rendering anything at all.
     assert markup.count('data-tab="') >= 5, "tab bar missing -- page JS crashed on load"
 
-    # Data binding: the month dropdown holds exactly the browsable range,
-    # plus its one "All time" head. An off-by-anything here is the render
-    # disagreeing with the payload it was handed.
-    sel = re.search(r'<select id="month">(.*?)</select>', markup, re.S)
-    assert sel, "the filter bar never rendered"
-    assert sel.group(1).count("<option") == len(payload["month_range"]) + 1
+    # Data binding: the month stepper, at the default view, is at All time --
+    # the end of the walk -- so forward is disabled and back leads to the
+    # newest month of the browsable range. This replaced a count of the old
+    # dropdown's options, and asks the same question of the new control: does
+    # the render agree with the payload it was handed, at both ends.
+    step = re.search(r'<div class="pstep">(.*?)</div>', markup, re.S)
+    assert step, "the period stepper never rendered"
+    back, fwd = re.findall(r"<button([^>]*)>", step.group(1))
+    assert "All time" in step.group(1)
+    assert "disabled" in fwd, "at All time there is nowhere forward to go"
+    if payload["month_range"]:
+        assert f'data-month="{payload["month_range"][0]}"' in back, (
+            "one step back from All time must land on the newest month of the range"
+        )
 
     # Conditional rendering, oracle-driven from the same payload the page
     # fetched: quotes present means the currency toggle exists and offers
