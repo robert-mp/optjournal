@@ -283,3 +283,19 @@ def test_the_payload_names_every_writable_field(db):
     for name in journal.FIELDS:
         assert name in payload, f"{name} is writable but absent from the payload"
     assert payload["anchor"] == "1241544513"
+
+
+def test_a_link_has_one_spelling_and_round_trips(db):
+    """Lower id first, by number: '999' before '1000', which string order gets
+    wrong. Linking twice is one row."""
+    assert journal.link(db, "1000", "999") == ("999", "1000")
+    journal.link(db, "999", "1000")
+    assert journal.links(db) == [("999", "1000")]
+    assert journal.unlink(db, "1000", "999") is True
+    assert journal.links(db) == []
+    assert journal.unlink(db, "1000", "999") is False
+
+
+def test_an_order_cannot_be_linked_to_itself(db):
+    with pytest.raises(journal.JournalError):
+        journal.link(db, "42", "42")

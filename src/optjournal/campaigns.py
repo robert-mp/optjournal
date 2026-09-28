@@ -134,6 +134,10 @@ class Campaign:
     #: matching the lifecycle card and the Dashboard's own rule.
     realized: Money | None
     commission: Money | None
+    #: The hand-made links (`link`'s `links`) that joined episodes into this
+    #: campaign, as stored. Empty for a campaign the window alone built, which is
+    #: how the Trades tab knows which cards it may offer to unlink.
+    links: tuple[tuple[str, str], ...] = ()
 
     @property
     def anchor(self) -> str | None:
@@ -215,6 +219,7 @@ def link(
     *,
     order_groups: Iterable[Iterable[str]],
     order_of_trade: Mapping[str, str],
+    links: Iterable[tuple[str, str]] = (),
 ) -> list[Campaign]:
     """Episodes unioned into campaigns by the orders that filled them.
 
@@ -234,6 +239,12 @@ def link(
     An episode no order group claims is its own campaign. Not an edge case: a
     contract held from before the archive has no fills at all (this journal's
     LEAP), and it is still a position.
+
+    `links` are pairs of order ids the reader joined by hand: a roll whose two
+    halves were placed further apart than `WINDOW_S`. Each unions every episode
+    either order filled. A pair naming an order no episode reached (another
+    category, or a fill since re-keyed) is skipped rather than raised, because
+    the row is the reader's and the page still has to render.
     """
     parent = list(range(len(episodes)))
 
@@ -276,9 +287,23 @@ def link(
             )
             union(first_in_group.setdefault(group, i), i)
 
+    episode_of_order: dict[str, int] = {}
+    for i, oids in orders_of_episode.items():
+        for oid in oids:
+            episode_of_order.setdefault(oid, i)
+    applied: list[tuple[int, tuple[str, str]]] = []
+    for a, b in links:
+        ia, ib = episode_of_order.get(str(a)), episode_of_order.get(str(b))
+        if ia is not None and ib is not None:
+            union(ia, ib)
+            applied.append((ia, (str(a), str(b))))
+
     members: dict[int, list[int]] = {}
     for i in range(len(episodes)):
         members.setdefault(find(i), []).append(i)
+    links_of_root: dict[int, list[tuple[str, str]]] = {}
+    for i, pair in applied:
+        links_of_root.setdefault(find(i), []).append(pair)
 
     out: list[Campaign] = []
     for root in sorted(members):
@@ -305,6 +330,7 @@ def link(
             commission=Money.charged(
                 (e.commission_base, e.commission, e.currency) for e in eps
             ) if decided else None,
+            links=tuple(sorted(links_of_root.get(root, ()))),
         ))
     return out
 

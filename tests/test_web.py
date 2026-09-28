@@ -337,8 +337,9 @@ _UNSAMPLED = frozenset({
     "ChartPoint", "Bucket", "SyncResponse",
     # `JField` is page-side, like `Bucket`: the journal form's own field table,
     # never sent by the server. `JournalWrite` is the `/api/journal` reply, off
-    # the state payload like every other write reply here.
-    "JField", "JournalWrite",
+    # the state payload like every other write reply here. `LinkWrite` is the
+    # `/api/links` reply, for the same reason.
+    "JField", "JournalWrite", "LinkWrite",
     "MarketFetch", "WatchWrite", "QuoteReply", "Quote",
     # Reached only through `QuoteReply.ranks`, the `/api/quotes` reply, not the
     # state payload -- so no `/api/state` sample can carry it, exactly like
@@ -7112,3 +7113,64 @@ def test_below_760px_the_rail_becomes_a_strip():
     rules = _media_rules(760)
     assert any(s == ".shell" and "minmax(0,1fr)" in b for s, b in rules)
     assert any(s == ".rail" and "flex-direction:row" in b for s, b in rules)
+
+
+def _two_cards_on_one_underlying(state) -> tuple[str, str]:
+    by_under: dict[str, list[str]] = {}
+    for lc in state["lifecycles"]:
+        if lc["anchor"]:
+            by_under.setdefault(lc["underlying"], []).append(lc["anchor"])
+    pairs = [sorted(a, key=lambda o: (len(o), o))[:2]
+             for a in by_under.values() if len(a) > 1]
+    if not pairs:
+        pytest.skip("no underlying with two separate positions in this archive")
+    low, high = pairs[0]
+    return low, high
+
+
+def test_linking_two_cards_by_hand_makes_them_one_and_unlinking_undoes_it(populated):
+    """The whole round trip against the real fills: two cards become one filed
+    under the lower anchor, carrying the pair so the page can offer the undo,
+    and the undo restores both cards."""
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _, before = _get(base, "/api/state")
+        low, high = _two_cards_on_one_underlying(before)
+        status, wrote = _post(base, "/api/links", {"anchor": high, "joins": low})
+        assert (status, wrote["ok"], wrote["pair"]) == (200, True, [low, high])
+
+        _, after = _get(base, "/api/state")
+        anchors = {lc["anchor"]: lc for lc in after["lifecycles"]}
+        assert high not in anchors, "the later card is still drawn on its own"
+        assert anchors[low]["links"] == [[low, high]]
+        assert len(after["lifecycles"]) == len(before["lifecycles"]) - 1
+
+        _post(base, "/api/links", {"anchor": high, "joins": low, "unlink": True})
+        _, undone = _get(base, "/api/state")
+    assert len(undone["lifecycles"]) == len(before["lifecycles"])
+
+
+def test_a_link_that_would_hide_a_write_up_is_refused(populated):
+    """The merged card files under the lower anchor, so writing on the higher one
+    would stop showing anywhere. Refused, and nothing is stored."""
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _, state = _get(base, "/api/state")
+        low, high = _two_cards_on_one_underlying(state)
+        _post(base, "/api/journal", {"anchor": high, "lessons": "keep me"})
+        status, refused = _post(base, "/api/links", {"anchor": high, "joins": low})
+        _, after = _get(base, "/api/state")
+    assert (status, refused["ok"]) == (409, False)
+    assert high in {lc["anchor"] for lc in after["lifecycles"]}
+
+
+def test_a_link_across_underlyings_is_refused(populated):
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _, state = _get(base, "/api/state")
+        firsts: dict[str, str] = {}
+        for lc in state["lifecycles"]:
+            if lc["anchor"]:
+                firsts.setdefault(lc["underlying"], lc["anchor"])
+        if len(firsts) < 2:
+            pytest.skip("one underlying only in this archive")
+        a, b = list(firsts.values())[:2]
+        status, refused = _post(base, "/api/links", {"anchor": a, "joins": b})
+    assert (status, refused["ok"]) == (400, False)

@@ -363,3 +363,38 @@ def test_a_campaign_with_no_fills_has_no_anchor():
     """
     campaigns = link([_Ep("C1", [])], order_groups=[], order_of_trade={})
     assert campaigns[0].anchor is None
+
+
+# ------------------------------------------------------------ links by hand
+
+
+def _two_separate_decisions():
+    """A put closed at a loss on Monday and a new one opened on Tuesday: a roll
+    the window cannot see, because the two orders are a day apart."""
+    eps = [_Ep("A", ["t1", "t2"], pnl=-1200.0), _Ep("B", ["t3", "t4"], pnl=50.0)]
+    groups = [("a1",), ("a2",), ("b1",), ("b2",)]
+    orders = {"t1": "a1", "t2": "a2", "t3": "b1", "t4": "b2"}
+    return eps, groups, orders
+
+
+def test_a_roll_the_window_missed_is_one_decision_once_linked_by_hand():
+    """Without the link it scores a win and a loss; with it, one loss of 1150,
+    which is the losing-roll case the module docstring opens with."""
+    eps, groups, orders = _two_separate_decisions()
+    assert len(link(eps, order_groups=groups, order_of_trade=orders)) == 2
+
+    (camp,) = link(eps, order_groups=groups, order_of_trade=orders,
+                   links=[("a1", "b1")])
+    assert camp.episode_indices == (0, 1)
+    assert camp.realized is not None and camp.realized.base == -1150.0
+    assert camp.links == (("a1", "b1"),)
+
+
+def test_a_link_naming_an_order_no_episode_filled_is_skipped():
+    """Another category's order, say. The row is the reader's, so it is left
+    alone rather than raised, and the cards stay as the window built them."""
+    eps, groups, orders = _two_separate_decisions()
+    camps = link(eps, order_groups=groups, order_of_trade=orders,
+                 links=[("a1", "zz")])
+    assert len(camps) == 2
+    assert all(c.links == () for c in camps)

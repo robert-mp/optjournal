@@ -1735,6 +1735,13 @@ stop.gneg{stop-color:var(--bad)}
   color:var(--fg);background:var(--panel2);border:1px solid var(--line2);
   cursor:pointer;white-space:nowrap}
 .jbtn:hover{border-color:var(--dim2)}
+.jbtns{display:flex;gap:var(--s4);flex-wrap:wrap}
+/* The roll-link picker: one sentence, a select and a button, under the row. */
+.lform{display:flex;align-items:center;gap:var(--s4);flex-wrap:wrap;margin-top:var(--s5)}
+.lform select{width:auto;max-width:100%}
+.lunlink{font:inherit;color:var(--dim2);background:none;border:0;padding:0;
+  margin-left:var(--s3);cursor:pointer}
+.lunlink:hover{color:var(--fg)}
 .jsave{font:inherit;font-size:var(--t2);font-weight:var(--w-label);padding:var(--s3) var(--s7);
   border-radius:var(--r2);color:var(--fg);background:var(--okfill2);
   border:1px solid var(--ok);cursor:pointer}

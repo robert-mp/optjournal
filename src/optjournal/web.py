@@ -1456,6 +1456,69 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             "entry": entry.payload() if entry else None,
         }
 
+    def _link_write(self) -> tuple[int, dict[str, Any]]:
+        """Join two decisions by hand, or undo a join.
+
+        The body names two ANCHORS, the handles of the two cards, and
+        `unlink: true` to remove the pair instead. Both must be orders this
+        journal holds fills for, on one underlying: a roll continues a position,
+        and joining two symbols would merge two decisions the reader can then
+        only see as one.
+
+        REFUSED when it would hide writing. A merged card is filed under the
+        lower anchor, so a write-up on the higher one would stop showing on any
+        card. It is still in the table, but nothing on the page reaches it, and
+        for the one table a re-ingest cannot rebuild that reads as lost.
+        """
+        body = self._body()
+        a = str(body.get("anchor") or "").strip()
+        b = str(body.get("joins") or "").strip()
+        broker = str(body.get("broker") or DEFAULT_BROKER).strip()
+        if not a or not b:
+            return 400, {"ok": False, "kind": "link",
+                         "message": "a link needs two positions to join."}
+        if a == b:
+            return 400, {"ok": False, "kind": "link",
+                         "message": "a position cannot be linked to itself."}
+        with open_journal(self.cfg.db_path) as conn:
+            if body.get("unlink"):
+                gone = journal.unlink(conn, a, b, broker=broker)
+                return 200, {"ok": True, "kind": "link", "removed": gone}
+            unders: dict[str, Any] = {}
+            for oid in (a, b):
+                row = conn.execute(
+                    "SELECT COALESCE(underlying_symbol, symbol) AS u FROM trades"
+                    " WHERE broker = ? AND ib_order_id = ? LIMIT 1", (broker, oid),
+                ).fetchone()
+                if row is None:
+                    return 404, {"ok": False, "kind": "link",
+                                 "message": f"no fill in this journal was placed "
+                                            f"under order {oid}."}
+                unders[oid] = row["u"]
+            if unders[a] != unders[b]:
+                return 400, {"ok": False, "kind": "link",
+                             "message": f"{unders[a]} and {unders[b]} are different "
+                                        f"underlyings, so they cannot be one "
+                                        f"position."}
+            # The card a merge files under is the lower anchor, same order
+            # `journal` stores the pair in.
+            high = max((a, b), key=lambda o: (len(o), o))
+            if conn.execute(
+                "SELECT 1 FROM journal_entries WHERE broker = ?"
+                " AND anchor_order_id = ?", (broker, high),
+            ).fetchone():
+                return 409, {"ok": False, "kind": "link",
+                             "message": "the later position has a write-up, and "
+                                        "joining would file the card under the "
+                                        "earlier one, so that write-up would stop "
+                                        "showing. Copy it across and clear it "
+                                        "first. Nothing was linked."}
+            try:
+                pair = journal.link(conn, a, b, broker=broker)
+            except journal.JournalError as exc:
+                return 400, {"ok": False, "kind": "link", "message": str(exc)}
+        return 200, {"ok": True, "kind": "link", "pair": list(pair)}
+
     def _job_run(self) -> tuple[int, dict[str, Any]]:
         """Run one registered job now. The page's only write to the scheduler.
 
@@ -1572,6 +1635,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/jobs/run":
             self._json(*self._job_run())
+            return
+        if path == "/api/links":
+            self._json(*self._link_write())
             return
         if path == "/api/settings":
             self._json(*self._settings_write())

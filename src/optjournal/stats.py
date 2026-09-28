@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
-from optjournal import campaigns
+from optjournal import campaigns, journal
 from optjournal.history import build_history
 from optjournal.money import Money, win_rate
 
@@ -219,6 +219,7 @@ def campaigns_for(
             (oid, at, under) for oid, (at, under) in first_fill.items()
         ),
         order_of_trade=order_of_trade,
+        links=journal.links(conn),
     )
 
 

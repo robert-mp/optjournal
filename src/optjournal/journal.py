@@ -34,6 +34,11 @@ A campaign built only from position snapshots has no fills, therefore no order
 id, therefore no anchor. It cannot be journalled, and `save` says so rather than
 inventing a key: a position the archive holds no fills for is one this journal
 cannot yet describe.
+
+The one other thing here is a LINK: the reader saying two orders were one
+decision when the 90-second window could not see it, a roll closed one day and
+reopened the next. It is intent for the same reason a plan is. No statement
+records that the second order continued the first.
 """
 
 from __future__ import annotations
@@ -51,10 +56,13 @@ __all__ = [
     "Entry",
     "JournalError",
     "delete",
+    "link",
+    "links",
     "entry_for",
     "entries",
     "orphans",
     "save",
+    "unlink",
 ]
 
 #: Answers to "did you follow the plan". THREE values, not a boolean: a trade
@@ -344,3 +352,54 @@ def orphans(
         entry for key, entry in sorted(entries(conn).items())
         if key[2] not in live_anchors
     ]
+
+
+def _pair(a: str, b: str) -> tuple[str, str]:
+    """One spelling per pair, lower id first. By length then text, which is
+    numeric order for the digit strings IBKR issues and total for anything else.
+    """
+    first, second = sorted((str(a), str(b)), key=lambda o: (len(o), o))
+    return first, second
+
+
+def links(
+    conn: sqlite3.Connection, broker: str = DEFAULT_BROKER
+) -> list[tuple[str, str]]:
+    """Every hand-made link, as `campaigns.link` takes them."""
+    return [
+        (row["order_id"], row["joins_order_id"])
+        for row in conn.execute(
+            "SELECT order_id, joins_order_id FROM campaign_links"
+            " WHERE broker = ? ORDER BY order_id, joins_order_id",
+            (broker,),
+        )
+    ]
+
+
+def link(
+    conn: sqlite3.Connection, a: str, b: str, *, broker: str = DEFAULT_BROKER
+) -> tuple[str, str]:
+    """Record that orders `a` and `b` were one decision. Idempotent."""
+    if str(a) == str(b):
+        raise JournalError("an order cannot be linked to itself")
+    pair = _pair(a, b)
+    conn.execute(
+        "INSERT OR IGNORE INTO campaign_links"
+        " (broker, order_id, joins_order_id, created_at) VALUES (?, ?, ?, ?)",
+        (broker, *pair, _now()),
+    )
+    conn.commit()
+    return pair
+
+
+def unlink(
+    conn: sqlite3.Connection, a: str, b: str, *, broker: str = DEFAULT_BROKER
+) -> bool:
+    """Remove a link. True if a row went."""
+    cur = conn.execute(
+        "DELETE FROM campaign_links"
+        " WHERE broker = ? AND order_id = ? AND joins_order_id = ?",
+        (broker, *_pair(a, b)),
+    )
+    conn.commit()
+    return bool(cur.rowcount)

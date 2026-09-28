@@ -1092,6 +1092,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string|null} anchor -- the decision's stable handle, an IBKR order
  *   id (campaigns.Campaign.anchor). Null for a card no campaign claims, which has
  *   no order to file writing under. Index into State.journal
+ * @property {Array} links -- [order, order] pairs the reader joined by hand
+ *   (campaigns.Campaign.links), so the card can offer to undo exactly those
  * @property {number} episodes
  * @property {number} fills
  * @property {Money} proceeds
@@ -1124,6 +1126,14 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} [message]
  * @property {string} [anchor]
  * @property {JournalEntry|null} [entry] -- null when the write emptied the entry
+ */
+
+/** @typedef {Object} LinkWrite -- the /api/links reply (web._link_write)
+ * @property {boolean} ok
+ * @property {string} kind
+ * @property {string} [message]
+ * @property {Array} [pair] -- the pair as stored, lower order id first
+ * @property {boolean} [removed]
  */
 
 /** @typedef {Object} Trigger -- one exit-trigger option (journal.TRIGGERS)
@@ -1277,7 +1287,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload bc:BrokerCosts CT:CostTotals F:FrictionTotals A:AutoFx ch:Charge
  * @payload csc:CostSelection cc:CategoryCost fxr:FxPairCost fee:FeeGroup
  * @payload whr:Withholding
- * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle
+ * @payload od:OdteBlock co:Cohort g:StrategyGroup lc:Lifecycle olc:Lifecycle
  * @payload oc:OdteContext oe:SessionEvent
  * @payload zr:StrikeRow zl:ScratchLine zs:Scratch zm:Move
  * @payload res:SyncResponse sync:Sync pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
@@ -1288,7 +1298,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload ivr:IvRank ir:IvRank
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook
- * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite
+ * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite lkres:LinkWrite
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
  * @local leaves PERIOD_TABS pop quotes steps TILES
  * @local draft dr order known tilesave tilereset Array
@@ -1308,6 +1318,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local events
  * @local zrows clean
  * @local rails sessions sigma
+ * @local body others pair pick
  */
 
 const $=s=>document.querySelector(s);
@@ -1349,6 +1360,9 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      which looks like the writing was lost. A link to "that trade" is `replay`,
      which is in the hash and shows what happened. */
   jrnl:null,
+  /* Which card's roll-link picker is open, by anchor. Not in the hash for the
+     `jrnl` reason: it is an unfinished act, not a view. */
+  lnk:null,
   /* Calendar filter, TWO INDEPENDENT AXES: a Set of countries and a Set of
      impacts, each holding the values currently shown.
 
@@ -3489,12 +3503,40 @@ function journalRow(lc){
   const je=JENTRY(a), n=jcount(je), shownj=S.jrnl===a;
   const badge=n?`<span class="pill ok">written up <b>${n}</b></span>`
     :`<span class="pill dim">not written up</span>`;
+  const joins=(lc.links||[]).map(pair=>`<span class="pill">joined by hand
+    <button class="lunlink" data-lunlink="${esc(pair.join('|'))}"
+      aria-label="undo this link">×</button></span>`).join('');
+  const others=rollCandidates(lc), shownl=S.lnk===a;
   return `<div class="jrow">
-    <div class="jsum">${badge}${je&&je.updated_at?`<span class="dim2 mono"
+    <div class="jsum">${badge}${joins}${je&&je.updated_at?`<span class="dim2 mono"
       >last written ${esc(String(je.updated_at).slice(0,10))}</span>`:''}</div>
+    <div class="jbtns">${others.length?`<button class="jbtn" data-lopen="${esc(a)}">${
+      shownl?'cancel':'link a roll'}</button>`:''}
     <button class="jbtn" data-jopen="${esc(a)}">${
-      shownj?'close':(n?'edit the write-up':'write this up')}</button>
-  </div>${shownj?journalForm(lc,je):''}`;
+      shownj?'close':(n?'edit the write-up':'write this up')}</button></div>
+  </div>${shownl?linkForm(lc,others):''}${shownj?journalForm(lc,je):''}`;
+}
+
+/* The other cards this one could continue: same underlying, and journalled
+   under an anchor of their own. A roll is one symbol by definition, and the
+   server refuses anything else, so offering it here would only offer a refusal. */
+function rollCandidates(lc){
+  return (S.state.lifecycles||[]).filter(olc=>olc.anchor&&olc.anchor!==lc.anchor
+    &&olc.underlying===lc.underlying);
+}
+
+/* For a roll the 90-second window could not see: closed one day, reopened the
+   next. The window stays the default because it is right almost always, and
+   this is how a reader says the rest. */
+function linkForm(lc,others){
+  return `<div class="lform">
+    <span class="dim">This position continues</span>
+    <select id="lk-pick" data-subject="${esc(lc.anchor)}">${others.map(olc=>
+      `<option value="${esc(olc.anchor)}">${esc(olc.label)} · opened ${
+        esc(String(olc.opened_at||'').slice(0,10))} · ${esc(olc.status)}</option>`).join('')}
+    </select>
+    <button class="jsave" data-lsave="${esc(lc.anchor)}">Link</button>
+  </div>`;
 }
 
 /* `data-subject` is the anchor, and it is not decoration. An id is unique per
@@ -3560,7 +3602,32 @@ function journalForm(lc,je){
    "clear this", which is exactly what a reader deleting a sentence intends. The
    two are the same act from the form's side, and the server's rule is what keeps
    the entry form and the review from erasing each other across separate opens. */
+async function postLink(body){
+  let lkres;
+  try{
+    const r=await fetch('/api/links',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    lkres=await r.json();
+  }catch(err){
+    note('Could not link: '+esc(err),'bad');
+    return;
+  }
+  if(!lkres.ok){note(esc(lkres.message||'the link was refused'),'bad');return;}
+  S.lnk=null;
+  note(body.unlink?'Link removed.':'Linked. The two cards are now one position.','ok');
+  await load();
+}
+
 function bindJournal(){
+  document.querySelectorAll('[data-lopen]').forEach(b=>
+    b.onclick=()=>{const a=b.dataset.lopen;
+      S.lnk=S.lnk===a?null:a; draw();});
+  document.querySelectorAll('[data-lsave]').forEach(b=>
+    b.onclick=()=>{const pick=$('#lk-pick');
+      if(pick) postLink({anchor:b.dataset.lsave,joins:pick.value});});
+  document.querySelectorAll('[data-lunlink]').forEach(b=>
+    b.onclick=()=>{const [a,j]=b.dataset.lunlink.split('|');
+      postLink({anchor:a,joins:j,unlink:true});});
   document.querySelectorAll('[data-jopen]').forEach(b=>
     b.onclick=()=>{const a=b.dataset.jopen;
       S.jrnl=S.jrnl===a?null:a; draw();});

@@ -239,6 +239,9 @@ def position_groups(
             # claims (snapshots only), and the page renders that as a decision it
             # cannot yet attach writing to rather than hiding the button.
             "anchor": camp.anchor if camp else None,
+            # Hand-made links that built this card, so the page can offer to
+            # undo exactly those and nothing the window decided.
+            "links": [list(pair) for pair in camp.links] if camp else [],
             "episodes": len(eps),
             "fills": sum(e.get("fills") or 0 for e in members),
             # Down to the same leaf rows again, through every event's orders.

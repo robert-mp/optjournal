@@ -47,7 +47,7 @@ __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -507,6 +507,21 @@ CREATE TABLE IF NOT EXISTS journal_entries (
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL,
   PRIMARY KEY (broker, account_id, anchor_order_id)
+);
+
+-- ROLLS THE WINDOW MISSED, joined by hand. `campaigns.cluster_orders` links
+-- orders placed within 90 seconds; a roll closed on Monday and reopened on
+-- Tuesday is two decisions to it, and only the reader knows it was one. Each row
+-- says two orders were one decision, and `campaigns.link` unions the episodes
+-- they filled. Keyed on ORDER IDS, not campaigns, for the reason
+-- `journal_entries` is: IBKR issued them, and every ingest rebuilds campaigns.
+-- Stored with the lower id first, so one pair has one spelling.
+CREATE TABLE IF NOT EXISTS campaign_links (
+  broker           TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}',
+  order_id         TEXT NOT NULL,
+  joins_order_id   TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  PRIMARY KEY (broker, order_id, joins_order_id)
 );
 
 -- The SCHEDULING ANCHOR: one row per job, forever. See SCHEDULER_PLAN.md step 4.
