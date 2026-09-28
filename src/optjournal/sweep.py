@@ -460,11 +460,17 @@ def check_no_blank_contract_cells(p: Page) -> Verdict:
 
 
 def check_closing_events_are_captioned(p: Page) -> Verdict:
-    """A closing event on a closed lifecycle reads "Closed".
+    """A close that repeats its own card's strategy reads "Closed", not the name.
 
-    The caption is contextual: an event whose shape matches its card's label is
-    an open or a close, and spelling the full strategy name twice on one card
-    reads as two separate trades.
+    The caption is contextual: inside a "Short put" card an event labelled
+    "Short put close" is noise and should read "Closed", while an event that
+    carries NEW information keeps its full name. That second half is what this
+    check first got wrong. It demanded a "Closed" on every closed card, and a
+    strangle closed one leg at a time has none -- its closes are "Short put close"
+    and "Short call close" on a "Strangle" card, which is exactly the new
+    information the rule exists to keep. Five real-journal pages failed on that
+    for weeks while rendering correctly. So the defect is checked as it is
+    defined: an event caption equal to its OWN card's label plus " close".
     """
     if p.tab not in ("trades", "odte"):
         return skip("no lifecycle cards on this tab")
@@ -473,13 +479,17 @@ def check_closing_events_are_captioned(p: Page) -> Verdict:
     for card in cards:
         if "CLOSED" not in card:
             continue
-        if not re.search(r"\b(STC|BTC)\b", card):
+        label = re.search(r'<span class="dim lbl">([^<]*)</span>', card)
+        captions = re.findall(r'<span class="gl">[^<]*?— ([^<]*?)\s*<span', card)
+        if not label or not captions:
             continue
         seen += 1
-        if "Closed" not in card:
-            return bad("a closed lifecycle's closing event is not captioned 'Closed'")
+        repeated = f"{label.group(1).strip()} close"
+        if repeated in (c.strip() for c in captions):
+            return bad(f"a closing event repeats its card's strategy as {repeated!r} "
+                       "instead of reading 'Closed'")
     if not seen:
-        return skip("no closed lifecycle with a closing fill on this page")
+        return skip("no closed lifecycle with captioned events on this page")
     return ok()
 
 

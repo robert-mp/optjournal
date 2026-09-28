@@ -249,14 +249,27 @@ _SIDE_OK = '<td class="side buy">Long</td><td class="side sell">Short</td>'
 #: `side` alone has no hue; the column renders as unstyled text.
 _SIDE_UNSTYLABLE = '<td class="side">Long</td>'
 
+def _closed_card(label: str, *captions: str) -> str:
+    """A closed lifecycle card in the markup shape `trades()` renders."""
+    events = "".join(
+        f'<div class="grp"><div class="gh"><span class="gl">2026-08-31 — {c} '
+        f'<span class="dim2 mono">order 1</span></span></div>'
+        f'<div class="leg"><span class="act">BTC</span></div></div>'
+        for c in captions)
+    return (f'<div class="card"><h2>AAPL <span class="dim lbl">{label}</span></h2>'
+            f'<span class="pill">CLOSED</span>{events}</div>')
+
+
+#: Two correct closed cards. The second is the case the check first got wrong: a
+#: strangle closed one leg at a time has no event matching the whole card, so its
+#: closes keep their names -- which is new information, not repetition.
 _CLOSED_OK = (
-    '<div class="card">CLOSED <span>STC</span> <span>Closed</span></div>'
+    _closed_card("Short put", "Opened", "Closed")
+    + _closed_card("Strangle", "Opened", "Short put close", "Short call close")
 )
 #: A closed lifecycle whose closing event repeats the full strategy name reads
 #: as two unrelated trades on one card.
-_CLOSED_UNCAPTIONED = (
-    '<div class="card">CLOSED <span>STC</span> <span>Short put close</span></div>'
-)
+_CLOSED_UNCAPTIONED = _closed_card("Short put", "Opened", "Short put close")
 
 _DRILL_PAYLOAD = {"stats": {"days": [{"day": "2026-08-04", "trades": 2}]}}
 _DRILL_OK = (
