@@ -598,9 +598,9 @@ its own grid.
 **Tables scroll in place below 1180px.** Positions, Costs and Annual carry 8 to 10
 nowrap columns. Each `table` becomes its own `overflow-x:auto` block rather than
 the card, because a scrolling card would clip the tooltips that deliberately hang
-out of it. The watchlist and ladder tables are excluded; each already sits in its own
-scrolling or clipping wrapper. The
-first column does not stick, which keeps the rule to one line.
+out of it. The watchlist and ladder tables are excluded; each already sits in its
+own scrolling or clipping wrapper. The first column does not stick, which keeps
+the rule to one line.
 
 **Tooltips anchor to the card, not the glyph.** `.tip` was `position:absolute;
 left:10px` inside `.info`, the 15px glyph, so a 430px tip ran rightward from
