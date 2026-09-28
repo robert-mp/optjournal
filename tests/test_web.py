@@ -15,6 +15,7 @@ only thing that would have caught any of those five.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import socket
@@ -409,6 +410,9 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
     samples = {
         "State": state,
         "Stats": state["stats"],
+        # all_time rather than the selected month: a single month can hold no
+        # decided position and leave the shape null, which would exempt it.
+        "StrategyRank": state["all_time"]["best_strategy"],
         # Anchors the nested money shape to a real figure, so the Money
         # typedef cannot drift from what the serializer actually sends.
         "Money": state["stats"]["commissions"],
@@ -4163,7 +4167,7 @@ def test_every_control_has_a_visible_keyboard_focus_ring():
 #: given}. The dashboard's is a SET because the reader chooses how many tiles to
 #: show; the others are fixed. The divisibility check reads every count listed,
 #: and the dashboard's set is pinned against the page's own `TILE_STEP` below.
-STATS_GRIDS = {"": (4, 8, 12, 16), "c3": (3,), "c2": (4,)}
+STATS_GRIDS = {"": (4, 8, 12, 16, 20), "c3": (3,), "c2": (4,)}
 
 #: Columns per modifier at each breakpoint, widest first. Read off the stylesheet
 #: by the test rather than trusted, so a retune cannot drift from this table.
@@ -4194,7 +4198,7 @@ def test_the_scoreboard_is_a_grid_whose_columns_every_tile_count_divides():
     So the premise went instead. First Net P&L spanned the first row as a lead
     tile, leaving eight; then the header took over the headline and the tiles
     became peers the reader orders and chooses. What keeps the grid gapless now
-    is the COUNT: 4, 8, 12 or 16, every one of which divides 4, 2 and 1, so the
+    is the COUNT: a multiple of four, every one of which divides 4, 2 and 1, so the
     columns align at every breakpoint AND no cell is empty, which the flex row
     could not do at the same time.
 
@@ -6726,7 +6730,7 @@ def test_a_tile_list_the_grid_cannot_hold_is_refused_with_its_reason(tiles, says
 
 
 def test_a_tile_list_the_grid_can_hold_is_accepted():
-    assert web._tiles_problem(list(web.DASHBOARD_TILES)) is None, "all sixteen"
+    assert web._tiles_problem(list(web.DASHBOARD_TILES)) is None, "every tile"
     assert web._tiles_problem(["inflight", "red_days", "wins", "trades"]) is None
 
 
@@ -7012,3 +7016,33 @@ def test_the_header_figure_cannot_break_between_its_sign_and_its_number():
     # And the header gives the period its own row when one row cannot hold it --
     # only when there IS a period, so the six tabs without one grow no dead row.
     assert ".brand:has(.period:not(:empty)){" in css
+
+
+def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state):
+    """The ranking reads the lifecycles; the tiles read month_stats. Both claim to
+    count decided positions' realised P&L, so over all time the decided cards must
+    sum to what Avg P&L per Trade implies -- or the Best Strategy tile is ranking a
+    different population from the tiles beside it. Recomputed, not pinned.
+    """
+    at = state["all_time"]
+    if at["scoring"] != "position" or not at["decided_campaigns"]:
+        pytest.skip("needs decided positions under position scoring")
+    decided = [lc for lc in state["lifecycles"]
+               if lc["status"] == "closed" and lc["realized_pnl"]]
+    assert sum(lc["realized_pnl"]["base"] for lc in decided) == pytest.approx(
+        at["avg_pnl"]["base"] * at["decided_campaigns"])
+    best = at["best_strategy"]
+    assert best and best["pnl"]["base"] >= (at["worst_strategy"] or best)["pnl"]["base"]
+    # And the largest outcomes bound the averages they were chosen from.
+    if at["largest_win"]:
+        assert at["largest_win"]["base"] >= at["avg_win"]["base"]
+    if at["largest_loss"]:
+        assert at["largest_loss"]["base"] <= at["avg_loss"]["base"]
+
+
+def test_each_stats_block_ranks_strategies_over_its_own_period():
+    """`stats` is the selected month and `all_time` is everything; ranking both over
+    all time would put a lifetime answer on a one-month dashboard."""
+    src = inspect.getsource(web.build_state).replace(" ", "")
+    assert 'for block, period in (("stats", selected), ("all_time", None)):'.replace(" ", "") in src
+    assert "strategy_ranking(state[\"lifecycles\"],period)" in src

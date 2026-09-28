@@ -432,6 +432,12 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Money|null} avg_loss -- null without losses
  * @property {Money|null} avg_pnl -- mean decided outcome; null with nothing decided
  * @property {number|null} profit_factor -- gross won over gross lost; null without losses
+ * @property {Money|null} largest_win -- the best single decided outcome
+ * @property {Money|null} largest_loss -- the worst single decided outcome
+ * @property {StrategyRank|null} best_strategy -- set by web.build_state from the
+ *   lifecycles (stats.strategy_ranking); null with nothing decided
+ * @property {StrategyRank|null} worst_strategy -- null unless two or more
+ *   strategies decided, since one would repeat best_strategy
  * @property {Money} inflight_realized -- the part of net_pnl that closed inside a
  *   position still running (a roll's near contract). In the money, out of the
  *   scoreboard; provenance, not a forecast, since it can fall
@@ -1046,6 +1052,12 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} impact -- the feed's grade, shown as theirs not ours
  */
 
+/** @typedef {Object} StrategyRank -- one strategy's result (stats.strategy_ranking)
+ * @property {string} label -- the shape the positions were opened as
+ * @property {Money} pnl -- summed realised P&L over its decided positions, in base
+ * @property {number} decided -- how many decided positions that sum covers
+ */
+
 /** @typedef {Object} Cohort
  * @property {string} label
  * @property {number} episodes
@@ -1258,6 +1270,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *  diff as the code that introduces the name.
  * @payload st:State s:Stats best:Stats alt:Stats x:Episode ep:Episode dy:Day
  * @payload se:Settings tok:TokenStatus pv:Provisional
+ * @payload rk:StrategyRank
  * @payload pos:Position o:Order l:Leg h:History
  * @payload stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
  * @payload mo:Money
@@ -1278,7 +1291,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
  * @local leaves PERIOD_TABS pop quotes steps TILES
- * @local draft dr order known tilesave tilereset
+ * @local draft dr order known tilesave tilereset Array
  * @local JFIELDS entered closed options STATE_KEYS_REQUIRED
  * @local cells days buckets evs glegs lcs legs mons month
  * @local open opts out ps pts rows yrs active shown
@@ -2080,7 +2093,7 @@ function statCard(k,v,note,klass,tile){
    THE VISIBLE COUNT IS A MULTIPLE OF FOUR, and that is the grid, not a taste.
    `.stats` runs 4, 2 and 1 columns across its breakpoints, and a count none of
    them divides leaves an empty cell -- the orphan app.css records as most of what
-   once read as unpolished here. So 4, 8, 12 or 16 shown: the chooser enforces it
+   once read as unpolished here. So a multiple of four shown: the chooser enforces it
    and `web._settings_write` refuses anything else. Twelve by default: the nine
    this tab always had, plus Profit Factor, Avg P&L per Trade and Open Premium. */
 const TILES=[
@@ -2092,8 +2105,14 @@ const TILES=[
   ['gain','Gain % of Net Liq'],['open_premium','Open Premium'],
   ['open_positions','Open Positions'],['green_days','Green Days'],
   ['red_days','Red Days'],['inflight','In-flight Realised'],
+  ['best_strategy','Best Strategy'],['worst_strategy','Worst Strategy'],
+  ['largest_win','Largest Win'],['largest_loss','Largest Loss'],
 ];
 const TILE_STEP=4;
+/* Every count the grid can hold, up to showing them all, for the chooser to
+   state rather than a sentence that goes stale when a tile is added. */
+const TILE_COUNTS=()=>Array.from({length:Math.floor(TILES.length/TILE_STEP)},
+  (_,i)=>(i+1)*TILE_STEP);
 const TILE_DEFAULT=TILES.slice(0,12).map(t=>t[0]);
 /* The tiles to render, in order: the stored choice if it still holds, else the
    default. Checked again here although the server refused a bad list on the way
@@ -2147,7 +2166,7 @@ function tileChooser(){
      at a glance once it is stated. */
   return `<h2 class="sub3 mt-5">Dashboard tiles</h2>
     <div class="note">Drag or use the arrows to reorder. The grid is four across,
-      so show 4, 8, 12 or 16.</div>
+      so show ${TILE_COUNTS().join(', ').replace(/, (\d+)$/,' or $1')}.</div>
     <ul class="tilelist">${rows}</ul>
     <div class="setrow"><span class="${valid?'dim':'warn2'}" id="tilestat">${n} shown${
       valid?'':` — choose a multiple of ${TILE_STEP}`}</span>
@@ -2322,7 +2341,31 @@ function dashboard(){
     inflight:()=>statCard('In-flight Realised', moneyOf(s.inflight_realized),
       'in Net P&L, but inside a position still running', cls(s.inflight_realized.base),
       'inflight'),
+    /* A strategy tile names a SHAPE and carries its money underneath, because the
+       name is the answer and the sum is its evidence -- a tile reading only
+       "Strangle" asks the reader to trust it. Summed, not averaged: see
+       stats.strategy_ranking. Worst is absent rather than equal to best when one
+       strategy decided everything, and says so. */
+    best_strategy:()=>stratTile('Best Strategy', s.best_strategy, 'best_strategy',
+      'nothing decided yet'),
+    worst_strategy:()=>stratTile('Worst Strategy', s.worst_strategy, 'worst_strategy',
+      s.best_strategy?'only one strategy decided':'nothing decided yet'),
+    largest_win:()=>statCard('Largest Win', moneyOf(s.largest_win),
+      `the best single decided ${unitWord(s,1)}`, cls(s.largest_win?.base),'largest_win'),
+    largest_loss:()=>statCard('Largest Loss',
+      s.losses===0&&s.decided_campaigns>0?'<span class="nil">none yet</span>'
+        :moneyOf(s.largest_loss),
+      s.losses===0&&s.decided_campaigns>0?`${s.decided_campaigns} decided, none at a loss`
+        :`the worst single decided ${unitWord(s,1)}`,
+      cls(s.largest_loss?.base),'largest_loss'),
   };
+  function stratTile(k,rk,key,none){
+    return rk
+      ? statCard(k,`${esc(rk.label)}<span class="vsub ${cls(rk.pnl.base)}">${
+          moneyOf(rk.pnl)}</span>`,
+          `${rk.decided} decided position(s), realised P&L summed`,'sm',key)
+      : statCard(k,'—',none,'dim2',key);
+  }
   const cards=tileKeys().map(k=>R[k]()).join('');
 
   /* WHAT THIS PANEL SAYS ON SIGHT, AND WHAT IT SAYS ON ASK.

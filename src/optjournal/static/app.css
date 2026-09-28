@@ -755,7 +755,7 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
    meant nothing, because "put Win Rate first" had nowhere to go.
 
    So the tiles are peers again and the READER chooses them, and what keeps the
-   grid whole is the count rather than the layout: 4, 8, 12 or 16 shown, every one
+   grid whole is the count rather than the layout: a multiple of four shown, every one
    of which 4, 2 and 1 divide. The chooser enforces it and the server refuses
    anything else (`TILE_STEP` in page.html, `TILE_STEP` in web.py), so a hole is
    unrepresentable rather than merely unlikely.
@@ -828,7 +828,7 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
   cursor:pointer}
 .setrow button:hover:not(:disabled){border-color:var(--accentlit1)}
 .setrow button:disabled{opacity:.4;cursor:not-allowed}
-/* The tile chooser. ONE column, although sixteen rows is tall: the list is an
+/* The tile chooser. ONE column, although twenty rows is tall: the list is an
    ORDER, and two columns read row by row or column by column depending on who is
    looking -- the ambiguity this control exists to remove. Capped so the label and
    its arrows stay within one glance of each other on a wide panel. */
@@ -931,6 +931,11 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
 .stat .v{font-size:var(--t7);font-weight:var(--w-fig);font-family:var(--fig);
   font-variant-numeric:tabular-nums;line-height:1.15}
 .stat .v.sm{font-size:var(--t6)}
+/* The evidence under a tile whose value is a NAME -- a strategy's summed P&L
+   beneath the strategy. A figure, so the figure face; smaller than the name,
+   because the name is the answer and this is why. */
+.stat .v .vsub{display:block;margin-top:var(--s0);font-size:var(--t3);
+  font-family:var(--fig);font-variant-numeric:tabular-nums;font-weight:var(--w-label)}
 
 .pill{font-size:var(--t2);padding:var(--s2) var(--s5);border-radius:var(--rpill);background:var(--panel2);
   border:1px solid var(--line2);color:var(--dim);white-space:nowrap}

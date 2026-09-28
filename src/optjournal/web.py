@@ -135,6 +135,7 @@ from optjournal.stats import (
     odte_scope,
     scope_for,
     stats_data,
+    strategy_ranking,
 )
 from optjournal.strategies import (
     position_groups,
@@ -187,6 +188,7 @@ DASHBOARD_TILES = (
     "wins", "losses", "avg_win", "avg_loss",
     "commissions", "avg_pnl", "gain", "open_premium",
     "open_positions", "green_days", "red_days", "inflight",
+    "best_strategy", "worst_strategy", "largest_win", "largest_loss",
 )
 #: The visible count must be a multiple of this, because `.stats` runs 4, 2 and 1
 #: columns and any other count leaves an empty cell. Mirrors `TILE_STEP` in the
@@ -574,6 +576,16 @@ def build_state(
         )
         for block in ("stats", "all_time"):
             state[block]["open_positions"] = open_positions
+        # The strategy ranking, for the same reason as open_positions: it reads
+        # the lifecycles, which carry each position's opening shape, and those are
+        # built here rather than inside month_stats. Unlike open_positions it IS
+        # period-bound, so each block ranks its own period. The lifecycles come
+        # from scope-filtered orders, so the ranking obeys the trade type exactly
+        # as the tiles beside it do.
+        for block, period in (("stats", selected), ("all_time", None)):
+            ranking = strategy_ranking(state["lifecycles"], period)
+            state[block]["best_strategy"] = ranking["best"]
+            state[block]["worst_strategy"] = ranking["worst"]
         # Annual is all-time by construction and ignores both filters. The month
         # selector because a year-by-year table filtered to one month would have
         # a single row -- and the trade-type scope because this tab renders no

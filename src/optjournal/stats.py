@@ -409,6 +409,11 @@ class MonthStats:
     #: same `won` and `lost` lists the averages divide, so it cannot disagree
     #: with the Avg Win and Avg Loss tiles beside it.
     profit_factor: float | None = None
+    #: The single best and worst decided outcomes. None when nothing won or lost,
+    #: under the averages' rule. Chosen from the same `won` and `lost` lists, so
+    #: the largest win can never be smaller than Avg Win beside it.
+    largest_win: Money | None = None
+    largest_loss: Money | None = None
 
     #: Net premium sitting in *currently open* episodes: positive when short
     #: premium was collected, negative for long debits. Point-in-time like
@@ -1185,6 +1190,12 @@ def month_stats(
         (e.realized_pnl_base, e.realized_pnl, e.currency) for c in decided for e in c
     ).per(len(decided))
     stats.profit_factor = gross_won.base / -gross_lost.base if gross_lost.base else None
+    stats.largest_win = (
+        max((_campaign_pnl(c) for c in won), key=lambda m: m.base) if won else None
+    )
+    stats.largest_loss = (
+        min((_campaign_pnl(c) for c in lost), key=lambda m: m.base) if lost else None
+    )
     # The part of `net_pnl` whose position has not finished: episodes this period
     # counted as closed that sit in a campaign still running. Taken from the SAME
     # `units` the scoreboard uses, so the figure that explains the gap cannot
@@ -1241,6 +1252,8 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "avg_loss": None if stats.avg_loss is None else stats.avg_loss.payload(),
         "avg_pnl": None if stats.avg_pnl is None else stats.avg_pnl.payload(),
         "profit_factor": stats.profit_factor,
+        "largest_win": None if stats.largest_win is None else stats.largest_win.payload(),
+        "largest_loss": None if stats.largest_loss is None else stats.largest_loss.payload(),
         "inflight_realized": stats.inflight_realized.payload(),
         "open_premium": stats.open_premium.payload(),
         "open_commission": stats.open_commission.payload(),
@@ -1256,4 +1269,47 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
             {"day": d.day, "trades": d.trades, "realized": d.realized.payload()}
             for d in stats.days
         ],
+    }
+
+
+def strategy_ranking(
+    lifecycles: list[dict[str, Any]], period: str | None
+) -> dict[str, dict[str, Any] | None]:
+    """The best and worst strategy over decided positions closing in `period`.
+
+    A strategy is the shape a position was OPENED as -- the lifecycle's `label`,
+    the name its Trades card carries -- and its figure is the SUM of realised
+    P&L over its decided positions in the period, in base. Summed rather than
+    averaged, because the question is which way of trading made or lost the most
+    money here, and one lucky trade should not top the list over a strategy that
+    earned more across twenty.
+
+    Positions, not contracts, whatever the scoreboard's unit: a strategy is a
+    property of a decision, and under contract scoring a strangle's two legs are
+    not two strategies. The money is the same either way -- every closed contract
+    sits in exactly one decided position -- except cash settled inside a position
+    still running, which belongs to no strategy's result yet.
+
+    `worst` is None when only one strategy decided anything: it would repeat
+    `best`, and a tile saying the same strategy is both best and worst is
+    arithmetic, not information. Ties break on the label, so the answer is stable.
+    """
+    totals: dict[str, list[float]] = {}
+    for lc in lifecycles:
+        pnl = lc.get("realized_pnl")
+        if (lc.get("status") != "closed" or not pnl or pnl.get("base") is None
+                or not lc.get("label") or not _in_period(lc.get("closed_at"), period)):
+            continue
+        totals.setdefault(str(lc["label"]), []).append(float(pnl["base"]))
+    if not totals:
+        return {"best": None, "worst": None}
+    ranked = sorted(totals.items(), key=lambda kv: (-sum(kv[1]), kv[0]))
+
+    def entry(label: str, values: list[float]) -> dict[str, Any]:
+        return {"label": label, "pnl": Money.restated(sum(values)).payload(),
+                "decided": len(values)}
+
+    return {
+        "best": entry(*ranked[0]),
+        "worst": entry(*ranked[-1]) if len(ranked) > 1 else None,
     }

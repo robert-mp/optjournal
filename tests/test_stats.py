@@ -349,3 +349,44 @@ def test_the_scoring_travels_into_the_payload_for_the_page_to_label_with(conn):
     ))
     assert view["scoring"] == CONTRACT_SCORING
     assert (view["wins"], view["losses"], view["decided_campaigns"]) == (1, 1, 2)
+
+
+def _lc(label, pnl, *, closed="2026-08-20", status="closed"):
+    return {"label": label, "status": status, "closed_at": closed,
+            "realized_pnl": None if pnl is None else {"base": pnl, "native": None, "ccy": None}}
+
+
+def test_the_strategy_ranking_sums_decided_positions_per_opening_shape():
+    """Summed, not averaged: two modest strangles outrank one lucky put."""
+    from optjournal.stats import strategy_ranking
+
+    lcs = [_lc("Strangle", 300.0), _lc("Strangle", 250.0), _lc("Short put", 500.0),
+           _lc("Put vertical", -120.0)]
+    r = strategy_ranking(lcs, None)
+    assert (r["best"]["label"], r["best"]["pnl"]["base"], r["best"]["decided"]) == \
+        ("Strangle", 550.0, 2)
+    assert (r["worst"]["label"], r["worst"]["pnl"]["base"]) == ("Put vertical", -120.0)
+
+
+def test_the_strategy_ranking_counts_only_what_decided_inside_the_period():
+    from optjournal.stats import strategy_ranking
+
+    lcs = [_lc("Strangle", 900.0, status="open"),          # not decided
+           _lc("Short put", 400.0, closed="2026-07-31"),    # another month
+           _lc("Short call", 50.0), _lc("Short put", 10.0)]
+    r = strategy_ranking(lcs, "2026-08")
+    assert (r["best"]["label"], r["best"]["pnl"]["base"]) == ("Short call", 50.0)
+    assert (r["worst"]["label"], r["worst"]["pnl"]["base"]) == ("Short put", 10.0)
+    # IBKR's compact dates match a period exactly as ISO ones do.
+    assert strategy_ranking([_lc("Strangle", 5.0, closed="20260820")], "2026-08")["best"]
+
+
+def test_one_strategy_has_no_worst_and_nothing_decided_has_neither():
+    """A tile calling the same strategy best AND worst is arithmetic, not news."""
+    from optjournal.stats import strategy_ranking
+
+    one = strategy_ranking([_lc("Strangle", 5.0), _lc("Strangle", -9.0)], None)
+    assert one["best"]["label"] == "Strangle" and one["worst"] is None
+    assert strategy_ranking([], None) == {"best": None, "worst": None}
+    assert strategy_ranking([_lc("Strangle", 5.0, status="open")], None) == \
+        {"best": None, "worst": None}
