@@ -1034,7 +1034,13 @@ tr:last-child td{border-bottom:0}
    face here is what let those 42 `class="n mono"` attributes drop the `mono`
    instead of swapping it for a `fig`. */
 td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-nums}
-.empty{color:var(--dim2);font-style:italic;padding:var(--s6) var(--s4);text-align:center}
+/* An empty state reads as a sentence, not a fragment: upright, capitalised, the
+   reference app's "No scheduled events for this day." It was lowercase italic,
+   which read as a placeholder the page forgot to replace. Capitalised HERE rather
+   than in twenty strings, so the text stays what the tests and the sweep match
+   and a new empty state cannot forget the rule. */
+.empty{color:var(--dim2);padding:var(--s6) var(--s4);text-align:center}
+.empty::first-letter{text-transform:uppercase}
 
 /* ---- calendar ---- */
 .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:var(--s3)}
@@ -1581,6 +1587,20 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    track, which would add a stray 12px gap to every Trades row. */
 .leg.ctx{grid-template-columns:52px 1fr auto auto auto auto}
 .leg:last-child{border-bottom:0}
+/* The contract's cells. `flex-wrap` because the contract track is the grid's
+   `1fr`, the one that gives way first on a narrow window, and chips that wrap
+   stay legible where a single run of text would clip. */
+.kchips{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s2);min-width:0}
+.kchip{border:1px solid var(--line);border-radius:var(--r1);background:var(--bg2);
+  padding:0 var(--s2);font-size:var(--t2);color:var(--dim)}
+/* The strike is the cell a reader scans for, so it alone is full-strength. A
+   class on the chip rather than a `<b>` inside it: `.kchip b{color}` would outrank
+   any sign tint that ever landed on that `<b>`, the trap the tint test guards. */
+.kchip.kstrike{color:var(--fg);font-weight:var(--w-label)}
+/* The right takes its categorical hue AND stays a letter: put and call are
+   told apart by P and C at any acuity, so the colour is a second signal, never
+   the only one -- this page's rule for every categorical pair. */
+.kchip.put{color:var(--put)} .kchip.call{color:var(--call)}
 .act{font-family:var(--mono);font-size:var(--t1);font-weight:var(--w-fig);text-align:center;
   padding:var(--s1) 0;border-radius:var(--r1);background:var(--seg2);border:1px solid var(--line2);
   color:var(--kicker)}

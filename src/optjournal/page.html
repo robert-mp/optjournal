@@ -2801,11 +2801,24 @@ function legRow(l,extra=''){
      drill-down wedges the strategy label between contract and quantity,
      because there the leg appears outside its strategy card; the Trades
      card, already under its strategy header, passes nothing. */
+  /* THE CONTRACT AS CELLS: expiry, strike, right, each in its own chip, the
+     reference app's shape. Run together as `NVDA 140P 2026-03-20` the three read
+     as one token, and the part a reader scans for -- which strike, which month --
+     sat mid-string. Two departures, both on purpose. The expiry keeps its year,
+     because a LEAP two years out would otherwise read as this year's. And the
+     quantity stays in its own column rather than joining the chips: it is already
+     beside the BTO/STO badge, and a second copy is a second place to disagree.
+     A stock leg has no strike or expiry, so it gets the symbol and no chips. */
+  const K=(l.put_call||'').toUpperCase();
+  const chips=l.strike!=null&&l.expiry
+    ?`<span class="kchip">${esc(dayLabel(l.expiry,true))}</span>
+      <span class="kchip kstrike fig">${strike(l.strike)}</span>${
+      K?`<span class="kchip ${K==='P'?'put':'call'}">${esc(K)}</span>`:''}`
+    :'';
   return `<div class="leg${extra?' ctx':''}">
     <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
-    <span class="mono">${esc(l.underlying_symbol||l.symbol||'')}
-      <b>${strike(l.strike)}${esc(l.put_call||'')}</b>
-      <span class="dim">${esc(l.expiry||'')}</span></span>
+    <span class="kchips"><span class="mono">${esc(l.underlying_symbol||l.symbol||'')}</span>${
+      chips}</span>
     ${extra}
     <span class="fig dim">×${Math.abs(l.quantity)}</span>
     <span class="fig" title="fill price, always in the contract's own currency"
