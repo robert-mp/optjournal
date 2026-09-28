@@ -1724,6 +1724,22 @@ stop.gneg{stop-color:var(--bad)}
 .zlad td.zpbot{border-bottom:2px solid var(--put)}
 .zmore{display:flex;justify-content:center;padding:var(--s5) 0 var(--s0);
   border-top:1px solid var(--line)}
+/* ---- the rails' own record ----
+   Under the ladder and separated by a rule, because it answers a different
+   question: the table above is what to sell today, this is whether the band has
+   been worth trusting. Narrow on purpose -- four short columns, so it reads as a
+   footnote to the ladder rather than competing with it. */
+.zscore{margin-top:var(--s7);padding-top:var(--s6);border-top:1px solid var(--line)}
+.zsc{width:auto;min-width:17rem;margin-top:var(--s5)}
+.zsc th{text-transform:uppercase;letter-spacing:var(--tr-caps);
+  font-weight:var(--w-label);padding-bottom:var(--s3)}
+.zsc td{font-family:var(--fig);font-variant-numeric:tabular-nums}
+.zsc td.n,.zsc th.n{text-align:right;padding-left:var(--s6)}
+/* The expected move's row, in the same brass the ladder gives its own two
+   strikes: the reader is comparing this rate against 68%, and the other rows are
+   the context it is read in. */
+.zsig-row{background:var(--rollwash)}
+.zsig-row td{font-weight:var(--w-fig)}
 /* ---- the Broker Companion window ----
    The same two pads, in a document of its own (src/optjournal/companion.html),
    sized to float over a broker's order ticket. No `.wrap`: at 330px a centred

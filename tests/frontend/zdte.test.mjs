@@ -4,10 +4,12 @@ import test from "node:test";
 import {
   RAIL_PCTS,
   SESSION_CHIPS,
+  SIGMA_LABEL,
   VIX_DIVISOR,
   expectedMove,
   ladderRows,
   parseNumber,
+  railScores,
   sanitizeLevel,
   scratchLines,
   scratchRead,
@@ -408,4 +410,97 @@ test("a group takes the best tier its members carry, not the first one's", () =>
   assert.equal(shown[0].tier, 1, "the Chair speaking makes the group first-tier");
   assert.equal(shown[0].impact, "High");
   assert.equal(shown[0].at, "09:00", "and it still starts when the first one speaks");
+});
+
+/* ---- scoring the rails against sessions that have settled ------------------ */
+
+/* Two sessions off one close, chosen so the 1σ holds on one and breaks on the
+   other. VIX 16 makes the expected move exactly 1% (`16 / VIX_DIVISOR`), so the
+   rails the outcome has to be read against are round numbers rather than
+   arithmetic the reader has to redo. */
+const HELD = { date: "2026-08-27", prev_close: 7600, vix: 16, close: 7650 };
+const BROKE = { date: "2026-08-28", prev_close: 7600, vix: 16, close: 7700 };
+
+const rateOf = (rails, label) =>
+  rails.find((rail) => rail.label === label);
+
+test("a rail is scored on whether the session moved further than it", () => {
+  const { rails } = railScores([HELD, BROKE]);
+  /* 50 points on 7600 is 0.66%, inside the 1% expected move; 100 points is
+     1.32%, outside it and outside the 1% rail, inside everything wider. */
+  assert.deepEqual(rateOf(rails, SIGMA_LABEL),
+    { label: SIGMA_LABEL, tested: 2, held: 1, rate: 0.5 });
+  assert.deepEqual(rateOf(rails, "1%"),
+    { label: "1%", tested: 2, held: 1, rate: 0.5 });
+  assert.deepEqual(rateOf(rails, "1.5%"),
+    { label: "1.5%", tested: 2, held: 2, rate: 1 });
+  assert.equal(rateOf(rails, "5%").rate, 1, "a 5% rail survives both");
+});
+
+test("the 1σ is scored first, then the fixed ladder outward", () => {
+  const { rails } = railScores([HELD]);
+  assert.deepEqual(rails.map((rail) => rail.label),
+    [SIGMA_LABEL, ...RAIL_PCTS.map((pct) => `${pct}%`)],
+    "the expected move leads, because it is the row the ladder is measured from");
+});
+
+test("a close landing exactly on a rail is inside it", () => {
+  /* A 2% move against a 2% rail, and against a 1σ the VIX puts in the same
+     place: the rail is where the expected move ENDS, not where it starts. */
+  const { rails } = railScores([
+    { date: "2026-08-28", prev_close: 100, vix: 32, close: 102 },
+  ]);
+  assert.equal(rateOf(rails, SIGMA_LABEL).held, 1, "32 / 16 is a 2% move");
+  assert.equal(rateOf(rails, "2%").held, 1);
+  assert.equal(rateOf(rails, "1.5%").held, 0, "and the tighter rails still broke");
+});
+
+test("the per-session detail says which rails broke, not just how many", () => {
+  const { sessions } = railScores([BROKE]);
+  assert.equal(sessions.length, 1);
+  const [session] = sessions;
+  assert.equal(session.date, "2026-08-28");
+  assert.equal(session.from, 7600);
+  assert.equal(session.close, 7700);
+  assert.equal(session.vix, 16);
+  assert.equal(session.points, 100);
+  assert.equal(Number(session.pct.toFixed(2)), 1.32);
+  assert.equal(session.sigmaPct, 1, "16 / 16");
+  assert.equal(session.held[SIGMA_LABEL], false);
+  assert.equal(session.held["1.5%"], true);
+});
+
+test("a session the readings cannot support is skipped, not counted as a miss", () => {
+  /* The one failure a score must not have: an absent VIX read as a broken band
+     would make every rail look worse than the history it is measuring. */
+  for (const bad of [
+    { date: "x", prev_close: 7600, vix: null, close: 7650 },
+    { date: "x", prev_close: 7600, vix: -1, close: 7650 },
+    { date: "x", prev_close: 0, vix: 16, close: 7650 },
+    { date: "x", prev_close: 7600, vix: 16, close: 0 },
+    { date: "x", prev_close: 7600, vix: 16, close: null },
+  ]) {
+    const { sessions, rails } = railScores([bad]);
+    assert.deepEqual(sessions, [], `skipped: ${JSON.stringify(bad)}`);
+    assert.deepEqual(rails, [], "and no rail is scored against it either");
+  }
+});
+
+test("no history is an empty table rather than every rail failing", () => {
+  assert.deepEqual(railScores([]), { sessions: [], rails: [] });
+  assert.deepEqual(railScores(null), { sessions: [], rails: [] });
+});
+
+test("a zero VIX scores a band nothing can land inside unless nothing moved", () => {
+  /* Consistent with the ladder, which treats a zero VIX as the real if never-seen
+     reading "no expected move" rather than as an absence. */
+  const flat = railScores([
+    { date: "a", prev_close: 7600, vix: 0, close: 7600 },
+  ]);
+  assert.equal(rateOf(flat.rails, SIGMA_LABEL).held, 1, "it did not move");
+  const moved = railScores([
+    { date: "b", prev_close: 7600, vix: 0, close: 7601 },
+  ]);
+  assert.equal(rateOf(moved.rails, SIGMA_LABEL).held, 0);
+  assert.equal(rateOf(moved.rails, "1%").held, 1, "the fixed rails are unaffected");
 });

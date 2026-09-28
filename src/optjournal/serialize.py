@@ -840,6 +840,71 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
     }
 
 
+def odte_scoring_data(conn: sqlite3.Connection, *, now: datetime) -> list[Row]:
+    """Settled sessions the 0DTE rails can be scored against, oldest first.
+
+    One row per session that has CLOSED: `{date, prev_close, vix, close}` -- the
+    close a band would have been drawn from, the VIX it would have been drawn at,
+    and what the index actually did that day. Empty when either series is missing,
+    the same absence `odte_context_data` reports.
+
+    NO LEVELS HERE EITHER, for the reason given there and one more. The rails are
+    `static/zdte.railScores`' to draw, from the same `RAIL_PCTS` the ladder uses, so
+    a rail cannot be scored against a definition of itself that the tab no longer
+    holds. This function's whole job is to pair two stored series by trading day.
+
+    WHY THERE IS NO SNAPSHOT TABLE BEHIND THIS. The reference implementation keeps
+    `zdte_snapshots`, a row per session carrying all ten of its derived levels, and
+    so begins counting the day its calculator was first opened. Everything a band
+    needs is ALREADY stored here: `price_bars` holds the daily ^GSPC and ^VIX closes
+    and is a cache that only ever grows (see `db.py`), so the entire bar history is
+    scorable the first time this runs, and a level that is recomputed cannot drift
+    from the one on screen. A new table would have bought nothing but the drift.
+
+    THE VIX IS THE PRIOR SESSION'S CLOSE, WHICH THE LIVE TAB'S IS NOT. That tab
+    reads the CURRENT level against the last completed close, and a daily series
+    cannot reproduce an intraday reading: the newest settled VIX before a session
+    opens is the one before it. So these are the rails as the last settled readings
+    would have drawn them, which is close to what the tab showed that morning
+    without being it. The difference is real -- the reference's own row for
+    2026-09-24 carries VIX 16.33 against the 15.67 the tab was read at on the same
+    close -- so `railScores` says so rather than implying the two are one thing.
+
+    TODAY IS EXCLUDED. Its close is still moving, and scoring a band against a
+    price that has not settled would report a hit that the afternoon can take back.
+    """
+    spx = bars_close_series(conn, "^GSPC", bar_size="1d")
+    vix = bars_close_series(conn, "^VIX", bar_size="1d")
+    if not spx or not vix:
+        return []
+
+    today = now.astimezone(MARKET_TZ).date().isoformat()
+    # Keyed by trading day rather than by timestamp, because the two series are
+    # not stamped alike even when they come from one provider -- see `clock.et_day`.
+    vix_by_day = {et_day(ts): close for ts, close in vix}
+    sessions = [(et_day(ts), close) for ts, close in spx if et_day(ts) != today]
+
+    rows: list[Row] = []
+    # Sliding pairs, so the shorter tail is the point rather than a mismatch: the
+    # oldest stored session has no close before it to have drawn a band from.
+    for (before, opened_from), (day, close) in zip(sessions, sessions[1:],
+                                                  strict=False):
+        level = vix_by_day.get(before)
+        # The same bounds `odte_context_data` holds, and for the same reason: a
+        # non-positive close is a bad row and a negative VIX is impossible. A
+        # session missing either is SKIPPED rather than scored, because counting an
+        # absence as a broken band would make every rail read worse than it is.
+        if level is None or level < 0 or opened_from <= 0 or close <= 0:
+            continue
+        rows.append({
+            "date": day,
+            "prev_close": opened_from,
+            "vix": level,
+            "close": close,
+        })
+    return rows
+
+
 def _days_until(recorded: str | None, *, today: date) -> int | None:
     """Whole days from `today` to a recorded YYYY-MM-DD day. Signed, or None.
 

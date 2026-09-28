@@ -123,6 +123,22 @@ than a volatility solved for. Three rules keep it from contaminating anything:
   formulas inside the page. `tests/frontend/zdte.test.mjs` pins the whole opening
   ladder against the reference implementation's own screen, row by row.
 
+**The rails keep a record, and no table was added to hold it.** A band quoted as
+"roughly two closes in three" is a claim, and printing it for months without
+checking it against this index is repeating a textbook. `zdte.railScores` scores
+every rail against the sessions that have since settled, and `serialize.
+odte_scoring_data` supplies them by pairing two series this journal already stores:
+`price_bars` keeps the daily `^GSPC` and `^VIX` closes and is a cache that only
+ever grows. So the bands are RECOMPUTED from the same `RAIL_PCTS` the ladder draws,
+never stored beside it, and the whole bar history scores on the first run (57
+sessions on this account the day it shipped). The reference implementation made the
+other choice: `zdte_snapshots` persists ten derived levels a session, which means
+it can only count from the day its calculator was first opened and its stored rails
+can drift from its drawn ones. One honest gap comes with the cheaper design, and
+the tab says it rather than implying otherwise: a daily series carries no intraday
+reading, so a scored band is drawn from the PRIOR session's VIX close while the
+live ladder uses the current level.
+
 ## Clocks
 
 Every journal timestamp is **US Eastern**, settled from the data rather than

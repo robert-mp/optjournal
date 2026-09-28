@@ -357,6 +357,13 @@ _UNSAMPLED = frozenset({
     # numbers, so no `/api/state` sample can carry them. Their keys are pinned by
     # tests/frontend/zdte.test.mjs, which runs the module that produces them.
     "StrikeRow", "ScratchLine", "Scratch", "Move", "SessionEvent",
+    # `OdteSession` is server-built but empty for the same reason `OdteContext` is
+    # null: scoring needs TWO sessions of index bars and this fixture has none.
+    # `RailScore` and `ScoredSession` are page-side, out of `zdte.railScores`, so
+    # no `/api/state` sample can carry them either. All three are exercised
+    # directly -- the first against inserted bars in test_serialize.py, the other
+    # two in tests/frontend/zdte.test.mjs.
+    "OdteSession", "RailScore", "ScoredSession",
     # `GET /api/settings/token`. Deliberately off the state payload -- the
     # keyring has been measured at 8.2s with a locked keychain, so presence is
     # fetched by a button rather than on every page load, and no `/api/state`
@@ -2491,7 +2498,7 @@ def test_annual_and_odte_are_in_the_payload(state):
     """Both tabs were disabled with hardcoded reasons; now they have data."""
     assert state["annual"], "the Annual tab renders from this"
     assert set(state["odte"]) == {
-        "cohort", "rest", "unknown_dte", "selectable", "context"}
+        "cohort", "rest", "unknown_dte", "selectable", "context", "history"}
     # A cohort in isolation says nothing, so the comparison set must be present.
     assert state["odte"]["rest"]["episodes"] >= 0
 

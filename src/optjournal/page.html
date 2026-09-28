@@ -134,8 +134,9 @@ import {cls, dayLabel, dp, esc, level, money, monthLabel, num, pct, strike, sym}
   from '/static/format.js';
 import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
   from '/static/market.js';
-import {VIX_DIVISOR, expectedMove, ladderRows, parseNumber, sanitizeLevel,
-  scratchLines, scratchRead, sessionEvents} from '/static/zdte.js';
+import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
+  railScores, sanitizeLevel, scratchLines, scratchRead,
+  sessionEvents} from '/static/zdte.js';
 
 /* ===================== the payload contract =====================
    Everything this page reads, declared beside the code that reads it. The
@@ -925,6 +926,36 @@ import {VIX_DIVISOR, expectedMove, ladderRows, parseNumber, sanitizeLevel,
  * @property {OdteContext|null} context -- the calculator's opening reading, null
  *   until a `bars` fetch has landed the S&P and VIX closes
  *   (serialize.odte_context_data)
+ * @property {Array} history -- OdteSession rows, the settled sessions the rails are
+ *   scored against; empty until two sessions of bars have landed
+ *   (serialize.odte_scoring_data)
+ */
+
+/** @typedef {Object} OdteSession -- one settled session to score a band against
+ * (serialize.odte_scoring_data)
+ * @property {string} date -- the ET session whose close is the OUTCOME
+ * @property {number} prev_close -- the S&P close the band was drawn from
+ * @property {number} vix -- the VIX it was drawn at: the PRIOR session's close,
+ *   which the live tab's intraday reading is not
+ * @property {number} close -- what the index actually printed that session
+ */
+
+/** @typedef {Object} RailScore -- page-side: one rail's record (zdte.railScores)
+ * @property {string} label -- "1σ", or the fixed rail as "2.5%"
+ * @property {number} tested -- sessions scored against it
+ * @property {number} held -- of those, how many closed inside it
+ * @property {number} rate -- held over tested, 0 to 1
+ */
+
+/** @typedef {Object} ScoredSession -- page-side: one scored session (zdte.railScores)
+ * @property {string} date
+ * @property {number} from -- the close the band was drawn from
+ * @property {number} close -- the outcome
+ * @property {number} vix
+ * @property {number} points -- how far the index moved
+ * @property {number} pct -- that move as a percentage of `from`
+ * @property {number} sigmaPct -- the expected move that session, `vix / 16`
+ * @property {Object} held -- rail label to whether it held
  */
 
 /** @typedef {Object} OdteContext -- the two readings the calculator opens on
@@ -1226,6 +1257,7 @@ import {VIX_DIVISOR, expectedMove, ladderRows, parseNumber, sanitizeLevel,
  * @local WBX_LABEL WIVR_LABEL WMETER WRING items it arc tin tout sb
  * @local events
  * @local zrows clean
+ * @local rails sessions sigma
  */
 
 const $=s=>document.querySelector(s);
@@ -4922,6 +4954,54 @@ function odte(){
         :`Show ${zhidden} more strike${zhidden===1?'':'s'}`}</button></div>`:''}</div>`
     :`<div class="empty">no ladder yet — both readings above have to be
       numbers</div>`}
+    ${zscore(od.history)}
+  </div>`;
+}
+
+/* HOW OFTEN EACH RAIL ACTUALLY HELD, which is the one thing the ladder above
+ * cannot tell you. The expected move is quoted as "roughly two closes in three",
+ * and a journal that prints that figure for months without ever checking it
+ * against its own index is repeating a textbook rather than measuring anything.
+ * This counts.
+ *
+ * SCORED FROM THE BARS, NOT FROM A SNAPSHOT TABLE. The reference implementation
+ * stores a row per session with its ten derived levels and so can only count from
+ * the day its calculator was first opened. `price_bars` already holds every daily
+ * S&P and VIX close, so `zdte.railScores` re-draws each past band from the same
+ * `RAIL_PCTS` this tab uses and the whole history is scorable at once. A rail that
+ * is recomputed cannot disagree with the rail on screen.
+ *
+ * THE CAVEAT IS ON SCREEN RATHER THAN IN A COMMENT. These bands are drawn from the
+ * PRIOR session's VIX close, because a daily series has no intraday reading, while
+ * the ladder above uses the live one. Near enough to be worth counting, different
+ * enough that the reader has to be told, so the note says it in place of implying
+ * the score is exactly what this tab showed that morning. */
+function zscore(history){
+  const {sessions,rails}=railScores(history);
+  if(!rails.length) return `<div class="zscore"><div class="empty">no settled
+    sessions to score yet — two sessions of price bars and the rails start
+    keeping a record</div></div>`;
+  const sigma=rails.find((r)=>r.label===SIGMA_LABEL);
+  return `<div class="zscore">
+    <div class="crow"><div><h3>How often each rail held</h3>
+      <div class="sub">${sessions.length} settled session${
+        sessions.length===1?'':'s'}, scored against what the index did next.</div>
+    </div></div>
+    <table class="zsc"><thead><tr><th>Rail</th><th class="n">Held</th>
+      <th class="n">Of</th><th class="n">Rate</th></tr></thead>
+      <tbody>${rails.map((r)=>`<tr${r.label===SIGMA_LABEL?' class="zsig-row"':''}
+        ><td>${esc(r.label)}</td><td class="n">${r.held}</td>
+        <td class="n">${r.tested}</td>
+        <td class="n">${pct(r.rate*100,0)}</td></tr>`).join('')}</tbody></table>
+    <div class="note">${sigma?`The 1σ held <b>${pct(sigma.rate*100,0)}</b> of
+      ${sigma.tested} session${sigma.tested===1?'':'s'}, against the <b>≈68%</b>
+      one sigma implies. `:''}A record, not a promise.${infoTip(`Each band here is
+      drawn from the <b>previous</b> session's VIX close, because stored daily bars
+      carry no intraday reading. The ladder above uses the <b>live</b> VIX, so
+      these are the rails the last settled readings would have drawn rather than
+      the exact ones this tab showed that morning. Close enough to be worth
+      counting, and far enough apart to say so: the same S&amp;P close can carry a
+      settled VIX of 16.33 against a 15.67 read intraday.`)}</div>
   </div>`;
 }
 

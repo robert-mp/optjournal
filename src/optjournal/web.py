@@ -112,6 +112,7 @@ from optjournal.serialize import (
     logbook_data,
     market_data,
     odte_context_data,
+    odte_scoring_data,
     orders_data,
     positions_data,
     statements_data,
@@ -583,6 +584,14 @@ def build_state(
             # rather than an empty gauge -- it is context on top of the cohort
             # comparison, not a reason to blank the tab.
             "context": odte_context_data(conn, now=datetime.now(UTC)),
+            # The settled sessions behind that planner, so the rails can be SCORED
+            # rather than only drawn: one row per closed session carrying the close
+            # a band was drawn from, the VIX it was drawn at, and what the index
+            # actually did. `static/zdte.railScores` turns it into hit rates, from
+            # the same rails the ladder uses -- no level is stored on either side.
+            # Empty until two sessions of bars have landed, which the page renders
+            # the same way it renders the absent planner.
+            "history": odte_scoring_data(conn, now=datetime.now(UTC)),
         }
         base_ccy = str(state["stats"].get("base_currency") or "")
         state["fx"] = {"base": base_ccy, "quotes": fx_quotes(conn, base_ccy)}

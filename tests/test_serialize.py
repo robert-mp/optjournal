@@ -521,3 +521,79 @@ def test_before_the_open_the_newest_row_is_itself_the_prior_close(conn):
     ctx = odte_context_data(conn, now=datetime(2026, 8, 30, 18, 0, tzinfo=UTC))
     assert ctx is not None and ctx["spx_prev_close"] == 7711.76
     assert ctx["spx_date"] == "2026-08-28"
+
+
+def test_scoring_pairs_each_settled_session_with_the_close_before_it(conn):
+    """`odte_scoring_data` walks the stored series into band-and-outcome pairs.
+
+    The whole point of the function in one assertion: a session's row carries the
+    close a band would have been drawn FROM, the VIX it would have been drawn AT
+    (the prior session's, the newest settled reading before the open), and the close
+    the index actually printed. NO level is here, for the same reason
+    `odte_context_data` carries none -- the rails are `railScores`' to draw from the
+    ladder's own `RAIL_PCTS`, and a stored rail is one that can disagree with the
+    drawn one.
+
+    This is the half the reference implementation keeps a whole table for
+    (`zdte_snapshots`, ten derived columns a session) and can only fill going
+    forward. Here it falls out of `price_bars`, which already holds both series.
+    """
+    from optjournal.serialize import odte_scoring_data
+    for day, spx, vix in [
+        ("2026-08-26", 7600.0, 15.0),
+        ("2026-08-27", 7650.0, 16.0),
+        ("2026-08-28", 7711.76, 14.43),
+    ]:
+        _seed_index(conn, "^GSPC", day, spx)
+        _seed_index(conn, "^VIX", day, vix)
+
+    rows = odte_scoring_data(conn, now=datetime(2026, 8, 31, 13, 0, tzinfo=UTC))
+    assert rows == [
+        {"date": "2026-08-27", "prev_close": 7600.0, "vix": 15.0, "close": 7650.0},
+        {"date": "2026-08-28", "prev_close": 7650.0, "vix": 16.0, "close": 7711.76},
+    ], "each row is the band's inputs and the outcome, oldest first"
+    # The first stored session is not scorable and must not appear: there is no
+    # close before it to have drawn a band from.
+
+
+def test_scoring_excludes_today_because_its_close_is_still_moving(conn):
+    """A band scored against an unsettled price reports a hit the afternoon revokes.
+
+    The same exclusion `odte_context_data` makes for the prior close, needed here
+    for the outcome instead of the input.
+    """
+    from optjournal.serialize import odte_scoring_data
+    _seed_index(conn, "^GSPC", "2026-08-28", 7711.76)
+    _seed_index(conn, "^VIX", "2026-08-28", 14.43)
+    _seed_index(conn, "^GSPC", "2026-08-31", 7686.14)   # today, in progress
+    _seed_index(conn, "^VIX", "2026-08-31", 15.25)
+    now = datetime(2026, 8, 31, 17, 0, tzinfo=UTC)      # Monday, mid-session ET
+
+    assert odte_scoring_data(conn, now=now) == [], "today is not a settled outcome"
+
+
+def test_scoring_skips_a_session_whose_vix_never_landed(conn):
+    """A missing reading is an absence, not a band that broke.
+
+    Counting it would make every rail's hit rate read worse than the history it is
+    supposed to be measuring, which is the one failure a score must not have.
+    """
+    from optjournal.serialize import odte_scoring_data
+    for day, spx in [("2026-08-26", 7600.0), ("2026-08-27", 7650.0),
+                     ("2026-08-28", 7711.76)]:
+        _seed_index(conn, "^GSPC", day, spx)
+    _seed_index(conn, "^VIX", "2026-08-26", 15.0)
+    # Nothing for the 27th, so the session it would have drawn the 28th's band from
+    # is unusable.
+    rows = odte_scoring_data(conn, now=datetime(2026, 8, 31, 13, 0, tzinfo=UTC))
+    assert [row["date"] for row in rows] == ["2026-08-27"]
+
+
+def test_scoring_is_empty_until_both_series_have_landed(conn):
+    """One index without the other scores nothing, the same as it reads nothing."""
+    from optjournal.serialize import odte_scoring_data
+    now = datetime(2026, 8, 31, 13, 0, tzinfo=UTC)
+    assert odte_scoring_data(conn, now=now) == []
+    _seed_index(conn, "^GSPC", "2026-08-27", 7650.0)
+    _seed_index(conn, "^GSPC", "2026-08-28", 7711.76)
+    assert odte_scoring_data(conn, now=now) == [], "the S&P alone scores nothing"

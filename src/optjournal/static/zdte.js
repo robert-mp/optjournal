@@ -230,6 +230,107 @@ export function sessionEvents(events, options) {
   return { shown: rows.slice(0, chips), hidden: Math.max(0, rows.length - chips) };
 }
 
+/* ---- scoring the rails, once the session has closed -------------------------
+ *
+ * WHAT THIS IS FOR. Everything above draws a band. Nothing above says whether the
+ * band was ever any good, and a journal that prints a 68% reading without ever
+ * checking it against its own history is asserting a number rather than measuring
+ * one. This scores the rails against sessions that have since settled: the 1σ is
+ * supposed to hold about two days in three, and the only way to know whether it
+ * does on THIS account's index is to count.
+ *
+ * NO NEW TABLE, AND NO SECOND COPY OF THE ARITHMETIC. The reference
+ * implementation persists a row per session with all ten of its derived levels
+ * (`zdte_snapshots`: the 1σ pair, the 2% pair, the 3% pair, the points, rounded to
+ * two decimals as strings). It therefore starts counting the day the feature was
+ * switched on, and can never re-score a rail it did not store. This journal
+ * already has the only two inputs a band needs -- `price_bars` keeps the daily
+ * ^GSPC and ^VIX closes and is a cache that only ever grows -- so the levels are
+ * recomputed from `expectedMove` and `RAIL_PCTS` rather than stored beside them,
+ * and the whole bar history is scorable retroactively. Persisting a derived level
+ * is what makes the stored copy and the drawn copy able to disagree.
+ *
+ * COMPARED AS PERCENTAGES, WHICH IS THE SAME TEST DONE WITHOUT LEVELS. A rail sits
+ * at `prev_close * (1 ± pct/100)`, so "the close landed inside it" is exactly
+ * "the session moved no more than `pct`". Measuring the move against the close the
+ * band was drawn from keeps the rails as the single definition of where they are.
+ *
+ * ONE HONEST LIMIT, AND IT IS IN THE DATA RATHER THAN HERE. The live tab reads the
+ * CURRENT VIX against the prior close (see `serialize.odte_context_data`), and a
+ * daily bar history cannot reproduce an intraday reading -- the only settled VIX
+ * available before a session opens is the previous session's close. So a score is
+ * what the rails would have said drawn from the last settled readings, which is
+ * not quite the ladder the tab showed at 09:40 that morning. Near enough to be
+ * worth counting, and different enough that it must be said rather than implied:
+ * the reference's own row for 2026-09-24 carries VIX 16.33 where the tab was read
+ * at 15.67 on the same close.
+ */
+
+/** The label the VIX rail scores under, which no fixed rail can collide with. */
+export const SIGMA_LABEL = "1σ";
+
+/** How often each rail held, over sessions that have settled.
+ *
+ * Takes `{date, prev_close, vix, close}` per session -- the close the band was
+ * drawn from, the VIX it was drawn at, and what the index actually did -- and
+ * returns `{sessions, rails}`. `rails` is one row per rail, the 1σ first and the
+ * fixed ladder after it, each `{label, tested, held, rate}`. `rails` is empty when
+ * no session was usable, rather than a table of zeros claiming every rail failed.
+ * `sessions` carries the per-day detail so the page can
+ * show the misses rather than only the ratio: a rail that holds 65% of the time is
+ * a different story depending on whether the third day is a near miss or a gap.
+ *
+ * A session the readings cannot support is SKIPPED rather than counted as a miss.
+ * A missing VIX is an absence, and scoring it as a broken band would quietly make
+ * every rail look worse than it is.
+ */
+export function railScores(sessions) {
+  const tally = new Map();
+  const scored = [];
+  for (const session of sessions || []) {
+    const move = expectedMove(session.prev_close, session.vix);
+    const from = parseNumber(session.prev_close);
+    const close = parseNumber(session.close);
+    if (!move || from == null || close == null || close <= 0) continue;
+    const points = Math.abs(close - from);
+    const pct = points / from * 100;
+    const rails = [
+      { label: SIGMA_LABEL, pct: move.pct },
+      ...RAIL_PCTS.map((rail) => ({ label: `${rail}%`, pct: rail })),
+    ];
+    const held = {};
+    for (const rail of rails) {
+      /* Inclusive: a close that lands exactly ON the rail is inside it. The rail
+         is where the move stops being expected, not where it starts. */
+      const inside = pct <= rail.pct;
+      held[rail.label] = inside;
+      const row = tally.get(rail.label)
+        || { label: rail.label, tested: 0, held: 0 };
+      row.tested += 1;
+      if (inside) row.held += 1;
+      tally.set(rail.label, row);
+    }
+    scored.push({
+      date: session.date,
+      from,
+      close,
+      vix: parseNumber(session.vix),
+      points,
+      pct,
+      sigmaPct: move.pct,
+      held,
+    });
+  }
+  /* Every rail in the tally was tested by the session that put it there, so a
+     rate is always available: there is no "scored nothing" rail to guard against,
+     only an empty table when no session was usable. */
+  const rails = [...tally.values()].map((row) => ({
+    ...row,
+    rate: row.held / row.tested,
+  }));
+  return { sessions: scored, rails };
+}
+
 /** A finite number from a typed string, or null. Never NaN, which is the value a
  * half-typed field yields and the one that renders as "NaN" in a cell. */
 export function parseNumber(text) {
