@@ -596,3 +596,27 @@ def test_the_matrix_exercises_both_axes():
     assert all(c is None for _, c, _ in sweep.page_coords(None)), (
         "a journal with no quote currency must not be swept at one"
     )
+
+
+def test_a_page_the_browser_never_rendered_fails_rather_than_skips(
+    populated_db, tmp_path, monkeypatch
+):
+    """Measured: a flaky headless run printed `ok  real  watchlist  0 pass 1 skip`,
+    one check where eighteen belonged, and the sweep's headline still read 0
+    failed. A render with no DOM gets one retry, then fails.
+
+    Ablated by restoring the `skip`: this fails.
+    """
+    from conftest import RAW_DIR  # noqa: PLC0415 - local to this test
+
+    calls: list[str] = []
+
+    def no_dom(url, profile):
+        calls.append(url)
+        return None
+
+    monkeypatch.setattr(browser, "dump_dom", no_dom)
+    result = sweep.sweep_journal("t", populated_db, RAW_DIR, tmp_path / "p")
+    verdicts = [v for _, _, checks in result.pages for _, v in checks]
+    assert verdicts and all(v.status == FAIL for v in verdicts)
+    assert len(calls) == 2 * len(result.pages), "each page gets exactly one retry"

@@ -847,11 +847,19 @@ def sweep_journal(
         for tab, ccy, kind, calday, replay in coords:
             page = Page(tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay,
                         dom="", markup="", text="", payload=payload)
-            dom = browser.dump_dom(base + "/" + page.url_hash(), profile)
+            # Twice, because headless Chrome occasionally exits without a DOM
+            # under load. Then a FAIL: `cmd_sweep` has already refused to run
+            # with no browser at all, so a page that still has none did not
+            # render. As a skip it printed "ok" with one check where eighteen
+            # belonged, which is the one report a sweep may never give.
+            url = base + "/" + page.url_hash()
+            dom = browser.dump_dom(url, profile) or browser.dump_dom(url, profile)
             if dom is None:
-                result.pages.append(
-                    (name, page.label, [("render", skip("no browser produced a DOM"))])
-                )
+                result.pages.append((name, page.label, [(
+                    "render",
+                    bad("no DOM after two attempts: the page did not render "
+                         "or the browser timed out"),
+                )]))
                 continue
             page = Page(tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay,
                         console=tuple(browser.last_console_errors()),
