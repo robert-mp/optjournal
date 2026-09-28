@@ -497,6 +497,27 @@ def check_no_uncaught_javascript(p: Page) -> Verdict:
     return ok()
 
 
+def check_no_source_comment_leaked_into_the_markup(p: Page) -> Verdict:
+    """No `/*` in the rendered page, anywhere.
+
+    The page is one file of JavaScript building HTML out of template literals, and
+    the two languages have different comment syntax with no boundary between them
+    on screen. A `/* ... */` written one line too deep -- inside a template literal
+    rather than inside a `${...}` expression -- is not a comment at all: it is TEXT,
+    and it lands in the middle of a tag, where the browser reads it as bogus
+    attributes and renders the element looking almost right.
+
+    Caught exactly that way while the 0DTE strip was being written: a five-line
+    rationale ended up inside a `<span`, and every Python test stayed green because
+    the page still parsed, still had its classes, and still said the right words.
+    Only the rendered markup shows it.
+    """
+    if "/*" in p.markup:
+        at = p.markup.index("/*")
+        return bad(f"a source comment reached the markup: {p.markup[at:at + 60]!r}")
+    return ok()
+
+
 def check_replay_renders_from_url(p: Page) -> Verdict:
     """A replay panel opens from the URL alone, with a price line and its strikes.
 
@@ -722,6 +743,7 @@ CHECKS: tuple[Check, ...] = (
     check_no_blank_contract_cells,
     check_closing_events_are_captioned,
     check_no_uncaught_javascript,
+    check_no_source_comment_leaked_into_the_markup,
     check_replay_renders_from_url,
     check_drilldown_renders_from_url,
     check_drilldown_legs_have_context,

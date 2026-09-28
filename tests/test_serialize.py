@@ -398,20 +398,22 @@ def _seed_index(conn, symbol: str, day: str, close: float) -> None:
     """One daily index close under the symbol's own conid, as the manifest stores it.
 
     `^GSPC` and `^VIX` are not contracts, so the symbol IS the conid -- see
-    `bars.CONTEXT_SYMBOLS`. Daily, because that is what the planner reads and what
+    `bars.CONTEXT_SYMBOLS`. Daily, because that is what the calculator reads and what
     the manifest fetches for them.
     """
     upsert_bars(conn, conid=symbol, symbol=symbol, bar_size="1d", source="yahoo",
                 bars=[_bar(day, 16, close)])
 
 
-def test_the_planner_pairs_the_latest_index_closes_with_the_days_events(conn):
-    """`odte_context_data` reads the newest S&P and VIX closes and bands them.
+def test_the_calculator_pairs_the_latest_index_closes_with_the_days_events(conn):
+    """`odte_context_data` reads the newest S&P and VIX closes, and nothing else.
 
-    The whole planner in one assertion: the two levels come back as stored, the
-    bands are `zdte.plan`'s (checked in full in test_zdte.py, so only their
-    presence and the fixed rails are pinned here), and the dates ride along so a
-    reader can see which session each figure is from.
+    The whole reading in one assertion: the two levels come back as stored and the
+    dates ride along so a reader can see which session each figure is from. NO
+    derived level is here to check -- the strike ladder is built in
+    `static/zdte.js` from a reading the tab lets you retype, and is checked
+    against the reference implementation's own screen in
+    tests/frontend/zdte.test.mjs.
     """
     from optjournal.serialize import odte_context_data
     _seed_index(conn, "^GSPC", "2026-08-27", 6000.0)
@@ -424,17 +426,45 @@ def test_the_planner_pairs_the_latest_index_closes_with_the_days_events(conn):
     assert ctx["spx_prev_close"] == 6120.0, "the newest close is the reading"
     assert ctx["vix"] == 16.0
     assert ctx["spx_date"] == "2026-08-28" and ctx["vix_date"] == "2026-08-28"
-    labels = {b["label"] for b in ctx["bands"]}
-    assert labels == {"VIX 1σ", "2%", "3%"}
-    two = next(b for b in ctx["bands"] if b["label"] == "2%")
-    assert two["low"] == pytest.approx(6120.0 * 0.98)
-    assert two["high"] == pytest.approx(6120.0 * 1.02)
+    assert set(ctx) == {
+        "spx_prev_close", "spx_date", "vix", "vix_date", "events_today", "today",
+    }, "a derived level in the payload is a second copy of the ladder"
 
 
-def test_the_planner_is_absent_until_both_feeds_have_landed(conn):
-    """One index without the other is not half a planner, it is none.
+@pytest.mark.parametrize("spx_close, vix_close", [
+    (0.0, 16.0),      # a bad index row
+    (-1.0, 16.0),     # a bad index row
+    (6000.0, -1.0),   # an impossible VIX
+])
+def test_an_unusable_index_row_is_an_absence(conn, spx_close, vix_close):
+    """A reading the calculator cannot draw from is None, not a ladder of zeros.
 
-    A band needs the S&P close and the VIX together, so a fetch that got one and
+    The same bound `static/zdte.js` holds against a typed reading, kept here too
+    because the two inputs arrive by different routes and only one of them passes
+    through the page.
+    """
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-08-28", spx_close)
+    _seed_index(conn, "^VIX", "2026-08-28", vix_close)
+    assert odte_context_data(conn, now=datetime(2026, 8, 31, 13, 0, tzinfo=UTC)) is None
+
+
+def test_a_zero_vix_is_a_reading_not_an_absence(conn):
+    """Zero means "no expected move", which is a figure; the feed missing is not.
+
+    `>= 0` for the VIX and `> 0` for the close, and the asymmetry is the point.
+    """
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-08-28", 6120.0)
+    _seed_index(conn, "^VIX", "2026-08-28", 0.0)
+    ctx = odte_context_data(conn, now=datetime(2026, 8, 31, 13, 0, tzinfo=UTC))
+    assert ctx is not None and ctx["vix"] == 0.0
+
+
+def test_the_calculator_is_absent_until_both_feeds_have_landed(conn):
+    """One index without the other is not half a reading, it is none.
+
+    A ladder needs the S&P close and the VIX together, so a fetch that got one and
     not the other is an absence the tab renders as "run bars", not a partial
     reading that implies a range it cannot compute.
     """
@@ -455,7 +485,7 @@ def test_the_prior_close_is_the_last_settled_session_not_todays_moving_bar(conn)
     The newest daily bar during a session is TODAY's, still moving. Printing it
     as the prior close labels a live quote as a settled one AND shifts every rail
     under the reader mid-session, which is the opposite of what a pre-open
-    planner is for. Caught by comparing against the reference implementation,
+    calculator is for. Caught by comparing against the reference implementation,
     which read Friday's 7711.76 while the newest row here held Monday's 7686.14.
 
     The VIX is deliberately the newest row: the plan wants CURRENT volatility
@@ -473,17 +503,16 @@ def test_the_prior_close_is_the_last_settled_session_not_todays_moving_bar(conn)
     assert ctx["spx_date"] == "2026-08-28"
     assert ctx["vix"] == 15.25, "the VIX is the live level, so today's row stands"
     assert ctx["vix_date"] == "2026-08-31"
-    # And the rails follow the settled close, matching the reference exactly.
-    band = next(b for b in ctx["bands"] if b["label"] == "VIX 1σ")
-    assert round(band["low"], 2) == 7638.26
-    assert round(band["high"], 2) == 7785.26
+    # That the rails then follow the settled close is checked where they are built,
+    # in tests/frontend/zdte.test.mjs -- against this same session's reference
+    # figures (7638.26 and 7785.26 around this close).
 
 
 def test_before_the_open_the_newest_row_is_itself_the_prior_close(conn):
     """On a weekend or pre-open, every stored row predates today.
 
     The exclusion must not empty the series in that case -- it is the ordinary
-    state for a planner read on Sunday evening, and the newest row genuinely IS
+    state for a calculator read on Sunday evening, and the newest row genuinely IS
     the last completed session.
     """
     from optjournal.serialize import odte_context_data

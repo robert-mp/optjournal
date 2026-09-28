@@ -794,9 +794,31 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        # No external resources are loaded, so lock that down rather than
-        # relying on the page never gaining a <script src>.
-        self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'")
+        # No external resources are loaded, so lock that down rather than relying on
+        # the page never gaining a <script src>.
+        #
+        # `'unsafe-inline'` IS SCOPED TO SCRIPTS, and it used to sit on `default-src`,
+        # where it also licensed inline STYLE -- an `<style>` block and every
+        # `style="..."` attribute, which is the easiest thing for an injected string
+        # to reach and the hardest to notice. Nothing here needs it: the 20 inline
+        # style attributes were converted to classes, `app.css` is an external
+        # stylesheet, and there are no `.style.x =` assignments anywhere in the page.
+        # That is not a hope, it is pinned -- see the inline-style and CSP tests in
+        # tests/test_web.py. So style falls back to `default-src 'self'` and stays
+        # strict, while the one thing that genuinely needs the exemption keeps it.
+        #
+        # The exemption is for page.html's single inline <script>, 6000 lines of it.
+        # A hash (`script-src 'self' 'sha256-...'`) would remove it entirely and was
+        # considered and not done: the page is read from disk per request, so the
+        # hash would have to be recomputed per response over bytes extracted by
+        # parsing the document, and any drift between what is hashed and what is
+        # served is not a degraded page but a completely blank one. On a
+        # loopback-only, single-user server that is a bad trade. Revisit it if this
+        # ever listens on anything but 127.0.0.1.
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'",
+        )
         self.send_header("X-Content-Type-Options", "nosniff")
         # NOTHING HERE IS CACHEABLE. The page is read from disk per request and the
         # payload is a live brokerage account, so a cached copy is a stale copy in
@@ -817,6 +839,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(query)
         if path in ("/", "/index.html"):
             self._send(200, page_html().encode(), "text/html; charset=utf-8")
+        elif path == "/companion":
+            # The 0DTE tab's Broker Companion window. A document of its own rather
+            # than the page in a narrow window: it needs no payload, so it makes no
+            # request here beyond this one and the two modules it shares with the
+            # page. Everything it renders arrives in its own URL hash.
+            self._send(200, companion_html().encode(), "text/html; charset=utf-8")
         elif path.startswith("/static/"):
             # Same-origin only, and only the files shipped beside the page: the
             # CSP is `default-src 'self'`, and a path that could escape this
@@ -1738,6 +1766,14 @@ def serve_ephemeral(
 #: diffed sensibly, rather than living as a multi-hundred-line string literal.
 PAGE_PATH = Path(__file__).resolve().parent / "page.html"
 
+#: The 0DTE tab's Broker Companion: the two scratch pads in a window small enough
+#: to float over a broker's order ticket. A SECOND DOCUMENT, and the reason is in
+#: its own comment block -- the shell, the nine tabs and the /api/state fetch are
+#: neither wanted nor needed at 330 pixels, and three numbers in a hash are the
+#: whole of its input. It shares `app.css` and both pure modules with the page, so
+#: nothing about it is a second implementation of anything.
+COMPANION_PATH = Path(__file__).resolve().parent / "companion.html"
+
 #: What `/static/` will serve, by extension. An allowlist rather than a lookup
 #: through `mimetypes`, and the reason is the 404 above: an extension absent
 #: here is not served at all. The handler used to answer `text/javascript` for
@@ -1771,3 +1807,8 @@ def page_html() -> str:
     enough: reload the browser and the edit is there.
     """
     return PAGE_PATH.read_text(encoding="utf-8")
+
+
+def companion_html() -> str:
+    """The Broker Companion's markup, read fresh on every call, like the page."""
+    return COMPANION_PATH.read_text(encoding="utf-8")

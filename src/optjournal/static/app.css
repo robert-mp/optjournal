@@ -13,6 +13,13 @@
  * and the CSP's `default-src 'self'` already permits a same-origin stylesheet.
  * Measured cost of the extra request on loopback: 1.4 ms.
  *
+ * That external <link> is also what lets the policy keep STYLE strict. While the
+ * rules lived in a <style> block the policy needed `'unsafe-inline'` on
+ * `default-src`, which licensed every `style="..."` attribute too; now the
+ * exemption is scoped to `script-src` and an injected inline style is refused by
+ * the browser. Moving these rules out bought a security property, not just a
+ * testable one -- see the CSP note in web.py.
+ *
  * Still no build step, no preprocessor, no framework. This is one plain file.
  *
  * THEMES. Every colour on this page is a custom property declared in the blocks
@@ -111,7 +118,6 @@
   --bevelfaint:rgba(255,255,255,.03); --bevel:rgba(255,255,255,.18);
   --bevelhi:rgba(255,255,255,.22); --bevelon:rgba(255,255,255,.16);
   --drop:rgba(0,0,0,.5); --dropsoft:rgba(0,0,0,.4);
-  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 
 /* ADMIRALTY -- nautical night. Blue-black ground with brass, which is the theme
@@ -179,7 +185,6 @@
   --bevelfaint:rgba(255,255,255,.035); --bevel:rgba(255,255,255,.2);
   --bevelhi:rgba(255,255,255,.24); --bevelon:rgba(255,255,255,.18);
   --drop:rgba(0,0,0,.55); --dropsoft:rgba(0,0,0,.45);
-  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 
 /* LEDGER -- deep green buckram and aged gilt, the other classic accounts-book
@@ -246,7 +251,118 @@
   --bevelfaint:rgba(255,255,255,.032); --bevel:rgba(255,255,255,.19);
   --bevelhi:rgba(255,255,255,.23); --bevelon:rgba(255,255,255,.17);
   --drop:rgba(0,0,0,.52); --dropsoft:rgba(0,0,0,.42);
+}
+/* ---------------------------------------------------------------- measurement
+   THE SAME MECHANISM THE COLOURS ALREADY HAVE, applied to size and space.
+
+   Every colour on this page is a named token and a test forbids a literal
+   outside the theme blocks. Measurement had none of that, and the audit is why
+   this block exists: 17 font sizes, 12 radii, 20 padding values, 15 margins and
+   15 gaps -- 64 distinct literals for a page with maybe a dozen kinds of thing
+   on it. Nine of the type sizes were within half a pixel of another (9.5, 10.5,
+   11.5, 12.5), which is the signature of tuning each element alone rather than
+   choosing a scale: the values did not disagree about anything, they had simply
+   never been asked to agree.
+
+   That is what "unpolished" was. A reader perceives rhythm from REPETITION, and
+   a page where no two elements share a measurement has none to perceive -- each
+   box is individually defensible and the set reads as assembled.
+
+   Two things the scale caught that no amount of looking had:
+     - `.big` is the dashboard's headline net P&L and its comment claimed it was
+       "larger than every other number on the page". It was 22px, against 25px
+       for an ordinary `.stat .v` and 34px for `.hero .fig`. Third largest.
+     - Six sizes (19/22/25/26/30/34) were doing the work of two roles: a panel
+       title and a figure.
+
+   ON `html` RATHER THAN `:root`. Not style: tests/test_web.py's `_themes()`
+   matches `^:root...{...}` and reads every block it finds as a palette, so a
+   second `:root` block here would be parsed as a theme that declares none of
+   the colour names and fail the parity check. `html` IS the root element, so
+   the cascade is identical and the colour tests stay about colour.
+
+   These are NOT themed. A palette swap changes what the page is made of; it
+   does not change how big a caption is. */
+html{
+  /* Type. Eight steps, and the half-pixels are gone -- there is no reading
+     distance at which 11px and 11.5px are two different decisions. Roles, not
+     sizes, because that is what stops a ninth step being added: if a new
+     element wants 17px, the question is which of these it IS. */
+  --t0:10px;   /* micro caps: table headings, axis labels, the ladder's keys */
+  --t1:11px;   /* caption, status word, tooltip body */
+  --t2:12px;   /* small label: a card's key, a provenance note */
+  --t3:13px;   /* control text and secondary body: tabs, inputs, captions */
+  --t4:14px;   /* body, inherited from <body> */
+  --t5:16px;   /* section heading inside a card */
+  --t6:19px;   /* panel title */
+  /* 26 and 33, not 25 and 32, and the extra pixel is compensation rather than
+     taste. These two steps are almost entirely figures, and figures moved off the
+     monospace face (see --fig): SF Mono sets a digit 2.77% taller than SF Pro at
+     the same px -- measured on the running page, cap height 18.55 against 17.94 at
+     25px -- so a same-px swap makes every number on the page read slightly
+     smaller. 25 x 1.034 = 25.85 and 32 x 1.0268 = 32.86, hence 26 and 33.
+     (An earlier estimate of "about 8%" was eyeballed and wrong by a factor of
+     three. It was worth measuring: at 8% these would have been 27 and 35.) */
+  --t7:26px;   /* a figure */
+  --t8:33px;   /* display: the wordmark, and the one headline figure */
+  /* Space. A 2px base, even throughout. Nine steps sounds like a lot until you
+     remember it replaced 50 literals across padding, margin and gap -- and a
+     dense table page genuinely wants both 8 and 10, which a strict 4-based
+     scale cannot spell. */
+  --s0:2px; --s1:4px; --s2:6px; --s3:8px; --s4:10px;
+  --s5:12px; --s6:16px; --s7:20px; --s8:24px;
+  /* Radius. Three sizes and a pill, keyed to what the box IS rather than how
+     big it is: a chip, a control, a panel. Twelve values became four, and the
+     ones that went were the pairs no eye separates -- 8 from 9, 11 from 12. */
+  --r1:6px;    /* chip, tag, inline badge */
+  --r2:10px;   /* control: button, input, select, nested box */
+  --r3:14px;   /* panel: a card, the header slab, the filter bar */
+  --rpill:999px;
+  /* Weight. Three. 500 was used three times and is indistinguishable from 400
+     at 14px in this family; 800 twice, and at 32px 700 is already emphatic. */
+  --w-body:400; --w-label:600; --w-fig:700;
+  /* Tracking. Only uppercase text is tracked, which is the one place it earns
+     its keep. The ten values between .02em and .13em were noise: at 11px,
+     .02em is 0.22px, a measurement no reader recovers. */
+  --tr-tight:-.01em;  /* display sizes, where default tracking gaps */
+  --tr-caps:.08em;    /* an uppercase label */
+  --tr-wide:.16em;    /* the kicker and the ladder's dividers */
+  /* ---- the two faces ----
+     TWO, because one was doing three unrelated jobs. `--mono` dressed the
+     quantities, the machine identifiers AND a couple of decorative glyphs, and
+     the quantities are the one group it is actively wrong for.
+
+     THE MEASUREMENT. In a monospace font every glyph occupies one cell -- that is
+     what monospace means -- so the comma and the full stop are each as wide as a
+     digit. Measured in SF Mono at 25px: `0` 15.05px, `,` 15.05px, `.` 15.05px. So
+     `+€3,279.87` renders with two full digit-width holes punched into it at
+     exactly the two places a reader groups the number, and the thousands
+     separator stops separating anything. The figure reads as a row of loose
+     characters instead of a quantity. That is what "the font for the numbers is
+     not right" was, and it is arithmetic, not taste.
+
+     WHY A DIFFERENT MONO CANNOT FIX IT. Padding punctuation to a full cell is the
+     definition of the genre, so every true monospace has this defect. The fix has
+     to be a PROPORTIONAL face with tabular figures, which is what `--fig` is: the
+     same UI sans the labels already use, with `font-variant-numeric:tabular-nums`.
+     Digits then come out all one width (16.401px at 25px, so columns still align
+     -- verified on Positions, every numeric column has exactly one right edge)
+     while the comma and stop stay narrow at 6.525px. The whole figure is also
+     SHORTER despite the wider digits: 138.29px against 150.51px.
+
+     It costs nothing to ship, which matters here. No webfont, no build step, no
+     binary asset, and no second render-blocking request -- the same constraints
+     that keep this stylesheet one plain file.
+
+     WHAT KEEPS `--mono`. Anything that is a literal rather than a measurement: a
+     ticker, an order id, a currency code, an ISO timestamp, a job name, the
+     database path, the version string, the BTO/STO/STC/BTC badges. On those the
+     code face is doing real work -- it says "this is a string the machine gave
+     us, character for character" -- and a fixed cell is a feature, because it is
+     how `1100002192` stays scannable against `1100001918`. Two faces, one
+     distinction: `--fig` measures, `--mono` quotes. */
   --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  --fig:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
 }
 *{box-sizing:border-box}
 /* `color-scheme:dark` is not decoration and was MISSING, which is a gap no
@@ -272,12 +388,18 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    ring from reading as a stuck selection. --leather1 matches `.tipped:focus`,
    the one control that already had a ring. */
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px;
-  border-radius:4px}
+  border-radius:var(--r1)}
 /* Inside the ring rather than outside it: these two sit flush against a panel
    edge, where a 2px offset ring is clipped. */
 .tab:focus-visible,.icobtn:focus-visible{outline-offset:-2px}
 
+/* The two utilities, and they are not interchangeable -- see `--fig`/`--mono`.
+   `.mono` QUOTES: a ticker, an order id, a currency code, a timestamp, a path.
+   `.fig` MEASURES: anything a reader would add up or compare.
+   `tabular-nums` on both, because an order id wants its digits in a column just
+   as much as a price does. */
 .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.fig{font-family:var(--fig);font-variant-numeric:tabular-nums}
 .dim{color:var(--dim)} .dim2{color:var(--dim2)}
 /* Sign is carried by a GLYPH as well as a hue, because hue alone does not
    survive red-green colour blindness: measured, --ok against --bad separates by
@@ -298,10 +420,31 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    already uses, so this inherits each theme's contrast check for free. */
 .warn2{color:var(--warnfg)}
 .pos.signed::before{content:"+"}
-.wrap{max-width:1480px;margin:0 auto;padding:22px}
+.wrap{max-width:1480px;margin:0 auto;padding:var(--s8)}
 
-/* ---- branded header ---- */
-.brand{display:flex;align-items:flex-start;gap:18px;padding:20px 22px;border-radius:16px;
+/* ---- branded header ----
+   A GRID of three columns and two rows, which is what the header always wanted
+   to be and could not say as a flex row. The mark spans both rows; the dateline
+   and title take the middle of row one; the actions take its right; the tab
+   strip owns the whole of row two.
+
+   As a flex row the strip was nested inside the title's column, so it inherited
+   that column's width -- it stopped at the ninth tab and left roughly 500px of
+   empty slab beside it, under a right-hand stack (currency toggle, then the two
+   icon buttons on a second line) that was itself mostly air. The slab stood
+   ~140px tall to contain an arrangement whose right half held nothing. Both
+   problems were the same problem: the only axis a flex row could give the strip
+   was the one the title was already using.
+
+   `align-items:start` so a short actions column does not stretch, and the areas
+   rather than line numbers because the two rows are named things -- a reader
+   should not have to count tracks to learn that the tabs are the second row. */
+.brand{display:grid;grid-template-columns:auto 1fr auto;
+  grid-template-areas:"mark head actions"
+                      "mark tabs tabs";
+  align-items:start;
+  column-gap:var(--s7);row-gap:var(--s5);
+  padding:var(--s6) var(--s8);border-radius:var(--r3);
   background:linear-gradient(150deg,var(--brand1) 0%,var(--brand2) 55%,var(--brand3) 100%);
   border:1px solid var(--line2);box-shadow:0 1px 0 var(--bevelfaint) inset}
 /* The mark is a compass rose seated in a binnacle ring -- a bitácora is the
@@ -309,7 +452,7 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    <img>: it inherits the palette below through currentColor and the CSS
    custom properties, so the logo cannot drift out of tune with the theme the
    way a flat exported asset would. */
-.logo{width:58px;height:58px;border-radius:14px;flex:0 0 auto;
+.logo{grid-area:mark;width:58px;height:58px;border-radius:var(--r3);
   background:linear-gradient(150deg,var(--logo1),var(--logo2) 60%,var(--logo3));
   border:1px solid var(--accentedge);display:grid;place-items:center;
   box-shadow:0 2px 8px var(--drop), 0 1px 0 var(--bevel) inset;
@@ -337,72 +480,85 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
 @media (prefers-reduced-motion:reduce){
   .logo::after{display:none}
 }
-.kicker{font-size:10.5px;letter-spacing:.19em;text-transform:uppercase;
-  color:var(--kicker);font-weight:600;margin-bottom:2px}
-.title{font-size:30px;font-weight:800;letter-spacing:-.01em;line-height:1.1;
-  display:flex;align-items:center;gap:10px}
+.kicker{font-size:var(--t0);letter-spacing:var(--tr-wide);text-transform:uppercase;
+  color:var(--kicker);font-weight:var(--w-label);margin-bottom:var(--s0)}
+.title{font-size:var(--t8);font-weight:var(--w-fig);letter-spacing:var(--tr-tight);line-height:1.1;
+  display:flex;align-items:center;gap:var(--s4)}
 /* `font:inherit` and the cursor are what a <button> needs that the old <span>
    did not: a button does not inherit the page's family or size, so without it
    the chip rendered in the browser's default UI font beside a 30px title. */
-.edition{font:inherit;font-size:10.5px;font-weight:600;line-height:1.5;
+.edition{font:inherit;font-size:var(--t0);font-weight:var(--w-label);line-height:1.5;
   color:var(--edfg);background:var(--edbg);cursor:pointer;
-  border:1px solid var(--edline);border-radius:999px;padding:3px 9px;letter-spacing:.02em}
+  border:1px solid var(--edline);border-radius:var(--rpill);padding:var(--s1) var(--s3)}
 /* Hover states the chip is a control. The border is what moves, not the fill:
    at 10.5px a background change reads as the label having been selected. */
 .edition:hover{border-color:var(--accentedge);color:var(--fg)}
-.tabs{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
-.tab{font:inherit;font-weight:600;font-size:13px;cursor:pointer;padding:8px 17px;
-  border-radius:9px;background:var(--panel2);border:1px solid var(--line);color:var(--fg)}
+.brandhead{grid-area:head;min-width:0}
+/* No `margin-top`: the grid's `row-gap` is what separates the strip from the
+   title now, and keeping both stacked two spacings on one edge. */
+.tabs{grid-area:tabs;display:flex;gap:var(--s3);flex-wrap:wrap}
+.tab{font:inherit;font-weight:var(--w-label);font-size:var(--t3);cursor:pointer;padding:var(--s3) var(--s6);
+  border-radius:var(--r2);background:var(--panel2);border:1px solid var(--line);color:var(--fg)}
 .tab:hover:not(:disabled){border-color:var(--line2)}
 .tab.on{background:linear-gradient(160deg,var(--accent),var(--accent2));
   border-color:var(--accentedge);color:var(--accentfg);
   box-shadow:0 1px 0 var(--bevelon) inset,0 2px 10px var(--dropsoft)}
-/* `align-items` must be pinned on BOTH levels, and the reason differs at each.
-   On the column itself, the default `stretch` is opted out of by .icobtn's
-   explicit width -- and a definite cross-size lands the item at the cross-axis
-   START, so the two icon buttons sat hard LEFT while .ccynote beside them was
-   text-align:right. Inside #ccywrap, `stretch` is NOT opted out of: .ccytog has
-   no width, so it inflated to the wrap's width, which .ccynote's max-width had
-   already pushed to 210px -- the rounded border then extended well past $USD
-   with dead space inside it. Right-aligning the wrap makes the toggle
-   shrink-wrap its own buttons, which is the only width that means anything. */
-.hdr-actions{margin-left:auto;display:flex;flex-direction:column;gap:9px;
-  align-items:flex-end}
-#ccywrap{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+/* A ROW now, not a column. Stacked, the currency toggle and the two icon buttons
+   made a three-deep pile against the right edge that set the header's height on
+   its own -- and read as three unrelated things, since nothing but proximity
+   grouped them. Side by side they are one bar of controls, and the slab loses the
+   row it was standing tall to hold.
+
+   `align-items:flex-start`, which is the OPPOSITE of what this rule carried as a
+   column and for a related reason. Down the cross axis of a row, `flex-end` would
+   seat the icons level with the BOTTOM of #ccywrap -- i.e. with .ccynote, the
+   explanatory note that only exists while a restated total is showing. The icons
+   would then move whenever that note appeared. Aligning to the start pins them to
+   the toggle, which is the control they belong beside.
+
+   `#ccywrap` keeps `align-items:flex-end`, and that one is unchanged and still
+   load-bearing: `.ccytog` has no width, so under the default `stretch` it
+   inflated to the wrap's width -- itself pushed to 210px by `.ccynote`'s
+   max-width -- and the rounded border ran well past $USD with dead space inside
+   it. Right-aligning the wrap makes the toggle shrink-wrap its own buttons,
+   which is the only width that means anything. */
+.hdr-actions{grid-area:actions;display:flex;gap:var(--s6);
+  align-items:flex-start}
+#ccywrap{display:flex;flex-direction:column;align-items:flex-end;gap:var(--s2)}
 /* The two icons are one control group, so they share a row rather than
    stacking -- stacked, they read as two unrelated affordances. */
-.hdr-icons{display:flex;gap:9px}
-.ccytog{display:flex;gap:0;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.hdr-icons{display:flex;gap:var(--s3)}
+.ccytog{display:flex;gap:0;border:1px solid var(--line);border-radius:var(--r2);overflow:hidden}
 .ccytog button{background:transparent;border:0;color:var(--dim);font:inherit;
-  font-size:12px;font-weight:600;letter-spacing:.04em;padding:6px 11px;cursor:pointer}
+  font-size:var(--t2);font-weight:var(--w-label);padding:var(--s2) var(--s4);cursor:pointer}
 .ccytog button.on{background:linear-gradient(180deg,var(--accentlit1),var(--accentlit2));color:var(--onaccent)}
 .ccytog button:disabled{opacity:.4;cursor:not-allowed}
-.calnav{display:inline-flex;gap:4px;margin-left:10px;vertical-align:2px}
+.calnav{display:inline-flex;gap:var(--s1);margin-left:var(--s4);vertical-align:2px}
 .calnav button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
-  border-radius:7px;font:inherit;font-size:14px;line-height:1;padding:3px 9px;cursor:pointer}
+  border-radius:var(--r1);font:inherit;font-size:var(--t4);line-height:1;padding:var(--s1) var(--s3);cursor:pointer}
 .calnav button:hover:not(:disabled){color:var(--fg)}
 .calnav button:disabled{opacity:.35;cursor:not-allowed}
 /* A restated (non-base) total is not IBKR's own figure, so the toggle says so
    rather than letting the number pass as authoritative. */
-.ccynote{font-size:11px;color:var(--dim2);text-align:right;max-width:210px;
+.ccynote{font-size:var(--t1);color:var(--dim2);text-align:right;max-width:210px;
   line-height:1.35}
-.icobtn{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;
+.icobtn{width:38px;height:38px;border-radius:var(--r2);display:grid;place-items:center;
   background:var(--panel2);border:1px solid var(--line);color:var(--dim);
-  cursor:pointer;font-size:15px}
+  cursor:pointer;font-size:var(--t5)}
 .icobtn:hover:not(:disabled){color:var(--fg);border-color:var(--line2)}
 .icobtn:disabled{opacity:.45;cursor:not-allowed}
 .icobtn.busy{animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
 /* ---- filter bar ---- */
-.filters{display:grid;gap:20px;grid-template-columns:1fr auto 1fr;align-items:end;
-  margin-top:16px;padding:16px 20px;border-radius:14px;
+.filters{display:grid;gap:var(--s7);grid-template-columns:1fr auto 1fr;align-items:end;
+  margin-top:var(--s6);padding:var(--s6) var(--s7);border-radius:var(--r3);
   background:var(--panel);border:1px solid var(--line)}
-.flabel{font-size:12.5px;font-weight:600;margin-bottom:8px}
-select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg);
+.flabel{font-size:var(--t2);font-weight:var(--w-label);margin-bottom:var(--s3)}
+select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r2);color:var(--fg);
   background:var(--bg2);border:1px solid var(--line2)}
-.seg{display:flex;border:1px solid var(--line2);border-radius:9px;overflow:hidden}
-.seg button{font:inherit;font-weight:600;font-size:13px;padding:9px 20px;cursor:pointer;
+.seg{display:flex;border:1px solid var(--line2);border-radius:var(--r2);overflow:hidden}
+.seg button{font:inherit;font-weight:var(--w-label);font-size:var(--t3);padding:var(--s3) var(--s7);cursor:pointer;
   background:var(--panel2);border:0;border-right:1px solid var(--line2);color:var(--dim)}
 .seg button:last-child{border-right:0}
 .seg button.on{background:linear-gradient(160deg,var(--seg1),var(--seg2));color:var(--fg)}
@@ -410,111 +566,180 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
 .center{text-align:center}
 
 /* ---- cards ---- */
-.card{margin-top:16px;padding:18px 20px;border-radius:14px;
+.card{margin-top:var(--s6);padding:var(--s7);border-radius:var(--r3);
   background:var(--panel);border:1px solid var(--line)}
-.card h2{font-size:19px;font-weight:700;margin:0 0 3px}
-.card .sub{font-size:12.5px;color:var(--dim);margin-bottom:14px}
+.card h2{font-size:var(--t6);font-weight:var(--w-fig);margin:0 0 var(--s1)}
+/* `h3` is styled as an ELEMENT, deliberately, and it is the one place here that
+   earns an unclassed selector. This bug has been found twice: the Watchlist's
+   title was a classless `<h3>` wearing the user agent's size and its 1em margins
+   (see page.html, `<h2>`, not the old `<h3>`), and the fix that time was to change
+   that one tag -- which left the Market tab's two `<h3>`s doing it still. Measured
+   on the running page: "Economic Calendar" was rendering at 16.38px, the browser's
+   1.17em, the only size on any tab that is not on the scale.
+
+   A class would have to be remembered at every future site. Sizing the element
+   means the next unclassed `h3` is already right, which is the only version of
+   this fix that ends the bug rather than moving it. `.jsec h3` still overrides:
+   equal specificity, declared later. */
+.card h3{font-size:var(--t5);font-weight:var(--w-fig);margin:0 0 var(--s1)}
+/* Same measure cap as `.note`, and for the same reason: a panel caption that runs
+   the full 1350px of a card is a line the eye cannot return along. No rule or
+   indent here -- this one IS part of the panel's heading block, directly under the
+   title, so it needs no marker saying where it belongs. */
+.card .sub{font-size:var(--t2);color:var(--dim);margin-bottom:var(--s6);
+  max-width:86ch}
 /* `flex-wrap` so a narrow viewport moves the pill strip BELOW the caption as a
    row, rather than overflowing the card: the strip refuses to shrink (see
    .pills), so without somewhere to wrap to it would push past the card edge. */
-.crow{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;
+.crow{display:flex;align-items:flex-start;justify-content:space-between;gap:var(--s6);
   flex-wrap:wrap}
 
-/* Flex, not grid, and the reason is arithmetic rather than taste. The dashboard
-   renders EXACTLY nine cards -- both of its conditionals are either/or, so the
-   count is structural -- and nine divides evenly into none of the column counts
-   this page uses: 9/5 leaves one orphan, 9/2 leaves one, and no card count is
-   gapless across 5, 3 and 2 at once. A fixed grid therefore always has a hole
-   somewhere, and it lands in the wide view, which is the one most people see.
+/* THE SCOREBOARD. A grid again, and the arithmetic that once forbade one is the
+   reason it works now.
 
-   The two obvious fixes are both worse, measured: four columns leaves THREE
-   gaps, and promoting Net P&L to a two-cell hero closes the wide row but opens
-   two gaps at the 1180px breakpoint -- it moves the hole rather than removing
-   it. So the row is asked to distribute its remainder instead: `flex:1 1 <base>`
-   lets the last row's cards absorb the leftover width and end flush with the
-   row above. A trailing card is then WIDER than its neighbours rather than
-   missing, which reads as a layout instead of as a failed render.
+   The history matters, because the obvious change here is a regression. This was
+   `display:grid;repeat(5,1fr)`, became `display:flex;flex-wrap:wrap;--sw:18%`,
+   and the flex was CORRECT for what it was given: the dashboard emitted exactly
+   nine cards, nine divides evenly into none of 5, 3 or 2, so every fixed grid
+   orphaned a cell in the wide view. `flex:1 1 <basis>` let the last row absorb
+   the remainder and end flush, which is a real fix for a real problem.
 
-   `--sw` is the basis width per breakpoint, and it is what picks the wrap
-   point: five per row while each card can hold 18% of the line, then three,
-   then two. Sized just under the true fraction (18 < 20, 30 < 33.3) so rounding
-   can never overflow a row and drop one card to a line of its own. */
-.stats{display:flex;flex-wrap:wrap;gap:13px;--sw:18%}
-.stats>*{flex:1 1 var(--sw);min-width:0}
-@media(max-width:1180px){.stats{--sw:30%}}
-@media(max-width:760px){.stats{--sw:46%}
+   It just paid for a flush right edge with the interior columns. Wrapped flex
+   rows size INDEPENDENTLY, so the nine cards came out as five of 260px above
+   four of 329px and not one column edge lined up down the panel -- measured at
+   1440px. Nine co-equal boxes in two ragged rows is most of what read as
+   unpolished here, and no amount of tuning the basis fixes it, because the
+   raggedness IS the mechanism.
+
+   So the premise went instead of the layout. Nine cards were never nine peers:
+   one of them is Net P&L, the figure the whole tab exists to report, and it sat
+   the same size in the same box as Avg Loss. Promoting it out of the row leaves
+   EIGHT, which divides evenly into 4, 2 and 1 -- every column count this page
+   uses. Aligned columns, no orphan, and a hierarchy, from removing a card rather
+   than adding a rule.
+
+   (The old comment here rejected exactly this as "moves the hole rather than
+   removing it". That was measured against a hero spanning TWO cells of five,
+   which does move the hole. Spanning the full row at a column count the
+   remainder divides into is a different shape, and it has no hole at any
+   breakpoint -- 8/4, 8/2, 8/1 are all exact.)
+
+   THE COLUMN COUNT IS PER SITE, because `.stats` serves four panels and they do
+   not hold the same number of tiles. Four columns is the dashboard's eight; the
+   lifecycle card and the watchlist detail hold THREE, which a four-column grid
+   orphans exactly the way five orphaned nine; and the 0DTE cohort holds four
+   inside a half-width `.duo` card, where four columns measured 148px per tile and
+   wrapped `€3,279.87` onto two lines. So each site names its count and the
+   invariant is checked rather than assumed: every count divides its card total,
+   at every breakpoint. A modifier is more words than `auto-fit` and it is the
+   right ones -- `auto-fit` sizes to the container and would have put five columns
+   under the dashboard's eight cards, which is the orphan again by another route. */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s5)}
+.stats.c3{grid-template-columns:repeat(3,1fr)}
+.stats.c2{grid-template-columns:repeat(2,1fr)}
+.stats>*{min-width:0}
+/* The headline. Full-bleed across the top of the grid rather than a wider tile,
+   because the point is that it is not in the row: a reader should not have to
+   compare it to anything to know it is the answer. */
+.stat.lead{grid-column:1/-1}
+/* A modifier must be named in a query to be changed by it -- `.stats.c3` is
+   specificity (0,2,0) and outranks a bare `.stats` whatever the media query. So
+   the lists here are deliberate on both counts: what they include AND what they
+   leave out.
+
+   At 1180px only the base collapses, 4 to 2. `c3` stays at THREE, and the first
+   attempt that dropped it to two was caught by the divisibility test in
+   tests/test_web.py: three tiles in two columns leaves an empty cell, which is
+   the exact orphan this whole layout exists to avoid. Three tiles at 1180px are
+   ~235px each, which a 19px `sm` figure fits comfortably. `c2` is already two. */
+@media(max-width:1180px){
+  .stats{grid-template-columns:repeat(2,1fr)}}
+/* The duo stacks BEFORE the tiles inside it collapse to one column, so the
+   cohort never has to show a two-column grid in a 350px card. */
+@media(max-width:900px){.duo{flex-direction:column}}
+@media(max-width:760px){
+  .stats,.stats.c3,.stats.c2{grid-template-columns:1fr}
   .filters{grid-template-columns:1fr}}
 /* Sub-headings inside a card. `.card h2` is the panel title at 19px; a card that
    carries several sections needs a smaller one, and these were 7 separate
-   `style="font-size:15px"` attributes -- invisible to the layout assertions in
+   `style="font-size:var(--t5)"` attributes -- invisible to the layout assertions in
    tests/test_web.py, which can only read this file. `.sub2` is the section heading,
    `.sub3` the slightly larger variant two panels use. `mt-*` carry the spacing that
    travelled with them, kept as separate utilities because the size and the gap were
    independently chosen at each site. */
-.card h2.sub2{font-size:15px}
-.card h2.sub3{font-size:16px}
-.mt-1{margin-top:2px}
-.mt-2{margin-top:4px}
-.mt-3{margin-top:14px}
-.mt-4{margin-top:16px}
-.mt-5{margin-top:18px}
-.mt-6{margin-top:20px}
+.card h2.sub2{font-size:var(--t5)}
+.card h2.sub3{font-size:var(--t5)}
+.mt-1{margin-top:var(--s0)}
+.mt-2{margin-top:var(--s1)}
+.mt-3{margin-top:var(--s6)}
+.mt-4{margin-top:var(--s6)}
+.mt-5{margin-top:var(--s7)}
+.mt-6{margin-top:var(--s7)}
 /* ---- the settings panel ----------------------------------------------
    One editable setting per row: label, control, action, status. `align-items:
    center` rather than baseline because the row mixes an input, a button and a
    status span whose text is often empty -- baseline alignment against an empty
    span collapses the row. Wraps, so a narrow window stacks the status under the
    control instead of pushing the Save button off the card. */
-.setrow{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.setrow{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s4)}
 /* The label inside a row, so it does not carry `.flabel`'s bottom margin, which
    was written for a label ABOVE its control. */
 .setrow .flabel{margin-bottom:0;min-width:118px}
 /* A text input, styled to match `.seg`/`.ccytog` controls rather than inheriting
    the browser default -- a raw input beside those reads as an artefact. */
-.tin{background:var(--panel);border:1px solid var(--line);border-radius:9px;
-  color:var(--fg);font:inherit;font-size:13px;padding:8px 11px;min-width:170px}
+.tin{background:var(--panel);border:1px solid var(--line);border-radius:var(--r2);
+  color:var(--fg);font:inherit;font-size:var(--t3);padding:var(--s3) var(--s4);min-width:170px}
 .tin:focus{outline:none;border-color:var(--accentlit1)}
 .tin:disabled{opacity:.55;cursor:not-allowed}
-.setrow button{background:var(--panel);border:1px solid var(--line);border-radius:9px;
-  color:var(--fg);font:inherit;font-weight:600;font-size:13px;padding:8px 15px;
+.setrow button{background:var(--panel);border:1px solid var(--line);border-radius:var(--r2);
+  color:var(--fg);font:inherit;font-weight:var(--w-label);font-size:var(--t3);padding:var(--s3) var(--s6);
   cursor:pointer}
 .setrow button:hover:not(:disabled){border-color:var(--accentlit1)}
 .setrow button:disabled{opacity:.4;cursor:not-allowed}
 /* Diagnostics, folded away. The marker is styled as a control because it IS one:
    an unstyled <summary> triangle in a panel of rounded buttons reads as unfinished
    markup rather than as something to click. */
-.adv>summary{cursor:pointer;font-size:14px;font-weight:600;padding:9px 0;
+.adv>summary{cursor:pointer;font-size:var(--t4);font-weight:var(--w-label);padding:var(--s3) 0;
   color:var(--dim)}
 .adv>summary:hover{color:var(--fg)}
 .adv[open]>summary{color:var(--fg)}
 
-/* A headline figure: the dashboard's net P&L, which is deliberately larger than
-   every other number on the page. */
-.big{font-size:22px;font-weight:700}
+/* A PANEL-HEADER figure: the total a card's contents add up to, stated beside its
+   title -- the Performance card's net P&L, the watchlist detail's last price.
+   Figure-sized, so it reads as a number rather than as part of the heading.
+
+   The comment here used to say "deliberately larger than every other number on the
+   page", and that was false when it was written: this was 22px against 25px for an
+   ordinary `.stat .v` and 34px for `.hero .fig`, so it was the third largest of six
+   sizes doing the work of two roles. Stating the role instead of a ranking is what
+   keeps it true -- the page's actual headline is `.stat.lead .v`, which is --t8,
+   and nothing else should claim to be the biggest thing on a page it cannot see. */
+.big{font-size:var(--t7);font-weight:var(--w-fig);font-family:var(--fig);
+  font-variant-numeric:tabular-nums}
 /* The two smaller inline labels beside a lifecycle heading. */
-.lbl{font-size:14px;font-weight:500}
-.lbl-sm{font-size:11px}
-.pill.gap{margin-left:8px;font-size:11px}
+.lbl{font-size:var(--t4);font-weight:var(--w-label)}
+.lbl-sm{font-size:var(--t1)}
+.pill.gap{margin-left:var(--s3);font-size:var(--t1)}
 /* Two cards side by side, each taking half the row: the 0DTE panel's pair. */
-.duo{display:flex;gap:12px;align-items:stretch}
+.duo{display:flex;gap:var(--s5);align-items:stretch}
 .duo>.card{background:var(--bg2);flex:1}
 /* A nested card, tinted to sit inside another one. */
-.card.inner{margin-top:16px;background:var(--bg2)}
-.stat{padding:13px 15px;border-radius:11px;background:var(--bg2);
+.card.inner{margin-top:var(--s6);background:var(--bg2)}
+.stat{padding:var(--s5) var(--s6);border-radius:var(--r2);background:var(--bg2);
   border:1px solid var(--line);position:relative}
 /* "no losses yet" is not a missing number, so it does not wear the figure's
    size or a sign colour: at 19px in --ok it read as a value, which is what an
    em-dash was already failing to communicate. Sized down to sit as prose in
    the slot a number would occupy. */
-.stat .v .nil{font-size:14px;font-weight:600;color:var(--dim)}
-.stat .k{font-size:11.5px;color:var(--dim);margin-bottom:7px}
+.stat .v .nil{font-size:var(--t4);font-weight:var(--w-label);color:var(--dim)}
+.stat .k{font-size:var(--t1);color:var(--dim);margin-bottom:var(--s3)}
 /* Instant, styled tooltip. NOT a `title` attribute: a native tooltip waits one
    to two seconds, is easily missed and does not exist on touch, so hiding
    always-visible text behind one deletes it in practice. Absolute so revealing
    it cannot change a card's height and nudge the grid. */
 .tip{position:absolute;left:10px;top:calc(100% - 3px);z-index:40;
-  width:max-content;max-width:230px;padding:7px 10px;border-radius:8px;
-  text-align:left;font-size:11px;line-height:1.55;font-weight:400;
+  width:max-content;max-width:230px;padding:var(--s3) var(--s4);border-radius:var(--r2);
+  text-align:left;font-size:var(--t1);line-height:1.55;font-weight:var(--w-body);
   /* Explicit, not inherited: the heading's trigger is a monospace glyph, so an
      inherited family rendered the same tooltip in two different typefaces
      depending on which element opened it. */
@@ -524,6 +749,12 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
   opacity:0;visibility:hidden;transition:opacity .12s ease;pointer-events:none}
 /* `focus-within` as well as `focus`, so the card reveals whether the focus
    landed on it or on something inside it. */
+/* WIDER, for a tip that is a paragraph rather than a caveat. 230px is right for
+   one sentence qualifying a figure; the calculator's two explanations are ~80
+   words each, which at that width is a 20-line column nobody reads. Both of its
+   triggers sit at the LEFT of a full-width card, so the extra width cannot run
+   off the viewport. */
+.tip.wide{max-width:430px}
 .tipped{cursor:help}
 .tipped:hover>.tip,.tipped:focus>.tip,.tipped:focus-within>.tip{
   opacity:1;visibility:visible}
@@ -533,18 +764,29 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
    at that weight a 1px dotted line reads as a rendering artefact rather than an
    invitation, so the heading gets an explicit glyph instead. */
 .info{display:inline-flex;align-items:center;justify-content:center;
-  position:relative;width:15px;height:15px;margin-left:7px;border-radius:999px;
+  position:relative;width:15px;height:15px;margin-left:var(--s3);border-radius:var(--rpill);
   background:var(--panel2);border:1px solid var(--line2);
-  font-size:10px;font-weight:700;font-family:var(--mono);color:var(--dim);
+  font-size:var(--t0);font-weight:var(--w-fig);font-family:var(--mono);color:var(--dim);
   vertical-align:middle}
 .info:hover{border-color:var(--accent);color:var(--fg)}
 .stat .k.hint{border-bottom:1px dotted var(--line2);display:inline-block;
-  padding-bottom:2px}
-.stat .v{font-size:25px;font-weight:700;font-family:var(--mono);
+  padding-bottom:var(--s0)}
+.stat .v{font-size:var(--t7);font-weight:var(--w-fig);font-family:var(--fig);
   font-variant-numeric:tabular-nums;line-height:1.15}
-.stat .v.sm{font-size:19px}
+.stat .v.sm{font-size:var(--t6)}
+/* The lead card's figure, and these two rules must sit HERE, after the row
+   card's, rather than beside `.stat.lead{grid-column}` where they were first
+   written. `.stat.lead .v.sm` and `.stat .v.sm` are both specificity (0,3,0), so
+   the tie breaks on source order alone -- declared earlier, the lead's long-number
+   figure silently rendered at the row card's 19px, which is SMALLER than the 25px
+   siblings it is meant to head. The one-class difference between the selectors
+   buys nothing; only the position does. */
+.stat.lead .v{font-size:var(--t8)}
+/* The escape hatch the row cards already have, at the lead's own scale: a
+   six-figure sum carrying a currency overflows 32px on a narrow window. */
+.stat.lead .v.sm{font-size:var(--t7)}
 
-.pill{font-size:12px;padding:6px 12px;border-radius:999px;background:var(--panel2);
+.pill{font-size:var(--t2);padding:var(--s2) var(--s5);border-radius:var(--rpill);background:var(--panel2);
   border:1px solid var(--line2);color:var(--dim);white-space:nowrap}
 /* `.pill b` is the DEFAULT weight and colour for an emphasised figure in a pill,
    so it must not outrank the sign tint. It did: `.pill b` is specificity (0,1,1)
@@ -556,14 +798,14 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
    the same silent-no-op class as the dead grid rules.
    Only the COLOUR is qualified; the weight stays unconditional, since a tint
    should not also change the weight. */
-.pill b{color:var(--fg);font-weight:600}
+.pill b{color:var(--fg);font-weight:var(--w-label)}
 .pill b.pos{color:var(--ok)} .pill b.neg{color:var(--bad)}
 /* `flex:0 0 auto` is load-bearing. Without it the pill strip is a shrinkable
    flex item, so a long caption beside it squeezed the strip to its narrowest
    content width and every pill wrapped onto its own line -- a three-row column
    taller than the header text, which pushed down into the stats grid. The
    caption is the part that should reflow, so it shrinks and the pills do not. */
-.pills{display:flex;gap:8px;flex-wrap:wrap;flex:0 0 auto;justify-content:flex-end}
+.pills{display:flex;gap:var(--s3);flex-wrap:wrap;flex:0 0 auto;justify-content:flex-end}
 /* Lets the text block shrink below its content width. A flex item defaults to
    min-width:auto, which refuses to go under min-content and is the usual reason
    a neighbour gets crushed instead. */
@@ -578,9 +820,9 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
    on at once would teach the wrong rule, so these are separate chips with their
    own gaps and an explicit tick. The tick is the affordance: colour alone says
    "active", a checkbox glyph says "several of these can be on". */
-.multi{display:flex;gap:7px;flex-wrap:wrap}
-.multi button{font:inherit;font-weight:600;font-size:12.5px;padding:7px 13px;
-  cursor:pointer;border-radius:999px;color:var(--dim);
+.multi{display:flex;gap:var(--s3);flex-wrap:wrap}
+.multi button{font:inherit;font-weight:var(--w-label);font-size:var(--t2);padding:var(--s3) var(--s5);
+  cursor:pointer;border-radius:var(--rpill);color:var(--dim);
   background:var(--panel2);border:1px solid var(--line2)}
 /* The same fill as `.seg button.on`, through the same names: these two controls
    are deliberately different SHAPES (pick-one versus pick-any), but a selected
@@ -602,24 +844,24 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
 /* The headline. One figure, deliberately large, with the measured/estimated
    split immediately under it -- close enough that no reader takes the number
    for a measurement, which is the whole reason the split is not a footnote. */
-.hero{display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;
-  padding:4px 0 2px}
-.hero .fig{font-size:34px;font-weight:700;font-family:var(--mono);
+.hero{display:flex;align-items:flex-end;gap:var(--s6);flex-wrap:wrap;
+  padding:var(--s1) 0 var(--s0)}
+.hero .fig{font-size:var(--t8);font-weight:var(--w-fig);font-family:var(--fig);
   font-variant-numeric:tabular-nums;line-height:1.05}
-.hero .split{font-size:12.5px;color:var(--dim);padding-bottom:5px}
+.hero .split{font-size:var(--t2);color:var(--dim);padding-bottom:var(--s2)}
 /* An estimated figure wears a marker in the text, not just a colour: the range
    is the honest form and the glyph is what survives a greyscale screenshot. */
-.hero .fig.est::after{content:"≈";font-size:16px;color:var(--dim2);
-  vertical-align:super;margin-left:4px}
+.hero .fig.est::after{content:"≈";font-size:var(--t5);color:var(--dim2);
+  vertical-align:super;margin-left:var(--s1)}
 
 /* The charged ledger: one line per currency IBKR actually billed. A row of
    these replaces the single restated figure `Money` would have offered, and the
    base translation sits beside them labelled as what it is. */
-.ledger{display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}
-.ledger .amt{font-size:12.5px;padding:5px 10px;border-radius:8px;
-  font-family:var(--mono);font-variant-numeric:tabular-nums;
+.ledger{display:flex;gap:var(--s3);flex-wrap:wrap;margin-top:var(--s0)}
+.ledger .amt{font-size:var(--t2);padding:var(--s2) var(--s4);border-radius:var(--r2);
+  font-family:var(--fig);font-variant-numeric:tabular-nums;
   background:var(--bg2);border:1px solid var(--line)}
-.ledger .amt .c{color:var(--dim2);margin-right:5px;font-size:11px}
+.ledger .amt .c{color:var(--dim2);margin-right:var(--s2);font-size:var(--t1)}
 /* The reconciliation, not a charge. Visually quieter than the charges it sums,
    because it is the derived figure and they are the facts. */
 .ledger .amt.calc{background:transparent;border-style:dashed;color:var(--dim)}
@@ -627,43 +869,48 @@ select{width:100%;font:inherit;padding:9px 12px;border-radius:9px;color:var(--fg
 /* A block of costs that cannot be attributed to anything the reader selected.
    Set apart rather than tinted: it is not a warning, it is a different KIND of
    figure, and it is always present at every scope. */
-.aside{margin-top:14px;padding:14px 16px;border-radius:11px;
+.aside{margin-top:var(--s6);padding:var(--s6);border-radius:var(--r2);
   background:var(--bg2);border:1px solid var(--line);
   border-left:2px solid var(--line2)}
-.aside h2{font-size:13px;font-weight:700;margin:0 0 3px}
-.aside .sub{font-size:11.5px;color:var(--dim2);margin-bottom:10px}
+.aside h2{font-size:var(--t3);font-weight:var(--w-fig);margin:0 0 var(--s1)}
+.aside .sub{font-size:var(--t1);color:var(--dim2);margin-bottom:var(--s4)}
 
 /* ---- tables ---- */
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;color:var(--dim);font-weight:500;font-size:11.5px;
-  letter-spacing:.04em;text-transform:uppercase;padding:0 10px 8px;
+table{width:100%;border-collapse:collapse;font-size:var(--t3)}
+th{text-align:left;color:var(--dim);font-weight:var(--w-label);font-size:var(--t1);
+  letter-spacing:var(--tr-caps);text-transform:uppercase;padding:0 var(--s4) var(--s3);
   border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:8px 10px;border-bottom:1px solid var(--hairline)}
+td{padding:var(--s3) var(--s4);border-bottom:1px solid var(--hairline)}
 tr:last-child td{border-bottom:0}
-td.n,th.n{text-align:right}
-.empty{color:var(--dim2);font-style:italic;padding:16px 10px;text-align:center}
+/* A numeric cell is a quantity BY DEFINITION, so the figure face comes with the
+   class rather than from a `mono` written beside it at each of 42 call sites. That
+   is what `.n` already meant -- it is why the rule right-aligns -- and carrying the
+   face here is what let those 42 `class="n mono"` attributes drop the `mono`
+   instead of swapping it for a `fig`. */
+td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-nums}
+.empty{color:var(--dim2);font-style:italic;padding:var(--s6) var(--s4);text-align:center}
 
 /* ---- calendar ---- */
-.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:7px}
-.dow{font-size:10.5px;letter-spacing:.1em;color:var(--dim2);text-align:center;
-  padding-bottom:5px;text-transform:uppercase}
-.day{min-height:82px;border-radius:9px;padding:8px 9px;background:var(--bg2);
+.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:var(--s3)}
+.dow{font-size:var(--t0);letter-spacing:var(--tr-caps);color:var(--dim2);text-align:center;
+  padding-bottom:var(--s2);text-transform:uppercase}
+.day{min-height:82px;border-radius:var(--r2);padding:var(--s3);background:var(--bg2);
   border:1px solid var(--line);display:flex;flex-direction:column;
-  justify-content:space-between;font-size:12px}
+  justify-content:space-between;font-size:var(--t2)}
 .day.void{background:transparent;border-color:transparent}
 .day.g{background:linear-gradient(160deg,var(--okfill1),var(--okfill2));border-color:var(--okedge)}
 .day.r{background:linear-gradient(160deg,var(--badfill1),var(--badfill2));border-color:var(--badedge)}
-.day .top{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
-.day .dnum{font-weight:600}
-.day .dct{font-size:10.5px;color:var(--dim)}
+.day .top{display:flex;justify-content:space-between;align-items:baseline;gap:var(--s2)}
+.day .dnum{font-weight:var(--w-label)}
+.day .dct{font-size:var(--t0);color:var(--dim)}
 .day.clk{cursor:pointer}
 .day.clk:hover{border-color:var(--dayhover)}
 .day.selected{outline:2px solid var(--accentlit1);outline-offset:-2px}
 /* Market strip. Reuses .cal/.day so the two calendars look like one idea; the
    difference is what a cell holds -- a P&L figure there, event titles here. */
 .mktoday{border-color:var(--accentedge)}
-.mkdots{display:flex;flex-direction:column;gap:3px;margin-top:5px}
-.mkdot{font-size:10.5px;color:var(--dim);display:flex;align-items:center;gap:5px;
+.mkdots{display:flex;flex-direction:column;gap:var(--s1);margin-top:var(--s2)}
+.mkdot{font-size:var(--t0);color:var(--dim);display:flex;align-items:center;gap:var(--s2);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mkdot.dim{color:var(--dim2)}
 /* Impact as a colour AND a word (the row shows the country pill and the title);
@@ -673,13 +920,13 @@ td.n,th.n{text-align:right}
 .mkimp.hi{background:var(--imphi)}
 .mkimp.md{background:var(--accentlit1)}
 .mkimp.lo{background:var(--implo)}
-.mksel{margin-top:16px}
-.mkrow{border:1px solid var(--line);border-radius:9px;padding:10px 12px;
-  background:var(--bg2);margin-top:7px}
-.mkrow-h{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
-.mkfig{font-size:11.5px;margin-top:4px}
-.mkattr{font-size:11px;margin-top:14px}
-.wnote{font-size:10.5px;margin-top:2px}
+.mksel{margin-top:var(--s6)}
+.mkrow{border:1px solid var(--line);border-radius:var(--r2);padding:var(--s4) var(--s5);
+  background:var(--bg2);margin-top:var(--s3)}
+.mkrow-h{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap}
+.mkfig{font-size:var(--t1);margin-top:var(--s1)}
+.mkattr{font-size:var(--t1);margin-top:var(--s6)}
+.wnote{font-size:var(--t0);margin-top:var(--s0)}
 
 /* ---- collection health (the Jobs strip) ----
    One row per registered job. GRID, not flex, and the columns are fixed rather
@@ -691,65 +938,79 @@ td.n,th.n{text-align:right}
    a grid item defaults to min-content, which would otherwise widen the whole
    row and push the timestamp off.
 
-   The separator is `.jrow+.jrow`, NOT `border-top` plus `.jrow:first-child{border-
-   top:0}`. That was the first attempt and it was DEAD: the first `.jrow` is not the
-   card's first child -- the header `.crow` is -- so `:first-child` matched nothing
-   and the strip wore a rule above its top row. Measured in the browser
+   The separator is `.jobrow+.jobrow`, NOT `border-top` plus `.jobrow:first-child
+   {border-top:0}`. That was the first attempt and it was DEAD: the first row is not
+   the card's first child -- the header `.crow` is -- so `:first-child` matched
+   nothing and the strip wore a rule above its top row. Measured in the browser
    (`borderTopWidth` 1px on row one, where it should have been 0), which is the
    third rule of this exact shape found today. A sibling combinator states the
-   intent directly and cannot be wrong about its position. */
-.jrow{display:grid;grid-template-columns:96px 74px 1fr auto auto auto;gap:10px;
-  align-items:baseline;padding:8px 2px}
-.jrow+.jrow{border-top:1px solid var(--line)}
-.jname{font-size:12.5px;font-weight:600}
+   intent directly and cannot be wrong about its position.
+
+   `job`, NOT `j`. These were `.jrow`/`.jname`/`.jstat`/`.jdet`/`.jwhen`/`.jrun`,
+   and `.jrow` was ALSO the journal write-up row 550 lines below (search `the
+   journal layer`). Same name, two features, and the later rule won: this strip
+   computed `display:flex`, so the six fixed columns above were inert and the
+   status word landed at five different x-positions down the panel -- 314, 356,
+   375, 386, 409 at 1440px. Every row also took that rule's `border-top`,
+   INCLUDING the first, which is precisely the defect the paragraph above says it
+   fixed. It had been shipping that way, green, because the collision is invisible
+   to every check here: each rule is individually valid, and the duplicate-
+   selector test in tests/test_web.py did not exist until this was found.
+
+   The journal's row keeps `j` because it is the journal. A strip of jobs is not,
+   and calling it `job` is what makes the collision unrepeatable. */
+.jobrow{display:grid;grid-template-columns:96px 74px 1fr auto auto auto;gap:var(--s4);
+  align-items:baseline;padding:var(--s3) var(--s0)}
+.jobrow+.jobrow{border-top:1px solid var(--line)}
+.jobname{font-size:var(--t2);font-weight:var(--w-label)}
 /* The status word, not a dot: `ok` and `nothing` are both healthy and must stay
    distinguishable, and a hue cannot say which is which. Untinted by default --
    `never run` and `nothing` are facts, not alarms. */
-.jstat{font-size:11.5px;font-weight:600;letter-spacing:.02em}
-.jdet{font-size:11.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;
+.jobstat{font-size:var(--t1);font-weight:var(--w-label)}
+.jobdet{font-size:var(--t1);min-width:0;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
-.jwhen{font-size:11px}
+.jobwhen{font-size:var(--t1)}
 /* The run button. Smaller than a card-header action and right-aligned in its own
    column, so a row of them makes a clean edge rather than a ragged one -- the
    detail column absorbs the width difference, which is why it is the `1fr`. */
-.jrun{padding:4px 10px;font-size:11.5px;min-width:64px;justify-self:end}
+.jobrun{padding:var(--s1) var(--s4);font-size:var(--t1);min-width:64px;justify-self:end}
 .pill.neg{border-color:var(--badedge)}
 @media(max-width:760px){
   /* The timestamp is the first thing to go: on a narrow screen the status and
      the detail are what answer the question. The BUTTON stays: it is the reason
      this panel is not read-only, and a control that disappears on a narrow
      window is a control you cannot find. */
-  .jrow{grid-template-columns:88px 70px 1fr auto auto}
-  .jwhen{display:none}
+  .jobrow{grid-template-columns:88px 70px 1fr auto auto}
+  .jobwhen{display:none}
 }
 /* Actions inside a card header. Borrowed from .seg's palette rather than given a
    new one, so a Refresh beside a segmented toggle reads as the same family of
    control. `sm` is the only size, kept as a modifier because a bare `.btn` would
    invite a second, larger one that nothing needs. */
-.btn{font:inherit;font-weight:600;font-size:12.5px;padding:8px 14px;cursor:pointer;
-  border-radius:9px;color:var(--dim);background:var(--panel2);
+.btn{font:inherit;font-weight:var(--w-label);font-size:var(--t2);padding:var(--s3) var(--s6);cursor:pointer;
+  border-radius:var(--r2);color:var(--dim);background:var(--panel2);
   border:1px solid var(--line2)}
 .btn:hover:not(:disabled){color:var(--fg);border-color:var(--dim2)}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .btn.busy{opacity:.6}
-.btn.sm{font-size:12px;padding:7px 12px}
+.btn.sm{font-size:var(--t2);padding:var(--s3) var(--s5)}
 /* Calendar filter: one labelled row per axis, currency above impact, with the
    reset controls last. GRID with a fixed label column so the two chip rows start
    at the same x -- ragged starts made the axes read as unrelated controls. */
-.mkfilter{display:grid;gap:8px;margin:14px 0 4px}
-.mkaxis{display:grid;grid-template-columns:64px 1fr;gap:10px;align-items:center}
-.mkaxlabel{font-size:11px;text-transform:lowercase}
-.mkaxis .chips{display:flex;gap:6px;flex-wrap:wrap}
+.mkfilter{display:grid;gap:var(--s3);margin:var(--s6) 0 var(--s1)}
+.mkaxis{display:grid;grid-template-columns:64px 1fr;gap:var(--s4);align-items:center}
+.mkaxlabel{font-size:var(--t1);text-transform:lowercase}
+.mkaxis .chips{display:flex;gap:var(--s2);flex-wrap:wrap}
 /* The actions are a third labelled axis row ("show"), so they inherit the same
    label column as the chip rows and line up under the chips they act on -- no
    grid-column override, and one less way for the layout to drift. */
-.mkbtns{display:flex;gap:7px;flex-wrap:wrap}
+.mkbtns{display:flex;gap:var(--s3);flex-wrap:wrap}
 /* A chip is a TOGGLE, so it must not look like the pills beside it, which are
    inert labels. Selection is border plus background plus weight, never colour
    alone: `aria-pressed` carries it for a screen reader, and a reader who cannot
    separate the hues still sees the border change. */
-.chip{font:inherit;font-size:11.5px;font-weight:600;padding:6px 11px;
-  cursor:pointer;border-radius:999px;color:var(--dim);background:var(--panel2);
+.chip{font:inherit;font-size:var(--t1);font-weight:var(--w-label);padding:var(--s2) var(--s4);
+  cursor:pointer;border-radius:var(--rpill);color:var(--dim);background:var(--panel2);
   border:1px solid var(--line2)}
 .chip:hover{color:var(--fg);border-color:var(--dim2)}
 /* The same gradient and edge `.seg button.on` and the selected calendar day use,
@@ -758,24 +1019,24 @@ td.n,th.n{text-align:right}
 .chip.on{color:var(--fg);background:linear-gradient(160deg,var(--seg1),var(--seg2));
   border-color:var(--accentedge)}
 /* The count is secondary to the value, and stays legible when the chip is on. */
-.chip .dim{font-weight:500;font-size:10.5px}
+.chip .dim{font-weight:var(--w-label);font-size:var(--t0)}
 .chip.on .dim{color:var(--dim)}
 /* Add field: an input and its button as one unit, so they cannot wrap apart. */
-.wadd{display:flex;gap:7px;align-items:center;flex:0 0 auto}
-.wadd input{font:inherit;font-size:12.5px;padding:7px 11px;width:132px;
-  border-radius:9px;color:var(--fg);background:var(--bg2);
+.wadd{display:flex;gap:var(--s3);align-items:center;flex:0 0 auto}
+.wadd input{font:inherit;font-size:var(--t2);padding:var(--s3) var(--s4);width:132px;
+  border-radius:var(--r2);color:var(--fg);background:var(--bg2);
   border:1px solid var(--line2)}
 .wadd input::placeholder{color:var(--dim2)}
 .wadd input:disabled{opacity:.5}
 /* Remove: quiet until hovered. A row of red crosses would read as errors, and
    the destructive act is confirmed rather than announced by colour. */
-.wrm{font:inherit;font-size:15px;line-height:1;cursor:pointer;padding:2px 7px;
-  border-radius:7px;color:var(--dim2);background:none;border:1px solid transparent}
+.wrm{font:inherit;font-size:var(--t5);line-height:1;cursor:pointer;padding:var(--s0) var(--s3);
+  border-radius:var(--r1);color:var(--dim2);background:none;border:1px solid transparent}
 .wrm:hover:not(:disabled){color:var(--badlit);border-color:var(--line2)}
 .wrm:disabled{opacity:.4;cursor:not-allowed}
 /* Marks a price as a stored close rather than a fetched quote. A glyph, not a
    colour: the distinction is factual, not good or bad. */
-.wstale{margin-left:2px}
+.wstale{margin-left:var(--s0)}
 
 /* ---- watchlist: a list beside a detail pane ----
    The tab's own layout, and this page's only master-detail GRID. Every rule below
@@ -787,7 +1048,7 @@ td.n,th.n{text-align:right}
    space-between with a two-child assumption, so the add form and Refresh travel as
    one cluster; the old header handed it four children, which is why the
    "3 symbol(s)" pill floated into the middle of the row. */
-.wacts{display:flex;gap:9px;align-items:center;flex-wrap:wrap;
+.wacts{display:flex;gap:var(--s3);align-items:center;flex-wrap:wrap;
   justify-content:flex-end}
 /* The tab's filter row: `.filters`' shape, five tracks, nested INSIDE the card.
    TWO SPECIFICITY TRAPS LIVE HERE, and both are silent.
@@ -810,9 +1071,9 @@ td.n,th.n{text-align:right}
    control crushed to nothing by prose two tracks away. The last two tracks stay
    `auto` because a chip and a count are the width they are. */
 .filters.wf{grid-template-columns:minmax(150px,1fr) minmax(0,1.5fr) minmax(0,1.4fr)
-  auto auto;gap:16px;align-items:start;margin:12px 0 0;background:var(--bg2)}
-.wf input{font:inherit;font-size:12.5px;padding:8px 11px;width:100%;
-  border-radius:9px;color:var(--fg);background:var(--panel2);
+  auto auto;gap:var(--s6);align-items:start;margin:var(--s5) 0 0;background:var(--bg2)}
+.wf input{font:inherit;font-size:var(--t2);padding:var(--s3) var(--s4);width:100%;
+  border-radius:var(--r2);color:var(--fg);background:var(--panel2);
   border:1px solid var(--line2)}
 .wf input::placeholder{color:var(--dim2)}
 /* `.seg` is a block-level flex box, so in a grid track it fills the track and
@@ -827,7 +1088,7 @@ td.n,th.n{text-align:right}
    name describes a different concept is the kind of small lie that outlives whoever
    wrote it. */
 .wdot{display:inline-block;width:7px;height:7px;border-radius:50%;
-  margin-right:6px;vertical-align:middle}
+  margin-right:var(--s2);vertical-align:middle}
 .wdot.lo{background:var(--imphi)}
 .wdot.mid{background:var(--dim2)}
 .wdot.hi{background:var(--ok)}
@@ -840,15 +1101,16 @@ td.n,th.n{text-align:right}
 /* "showing 7 of 12", which replaced the header's symbol-count pill: a count beside a
    filter row is a fact about the filter, and one beside a heading contradicted the
    table under it. Monospace so the two numbers do not jump as they change. */
-.wshow{font-family:var(--mono);font-size:13px;white-space:nowrap;padding-top:2px}
+.wshow{font-family:var(--fig);font-variant-numeric:tabular-nums;
+  font-size:var(--t3);white-space:nowrap;padding-top:var(--s0)}
 /* 50/50, which is the mockup's own proportion at whatever width this card gets
    (`.wrap` caps it at 1480px, measured as a 1436px card at a 1600px viewport).
    `minmax(0,1fr)` rather than `1fr`, because a bare `1fr` floors at min-content:
    one long company name or one long caption would then widen its track past the
    card instead of ellipsing inside it. Not `.duo`, which is a fixed 50/50 nowrap
    flex that never stacks. */
-.wsplit{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;
-  margin-top:12px}
+.wsplit{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:var(--s6);
+  margin-top:var(--s5)}
 /* THE TABLE PANE SCROLLS, so the two panes end roughly level and a long list
    cannot stretch the card past the pane beside it. The number is MEASURED, in a
    real browser at a 1600px viewport where this card is 1436px wide: the detail
@@ -896,11 +1158,11 @@ td.n,th.n{text-align:right}
 .wsb{font:inherit;color:inherit;letter-spacing:inherit;text-transform:inherit;
   background:none;border:0;padding:0;cursor:pointer}
 .wsb:hover{color:var(--fg)}
-.wsg{margin-left:4px;color:var(--dim2)}
+.wsg{margin-left:var(--s1);color:var(--dim2)}
 /* The direction glyph beside a B-Xtrender reading. No colour of its own: it
    inherits the cell's sign tint, and the glyph is the half that survives a
    greyscale screenshot and deuteranopia. */
-.wway{margin-left:4px}
+.wway{margin-left:var(--s1)}
 /* The symbol cell's control. The ellipsis TRIO -- `min-width:0`, `nowrap` and
    `text-overflow` -- is `.mkdot`'s idiom, and all three are load-bearing: any one
    missing silently disables the other two, and a company name beside a symbol
@@ -913,17 +1175,17 @@ td.n,th.n{text-align:right}
    performance chart already shipped once. Sized down and nudged off the baseline
    because it is a mark beside a word, not a word -- and it reserves no space when
    absent, so an unheld row's symbol starts where the header does. */
-.whold{color:var(--accent);font-size:9px;margin-right:5px;vertical-align:middle}
+.whold{color:var(--accent);font-size:var(--t0);margin-right:var(--s2);vertical-align:middle}
 /* The detail grid. Three columns, because the ring wants one of its own beside two
    narrower tiles and the daily arm wants the width of both of them. */
-.wdet{display:grid;grid-template-columns:1fr 1fr 1.1fr;gap:10px}
+.wdet{display:grid;grid-template-columns:1fr 1fr 1.1fr;gap:var(--s4)}
 .wdet>.wide{grid-column:1/3}
 .wdet>.tall{grid-row:1/3;grid-column:3}
 /* A tile is a `.stat` BOX with this layout inside it, so the padding, radius,
    ground and border stay the dashboard's names instead of a second copy of their
    values that would drift from them. */
-.wtile{display:flex;flex-direction:column;gap:5px}
-.wth{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+.wtile{display:flex;flex-direction:column;gap:var(--s2)}
+.wth{display:flex;align-items:baseline;justify-content:space-between;gap:var(--s4)}
 /* The NARROW tiles stack their label above their figure; only the wide daily arm
    puts the two on one line. Both halves of that are measured rather than taste.
    Label-left cost the earnings tile its date: at a 1600px viewport the tile's
@@ -932,40 +1194,40 @@ td.n,th.n{text-align:right}
    as "2026-08-" over "27". A broken date is not a date. Stacking gives the figure
    the tile's whole width, which is also the layout the earnings and weekly tiles
    are drawn with, so the fix and the target agree. */
-.wtile:not(.wide) .wth{flex-direction:column;align-items:flex-start;gap:4px}
+.wtile:not(.wide) .wth{flex-direction:column;align-items:flex-start;gap:var(--s1)}
 /* And the figure never breaks mid-token even so. Stacking buys enough width for
    today's strings; `nowrap` is what keeps a longer one (a date beside a delta on a
    narrower pane) from splitting inside the number itself rather than wrapping at
    the space between the two, which is the only break that stays readable. */
-.wtv{display:flex;align-items:baseline;gap:6px;white-space:nowrap}
+.wtv{display:flex;align-items:baseline;gap:var(--s2);white-space:nowrap}
 /* A tile's or a block's label. Its own name rather than `.stat .k`, which carries
    a 7px bottom margin for the label-ABOVE-value card and pushes the baseline off
    in a label-left header row. */
-.wk{font-size:11.5px;color:var(--dim);letter-spacing:.05em;text-transform:uppercase}
-.wdelta{font-size:11.5px;font-family:var(--mono)}
+.wk{font-size:var(--t1);color:var(--dim);letter-spacing:var(--tr-caps);text-transform:uppercase}
+.wdelta{font-size:var(--t1);font-family:var(--fig);font-variant-numeric:tabular-nums}
 /* The provenance line under a figure: the window, the periods or the count it came
    from. Always present, because a figure on this tab that cannot say where it came
    from is one its reader cannot reproduce. */
-.wcap{font-size:10.5px;color:var(--dim2);line-height:1.45}
-.wblk{margin-top:12px;padding:12px 14px;border-radius:11px;background:var(--bg2);
+.wcap{font-size:var(--t0);color:var(--dim2);line-height:1.45}
+.wblk{margin-top:var(--s5);padding:var(--s5) var(--s6);border-radius:var(--r2);background:var(--bg2);
   border:1px solid var(--line)}
 /* The two typed fields. `font-family:inherit` on the textarea because a textarea
    defaults to monospace and a note is prose, not a figure. */
-.wed{display:flex;gap:7px;align-items:flex-start;margin-top:7px}
-.wed input,.wed textarea{font:inherit;font-size:12.5px;padding:7px 11px;flex:1;
-  min-width:0;border-radius:9px;color:var(--fg);background:var(--panel2);
+.wed{display:flex;gap:var(--s3);align-items:flex-start;margin-top:var(--s3)}
+.wed input,.wed textarea{font:inherit;font-size:var(--t2);padding:var(--s3) var(--s4);flex:1;
+  min-width:0;border-radius:var(--r2);color:var(--fg);background:var(--panel2);
   border:1px solid var(--line2)}
 .wed textarea{font-family:inherit;min-height:58px;resize:vertical}
 .wed input::placeholder,.wed textarea::placeholder{color:var(--dim2)}
-.wdh{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:2px 0 12px}
-.wdsym{font-size:26px;font-weight:800;font-family:var(--mono);letter-spacing:.02em}
+.wdh{display:flex;align-items:baseline;gap:var(--s4);flex-wrap:wrap;margin:var(--s0) 0 var(--s5)}
+.wdsym{font-size:var(--t7);font-weight:var(--w-fig);font-family:var(--mono)}
 /* The detail pane with nothing to show, because the filter row is hiding every row.
    A block, not a half-populated card: every figure in the pane comes from an open row
    and there is none, so the honest render is the sentence saying which control is
    doing it. Same ground and radius as `.wblk` through the same names. */
-.wnone{display:flex;flex-direction:column;gap:7px;padding:14px 16px;
-  border-radius:11px;background:var(--bg2);border:1px solid var(--line);
-  color:var(--dim);font-size:12.5px}
+.wnone{display:flex;flex-direction:column;gap:var(--s3);padding:var(--s6);
+  border-radius:var(--r2);background:var(--bg2);border:1px solid var(--line);
+  color:var(--dim);font-size:var(--t2)}
 
 /* ---- the two gauges ----
    Both are inline SVG positioned by GEOMETRY attributes and coloured only from here.
@@ -974,7 +1236,7 @@ td.n,th.n{text-align:right}
    a `var()`, so a hex in one survives every theme swap unchanged -- which is exactly
    how the performance chart came to ring its dots in Leather's background on the
    Admiralty page. Every name below already exists in all three theme blocks. */
-.wmeter{display:block;width:100%;max-width:230px;height:auto;margin-top:4px}
+.wmeter{display:block;width:100%;max-width:230px;height:auto;margin-top:var(--s1)}
 /* The gradient's stops. `stop-color` belongs in CSS for the reason above, and the
    `stop.gpos` rules further down this file are the same idiom on the performance
    chart. The three names are the meter's own reading of its scale: a negative end, a
@@ -995,9 +1257,10 @@ td.n,th.n{text-align:right}
 /* The scale ends. Printed because a gauge whose bounds are not on screen could be
    showing anything, and `text-anchor` on the right one so the label ends where the
    track does rather than running past it. */
-.wmend{fill:var(--dim2);font-size:9px;font-family:var(--mono)}
+.wmend{fill:var(--dim2);font-size:var(--t0);font-family:var(--fig);
+  font-variant-numeric:tabular-nums}
 .wmend.wmr{text-anchor:end}
-.wring{display:block;width:82px;height:auto;margin:6px 0 2px}
+.wring{display:block;width:82px;height:auto;margin:var(--s2) 0 var(--s0)}
 /* The track, which is what makes the arc read as a PROPORTION: 40% of a circle and
    40% of nothing look identical. */
 .wrtrack{fill:none;stroke:var(--line2);stroke-width:6}
@@ -1032,22 +1295,23 @@ td.n,th.n{text-align:right}
    day -- one drill-down grammar, not two. */
 .rk{cursor:pointer}
 .rk:hover .rhint{color:var(--fg)}
-.rhint{font-size:11px;color:var(--dim2);white-space:nowrap;letter-spacing:.03em}
+.rhint{font-size:var(--t1);color:var(--dim2);white-space:nowrap}
 .caret{display:inline-block;transition:transform .12s ease}
 .caret.open{transform:rotate(90deg)}
-.replay{margin-top:14px;padding:14px 16px 10px;border-radius:12px;
+.replay{margin-top:var(--s6);padding:var(--s6) var(--s4);border-radius:var(--r3);
   background:var(--bg2);border:1px solid var(--line)}
-.replay svg{display:block;width:100%;height:auto;margin-top:6px}
-.rpanel>td{padding:0 0 4px 0;background:var(--bg2)}
+.replay svg{display:block;width:100%;height:auto;margin-top:var(--s2)}
+.rpanel>td{padding:0 0 var(--s1) 0;background:var(--bg2)}
 .ax{stroke:var(--line2);stroke-width:1}
 .gr{stroke:var(--line);stroke-width:1}
-.tk{fill:var(--dim2);font-size:11px;font-family:var(--mono)}
+.tk{fill:var(--dim2);font-size:var(--t1);font-family:var(--fig);
+  font-variant-numeric:tabular-nums}
 .pxline{stroke:var(--fg);stroke-width:1.7;fill:none;stroke-linejoin:round}
 /* Session boundary. Faint on purpose: it restores the day breaks that an
    ordinal axis collapses, without competing with the price line. */
 .sess{stroke:var(--line);stroke-width:1;stroke-dasharray:2 5}
 .edge{stroke:var(--kicker);stroke-width:1;stroke-dasharray:3 3;opacity:.85}
-.edgelab{fill:var(--kicker);font-size:9.5px;letter-spacing:.1em;
+.edgelab{fill:var(--kicker);font-size:var(--t0);letter-spacing:var(--tr-caps);
   text-transform:uppercase;font-family:var(--mono)}
 .fill{fill:var(--fg);stroke:var(--bg2);stroke-width:1.4}
 /* One standard deviation of expected move: a faint fill for the region and two
@@ -1057,24 +1321,24 @@ td.n,th.n{text-align:right}
 .emband{fill:var(--accent2);opacity:.17}
 .emedge{fill:none;stroke:var(--accent);stroke-width:1;opacity:.5;stroke-dasharray:4 4}
 .cross{stroke:var(--dim);stroke-width:1;opacity:.5}
-.rctl{display:flex;align-items:center;gap:12px;margin-top:8px;padding:0 2px}
-.rbtn{font:inherit;font-size:11.5px;font-weight:600;padding:5px 11px;
-  border-radius:8px;cursor:pointer;white-space:nowrap;
+.rctl{display:flex;align-items:center;gap:var(--s5);margin-top:var(--s3);padding:0 var(--s0)}
+.rbtn{font:inherit;font-size:var(--t1);font-weight:var(--w-label);padding:var(--s2) var(--s4);
+  border-radius:var(--r2);cursor:pointer;white-space:nowrap;
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2)}
 .rbtn:hover{border-color:var(--accent)}
 .rscrub{flex:1;accent-color:var(--accent);cursor:pointer;min-width:80px}
 /* width and flex are explicit because the page has a global `select{width:100%}`
    for the month picker, which as a flex item claimed the whole control row and
    squeezed the scrubber to a stub. */
-.rspeed{font:inherit;font-size:11.5px;padding:4px 6px;border-radius:8px;
+.rspeed{font:inherit;font-size:var(--t1);padding:var(--s1) var(--s2);border-radius:var(--r2);
   width:auto;flex:0 0 auto;
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2);cursor:pointer}
-.rread{font-size:11.5px;color:var(--dim);white-space:nowrap;min-width:150px;
-  text-align:right}
-.rauto{font-size:11px;color:var(--dim2);white-space:nowrap;cursor:pointer;
-  display:flex;align-items:center;gap:4px}
-.rkey{font-size:10.5px;color:var(--dim);margin-top:8px;display:flex;
-  flex-wrap:wrap;gap:2px;align-items:baseline}.lg{font-weight:700;margin-right:3px}
+.rread{font-size:var(--t1);color:var(--dim);white-space:nowrap;min-width:150px;
+  text-align:right;font-family:var(--fig);font-variant-numeric:tabular-nums}
+.rauto{font-size:var(--t1);color:var(--dim2);white-space:nowrap;cursor:pointer;
+  display:flex;align-items:center;gap:var(--s1)}
+.rkey{font-size:var(--t0);color:var(--dim);margin-top:var(--s3);display:flex;
+  flex-wrap:wrap;gap:var(--s0);align-items:baseline}.lg{font-weight:var(--w-fig);margin-right:var(--s1)}
 .lg.put{color:var(--put)} .lg.call{color:var(--call)}
 .lg.px{color:var(--fg)} .lg.dl{color:var(--dim)}
 /* Event annotation cards. One per DECISION, laid out along the timeline below
@@ -1083,9 +1347,9 @@ td.n,th.n{text-align:right}
    outcome before the chart does, which is the same reason the price line is
    clipped. Hidden by visibility rather than display so the strip keeps its
    height and the panel does not jump as cards appear. */
-.evs{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
-.evc{flex:1 1 210px;min-width:200px;max-width:340px;padding:8px 10px;
-  border-radius:9px;background:var(--panel2);border:1px solid var(--line2);
+.evs{display:flex;flex-wrap:wrap;gap:var(--s3);margin-top:var(--s4)}
+.evc{flex:1 1 210px;min-width:200px;max-width:340px;padding:var(--s3) var(--s4);
+  border-radius:var(--r2);background:var(--panel2);border:1px solid var(--line2);
   cursor:pointer;visibility:hidden;opacity:0;transition:opacity .18s ease}
 .evc.on{visibility:visible;opacity:1}
 .evc:hover{border-color:var(--accent)}
@@ -1098,34 +1362,34 @@ td.n,th.n{text-align:right}
 .rfocus{position:absolute;inset:0;display:none;align-items:center;
   justify-content:center;pointer-events:none}
 .rfocus.on{display:flex}
-.fcard{pointer-events:auto;min-width:270px;max-width:340px;padding:14px 16px;
-  border-radius:12px;background:var(--overlay);border:1px solid var(--accent);
+.fcard{pointer-events:auto;min-width:270px;max-width:340px;padding:var(--s6);
+  border-radius:var(--r3);background:var(--overlay);border:1px solid var(--accent);
   box-shadow:0 8px 28px var(--shadow)}
-.fh{display:flex;align-items:baseline;gap:10px;justify-content:space-between}
-.ft{font-size:15px;font-weight:700;color:var(--fg)}
-.fx{background:none;border:0;color:var(--dim);cursor:pointer;font-size:16px;
-  line-height:1;padding:0 2px}
+.fh{display:flex;align-items:baseline;gap:var(--s4);justify-content:space-between}
+.ft{font-size:var(--t5);font-weight:var(--w-fig);color:var(--fg)}
+.fx{background:none;border:0;color:var(--dim);cursor:pointer;font-size:var(--t5);
+  line-height:1;padding:0 var(--s0)}
 .fx:hover{color:var(--fg)}
-.fw{font-size:10px;color:var(--dim2);margin-top:2px;margin-bottom:8px}
+.fw{font-size:var(--t0);color:var(--dim2);margin-top:var(--s0);margin-bottom:var(--s3)}
 /* Label left, figure right: the reader scans the right column for the numbers,
    which is why they are monospace and the labels are not. */
-.fr{display:flex;justify-content:space-between;align-items:baseline;gap:14px;
-  padding:3px 0;font-size:11.5px}
-.fk{color:var(--dim);text-transform:uppercase;letter-spacing:.07em;font-size:9.5px}
-.fv{color:var(--fg)}
+.fr{display:flex;justify-content:space-between;align-items:baseline;gap:var(--s6);
+  padding:var(--s1) 0;font-size:var(--t1)}
+.fk{color:var(--dim);text-transform:uppercase;letter-spacing:var(--tr-caps);font-size:var(--t0)}
+.fv{color:var(--fg);font-family:var(--fig);font-variant-numeric:tabular-nums}
 .fa{color:var(--dim2)}
-.evh{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
-.evk{font-size:9px;letter-spacing:.09em;text-transform:uppercase;font-weight:700;
-  padding:1px 5px;border-radius:5px;font-family:var(--mono)}
+.evh{display:flex;align-items:baseline;gap:var(--s2);flex-wrap:wrap}
+.evk{font-size:var(--t0);letter-spacing:var(--tr-caps);text-transform:uppercase;font-weight:var(--w-fig);
+  padding:var(--s0) var(--s2);border-radius:var(--r1);font-family:var(--mono)}
 .evk.open{background:var(--callwash);color:var(--call)}
 .evk.close{background:var(--putwash);color:var(--put)}
 /* A roll is neither: it closes and opens in one act, and colouring it as either
    half would misreport which. Neutral, and the only kind that gets its own hue. */
 .evk.roll{background:var(--rollwash);color:var(--accent)}
-.evt{font-size:11.5px;font-weight:600}
-.evw{font-size:10px;color:var(--dim2)}
-.evl{font-size:10.5px;color:var(--dim);margin-top:4px;line-height:1.5}
-.evm{font-size:10.5px;color:var(--dim2);margin-top:3px;line-height:1.5}
+.evt{font-size:var(--t1);font-weight:var(--w-label)}
+.evw{font-size:var(--t0);color:var(--dim2)}
+.evl{font-size:var(--t0);color:var(--dim);margin-top:var(--s1);line-height:1.5}
+.evm{font-size:var(--t0);color:var(--dim2);margin-top:var(--s1);line-height:1.5}
 .lg.em{color:var(--accent)}
 /* Two independent readings of one line: HUE says put or call, DASH says short or
    long. Deliberately not the pos/neg palette -- green/red means signed money
@@ -1135,7 +1399,7 @@ td.n,th.n{text-align:right}
 .sk.put{stroke:var(--put)}
 .sk.call{stroke:var(--call)}
 .sk.long{stroke-dasharray:5 4}
-.sklab{font-size:10.5px;font-family:var(--mono);letter-spacing:.02em}
+.sklab{font-size:var(--t0);font-family:var(--mono)}
 .sklab.put{fill:var(--put)}
 .sklab.call{fill:var(--call)}
 /* Effective delta: dotted and dim, on its own right-hand scale. A derived
@@ -1148,19 +1412,20 @@ td.n,th.n{text-align:right}
 .dax{fill:var(--dim2)}
 .zero{stroke:var(--line2);stroke-width:1;stroke-dasharray:2 4;opacity:.7}
 .linkish{background:none;border:none;color:var(--dim);cursor:pointer;
-  font:inherit;font-size:11px;text-decoration:underline;padding:0}
+  font:inherit;font-size:var(--t1);text-decoration:underline;padding:0}
 .linkish:hover{color:var(--fg)}
-.day .dpl{font-family:var(--mono);font-weight:600;font-size:13px}
+.day .dpl{font-family:var(--fig);font-variant-numeric:tabular-nums;
+  font-weight:var(--w-label);font-size:var(--t3)}
 .day.g .dct,.day.r .dct{color:var(--onfill)}
 
 /* ---- legs / strategy ---- */
-.grp{margin-top:12px;border:1px solid var(--line);border-radius:11px;overflow:hidden}
-.grp .gh{display:flex;justify-content:space-between;align-items:center;gap:12px;
-  padding:9px 13px;background:var(--panel2);font-size:12px;
+.grp{margin-top:var(--s5);border:1px solid var(--line);border-radius:var(--r2);overflow:hidden}
+.grp .gh{display:flex;justify-content:space-between;align-items:center;gap:var(--s5);
+  padding:var(--s3) var(--s5);background:var(--panel2);font-size:var(--t2);
   border-bottom:1px solid var(--line)}
-.grp .gh .gl{font-family:var(--mono);color:var(--kicker);letter-spacing:.03em}
-.leg{display:grid;grid-template-columns:52px 1fr auto auto auto;gap:12px;
-  align-items:center;padding:8px 13px;font-size:13px;
+.grp .gh .gl{font-family:var(--mono);color:var(--kicker)}
+.leg{display:grid;grid-template-columns:52px 1fr auto auto auto;gap:var(--s5);
+  align-items:center;padding:var(--s3) var(--s5);font-size:var(--t3);
   border-bottom:1px solid var(--hairline)}
 /* The calendar drill-down wedges a strategy label in as a SIXTH child (legRow's
    `extra`), and a sixth child in a five-column grid wraps: the proceeds figure
@@ -1170,8 +1435,8 @@ td.n,th.n{text-align:right}
    track, which would add a stray 12px gap to every Trades row. */
 .leg.ctx{grid-template-columns:52px 1fr auto auto auto auto}
 .leg:last-child{border-bottom:0}
-.act{font-family:var(--mono);font-size:11px;font-weight:700;text-align:center;
-  padding:3px 0;border-radius:5px;background:var(--seg2);border:1px solid var(--line2);
+.act{font-family:var(--mono);font-size:var(--t1);font-weight:var(--w-fig);text-align:center;
+  padding:var(--s1) 0;border-radius:var(--r1);background:var(--seg2);border:1px solid var(--line2);
   color:var(--kicker)}
 /* The Positions side cell wants the buy/sell HUE without the chip's box, and
    the only buy/sell rules were compound (.act.buy / .act.sell) -- so a bare
@@ -1200,7 +1465,8 @@ td.n,th.n{text-align:right}
    is the range the rest of the small text occupies.
    This is the trade uniform scaling asks for -- it was free before only because
    `preserveAspectRatio="none"` was stretching the glyphs instead. */
-.chart .axis{fill:var(--dim2);font-size:13px;font-family:var(--mono)}
+.chart .axis{fill:var(--dim2);font-size:var(--t3);font-family:var(--fig);
+  font-variant-numeric:tabular-nums}
 /* `.chart .zero` and `.chart .zerolab` lived here: a dashed rule at break-even
    with an uppercase caption. Removed with the markup that drew them rather than
    left behind -- `test_every_rule_in_the_stylesheet_is_reachable_from_the_page`
@@ -1236,7 +1502,7 @@ stop.gneg{stop-color:var(--bad)}
    glanced up that the message LEFT rather than that they imagined it. `display`
    still does the showing, so the element takes no layout space when idle and the
    panels below do not shift. Only the fade is transitioned. */
-#msg{margin-top:14px;padding:11px 15px;border-radius:10px;font-size:13px;
+#msg{margin-top:var(--s6);padding:var(--s4) var(--s6);border-radius:var(--r2);font-size:var(--t3);
   display:none;border:1px solid var(--msgline);opacity:1;
   transition:opacity .45s ease}
 #msg.show{display:block}
@@ -1249,43 +1515,62 @@ stop.gneg{stop-color:var(--bad)}
 #msg.ok{background:var(--okfill2);color:var(--ok)}
 #msg.warn{background:var(--warnfill);color:var(--warnfg)}
 #msg.bad{background:var(--badfill2);color:var(--badlit)}
-.note{margin-top:12px;font-size:12px;color:var(--dim2);line-height:1.6}
+/* APPARATUS, not body copy. These paragraphs explain how a figure was counted --
+   which unit the win rate used, why a round-trip total disagrees with a decision
+   count -- and they are the most valuable prose on the page. They also looked
+   like the page had spilled, and the cause was measure, not content: set full
+   bleed in a 1480px column they ran to roughly 200 characters a line, against the
+   45-75 a reader tracks comfortably. At that width the eye loses the line it is
+   returning to, so the text reads as something dumped rather than something
+   written, however good it is.
+
+   `max-width` in `ch` because the constraint is a character count and `ch` is the
+   unit that survives a font-size change. The left rule and the indent say the
+   same thing structurally: this is a note ABOUT the panel, not another row of it.
+   Nothing is hidden behind a hover -- the tooltip is right for a caveat on one
+   figure, and wrong for a reconciliation the reader is owed on sight. */
+.note{margin-top:var(--s5);font-size:var(--t2);color:var(--dim2);line-height:1.6;
+  max-width:78ch;padding-left:var(--s5);border-left:2px solid var(--line)}
+/* The footer is a `.note` by class and a single line of chrome by role: the
+   journal's path and "loopback only", which is neither apparatus nor prose and
+   should not wear a rule. */
+#foot{max-width:none;padding-left:0;border-left:0}
 
 /* ------------------------------------------------ the journal layer */
 /* The write-up on a lifecycle card. Set apart from the figures above it by a rule
    and a tint rather than by a heading, because it is not another reading of the
    trade -- it is the one thing on the card the broker did not supply, and it
    should look like a different kind of object. */
-.jrow{display:flex;align-items:center;justify-content:space-between;gap:12px;
-  margin-top:14px;padding-top:13px;border-top:1px solid var(--line)}
-.jsum{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.jrow{display:flex;align-items:center;justify-content:space-between;gap:var(--s5);
+  margin-top:var(--s6);padding-top:var(--s5);border-top:1px solid var(--line)}
+.jsum{display:flex;align-items:baseline;gap:var(--s4);flex-wrap:wrap}
 .pill.ok{background:var(--okfill2);color:var(--ok);border-color:var(--okfill2)}
 .pill.dim{color:var(--dim2)}
-.jbtn{font:inherit;font-size:12px;padding:7px 13px;border-radius:9px;
+.jbtn{font:inherit;font-size:var(--t2);padding:var(--s3) var(--s5);border-radius:var(--r2);
   color:var(--fg);background:var(--panel2);border:1px solid var(--line2);
   cursor:pointer;white-space:nowrap}
 .jbtn:hover{border-color:var(--dim2)}
-.jsave{font:inherit;font-size:12.5px;font-weight:600;padding:8px 18px;
-  border-radius:9px;color:var(--fg);background:var(--okfill2);
+.jsave{font:inherit;font-size:var(--t2);font-weight:var(--w-label);padding:var(--s3) var(--s7);
+  border-radius:var(--r2);color:var(--fg);background:var(--okfill2);
   border:1px solid var(--ok);cursor:pointer}
 .jsave.busy,.jsave:disabled{opacity:.55;cursor:default}
 /* Two columns where the width allows, because entry and close are two moments
    and reading them side by side is the point: the plan on the left, whether it
    was followed on the right. One column below 900px, where side-by-side would
    make both unreadably narrow. */
-.jform{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}
+.jform{display:grid;grid-template-columns:1fr 1fr;gap:var(--s6);margin-top:var(--s6)}
 @media (max-width:900px){.jform{grid-template-columns:1fr}}
-.jsec{padding:14px 15px;border-radius:11px;background:var(--bg2);
+.jsec{padding:var(--s6);border-radius:var(--r2);background:var(--bg2);
   border:1px solid var(--line)}
-.jsec h3{margin:0;font-size:13px;letter-spacing:.02em}
-.jsub{font-size:10.5px;color:var(--dim2);line-height:1.45;margin:3px 0 11px}
-.jf{display:block;margin-top:11px}
-.jl{display:block;font-size:11px;color:var(--dim);margin-bottom:4px}
-.jh{display:block;font-size:10.5px;color:var(--dim2);line-height:1.45;margin-top:3px}
+.jsec h3{margin:0;font-size:var(--t3)}
+.jsub{font-size:var(--t0);color:var(--dim2);line-height:1.45;margin:var(--s1) 0 var(--s4)}
+.jf{display:block;margin-top:var(--s4)}
+.jl{display:block;font-size:var(--t1);color:var(--dim);margin-bottom:var(--s1)}
+.jh{display:block;font-size:var(--t0);color:var(--dim2);line-height:1.45;margin-top:var(--s1)}
 /* `font-family:inherit` for the same reason `.wed textarea` needs it: a plan is
    prose, and a textarea defaults to monospace. */
-.jf textarea,.jf select{font:inherit;font-size:12.5px;padding:7px 11px;width:100%;
-  box-sizing:border-box;border-radius:9px;color:var(--fg);background:var(--panel2);
+.jf textarea,.jf select{font:inherit;font-size:var(--t2);padding:var(--s3) var(--s4);width:100%;
+  box-sizing:border-box;border-radius:var(--r2);color:var(--fg);background:var(--panel2);
   border:1px solid var(--line2)}
 .jf textarea{font-family:inherit;resize:vertical;min-height:44px}
 /* A SIBLING of the grid, not a cell in it, so Save sits under the whole form
@@ -1293,11 +1578,163 @@ stop.gneg{stop-color:var(--bad)}
    grid item spanning both columns first; outside the grid it needs no span, and
    `.jform`'s job stays "two moments side by side" rather than "two moments and a
    button". */
-.jact{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}
+.jact{display:flex;align-items:center;gap:var(--s5);flex-wrap:wrap;margin-top:var(--s5)}
 
 /* The dev-mode marker in the footer. Amber (the warn pair, not the error one):
    dev mode is a state to be aware of, not a fault. Deliberately conspicuous, so a
    screenshot taken in dev mode is obviously in dev mode. Themed through the same
    tokens as every other surface, so it survives a palette switch. */
-.devtag{color:var(--warnfg);background:var(--warnfill);border-radius:6px;
-  padding:1px 7px;font-weight:600;font-style:normal}
+.devtag{color:var(--warnfg);background:var(--warnfill);border-radius:var(--r1);
+  padding:var(--s0) var(--s3);font-weight:var(--w-label);font-style:normal}
+
+/* ---- the 0DTE calculator ----
+   A WORKING SURFACE rather than a report, and the layout says so: two typed
+   readings at the top, two scratch pads under them, and the strike ladder
+   filling the rest. Nothing here is a figure the journal stated.
+
+   Every colour is a name that already existed. The call/put pair is the one
+   this tab leans on -- `--call`/`--put` for the text and `--callwash`/
+   `--putwash` for the grounds -- because green-above / rose-below is what a
+   reader of an option chain already has in their eye, and it is deliberately
+   NOT `--ok`/`--bad`, which mean signed money everywhere else on this page. */
+.zcalc .zk{font-size:var(--t1);letter-spacing:var(--tr-caps);text-transform:uppercase;
+  color:var(--kicker);font-weight:var(--w-label)}
+/* The day's releases, above the readings: a print at 08:30 is the reason a
+   quiet tape becomes a 2% day, so it is the first thing read here. */
+.zevents{display:flex;gap:var(--s3);flex-wrap:wrap;margin:0 0 var(--s6)}
+.zevent{display:inline-flex;align-items:center;gap:var(--s3);font-size:var(--t2);
+  padding:var(--s2) var(--s5);border-radius:var(--rpill);background:var(--panel2);
+  border:1px solid var(--line)}
+/* ---- the two readings ----
+   Side by side because they are read together: the close sets the rails and the
+   VIX sets their width, and neither is interpretable alone. One column below
+   760px, where two would make both fields too narrow for a six-figure level. */
+.zfeed{display:grid;grid-template-columns:1fr 1fr;gap:var(--s6)}
+@media (max-width:760px){.zfeed{grid-template-columns:1fr}}
+.zfield{padding:var(--s5) var(--s6);border-radius:var(--r2);background:var(--bg2);
+  border:1px solid var(--line)}
+/* Larger than any other input on the page, on purpose: these two numbers are
+   what every figure below is derived from, and they are typed against a moving
+   tape rather than filled in once. `box-sizing` because `.tin` is padded and a
+   percentage width would otherwise overflow the panel. */
+.zin{width:100%;box-sizing:border-box;margin-top:var(--s3);font-size:var(--t5);
+  font-family:var(--fig);font-variant-numeric:tabular-nums}
+.zin::placeholder{color:var(--dim2);font-size:var(--t3)}
+.zfield .wcap{margin-top:var(--s3)}
+/* "use it" -- the way back to the feed's reading, inline in the provenance line
+   rather than a button of its own: it is a footnote to a sentence about where
+   the number came from, and it only exists while a typed one is standing. */
+.zlink{font:inherit;font-size:var(--t0);color:var(--accentlit1);background:none;
+  border:0;padding:0 0 0 var(--s1);cursor:pointer;text-decoration:underline}
+.zlink:hover{color:var(--fg)}
+/* The expected move: one line carrying the figure, with the reasoning behind its
+   `i`. A flex row rather than a paragraph because that is what it now is -- a
+   label, two readings and a hover -- and because the parts must stay on one
+   baseline as the numbers change width. */
+.zmove{display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;margin-top:var(--s6);
+  font-size:var(--t3);color:var(--dim)}
+/* The two figures. Its own class rather than `.zmove b`, because that selector
+   also caught every `<b>` inside the hover's paragraph -- and because a rule
+   setting colour on a `b` is one a `.pos`/`.neg` sign tint would lose the cascade
+   to, which tests/test_web.py checks for across the whole stylesheet. */
+.zfig{font-size:var(--t5);color:var(--fg);font-family:var(--fig);
+  font-variant-numeric:tabular-nums}
+/* The sigma badge. Says which reading the two figures are, in the place a reader
+   looks for a unit -- the alternative was spelling "one sigma" on the line, which
+   is the sentence the hover is for. */
+.zsig{font-size:var(--t0);padding:var(--s0) var(--s3);border-radius:var(--rpill);
+  background:var(--panel2);border:1px solid var(--line2);color:var(--dim2)}
+/* ---- the scratch pads ---- */
+.zpads{display:grid;grid-template-columns:1fr 1fr;gap:var(--s6);margin-top:var(--s6)}
+@media (max-width:760px){.zpads{grid-template-columns:1fr}}
+.zpad{padding:var(--s5) var(--s6);border-radius:var(--r2);background:var(--bg2);
+  border:1px solid var(--line)}
+.zpadcall .zk{color:var(--call)}
+.zpadput .zk{color:var(--put)}
+.zpadh{display:flex;align-items:center;justify-content:space-between;gap:var(--s4)}
+/* The Broker Companion's handle. Quiet until there is something to float, and
+   disabled rather than hidden so its absence is never a mystery. */
+.zpop{font:inherit;font-size:var(--t3);line-height:1;color:var(--dim);
+  background:none;border:0;padding:var(--s0) var(--s1);cursor:pointer}
+.zpop:hover:not(:disabled){color:var(--fg)}
+.zpop:disabled{opacity:.35;cursor:not-allowed}
+/* Three readings of one level, in a row, because they answer three different
+   questions about it and none of them is the headline. */
+.zreads{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--s3);margin-top:var(--s4)}
+.zread{padding:var(--s3) var(--s4);border-radius:var(--r2);border:1px solid var(--line)}
+.zpadcall .zread{background:var(--callwash)}
+.zpadput .zread{background:var(--putwash)}
+.zread .zk{font-size:var(--t0);letter-spacing:var(--tr-caps);color:var(--dim)}
+.zv{font-size:var(--t5);font-weight:var(--w-fig);font-family:var(--fig);margin-top:var(--s2);
+  font-variant-numeric:tabular-nums}
+.zwarn{margin-top:var(--s3);color:var(--warnfg)}
+/* ---- the ladder ----
+   Seven columns around one: calls read leftward from the strike, puts rightward,
+   so each side's figures sit against the column they describe and the middle is
+   the only thing a reader has to track down the page. */
+/* The ladder is a PANEL, not a bare table on the card, and it is the one element
+   here that had to be told so twice: the readings and the pads are already boxed,
+   so a seven-column grid floating between them read as spill rather than as the
+   thing the tab is for. `overflow:hidden` is what lets the header band and the
+   footer button sit flush inside the rounded edge. */
+.zladwrap{margin-top:var(--s7);border:1px solid var(--line);border-radius:var(--r3);
+  overflow:hidden;background:var(--bg2)}
+.zlad thead tr{background:var(--panel2)}
+.zlad th{padding-top:var(--s4);padding-bottom:var(--s4)}
+.zlad td:first-child,.zlad th:first-child{padding-left:var(--s6)}
+.zlad td:last-child,.zlad th:last-child{padding-right:var(--s6)}
+/* No hairline under the last row: the footer's own top border is the closing
+   edge, and two lines 1px apart read as a rendering fault. */
+.zlad tbody tr:last-child td{border-bottom:0}
+.zlad th{text-transform:uppercase;letter-spacing:var(--tr-caps);font-weight:var(--w-label)}
+.zlad th.zc,.zlad td.zc{text-align:right}
+.zlad th.zp,.zlad td.zp{text-align:left}
+.zlad th.zc{color:var(--call)}
+.zlad th.zp{color:var(--put)}
+.zlad td.zc{color:var(--call)}
+.zlad td.zp{color:var(--put)}
+.zlad td.zc,.zlad td.zp{font-family:var(--fig);font-weight:var(--w-label);
+  font-variant-numeric:tabular-nums}
+.zlad td.center{text-align:center}
+.zlad th.center{text-align:center}
+/* The strike itself: the page's only draggable cell, and `grab` is what says so
+   before the drag starts. */
+.zstrike{font-weight:var(--w-fig);color:var(--fg);cursor:grab;
+  font-family:var(--fig);font-variant-numeric:tabular-nums}
+.zstrike:active{cursor:grabbing}
+.zlad tbody tr:hover{background:var(--hairline)}
+/* The expected move's own two strikes. Brass, the accent this page uses for "the
+   thing that was measured", and the row the opening view runs outward from. */
+.zbase{background:var(--rollwash)}
+/* The market, between the two sides. Reads as a divider rather than as a row
+   because nothing in it is for sale: same gradient as a selected list row, and
+   the word CURRENT either side of the level in the label colour. */
+.zcur{background:linear-gradient(160deg,var(--seg1),var(--seg2))}
+.zcur td{color:var(--dim)}
+.zcur .zk{font-size:var(--t0);letter-spacing:var(--tr-wide);color:var(--dim2)}
+/* A sold level that IS a shown strike tints its row; one that falls between two
+   strikes draws a line on the edge it fell past. The line is the more common
+   case by far -- a sold level is rarely a $5 centre -- and it is the honest
+   picture either way: everything on the far side of it is still yours. */
+.zoncall{background:var(--callwash)}
+.zonput{background:var(--putwash)}
+.zlad td.zctop{border-top:2px solid var(--call)}
+.zlad td.zcbot{border-bottom:2px solid var(--call)}
+.zlad td.zptop{border-top:2px solid var(--put)}
+.zlad td.zpbot{border-bottom:2px solid var(--put)}
+.zmore{display:flex;justify-content:center;padding:var(--s5) 0 var(--s0);
+  border-top:1px solid var(--line)}
+/* ---- the Broker Companion window ----
+   The same two pads, in a document of its own (src/optjournal/companion.html),
+   sized to float over a broker's order ticket. No `.wrap`: at 330px a centred
+   1480px column with 22px of padding is all padding, so the window's own edge is
+   the margin. Its pads inherit every rule above, which is the whole reason it
+   reuses the calculator's classes rather than growing a second vocabulary. */
+.zcomp{padding:var(--s5);display:flex;flex-direction:column;gap:var(--s4)}
+.zcomp .zpad{padding:var(--s4) var(--s5)}
+.zcomp .zreads{gap:var(--s2)}
+/* The one line of chrome: whose window this is, and the level the two pads are
+   measured from. Without the close on screen the figures below are unreadable --
+   "73.97 points" from what? */
+.zcomph{display:flex;align-items:baseline;justify-content:space-between;gap:var(--s4);
+  font-size:var(--t1);color:var(--dim)}

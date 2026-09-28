@@ -36,7 +36,13 @@ from optjournal.config import (
 from optjournal.db import connect, migrate, open_journal
 from optjournal.history import build_history
 from optjournal.stats import campaigns_for
-from optjournal.web import _origin_is_same, build_state, page_html, serve
+from optjournal.web import (
+    _origin_is_same,
+    build_state,
+    companion_html,
+    page_html,
+    serve,
+)
 
 
 @pytest.fixture
@@ -163,8 +169,19 @@ def _js() -> str:
     payload, so every payload read this contract polices still happens in the
     page. A read moving into the module would show up as a property read on an
     undeclared binding, which is the same failure this guard already raises.
+
+    HTML COMMENTS ARE STRIPPED FIRST, and that is not tidiness. This split used to
+    run on the raw page, so the first literal `<script` won -- and a comment in
+    <head> that mentions the inline `<script` in prose is enough to win it. One did,
+    while documenting the CSP's script-src exemption, and the helper then returned
+    the entire head and body AS the script: `app.css`, `mark.svg` and `replay.js`
+    all surfaced as undeclared property reads on bindings called `app`, `mark` and
+    `replay`. The contract guard failed for a reason that had nothing to do with the
+    contract. A helper this much of the file depends on should not be defeatable by
+    a sentence.
     """
-    body = page_html().split("<script", 1)[1]
+    page = re.sub(r"<!--.*?-->", "", page_html(), flags=re.S)
+    body = page.split("<script", 1)[1]
     script = body.split(">", 1)[1].split("</script>")[0]
     return _IMPORT.sub("", script)
 
@@ -328,12 +345,18 @@ _UNSAMPLED = frozenset({
     # the coherence test skips without the `raw/` archive, which the watchlist
     # worktree lacked, so it first ran here on the real checkout.
     "IvRank",
-    # The 0DTE planner's shapes. `OdteBlock.context` is null until a `bars` fetch
-    # has landed the S&P and VIX daily closes, and the archive-only fixture has
-    # ingested statements but no index bars -- so the nested context never
-    # materialises here. Exempt for the same reason as the quote shapes above,
-    # and exercised directly against inserted bars in test_serialize.py instead.
-    "OdteContext", "OdteBand", "OdteEvent",
+    # The 0DTE calculator's payload shapes. `OdteBlock.context` is null until a
+    # `bars` fetch has landed the S&P and VIX daily closes, and the archive-only
+    # fixture has ingested statements but no index bars -- so the nested context
+    # never materialises here. Exempt for the same reason as the quote shapes
+    # above, and exercised directly against inserted bars in test_serialize.py.
+    "OdteContext", "OdteEvent",
+    # And its PAGE-SIDE shapes, like `ChartPoint` and `Bucket`: a ladder row, a
+    # row's scratch-line marks, a sold level read against the close, and the
+    # session's expected move are all built in `static/zdte.js` from two typed
+    # numbers, so no `/api/state` sample can carry them. Their keys are pinned by
+    # tests/frontend/zdte.test.mjs, which runs the module that produces them.
+    "StrikeRow", "ScratchLine", "Scratch", "Move", "SessionEvent",
     # `GET /api/settings/token`. Deliberately off the state payload -- the
     # keyring has been measured at 8.2s with a locked keychain, so presence is
     # fetched by a button rather than on every page load, and no `/api/state`
@@ -1206,6 +1229,36 @@ def test_the_stylesheet_is_served_and_its_rules_reach_the_page():
     assert "<style>" not in page_html(), "a stylesheet was left embedded in the page"
 
 
+def test_the_companion_window_is_served_as_a_document_of_its_own():
+    """`window.open('/companion')` has to answer with markup, not with a 404 JSON.
+
+    The one route the page opens in a SECOND window, so nothing about it is
+    exercised by loading the dashboard: a missing branch in `do_GET` would leave
+    the 0DTE tab's Broker Companion button opening a window containing
+    `{"error": "not found"}`, and every other test in this file green.
+
+    Checked over a real server rather than by reading `do_GET`, because the failure
+    is the response -- its status, its type, and that the body is the companion and
+    not the page.
+    """
+    import urllib.request  # noqa: PLC0415 - local to this test
+
+    with web.serve_ephemeral(db_path=DEFAULT_DEMO_DB, archive_dir=DEFAULT_DEMO_DIR) as base:
+        with urllib.request.urlopen(f"{base}/companion", timeout=10) as resp:  # noqa: S310
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/html")
+            body = resp.read().decode()
+
+    assert "Broker Companion" in body
+    assert "/static/zdte.js" in body, "it must share the calculator's arithmetic"
+    # `fetch(` rather than a path, because the prose in this document names
+    # /api/state to explain why it does NOT ask for it.
+    assert "fetch(" not in body, (
+        "the companion takes its three numbers from its own hash; a payload fetch "
+        "here would put a brokerage account behind a 330px window that needs none"
+    )
+
+
 def test_no_element_carries_two_class_attributes():
     """HTML keeps the FIRST `class` and silently drops the rest.
 
@@ -1246,10 +1299,118 @@ def test_styling_lives_in_the_stylesheet_not_in_the_markup():
     a comment saying why and this test will need an allowlist -- deliberately not
     pre-built, because an unused exemption invites use.
     """
-    attrs = re.findall(r'style="([^"]*)"', page_html())
+    attrs = [a for markup in _dressed() for a in re.findall(r'style="([^"]*)"', markup)]
     assert not attrs, (
         f"styling belongs in static/app.css, where the layout tests can see it: "
         f"{attrs}"
+    )
+
+
+#: Words of visible prose one `.note` or `.sub` may carry. A BUDGET, not a style
+#: rule: the page is at 32 and the cap is what stops the next explanation being
+#: written where it is cheap rather than where it belongs.
+PROSE_BUDGET = 40
+
+
+def test_no_caption_carries_more_prose_than_a_reader_will_read():
+    """897 WORDS OF STANDING PROSE, across nine tabs, on every single load.
+
+    Measured in a browser before this was cut, and it is what "the app does not feel
+    polished" turned out to mean. The dashboard alone carried 280 — including one
+    98-word note, one of 80, and a caption that opened with "Amounts in EUR, the
+    account base currency" on a page where every figure already shows a €.
+
+    The cause was mechanical, not editorial. The `i` affordance existed but had no
+    helper, so it was written out by hand at four sites; adding a paragraph to a
+    `.sub` was one line and adding it to a tip was six. Prose went where it was
+    cheap. `infoTip()` closed that gap, and this budget is what keeps it closed —
+    without it the next explanation goes back into the caption for the same reason.
+
+    The split the cull applied, which is the rule this enforces the edge of:
+
+    - A fact the reader can SEE stays visible. Two counts that disagree has to be
+      named or the figures look wrong.
+    - Reference — why they disagree, what a column counts, how a figure is modelled
+      — goes behind an `i`. Wanted once, and nobody re-reads it on the ninth visit.
+    - A caption that says the same thing on every load says nothing. `ccyNote`
+      returns '' in the base case now for exactly that reason.
+
+    Conditional notices are exempt from the spirit but not the letter: an empty state
+    or a warning that appears only when something is true is information, and several
+    sit in the 20-40 range legitimately. The cap is set above them and below the
+    paragraphs, which is where a budget belongs.
+
+    Counted on the TEMPLATE, so it holds for data this demo journal cannot produce —
+    the 97-word replay legend rendered only with a replay expanded and was invisible
+    to the browser sweep that found the others.
+    """
+    code = re.sub(r"/\*.*?\*/", "", _js(), flags=re.S)
+    over = []
+    for found in re.finditer(r'class="(?:note|sub)[^"]*">(.*?)</div>', code, flags=re.S):
+        body = found.group(1)
+        # An `i`'s contents are not visible prose -- that is the whole point of it.
+        body = re.sub(r"\$\{infoTip\(.*?\)\}", "", body, flags=re.S)
+        # An interpolation renders as one figure or short phrase, not as prose.
+        body = re.sub(r"\$\{.*?\}", " X ", body, flags=re.S)
+        text = " ".join(re.sub(r"<[^>]+>", " ", body).split())
+        # A table's own header markup matches this shape; it is not a caption.
+        if "</th>" in body or "</tr>" in body:
+            continue
+        if len(text.split()) > PROSE_BUDGET:
+            over.append(f"{len(text.split())}w: {text[:90]}")
+    assert not over, (
+        f"these captions are over the {PROSE_BUDGET}-word budget:\n  "
+        + "\n  ".join(over)
+        + "\n\nMove the reference half behind `infoTip(...)` and leave the fact the "
+        "reader needs on sight. If it is genuinely all needed on sight, raise "
+        "PROSE_BUDGET deliberately and say why here."
+    )
+
+
+def test_the_csp_exempts_inline_script_only_and_nothing_needs_more():
+    """`'unsafe-inline'` IS THE WHOLE POLICY'S WEAK POINT, so it is scoped and pinned.
+
+    It used to sit on `default-src`, where one token licensed inline script AND
+    inline style -- and inline style is the easiest thing for an injected broker
+    string to reach and the hardest to spot. Nothing in this project needs it:
+    `test_styling_lives_in_the_stylesheet_not_in_the_markup` above forbids
+    `style="..."`, `app.css` is an external stylesheet, and there are no `.style.x =`
+    assignments in the page. So the exemption now names `script-src` alone and style
+    falls back to a strict `default-src 'self'`.
+
+    This test and that one hold the property jointly: the strict `style-src` is only
+    safe while nothing has quietly started setting styles from JavaScript, which the
+    regex below is what checks. No CSP test existed before, so the header had drifted
+    from the two comments describing it -- both quoted `default-src 'self'` and
+    omitted the exemption entirely.
+    """
+    header = (ROOT / "src" / "optjournal" / "web.py").read_text()
+    policy = re.search(
+        r'"Content-Security-Policy",\s*\n?\s*"([^"]*)"', header
+    ) or re.search(r'"Content-Security-Policy",\s*"([^"]*)"', header)
+    assert policy, "no Content-Security-Policy header is being sent at all"
+    value = policy.group(1)
+
+    assert "default-src 'self'" in value, "the same-origin default is gone"
+    assert "script-src 'self' 'unsafe-inline'" in value, (
+        f"the inline-script exemption is not scoped to script-src: {value!r}. The "
+        f"page's one inline <script> needs it; inline STYLE must not get it too."
+    )
+    # The directive the exemption must never reappear on.
+    default = value.split(";")[0]
+    assert "unsafe-inline" not in default, (
+        f"`'unsafe-inline'` is back on default-src ({default!r}), which silently "
+        f"re-licenses every inline style attribute an injected value could carry"
+    )
+    assert "unsafe-eval" not in value, "unsafe-eval is never needed here"
+
+    # What makes the strict style-src safe, checked directly rather than assumed.
+    js = _code_only(_js())
+    styled = re.findall(r"\.style\.[A-Za-z]", js)
+    assert not styled, (
+        f"the page sets styles from JavaScript ({sorted(set(styled))}), which the "
+        f"strict style-src now blocks. Move it to a class, or the policy has to "
+        f"loosen again."
     )
 
 
@@ -1281,8 +1442,20 @@ def _css_classes() -> set[str]:
                           re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)))
 
 
+def _dressed() -> list[str]:
+    """Every document `app.css` styles.
+
+    TWO of them since the 0DTE calculator shipped: the page, and the Broker
+    Companion window it opens. Both directions of the class contract below run
+    over this list rather than over the page alone -- the companion reuses the
+    calculator's own classes, so checking only the page would report a live rule
+    as dead the moment a class was used by the smaller document only.
+    """
+    return [page_html(), companion_html()]
+
+
 def _literal_page_classes() -> set[str]:
-    """Class tokens the page states outright, with `${...}` blanked out.
+    """Class tokens the documents state outright, with `${...}` blanked out.
 
     Blanked rather than parsed: an interpolation is a JS expression whose value
     this cannot know, so a token that only ever arrives through one is checked by
@@ -1290,9 +1463,10 @@ def _literal_page_classes() -> set[str]:
     text, which is where a typo lands.
     """
     tokens: set[str] = set()
-    for attr in re.finditer(r'class="([^"]*)"', page_html()):
-        plain = re.sub(r"\$\{[^{}]*\}", " ", attr.group(1))
-        tokens |= set(plain.split())
+    for markup in _dressed():
+        for attr in re.finditer(r'class="([^"]*)"', markup):
+            plain = re.sub(r"\$\{[^{}]*\}", " ", attr.group(1))
+            tokens |= set(plain.split())
     return tokens
 
 
@@ -1330,14 +1504,14 @@ def test_every_rule_in_the_stylesheet_is_reachable_from_the_page():
     `.g`/`.lo`/`.hi` matched inside `logo` and `hidden` and the check was
     vacuous.
     """
-    page = page_html()
+    markup = "\n".join(_dressed())
     unreachable = sorted(
         cls for cls in _css_classes()
-        if not re.search(rf"(?<![A-Za-z0-9_-]){re.escape(cls)}(?![A-Za-z0-9_-])", page)
+        if not re.search(rf"(?<![A-Za-z0-9_-]){re.escape(cls)}(?![A-Za-z0-9_-])", markup)
     )
     assert not unreachable, (
-        f"static/app.css defines these and the page never names them, so they are "
-        f"dead: {unreachable}"
+        f"static/app.css defines these and neither document names them, so they "
+        f"are dead: {unreachable}"
     )
 
 
@@ -1373,9 +1547,24 @@ def test_no_rule_sets_a_layout_property_its_display_mode_cannot_use():
     one of its classes, because that is how `.filters` and `.leg.ctx`
     legitimately set grid properties: their base rules declare `display:grid` in
     this same file, which is the co-location the inline overrides lacked.
+
+    CONTAINER properties only. `grid-area`, `grid-column` and `grid-row` were in
+    this list and had to come out, because they are grid ITEM properties: they are
+    set on the CHILDREN of a grid, whose own `display` is irrelevant and is
+    usually `block`. Listing them made the check demand `display:grid` on the
+    wrong element -- it flagged `.brandhead`, `.tabs`, `.hdr-actions` and
+    `.stat.lead`, every one of them a correct child of a correct grid, while
+    `.brand` and `.stats` declared the grid a line or two above. A rule that
+    reports four false positives is a rule that gets deleted, so the honest fix is
+    for it to check only what it can actually know from one selector.
+
+    The item-property case is not unchecked, it is checked by arithmetic instead:
+    `test_the_scoreboard_is_a_grid_whose_columns_every_tile_count_divides` reads
+    the real column counts and tile counts, which is the thing that can actually
+    go wrong with a grid item.
     """
     grid_only = ("grid-template-columns", "grid-template-rows", "grid-template-areas",
-                 "grid-auto-flow", "grid-column", "grid-row", "grid-area")
+                 "grid-auto-flow")
     flex_only = ("flex-wrap", "flex-direction", "flex-basis", "flex-grow", "flex-shrink")
 
     def classes(sel: str) -> set[str]:
@@ -2632,18 +2821,37 @@ def _fn(name: str) -> str:
 
 
 def test_header_cluster_right_aligns_and_groups_its_icons():
-    """`align-items` is pinned at BOTH levels, for two different reasons.
+    """`align-items` is pinned at BOTH levels, and the two values DIFFER.
 
-    On .hdr-actions the default `stretch` was opted out of by .icobtn's
-    explicit width, and a definite cross-size lands an item at the cross-axis
-    start -- so the sync and cog buttons sat hard left of the right-aligned
-    note above them. Inside #ccywrap `stretch` was NOT opted out of: .ccytog
-    has no width, so it inflated to the wrap's width, itself widened to 210px
-    by .ccynote's max-width, leaving the rounded border extending past the
-    active button with dead space inside it.
+    That asymmetry is the whole content of this test, because the obvious edit is
+    to make them match and it reintroduces a bug at whichever level loses.
+
+    `.hdr-actions` is a ROW: the currency toggle and the two icon buttons side by
+    side. Down a row's cross axis `flex-end` would seat the icons level with the
+    BOTTOM of #ccywrap -- that is, with `.ccynote`, the note that appears only
+    while a restated (non-base) total is showing. The icons would then shift down
+    the moment a reader switched currency. `flex-start` pins them to the toggle.
+    (As a COLUMN this rule wanted `flex-end`, for a different reason again: the
+    default `stretch` was opted out of by .icobtn's explicit width, and a definite
+    cross-size lands an item at the cross-axis start, so the icons sat hard left
+    of the right-aligned note above them. That layout is gone -- stacked, the two
+    groups set the header's height on their own and read as unrelated.)
+
+    Inside `#ccywrap` `flex-end` is unchanged and still load-bearing: `stretch` is
+    NOT opted out of there, because `.ccytog` has no width, so it inflated to the
+    wrap's width -- itself widened to 210px by `.ccynote`'s max-width -- leaving
+    the rounded border extending past the active button with dead space inside it.
     """
     css = _css().replace(" ", "").replace("\n", "")
-    assert "align-items:flex-end" in css.split(".hdr-actions{")[1].split("}")[0]
+    actions = css.split(".hdr-actions{")[1].split("}")[0]
+    assert "align-items:flex-start" in actions, (
+        "the actions row is back to flex-end, so the icon buttons align with "
+        ".ccynote and move whenever a restated total appears"
+    )
+    assert "flex-direction:column" not in actions, (
+        "the actions are stacked again, which is the three-deep pile that set the "
+        "header's height and read as three unrelated controls"
+    )
     assert "align-items:flex-end" in css.split("#ccywrap{")[1].split("}")[0], \
         "the currency toggle will stretch to the note's width again"
     assert ".hdr-icons{display:flex" in css
@@ -3099,7 +3307,12 @@ def test_a_stat_cards_note_is_a_hoverable_element_not_a_title_attribute():
         "back to a native title tooltip, which is the mechanism that failed to "
         "surface the note at all"
     )
-    assert "class=\"stat${note?'tipped':''}\"" in card, "no tooltip trigger class"
+    # The trigger clause alone, not the whole class attribute. Pinning the full
+    # string made this fail the moment `statCard` grew a fifth parameter for a
+    # card-level class (`.stat.lead`), which has nothing to do with tooltips --
+    # the invariant here is that `tipped` is driven by `note` and by nothing else.
+    assert "${note?'tipped':''}" in card, "no tooltip trigger class"
+    assert 'class="stat' in card, "the tile is no longer a .stat"
     assert 'tabindex="0"' in card, (
         "not focusable, so the note is reachable by mouse only"
     )
@@ -3497,6 +3710,342 @@ def test_no_colour_literal_lives_outside_a_theme_block():
     )
 
 
+#: The properties the measurement scale owns. Each is a decision about SIZE or
+#: SPACE, which is exactly the class of decision that wants a shared vocabulary --
+#: unlike a border width (hairlines are 1px, always), a box-shadow offset (optical,
+#: per surface), a width/height (content-driven), or a media-query breakpoint (a
+#: device fact). Those keep their literals on purpose.
+MEASURED_PROPERTIES = (
+    "font-size", "border-radius", "gap", "row-gap", "column-gap",
+    "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
+    "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
+    "font-weight", "letter-spacing",
+)
+
+
+def test_no_measurement_literal_lives_outside_the_token_block():
+    """THE COLOUR RULE ABOVE, APPLIED TO SIZE AND SPACE -- and the asymmetry
+    between the two is what "this does not look polished" turned out to be.
+
+    Every colour on this page was already a named token with a test forbidding a
+    literal. Measurement had neither, and the audit that prompted this found 17
+    font sizes, 12 radii, 20 padding values, 15 margins, 15 gaps and 12 letter-
+    spacings: 64 literals for a page with about a dozen kinds of thing on it. Nine
+    of the type sizes were within half a pixel of another -- 9.5, 10.5, 11.5, 12.5
+    -- which is the signature of tuning each element by itself. The values did not
+    disagree about anything; they had simply never been asked to agree.
+
+    That is a visual defect and not a tidiness one. A reader perceives rhythm from
+    REPETITION, so a page on which no two elements share a measurement offers none
+    to perceive: every box is individually defensible and the set reads as
+    assembled rather than designed.
+
+    No allowlist, deliberately. The conversion left exactly zero literals in these
+    properties, so the check is absolute -- and an absolute check is the only kind
+    that survives contact with a hurry. `padding:1px` on two badges was the last
+    holdout and became `--s0` (2px), a difference no reader can see, in exchange
+    for a rule with no exceptions in it.
+    """
+    css = _css()
+    # The token block itself is where the literals are SUPPOSED to be.
+    body = css.split("*{box-sizing:border-box}", 1)
+    assert len(body) == 2, "the token block's anchor moved; this test cannot find it"
+    rules = re.sub(r"/\*.*?\*/", "", body[1], flags=re.S)
+
+    props = "|".join(re.escape(p) for p in MEASURED_PROPERTIES)
+    strays = []
+    for found in re.finditer(rf"(?<![-\w])({props})\s*:\s*([^;}}]+)", rules):
+        prop, value = found.group(1), found.group(2).strip()
+        # A bare unit-ed number, or a raw font-weight keyword number.
+        if re.search(r"(?<![\w.-])\d+(?:\.\d+)?(px|em|rem)(?![\w-])", value) or (
+            prop == "font-weight" and re.fullmatch(r"\d{3}", value)
+        ):
+            strays.append(f"{prop}:{value}")
+    assert not strays, (
+        f"measurement literals outside the token block: {sorted(set(strays))} -- "
+        f"each one is a size nothing else on the page shares. Pick the step it "
+        f"belongs to (--t*, --s*, --r*, --w-*, --tr-*) and use var()."
+    )
+
+
+def test_every_figure_face_rule_also_asks_for_tabular_figures():
+    """MONOSPACE GAVE COLUMN ALIGNMENT FOR FREE. `--fig` does not.
+
+    In a monospace font every glyph is one cell wide, so a column of numbers lines
+    up whether or not anyone asked for it. `--fig` is the proportional UI sans, and
+    there a `1` is 12.25px against a `0` at 16.63px -- so the same column goes
+    ragged unless the rule also says `font-variant-numeric:tabular-nums`, which
+    pins every digit to 16.401px.
+
+    Not hypothetical: the swap left SIX rules without it, and two of them are grids
+    where the misalignment would have been the first thing a reader saw -- the
+    calendar's per-day P&L (`.day .dpl`, a 7-wide grid) and the performance chart's
+    axis labels (`.chart .axis`, stacked vertically). `.wdelta`, `.tk`, `.wmend`
+    and `.wshow` were the others. Every one of them had been correct while it was
+    monospace and silently stopped being correct on the same line that improved it,
+    which is the most expensive kind of change there is.
+
+    Punctuation is deliberately NOT pinned: `tabular-nums` leaves the comma and the
+    full stop narrow, and that is the entire reason the figures moved off the code
+    face. See `--fig` in app.css.
+    """
+    css = re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)
+    ragged = [
+        selector.strip()
+        for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+        if "var(--fig)" in body
+        and "font-family" in body
+        and "tabular-nums" not in body
+    ]
+    assert not ragged, (
+        f"these rules set the proportional figure face without asking for tabular "
+        f"figures, so their digits are variable-width and any column of them goes "
+        f"ragged: {ragged}. Monospace made this free; --fig does not."
+    )
+
+
+def test_the_two_faces_are_declared_once_and_mean_different_things():
+    """`--mono` used to be declared THREE times -- once in every theme block --
+    which said a typeface is part of a palette. It is not: all three themes carried
+    the identical stack, so a palette swap changed nothing about it, and the only
+    effect was that adding a second face meant editing three places or forgetting
+    to. Both faces now sit in the token block beside the type scale, declared once.
+
+    The two must also stay DISTINCT. Collapsing them is the tidy-up that undoes the
+    whole distinction: `--fig` measures, `--mono` quotes, and if they resolve to the
+    same stack then an order id and a price look identical again and nothing on the
+    page says which is which.
+    """
+    css = _css()
+    for token in ("--mono", "--fig"):
+        declarations = re.findall(rf"^\s*{token}\s*:", css, flags=re.M)
+        assert len(declarations) == 1, (
+            f"{token} is declared {len(declarations)} times; both faces belong in "
+            f"the `html` token block once, not in the theme blocks -- a typeface is "
+            f"not part of a palette"
+        )
+    block = css.split("html{", 1)[1].split("\n}", 1)[0]
+    mono = re.search(r"--mono:\s*([^;]+);", block)
+    fig = re.search(r"--fig:\s*([^;]+);", block)
+    assert mono and fig, "both faces must be declared in the token block"
+    assert "monospace" in mono.group(1), (
+        "--mono is no longer a monospace stack, so the identifiers it dresses "
+        "(order ids, tickers, paths) have lost the fixed cell that makes them "
+        "scannable character by character"
+    )
+    assert "monospace" not in fig.group(1), (
+        "--fig resolves to a monospace stack, which reintroduces the defect it "
+        "exists to fix: a monospace comma is a full digit wide, so it punches a "
+        "hole in every thousands-separated figure on the page"
+    )
+    assert mono.group(1).strip() != fig.group(1).strip(), (
+        "the two faces are the same stack, so nothing distinguishes a quantity "
+        "from a literal any more"
+    )
+
+
+def test_a_numeric_table_cell_carries_the_figure_face_from_its_own_class():
+    """42 markup sites depend on this one rule.
+
+    They used to read `class="n mono"`, naming the face at every call site. `.n`
+    already meant "numeric cell" -- it is why the rule right-aligns -- so the face
+    belongs with the class, and carrying it here is what let all 42 drop the `mono`
+    rather than swap it for a `fig`. If this rule loses the family, every numeric
+    column on Positions, Costs and Annual silently falls back to the body font with
+    proportional digits.
+    """
+    css = _css().replace(" ", "").replace("\n", "")
+    rule = css.split("td.n,th.n{")[1].split("}")[0]
+    assert "font-family:var(--fig)" in rule, (
+        "numeric table cells no longer carry the figure face, and the markup no "
+        "longer names it either -- so they inherit the body font"
+    )
+    assert "tabular-nums" in rule, "numeric columns will go ragged"
+    assert "text-align:right" in rule, "numeric columns are no longer right-aligned"
+    # And the markup must NOT have gone back to naming it per site.
+    assert 'class="nmono"' not in page_html().replace(" ", ""), (
+        "`class=\"n mono\"` is back, which puts the code face on quantities again"
+    )
+
+
+def test_every_heading_level_the_markup_uses_is_sized_by_the_stylesheet():
+    """THE ONE WAY ONTO THE PAGE THE LITERAL CHECK CANNOT SEE: inherit it.
+
+    A stylesheet with no size literals outside the token block still renders an
+    off-scale size if an element is left unstyled, because the user agent has an
+    opinion about headings. `h3` defaults to 1.17em -- 16.38px here -- plus 1em
+    margins top and bottom, and none of that is a literal anywhere in this repo.
+
+    Found twice, which is why it is pinned rather than fixed again. The Watchlist's
+    title was a classless `<h3>` doing exactly this; the fix changed that one tag to
+    `<h2>` and left the Market tab's two `<h3>`s untouched, so "Economic Calendar"
+    went on rendering at 16.38px -- measured on the running page, the only size on
+    any of the nine tabs that was not on the scale. Sizing the ELEMENT ends it;
+    changing a tag moves it.
+    """
+    markup = page_html() + (
+        ROOT / "src" / "optjournal" / "companion.html"
+    ).read_text()
+    # Templates build tags in JS too, so match the opening tag anywhere.
+    used = {tag for tag in ("h1", "h2", "h3", "h4", "h5", "h6")
+            if re.search(rf"<{tag}[\s>]", markup)}
+    assert used, "no headings found at all; this test has lost its subject"
+
+    # The rule must be BROAD: the bare element, or the element inside `.card`,
+    # which is the wrapper every panel on this page uses. A narrowly scoped rule
+    # does not count, and the first version of this test accepted one -- it asked
+    # only whether SOME selector ended in the tag, which `.jsec h3` satisfied while
+    # applying inside one editor pane. Ablating `.card h3` then left the test green
+    # with the Market tab's headings back on the user agent's size, which is the
+    # precise bug. Checked by ablation now.
+    unsized = []
+    for tag in sorted(used):
+        sized = any(
+            re.fullmatch(rf"(?:\.card\s+)?{tag}", one.strip()) and "font-size" in body
+            for selector, body in _css_rules()
+            for one in selector.split(",")
+        )
+        if not sized:
+            unsized.append(tag)
+    assert not unsized, (
+        f"the markup uses {unsized} and no BROAD rule (`{unsized[0]}` or "
+        f"`.card {unsized[0]}`) sets a font-size, so an unclassed one wears the "
+        f"user agent's em-relative size and 1em margins -- an off-scale size that "
+        f"no literal in this repo can be searched for. A rule scoped to one "
+        f"container does not count; that is how this bug survived its first fix."
+    )
+
+
+def test_the_token_block_is_not_parsed_as_a_theme():
+    """`html{}`, not a second `:root{}`, and the reason is this file's own tests.
+
+    `_themes()` matches `^:root...{...}` and reads every block it finds as a
+    palette. A second `:root` block would therefore be collected as a theme that
+    declares none of the colour names, and
+    `test_every_theme_declares_the_same_palette` would fail on it -- for a block
+    that has nothing to do with colour. `html` IS the root element, so the cascade
+    is identical and the colour tests stay about colour.
+
+    Pinned because the edit that breaks it is a tidy-up: `:root` reads as more
+    idiomatic than `html` and swapping them looks free.
+    """
+    css = _css()
+    assert re.search(r"^html\{", css, flags=re.M), (
+        "the measurement tokens are no longer declared on `html`; if they moved to "
+        "a second `:root` block, `_themes()` now reads them as an empty palette"
+    )
+    assert "--t0:" in css.split("html{", 1)[1].split("\n}", 1)[0], (
+        "the type scale is not inside the `html` block"
+    )
+    # The safety net for the above, stated as the thing that actually matters.
+    assert all(pal for pal in _themes().values()), (
+        f"a theme block parsed as empty, so the palette-parity check is measuring "
+        f"nothing: {[sel for sel, pal in _themes().items() if not pal]}"
+    )
+
+
+def _toplevel_rules() -> list[tuple[str, str]]:
+    """(selector, body) for rules OUTSIDE any at-rule, comments stripped.
+
+    Nested at-rules are excluded rather than flattened, and BOTH kinds here have a
+    legitimate reason to repeat a selector:
+
+    - `@media` is a responsive override. `.stats` setting `grid-template-columns`
+      in the base and again at 1180px is the mechanism working, not a collision.
+    - `@keyframes` names its own steps. `sheen` and `spin` both have a `to` block
+      setting `transform`, which are two unrelated animations rather than one
+      overriding the other -- caught as a false positive on the first run of the
+      duplicate check, which is why the strip is by at-rule rather than by `@media`.
+    """
+    css = re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)
+    # Any at-rule whose block contains nested rules, of any depth-1 shape.
+    css = re.sub(r"@[a-z-]+[^{]*\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}", "", css, flags=re.S)
+    return re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+
+
+def test_no_two_rules_claim_the_same_selector_and_the_same_property():
+    """THE `.jrow` COLLISION, and it shipped green because nothing here looked.
+
+    Two features both named their row `.jrow`: the Collection strip (a six-column
+    grid, app.css `the Jobs strip`) and the journal write-up row 550 lines below.
+    Both rules were individually valid, so every other check passed -- including
+    `test_no_rule_sets_a_layout_property_its_display_mode_cannot_use`, which reads
+    one rule at a time and saw a `display:grid` sitting beside its own
+    `grid-template-columns`.
+
+    What it could not see is that the LATER rule set `display:flex`. So the strip
+    computed flex, its six fixed columns were inert, and the status word landed at
+    five different x-positions down the panel -- 314, 356, 375, 386, 409 at 1440px.
+    Every row also took the journal rule's `border-top`, including the first, which
+    is exactly the defect the comment above the grid claims to have fixed. A
+    comment describing a layout the page does not have is worse than no comment.
+
+    The invariant is the general one: if two rules at the same level share a
+    selector AND a property, the earlier declaration is dead, and a dead
+    declaration is either a bug or a line to delete. Augmenting a selector with
+    DIFFERENT properties stays legal -- `.zlad th` does it twice, once for padding
+    and once for type -- because nothing is silently lost.
+    """
+    seen: dict[str, dict[str, str]] = {}
+    clashes = []
+    for selector, body in _toplevel_rules():
+        for one in (s.strip() for s in selector.split(",")):
+            if not one:
+                continue
+            props = {
+                m.group(1)
+                for m in re.finditer(r"(?:^|;)\s*([-a-z]+)\s*:", body)
+            }
+            overlap = props & set(seen.get(one, {}))
+            if overlap:
+                clashes.append(
+                    f"`{one}` sets {sorted(overlap)} twice; the first is dead"
+                )
+            seen.setdefault(one, {}).update(dict.fromkeys(props, body))
+    assert not clashes, (
+        "two rules claim the same selector and the same property, so the earlier "
+        f"declaration never renders: {clashes}. This is the shape of the `.jrow` "
+        f"bug -- if the two are different features, rename one."
+    )
+
+
+def test_the_stylesheet_has_no_text_loose_outside_a_rule():
+    """A COMMENT THAT DOES NOT CLOSE TAKES THE REST OF THE FILE WITH IT, quietly.
+
+    Found by making it: a paragraph was added to the scoreboard's explanation and
+    landed one line BELOW the `*/` instead of above it. The browser then hit prose
+    where a selector belonged, discarded declarations until it resynchronised, and
+    `.stats` lost its `grid-template-columns` -- so the dashboard rendered as a
+    single column at 1440px. No test failed. The stylesheet still parsed as a
+    string, still contained every rule as text, and every assertion that searches
+    it with `in` still passed, because the bytes were all present.
+
+    This file is 1500 lines of prose and rules interleaved, which is a deliberate
+    choice that earns its keep -- and it makes this failure mode routine rather
+    than exotic, so it wants a check of its own.
+    """
+    css = _css()
+    assert css.count("/*") == css.count("*/"), (
+        f"unbalanced CSS comments: {css.count('/*')} openers, {css.count('*/')} "
+        f"closers -- everything after the unclosed one is being parsed as prose"
+    )
+    stripped = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    # Whatever sits between one rule's `}` and the next rule's `{` is a selector,
+    # and a selector cannot contain a full stop followed by a space, or a semicolon.
+    for chunk in re.split(r"\}", stripped):
+        head = chunk.split("{", 1)[0]
+        if "{" not in chunk and not head.strip():
+            continue
+        assert ";" not in head, (
+            f"a declaration is sitting outside any rule, which means a comment "
+            f"above it did not close: {head.strip()[:120]!r}"
+        )
+        assert not re.search(r"\.\s|\bthe\b|\bbecause\b", head), (
+            f"prose is sitting where a selector belongs, so a comment above it did "
+            f"not close: {head.strip()[:120]!r}"
+        )
+
+
 def test_no_colour_literal_lives_in_the_page_either():
     """THE STYLESHEET IS NOT THE ONLY PLACE A COLOUR CAN HIDE, and checking only
     `app.css` is why three visible things sat out the first theme release.
@@ -3548,49 +4097,136 @@ def test_every_control_has_a_visible_keyboard_focus_ring():
     )
 
 
-def test_the_stat_row_distributes_its_remainder_instead_of_leaving_a_hole():
-    """The dashboard renders exactly nine cards and nine divides evenly into
-    none of this page's column counts, so a fixed grid always orphans one.
+#: Every `.stats` grid, as {modifier class or "" : tiles it is given}. The tile
+#: counts are pinned by `test_each_stats_grid_holds_the_tile_count_its_columns_
+#: divide` below; this table is what the divisibility check reads.
+STATS_GRIDS = {"": 8, "c3": 3, "c2": 4}
 
-    Arithmetic, not preference: 9 into 5 leaves one empty cell and 9 into 2
-    leaves one, and no card count is gapless across 5, 3 and 2 at once. The two
-    obvious fixes measured worse -- four columns leaves THREE gaps, and a
-    two-cell hero for Net P&L closes the wide row while opening two at the
-    1180px breakpoint, moving the hole rather than removing it.
+#: Columns per modifier at each breakpoint, widest first. Read off the stylesheet
+#: by the test rather than trusted, so a retune cannot drift from this table.
+#: A modifier absent from a query keeps its wider count through it, which is why
+#: these tuples differ in length: `c3` is deliberately not named at 1180px, since
+#: three tiles in two columns is an orphan. Every tuple must still END at 1.
+STATS_COLUMNS = {
+    "": (4, 2, 1),
+    "c3": (3, 1),
+    "c2": (2, 1),
+}
 
-    So the cards flex and the last row absorbs the leftover width. Verified in a
-    browser at three widths: every row ends flush with the container.
+
+def test_the_scoreboard_is_a_grid_whose_columns_every_tile_count_divides():
+    """THE ARITHMETIC THAT ONCE FORBADE A GRID, now satisfied instead of dodged.
+
+    History, because the obvious edit here is a regression. `.stats` was
+    `repeat(5,1fr)`, became `display:flex;flex-wrap:wrap;--sw:18%`, and the flex
+    was CORRECT for its inputs: the dashboard emitted nine cards, nine divides
+    evenly into none of 5/3/2, and every fixed grid orphaned a cell in the wide
+    view. `flex:1 1 <basis>` let the last row absorb the remainder and end flush.
+
+    What it could not fix is that wrapped flex rows size INDEPENDENTLY. Measured at
+    1440px, the nine came out as five tiles of 260px above four of 329px, and not
+    one column edge lined up down the panel. A flush right edge, bought with the
+    interior alignment -- which is most of what read as unpolished on this tab.
+
+    So the premise went instead. Net P&L was never a peer of Avg Loss: it is the
+    figure the tab exists to report, and it now spans the grid's first row as
+    `.stat.lead`, leaving EIGHT tiles. Eight divides into 4, 2 and 1 -- every
+    column count this page uses -- so the grid is gapless at every breakpoint AND
+    its columns align, which the flex row could not do at the same time.
+
+    Checked as arithmetic over the real stylesheet, not as a spelling: the column
+    counts are parsed out of the CSS, so retuning a breakpoint is free and
+    introducing an orphan is not.
     """
     css = _css().replace(" ", "").replace("\n", "")
-    assert ".stats{display:flex;flex-wrap:wrap" in css, (
-        "the stat row is back to a fixed grid, which orphans a card at 5 and 2 "
-        "columns because the dashboard always renders nine"
+    assert ".stats{display:grid" in css, (
+        "the scoreboard is a flex row again, so its wrapped rows will size "
+        "independently and the columns will not line up"
     )
-    assert ".stats>*{flex:11var(--sw)" in css, (
-        "cards no longer grow, so the last row stops short of the row above"
+    assert ".stat.lead{grid-column:1/-1}" in css, (
+        "the lead tile no longer spans the row, so the dashboard is back to nine "
+        "co-equal tiles -- which is both the orphan and the missing headline"
     )
-    # The basis must stay UNDER the true fraction at every breakpoint, or
-    # rounding overflows a row and drops one card onto a line of its own.
-    for basis, cols in ((18, 5), (30, 3), (46, 2)):
-        assert basis * cols < 100, (
-            f"--sw:{basis}% x {cols} exceeds the line, so a row will wrap early"
+
+    for mod, cols in _stats_column_counts().items():
+        name = f".stats{'.' + mod if mod else ''}"
+        tiles = STATS_GRIDS[mod]
+        assert cols == STATS_COLUMNS[mod], (
+            f"`{name}` now runs {cols} columns across the breakpoints, not "
+            f"{STATS_COLUMNS[mod]}"
         )
-        assert f"--sw:{basis}%" in css, f"the {cols}-per-row basis is gone"
+        for count in cols:
+            assert tiles % count == 0, (
+                f"`{name}` holds {tiles} tiles in {count} columns, which leaves "
+                f"{tiles % count} empty cell(s) -- the orphan the flex row existed "
+                f"to avoid"
+            )
+        assert cols[-1] == 1, (
+            f"`{name}` never reaches one column, so on a phone its tiles stay "
+            f"{cols[-1]} across and the figures inside them wrap"
+        )
 
 
-def test_the_dashboard_renders_exactly_nine_stat_cards(state):
-    """The premise the flex row rests on. Both of the dashboard's conditionals
-    are either/or -- options-or-not, net-liq-or-not -- so the count is
-    structural. If a tenth card lands, the basis widths above want rechecking.
+def _stats_column_counts() -> dict[str, tuple[int, ...]]:
+    """Columns per `.stats` modifier, widest breakpoint first, read off the CSS.
+
+    A bare `repeat(n,1fr)` is n columns and `1fr` is one. Media queries are taken
+    in source order, which is how the stylesheet is written (widest first), and
+    each one must name every modifier explicitly -- `.stats.c3` is specificity
+    (0,2,0) and outranks a bare `.stats` whatever the query, so a rule that
+    forgets to list it leaves a three-column strip three columns on a phone. That
+    requirement is what makes this parse well defined.
+    """
+    css = _css()
+    counts: dict[str, list[int]] = {mod: [] for mod in STATS_GRIDS}
+
+    def columns(decl: str) -> int:
+        found = re.search(r"repeat\((\d+),1fr\)", decl.replace(" ", ""))
+        return int(found.group(1)) if found else 1
+
+    # Base rules first, then each media block in order.
+    blocks = [css.split("@media")[0]] + [
+        "@media" + part for part in css.split("@media")[1:]
+    ]
+    for block in blocks:
+        for mod in counts:
+            selector = rf"\.stats{re.escape('.' + mod) if mod else ''}\b"
+            # The selector may appear in a comma list; take the rule it belongs to.
+            for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}",
+                                        re.sub(r"/\*.*?\*/", "", block, flags=re.S)):
+                if "grid-template-columns" not in body:
+                    continue
+                if any(re.fullmatch(selector, one.strip())
+                       for one in sel.split(",")):
+                    counts[mod].append(columns(body))
+                    break
+    return {mod: tuple(seen) for mod, seen in counts.items()}
+
+
+def test_the_dashboard_renders_one_lead_tile_and_eight_in_the_row(state):
+    """The premise the grid rests on. Both of the dashboard's conditionals are
+    either/or -- options-or-not, net-liq-or-not -- so the count is structural.
+
+    If a tenth card lands, the divisibility check above starts failing rather than
+    the layout quietly growing a hole, which is the point of pinning it here.
     """
     body = _fn("dashboard")
-    # Count the cards the function can emit, minus the alternates that can
-    # never both render.
     emitted = body.count("statCard(")
     alternates = body.count("? statCard(")
-    assert emitted - alternates == 9, (
-        f"the dashboard now renders {emitted - alternates} cards, not 9. The "
-        f"flex basis in `.stats` was chosen for nine; recheck it wraps cleanly."
+    total = emitted - alternates
+    assert total == 9, (
+        f"the dashboard now renders {total} tiles, not 9. One of them is the lead "
+        f"and the other {total - 1} share the grid; eight is what divides into "
+        f"4, 2 and 1, so recheck `.stats` before changing this."
+    )
+    leads = body.count("'lead'")
+    assert leads == 1, (
+        f"{leads} tiles are tagged `lead`, not 1. Two leads would each span the "
+        f"whole row; none leaves the tab with no headline figure."
+    )
+    assert total - leads == STATS_GRIDS[""], (
+        f"the dashboard's row holds {total - leads} tiles but STATS_GRIDS says "
+        f"{STATS_GRIDS['']} -- update it, and recheck the divisibility above"
     )
 
 
@@ -3919,6 +4555,46 @@ def test_the_job_status_word_is_rendered_not_collapsed_to_a_colour():
     )
 
 
+def test_no_handler_is_bound_to_a_styling_class():
+    """A CLASS IS A STYLING HOOK; AN ATTRIBUTE IS A BEHAVIOUR HOOK. Mixing them
+    means a rename in the stylesheet can silently delete a feature.
+
+    This is not a style preference, it is a bill that was paid. `bindJobRuns` read
+    `document.querySelectorAll('button.jrun')` while the CSS class was renamed to
+    `.jobrun` -- necessary, because `.jrow` was two different features sharing a
+    name. The stylesheet, the markup and every layout assertion moved together and
+    the whole suite stayed green, because nothing asserted on the SELECTOR. The
+    Collection strip rendered perfectly and not one of its five run buttons did
+    anything at all.
+
+    Every other binder in this page already keys on a data attribute --
+    `[data-replay]`, `[data-wsel]`, `[data-zstrike]`, `[data-calday]` and twenty
+    more -- so this was the single exception, and it was the single thing the rename
+    broke. Which is the argument: the convention was already right, it just was not
+    enforced anywhere.
+
+    Element and structural selectors are fine (`#body input`, `.seg button[data-
+    type]` reaches its attribute). What is banned is a BARE class carrying the
+    identity of the thing being wired.
+    """
+    js = _code_only(_js())
+    offenders = []
+    for call in re.finditer(r"querySelector(?:All)?\(\s*(['\"])(.*?)\1", js):
+        selector = call.group(2)
+        # Does any part of the selector reach a data attribute or an id?
+        if "[data-" in selector or "#" in selector:
+            continue
+        # A bare class (possibly tag-qualified) with no attribute qualifier.
+        if re.search(r"(?:^|[\s,>])[a-z]*\.[A-Za-z][\w-]*\s*$", selector):
+            offenders.append(selector)
+    assert not offenders, (
+        f"these handlers are bound to a styling class, so renaming it in app.css "
+        f"silently unbinds them: {offenders}. Bind on a `data-` attribute instead "
+        f"-- that is what the other two dozen binders in this file do, and it is "
+        f"why the `.jrun` -> `.jobrun` rename broke only this one."
+    )
+
+
 def test_every_runnable_job_gets_a_button_and_a_retired_one_does_not():
     """Step 5e replaces step 4c's read-only pin. That pin is why this one exists.
 
@@ -3930,7 +4606,7 @@ def test_every_runnable_job_gets_a_button_and_a_retired_one_does_not():
     whose job has left the registry must NOT offer a button that cannot work.
     """
     strip = _fn("collection").replace(" ", "").replace("\n", "")
-    assert 'class="btnsmjrun"data-job="${esc(j.job)}"' in strip, (
+    assert 'class="btnsmjobrun"data-job="${esc(j.job)}"' in strip, (
         "the run button is gone, so the strip is read-only again and the jobs can "
         "only be started from a terminal"
     )
@@ -5940,3 +6616,187 @@ def test_the_provisional_banner_dashes_ibkrs_date():
     assert "raw.slice(0,4)" in banner and "raw.slice(4,6)" in banner, (
         "the banner renders IBKR's compact date without reformatting it"
     )
+
+
+# --------------------------------------------------------------------------
+# The 0DTE calculator's wiring
+#
+# Its controls are the page's only two-way surface outside the watchlist and the
+# journal form: four typed fields, a sort, a toggle, two resets, two pop-outs, and
+# a draggable strike in every ladder row. None of that is reachable by the checks
+# that read rendered markup, because a handler attached to a selector that matches
+# nothing renders perfectly and does nothing -- the same silent no-op an unstyled
+# class is, one layer down. So the two halves are pinned against each other.
+# --------------------------------------------------------------------------
+
+
+#: Every hook the calculator's markup emits, and what it is for. The binder is
+#: checked against this list in both directions, so a renamed attribute breaks a
+#: test rather than a control.
+_ZDTE_HOOKS = {
+    "data-zread": "the four typed fields",
+    "data-zstrike": "the draggable strike cell",
+    "data-zreset": "back to the feed's reading",
+    "data-zsort": "the strike column's direction",
+    "data-zall": "collapse or reveal the outer rails",
+    "data-zpop": "the Broker Companion",
+}
+
+
+@pytest.mark.parametrize("hook", sorted(_ZDTE_HOOKS), ids=lambda h: h)
+def test_every_calculator_hook_is_both_rendered_and_bound(hook):
+    """A control needs an attribute in `odte()` and a handler in `bindZdte()`."""
+    view = _fn("odte")
+    binder = _fn("bindZdte")
+    assert hook in view, (
+        f"{hook} ({_ZDTE_HOOKS[hook]}) is bound but never rendered, so the "
+        "handler attaches to nothing"
+    )
+    assert hook in binder, (
+        f"{hook} ({_ZDTE_HOOKS[hook]}) is rendered but never bound, so the "
+        "control is inert"
+    )
+
+
+def test_the_calculator_binds_no_hook_it_does_not_render():
+    """The other direction, over whatever the binder actually reaches for."""
+    bound = set(re.findall(r"data-(z[a-z]+)", _fn("bindZdte")))
+    declared = {hook.removeprefix("data-") for hook in _ZDTE_HOOKS}
+    assert bound <= declared, (
+        f"bindZdte reaches for {sorted(bound - declared)}, which is not in this "
+        "test's hook table -- add it there and to the view, or drop the handler"
+    )
+
+
+def test_typing_a_reading_redraws_and_the_caret_survives():
+    """The ladder is recomputed per keystroke, which is only usable if the field
+    keeps its text and its cursor: `#body` is replaced wholesale on every draw.
+
+    `preserveInputs` does the carrying, so every field needs an id -- and the two
+    readings need `setSelectionRange`, because masking out a stray character
+    shortens the value and the caret would otherwise jump to the end.
+    """
+    view = _fn("odte")
+    for field in ('id="${id}"', 'id="z${side}"'):
+        assert field in view, f"a calculator field has no id ({field})"
+    binder = _fn("bindZdte")
+    assert "el.oninput" in binder, "typing does not recompute the ladder"
+    assert "sanitizeLevel" in binder, "the field accepts characters it cannot parse"
+    assert "setSelectionRange" in binder, "the caret jumps on a masked keystroke"
+
+
+def test_a_programmatic_fill_writes_the_node_as_well_as_the_state():
+    """The trap `zfill` exists for, pinned so it cannot be quietly undone.
+
+    `restoreInputs` writes the PRE-render text back into every field it finds by
+    id, unconditionally. A handler that set only `S.zcall` would therefore render
+    the dropped strike into the markup and have it overwritten a line later by the
+    stale value still in the old input -- so dragging a strike into a pad would
+    look like nothing happened. Setting the live node too is what keeps the two
+    agreeing at the only moment the preserver looks.
+    """
+    fill = _fn("zfill")
+    assert "el.value=" in fill.replace(" ", ""), (
+        "zfill no longer writes the field, so restoreInputs will revert every "
+        "drag, double-click and reset"
+    )
+    assert "draw()" in fill
+
+
+def test_the_companion_window_is_reused_and_kept_in_step():
+    """One window, and it follows what is typed here.
+
+    Opening a second window per click would leave two disagreeing readouts over
+    the broker; opening it once and never posting into it would leave one readout
+    that silently stops matching the ladder it came from.
+    """
+    opener = _fn("openCompanion")
+    assert "S.zpop&&!S.zpop.closed" in opener.replace(" ", ""), (
+        "a second click opens a second window"
+    )
+    assert "bitacora-companion" in opener, "the window is not named, so it cannot be reused"
+    assert "noopener" not in opener, (
+        "noopener would drop the handle companionPost needs"
+    )
+    post = _fn("companionPost")
+    assert "location.origin" in post, "the message must be addressed to this origin"
+    assert "companionPost();" in _fn("draw"), (
+        "the floating pads stop following what is typed on the tab"
+    )
+
+
+def test_the_typed_readings_ride_in_the_hash_and_heal_back_out():
+    """A reload lands on the ladder you left, and a reading that agrees with the
+    feed stops claiming to be an override.
+
+    Both halves matter. Without the write, the four fields are lost on every
+    reload and a link carries none of them; without the heal, retyping the feed's
+    own close leaves `#spx=` in the address bar for the rest of the day, and a
+    link shared tomorrow pins yesterday's number as an override of a close that
+    has since moved.
+    """
+    sync = _fn("syncHash")
+    for key in ("spx", "vix", "call", "put"):
+        assert f"hs.set('{key}'" in sync, f"the hash does not carry {key}"
+    assert "zfeed(oc.spx_prev_close)" in _fn("draw"), (
+        "a typed reading identical to the feed's no longer heals out of the URL"
+    )
+    apply_hash = _fn("applyHash")
+    assert "sanitizeLevel" in apply_hash, (
+        "a hand-edited hash could put a non-number in the field"
+    )
+
+
+def test_the_calculator_explains_itself_on_hover_rather_than_on_the_page():
+    """Its two explanations live in tips, and the figures stay on the page.
+
+    They were paragraphs under the readings and under the ladder: ~160 words of
+    correct, once-useful prose that a seller rereads every session and then has to
+    look past. The reasoning is now behind two `i` triggers -- the idiom the
+    Statistics heading already uses -- and what stays visible is the expected move
+    itself, which is a reading rather than an argument.
+
+    Pinned because the pressure runs one way: the next thing worth saying about the
+    ladder is easiest to add as another sentence under it.
+    """
+    view = _fn("odte")
+    assert view.count('class="tip wide"') == 2, (
+        "the calculator's two explanations are no longer both in hovers"
+    )
+    # Exactly one `.note` survives, and it is the empty state: an instruction for a
+    # journal whose index bars have not landed, which has no figure to hide behind
+    # and nothing on the tab works without.
+    notes = view.count('class="note"')
+    assert notes == 1 and "Not available yet" in view, (
+        f"{notes} prose blocks on the tab -- explanation belongs in one of the two "
+        "tips; only the 'run optjournal bars' instruction stays on the page"
+    )
+    # Keyboard-reachable, or the explanation exists only for a mouse.
+    assert view.count('class="info tipped"\n      tabindex="0"') + view.count(
+        'class="info tipped" tabindex="0"') == 2, (
+        "an info trigger is not focusable, so it cannot be opened from a keyboard"
+    )
+    # The reading itself is NOT in the tip.
+    assert "expected move</span>" in view and "zfig" in view, (
+        "the expected move has to stay on the page; only its reasoning hides"
+    )
+
+
+def test_the_calendar_strip_shows_us_releases_only():
+    """This tab sells SPX, so a Swiss rate decision is not news on it.
+
+    The journal's feed is worldwide -- 23 entries on the day this was written, most
+    of them irrelevant to an SPX seller -- and all of them as chips buried the two
+    readings under six rows. The Market tab is where the whole day lives, and the
+    strip names it.
+    """
+    view = _fn("odte")
+    assert "sessionEvents(oc.events_today)" in view, (
+        "the strip no longer asks the module which releases belong on this tab, so "
+        "the whole world is back on it"
+    )
+    assert "more US" in view, "the rest of the day is not accounted for"
+    # The rule itself, and the Fed-speaker merge with it, live in the module where
+    # node runs them -- see tests/frontend/zdte.test.mjs.
+    module = (ROOT / "src" / "optjournal" / "static" / "zdte.js").read_text(encoding="utf-8")
+    assert 'SESSION_COUNTRY = "USD"' in module, "the country filter is gone"

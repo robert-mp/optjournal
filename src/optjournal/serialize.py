@@ -65,7 +65,6 @@ from optjournal.vol import (
     realised_vol,
     realised_vol_series,
 )
-from optjournal.zdte import plan as zdte_plan
 
 Row = dict[str, Any]
 
@@ -757,15 +756,21 @@ def market_data(
 
 
 def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
-    """The 0DTE planner's pre-open reading, or None when the feed has not landed.
+    """The 0DTE calculator's opening reading, or None when the feed has not landed.
 
-    Three parts, and each is an ABSENCE the planner renders rather than a zero:
-    the S&P 500's last completed session close, the current VIX, and the
-    expected-range bands `zdte.plan` derives from the two. None when either close
-    is missing -- a fresh clone, or a `bars` fetch that has not run -- because a
-    planner drawn from no data is worse than one that says "run `optjournal
-    bars`". The band maths lives in `zdte.py`; this only reads the two numbers
-    and pairs them with the day's events.
+    Two numbers and the day around them: the S&P 500's last completed session
+    close, the current VIX, and today's events. None when either close is missing
+    -- a fresh clone, or a `bars` fetch that has not run -- because a calculator
+    drawn from no data is worse than one that says "run `optjournal bars`".
+
+    NO LEVELS ARE DERIVED HERE, and that is a decision rather than a gap. The
+    strike ladder used to be computed in Python (`zdte.py`, deleted with this
+    change) and sent ready-made, which worked only while the two readings were the
+    feed's. They are now TYPED: the tab lets a reader override either one against
+    a moving tape, so the ladder is recomputed on a keystroke and lives in
+    `static/zdte.js`, where `node --test` runs it. Sending a second, server-built
+    copy of the same levels would be a copy that disagrees with the one on screen
+    the moment a digit is typed.
 
     Closes come from `price_bars` under the index's own symbol as conid (see
     `bars.CONTEXT_SYMBOLS`). The S&P figure is the last COMPLETED session's
@@ -784,7 +789,7 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
 
     Today's events are the same rows the Market tab holds, narrowed to the ET
     session date -- an economic print at 08:30 is exactly the "big day" warning a
-    same-day seller wants beside the bands. Filtered here rather than in the page
+    same-day seller wants beside the ladder. Filtered here rather than in the page
     so the two surfaces cannot disagree about which day "today" is.
     """
     spx = bars_close_series(conn, "^GSPC", bar_size="1d")
@@ -802,8 +807,13 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
     spx_ts, spx_close = settled[-1]
     # The VIX is the live level, so the newest row stands. See the docstring.
     vix_ts, vix_close = vix[-1]
-    result = zdte_plan(spx_prev_close=spx_close, vix=vix_close)
-    if result is None:
+    # A non-positive close is a bad row and a negative VIX is impossible: both are
+    # an absence the tab renders as "not available yet" rather than a ladder drawn
+    # around a level nothing traded at. A zero VIX is USABLE -- it reads as "no
+    # expected move", which is a real if never-seen figure -- and the same bound
+    # is checked again in `static/zdte.js`, which has to hold it against a TYPED
+    # reading this function never sees.
+    if spx_close <= 0 or vix_close < 0:
         return None
 
     day_start = now.astimezone(MARKET_TZ).replace(
@@ -820,12 +830,14 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
         for r in rows
     ]
 
-    payload = result.payload()
-    payload["spx_date"] = et_day(spx_ts)
-    payload["vix_date"] = et_day(vix_ts)
-    payload["events_today"] = events
-    payload["today"] = today
-    return payload
+    return {
+        "spx_prev_close": spx_close,
+        "spx_date": et_day(spx_ts),
+        "vix": vix_close,
+        "vix_date": et_day(vix_ts),
+        "events_today": events,
+        "today": today,
+    }
 
 
 def _days_until(recorded: str | None, *, today: date) -> int | None:

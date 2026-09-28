@@ -402,6 +402,13 @@ CASES: list[tuple[str, sweep.Check, Page, Page]] = [
           payload=_REPLAY_PAYLOAD),
      page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_CARD_MISSEEKS,
           payload=_REPLAY_PAYLOAD)),
+    # The bug that wrote this check: a rationale one line too deep inside a
+    # template literal is TEXT, and it lands inside a tag. The broken page here is
+    # what that renders as -- a `<span` carrying a comment as bogus attributes.
+    ("no source comment in markup",
+     sweep.check_no_source_comment_leaked_into_the_markup,
+     page(tab="odte", body='<span class="zevent"><b>08:30</b> Claims</span>'),
+     page(tab="odte", body='<span\n  /* the dot is the tier */\n  class="zevent">x</span>')),
     ("drill-down legs carry ctx",
      sweep.check_drilldown_legs_have_context,
      page(tab="calendar", calday="2026-08-04", body=_DRILL_OK, payload=_DRILL_PAYLOAD),

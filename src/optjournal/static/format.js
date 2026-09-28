@@ -42,6 +42,24 @@ export const cls = (value) => value == null || Number(value) === 0
   ? ""
   : Number(value) > 0 ? "pos signed" : "neg signed";
 
+/** An index level or a listed strike, UNGROUPED: 7706.03, never 7,706.03.
+ *
+ * Its own formatter rather than `num`, and the difference is one separator that
+ * matters at the density the 0DTE ladder is read: seven numeric columns of
+ * four-digit levels, scanned for where a strike sits relative to its neighbours,
+ * where a thousands comma in every cell is ink that carries nothing -- these are
+ * always thousands. It is also how every platform quoting SPX prints a strike, and
+ * a ladder that has to be checked against a broker screen should not differ from
+ * it typographically. Money keeps its grouping, everywhere, through `num`.
+ */
+export const level = (value, digits = 2) => value == null
+  ? "—"
+  : Number(value).toLocaleString(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+    useGrouping: false,
+  });
+
 export function strike(value) {
   if (value == null) return "";
   const amount = Number(value);

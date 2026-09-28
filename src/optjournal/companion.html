@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Broker Companion — Bitácora</title>
+<link rel="icon" href="/static/mark.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css"></head>
+<body><div class="zcalc zcomp" id="comp"></div>
+<!--
+  THE BROKER COMPANION: the 0DTE tab's two scratch pads, in a window small
+  enough to float over a broker's order ticket.
+
+  WHY A SECOND DOCUMENT AND NOT THE PAGE IN A NARROW WINDOW. `page.html` is a
+  header slab, nine tabs and an /api/state fetch over a whole brokerage account;
+  none of that is wanted at 330 pixels, and none of it is needed -- everything
+  this window shows is derived from three numbers. So it takes them in its own
+  hash, fetches nothing, and imports the same two modules the page does. The
+  arithmetic is `zdte.scratchRead`, exactly as on the tab, because a floating
+  figure that disagreed with the one it was opened from would be worse than no
+  window at all.
+
+  IT FOLLOWS WHAT IS TYPED. The opener posts a message on every render (see
+  `companionPost` in page.html), so editing a level on the tab moves the figures
+  here without reopening anything. The hash is only the opening state, which is
+  also what makes the window survivable on its own: reload it, or bookmark it,
+  and it still reads.
+
+  Theme comes in with the rest, because this document renders outside the page
+  where its `data-theme` attribute cannot reach -- the same reason `mark.svg`
+  carries its own colours.
+-->
+<script type="module">
+import {esc, level, pct} from '/static/format.js';
+import {parseNumber, scratchRead} from '/static/zdte.js';
+
+/* The state is three strings and a theme name, and it arrives two ways: in the
+   hash at open, and by message afterwards. One shape for both, so the render
+   cannot tell which it was and there is only one code path to be wrong. */
+const Z={spx:'',call:'',put:'',theme:'leather'};
+
+function fromHash(){
+  const hs=new URLSearchParams(String(location.hash||'').replace(/^#/,''));
+  take({spx:hs.get('spx')||'',call:hs.get('call')||'',put:hs.get('put')||'',
+    theme:hs.get('theme')||'leather'});
+}
+
+function take(next){
+  /* Assigned key by key rather than by replacing the object: a message that
+     carries only some of them must not blank the rest. */
+  ['spx','call','put','theme'].forEach(key=>{
+    if(next[key]!=null) Z[key]=String(next[key]);
+  });
+  render();
+}
+
+/* One pad. Empty is a dash in every cell rather than a hidden block: a window
+   that changes height as levels are typed moves under the pointer, and this one
+   is positioned by hand over something else. */
+function pad(side){
+  const zs=scratchRead(Z.spx,side==='call'?Z.call:Z.put);
+  return `<div class="zpad ${side==='call'?'zpadcall':'zpadput'}">
+    <div class="zpadh"><span class="zk">${side} sold</span>
+      <span class="zv">${zs?level(zs.level):'—'}</span></div>
+    <div class="zreads">
+      <div class="zread"><div class="zk">Points</div>
+        <div class="zv">${zs?level(zs.points):'—'}</div></div>
+      <div class="zread"><div class="zk">Percent</div>
+        <div class="zv">${zs?pct(zs.pct,2):'—'}</div></div>
+      <div class="zread"><div class="zk">$5 strike</div>
+        <div class="zv">${zs?level(zs.strike,0):'—'}</div></div>
+    </div></div>`;
+}
+
+function render(){
+  document.documentElement.dataset.theme=Z.theme;
+  const spx=parseNumber(Z.spx);
+  document.getElementById('comp').innerHTML=`<div class="zcomph">
+      <span class="kicker">Bitácora · 0DTE</span>
+      <span class="mono">SPX ${spx==null?'—':esc(level(spx))}</span>
+    </div>
+    ${pad('call')}${pad('put')}`;
+}
+
+/* Same-origin only, and the check is not a formality: this window is opened with
+   a handle its opener keeps, so any document able to reach it could otherwise
+   move the numbers a reader is about to trade against. */
+window.addEventListener('message',ev=>{
+  if(ev.origin!==location.origin) return;
+  if(ev.data&&typeof ev.data==='object') take(ev.data);
+});
+window.addEventListener('hashchange',fromHash);
+fromHash();
+</script>
+</body></html>

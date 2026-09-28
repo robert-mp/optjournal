@@ -33,9 +33,19 @@ MODULES = (
     STATIC / "market.js",
     STATIC / "replay.js",
     STATIC / "watch.js",
+    # The 0DTE calculator's ladder. The first module on this seam whose arithmetic
+    # runs on a KEYSTROKE -- both its inputs are typed -- which is why it is here
+    # rather than in Python beside the rest of the journal's numbers.
+    STATIC / "zdte.js",
 )
 SUITE = ROOT / "tests" / "frontend"
 PAGE = ROOT / "src" / "optjournal" / "page.html"
+#: The second document `app.css` dresses and the second importer of these modules:
+#: the 0DTE tab's Broker Companion window. Held to the same seam as the page below,
+#: because a floating window that recomputed `scratchRead` in its own script would
+#: be the exact duplication this directory exists to prevent -- and it would be
+#: unexecuted by any test, since only page.html is scanned by the payload contract.
+COMPANION = ROOT / "src" / "optjournal" / "companion.html"
 
 
 @pytest.mark.parametrize("module", MODULES, ids=lambda p: p.name)
@@ -61,6 +71,51 @@ def test_the_javascript_suite_passes():
     passed = re.search(r"^# pass (\d+)$", result.stdout, re.M)
     assert passed and int(passed.group(1)) > 0, (
         "node reported no passing tests -- the suite is not being discovered"
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node runtime")
+def test_the_pages_inline_script_parses(tmp_path):
+    """THE PAGE'S OWN 6000 LINES, PARSED. Nothing else here does that.
+
+    Every other frontend check in this repo reads the inline script as TEXT -- the
+    contract guard, the layout assertions, the escaping rules -- so a syntax error
+    passes all of them and the page simply does not run. There is no build step to
+    catch it either. The browser says one line into the console and renders a blank
+    document, which is the worst available failure mode: silent, total, and visible
+    only if you happen to have devtools open.
+
+    Earned. An HTML comment was added inside a template literal, explaining a change
+    to a caption, and it contained a backtick around an identifier -- which ENDS the
+    template literal it sits in. The page died with `Unexpected identifier 'i'`
+    before rendering a single element, and the full suite stayed green, because the
+    helper that extracts the script for analysis strips HTML comments first and
+    removed the offending character before looking at it.
+
+    So this parses the RAW script, comments intact, with `node --check`. It catches
+    that shape and every other syntax error, which is the right level to check at:
+    the specific rule ("no backtick in an HTML comment in a template") would have
+    been a rule about one bug rather than about the file being valid JavaScript.
+
+    Imports are not resolved by `--check`, only parsed, so the `/static/*.js`
+    specifiers do not need to exist for this to run.
+    """
+    page = (ROOT / "src" / "optjournal" / "page.html").read_text(encoding="utf-8")
+    body = page.split("<script", 1)[1]
+    script = body.split(">", 1)[1].split("</script>")[0]
+    # `.mjs` so node parses it as a module: the page's script is `type="module"`
+    # and top-level `import` is a syntax error in a script.
+    scratch = tmp_path / "inline.mjs"
+    scratch.write_text(script, encoding="utf-8")
+    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [shutil.which("node") or "node", "--check", str(scratch)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60, check=False,
+    )
+    assert result.returncode == 0, (
+        "page.html's inline script is not valid JavaScript, so the page will render "
+        "blank with one line in the console and nothing else in this suite will "
+        f"notice:\n{result.stderr[-3000:]}"
     )
 
 
@@ -187,3 +242,48 @@ def test_every_shipped_svg_is_well_formed_xml():
                 f"browser: {exc}. A `--` inside an <!-- --> comment is the "
                 f"usual cause."
             ) from exc
+
+
+#: What the Broker Companion legitimately needs: the shared formatters and the
+#: calculator's arithmetic. Not the whole seam -- it draws no chart and holds no
+#: watchlist -- so the two it does import are named rather than parametrising over
+#: MODULES, which would assert an import the window has no reason to carry.
+_COMPANION_MODULES = (STATIC / "format.js", STATIC / "zdte.js")
+
+
+@pytest.mark.parametrize("module", _COMPANION_MODULES, ids=lambda p: p.name)
+def test_the_companion_imports_the_module_rather_than_duplicating_it(module):
+    """The floating window must derive its figures from the same code as the tab.
+
+    This is the failure the window is most likely to grow: it prints three numbers
+    from three inputs, which is small enough to retype in its own script, and the
+    copy would then drift from the ladder it was opened from -- while looking right
+    on the day it was written. A reader mid-trade comparing the two would have no
+    way to tell which was lying.
+    """
+    markup = COMPANION.read_text(encoding="utf-8")
+    assert f"/static/{module.name}" in markup, (
+        f"companion.html does not import {module.name}"
+    )
+    assert 'type="module"' in markup, "an ES module needs a module script tag"
+    exported = set(re.findall(
+        r"^export (?:function|const) (\w+)", module.read_text(encoding="utf-8"), re.M
+    ))
+    body = code_only(markup)
+    duplicated = sorted(
+        name for name in exported
+        if re.search(rf"\b(?:function|const|let)\s+{name}\b", body)
+    )
+    assert not duplicated, (
+        f"companion.html redefines {duplicated}, which {module.name} exports"
+    )
+
+
+def test_the_companion_wears_the_shared_stylesheet_and_no_rules_of_its_own():
+    """Every styling decision stays in app.css, which is where the tests can read
+    it -- the same rule that emptied page.html's `<style>` block, applied to the
+    second document that block's rules now dress.
+    """
+    markup = COMPANION.read_text(encoding="utf-8")
+    assert '/static/app.css' in markup, "the companion must share the stylesheet"
+    assert "<style" not in markup, "a stylesheet was embedded in the companion"
