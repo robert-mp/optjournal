@@ -7046,3 +7046,69 @@ def test_each_stats_block_ranks_strategies_over_its_own_period():
     src = inspect.getsource(web.build_state).replace(" ", "")
     assert 'for block, period in (("stats", selected), ("all_time", None)):'.replace(" ", "") in src
     assert "strategy_ranking(state[\"lifecycles\"],period)" in src
+
+
+def _media_rules(width: int) -> list[tuple[str, str]]:
+    """(selector, body) for every rule inside `@media(max-width:<width>px)`."""
+    css = re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)
+    rules: list[tuple[str, str]] = []
+    for m in re.finditer(rf"@media\s*\(max-width:\s*{width}px\)\s*\{{", css):
+        depth, i = 1, m.end()
+        while depth:
+            depth += {"{": 1, "}": -1}.get(css[i], 0)
+            i += 1
+        rules += re.findall(r"([^{}]+)\{([^{}]*)\}", css[m.end():i - 1])
+    return [(sel.strip(), body) for sel, body in rules]
+
+
+def test_the_content_column_can_shrink_below_its_widest_child():
+    """A `1fr` track has an `auto` minimum, so one wide table widened `.wrap`
+    past the viewport and the whole page scrolled sideways. `minmax(0,1fr)` is
+    what moves the overflow down to the table that owns it.
+
+    Ablated by restoring `auto 1fr`: this fails.
+    """
+    shell = [b for s, b in _css_rules() if s.strip() == ".shell"]
+    assert shell, "no .shell rule"
+    for body in shell:
+        cols = re.search(r"grid-template-columns:([^;}]+)", body)
+        if cols:
+            tracks = re.sub(r"minmax\([^)]*\)", "", cols.group(1))
+            assert "1fr" not in tracks, f".shell has a bare 1fr track: {cols.group(1)}"
+
+
+def test_a_tooltip_does_not_inherit_nowrap_from_its_pill():
+    """A `.tip` inside a `.pill` inherited `white-space:nowrap`, ran as one
+    line, and widened the page even while hidden.
+
+    Ablated by dropping the declaration: this fails.
+    """
+    base = [b for s, b in _css_rules() if s.strip() == ".tip"]
+    assert any(re.search(r"white-space:\s*normal", b) for b in base)
+
+
+def test_below_1180px_tables_scroll_in_place_and_tips_keep_their_heading():
+    """Tables get their own scroller rather than the card, because a scrolling
+    card clips the tips that hang out of it. The tips then anchor to the card,
+    and `top:auto` keeps them at their static position under the heading
+    instead of at the card's foot.
+
+    Ablated by removing each rule in turn: each assertion fails on its own.
+    """
+    rules = _media_rules(1180)
+    tables = [b for s, b in rules if s.startswith("table")]
+    assert any("display:block" in b and "overflow-x:auto" in b for b in tables)
+    assert any(s == ".card" and "position:relative" in b for s, b in rules)
+    tips = [b for s, b in rules if ".tip" in s and "top:auto" in b]
+    assert tips, "no tip keeps its static top below 1180px"
+
+
+def test_below_760px_the_rail_becomes_a_strip():
+    """The rail stays a fixed-width column otherwise, and a phone loses a
+    third of its width to it.
+
+    Ablated by removing the rule: this fails.
+    """
+    rules = _media_rules(760)
+    assert any(s == ".shell" and "minmax(0,1fr)" in b for s, b in rules)
+    assert any(s == ".rail" and "flex-direction:row" in b for s, b in rules)

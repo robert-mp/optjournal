@@ -463,7 +463,11 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    `auto 1fr` so the rail is as wide as its widest label and the content takes the
    rest; `.wrap` keeps `margin:0 auto`, so the content column still centres in what
    is left and is never narrower than it was. */
-.shell{display:grid;grid-template-columns:auto 1fr;align-items:start}
+/* `minmax(0,1fr)`, not `1fr`: a bare `1fr` has an `auto` minimum, so the widest
+   table's min-content widened the whole content column past a narrow viewport
+   -- every card on those tabs then overflowed with it, and a tooltip pinned
+   inside its card overflowed by exactly as much. Measured at 390px. */
+.shell{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start}
 
 /* ---- the rail ----
    Sticky rather than fixed, which is the CSS-only way to keep it in view: `fixed`
@@ -895,6 +899,11 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
 .tip{position:absolute;left:10px;top:calc(100% - 3px);z-index:40;
   width:max-content;max-width:230px;padding:var(--s3) var(--s4);border-radius:var(--r2);
   text-align:left;font-size:var(--t1);line-height:1.55;font-weight:var(--w-body);
+  /* `normal` explicitly, because a tip inherits from whatever hosts it and `.pill`
+     is `nowrap`: a pill's tooltip rendered its whole paragraph as one line, 500px
+     of text running past a 342px box -- at every width, not only a narrow one,
+     which is where it was found. */
+  white-space:normal;
   /* Explicit, not inherited: the heading's trigger is a monospace glyph, so an
      inherited family rendered the same tooltip in two different typefaces
      depending on which element opened it. The body's stack, spelled out, so it has
@@ -1445,7 +1454,12 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    and five tracks would stay five tracks on a phone. The failure is silent -- a row
    scrolling off the card edge, with the collapse rule sitting right there looking
    like it applies. */
-@media(max-width:760px){.filters.wf{grid-template-columns:1fr}}
+@media(max-width:760px){.filters.wf{grid-template-columns:minmax(0,1fr)}
+  /* The one segmented control too wide for a phone -- four `nowrap` bands --
+     scrolls inside itself rather than wrapping, because a joined control broken
+     across two lines no longer reads as one choice. With the track's minimum at
+     zero it is what overflows, instead of the whole page (measured 424px). */
+  .wf .seg{overflow-x:auto}}
 /* Replay drill-down. The panel is the chart's home rather than a table cell:
    reading a strike against a price scale needs a y-axis, and an axis needs
    room. Clicking the card header opens it, the same act as clicking a calendar
@@ -1925,3 +1939,81 @@ stop.gneg{stop-color:var(--bad)}
    "73.97 points" from what? */
 .zcomph{display:flex;align-items:baseline;justify-content:space-between;gap:var(--s4);
   font-size:var(--t1);color:var(--dim)}
+
+/* ---- below 1180px: tables and tooltips ----
+   Split out of the 760px block below because the band between failed too:
+   measured at 761px, with the rail's 108px beside the content, the Annual page
+   ran to 1041px and nine tooltips clipped. The containment rules therefore start
+   at the page's next breakpoint, where the widest tables stop fitting.
+
+   Tooltips keep their 230/430px caps here, and are only forbidden to exceed the
+   card: a card-wide tip is right on a phone and absurd in an 800px card. Stat
+   tiles are positioned, so their tips stay anchored to the tile.
+
+   WIDE TABLES each scroll inside themselves. The note's objection to the
+   one-line fix was that `.card{overflow-x:auto}` clips the tooltips, which hang
+   out of their card by design; no tooltip lives inside a table, so a table can
+   be its own scroller and clip nothing. `display:block` is what gives a table an
+   overflow box, and it is harmless here because at this width every one of them
+   is wider than the viewport anyway. The watchlist table and the 0DTE ladder are
+   excluded: both already sit in scroll containers with sticky headers, which a
+   second scroller on the table itself would break. No sticky first column: a
+   contract name pinned over scrolling numbers is a second decision, not needed
+   for the page to stop scrolling sideways.
+
+   HEADING TOOLTIPS stop running off the edge, by the route the note's dead ends
+   did not try. Each of those kept an explicit `top`, which is what dropped the
+   tip to the card's foot once the card became its containing block. `top:auto`
+   keeps the tip's STATIC position instead -- level with the glyph it hangs from
+   -- while `left`/`right` insets against a positioned card pin its width inside
+   the card, so no viewport can clip it. Pure CSS, so the page still sets no style
+   from script.
+
+   EVERY TOOLTIP IN A CARD, not only a heading's, is held inside the card. A
+   pill's tip is `.wide`, 430px from a 10px offset, in a card ~340px wide on a
+   phone -- and hidden or not it counts for layout, since `visibility:hidden` keeps
+   its box, so one invisible tip on a header pill widened the Costs page to 524px.
+   Pills get `top:auto` like the headings, for the same reason. */
+@media(max-width:1180px){
+  table:not(.wtab):not(.zlad){display:block;overflow-x:auto}
+  .card{position:relative}
+  .info{position:static}
+  .card .tip{left:var(--s4);right:auto;max-width:min(230px,calc(100% - var(--s8)))}
+  .card .tip.wide{max-width:min(430px,calc(100% - var(--s8)))}
+  .info .tip,.pill .tip{top:auto;margin-top:var(--s7)}}
+
+/* ---- below 760px ----
+   The width docs/design-notes.md recorded as unsupported. Its two named causes,
+   tables and tooltips, are answered in the 1180px block above; what is left here
+   is the layout itself.
+
+   THE RAIL becomes a strip across the top: a 108px column beside a phone's
+   content leaves the content ~250px. Sticky, like the column it was, with the
+   page's ground behind it so rows scrolling under it do not show through; it
+   scrolls sideways itself when seven items outrun the width.
+
+   THE HEADER stacks: mark and title, then the period, then the actions -- and
+   with no period, just title then actions, so the tabs without one grow no empty
+   row. The `:has()` form is restated because the 1320px rule's is specificity
+   (0,3,0) and a bare `.brand` would lose to it here, source order or not.
+
+   THE WEEK STRIP'S CELLS get a zero minimum and clip, because seven `1fr` tracks
+   each refused to shrink below their longest event title -- the Market page ran
+   to 467px. The selected day's list beneath the strip carries every title in
+   full, so clipping here loses nothing. The watchlist detail's three columns go
+   to one, as its tiles cannot fit three across a phone. */
+@media(max-width:760px){
+  .shell{grid-template-columns:minmax(0,1fr)}
+  .rail{flex-direction:row;overflow-x:auto;z-index:30;background:var(--bg);
+    padding:var(--s3) var(--s5);border-bottom:1px solid var(--line)}
+  .rail .tab{flex:0 0 auto}
+  .wrap{padding:var(--s5)}
+  .brand{grid-template-columns:auto 1fr;
+    grid-template-areas:"mark head" "actions actions";row-gap:var(--s5)}
+  .brand:has(.period:not(:empty)){grid-template-columns:auto 1fr;
+    grid-template-areas:"mark head" "period period" "actions actions"}
+  .period{justify-self:start;flex-wrap:wrap;row-gap:var(--s3)}
+  .hdr-actions{justify-self:start}
+  .cal{grid-template-columns:repeat(7,minmax(0,1fr))}
+  .cal>.day{min-width:0;overflow:hidden}
+  .wdet{grid-template-columns:minmax(0,1fr)}}

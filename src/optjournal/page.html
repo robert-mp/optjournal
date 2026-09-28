@@ -1811,6 +1811,11 @@ function renderPeriod(){
    panel would be empty: one-currency accounts on a tab with no trade type. */
 function renderViewOptions(){
   const pop=$('#vpop'), btn=$('#vbtn');
+  /* No payload yet, no options: a hash change can reach draw() before the first
+     reply lands -- found by switching tabs quickly on a phone-width page, where
+     this read `S.state.asset_category` off null and threw. `renderPeriod` has
+     always had this guard; this function shipped without it. */
+  if(!S.state){btn.innerHTML='';pop.innerHTML='';return;}
   const onPeriod=PERIOD_TABS.includes(S.tab);
   const ccy=ccyControl();
   const parts=[];

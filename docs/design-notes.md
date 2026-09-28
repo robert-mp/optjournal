@@ -582,42 +582,41 @@ naming it — `.n` already meant "numeric cell", which is why it right-aligns.
 typeface is part of a palette. It is not — all three carried the identical stack.
 Both faces now sit once in the token block beside the type scale.
 
-## Known narrow-width limitations
+## Narrow widths
 
-Two, both confined to below roughly 760px, and both left alone deliberately rather
-than by oversight. Below that width this layout is already not the supported one:
-the `.stats` grids have collapsed to a single tile per row, and the rail keeps
-its width while the content column narrows beside it.
+The page now holds down to a 390px phone without sideways scroll and without a
+tooltip leaving the viewport. Measured at 390, 600, 761, 900, 1024, 1180, 1181,
+1320 and 1600px on all nine views, with every `.tipped` element focused in turn.
+Five causes, each fixed where it lived.
 
-**Wide tables overflow.** Positions, Costs and Annual carry 8-10 columns with
-`white-space:nowrap` headers, so their min-content width exceeds the viewport and
-the page scrolls sideways. Predates the measurement work and is untouched by it —
-those rules convert to byte-identical values (`th` padding `0 10px 8px`, `table`
-13px). The one-line containment, `.card{overflow-x:auto}`, clips the `.tip`
-tooltips, which are absolutely positioned and deliberately overflow their card, so
-a real fix needs a scroll container per table and a decision about whether the
-first column sticks.
+**The content column grew to fit its widest child.** `.shell` put `.wrap` in a
+`1fr` track, and a `1fr` track has an `auto` minimum, so a wide table widened the
+column past the viewport. `minmax(0,1fr)` lets the column shrink and pushes the
+overflow down to whatever is actually wide. The watchlist form had the same bug in
+its own grid.
 
-**Wide tooltips clip on the right.** Measured: clean at 900px and 1200px, nine tips
-clipped at 600px, the worst by 293px. The cause is positional, not width. `.tip` is
-`position:absolute; left:10px` and its containing block is `.info`, the 15px `i`
-glyph — so a 430px tip extends rightward from wherever that glyph landed on its
-heading, which on a narrow screen is past the edge.
+**Tables scroll in place below 1180px.** Positions, Costs and Annual carry 8 to 10
+nowrap columns. Each `table` becomes its own `overflow-x:auto` block rather than
+the card, because a scrolling card would clip the tooltips that deliberately hang
+out of it. The watchlist and ladder tables are excluded; each already sits in its own
+scrolling or clipping wrapper. The
+first column does not stick, which keeps the rule to one line.
 
-It resists a CSS-only fix, and the dead ends are worth recording so they are not
-retried. Clamping `max-width` does nothing, because the left anchor is the problem.
-Flipping to `right:0` makes the tip extend leftward and clip on the LEFT instead,
-since every wide tip hangs off a heading near the card's left edge. Anchoring to
-the card needs `.card{position:relative}` and `.info{position:static}`, which also
-moves the tip's `top:calc(100% - 3px)` reference to the card and drops the tip at
-the card's foot instead of under its heading. CSS anchor positioning would solve it
-and is not yet broadly supported.
+**Tooltips anchor to the card, not the glyph.** `.tip` was `position:absolute;
+left:10px` inside `.info`, the 15px glyph, so a 430px tip ran rightward from
+wherever the glyph landed. Below 1180px the card becomes the containing block and
+the tip is inset from its left edge with a `max-width` of the card less its
+padding. The earlier dead end, that anchoring to the card drops the tip at the
+card's foot, is avoided with `top:auto`: an absolute box with no `top` keeps its
+static position, which is directly under the heading it belongs to, and a
+`margin-top` clears the glyph. No JavaScript, so no style writes and the strict
+`style-src` stays intact.
 
-What is left is roughly six lines of JS clamping the tip into the viewport on
-hover/focus. That was not done for one reason worth stating: it means writing
-`el.style.left`, and `test_the_csp_exempts_inline_script_only_and_nothing_needs_more`
-asserts the page sets NO styles from JavaScript — that assertion is what makes the
-strict `style-src 'self'` safe to ship. Trading a real security property for a
-tooltip at a width the tables already do not survive is the wrong way round. Revisit
-if the narrow layout ever becomes supported, and relax that test with a documented
-exemption rather than silently.
+**Two invisible widths.** A `.tip` inside a `.pill` inherited the pill's
+`white-space:nowrap` and ran as one line, and a hidden tip still takes layout
+space, so it widened the page while invisible. The base `.tip` rule now resets
+`white-space:normal`.
+
+**Below 760px the shell reflows.** The rail becomes a horizontally scrolling strip
+across the top, the header stacks to mark and heading, then period, then actions,
+and calendar days take `minmax(0,1fr)` so seven columns fit a phone.
