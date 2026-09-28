@@ -1335,6 +1335,10 @@ suite green and ruff clean.
   titled with what you hold on the name. (It is identical on every row in the mockup,
   so it carries no information, and this page has no icon set beyond the header's two
   buttons and `mark.svg`. The same pixels can carry a fact only this journal knows.)
+  *Superseded in part, 2026-09-28:* the page now has an icon set, seven glyphs on
+  the rail that replaced the tab strip (see the entry on window chrome below). The
+  reasoning here still holds for this cell: a glyph identical on every row carries
+  nothing, and the rail's glyphs sit beside their labels rather than replacing them.
 - **The section refresh as an icon-only button**. Built as a labelled `.btn.sm` with the
   existing `.busy` affordance, in a regrouped two-child `.crow` header. (`.icobtn`
   (`app.css:384`) is 38px and lives in the page header, and the precedent for a
@@ -1404,3 +1408,12 @@ suite green and ruff clean.
   The tab key `watchlist` is additionally pinned in three files at once
   (`page.html:1138`, `sweep.py:736`, and tests holding the two together), so it must
   not change.)
+  *Superseded, 2026-09-28.* This plan's target was one panel; the Bitácora 2.0
+  migration targeted the shell, and replaced the nine-tab strip with a rail of seven
+  labelled destinations (Trades holds Positions, a new Analysis holds Costs and
+  Annual). The name stays Bitácora. The tab KEYS did not change, which is the
+  constraint this entry actually protected: `TABS` is still the nine leaves, so
+  `watchlist` and every other key still resolve, and `sweep.TABS` is untouched. (The
+  line numbers cited above are stale: the lists are at `page.html`'s `const TABS=` and
+  `sweep.py`'s `TABS =`.) The refusal of icon-only controls stands; every rail glyph
+  has its label.
