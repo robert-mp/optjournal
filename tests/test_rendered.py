@@ -181,3 +181,40 @@ def test_a_themed_url_repaints_the_whole_page(served, tmp_path):
             f"#theme={requested} left the edition chip claiming something other "
             f"than {label!r}, so the chip and the palette disagree"
         )
+
+
+def test_the_dashboard_renders_the_tiles_the_reader_stored(served, tmp_path):
+    """The chosen arrangement, in its order -- and the default when what is
+    stored cannot be drawn.
+
+    The second half is the one only a browser can check. The server refuses a
+    bad list on the way in, but `.optjournal.json` is hand-editable and a tile
+    can be retired after a reader chose it, and the page's own check in
+    `tileKeys` is all that stands between that file and a dashboard that
+    throws halfway through rendering. Source analysis can see the check exists;
+    only an executed render shows it holds.
+    """
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    from optjournal import settings  # noqa: PLC0415 - the session's settings home
+
+    def rendered_tiles(profile: str) -> list[str]:
+        dom = browser.dump_dom(served + "/", tmp_path / profile)
+        if dom is None:
+            pytest.skip("no browser produced a DOM (environment, not the page)")
+        assert not browser.last_console_errors(), (
+            "the page raised: " + "; ".join(browser.last_console_errors())
+        )
+        return re.findall(r'data-tile="([a-z_]+)"', browser.markup(dom))
+
+    chosen = ["win_rate", "net_pnl", "profit_factor", "avg_pnl"]
+    try:
+        settings.update(tiles=chosen)
+        assert rendered_tiles("chosen") == chosen, "the stored order did not render"
+        # A hand-edited file holding a count the grid cannot divide.
+        settings.update(tiles=["net_pnl", "trades", "wins"])
+        assert rendered_tiles("bad") == list(web.TILE_DEFAULT), (
+            "a stored arrangement the grid cannot hold was drawn instead of the default"
+        )
+    finally:
+        settings.update(tiles=None)

@@ -4152,10 +4152,11 @@ def test_every_control_has_a_visible_keyboard_focus_ring():
     )
 
 
-#: Every `.stats` grid, as {modifier class or "" : tiles it is given}. The tile
-#: counts are pinned by `test_each_stats_grid_holds_the_tile_count_its_columns_
-#: divide` below; this table is what the divisibility check reads.
-STATS_GRIDS = {"": 8, "c3": 3, "c2": 4}
+#: Every `.stats` grid, as {modifier class or "" : the tile counts it can be
+#: given}. The dashboard's is a SET because the reader chooses how many tiles to
+#: show; the others are fixed. The divisibility check reads every count listed,
+#: and the dashboard's set is pinned against the page's own `TILE_STEP` below.
+STATS_GRIDS = {"": (4, 8, 12, 16), "c3": (3,), "c2": (4,)}
 
 #: Columns per modifier at each breakpoint, widest first. Read off the stylesheet
 #: by the test rather than trusted, so a retune cannot drift from this table.
@@ -4183,11 +4184,12 @@ def test_the_scoreboard_is_a_grid_whose_columns_every_tile_count_divides():
     one column edge lined up down the panel. A flush right edge, bought with the
     interior alignment -- which is most of what read as unpolished on this tab.
 
-    So the premise went instead. Net P&L was never a peer of Avg Loss: it is the
-    figure the tab exists to report, and it now spans the grid's first row as
-    `.stat.lead`, leaving EIGHT tiles. Eight divides into 4, 2 and 1 -- every
-    column count this page uses -- so the grid is gapless at every breakpoint AND
-    its columns align, which the flex row could not do at the same time.
+    So the premise went instead. First Net P&L spanned the first row as a lead
+    tile, leaving eight; then the header took over the headline and the tiles
+    became peers the reader orders and chooses. What keeps the grid gapless now
+    is the COUNT: 4, 8, 12 or 16, every one of which divides 4, 2 and 1, so the
+    columns align at every breakpoint AND no cell is empty, which the flex row
+    could not do at the same time.
 
     Checked as arithmetic over the real stylesheet, not as a spelling: the column
     counts are parsed out of the CSS, so retuning a breakpoint is free and
@@ -4198,24 +4200,24 @@ def test_the_scoreboard_is_a_grid_whose_columns_every_tile_count_divides():
         "the scoreboard is a flex row again, so its wrapped rows will size "
         "independently and the columns will not line up"
     )
-    assert ".stat.lead{grid-column:1/-1}" in css, (
-        "the lead tile no longer spans the row, so the dashboard is back to nine "
-        "co-equal tiles -- which is both the orphan and the missing headline"
+    assert ".stat.lead" not in css, (
+        "a lead tile spans the first row again, so the reader's order has "
+        "nowhere to start and the header's period figure has a duplicate"
     )
 
     for mod, cols in _stats_column_counts().items():
         name = f".stats{'.' + mod if mod else ''}"
-        tiles = STATS_GRIDS[mod]
         assert cols == STATS_COLUMNS[mod], (
             f"`{name}` now runs {cols} columns across the breakpoints, not "
             f"{STATS_COLUMNS[mod]}"
         )
-        for count in cols:
-            assert tiles % count == 0, (
-                f"`{name}` holds {tiles} tiles in {count} columns, which leaves "
-                f"{tiles % count} empty cell(s) -- the orphan the flex row existed "
-                f"to avoid"
-            )
+        for tiles in STATS_GRIDS[mod]:
+            for count in cols:
+                assert tiles % count == 0, (
+                    f"`{name}` can hold {tiles} tiles in {count} columns, which "
+                    f"leaves {tiles % count} empty cell(s) -- the orphan the flex "
+                    f"row existed to avoid"
+                )
         assert cols[-1] == 1, (
             f"`{name}` never reaches one column, so on a phone its tiles stay "
             f"{cols[-1]} across and the figures inside them wrap"
@@ -4258,30 +4260,53 @@ def _stats_column_counts() -> dict[str, tuple[int, ...]]:
     return {mod: tuple(seen) for mod, seen in counts.items()}
 
 
-def test_the_dashboard_renders_one_lead_tile_and_eight_in_the_row(state):
-    """The premise the grid rests on. Both of the dashboard's conditionals are
-    either/or -- options-or-not, net-liq-or-not -- so the count is structural.
+def _tile_registry() -> tuple[list[str], list[str], int]:
+    """(every tile key in TILES order, the renderer keys in dashboard(), TILE_STEP)."""
+    js = _js()
+    table = js.split("const TILES=[", 1)[1].split("];", 1)[0]
+    keys = re.findall(r"\['([a-z_]+)','", table)
+    renderers = re.findall(r"^\s{4}([a-z_]+):\(\)=>", _fn("dashboard"), re.M)
+    step = int(re.search(r"const TILE_STEP=(\d+);", js).group(1))
+    return keys, renderers, step
 
-    If a tenth card lands, the divisibility check above starts failing rather than
-    the layout quietly growing a hole, which is the point of pinning it here.
+
+def test_every_tile_the_chooser_offers_has_a_renderer_and_none_is_orphaned():
+    """TILES lists what Settings offers; `dashboard()` holds what can render.
+
+    They are two tables because the chooser has no payload to render against, and
+    two tables drift: a key offered with no renderer throws on the dashboard the
+    moment a reader ticks it, and a renderer nothing offers is a tile no reader
+    can ever see. Both directions, same as the payload guard.
     """
-    body = _fn("dashboard")
-    emitted = body.count("statCard(")
-    alternates = body.count("? statCard(")
-    total = emitted - alternates
-    assert total == 9, (
-        f"the dashboard now renders {total} tiles, not 9. One of them is the lead "
-        f"and the other {total - 1} share the grid; eight is what divides into "
-        f"4, 2 and 1, so recheck `.stats` before changing this."
+    keys, renderers, _ = _tile_registry()
+    assert len(keys) == len(set(keys)), f"a tile key is listed twice: {keys}"
+    assert sorted(keys) == sorted(renderers), (
+        f"offered without a renderer: {sorted(set(keys) - set(renderers))}; "
+        f"renderable but never offered: {sorted(set(renderers) - set(keys))}"
     )
-    leads = body.count("'lead'")
-    assert leads == 1, (
-        f"{leads} tiles are tagged `lead`, not 1. Two leads would each span the "
-        f"whole row; none leaves the tab with no headline figure."
+
+
+def test_the_tile_counts_the_page_allows_are_the_ones_the_grid_divides():
+    """The page's own step, the default and the full set, against STATS_GRIDS.
+
+    `TILE_STEP` is what the chooser enforces and what the server validates, and
+    every count it permits has to be a count the grid's columns divide. Read out
+    of the page rather than restated, so changing the step without rechecking the
+    grid fails here instead of shipping a hole. The default must be one of those
+    counts, and so must showing everything, since "tick them all" is the first
+    thing a reader tries.
+    """
+    keys, _, step = _tile_registry()
+    allowed = tuple(range(step, len(keys) + 1, step))
+    assert allowed == STATS_GRIDS[""], (
+        f"the page permits {allowed} visible tiles but the grid is checked for "
+        f"{STATS_GRIDS['']} -- update STATS_GRIDS and recheck the divisibility above"
     )
-    assert total - leads == STATS_GRIDS[""], (
-        f"the dashboard's row holds {total - leads} tiles but STATS_GRIDS says "
-        f"{STATS_GRIDS['']} -- update it, and recheck the divisibility above"
+    default = int(re.search(r"const TILE_DEFAULT=TILES\.slice\(0,(\d+)\)", _js()).group(1))
+    assert default in allowed, f"the default shows {default} tiles, not a multiple of {step}"
+    assert len(keys) in allowed, (
+        f"all {len(keys)} tiles shown leaves a hole; the full set must be a multiple "
+        f"of {step} too"
     )
 
 
@@ -6659,6 +6684,74 @@ def test_the_settings_endpoint_stores_and_clears_the_confirm_query(populated):
             "an empty confirm query id was not stored as absent, so the poll "
             "cannot be turned off from the page"
         )
+
+
+def test_the_server_and_the_page_agree_on_the_dashboard_tiles():
+    """Two copies of one vocabulary, pinned together like `sweep.TABS`.
+
+    The page needs the labels and the server needs the keys to refuse, and
+    neither can import the other. Drift in one direction stores a tile the page
+    cannot render (it falls back to the default, and the reader's choice silently
+    vanishes); in the other, the page offers a tile the server refuses to save.
+    The step and the default are pinned too, because the server stores the
+    default as absence and must recognise exactly the arrangement the page means.
+    """
+    keys, _, step = _tile_registry()
+    assert tuple(keys) == web.DASHBOARD_TILES, (
+        "page.html's TILES and web.DASHBOARD_TILES disagree -- change both"
+    )
+    assert step == web.TILE_STEP
+    default = int(re.search(r"const TILE_DEFAULT=TILES\.slice\(0,(\d+)\)", _js()).group(1))
+    assert web.DASHBOARD_TILES[:default] == web.TILE_DEFAULT
+
+
+@pytest.mark.parametrize("tiles, says", [
+    ("net_pnl", "list"),
+    (["net_pnl", 3, "trades", "wins"], "list"),
+    (["net_pnl", "trades", "wins", "sharpe"], "unknown tile(s): sharpe"),
+    (["net_pnl", "net_pnl", "trades", "wins"], "twice"),
+    (["net_pnl", "trades", "wins"], "3 tiles leaves an empty cell"),
+])
+def test_a_tile_list_the_grid_cannot_hold_is_refused_with_its_reason(tiles, says):
+    """Each rule is one the page depends on, and the reason is what it shows."""
+    problem = web._tiles_problem(tiles)
+    assert problem and says in problem, f"{tiles!r} -> {problem!r}"
+
+
+def test_a_tile_list_the_grid_can_hold_is_accepted():
+    assert web._tiles_problem(list(web.DASHBOARD_TILES)) is None, "all sixteen"
+    assert web._tiles_problem(["inflight", "red_days", "wins", "trades"]) is None
+
+
+def test_the_settings_endpoint_stores_tiles_and_stores_the_default_as_absence(populated):
+    """A chosen arrangement round-trips; the default and a reset both store nothing.
+
+    Absence for the default, as for `scoring`: a stored copy of today's default
+    would freeze it for this reader when the default later changes. A refused list
+    must leave the stored one exactly as it was -- a 400 that half-applied would be
+    a grid with a hole in it on the next load.
+    """
+    four = ["win_rate", "net_pnl", "profit_factor", "avg_pnl"]
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, saved = _post(base, "/api/settings", {"tiles": four})
+        assert (status, saved["ok"]) == (200, True)
+        assert saved["stored"]["tiles"] == four
+        assert _get(base, "/api/state")[1]["settings"]["tiles"] == four
+
+        status, bad = _post(base, "/api/settings", {"tiles": four[:3]})
+        assert (status, bad["kind"]) == (400, "tiles")
+        assert _get(base, "/api/state")[1]["settings"]["tiles"] == four, (
+            "a refused tile list changed what was stored"
+        )
+
+        status, same = _post(base, "/api/settings", {"tiles": list(web.TILE_DEFAULT)})
+        assert (status, same["ok"]) == (200, True)
+        assert "tiles" not in same["stored"], "the default was stored as a copy"
+
+        _post(base, "/api/settings", {"tiles": four})
+        status, reset = _post(base, "/api/settings", {"tiles": None})
+        assert (status, reset["ok"]) == (200, True)
+        assert "tiles" not in reset["stored"], "a reset left a stored arrangement"
 
 
 def test_the_provisional_banner_dashes_ibkrs_date():

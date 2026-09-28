@@ -704,21 +704,22 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
    unpolished here, and no amount of tuning the basis fixes it, because the
    raggedness IS the mechanism.
 
-   So the premise went instead of the layout. Nine cards were never nine peers:
-   one of them is Net P&L, the figure the whole tab exists to report, and it sat
-   the same size in the same box as Avg Loss. Promoting it out of the row leaves
-   EIGHT, which divides evenly into 4, 2 and 1 -- every column count this page
-   uses. Aligned columns, no orphan, and a hierarchy, from removing a card rather
-   than adding a rule.
+   So the premise went instead of the layout, twice. First Net P&L left the row:
+   it was the figure the tab exists to report, sat the same size as Avg Loss, and
+   spanning the full first row as a lead tile left EIGHT, which 4, 2 and 1 all
+   divide. Then the header gained the period's Net P&L beside the month stepper,
+   which made the header the headline, and the lead tile became a second copy of
+   it holding the grid's first row hostage: with one tile spanning it, an ORDER
+   meant nothing, because "put Win Rate first" had nowhere to go.
 
-   (The old comment here rejected exactly this as "moves the hole rather than
-   removing it". That was measured against a hero spanning TWO cells of five,
-   which does move the hole. Spanning the full row at a column count the
-   remainder divides into is a different shape, and it has no hole at any
-   breakpoint -- 8/4, 8/2, 8/1 are all exact.)
+   So the tiles are peers again and the READER chooses them, and what keeps the
+   grid whole is the count rather than the layout: 4, 8, 12 or 16 shown, every one
+   of which 4, 2 and 1 divide. The chooser enforces it and the server refuses
+   anything else (`TILE_STEP` in page.html, `TILE_STEP` in web.py), so a hole is
+   unrepresentable rather than merely unlikely.
 
    THE COLUMN COUNT IS PER SITE, because `.stats` serves four panels and they do
-   not hold the same number of tiles. Four columns is the dashboard's eight; the
+   not hold the same number of tiles. Four columns is the dashboard's; the
    lifecycle card and the watchlist detail hold THREE, which a four-column grid
    orphans exactly the way five orphaned nine; and the 0DTE cohort holds four
    inside a half-width `.duo` card, where four columns measured 148px per tile and
@@ -726,15 +727,11 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
    invariant is checked rather than assumed: every count divides its card total,
    at every breakpoint. A modifier is more words than `auto-fit` and it is the
    right ones -- `auto-fit` sizes to the container and would have put five columns
-   under the dashboard's eight cards, which is the orphan again by another route. */
+   under a twelve-tile dashboard, which is the orphan again by another route. */
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s5)}
 .stats.c3{grid-template-columns:repeat(3,1fr)}
 .stats.c2{grid-template-columns:repeat(2,1fr)}
 .stats>*{min-width:0}
-/* The headline. Full-bleed across the top of the grid rather than a wider tile,
-   because the point is that it is not in the row: a reader should not have to
-   compare it to anything to know it is the answer. */
-.stat.lead{grid-column:1/-1}
 /* A modifier must be named in a query to be changed by it -- `.stats.c3` is
    specificity (0,2,0) and outranks a bare `.stats` whatever the media query. So
    the lists here are deliberate on both counts: what they include AND what they
@@ -789,6 +786,28 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
   cursor:pointer}
 .setrow button:hover:not(:disabled){border-color:var(--accentlit1)}
 .setrow button:disabled{opacity:.4;cursor:not-allowed}
+/* The tile chooser. ONE column, although sixteen rows is tall: the list is an
+   ORDER, and two columns read row by row or column by column depending on who is
+   looking -- the ambiguity this control exists to remove. Capped so the label and
+   its arrows stay within one glance of each other on a wide panel. */
+.tilelist{list-style:none;margin:var(--s3) 0 0;padding:0;max-width:420px;
+  display:flex;flex-direction:column;gap:var(--s1)}
+.tilerow{display:flex;align-items:center;gap:var(--s4);padding:var(--s1) var(--s4);
+  border:1px solid var(--line);border-radius:var(--r2);background:var(--bg2);cursor:grab}
+/* A hidden tile stays in the list at its place, dimmed, so ticking it back
+   returns it where the reader left it rather than at the end. */
+.tilerow.off label{color:var(--dim)}
+/* The drop target. The border rather than the fill, so the row under the pointer
+   reads as "here" without looking selected -- the rule the edition chip follows. */
+.tilerow.over{border-color:var(--accentedge)}
+.tilerow label{flex:1;display:flex;align-items:center;gap:var(--s3);cursor:pointer}
+.grip{color:var(--dim2);font-size:var(--t4)}
+.tilemove{display:flex;gap:var(--s1)}
+.tilemove button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+  border-radius:var(--r1);font:inherit;font-size:var(--t2);line-height:1;
+  padding:var(--s1) var(--s3);cursor:pointer}
+.tilemove button:hover:not(:disabled){color:var(--fg)}
+.tilemove button:disabled{opacity:.35;cursor:not-allowed}
 /* Diagnostics, folded away. The marker is styled as a control because it IS one:
    an unstyled <summary> triangle in a panel of rounded buttons reads as unfinished
    markup rather than as something to click. */
@@ -805,8 +824,9 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
    page", and that was false when it was written: this was 22px against 25px for an
    ordinary `.stat .v` and 34px for `.hero .fig`, so it was the third largest of six
    sizes doing the work of two roles. Stating the role instead of a ranking is what
-   keeps it true -- the page's actual headline is `.stat.lead .v`, which is --t8,
-   and nothing else should claim to be the biggest thing on a page it cannot see. */
+   keeps it true -- the page's actual headline is the header's period figure,
+   `.ppl`, and nothing else should claim to be the biggest thing on a page it
+   cannot see. */
 .big{font-size:var(--t7);font-weight:var(--w-fig);font-family:var(--fig);
   font-variant-numeric:tabular-nums}
 /* The two smaller inline labels beside a lifecycle heading. */
@@ -867,17 +887,6 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
 .stat .v{font-size:var(--t7);font-weight:var(--w-fig);font-family:var(--fig);
   font-variant-numeric:tabular-nums;line-height:1.15}
 .stat .v.sm{font-size:var(--t6)}
-/* The lead card's figure, and these two rules must sit HERE, after the row
-   card's, rather than beside `.stat.lead{grid-column}` where they were first
-   written. `.stat.lead .v.sm` and `.stat .v.sm` are both specificity (0,3,0), so
-   the tie breaks on source order alone -- declared earlier, the lead's long-number
-   figure silently rendered at the row card's 19px, which is SMALLER than the 25px
-   siblings it is meant to head. The one-class difference between the selectors
-   buys nothing; only the position does. */
-.stat.lead .v{font-size:var(--t8)}
-/* The escape hatch the row cards already have, at the lead's own scale: a
-   six-figure sum carrying a currency overflows 32px on a narrow window. */
-.stat.lead .v.sm{font-size:var(--t7)}
 
 .pill{font-size:var(--t2);padding:var(--s2) var(--s5);border-radius:var(--rpill);background:var(--panel2);
   border:1px solid var(--line2);color:var(--dim);white-space:nowrap}

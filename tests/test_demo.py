@@ -178,6 +178,40 @@ def test_has_closed_round_trips_with_wins_and_losses(conn):
     assert 0 < s.win_rate < 100
 
 
+def test_profit_factor_and_average_outcome_reconcile_with_the_averages(conn):
+    """Both are RECOMPUTED here from the win and loss averages the dashboard
+    already shows, never pinned as literals.
+
+    That is the property worth holding: the Profit Factor and Avg P&L per Trade
+    tiles sit beside Avg Win and Avg Loss, so a reader can check one against the
+    others, and they must agree. Gross won is `avg_win * wins`; the ratio divides
+    it by gross lost. The mean outcome includes scratches -- decided at exactly
+    zero, neither won nor lost -- which is why it divides by `decided_campaigns`
+    rather than by `wins + losses`, and why a scratch adds nothing to the sum.
+    """
+    s = month_stats(conn, period=None)
+    assert s.avg_win is not None and s.avg_loss is not None and s.avg_pnl is not None
+    won, lost = s.avg_win.base * s.wins, s.avg_loss.base * s.losses
+    assert s.profit_factor == pytest.approx(won / -lost)
+    assert s.avg_pnl.base == pytest.approx((won + lost) / s.decided_campaigns)
+    # And NOT net P&L over decided: net P&L also holds cash settled inside a
+    # position still running, which no decided outcome earned.
+    if s.inflight_realized.base:
+        assert s.avg_pnl.base != pytest.approx(s.net_pnl.base / s.decided_campaigns)
+
+
+def test_a_month_with_wins_and_no_losses_has_no_profit_factor(conn):
+    """Nothing lost means an infinite ratio, reported as None -- while the average
+    outcome, which has a perfectly good denominator, is still reported."""
+    clean = [m for m in available_months(conn)
+             if (s := month_stats(conn, period=m)).wins and not s.losses]
+    assert clean, "the demo needs a month of wins and no losses to exercise this"
+    for m in clean:
+        s = month_stats(conn, period=m)
+        assert s.profit_factor is None, f"{m}: {s.profit_factor} over zero losses"
+        assert s.avg_pnl is not None and s.avg_pnl.base > 0
+
+
 def test_the_campaign_unit_is_the_default_not_an_opt_in(conn):
     """A caller who passes no linkage must still get the corrected figures.
 

@@ -178,6 +178,13 @@ def test_a_period_with_no_wins_reports_no_average_win_not_a_zero(conn):
         "base": 250.0, "native": None, "ccy": None
     }
 
+    # The two figures derived from the same populations follow the same rule:
+    # no decided unit, no average outcome; nothing lost, no profit factor. An
+    # all-wins month is the case that matters for the second -- the ratio is
+    # infinite there, and a big finite number would read as a measurement.
+    assert view["avg_pnl"] is None and view["profit_factor"] is None
+    assert "avg_pnl" in view and "profit_factor" in view
+
 
 def _leg(
     conn: sqlite3.Connection,

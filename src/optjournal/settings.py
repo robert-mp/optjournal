@@ -62,11 +62,11 @@ FILENAME = ".optjournal.json"
 #: never applies -- the failure mode a settings file invites.
 #:
 #: `dev` is writable HERE (a hand-edited file, or `update(dev=True)`) but is
-#: deliberately absent from `web._settings_write`, which names its two keys by
-#: hand and writes nothing else. So the unauthenticated HTTP surface cannot turn
-#: dev mode on: it is set out-of-band, the way IAG's `is_admin` is a server
-#: decision the client can only read -- see `dev` below.
-_KEYS = frozenset({"query_id", "confirm_query_id", "scoring", "dev"})
+#: deliberately absent from `web._settings_write`, which names its keys by hand
+#: and writes nothing else. So the unauthenticated HTTP surface cannot turn dev
+#: mode on: it is set out-of-band, the way IAG's `is_admin` is a server decision
+#: the client can only read -- see `dev` below.
+_KEYS = frozenset({"query_id", "confirm_query_id", "scoring", "tiles", "dev"})
 
 #: The environment channel for the dev flag. `OPTJOURNAL_DEV=1 optjournal serve`
 #: turns developer-only surfaces on for one session without touching the file.
@@ -245,3 +245,19 @@ def scoring(explicit: str | None = None, *, root: Path | None = None) -> str | N
         return explicit.strip()
     stored = read(root).get("scoring")
     return str(stored).strip() if stored else None
+
+
+def tiles(*, root: Path | None = None) -> list[str] | None:
+    """The dashboard tiles the reader chose to show, in order, or None.
+
+    None is the default arrangement, stored as absence like `scoring`'s default,
+    so a change to the default reaches everyone who never chose. Anything but a
+    list of strings reads as None too: this fails open like `read`, and
+    validation belongs to `web._settings_write`, which owns the vocabulary and
+    refuses a bad list before it is ever stored. A hand-edited file that slips
+    past it lands on the page, which checks again and falls back to the default.
+    """
+    stored = read(root).get("tiles")
+    if not isinstance(stored, list) or not all(isinstance(k, str) for k in stored):
+        return None
+    return stored or None

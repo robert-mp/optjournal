@@ -267,6 +267,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   stored value, so the form must not offer to edit what would not take effect
  * @property {string} scoring -- the scoreboard unit in force, same value as
  *   stats.scoring; here so the settings form reads its own block
+ * @property {string[]|null} tiles -- the dashboard tiles shown, in order; null is
+ *   the default arrangement (settings.tiles, validated by web._settings_write)
  * @property {Object|null} token -- ALWAYS null on load. The keyring has been
  *   measured at 8.2s with a locked keychain, so presence is never read on a page
  *   load: it arrives from /api/settings/token, either from the check button or as
@@ -428,6 +430,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Money|null} avg_win -- null without wins; an average of no
  *   outcomes is undefined, and zero would read as break-even
  * @property {Money|null} avg_loss -- null without losses
+ * @property {Money|null} avg_pnl -- mean decided outcome; null with nothing decided
+ * @property {number|null} profit_factor -- gross won over gross lost; null without losses
  * @property {Money} inflight_realized -- the part of net_pnl that closed inside a
  *   position still running (a roll's near contract). In the money, out of the
  *   scoreboard; provenance, not a forecast, since it can fall
@@ -1273,7 +1277,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload lb:Logbook
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
- * @local leaves PERIOD_TABS pop quotes steps
+ * @local leaves PERIOD_TABS pop quotes steps TILES
+ * @local draft dr order known tilesave tilereset
  * @local JFIELDS entered closed options STATE_KEYS_REQUIRED
  * @local cells days buckets evs glegs lcs legs mons month
  * @local open opts out ps pts rows yrs active shown
@@ -2052,17 +2057,103 @@ function infoTip(html){
     >${html}</span>i</span>`;
 }
 
-/* `card` is the fifth parameter and the only one that lands on the OUTER div:
-   `klass` has always gone on the figure, which is right for a sign tint and
-   useless for anything that must size or place the box. The dashboard's lead
-   card needs `.stat.lead`, and threading it through here rather than wrapping
-   the call keeps one function emitting every stat on the page. */
-function statCard(k,v,note,klass,card){
-  return `<div class="stat${card?' '+card:''}${note?' tipped':''}"${
+/* `tile` is the dashboard registry's key, emitted as `data-tile` so a rendered
+   scoreboard names which tile is which -- the tests count and order them by it,
+   and a data attribute rather than a class because it identifies rather than
+   styles. It used to be `card`, a class for the one tile that needed to size its
+   own box (`.stat.lead`); the lead went with the uniform grid, and with it the
+   only reason for this function to write a class on the outer div. */
+function statCard(k,v,note,klass,tile){
+  return `<div class="stat${note?' tipped':''}"${tile?` data-tile="${tile}"`:''}${
     note?' tabindex="0"':''}>
     <div class="k${note?' hint':''}">${esc(k)}</div>
     <div class="v ${klass||''}">${v}</div>
     ${note?`<div class="tip">${esc(note)}</div>`:''}</div>`;
+}
+
+/* ------------------------------------------------ the dashboard's tiles
+
+   [key, label], in the default order. Every key has a renderer in `dashboard()`;
+   the labels are here so the tile chooser in Settings can list them without a
+   payload to render against.
+
+   THE VISIBLE COUNT IS A MULTIPLE OF FOUR, and that is the grid, not a taste.
+   `.stats` runs 4, 2 and 1 columns across its breakpoints, and a count none of
+   them divides leaves an empty cell -- the orphan app.css records as most of what
+   once read as unpolished here. So 4, 8, 12 or 16 shown: the chooser enforces it
+   and `web._settings_write` refuses anything else. Twelve by default: the nine
+   this tab always had, plus Profit Factor, Avg P&L per Trade and Open Premium. */
+const TILES=[
+  ['net_pnl','Net P&L'],['trades','Trades'],['win_rate','Win Rate'],
+  ['profit_factor','Profit Factor'],
+  ['wins','Winning Trades'],['losses','Losing Trades'],['avg_win','Avg Win'],
+  ['avg_loss','Avg Loss'],
+  ['commissions','Commissions'],['avg_pnl','Avg P&L / Trade'],
+  ['gain','Gain % of Net Liq'],['open_premium','Open Premium'],
+  ['open_positions','Open Positions'],['green_days','Green Days'],
+  ['red_days','Red Days'],['inflight','In-flight Realised'],
+];
+const TILE_STEP=4;
+const TILE_DEFAULT=TILES.slice(0,12).map(t=>t[0]);
+/* The tiles to render, in order: the stored choice if it still holds, else the
+   default. Checked again here although the server refused a bad list on the way
+   in, because the file is hand-editable and a tile can be retired from TILES
+   after a reader chose it -- and a key with no renderer would throw halfway
+   through the dashboard, which is a blank tab rather than a missing tile. */
+function tileKeys(){
+  const chosen=(S.state.settings||{}).tiles;
+  const known=new Set(TILES.map(x=>x[0]));
+  const ok=Array.isArray(chosen)&&chosen.length&&chosen.length%TILE_STEP===0
+    &&new Set(chosen).size===chosen.length&&chosen.every(k=>known.has(k));
+  return ok?chosen:TILE_DEFAULT;
+}
+
+/* THE TILE CHOOSER, in Settings. A draft is edited in `S.tiledraft` and saved in
+   one request, rather than every tick writing through: a count that is not a
+   multiple of four is a legitimate state to pass THROUGH on the way to the one
+   you want -- untick two, tick two others -- and saving on each click would
+   either refuse the middle step or store a grid with a hole in it.
+
+   Two ways to reorder, both writing the same draft. Drag, which is how the
+   reference app does it and how a pointer wants to; and the up and down buttons
+   on each row, because native drag and drop has no keyboard path at all, and a
+   reorder only a mouse can perform is a setting some readers cannot change.
+
+   The draft is null until touched and holds {key,on} for EVERY tile, visible
+   ones first in their order, so a hidden tile keeps its place in the list while
+   it is off and comes back where the reader left it. */
+function tileDraft(){
+  if(S.tiledraft) return S.tiledraft;
+  const shown=tileKeys();
+  return shown.map(k=>({key:k,on:true}))
+    .concat(TILES.map(t=>t[0]).filter(k=>!shown.includes(k)).map(k=>({key:k,on:false})));
+}
+function tileChooser(){
+  const draft=tileDraft(), label=Object.fromEntries(TILES);
+  const n=draft.filter(dr=>dr.on).length;
+  const valid=n>0&&n%TILE_STEP===0;
+  const dirty=!!S.tiledraft;
+  const rows=draft.map((dr,i)=>`<li class="tilerow${dr.on?'':' off'}" draggable="true"
+      data-tilerow="${dr.key}"><span class="grip" aria-hidden="true">⠿</span>
+      <label><input type="checkbox" data-tilecheck="${dr.key}"${dr.on?' checked':''}>
+        ${esc(label[dr.key])}</label>
+      <span class="tilemove">
+        <button data-tilemove="${dr.key}" data-dir="-1" ${i?'':'disabled'}
+          aria-label="Move ${esc(label[dr.key])} up">↑</button>
+        <button data-tilemove="${dr.key}" data-dir="1" ${i<draft.length-1?'':'disabled'}
+          aria-label="Move ${esc(label[dr.key])} down">↓</button></span></li>`).join('');
+  /* The status line says what the count must be BEFORE the reader tries to save,
+     rather than letting Save fail: the rule is arithmetic a reader can satisfy
+     at a glance once it is stated. */
+  return `<h2 class="sub3 mt-5">Dashboard tiles</h2>
+    <div class="note">Drag or use the arrows to reorder. The grid is four across,
+      so show 4, 8, 12 or 16.</div>
+    <ul class="tilelist">${rows}</ul>
+    <div class="setrow"><span class="${valid?'dim':'warn2'}" id="tilestat">${n} shown${
+      valid?'':` — choose a multiple of ${TILE_STEP}`}</span>
+      <button class="btn sm" id="tilesave" ${valid&&dirty?'':'disabled'}>Save tiles</button>
+      <button class="btn sm" id="tilereset"
+        ${(S.state.settings||{}).tiles||dirty?'':'disabled'}>Default</button></div>`;
 }
 function dashboard(){
   const st=S.state, s=st.stats;
@@ -2108,24 +2199,27 @@ function dashboard(){
      needs to see it. Under contract scoring the two are equal, and the note
      saying so twice is honest rather than redundant: it is the reconciliation
      the reader came for. */
-  /* NET P&L LEADS, and it is first in the array rather than somewhere in the
-     middle because `.stat.lead` spans the grid's whole first row -- the DOM order
-     is the layout. It used to be the second of nine co-equal tiles, the same size
-     in the same box as Avg Loss, which left the tab with no headline at all: the
-     one figure the whole dashboard exists to report was findable only by reading
-     its label. Pulling it out is also what makes the grid divide evenly -- see
-     the scoreboard comment in app.css. */
-  const cards=[
-    statCard('Net P&L', moneyOf(s.net_pnl), pnlNote,
+  /* A KEYED REGISTRY, rendered in the order the reader chose. The keys are TILES'
+     at the top of the script, where the chooser in Settings reads their labels;
+     the figures are here because each needs the period's stats in scope.
+
+     Net P&L is first by default and no longer spans the row. It used to be
+     `.stat.lead`, full-width, because the tab otherwise had no headline -- the one
+     figure it exists to report was findable only by reading its label. The
+     header's period figure is that headline now, so the tile can be a peer again,
+     and a uniform grid is what makes an ORDER mean anything: with one tile
+     spanning the first row, "put Win Rate first" had nowhere to go. */
+  const R={
+    net_pnl:()=>statCard('Net P&L', moneyOf(s.net_pnl), pnlNote,
       cls(s.net_pnl.base)+' '+(String(moneyOf(s.net_pnl)).length>10?'sm':''),
-      'lead'),
-    opt
+      'net_pnl'),
+    trades:()=>opt
       ? statCard('Trades', s.decided_campaigns,
           `decided ${unitWord(s,s.decided_campaigns)}`
           +` · ${s.closed_episodes} contract round trip(s)`
-          +` · ${s.total_trades} fill(s), ${s.orders} order(s)`)
+          +` · ${s.total_trades} fill(s), ${s.orders} order(s)`,'','trades')
       : statCard('Total Trades', s.total_trades,
-          s.orders?`${s.orders} order(s)`:''),
+          s.orders?`${s.orders} order(s)`:'','','trades'),
     /* Commission rides the same attribution as the P&L it is already inside:
        for options, the round trip's whole commission lands in its close month.
        Fill-date commission here showed the same euros twice -- July displayed
@@ -2143,7 +2237,7 @@ function dashboard(){
        result was one plain figure in a row of green ones, which reads as a
        number the page forgot to finish rather than as a deliberate neutral.
        A commission is never a gain, so there is no sign to consult. */
-    statCard('Commissions', moneyOf(s.commissions),
+    commissions:()=>statCard('Commissions', moneyOf(s.commissions),
       basisOf(s.commissions)
       +(opt?` · closed round trips${s.open_commission.base?` · ${
         moneyOf(s.open_commission)} on open positions`:''}`
@@ -2152,7 +2246,7 @@ function dashboard(){
          19px this was the only card on the dashboard permanently smaller than
          its neighbours, which read as a different typeface rather than as a
          deliberate size -- and the tint made it obvious. */
-      'neg '+(String(moneyOf(s.commissions)).length>10?'sm':'')),
+      'neg '+(String(moneyOf(s.commissions)).length>10?'sm':''),'commissions'),
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
@@ -2164,32 +2258,72 @@ function dashboard(){
        own `scoring`, never from `S.scoring`: the figures were counted by the
        server, and labelling them from the control would let a stale payload be
        described by a unit it was not counted in. */
-    statCard('Winning Trades', s.wins, unitNote(s), s.wins?'pos':''),
-    statCard('Losing Trades', s.losses, unitNote(s), s.losses?'neg':''),
-    statCard('Win Rate', pct(s.win_rate),
+    wins:()=>statCard('Winning Trades', s.wins, unitNote(s), s.wins?'pos':'','wins'),
+    losses:()=>statCard('Losing Trades', s.losses, unitNote(s), s.losses?'neg':'','losses'),
+    win_rate:()=>statCard('Win Rate', pct(s.win_rate),
       s.decided_campaigns?`${s.decided_campaigns} decided ${unitWord(s,
-        s.decided_campaigns)}`:'nothing decided yet'),
-    statCard('Avg Win', moneyOf(s.avg_win), `per decided ${unitWord(s,1)}`,
-      cls(s.avg_win?.base)),
+        s.decided_campaigns)}`:'nothing decided yet','','win_rate'),
+    avg_win:()=>statCard('Avg Win', moneyOf(s.avg_win), `per decided ${unitWord(s,1)}`,
+      cls(s.avg_win?.base),'avg_win'),
     /* An em-dash on a card whose figure is genuinely absent reads as "this
        failed to load". `none yet` says the same thing as data: there have been
        no losses, which on this card is a fact rather than a gap. Only when the
        population is EMPTY -- no loss has happened -- so a real average loss
        still renders as the number it is, and the `—` remains for the case the
        payload truly has nothing to say. */
-    statCard('Avg Loss',
+    avg_loss:()=>statCard('Avg Loss',
       s.losses===0&&s.decided_campaigns>0?'<span class="nil">none yet</span>'
         :moneyOf(s.avg_loss),
       s.losses===0&&s.decided_campaigns>0
         ?`${s.decided_campaigns} decided, none at a loss`
         :`per decided ${unitWord(s,1)}`,
-      cls(s.avg_loss?.base)),
-    nl!=null
+      cls(s.avg_loss?.base),'avg_loss'),
+    gain:()=>nl!=null
       ? statCard('Gain % of Net Liq', pct(s.gain_pct_of_net_liq,2),
-          `NAV ${cash(nl)} · ${s.net_liq_date||''}`, cls(s.gain_pct_of_net_liq))
+          `NAV ${cash(nl)} · ${s.net_liq_date||''}`, cls(s.gain_pct_of_net_liq),'gain')
       : statCard('Gain % of Net Liq', '—',
-          'enable Equity Summary on the Flex query', 'dim2'),
-  ].join('');
+          'enable Equity Summary on the Flex query', 'dim2','gain'),
+    /* The ratio is tinted by which side of 1 it falls, not by `cls()`: it is not a
+       signed amount, so the `+` glyph `.signed` would prefix is wrong for it, and
+       0.8 is a loss-making book even though the number is positive. Absent losses
+       it is infinite; saying "no losses" names that fact where a dash would read as
+       a figure that failed to load, the rule Avg Loss's "none yet" already follows. */
+    profit_factor:()=>{
+      const pf=s.profit_factor;
+      return statCard('Profit Factor',
+        pf!=null?num(pf,2)
+          :s.wins&&!s.losses?'<span class="nil">no losses</span>':'—',
+        pf!=null?`gross won over gross lost · ${s.decided_campaigns} decided ${
+          unitWord(s,s.decided_campaigns)}`:s.wins&&!s.losses
+          ?`${s.wins} won, none lost`:'nothing decided yet',
+        pf==null?'':pf>1?'pos':pf<1?'neg':'','profit_factor');},
+    /* Over DECIDED units, scratches included, and not Net P&L over the count: Net
+       P&L also carries cash settled inside a position still running, which no
+       decided outcome earned. The server computes it from the same list the
+       wins and losses split. */
+    avg_pnl:()=>statCard('Avg P&L / Trade', moneyOf(s.avg_pnl),
+      `per decided ${unitWord(s,1)}, scratches included`,
+      cls(s.avg_pnl?.base),'avg_pnl'),
+    /* The figure the header's pill also shows. A tile as well because a pill is
+       fixed and a tile is chosen: a premium seller who wants it beside the win
+       rate can have it there, and one who does not can hide it. */
+    open_premium:()=>statCard('Open Premium', moneyOf(s.open_premium),
+      'collected on shorts, paid on longs · not in Net P&L until it closes',
+      cls(s.open_premium.base),'open_premium'),
+    open_positions:()=>statCard('Open Positions', s.open_positions,
+      `${s.open_episodes} open contract(s), a multi-leg strategy counted once`,
+      '','open_positions'),
+    green_days:()=>statCard('Green Days', s.green_days,
+      'days whose realised P&L closed above zero', s.green_days?'pos':'','green_days'),
+    red_days:()=>statCard('Red Days', s.red_days,
+      'days whose realised P&L closed below zero', s.red_days?'neg':'','red_days'),
+    /* Never "unrealised": see the in-flight clause on Net P&L above. This is cash
+       that settled, inside a decision that has not. */
+    inflight:()=>statCard('In-flight Realised', moneyOf(s.inflight_realized),
+      'in Net P&L, but inside a position still running', cls(s.inflight_realized.base),
+      'inflight'),
+  };
+  const cards=tileKeys().map(k=>R[k]()).join('');
 
   /* WHAT THIS PANEL SAYS ON SIGHT, AND WHAT IT SAYS ON ASK.
    *
@@ -5514,6 +5648,7 @@ function settingsPanel(){
     )}</div>
 
     ${scoringRow()}
+    ${tileChooser()}
 
     <details class="adv mt-5"${st.dev?' open':''}>
       <summary>Advanced — journal details and archive</summary>
@@ -5844,6 +5979,51 @@ function draw(push){
       await save({scoring:unit});
       load();
     });
+  /* The tile chooser edits a draft; nothing here reaches the server until Save.
+     Every handler copies the draft, changes the copy, and redraws, so the list on
+     screen is always a rendering of `S.tiledraft` and never a DOM the page has
+     rearranged under its own state. */
+  const moveTile=(key,to)=>{
+    const order=tileDraft().slice(), from=order.findIndex(dr=>dr.key===key);
+    if(from<0||to<0||to>=order.length||from===to) return;
+    const [it]=order.splice(from,1); order.splice(to,0,it);
+    S.tiledraft=order; draw();
+  };
+  document.querySelectorAll('input[data-tilecheck]').forEach(el=>
+    el.onchange=()=>{
+      S.tiledraft=tileDraft().map(dr=>dr.key===el.dataset.tilecheck?{...dr,on:el.checked}:dr);
+      draw();});
+  document.querySelectorAll('button[data-tilemove]').forEach(b=>
+    b.onclick=()=>{const k=b.dataset.tilemove;
+      moveTile(k,tileDraft().findIndex(dr=>dr.key===k)+Number(b.dataset.dir));});
+  /* Native drag and drop. The dragged key rides in dataTransfer as well as in a
+     closure, because Firefox starts no drag at all without `setData`. `dragover`
+     must cancel its default or the row refuses the drop; the highlight is a
+     class, never a style write, which this page does not make. */
+  document.querySelectorAll('[data-tilerow]').forEach(el=>{
+    el.ondragstart=ev=>{S.tiledrag=el.dataset.tilerow;
+      ev.dataTransfer.setData('text/plain',el.dataset.tilerow);};
+    el.ondragover=ev=>{ev.preventDefault();el.classList.add('over');};
+    el.ondragleave=()=>el.classList.remove('over');
+    el.ondrop=ev=>{ev.preventDefault();
+      const k=S.tiledrag||ev.dataTransfer.getData('text/plain'); S.tiledrag=null;
+      moveTile(k,tileDraft().findIndex(dr=>dr.key===el.dataset.tilerow));};
+  });
+  const tilesave=$('#tilesave');
+  if(tilesave) tilesave.onclick=async()=>{
+    const res=await save({tiles:tileDraft().filter(dr=>dr.on).map(dr=>dr.key)});
+    /* The server's reason on refusal, not a local guess, as the query-id form
+       does: it owns the rule, and the page restating it is two rules to keep in
+       step. */
+    if(!res||!res.ok){note(esc((res&&res.message)||'could not save the tiles'),'bad');return;}
+    S.tiledraft=null; note('Dashboard tiles saved.','ok'); load();
+  };
+  const tilereset=$('#tilereset');
+  if(tilereset) tilereset.onclick=async()=>{
+    const res=await save({tiles:null});
+    if(!res||!res.ok){note(esc((res&&res.message)||'could not reset the tiles'),'bad');return;}
+    S.tiledraft=null; load();
+  };
   const qidsave=$('#qidsave');
   if(qidsave) qidsave.onclick=async()=>{
     const el=$('#qid'), msg=$('#qidmsg');

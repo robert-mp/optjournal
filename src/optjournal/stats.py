@@ -395,6 +395,20 @@ class MonthStats:
     #: is undefined, and zero would read as a break-even trade.
     avg_win: Money | None = None
     avg_loss: Money | None = None
+    #: The mean outcome over every decided unit, wins, losses and scratches
+    #: together -- the same name and meaning as `Cohort.avg_pnl`. None under the
+    #: rule above: no decided unit, no average. NOT `net_pnl / decided`: net P&L
+    #: also holds cash settled inside a position still running
+    #: (`inflight_realized`), which belongs to no decided outcome, and dividing it
+    #: across the ones that are decided would credit them with money they did
+    #: not make.
+    avg_pnl: Money | None = None
+    #: Gross won over gross lost, both in base. None when nothing was lost -- the
+    #: ratio is then infinite, and a very large finite number would read as a
+    #: measurement rather than as the absence of a denominator. Summed from the
+    #: same `won` and `lost` lists the averages divide, so it cannot disagree
+    #: with the Avg Win and Avg Loss tiles beside it.
+    profit_factor: float | None = None
 
     #: Net premium sitting in *currently open* episodes: positive when short
     #: premium was collected, negative for long debits. Point-in-time like
@@ -1159,12 +1173,18 @@ def month_stats(
     # contributing EPISODES' currencies rather than by re-gating campaign
     # totals: a sum of already-gated figures cannot tell a native withheld for
     # being mixed from one that was never there.
-    stats.avg_win = Money.charged(
+    gross_won = Money.charged(
         (e.realized_pnl_base, e.realized_pnl, e.currency) for c in won for e in c
-    ).per(len(won))
-    stats.avg_loss = Money.charged(
+    )
+    gross_lost = Money.charged(
         (e.realized_pnl_base, e.realized_pnl, e.currency) for c in lost for e in c
-    ).per(len(lost))
+    )
+    stats.avg_win = gross_won.per(len(won))
+    stats.avg_loss = gross_lost.per(len(lost))
+    stats.avg_pnl = Money.charged(
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for c in decided for e in c
+    ).per(len(decided))
+    stats.profit_factor = gross_won.base / -gross_lost.base if gross_lost.base else None
     # The part of `net_pnl` whose position has not finished: episodes this period
     # counted as closed that sit in a campaign still running. Taken from the SAME
     # `units` the scoreboard uses, so the figure that explains the gap cannot
@@ -1219,6 +1239,8 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "win_rate": stats.win_rate,
         "avg_win": None if stats.avg_win is None else stats.avg_win.payload(),
         "avg_loss": None if stats.avg_loss is None else stats.avg_loss.payload(),
+        "avg_pnl": None if stats.avg_pnl is None else stats.avg_pnl.payload(),
+        "profit_factor": stats.profit_factor,
         "inflight_realized": stats.inflight_realized.payload(),
         "open_premium": stats.open_premium.payload(),
         "open_commission": stats.open_commission.payload(),

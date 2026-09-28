@@ -177,6 +177,47 @@ KEYRING_TIMEOUT_S = 4.0
 #: truncating.
 JOURNAL_BODY_LIMIT = 65536
 
+#: The dashboard's tiles, in default order -- a mirror of `TILES` in page.html,
+#: held here so `_settings_write` can refuse a key the page cannot render. Two
+#: copies of one list, pinned together by tests/test_web.py the way `sweep.TABS`
+#: is pinned to the page's `TABS`: the page needs the labels, the server needs
+#: the vocabulary, and neither can import the other.
+DASHBOARD_TILES = (
+    "net_pnl", "trades", "win_rate", "profit_factor",
+    "wins", "losses", "avg_win", "avg_loss",
+    "commissions", "avg_pnl", "gain", "open_premium",
+    "open_positions", "green_days", "red_days", "inflight",
+)
+#: The visible count must be a multiple of this, because `.stats` runs 4, 2 and 1
+#: columns and any other count leaves an empty cell. Mirrors `TILE_STEP` in the
+#: page, pinned by the same test.
+TILE_STEP = 4
+#: What the page shows when nothing is stored. A stored copy of it is stored as
+#: absence instead, so a later change to the default reaches every reader who
+#: never chose -- the rule `scoring`'s default already follows.
+TILE_DEFAULT = DASHBOARD_TILES[:12]
+
+
+def _tiles_problem(tiles: Any) -> str | None:
+    """Why a submitted tile list cannot be stored, or None when it can.
+
+    A reason rather than a bool, because the page shows the server's message
+    rather than guessing one -- the same arrangement as the query-id check. Every
+    rule is one the grid or the page depends on: a known key renders, a repeated
+    one would render twice, and a count off the step leaves a hole.
+    """
+    if not isinstance(tiles, list) or not all(isinstance(k, str) for k in tiles):
+        return "tiles must be a list of tile names"
+    unknown = sorted(set(tiles) - set(DASHBOARD_TILES))
+    if unknown:
+        return f"unknown tile(s): {', '.join(unknown)}"
+    if len(set(tiles)) != len(tiles):
+        return "a tile is listed twice"
+    if len(tiles) % TILE_STEP:
+        return (f"{len(tiles)} tiles leaves an empty cell in the grid; "
+                f"show a multiple of {TILE_STEP}")
+    return None
+
 #: The keys `/api/journal` reads for itself. Everything else in the body is a
 #: journal field, and `journal.FIELDS` is what judges it -- see `_journal_write`
 #: on why this endpoint must not do its own filtering.
@@ -639,6 +680,8 @@ def build_state(
         # form offering to edit it can never be lying about taking effect.
         "confirm_query_id": prefs.confirm_query_id(),
         "scoring": state["stats"]["scoring"],
+        # The reader's dashboard tiles, or null for the default arrangement.
+        "tiles": prefs.tiles(),
         # Deliberately NOT a keyring lookup. `flex.read_token` reaches the OS
         # credential store, which has been measured at 8.2s on this machine when
         # the keychain needs unlocking -- once per page load, on every tab. The
@@ -1214,6 +1257,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # The DEFAULT is stored as absence, matching the hash and the wire:
             # one spelling of "position" rather than two that can disagree.
             changes["scoring"] = None if raw in ("", POSITION_SCORING) else raw
+        if "tiles" in body:
+            tiles = body.get("tiles")
+            if tiles in (None, []):
+                # An explicit reset. Absence is the default, as for `scoring`.
+                changes["tiles"] = None
+            else:
+                problem = _tiles_problem(tiles)
+                if problem:
+                    return 400, {"ok": False, "kind": "tiles", "message": problem}
+                changes["tiles"] = None if tuple(tiles) == TILE_DEFAULT else list(tiles)
         if not changes:
             return 400, {"ok": False, "kind": "empty",
                          "message": "no known setting in the request"}
