@@ -28,16 +28,54 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from optjournal.clock import MARKET_TZ
 from optjournal.flex import fetch
 from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
 
-__all__ = ["SNAPSHOTS_KEPT", "SNAPSHOT_DIR", "sync_journal"]
+__all__ = ["SNAPSHOTS_KEPT", "SNAPSHOT_DIR", "first_sync_window", "sync_journal"]
 
 log = logging.getLogger(__name__)
+
+#: How far the first sync reaches back, as an inclusive span. IBKR serves at most
+#: ~365 days per Flex request; the two full-year statements in `raw/` are
+#: 20250801-20260731 and 20250810-20260803, both accepted.
+FIRST_SYNC_SPAN_DAYS = 365
+
+
+def first_sync_window(today: date) -> tuple[str, str]:
+    """The `fd`/`td` pair for a journal's first sync: the last year, as YYYYMMDD.
+
+    WHY A NEW JOURNAL NEEDS ONE: the saved query is `Last30CalendarDays`, so
+    without an override a new user's first sync returns a month and the older
+    eleven are never asked for.
+
+    Three IBKR rules shape it, and each broken one costs a request against the
+    lockout budget: both dates or neither, `td` no later than yesterday, and no
+    weekend dates. py_ibkr's CLI applies the last two; `FlexClient.download`,
+    which `flex.fetch` calls, does not. So the end rolls BACK to a weekday; the
+    start needs no roll, because 364 days is exactly 52 weeks and it lands on
+    the end's own weekday.
+    """
+    to = today - timedelta(days=1)
+    while to.weekday() >= 5:
+        to -= timedelta(days=1)
+    start = to - timedelta(days=FIRST_SYNC_SPAN_DAYS - 1)
+    return start.strftime("%Y%m%d"), to.strftime("%Y%m%d")
+
+
+def _is_new_journal(conn: sqlite3.Connection) -> bool:
+    """No statement has ever been ingested.
+
+    `statements`, not `trades`: an account with a quiet year has statements and
+    no trades, and keying on trades would re-request the year on every sync.
+    Confirms also write `statements` rows, but `optjournal confirms` refuses to
+    run before a statement exists, so an empty table still means a new user.
+    """
+    return conn.execute("SELECT 1 FROM statements LIMIT 1").fetchone() is None
 
 
 def _now() -> str:
@@ -107,6 +145,12 @@ def sync_journal(
     query is `Last30CalendarDays`, so every statement comes back for a request.
     """
     started = _now()
+    first_sync = from_date is None and to_date is None and _is_new_journal(conn)
+    if first_sync:
+        # Still ONE request under the same lock and cooldown, so the lockout
+        # guard is untouched; it only asks that request for a longer period.
+        from_date, to_date = first_sync_window(datetime.now(MARKET_TZ).date())
+        log.info("new journal: requesting %s to %s", from_date, to_date)
     result = fetch(
         query_id, archive_dir=archive_dir,
         from_date=from_date, to_date=to_date, force=force,
@@ -143,6 +187,8 @@ def sync_journal(
         if changed
         else f"no new activity (positions refreshed: {ingested.positions_written})"
     )
+    if first_sync:
+        summary = f"first sync, fetched {from_date} to {to_date}: {summary}"
     return {
         "ok": True,
         "kind": "synced",

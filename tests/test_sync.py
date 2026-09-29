@@ -26,6 +26,7 @@ What the tests here are about:
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -282,3 +283,108 @@ def test_a_sync_that_changed_nothing_writes_no_snapshot(populated, monkeypatch):
         "the day something actually happened"
     )
     assert result["snapshot"] is None
+
+
+# --------------------------------------------------------------------------
+# The first sync reaches back a year.
+#
+# The saved query is `Last30CalendarDays`, so a new user's first sync used to
+# return a month. `sync_journal` now asks that one request for the last year when
+# no statement has ever been ingested.
+# --------------------------------------------------------------------------
+
+
+def _stub_fetch(monkeypatch, calls: list[dict]):
+    """Record what `sync_journal` asked for; answer with a real archived statement."""
+    from optjournal import sync as mod  # noqa: PLC0415 - local to this test
+    from optjournal.archive import newest_statement  # noqa: PLC0415 - local
+
+    archive = newest_statement(RAW_DIR)
+    assert archive is not None, "the archive holds no statement to ingest"
+
+    class _Fetched:
+        raw_path = archive
+        raw_bytes = archive.stat().st_size
+        is_duplicate = True
+
+    def fetch(*_a, **kwargs):
+        calls.append(kwargs)
+        return _Fetched()
+
+    monkeypatch.setattr(mod, "fetch", fetch)
+    monkeypatch.setattr(mod, "_snapshot", lambda conn: None)
+    return mod
+
+
+def test_a_new_journal_asks_for_the_last_year(tmp_path, monkeypatch):
+    from optjournal.db import open_journal  # noqa: PLC0415 - local to this test
+
+    calls: list[dict] = []
+    mod = _stub_fetch(monkeypatch, calls)
+    with open_journal(tmp_path / "journal.db") as conn:
+        result = mod.sync_journal(conn=conn, archive_dir=tmp_path, query_id="1")
+
+    (asked,) = calls
+    assert asked["from_date"] is not None and asked["to_date"] is not None, (
+        "a new journal got the template's 30 days instead of a year"
+    )
+    assert result["summary"].startswith(
+        f"first sync, fetched {asked['from_date']} to {asked['to_date']}"
+    )
+
+
+def test_a_journal_with_statements_keeps_the_template_period(populated, monkeypatch):
+    from optjournal.db import connect  # noqa: PLC0415 - local to this test
+
+    calls: list[dict] = []
+    mod = _stub_fetch(monkeypatch, calls)
+    conn = connect(populated)
+    result = mod.sync_journal(conn=conn, archive_dir=RAW_DIR, query_id="1")
+    conn.close()
+
+    (asked,) = calls
+    assert asked["from_date"] is None and asked["to_date"] is None, (
+        "a daily sync re-requested a year, spending a longer generation for nothing"
+    )
+    assert not result["summary"].startswith("first sync")
+
+
+def test_dates_passed_explicitly_win_on_a_new_journal(tmp_path, monkeypatch):
+    from optjournal.db import open_journal  # noqa: PLC0415 - local to this test
+
+    calls: list[dict] = []
+    mod = _stub_fetch(monkeypatch, calls)
+    with open_journal(tmp_path / "journal.db") as conn:
+        mod.sync_journal(conn=conn, archive_dir=tmp_path, query_id="1",
+                         from_date="20260105", to_date="20260109")
+
+    (asked,) = calls
+    assert (asked["from_date"], asked["to_date"]) == ("20260105", "20260109")
+
+
+@pytest.mark.parametrize(("today", "expected"), [
+    # Tuesday: yesterday is Monday, a year back is a Tuesday.
+    (date(2026, 9, 29), ("20250929", "20260928")),
+    # Monday: yesterday is Sunday, so the end rolls back to Friday.
+    (date(2026, 9, 28), ("20250926", "20260925")),
+    # Sunday: the end rolls back to Friday, and the start lands 52 weeks
+    # earlier on a Friday too.
+    (date(2026, 8, 9), ("20250808", "20260807")),
+])
+def test_first_sync_window_edges(today, expected):
+    from optjournal.sync import first_sync_window  # noqa: PLC0415 - local
+
+    assert first_sync_window(today) == expected
+
+
+def test_first_sync_window_holds_ibkrs_rules_for_every_day_of_a_year():
+    from optjournal.sync import FIRST_SYNC_SPAN_DAYS, first_sync_window  # noqa: PLC0415
+
+    start_of_year = date(2026, 1, 1)
+    for offset in range(366):
+        today = start_of_year + timedelta(days=offset)
+        start, end = (datetime.strptime(d, "%Y%m%d").date()
+                      for d in first_sync_window(today))
+        assert end < today, f"{today}: td {end} is not before today"
+        assert end.weekday() < 5 and start.weekday() < 5, f"{today}: weekend date"
+        assert (end - start).days + 1 <= FIRST_SYNC_SPAN_DAYS, f"{today}: too long"
