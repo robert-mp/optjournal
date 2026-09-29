@@ -51,7 +51,7 @@ from optjournal.flex import (
 )
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_confirms
 from optjournal.locks import LockTimeout, locked
-from optjournal.sync import sync_journal
+from optjournal.sync import import_history, sync_journal
 
 __all__ = [
     "JOBS",
@@ -90,7 +90,9 @@ RUN_HISTORY = 200
 #: A CHECKED SET rather than free text, because a typo'd job name is invisible: it
 #: would write rows nothing reads and leave the real job looking as if it never ran
 #: -- the exact failure this ledger exists to make visible.
-KNOWN_JOBS = frozenset({"sync", "confirm", "bars_live", "bars_daily", "market"})
+KNOWN_JOBS = frozenset({
+    "sync", "confirm", "bars_live", "bars_daily", "market", "history",
+})
 
 #: Statuses a run may end in. `running` is written BEFORE the work starts (step 5),
 #: so a killed process leaves evidence rather than an unclaimed slot.
@@ -261,7 +263,8 @@ class Catchup(enum.Enum):
     #: Not a wall-clock fire at all -- due while inside a window and the last
     #: success is old enough. `bars_live` only, see its Job below.
     WINDOW = "window"
-    #: A missed instant is simply missed.
+    #: A missed instant is simply missed. With no `weekdays` there is no instant
+    #: to miss: the job runs only when asked (`history`).
     NONE = "none"
 
 
@@ -449,6 +452,29 @@ def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     except (FetchCooldown, TokenMissing, TokenRejected) as exc:
         return sync_outcome(exc)
     return sync_outcome(result)
+
+
+def _history(conn: sqlite3.Connection, ctx: Context) -> Outcome:
+    """Import the years before the journal's oldest statement. Run by hand only.
+
+    `ok` when anything was fetched, even if a later chunk was refused: the years
+    that landed are real, and the refusal is named in the detail. `failed` only
+    when the first chunk was refused, because then nothing happened.
+    """
+    if not ctx.query_id:
+        return Outcome("failed", "no Flex query id configured")
+    try:
+        result = import_history(
+            conn=conn, archive_dir=ctx.archive_dir, query_id=ctx.query_id,
+            assets=ctx.assets,
+        )
+    except (TokenMissing, TokenRejected) as exc:
+        return Outcome("failed", f"credentials: {exc}")
+    fetched, planned = len(result["fetched"]), result["planned"]
+    if fetched:
+        return Outcome("ok", result["summary"], fetched, planned)
+    return Outcome("failed" if result["stopped"] else "nothing",
+                   result["summary"], fetched, planned)
 
 
 #: How long a Trade Confirmation poll waits before asking again.
@@ -646,6 +672,18 @@ JOBS: tuple[Job, ...] = (
         minute=0, hour=11, weekdays=(1, 2, 3, 4, 5), zone="Europe/Dublin",
         catchup=Catchup.LATEST, window_s=24 * 3600,   # the feed serves this week
         timeout_s=120,
+    ),
+    Job(
+        name="history",
+        run=_history,
+        # NEVER SCHEDULED: no weekdays means no instant, so `due_jobs` never
+        # returns it. A one-off import spending up to five requests is the
+        # reader's decision, made from the page with the count in front of them.
+        minute=0, hour=0, weekdays=(), zone="UTC",
+        catchup=Catchup.NONE, window_s=0,
+        # Five chunks at `flex.MAX_RETRIES`' 660s ceiling, plus the pauses.
+        timeout_s=5 * 660 + 4 * 30,
+        spends_broker_request=True,
     ),
 )
 

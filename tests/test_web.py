@@ -345,6 +345,9 @@ _UNSAMPLED = frozenset({
     # A used exit trigger needs a written review, and the fixture archive has no
     # journal rows. Exercised directly in test_serialize.
     "TriggerTally",
+    # The demo account opened the day its only statement starts, so its history
+    # plan is rightly empty. Exercised directly in test_sync.
+    "HistoryChunk",
     "MarketFetch", "WatchWrite", "QuoteReply", "Quote",
     # Reached only through `QuoteReply.ranks`, the `/api/quotes` reply, not the
     # state payload -- so no `/api/state` sample can carry it, exactly like
@@ -7410,3 +7413,17 @@ def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, 
         _, reply = _get(base, "/api/quotes")
     assert calls == ["ZZZQ"], "a failure is stamped, so the day's budget is spent"
     assert reply["earnings_failed"] == []
+
+
+def test_each_job_row_says_how_many_requests_one_run_spends():
+    """The confirm dialogue reads this, so it must not say "one" for five."""
+    from optjournal.web import _with_request_counts
+
+    scheduler = {"jobs": [
+        {"job": "sync", "spends_request": True},
+        {"job": "market", "spends_request": False},
+        {"job": "history", "spends_request": True},
+    ]}
+    plan = [("20240802", "20250801"), ("20230804", "20240802")]
+    counts = {r["job"]: r["requests"] for r in _with_request_counts(scheduler, plan)["jobs"]}
+    assert counts == {"sync": 1, "market": 0, "history": 2}

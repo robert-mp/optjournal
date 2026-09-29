@@ -28,15 +28,23 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from py_ibkr import FlexError
+
+from optjournal.archive import account_opened
 from optjournal.clock import MARKET_TZ
 from optjournal.flex import fetch
 from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
 
-__all__ = ["SNAPSHOTS_KEPT", "SNAPSHOT_DIR", "first_sync_window", "sync_journal"]
+__all__ = [
+    "SNAPSHOTS_KEPT", "SNAPSHOT_DIR", "first_sync_window", "history_chunks",
+    "import_history", "sync_journal",
+]
 
 log = logging.getLogger(__name__)
 
@@ -60,11 +68,23 @@ def first_sync_window(today: date) -> tuple[str, str]:
     start needs no roll, because 364 days is exactly 52 weeks and it lands on
     the end's own weekday.
     """
-    to = today - timedelta(days=1)
-    while to.weekday() >= 5:
-        to -= timedelta(days=1)
+    to = _weekday_back(today - timedelta(days=1))
     start = to - timedelta(days=FIRST_SYNC_SPAN_DAYS - 1)
     return start.strftime("%Y%m%d"), to.strftime("%Y%m%d")
+
+
+def _weekday_back(day: date) -> date:
+    """`day`, or the Friday before it when it falls on a weekend."""
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
+
+
+def _weekday_forward(day: date) -> date:
+    """`day`, or the Monday after it when it falls on a weekend."""
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
 
 
 def _is_new_journal(conn: sqlite3.Connection) -> bool:
@@ -207,6 +227,147 @@ def sync_journal(
         "positions_written": ingested.positions_written,
         "warnings": ingested.warnings,
         "changed": changed,
+        "snapshot": None if snapshot is None else snapshot.name,
+        "summary": summary,
+    }
+
+
+#: Calendar years IBKR keeps before the current one. "Four previous calendar
+#: years plus the current one, the same as any saved Flex query":
+#: `docs/trade-confirmations.md`, Retention.
+HISTORY_YEARS_KEPT = 4
+
+#: Seconds between two chunks of a history import. IBKR's published pacing is
+#: 10 requests a minute per token, and one chunk is at least two (SendRequest,
+#: GetStatement). Thirty seconds keeps five chunks near four a minute when every
+#: statement is ready at once, which is the case that would otherwise burst.
+HISTORY_PAUSE_S = 30
+
+
+def history_chunks(
+    covered_from: date | None, opened: date | None, today: date,
+) -> list[tuple[str, str]]:
+    """The requests a history import makes, NEWEST FIRST, as (fd, td) YYYYMMDD.
+
+    It walks back from the oldest statement the journal holds, so a second
+    import asks only for what the first did not reach, and an import that already
+    reached the floor asks for nothing. Gaps between statements are not this
+    function's to fill: the daily sync's 30-day overlap keeps the recent past
+    whole.
+
+    The floor is the later of IBKR's retention (1 January, four years back) and
+    the account's opening day. Each chunk holds IBKR's rules the way
+    `first_sync_window` does: at most 365 days inclusive, no weekend dates, and
+    nothing later than yesterday.
+
+    ADJACENT CHUNKS SHARE A DAY, and so does the first chunk with the oldest
+    statement. Ending a chunk the day before the next one starts leaves a hole
+    whenever that start is a Monday: the day before is a Sunday, which rolls back
+    to Friday, and a cash row dated that weekend is in neither request. Ingest is
+    an idempotent upsert, so the shared day costs nothing.
+    """
+    floor = date(today.year - HISTORY_YEARS_KEPT, 1, 1)
+    if opened is not None:
+        floor = max(floor, opened)
+    if covered_from is not None and covered_from <= floor:
+        return []
+    end = covered_from if covered_from is not None else today - timedelta(days=1)
+    chunks: list[tuple[str, str]] = []
+    while True:
+        end = _weekday_back(end)
+        reach = end - timedelta(days=FIRST_SYNC_SPAN_DAYS - 1)
+        start = _weekday_forward(max(reach, floor))
+        if end < floor or start > end:
+            return chunks
+        chunks.append((start.strftime("%Y%m%d"), end.strftime("%Y%m%d")))
+        if reach <= floor:
+            return chunks
+        end = start
+
+
+def history_plan(
+    conn: sqlite3.Connection, archive_dir: Path, *, today: date | None = None,
+) -> list[tuple[str, str]]:
+    """`history_chunks` for this journal: what an import would ask for now."""
+    row = conn.execute(
+        "SELECT MIN(from_date) AS earliest FROM statements"
+        " WHERE source_file LIKE 'activity-%'"
+    ).fetchone()
+    opened = account_opened(archive_dir)
+    return history_chunks(
+        date.fromisoformat(row["earliest"]) if row and row["earliest"] else None,
+        datetime.strptime(opened, "%Y%m%d").date() if opened else None,
+        today or datetime.now(MARKET_TZ).date(),
+    )
+
+
+def import_history(
+    *,
+    conn: sqlite3.Connection,
+    archive_dir: Path,
+    query_id: str,
+    assets: tuple[str, ...] = DEFAULT_ASSET_FILTER,
+    pause_s: float = HISTORY_PAUSE_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Fetch and ingest everything IBKR still holds that the journal does not.
+
+    One chunk per `history_plan` entry, newest first, so the most useful year
+    lands first and a run that stops early has still done the best part.
+
+    `force=True` on every fetch, and only here. The cooldown exists because a
+    second Activity Statement inside fifteen minutes cannot hold anything new;
+    a chunk for a different period can, and the reader confirmed the request
+    count before starting. The lock is still taken per fetch.
+
+    STOPS AT THE FIRST REFUSED CHUNK rather than skipping it. Older chunks would
+    meet the same refusal (retention, an account younger than its statement
+    claims) and each would spend a request to learn it. Credentials are not a
+    stop but a raise: no chunk can succeed without them, and the job maps them
+    to `failed` the way it does for the daily sync.
+    """
+    started = _now()
+    plan = history_plan(conn, archive_dir)
+    fetched: list[str] = []
+    stopped: str | None = None
+    for i, (fd, td) in enumerate(plan):
+        if i:
+            sleep(pause_s)
+        log.info("history import: requesting %s to %s", fd, td)
+        try:
+            result = fetch(query_id, archive_dir=archive_dir,
+                           from_date=fd, to_date=td, force=True)
+        except FlexError as exc:
+            stopped = f"{fd} to {td} refused: {exc}"
+            log.warning("history import stopped: %s", stopped)
+            break
+        ingest_file(conn, result.raw_path, assets=assets)
+        fetched.append(f"{fd}-{td}")
+
+    new_trades = conn.execute(
+        "SELECT COUNT(*) AS n FROM trades WHERE first_seen_at >= ?", (started,),
+    ).fetchone()["n"]
+    new_cash = conn.execute(
+        "SELECT COUNT(*) AS n FROM cash_transactions WHERE first_seen_at >= ?",
+        (started,),
+    ).fetchone()["n"]
+    snapshot = _snapshot(conn) if new_trades or new_cash else None
+
+    if not plan:
+        summary = "history already complete back to what IBKR keeps"
+    else:
+        summary = (f"{len(fetched)} of {len(plan)} year(s) fetched: "
+                   f"{new_trades} new trade(s), {new_cash} new cash row(s)")
+        if stopped:
+            summary += f"; stopped at {stopped}"
+    return {
+        "ok": True,
+        "kind": "history",
+        "planned": len(plan),
+        "fetched": fetched,
+        "stopped": stopped,
+        "new_trades": new_trades,
+        "new_cash": new_cash,
         "snapshot": None if snapshot is None else snapshot.name,
         "summary": summary,
     }

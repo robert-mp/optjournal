@@ -147,7 +147,7 @@ from optjournal.strategies import (
     position_groups,
     strategy_groups,
 )
-from optjournal.sync import sync_journal
+from optjournal.sync import history_plan, sync_journal
 
 __all__ = ["build_state", "serve", "serve_ephemeral"]
 
@@ -503,6 +503,7 @@ def build_state(
         # sub-millisecond `LOCK_NB` attempts in the common case, and zero when no
         # row says `running`.
         interrupted_runs(conn, archive_dir=archive_dir)
+        plan = history_plan(conn, archive_dir)
         # One history pass over the home category, reused by the scope, the
         # cohorts and every period row below.
         report = build_history(conn, asset_category=asset_category)
@@ -615,7 +616,11 @@ def build_state(
             "watchlist": watchlist_data(conn),
             # What the scheduler has done, and whether it is running at all.
             # Read-only here: the runner writes, the page renders.
-            "scheduler": jobs_data(conn, now=datetime.now(UTC)),
+            "scheduler": _with_request_counts(
+                jobs_data(conn, now=datetime.now(UTC)), plan),
+            # The requests a history import would make now, newest first, so the
+            # Advanced panel can say how many before anyone presses it.
+            "history_plan": [{"from": fd, "to": td} for fd, td in plan],
             # Computed on EVERY load, unconditionally, and that is the design
             # rather than laziness: this used to be a cron, so the watchdog and
             # the thing it watched could stop together -- and did, for two days,
@@ -793,6 +798,22 @@ def build_state(
         ),
     }
     return state
+
+
+def _with_request_counts(
+    scheduler: dict[str, Any], plan: list[tuple[str, str]],
+) -> dict[str, Any]:
+    """Stamp each job row with the IBKR requests one run of it would spend.
+
+    `spends_request` says WHETHER; the confirm dialogue also has to say HOW MANY,
+    and for `history` that is the plan's length, which only this layer can see
+    (it needs the archive as well as the database). One count per spending run
+    for the rest.
+    """
+    for row in scheduler.get("jobs", []):
+        row["requests"] = (len(plan) if row["job"] == "history"
+                           else int(bool(row.get("spends_request"))))
+    return scheduler
 
 
 def _provisional(conn: sqlite3.Connection) -> dict[str, Any]:

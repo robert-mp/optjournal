@@ -40,6 +40,7 @@ from optjournal.flex import archive_digest
 __all__ = [
     "DuplicateGroup",
     "PruneResult",
+    "account_opened",
     "duplicate_groups",
     "newest_statement",
     "prune_archive",
@@ -207,22 +208,39 @@ def prune_archive(
     return result
 
 
-#: How much of a statement to read for its period. The `FlexStatement` tag is
-#: the third line of every archived file, `toDate` at byte 149 in both a daily
-#: and a full-year statement; 4 KB leaves room for a long query name.
+#: How much of a statement to read for its header. The `FlexStatement` and
+#: `AccountInformation` tags are the third and fourth lines of every archived
+#: file: `toDate` sits at byte 149 and `dateOpened` well inside the first KB in
+#: both a daily and a full-year statement. 4 KB leaves room for a long name.
 _HEADER_BYTES = 4096
 _TO_DATE = re.compile(rb'<FlexStatement [^>]*?toDate="(\d{8})"')
+_DATE_OPENED = re.compile(rb'<AccountInformation [^>]*?dateOpened="(\d{8})"')
 
 
-def _period_end(path: Path) -> str:
-    """The statement's own `toDate`, from its header. Empty when unreadable."""
+def _header_date(path: Path, pattern: re.Pattern[bytes]) -> str:
+    """One YYYYMMDD attribute from a statement's header. Empty when unreadable."""
     try:
         with path.open("rb") as fh:
             head = fh.read(_HEADER_BYTES)
     except OSError:
         return ""
-    found = _TO_DATE.search(head)
+    found = pattern.search(head)
     return found.group(1).decode() if found else ""
+
+
+def _period_end(path: Path) -> str:
+    return _header_date(path, _TO_DATE)
+
+
+def account_opened(archive_dir: Path) -> str | None:
+    """The day the account was opened, as YYYYMMDD, from the newest statement.
+
+    What a history import stops at: IBKR keeps four previous calendar years, but
+    a younger account has nothing before its opening, and asking for it would
+    spend a request to be refused.
+    """
+    newest = newest_statement(archive_dir)
+    return (_header_date(newest, _DATE_OPENED) or None) if newest else None
 
 
 def newest_statement(archive_dir: Path) -> Path | None:

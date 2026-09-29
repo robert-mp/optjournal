@@ -223,6 +223,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Array} watchlist -- Watch rows (serialize.watchlist_data)
  * @property {Scheduler} scheduler -- what the jobs did, and whether the loop is
  *   alive (serialize.jobs_data). Two separate questions: see the typedef
+ * @property {Array} history_plan -- HistoryChunk rows a history import would
+ *   request now, newest first (sync.history_plan); empty when complete
  * @property {Audit} audit -- did the last session's perishable bars land
  *   (serialize.audit_data). Computed on EVERY load, because when this was a cron
  *   the watchdog and the thing it watched stopped together
@@ -764,6 +766,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {boolean} spends_request -- running this costs one of IBKR's
  *   rate-limited Flex requests. From the REGISTRY, so the page holds no copy of
  *   which jobs touch the broker; it decides which button asks for confirmation
+ * @property {number} requests -- how many one run spends: one for a sync, the
+ *   plan's length for a history import (web._with_request_counts)
  * @property {boolean} [retired] -- only on a row whose job left the registry. Its
  *   history is kept and marked rather than dropped, so a rename does not silently
  *   erase a job's past from the panel that reports on collection health
@@ -1339,6 +1343,11 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   symbol has no options", which would be false about the reader's own watchlist
  */
 
+/** @typedef {Object} HistoryChunk -- one request of a history import (web.build_state)
+ * @property {string} from -- YYYYMMDD, IBKR's `fd`
+ * @property {string} to -- YYYYMMDD, IBKR's `td`
+ */
+
 /** @typedef {Object} ChartPoint -- page-side: built from Stats.days for the equity curve
  * @property {number} x
  * @property {number} y
@@ -1373,7 +1382,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
  * @payload ivr:IvRank ir:IvRank
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
- * @payload lb:Logbook
+ * @payload lb:Logbook hc:HistoryChunk
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite lkres:LinkWrite
  * @payload rv:JournalReview ty:Tally tt:TriggerTally zr2:OdteRefresh
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
@@ -1385,7 +1394,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
  * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen ws opts thin px
- * @local shownByDay next picked
+ * @local shownByDay next picked plan
  * @local JSON Object ages input mine qb wf was
  * @local when parts names raw err
  * @local COST_OPTIONS bits cost fees on wh
@@ -2678,9 +2687,10 @@ function collection(){
         ? `<span class="dim2 lbl-sm" title="This job is no longer registered. Its
             history is kept so a rename does not erase what it did."
             >retired</span>`
-        : `<button class="btn sm jobrun" data-job="${esc(j.job)}"${busy?' disabled':''}
+        : `<button class="btn sm jobrun" data-job="${esc(j.job)}"
+        data-requests="${j.requests??1}"${busy?' disabled':''}
         title="${j.spends_request
-          ? 'Spends one IBKR Flex request against a rate-limited budget.'
+          ? `Spends ${(j.requests??1)===1?'one IBKR Flex request':j.requests+' IBKR Flex requests'} against a rate-limited budget.`
           : 'Costs no IBKR request.'}">${busy?'running':'run'}</button>`}
     </div>`;
   }).join('');
@@ -5918,6 +5928,7 @@ function settingsPanel(){
           <td class="${stm.ingested?'pos':'dim2'}">${stm.ingested?'yes':'no'}</td>
           <td class="dim">${esc(stm.asset_filter||'-')}</td></tr>`).join('')}
       </tbody></table>
+      ${historyImport(st.history_plan||[])}
       <div class="note"><b>Needs the Flex query template:</b>
         <i>Gain % of Net Liq</i> reads the Equity Summary section — enable it on the
         query and sync, and the figure fills in from the next statement. <i>Trade
@@ -5925,6 +5936,29 @@ function settingsPanel(){
         none of which a statement carries.</div>
     </details>
   </div>`;
+}
+
+/* The one-off import of the years before the journal's oldest statement.
+   In Advanced rather than beside Sync because it is not a routine: it runs once,
+   spends one IBKR request per year, and the first sync already fetched the
+   last year. The count and the oldest date are the server's plan, not a guess
+   made here, so the dialogue and the button cannot disagree about the cost. */
+function historyImport(plan){
+  const day=d=>String(d||'').replace(/^(\d{4})(\d\d)(\d\d)$/,'$1-$2-$3');
+  if(!plan.length) return `<h2 class="sub3 mt-5">History import</h2>
+    <div class="note">The journal already reaches back as far as IBKR keeps:
+    four previous calendar years, or the day the account opened.</div>`;
+  const hc=plan[plan.length-1];
+  return `<h2 class="sub3 mt-5">History import</h2>
+    <div class="setrow">
+      <span>Fetch back to <b class="mono">${esc(day(hc.from))}</b>:
+        ${plan.length} IBKR request${plan.length===1?'':'s'}, one per year,
+        newest first, 30 seconds apart.</span>
+      <button class="btn sm" data-job="history" data-requests="${plan.length}"
+        >Import full history</button>
+    </div>
+    <div class="note">It runs on the server, so closing this page does not stop
+    it. The Collection card shows how it ended.</div>`;
 }
 
 /* ------------------------------------------------ view state in the URL
@@ -6562,11 +6596,15 @@ function bindJobRuns(){
   document.querySelectorAll('button[data-job]').forEach(b=>{
     b.onclick=async()=>{
       const job=b.dataset.job;
+      /* HOW MANY comes from the button, which carries the payload's count: one
+         for a sync, one per year for a history import. Zero means nothing is left
+         to ask for, so there is nothing to confirm either. */
+      const n=Number(b.dataset.requests??1);
       const spends=(((S.state.scheduler||{}).jobs)||[])
-        .some(j=>j.job===job&&j.spends_request);
+        .some(j=>j.job===job&&j.spends_request)&&n>0;
       if(spends&&!confirm(
-        `Run ${job}? This spends one IBKR Flex request against a rate-limited `
-        +`budget.`)) return;
+        `Run ${job}? This spends ${n===1?'one IBKR Flex request':n+' IBKR Flex requests'} `
+        +`against a rate-limited budget.`)) return;
       b.disabled=true; b.classList.add('busy'); b.textContent='running';
       try{
         const r=await fetch('/api/jobs/run',{method:'POST',

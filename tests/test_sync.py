@@ -388,3 +388,133 @@ def test_first_sync_window_holds_ibkrs_rules_for_every_day_of_a_year():
         assert end < today, f"{today}: td {end} is not before today"
         assert end.weekday() < 5 and start.weekday() < 5, f"{today}: weekend date"
         assert (end - start).days + 1 <= FIRST_SYNC_SPAN_DAYS, f"{today}: too long"
+
+
+# --------------------------------------------------------------------------
+# The history import: everything IBKR still holds before the oldest statement.
+# --------------------------------------------------------------------------
+
+
+def _days(chunks):
+    return [(datetime.strptime(a, "%Y%m%d").date(), datetime.strptime(b, "%Y%m%d").date())
+            for a, b in chunks]
+
+
+def test_history_walks_back_to_the_account_opening_newest_first():
+    from optjournal.sync import history_chunks  # noqa: PLC0415 - local
+
+    chunks = history_chunks(date(2025, 8, 1), date(2022, 5, 19), date(2026, 9, 29))
+    assert chunks[0][1] == "20250801", "the newest chunk must meet the oldest statement"
+    assert chunks[-1][0] == "20220519", "the import stops at the account's opening"
+    assert chunks == sorted(chunks, reverse=True), "newest year first"
+
+
+def test_history_stops_at_ibkrs_retention_for_an_older_account():
+    from optjournal.sync import history_chunks  # noqa: PLC0415 - local
+
+    chunks = history_chunks(None, date(2015, 1, 5), date(2026, 9, 29))
+    # 1 January 2022 is a Saturday, so the floor rolls forward to Monday.
+    assert chunks[-1][0] == "20220103"
+    assert chunks[0][1] == "20260928", "with no statement it ends yesterday"
+
+
+def test_history_that_already_reaches_the_floor_asks_for_nothing():
+    from optjournal.sync import history_chunks  # noqa: PLC0415 - local
+
+    assert history_chunks(date(2022, 5, 19), date(2022, 5, 19), date(2026, 9, 29)) == []
+    assert history_chunks(date(2021, 3, 1), None, date(2026, 9, 29)) == []
+
+
+@pytest.mark.parametrize("covered_from", [
+    date(2025, 8, 11),   # a Monday, the case that used to leave a weekend hole
+    date(2025, 8, 1),
+    date(2025, 8, 3),    # a Sunday
+    None,
+])
+def test_history_chunks_hold_ibkrs_rules_and_leave_no_gap(covered_from):
+    from optjournal.sync import FIRST_SYNC_SPAN_DAYS, history_chunks  # noqa: PLC0415
+
+    today = date(2026, 9, 29)
+    chunks = _days(history_chunks(covered_from, date(2022, 5, 19), today))
+    assert chunks
+    for start, end in chunks:
+        assert start.weekday() < 5 and end.weekday() < 5, f"weekend in {start}-{end}"
+        assert start <= end < today
+        assert (end - start).days + 1 <= FIRST_SYNC_SPAN_DAYS, f"{start}-{end} too long"
+    # Each older chunk must reach the newer one's start, or the days between them
+    # are in no request at all.
+    for (newer_start, _), (_, older_end) in zip(chunks, chunks[1:], strict=False):
+        assert older_end >= newer_start - timedelta(days=1), (
+            f"gap between {older_end} and {newer_start}")
+    if covered_from is not None:
+        assert chunks[0][1] >= covered_from - timedelta(days=3), (
+            "gap before the oldest statement")
+
+
+def _stub_history(monkeypatch, *, plan, refuse_after=None):
+    """`import_history` with the plan fixed and the network replaced."""
+    from py_ibkr import FlexError  # noqa: PLC0415 - local to this test
+
+    from optjournal import sync as mod  # noqa: PLC0415 - local to this test
+    from optjournal.archive import newest_statement  # noqa: PLC0415 - local
+
+    archive = newest_statement(RAW_DIR)
+    calls: list[dict] = []
+
+    class _Fetched:
+        raw_path = archive
+
+    def fetch(*_a, **kwargs):
+        if refuse_after is not None and len(calls) >= refuse_after:
+            calls.append(kwargs)
+            raise FlexError("1003: Statement is not available.")
+        calls.append(kwargs)
+        return _Fetched()
+
+    monkeypatch.setattr(mod, "history_plan", lambda *_a, **_k: plan)
+    monkeypatch.setattr(mod, "fetch", fetch)
+    monkeypatch.setattr(mod, "_snapshot", lambda conn: None)
+    return mod, calls
+
+
+def test_import_history_fetches_every_chunk_forced_and_paced(tmp_path, monkeypatch):
+    from optjournal.db import open_journal  # noqa: PLC0415 - local to this test
+
+    plan = [("20240802", "20250801"), ("20230804", "20240802")]
+    mod, calls = _stub_history(monkeypatch, plan=plan)
+    slept: list[float] = []
+    with open_journal(tmp_path / "journal.db") as conn:
+        result = mod.import_history(conn=conn, archive_dir=tmp_path, query_id="1",
+                                    sleep=slept.append)
+
+    assert [(c["from_date"], c["to_date"]) for c in calls] == plan
+    assert all(c["force"] for c in calls), (
+        "a chunk hit the 15-minute cooldown meant for re-fetching one statement")
+    assert slept == [mod.HISTORY_PAUSE_S], "one pause between two chunks, none before"
+    assert result["fetched"] == ["20240802-20250801", "20230804-20240802"]
+    assert result["stopped"] is None
+
+
+def test_import_history_stops_at_the_first_refusal(tmp_path, monkeypatch):
+    from optjournal.db import open_journal  # noqa: PLC0415 - local to this test
+
+    plan = [("20240802", "20250801"), ("20230804", "20240802"), ("20220805", "20230804")]
+    mod, calls = _stub_history(monkeypatch, plan=plan, refuse_after=1)
+    with open_journal(tmp_path / "journal.db") as conn:
+        result = mod.import_history(conn=conn, archive_dir=tmp_path, query_id="1",
+                                    sleep=lambda _s: None)
+
+    assert len(calls) == 2, "an older chunk was asked for after a refusal"
+    assert result["fetched"] == ["20240802-20250801"]
+    assert "20230804 to 20240802 refused" in result["stopped"]
+    assert "stopped at" in result["summary"]
+
+
+def test_import_history_with_nothing_owed_spends_nothing(tmp_path, monkeypatch):
+    from optjournal.db import open_journal  # noqa: PLC0415 - local to this test
+
+    mod, calls = _stub_history(monkeypatch, plan=[])
+    with open_journal(tmp_path / "journal.db") as conn:
+        result = mod.import_history(conn=conn, archive_dir=tmp_path, query_id="1")
+    assert calls == []
+    assert result["planned"] == 0 and "already complete" in result["summary"]

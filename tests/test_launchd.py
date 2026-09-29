@@ -308,7 +308,9 @@ def test_a_running_scheduler_leaves_evidence_in_the_log(tmp_path, monkeypatch):
         "a scheduler that stops leaves no trace, so a log ending mid-stream cannot "
         "be told from a crash"
     )
-    assert "5 job(s)" in written, (
+    from optjournal.jobs import JOBS  # noqa: PLC0415 - local to this test
+
+    assert f"{len(JOBS)} job(s)" in written, (
         "the startup line does not say WHICH jobs are registered -- the one thing "
         "the crons.json arrangement could never tell anyone"
     )

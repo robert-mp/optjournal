@@ -439,12 +439,12 @@ def test_only_the_sync_spends_a_broker_request():
     """
     from optjournal.jobs import JOBS
 
-    # TWO, since Trade Confirmations: the daily statement and the intraday poll
-    # each spend against the same token's lockout allowance. Pinned as a SET rather
-    # than loosened to "at least sync", so a third spender still has to be declared
-    # here deliberately -- which is the whole point of the flag.
+    # THREE: the daily statement, the intraday poll, and the hand-run history
+    # import, all against the same token's lockout allowance. Pinned as a SET
+    # rather than loosened to "at least sync", so a fourth spender still has to be
+    # declared here deliberately -- which is the whole point of the flag.
     assert {job.name for job in JOBS if job.spends_broker_request} == {
-        "sync", "confirm"}
+        "sync", "confirm", "history"}
 
 
 def test_the_live_poll_is_a_window_and_the_rest_are_wall_clock():
@@ -465,9 +465,9 @@ def test_the_live_poll_is_a_window_and_the_rest_are_wall_clock():
         "Confirmation poll. Both ask 'is it session time, and is the last success "
         "stale' rather than claiming a wall-clock minute"
     )
-    # And nothing is NONE: a job that silently drops a missed instant would have
-    # to earn that, and none of the four has.
-    assert not [j for j in JOBS if j.catchup is Catchup.NONE]
+    # And only the unscheduled job is NONE: a job that silently drops a missed
+    # instant would have to earn that, and `history` does by having no instants.
+    assert [j.name for j in JOBS if j.catchup is Catchup.NONE] == ["history"]
 
 
 def test_a_catchup_window_is_bounded_by_the_schedules_own_period():
@@ -512,7 +512,10 @@ def test_every_schedule_names_a_real_zone_and_a_real_time():
         job.tz()                                   # raises on an unknown zone
         assert 0 <= job.minute <= 59, f"{job.name}: minute {job.minute}"
         assert 0 <= job.hour <= 23, f"{job.name}: hour {job.hour}"
-        assert job.weekdays, f"{job.name} runs on no day at all"
+        # `history` is the one job with no schedule, and it is pinned by name so
+        # an empty tuple cannot creep onto a scheduled job as a typo.
+        assert job.weekdays or job.name == "history", (
+            f"{job.name} runs on no day at all")
         assert set(job.weekdays) <= set(range(1, 8)), (
             f"{job.name}: {job.weekdays} is not ISO weekdays (Monday=1)"
         )
@@ -947,7 +950,9 @@ def test_the_payload_says_which_jobs_spend_a_broker_request(conn):
         "the Trade Confirmation poll spends a request too, and the page has to say "
         "so -- it is the one that fires every half hour"
     )
-    assert not any(v for k, v in spends.items() if k not in ("sync", "confirm")), (
+    assert spends["history"] is True, "a history import spends up to five"
+    spenders = ("sync", "confirm", "history")
+    assert not any(v for k, v in spends.items() if k not in spenders), (
         f"a job other than sync claims to spend a broker request: {spends}"
     )
 
@@ -2139,3 +2144,42 @@ def test_a_window_job_that_failed_is_not_braked(conn):
     assert "confirm" in [d.job.name for d in due], (
         "a failed poll sits out the whole window instead of retrying"
     )
+
+
+def test_the_history_import_is_never_due():
+    """Up to five IBKR requests is the reader's decision, never the scheduler's."""
+    from datetime import UTC, datetime, timedelta
+
+    from optjournal.jobs import due_jobs
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    for hour in range(0, 24 * 14, 5):
+        now = start + timedelta(hours=hour)
+        due = due_jobs(now, claimed={}, last_poll={}, ever_ran={"history"})
+        assert "history" not in [d.job.name for d in due], f"history due at {now}"
+
+
+@pytest.mark.parametrize(("reply", "status"), [
+    ({"fetched": ["a", "b"], "planned": 2, "stopped": None}, "ok"),
+    # A later refusal does not undo the years that landed.
+    ({"fetched": ["a"], "planned": 3, "stopped": "refused"}, "ok"),
+    ({"fetched": [], "planned": 3, "stopped": "refused"}, "failed"),
+    ({"fetched": [], "planned": 0, "stopped": None}, "nothing"),
+])
+def test_the_history_outcome_names_what_happened(reply, status, monkeypatch, tmp_path):
+    from optjournal import jobs
+
+    monkeypatch.setattr(jobs, "import_history",
+                        lambda **_k: {**reply, "summary": "s"})
+    ctx = jobs.Context(archive_dir=tmp_path, db_path=tmp_path / "j.db", query_id="1")
+    outcome = jobs._history(None, ctx)
+    assert outcome.status == status
+    assert (outcome.done, outcome.total) == (len(reply["fetched"]), reply["planned"])
+
+
+def test_the_history_import_without_a_query_id_fails_with_the_cause(tmp_path):
+    from optjournal import jobs
+
+    ctx = jobs.Context(archive_dir=tmp_path, db_path=tmp_path / "j.db")
+    outcome = jobs._history(None, ctx)
+    assert outcome.status == "failed" and "query id" in outcome.detail
