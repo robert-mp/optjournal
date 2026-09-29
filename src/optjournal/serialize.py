@@ -29,6 +29,7 @@ from typing import Any
 from optjournal.analysis import CostReport
 from optjournal.bars import (
     audit_perishable,
+    upsert_bars,
     watch_closes,
     weekly_closes,
 )
@@ -55,6 +56,7 @@ from optjournal.journal import ADHERENCE as JOURNAL_ADHERENCE
 from optjournal.journal import FIELDS as JOURNAL_FIELDS
 from optjournal.journal import TRIGGERS as JOURNAL_TRIGGERS
 from optjournal.journal import entries as journal_entries
+from optjournal.marketdata import BarFetchError, fetch_bars
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
 from optjournal.stats import first_activity
@@ -821,6 +823,56 @@ def market_data(
     }
 
 
+#: When a session's daily bar is final, in ET: the 16:00 close plus a margin for
+#: the source to publish the settled print. Before it, the day's bar is still
+#: moving; after it, that bar IS the prior close for the next session.
+SETTLE_H, SETTLE_M = 16, 15
+#: The cash open, in ET. Between the open and the settle the VIX is a live
+#: reading and has to be recent to be true.
+OPEN_H, OPEN_M = 9, 30
+#: How old a live VIX may be during the session. Two refresh cycles of the page.
+VIX_LIVE_MAX_S = 10 * 60
+
+
+def last_settle(now: datetime) -> datetime:
+    """The most recent weekday settle at or before `now`, in ET.
+
+    NO HOLIDAY CALENDAR, deliberately, and it does not need one: this is the
+    moment after which a fetch MUST contain every completed session. On a holiday
+    it names a settle nothing happened at, and a fetch after it still returns the
+    last real session as newest, which is correct. What it catches is the case
+    that shipped: Friday's close never fetched, and Thursday's printed on Monday.
+    """
+    et = now.astimezone(MARKET_TZ)
+    day = et.replace(hour=SETTLE_H, minute=SETTLE_M, second=0, microsecond=0)
+    if et < day:
+        day -= timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
+
+
+def in_session(now: datetime) -> bool:
+    """Weekday, between the cash open and the settle, ET."""
+    et = now.astimezone(MARKET_TZ)
+    if et.weekday() >= 5:
+        return False
+    return (et.replace(hour=OPEN_H, minute=OPEN_M, second=0, microsecond=0) <= et
+            < et.replace(hour=SETTLE_H, minute=SETTLE_M, second=0, microsecond=0))
+
+
+def _fetched_at(conn: sqlite3.Connection, conid: str) -> datetime | None:
+    """When the newest fetch of one index's daily series landed."""
+    row = conn.execute(
+        "SELECT MAX(fetched_at) FROM price_bars WHERE conid = ? AND bar_size = '1d'",
+        (conid,),
+    ).fetchone()
+    try:
+        return datetime.fromisoformat(row[0]) if row and row[0] else None
+    except ValueError:
+        return None
+
+
 def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
     """The 0DTE calculator's opening reading, or None when the feed has not landed.
 
@@ -864,10 +916,12 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
         return None
 
     today = now.astimezone(MARKET_TZ).date().isoformat()
-    # The last close from a session that is NOT today. Falls back to the newest
-    # row only when every row predates today, which is the pre-open and
-    # weekend case -- there the newest row IS the prior close.
-    settled = [(ts, close) for ts, close in spx if et_day(ts) != today]
+    # The last close from a SETTLED session. Today's bar is excluded only until
+    # the settle: after 16:15 ET it is final, and it is the prior close for the
+    # next session -- excluding it all evening planned tomorrow off yesterday.
+    settle = last_settle(now)
+    open_day = None if settle.date().isoformat() == today else today
+    settled = [(ts, close) for ts, close in spx if et_day(ts) != open_day]
     if not settled:
         return None
     spx_ts, spx_close = settled[-1]
@@ -882,8 +936,16 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
     if spx_close <= 0 or vix_close < 0:
         return None
 
-    day_start = now.astimezone(MARKET_TZ).replace(
-        hour=0, minute=0, second=0, microsecond=0)
+    # THE SESSION THE LADDER IS FOR: today until its settle, then the next
+    # weekday. After Monday's close the reader is planning Tuesday, and Monday's
+    # 08:15 release beside Tuesday's ladder was a stale warning.
+    et = now.astimezone(MARKET_TZ)
+    session = et.date()
+    if settle.date() == session or session.weekday() >= 5:
+        session += timedelta(days=1)
+        while session.weekday() >= 5:
+            session += timedelta(days=1)
+    day_start = datetime(session.year, session.month, session.day, tzinfo=MARKET_TZ)
     rows = upcoming(conn, start=int(day_start.timestamp()),
                     end=int((day_start + timedelta(days=1)).timestamp()))
     events = [
@@ -896,14 +958,61 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
         for r in rows
     ]
 
+    # FRESHNESS, judged against the clock rather than assumed from the rows. A
+    # stored close is only the prior close if it was fetched after the last
+    # settle; the VIX is only live if it was fetched in the last few minutes of an
+    # open session. A reading that fails either is reported, and the page will not
+    # pre-fill the calculator with it.
+    spx_at, vix_at = _fetched_at(conn, "^GSPC"), _fetched_at(conn, "^VIX")
+    live = in_session(now)
+    problems = []
+    if spx_at is None or spx_at < settle:
+        problems.append(
+            f"the S&P close was last fetched "
+            f"{spx_at.astimezone(MARKET_TZ).strftime('%a %d %b %H:%M ET') if spx_at else 'never'},"
+            f" before the {settle.strftime('%a %d %b')} settle")
+    if vix_at is None or (live and (now - vix_at).total_seconds() > VIX_LIVE_MAX_S) \
+            or (not live and vix_at < settle):
+        problems.append(
+            f"the VIX was last fetched "
+            f"{vix_at.astimezone(MARKET_TZ).strftime('%a %d %b %H:%M ET') if vix_at else 'never'}")
+
     return {
         "spx_prev_close": spx_close,
         "spx_date": et_day(spx_ts),
         "vix": vix_close,
         "vix_date": et_day(vix_ts),
+        "spx_fetched_at": spx_at.isoformat() if spx_at else None,
+        "vix_fetched_at": vix_at.isoformat() if vix_at else None,
+        "live": live,
+        "fresh": not problems,
+        "stale_reason": "; ".join(problems) or None,
         "events_today": events,
-        "today": today,
+        "today": session.isoformat(),
     }
+
+
+def refresh_odte_bars(conn: sqlite3.Connection, *, now: datetime) -> str | None:
+    """Fetch the S&P and VIX daily series now. The error text, or None.
+
+    What the 0DTE tab calls when it opens and while it stays open, so the reading
+    on screen is the feed's as of now rather than as of the last scheduled job --
+    which is how Thursday's close came to be printed on a Monday after a Saturday
+    fetch failed offline. Two requests; the daily bar of an open session carries
+    the current level, so this is also the live VIX.
+    """
+    start = int((now - timedelta(days=10)).timestamp())
+    end = int(now.timestamp())
+    errors = []
+    for symbol in ("^GSPC", "^VIX"):
+        try:
+            bars = fetch_bars(symbol, bar_size="1d", start=start, end=end, timeout=10)
+        except BarFetchError as exc:
+            errors.append(str(exc))
+            continue
+        upsert_bars(conn, conid=symbol, symbol=symbol, bar_size="1d",
+                    source="yahoo", bars=bars)
+    return "; ".join(errors) or None
 
 
 def odte_scoring_data(conn: sqlite3.Connection, *, now: datetime) -> list[Row]:

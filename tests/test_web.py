@@ -340,6 +340,8 @@ _UNSAMPLED = frozenset({
     # the state payload like every other write reply here. `LinkWrite` is the
     # `/api/links` reply, for the same reason.
     "JField", "JournalWrite", "LinkWrite",
+    # The `/api/odte/refresh` reply, off the state payload like the other writes.
+    "OdteRefresh",
     # A used exit trigger needs a written review, and the fixture archive has no
     # journal rows. Exercised directly in test_serialize.
     "TriggerTally",
@@ -6809,6 +6811,7 @@ _ZDTE_HOOKS = {
     "data-zsort": "the strike column's direction",
     "data-zall": "collapse or reveal the outer rails",
     "data-zpop": "the Broker Companion",
+    "data-zretry": "check the feed again after a stale reading",
 }
 
 
@@ -7213,3 +7216,54 @@ def test_a_money_figure_keeps_its_minus():
     assert "chargeOf" not in body.group(1) and "abs" not in body.group(1)
     assert re.search(r"\.pos\.signed::before\{content:\"\+\"\}", _css())
     assert ".neg.signed::before" not in _css(), "the minus would print twice"
+
+
+def test_the_odte_refresh_fetches_now_and_answers_a_fresh_reading(populated, monkeypatch):
+    """Opening the tab fetches the S&P and VIX and answers the reading as of now.
+    The network is stubbed: a prior session for the S&P and a live VIX bar, both
+    landing at the moment of the request, which is exactly what makes them fresh.
+    """
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415 - local to this test
+
+    from optjournal import serialize  # noqa: PLC0415 - local to this test
+    from optjournal.marketdata import Bar  # noqa: PLC0415 - local to this test
+
+    now = datetime.now(UTC)
+    week = [int((now - timedelta(days=d)).timestamp()) for d in range(7, 0, -1)]
+
+    def fake(symbol, **_):
+        level = 7700.0 if symbol == "^GSPC" else 15.0
+        return [Bar(ts=ts, open=level, high=level, low=level, close=level + i,
+                    volume=0) for i, ts in enumerate(week)]
+
+    monkeypatch.setattr(serialize, "fetch_bars", fake)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/odte/refresh", {})
+    assert (status, reply["ok"], reply["error"]) == (200, True, None)
+    assert reply["context"]["fresh"] is True, reply["context"]["stale_reason"]
+
+
+def test_a_failed_odte_refresh_says_so_and_the_reading_is_not_fresh(populated, monkeypatch):
+    """Offline, as on the Saturday that shipped Thursday's close: the reply names
+    the failure, and a reading older than the settle is not called fresh."""
+    from optjournal import serialize  # noqa: PLC0415 - local to this test
+    from optjournal.marketdata import Bar, BarFetchError  # noqa: PLC0415
+
+    def offline(symbol, **_):
+        raise BarFetchError(f"{symbol} 1d: URLError: nodename nor servname")
+
+    conn = connect(populated)
+    for sym, level in (("^GSPC", 7704.13), ("^VIX", 15.11)):
+        serialize.upsert_bars(conn, conid=sym, symbol=sym, bar_size="1d",
+                              source="yahoo",
+                              bars=[Bar(ts=1790000000, open=level, high=level,
+                                        low=level, close=level, volume=0)])
+    conn.execute("UPDATE price_bars SET fetched_at = '2026-01-01T00:00:00+00:00'")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(serialize, "fetch_bars", offline)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/odte/refresh", {})
+    assert (status, reply["ok"]) == (200, False)
+    assert "URLError" in reply["error"]
+    assert reply["context"]["fresh"] is False

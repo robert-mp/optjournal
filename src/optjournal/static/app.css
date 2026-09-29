@@ -1743,6 +1743,8 @@ stop.gneg{stop-color:var(--bad)}
   cursor:pointer;white-space:nowrap}
 .jbtn:hover{border-color:var(--dim2)}
 .jbtns{display:flex;gap:var(--s4);flex-wrap:wrap}
+/* The 0DTE feed's standing, above the two readings it vouches for. */
+.zstat{margin-top:var(--s5)}
 /* Allocation: the bar column takes what the figures leave. */
 .alloc .abcell{width:30%;min-width:calc(var(--s8) * 4)}
 .alloc td{white-space:nowrap}

@@ -117,6 +117,7 @@ from optjournal.serialize import (
     odte_scoring_data,
     orders_data,
     positions_data,
+    refresh_odte_bars,
     statements_data,
     watchlist_data,
 )
@@ -1469,6 +1470,21 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             "entry": entry.payload() if entry else None,
         }
 
+    def _odte_refresh(self) -> tuple[int, dict[str, Any]]:
+        """Fetch the S&P and VIX now and answer the calculator's reading.
+
+        What the 0DTE tab calls on open and on a timer while open. A fetch that
+        fails still answers 200 with the stored reading and its verdict, because
+        the reading's own `fresh` flag is what the page acts on: a failed network
+        call is one reason a reading can be stale, not a different kind of reply.
+        """
+        now = datetime.now(UTC)
+        with open_journal(self.cfg.db_path) as conn:
+            error = refresh_odte_bars(conn, now=now)
+            context = odte_context_data(conn, now=datetime.now(UTC))
+        return 200, {"ok": error is None, "kind": "odte", "error": error,
+                     "context": context}
+
     def _link_write(self) -> tuple[int, dict[str, Any]]:
         """Join two decisions by hand, or undo a join.
 
@@ -1651,6 +1667,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/links":
             self._json(*self._link_write())
+            return
+        if path == "/api/odte/refresh":
+            self._json(*self._odte_refresh())
             return
         if path == "/api/settings":
             self._json(*self._settings_write())

@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from conftest import connect_migrated
@@ -428,6 +429,7 @@ def test_the_calculator_pairs_the_latest_index_closes_with_the_days_events(conn)
     assert ctx["spx_date"] == "2026-08-28" and ctx["vix_date"] == "2026-08-28"
     assert set(ctx) == {
         "spx_prev_close", "spx_date", "vix", "vix_date", "events_today", "today",
+        "spx_fetched_at", "vix_fetched_at", "live", "fresh", "stale_reason",
     }, "a derived level in the payload is a second copy of the ladder"
 
 
@@ -701,3 +703,91 @@ def test_the_review_lists_only_used_triggers_in_the_journals_order():
     assert keys == ["target", "max_loss"]
     stop = next(t for t in rv["triggers"] if t["key"] == "max_loss")
     assert (stop["count"], stop["wins"], stop["pnl"]) == (2, 1, -2.0)
+
+
+# ------------------------------------------------------ 0DTE freshness
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _fetched(conn, symbol: str, at: datetime) -> None:
+    """Stamp every stored bar of one index as fetched at `at`."""
+    conn.execute("UPDATE price_bars SET fetched_at = ? WHERE conid = ?",
+                 (at.astimezone(UTC).isoformat(timespec="seconds"), symbol))
+    conn.commit()
+
+
+def test_the_last_settle_skips_the_weekend_and_waits_for_the_close():
+    from optjournal.serialize import last_settle
+    mon_10 = datetime(2026, 9, 28, 10, 0, tzinfo=_ET)
+    assert last_settle(mon_10) == datetime(2026, 9, 25, 16, 15, tzinfo=_ET)
+    mon_17 = datetime(2026, 9, 28, 17, 0, tzinfo=_ET)
+    assert last_settle(mon_17) == datetime(2026, 9, 28, 16, 15, tzinfo=_ET)
+    sat = datetime(2026, 9, 26, 12, 0, tzinfo=_ET)
+    assert last_settle(sat) == datetime(2026, 9, 25, 16, 15, tzinfo=_ET)
+
+
+def test_a_close_fetched_before_the_last_settle_is_stale(conn):
+    """The case that shipped: Friday's fetch failed offline, and on Monday the
+    calculator opened on Thursday's close with nothing on screen saying so."""
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-09-24", 7704.13)
+    _seed_index(conn, "^VIX", "2026-09-25", 15.11)
+    _fetched(conn, "^GSPC", datetime(2026, 9, 25, 7, 0, tzinfo=_ET))
+    _fetched(conn, "^VIX", datetime(2026, 9, 25, 15, 0, tzinfo=_ET))
+    ctx = odte_context_data(conn, now=datetime(2026, 9, 28, 10, 0, tzinfo=_ET))
+    assert ctx is not None and ctx["fresh"] is False
+    assert "S&P" in ctx["stale_reason"] and "Fri 25 Sep" in ctx["stale_reason"]
+
+
+def test_a_close_fetched_after_the_settle_with_a_recent_vix_is_fresh(conn):
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-09-25", 7710.0)
+    _seed_index(conn, "^GSPC", "2026-09-28", 7690.0)   # today, still moving
+    _seed_index(conn, "^VIX", "2026-09-28", 16.2)
+    now = datetime(2026, 9, 28, 10, 0, tzinfo=_ET)
+    _fetched(conn, "^GSPC", now - timedelta(minutes=1))
+    _fetched(conn, "^VIX", now - timedelta(minutes=1))
+    ctx = odte_context_data(conn, now=now)
+    assert ctx["fresh"] is True and ctx["live"] is True
+    assert (ctx["spx_date"], ctx["spx_prev_close"]) == ("2026-09-25", 7710.0), \
+        "an open session's bar is not the prior close"
+
+
+def test_a_live_vix_older_than_ten_minutes_in_session_is_stale(conn):
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-09-25", 7710.0)
+    _seed_index(conn, "^VIX", "2026-09-28", 16.2)
+    now = datetime(2026, 9, 28, 11, 0, tzinfo=_ET)
+    _fetched(conn, "^GSPC", now - timedelta(minutes=1))
+    _fetched(conn, "^VIX", now - timedelta(minutes=11))
+    ctx = odte_context_data(conn, now=now)
+    assert ctx["fresh"] is False and "VIX" in ctx["stale_reason"]
+
+
+def test_after_the_settle_todays_close_is_the_prior_close(conn):
+    """Planning tomorrow in the evening means today's settled close, not
+    yesterday's."""
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-09-25", 7710.0)
+    _seed_index(conn, "^GSPC", "2026-09-28", 7690.0)
+    _seed_index(conn, "^VIX", "2026-09-28", 16.2)
+    now = datetime(2026, 9, 28, 17, 0, tzinfo=_ET)
+    _fetched(conn, "^GSPC", datetime(2026, 9, 28, 16, 30, tzinfo=_ET))
+    _fetched(conn, "^VIX", datetime(2026, 9, 28, 16, 30, tzinfo=_ET))
+    ctx = odte_context_data(conn, now=now)
+    assert ctx["fresh"] is True and ctx["live"] is False
+    assert (ctx["spx_date"], ctx["spx_prev_close"]) == ("2026-09-28", 7690.0)
+
+
+@pytest.mark.parametrize("when, session", [
+    (datetime(2026, 9, 28, 10, 0, tzinfo=_ET), "2026-09-28"),   # Monday, open
+    (datetime(2026, 9, 28, 17, 0, tzinfo=_ET), "2026-09-29"),   # Monday, settled
+    (datetime(2026, 9, 26, 12, 0, tzinfo=_ET), "2026-09-28"),   # Saturday
+    (datetime(2026, 9, 25, 17, 0, tzinfo=_ET), "2026-09-28"),   # Friday, settled
+])
+def test_the_ladder_is_for_the_next_session_once_today_has_settled(conn, when, session):
+    from optjournal.serialize import odte_context_data
+    _seed_index(conn, "^GSPC", "2026-09-24", 7700.0)
+    _seed_index(conn, "^VIX", "2026-09-24", 16.0)
+    assert odte_context_data(conn, now=when)["today"] == session

@@ -1027,6 +1027,19 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} vix_date -- the ET session the VIX is from; may lag spx_date
  * @property {Array} events_today -- OdteEvent rows on the ET session date
  * @property {string} today -- the ET session date the calculator is drawn for
+ * @property {string|null} spx_fetched_at -- when the S&P series last landed, UTC
+ * @property {string|null} vix_fetched_at -- when the VIX series last landed, UTC
+ * @property {boolean} live -- the cash session is open, so the VIX must be recent
+ * @property {boolean} fresh -- both readings are current against the clock; when
+ *   false the page does NOT pre-fill the calculator with them
+ * @property {string|null} stale_reason -- what failed the check, in words
+ */
+
+/** @typedef {Object} OdteRefresh -- the /api/odte/refresh reply (web._odte_refresh)
+ * @property {boolean} ok -- the fetch itself succeeded
+ * @property {string} kind
+ * @property {string|null} error -- the fetch's failure, when it failed
+ * @property {OdteContext|null} context -- the reading after the fetch
  */
 
 /** @typedef {Object} StrikeRow -- page-side: one ladder row (zdte.ladderRows)
@@ -1346,7 +1359,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite lkres:LinkWrite
- * @payload rv:JournalReview ty:Tally tt:TriggerTally
+ * @payload rv:JournalReview ty:Tally tt:TriggerTally zr2:OdteRefresh
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
  * @local leaves PERIOD_TABS pop quotes steps TILES
  * @local draft dr order known tilesave tilereset Array
@@ -1366,7 +1379,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local events
  * @local zrows clean
  * @local rails sessions sigma
- * @local body others pair pick said m
+ * @local body others pair pick said m r err Date
  */
 
 const $=s=>document.querySelector(s);
@@ -1411,6 +1424,9 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
   /* Which card's roll-link picker is open, by anchor. Not in the hash for the
      `jrnl` reason: it is an unfinished act, not a view. */
   lnk:null,
+  /* The 0DTE feed check: when it last answered, whether one is in flight, and
+     the fetch error if it failed. Not in the hash; it is a network state. */
+  zat:0, zbusy:false, zerr:null,
   /* Calendar filter, TWO INDEPENDENT AXES: a Set of countries and a Set of
      impacts, each holding the values currently shown.
 
@@ -5385,7 +5401,7 @@ function odte(){
       autocomplete="off" spellcheck="false" data-zread="${key}"
       aria-describedby="${id}from" value="${esc(zread(key))}">
     <div class="wcap" id="${id}from">${typed==null
-      ?`the feed's reading, ${esc(day)}`
+      ?(oc.fresh?`the feed's reading, ${esc(day)}`:'no current reading: type one')
       :`typed — the feed read <b>${level(feed)}</b> on ${esc(day)}
         <button class="zlink" data-zreset="${key}">use it</button>`}</div>
   </div>`;
@@ -5488,6 +5504,14 @@ function odte(){
        checked" rather than as "nothing scheduled". */
     :`<div class="wcap zevents">No US release on the calendar today — a lighter
       tape than a print day, though nothing rules out an intraday headline.</div>`}
+    ${!S.zat?`<div class="wcap zstat">Checking the feed…</div>`
+    :!oc.fresh?`<div class="note zwarn zstat"><b>Not current, so not
+      shown.</b> ${esc(oc.stale_reason||'')}.${S.zerr?` The refresh failed:
+      ${esc(S.zerr)}.`:''} Type a live reading into either field, or
+      <button class="zlink" data-zretry>check again</button>.</div>`
+    :`<div class="wcap zstat">S&amp;P close from <b>${esc(oc.spx_date)}</b> ·
+      VIX ${oc.live?'live, ':''}as of <b>${esc(etTime(oc.vix_fetched_at))}</b>${
+      S.zbusy?' · checking…':''}</div>`}
     <div class="zfeed">
       ${field('spx','zspx','Most recent closing SPX price',
         S.zspx,oc.spx_prev_close,oc.spx_date)}
@@ -5647,6 +5671,36 @@ function odteCohorts(){
   </div>`;
 }
 
+/* WHERE THE READINGS STAND, said above the fields. Fresh: which session the
+   close is from and how old the VIX is. Stale: why, and that nothing was
+   pre-filled, with a retry. The server judges freshness against the clock
+   (serialize.odte_context_data); this only reports it. */
+const etTime=iso=>iso?new Date(iso).toLocaleTimeString('en-US',
+  {timeZone:MKT,hour:'2-digit',minute:'2-digit',hour12:false})+' ET':'never';
+/* Fetch the S&P and VIX now and swap the reading in. Called when the tab opens,
+   then every minute while it stays open and visible. */
+async function zrefresh(){
+  if(S.zbusy) return;
+  S.zbusy=true;
+  let zr2=null;
+  try{
+    const r=await fetch('/api/odte/refresh',{method:'POST'});
+    zr2=await r.json();
+  }catch(err){S.zerr=String(err);}
+  S.zbusy=false; S.zat=Date.now();
+  if(zr2){
+    S.zerr=zr2.error;
+    if(S.state&&S.state.odte) S.state.odte.context=zr2.context;
+  }
+  if(S.tab==='odte') draw();
+}
+function zdue(){
+  if(S.tab==='odte'&&S.state&&document.visibilityState==='visible'
+     &&Date.now()-S.zat>=60000) zrefresh();
+}
+setInterval(zdue,15000);
+document.addEventListener('visibilitychange',zdue);
+
 /* THE READING IN FORCE: what was typed, or the feed's where nothing has been.
  *
  * One function because the view and the handlers must not disagree about which
@@ -5656,8 +5710,11 @@ function odteCohorts(){
  * exactly how that happens. */
 const zread=key=>{
   const oc=((S.state||{}).odte||{}).context;
-  if(key==='spx') return S.zspx==null?zfeed(oc&&oc.spx_prev_close):S.zspx;
-  if(key==='vix') return S.zvix==null?zfeed(oc&&oc.vix):S.zvix;
+  /* A reading the server could not confirm as current is NOT offered: an empty
+     field asks for a number, a stale one looks like an answer. */
+  const ok=oc&&oc.fresh;
+  if(key==='spx') return S.zspx==null?zfeed(ok?oc.spx_prev_close:null):S.zspx;
+  if(key==='vix') return S.zvix==null?zfeed(ok?oc.vix:null):S.zvix;
   return (key==='call'?S.zcall:S.zput)||'';
 };
 
@@ -5734,6 +5791,8 @@ function bindZdte(){
       zfill(at>close?'call':'put',String(at));
     };
   });
+  document.querySelectorAll('[data-zretry]').forEach(b=>
+    b.onclick=()=>{S.zat=0; zrefresh();});
   document.querySelectorAll('[data-zreset]').forEach(b=>
     b.onclick=()=>zfill(b.dataset.zreset,null));
   document.querySelectorAll('[data-zsort]').forEach(b=>
@@ -6112,7 +6171,7 @@ function draw(push){
      to the payload's reading, which is the number that was just typed. */
   if(S.state){
     const oc=(S.state.odte||{}).context;
-    if(oc){
+    if(oc&&oc.fresh){
       /* Compared as the STRING the field would hold without an override, which is
          the feed's reading at two decimals -- not the stored float, which no
          reader can retype (7706.02978515625). */
@@ -6213,6 +6272,8 @@ function draw(push){
       S.replay=S.replay===k?null:k;draw();});
   bindReplayControls();
   bindJournal();
+  /* Opening the 0DTE tab checks the feed at once; the timer keeps it current. */
+  zdue();
   document.querySelectorAll('[data-calday-clear]').forEach(el=>
     el.onclick=()=>{S.calday=null;draw();});
   /* Server-side like the month filter, so the aggregations are recomputed
