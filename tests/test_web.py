@@ -2725,7 +2725,8 @@ def test_the_month_stepper_walks_the_range_through_load():
     assert "data-month" in js
     binding = re.search(
         r"button\[data-month\].*?b\.onclick=\(\)=>\{.*?"
-        r"S\.month=b\.dataset\.month\|\|null;load\(\);",
+        r"const m=b\.dataset\.month\|\|null;\s*"
+        r"S\.month=m===\(S\.state\.month_range\|\|\[\]\)\[0\]\?null:m;load\(\);",
         js, re.S)
     assert binding, "a step must set S.month from the button and call load()"
     # A step clears the calendar's day selection: a day from the old month
@@ -2734,19 +2735,19 @@ def test_the_month_stepper_walks_the_range_through_load():
 
 
 def test_the_month_stepper_disables_at_the_ends_of_the_range():
-    """At the account's first month there is nowhere back to go, and at All time
+    """At All time there is nowhere back to go, and at the current month
     nowhere forward; a live button that does nothing reads as broken.
 
     Walks month_range -- the account's life -- and not the fills-only months
     list: with one traded month that list has one stop, and an empty month is a
-    real answer rendered as honest zeros. The walk is oldest first with All time
-    (the empty string) last, which is what makes a fresh page, whose default IS
-    All time, open with the forward button disabled.
+    real answer rendered as honest zeros. The walk is All time first, then oldest
+    to newest, which is what makes a fresh page, whose default is the CURRENT
+    month as in the reference app, open with the forward button disabled.
     """
     js = _fn("renderPeriod") + _fn("monthSteps")
     assert "const range=S.state.month_range||S.state.months||[];" in js
-    assert "[...range].reverse().concat([''])" in js, \
-        "the walk must run oldest to newest and end at All time"
+    assert "['all'].concat([...range].reverse())" in js, \
+        "the walk must start at All time and run oldest to newest"
     assert re.search(r"data-month=\"\$\{prev\?\?''\}\"\s*\$\{prev===null\?'disabled':''\}", js)
     assert re.search(r"data-month=\"\$\{next\?\?''\}\"\s*\$\{next===null\?'disabled':''\}", js)
 
@@ -3016,10 +3017,10 @@ def test_dashboard_commission_reads_the_same_as_the_tables():
         "the shared charge helper is gone"
     # The Dashboard card reads the payload key directly; both tables render
     # through `statsRow`, which is the only place a stats row's cells exist.
-    assert "moneyOf(s.commissions)" in _fn("dashboard").replace(" ", ""), \
+    assert "chargeMo(s.commissions)" in _fn("dashboard").replace(" ", ""), \
         "the dashboard card does not use the shared helper"
     row = _fn("statsRow").replace(" ", "").replace("\n", "")
-    assert "moneyOf(s.commissions)" in row, \
+    assert "chargeMo(s.commissions)" in row, \
         "statsRow does not use the shared helper, so both tables bypass it"
     for fn in ("dashboard", "annual", "monthlyTable", "statsRow"):
         body = _fn(fn).replace(" ", "").replace("\n", "")
@@ -3062,9 +3063,9 @@ def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
     # One entry point now, not a wrapper per figure: `moneyOf` applies the rule
     # to any Money-shaped key, so a new gated figure needs no new helper and
     # cannot arrive with a subtly different rule of its own.
-    assert "constmoneyOf=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);" in js
+    assert "constchargeMo=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);" in js
     card = _fn("dashboard").replace(" ", "").replace("\n", "")
-    assert "moneyOf(s.commissions)" in card and "moneyOf(s.open_commission)" in card
+    assert "chargeMo(s.commissions)" in card and "chargeMo(s.open_commission)" in card
     assert "cash(Math.abs(s.open_commission.base))" not in card, \
         "the open-positions figure bypasses the shared rule"
 
@@ -3248,15 +3249,16 @@ def test_proceeds_and_friction_follow_the_same_charge_rule_as_commission():
     """
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
     # A leg is the one payload shape still carrying the triple flat, so it
-    # reaches chargeOf directly rather than through moneyOf. Both paths are the
-    # SAME rule -- moneyOf delegates to chargeOf -- which is the property that
-    # stops a change reaching one figure and missing another.
+    # reaches chargeOf directly rather than through moneyOf. Both paths ask the
+    # SAME question -- `isNativeCharge` -- which is the property that stops a
+    # change reaching one figure and missing another. moneyOf keeps the sign and
+    # chargeOf drops it, which is the only difference between them.
     # There is now exactly ONE entry point. `legProceedsOf` existed only because
     # a leg carried its triple flat; the leaf now carries a Money too, so every
     # display site in the page goes through `moneyOf`.
     assert "legProceedsOf" not in js, "the second entry point is back"
-    assert "constmoneyOf=mo=>mo==null?cash(null):chargeOf(" in js, \
-        "moneyOf no longer delegates to the shared rule"
+    assert "constmoneyOf=mo=>mo==null?cash(null):isNativeCharge(mo.native,mo.ccy)" in js, \
+        "moneyOf no longer asks the shared as-charged rule"
     card = _fn("dashboard").replace(" ", "").replace("\n", "")
     assert "moneyOf(s.open_premium)" in card and "moneyOf(s.options_friction)" in card
     assert "cash(s.open_premium.base)}</b>" not in card, "pill bypasses the rule"
@@ -3410,7 +3412,7 @@ def test_commission_is_tinted_as_a_cost_and_sized_like_its_neighbours():
     same length rule Net P&L uses.
     """
     dash = _fn("dashboard").replace(" ", "").replace("\n", "")
-    assert "'neg'+(String(moneyOf(s.commissions)).length>10?'sm':'')" in dash, (
+    assert "'neg'+(String(chargeMo(s.commissions)).length>10?'sm':'')" in dash, (
         "the Commissions card lost its cost tint or its conditional sizing"
     )
     assert "'smneg'" not in dash, "back to an unconditional small size"
@@ -3467,7 +3469,7 @@ def test_a_cost_tint_is_never_given_a_minus_it_did_not_earn():
         "(money() already renders one) and mislabels the cost cards as negative"
     )
     stats = _fn("statsPanel") if "function statsPanel(" in _code_only(_js()) else _js()
-    assert "'neg '+(String(moneyOf(s.commissions))" in stats.replace("\n", ""), (
+    assert "'neg '+(String(chargeMo(s.commissions))" in stats.replace("\n", ""), (
         "the Commissions card no longer hardcodes its tint; if it now routes "
         "through cls() it will grow a + on a positive cost"
     )
@@ -7181,3 +7183,33 @@ def test_a_link_across_underlyings_is_refused(populated):
         a, b = list(firsts.values())[:2]
         status, refused = _post(base, "/api/links", {"anchor": a, "joins": b})
     assert (status, refused["ok"]) == (400, False)
+
+
+def test_the_page_default_is_the_current_month_and_absent_stays_all_time(populated):
+    """`month=current` is what the page sends with no month chosen, and the
+    server resolves it to the month today falls in, newest of `month_range`.
+    No month at all stays all-time, so the CLI keeps its reading.
+
+    Ablated by dropping the `current` branch: the first assertion fails.
+    """
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _, current = _get(base, "/api/state?month=current")
+        _, absent = _get(base, "/api/state")
+    assert current["selected_month"] == current["month_range"][0]
+    assert absent["selected_month"] is None
+
+
+def test_a_money_figure_keeps_its_minus():
+    """`moneyOf` routed every Money through `chargeOf`, whose `Math.abs` is right
+    for a commission and wrong for P&L: a losing month rendered red with no minus,
+    because `.signed` draws only the `+`. Found on the live journal's first
+    losing month. The unsigned form is `chargeMo`, for commission alone.
+
+    Ablated by restoring the `chargeOf` route: this fails.
+    """
+    js = _js()
+    body = re.search(r"const moneyOf=(.*?);\n", js, re.S)
+    assert body, "moneyOf is gone"
+    assert "chargeOf" not in body.group(1) and "abs" not in body.group(1)
+    assert re.search(r"\.pos\.signed::before\{content:\"\+\"\}", _css())
+    assert ".neg.signed::before" not in _css(), "the minus would print twice"

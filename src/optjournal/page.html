@@ -1366,7 +1366,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local events
  * @local zrows clean
  * @local rails sessions sigma
- * @local body others pair pick said
+ * @local body others pair pick said m
  */
 
 const $=s=>document.querySelector(s);
@@ -1569,7 +1569,15 @@ const isNativeCharge=(nat,ccy)=>nat!=null&&ccy===DISP();
 const chargeOf=(nat,ccy,base)=>isNativeCharge(nat,ccy)
   ? money(Math.abs(nat),ccy) : cash(Math.abs(base));
 /** @param {Money|null} mo */
-const moneyOf=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);
+/* SIGNED. A Money is P&L, proceeds or a value far more often than a charge, and
+   routing every one through `chargeOf` dropped the minus from every loss: a red
+   "€4,946.13" for a month down 4,946.13, since `.signed` draws only the `+` and
+   leaves the minus to `money()`. Measured on the live journal the first month it
+   closed down. Commission keeps the unsigned form it was written for, below. */
+const moneyOf=mo=>mo==null?cash(null)
+  :isNativeCharge(mo.native,mo.ccy)?money(mo.native,mo.ccy):cash(mo.base);
+/** A commission: a charge, shown unsigned in the currency it was billed in. */
+const chargeMo=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);
 /** @param {Money|null} mo */
 const isNative=mo=>mo!=null&&isNativeCharge(mo.native,mo.ccy);
 /* Which basis the figure on screen actually uses -- three states, not two.
@@ -1671,9 +1679,9 @@ function renderRail(){
        the URL cannot express, and this page keeps its view coordinates in the
        hash for exactly that reason. */
     return `<button class="tab${on?' on':''}" data-tab="${on?S.tab:leaves[0]}"${
-      on?' aria-current="page"':''}><svg class="railico" viewBox="0 0 24 24"
-      aria-hidden="true" focusable="false"><path d="${RAIL_ICONS[id]}"/></svg>${
-      esc(label)}</button>`;
+      on?' aria-current="page"':''}><span class="railtile"><svg class="railico"
+      viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="${
+      RAIL_ICONS[id]}"/></svg></span>${esc(label)}</button>`;
   }).join('');
 }
 
@@ -1824,11 +1832,12 @@ const TYPE_LABEL={'':'Options',equities:'Equities',odte:'0DTE'};
    `load()` -- so on the Calendar there were two ways to do one thing, one of them
    inside the card and one above it.
 
-   The walk is the account's life, oldest to newest, then All time at the end.
-   All time is the default view, so a fresh page opens with the forward button
-   disabled -- the reference app greys it at the current month, and "you are at
-   the most recent you can be" is the same statement. One step back lands on the
-   newest month. Walking `month_range` rather than the fills-only `months` for
+   The walk is All time, then the account's life oldest to newest. The CURRENT
+   month is the default, as the reference app opens on it (checked on a fresh
+   launch of IAG 2.0.16: Sep 2026, forward greyed), so a fresh page has the
+   forward button disabled. All time is one step before the oldest month.
+   `S.month` is null for that default, which keeps the URL clean and lets a
+   bookmark follow the calendar into next month; All time is spelled `all`. Walking `month_range` rather than the fills-only `months` for
    the reason the dropdown did: with one traded month the walk would have one
    stop, and an empty month is still a real answer, rendered as honest zeros.
 
@@ -1838,21 +1847,21 @@ const TYPE_LABEL={'':'Options',equities:'Equities',odte:'0DTE'};
    keeps its width. */
 function monthSteps(){
   const range=S.state.month_range||S.state.months||[];
-  return [...range].reverse().concat(['']);
+  return ['all'].concat([...range].reverse());
 }
 function renderPeriod(){
   const el=$('#period');
   if(!PERIOD_TABS.includes(S.tab)||!S.state){el.innerHTML='';return;}
-  const steps=monthSteps(), cur=S.month||'';
+  const steps=monthSteps(), cur=S.month||S.state.selected_month||'all';
   const i=steps.indexOf(cur);
   /* A hand-edited month outside the range has no neighbours to step to. Both
      buttons still lead somewhere sensible: back to the newest month, forward to
      All time -- which is where the healed page is heading anyway. */
-  const prev=i>0?steps[i-1]:i<0?(steps[steps.length-2]??null):null;
-  const next=i>=0&&i<steps.length-1?steps[i+1]:i<0?'':null;
-  const has=!cur||(S.state.months||[]).includes(cur);
-  const label=cur?monthLabel(cur):'All time';
-  const tipFor=m=>m===''?'All time':monthLabel(m);
+  const prev=i>0?steps[i-1]:i<0?'all':null;
+  const next=i>=0&&i<steps.length-1?steps[i+1]:i<0?(steps[steps.length-1]??null):null;
+  const has=cur==='all'||(S.state.months||[]).includes(cur);
+  const label=cur==='all'?'All time':monthLabel(cur);
+  const tipFor=m=>m==='all'?'All time':monthLabel(m);
   const s=S.state.stats;
   el.innerHTML=`<div class="pstep">
       <button data-month="${prev??''}" ${prev===null?'disabled':''}
@@ -2324,16 +2333,16 @@ function dashboard(){
        result was one plain figure in a row of green ones, which reads as a
        number the page forgot to finish rather than as a deliberate neutral.
        A commission is never a gain, so there is no sign to consult. */
-    commissions:()=>statCard('Commissions', moneyOf(s.commissions),
+    commissions:()=>statCard('Commissions', chargeMo(s.commissions),
       basisOf(s.commissions)
       +(opt?` · closed round trips${s.open_commission.base?` · ${
-        moneyOf(s.open_commission)} on open positions`:''}`
+        chargeMo(s.open_commission)} on open positions`:''}`
          :' · stated by IBKR'),
       /* Same length rule as Net P&L above, not an unconditional `sm`. Fixed at
          19px this was the only card on the dashboard permanently smaller than
          its neighbours, which read as a different typeface rather than as a
          deliberate size -- and the tint made it obvious. */
-      'neg '+(String(moneyOf(s.commissions)).length>10?'sm':''),'commissions'),
+      'neg '+(String(chargeMo(s.commissions)).length>10?'sm':''),'commissions'),
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
@@ -3154,7 +3163,7 @@ function replayEvents(rp,pts){
       :`Δ ${e.delta_before==null?'':dnum(e.delta_before)+' → '}${
         dnum(e.delta_after)}`;
     const bits=[flow,
-      e.commission?`comm ${moneyOf(e.commission)}`:'',
+      e.commission?`comm ${chargeMo(e.commission)}`:'',
       e.realized?`realised <b class="${cls(e.realized.native)}">${
         moneyOf(e.realized)}</b>`:'',
       dl].filter(Boolean).join('<span class="dim2"> · </span>');
@@ -3209,7 +3218,7 @@ function replayFocus(e,resume){
       `<b class="${Number(e.cash.native)<0?'neg':'pos'}">${moneyOf(e.cash)}</b>`],
     !e.realized?null:['realised',
       `<b class="${cls(e.realized.native)}">${moneyOf(e.realized)}</b>`],
-    !e.commission?null:['commission', moneyOf(e.commission)],
+    !e.commission?null:['commission', chargeMo(e.commission)],
   ].filter(Boolean).map(([k,v])=>
     `<div class="fr"><span class="fk">${k}</span><span class="fv">${v}</span></div>`
   ).join('');
@@ -3462,7 +3471,7 @@ function trades(){
           nat&&nat!==DISP()?`${money(legs.reduce((a,l)=>a+(l.proceeds||0),0),nat)} as filled`:'',
           'sm '+cls(lc.proceeds.base))}
         ${statCard('Comms & Fees',
-          lc.commission!=null?moneyOf(lc.commission):'—',
+          lc.commission!=null?chargeMo(lc.commission):'—',
           openLc?'lands with the outcome, on close':'all legs, whole lifecycle',
           'sm '+cls(lc.commission?.base))}
         ${statCard('Realised P&L',
@@ -4226,7 +4235,7 @@ function statsRow(s,{label,wide=false,klass=''}={}){ return `<tr${klass?` class=
   <td class="n ${cls(s.net_pnl.base)}">${moneyOf(s.net_pnl)}</td>
   ${wide?`<td class="n">${s.avg_win==null?'—':moneyOf(s.avg_win)}</td>
   <td class="n">${s.avg_loss==null?'—':moneyOf(s.avg_loss)}</td>`:''}
-  <td class="n">${moneyOf(s.commissions)}</td>
+  <td class="n">${chargeMo(s.commissions)}</td>
   <td class="n"><span class="pos">${s.green_days}</span>/<span
     class="neg">${s.red_days}</span></td></tr>`; }
 
@@ -6175,11 +6184,14 @@ function draw(push){
     b.onclick=()=>{S.tab=b.dataset.tab;draw(true);});
   /* The month stepper goes through load(), never a redraw: the stats are
      aggregated server-side per period, so a step that only redrew would show a
-     month the server never filtered for. An empty `data-month` is All time. */
+     month the server never filtered for. `all` is All time. */
   document.querySelectorAll('button[data-month]').forEach(b=>
     b.onclick=()=>{
       S.calday=null; /* a selection from the old month means nothing in the new */
-      S.month=b.dataset.month||null;load();});
+      /* Landing back on the current month is the default again, not a pin:
+         the URL stays clean and follows the calendar forward. */
+      const m=b.dataset.month||null;
+      S.month=m===(S.state.month_range||[])[0]?null:m;load();});
   /* Day drill-down: pure redraw, no request -- the leg data is already in the
      payload. Clicking the selected day again clears it (toggle). */
   document.querySelectorAll('[data-calday]').forEach(el=>
@@ -6870,7 +6882,11 @@ async function load(){
   /* Not `q` -- that name is the FX quote everywhere else in this page, and one
      name for two shapes is what makes the payload guard unable to check either. */
   const qs=new URLSearchParams();
-  if(S.month) qs.set('month',S.month);
+  /* `all` is the absence of a month on the wire; no month at all asks the
+     server for the current one, which only it can resolve. */
+  /* A linked day with no month names its own month: `#calday=2026-07-24` must
+     load July, or the drill-down has no data behind it. */
+  if(S.month!=='all') qs.set('month',S.month||(S.calday?S.calday.slice(0,7):'current'));
   if(S.type) qs.set('type',S.type);
   /* Same repeated key on the wire as in the hash, so one vocabulary spans URL,
      request and payload -- `parse_qs` hands the server the list directly. */
@@ -6883,13 +6899,13 @@ async function load(){
   if(!r.ok){note('Could not read state: HTTP '+r.status,'bad');return;}
   S.state=await r.json();
   staleServerCheck(S.state);
-  if(S.month===null && S.state.selected_month) S.month=S.state.selected_month;
   /* A month outside the account's lifetime heals away (the server answers with
      selected_month null rather than inventing one). Months WITH no fills are
      legitimate now -- validated against month_range, not the fills-only list,
      or picking one would revert on the very next load. */
-  if(S.month && !((S.state.month_range||S.state.months||[]).includes(S.month)))
-    S.month=S.state.selected_month;
+  if(S.month && S.month!=='all'
+     && !((S.state.month_range||S.state.months||[]).includes(S.month)))
+    S.month=null;
   /* Server-resolved, so an unrecognised type falls back to everything here too
      instead of leaving the button set out of step with the numbers. */
   S.type=S.state.trade_type==='all'?null:S.state.trade_type;

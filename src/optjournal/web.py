@@ -466,6 +466,12 @@ def build_state(
         # the page said why. An empty month now shows an honest zero month.
         # Months outside the account's lifetime still heal to all-time, so a
         # hand-edited `#month=1999-01` cannot render a calendar of nothing.
+        # `current` is the page's default: the month today falls in, which is
+        # what the reference app opens on. Resolved here because only the server
+        # knows the range. An absent month stays all-time, so the CLI and every
+        # existing caller keep the reading they had.
+        if month == "current":
+            month = browsable[0] if browsable else None
         selected = month if month in browsable else None
         # Fill counts per category, so the page can derive which Trade Types
         # buttons are offerable instead of asserting it in markup.

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.request
+from datetime import date
 
 import pytest
 from conftest import connect_migrated
@@ -57,6 +58,11 @@ def served(tmp_path_factory):
         yield base
 
 
+def _month_label(month: str) -> str:
+    """`format.js` monthLabel, for the one label this test reads."""
+    return date(int(month[:4]), int(month[5:7]), 1).strftime("%b %Y")
+
+
 def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     if not browser.browsers():
         pytest.skip("no Chrome/Chromium on this machine")
@@ -76,19 +82,21 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     # page JS threw before rendering anything at all.
     assert markup.count('data-tab="') >= 5, "tab bar missing -- page JS crashed on load"
 
-    # Data binding: the month stepper, at the default view, is at All time --
-    # the end of the walk -- so forward is disabled and back leads to the
-    # newest month of the browsable range. This replaced a count of the old
-    # dropdown's options, and asks the same question of the new control: does
-    # the render agree with the payload it was handed, at both ends.
+    # Data binding: the month stepper, at the default view, is at the CURRENT
+    # month -- the newest of the browsable range, and the end of the walk -- so
+    # forward is disabled and back leads to the month before it, or to All time
+    # when the account is one month old. The reference app opens the same way.
+    # Asks whether the render agrees with the payload it was handed, at the end.
     step = re.search(r'<div class="pstep">(.*?)</div>', markup, re.S)
     assert step, "the period stepper never rendered"
     back, fwd = re.findall(r"<button([^>]*)>", step.group(1))
-    assert "All time" in step.group(1)
-    assert "disabled" in fwd, "at All time there is nowhere forward to go"
-    if payload["month_range"]:
-        assert f'data-month="{payload["month_range"][0]}"' in back, (
-            "one step back from All time must land on the newest month of the range"
+    assert "disabled" in fwd, "at the current month there is nowhere forward to go"
+    rng = payload["month_range"]
+    if rng:
+        assert _month_label(rng[0]) in step.group(1), "the default is not the current month"
+        want = rng[1] if len(rng) > 1 else "all"
+        assert f'data-month="{want}"' in back, (
+            "one step back from the current month must land on the month before it"
         )
 
     # Conditional rendering, oracle-driven from the same payload the page
