@@ -7344,3 +7344,69 @@ def test_saving_a_field_does_not_refetch(populated, monkeypatch):
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         _post(base, "/api/watchlist", {"symbol": "SPY", "alert_above": "900"})
     assert calls == []
+
+
+def test_adding_a_symbol_fetches_its_earnings_date(populated, monkeypatch):
+    """A new watch arrives with its earnings countdown, not a dash until you type
+    one: the add asks Nasdaq once."""
+    from optjournal import earnings  # noqa: PLC0415 - local to this test
+
+    asked: list[str] = []
+
+    def fake(symbol, **_):
+        asked.append(symbol)
+        return earnings.Earnings(day="2026-10-28", confirmed=False, timing=None)
+
+    monkeypatch.setattr(earnings, "fetch_earnings", fake)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _post(base, "/api/watchlist", {"symbol": "zzzq"})
+        _, state = _get(base, "/api/state")
+    assert asked == ["ZZZQ"]
+    row = next(w for w in state["watchlist"] if w["symbol"] == "ZZZQ")
+    assert (row["earnings_date"], row["earnings_source"]) == ("2026-10-28", "estimated")
+
+
+def test_a_refresh_asks_for_an_earnings_date_once_a_day(populated, monkeypatch):
+    """Earnings ride the quote route, but a company confirming its date is a
+    quarterly event: one request per symbol per day, whatever the quote cadence.
+    Ablated by dropping the age gate: the second refresh asks again."""
+    from optjournal import earnings, marketdata  # noqa: PLC0415 - local to this test
+
+    calls: list[str] = []
+    monkeypatch.setattr(earnings, "fetch_earnings",
+                        lambda s, **k: calls.append(s) or None)
+    monkeypatch.setattr(marketdata, "fetch_quote",
+                        lambda s, **k: (_ for _ in ()).throw(
+                            marketdata.BarFetchError("no network in tests")))
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _post(base, "/api/watchlist", {"symbol": "zzzq"})
+        calls.clear()
+        _, first = _get(base, "/api/quotes")
+        asked_first = list(calls)
+        _, second = _get(base, "/api/quotes")
+    assert asked_first == [], "the add just asked; a refresh must not ask again"
+    assert (first["earnings_asked"], second["earnings_asked"]) == (0, 0)
+    assert first["earnings_failed"] == []
+
+
+def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, monkeypatch):
+    """A dead endpoint costs one request per symbol per day, not one per refresh,
+    and the page is told which symbols it could not refresh."""
+    from optjournal import earnings, marketdata  # noqa: PLC0415 - local to this test
+
+    calls: list[str] = []
+
+    def offline(symbol, **_):
+        calls.append(symbol)
+        raise earnings.EarningsFetchError(f"{symbol} earnings: URLError")
+
+    monkeypatch.setattr(earnings, "fetch_earnings", offline)
+    monkeypatch.setattr(marketdata, "fetch_quote",
+                        lambda s, **k: (_ for _ in ()).throw(
+                            marketdata.BarFetchError("no network in tests")))
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _post(base, "/api/watchlist", {"symbol": "zzzq"})
+        assert calls == ["ZZZQ"], "the add asked and the fetch failed"
+        _, reply = _get(base, "/api/quotes")
+    assert calls == ["ZZZQ"], "a failure is stamped, so the day's budget is spent"
+    assert reply["earnings_failed"] == []

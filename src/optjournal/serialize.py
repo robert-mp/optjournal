@@ -1181,7 +1181,8 @@ def watchlist_data(
     "today" on this tab means the trading day the rest of the tab is stated in.
     """
     rows = conn.execute(
-        "SELECT symbol, note, earnings_on, alert_above, alert_below, added_at"
+        "SELECT symbol, note, earnings_on, alert_above, alert_below, added_at,"
+        " earnings_next, earnings_confirmed, earnings_timing"
         " FROM watchlist ORDER BY symbol"
     ).fetchall()
     # One ET day for the whole payload, so two rows of one response cannot land on
@@ -1302,8 +1303,19 @@ def watchlist_data(
             "rv_rank_band": rank_band(rv_rank),
             #: The next earnings date, TYPED. Verbatim from the column, because the
             #: only claim being made about it is that this is what the reader
-            #: recorded -- there is no source to reconcile it against.
+            #: recorded.
             "earnings_on": row["earnings_on"],
+            #: The date in force: the typed one when there is one, else the feed's
+            #: (Nasdaq, from Zacks). `earnings_source` says which, and for the
+            #: feed's whether it is the company's announced date or Zacks' estimate
+            #: from past reporting dates, so the page never prints a guess as a
+            #: date. `earnings_timing` is the feed's "before open" or "after close".
+            "earnings_date": row["earnings_on"] or row["earnings_next"],
+            "earnings_source": ("typed" if row["earnings_on"]
+                                else None if not row["earnings_next"]
+                                else "confirmed" if row["earnings_confirmed"]
+                                else "estimated"),
+            "earnings_timing": None if row["earnings_on"] else row["earnings_timing"],
             #: The reader's price alerts, verbatim. Crossed or not is the page's
             #: to say, against the price it is showing (`watch.alertState`).
             "alert_above": row["alert_above"],
@@ -1312,7 +1324,8 @@ def watchlist_data(
             #: Days from the ET trading day to that date, derived here and never
             #: stored. Negative for a date that has gone by, 0 for today, None when
             #: nothing is recorded. See `_days_until` for why it is signed.
-            "earnings_in_days": _days_until(row["earnings_on"], today=today),
+            "earnings_in_days": _days_until(
+                row["earnings_on"] or row["earnings_next"], today=today),
             "options": held.get(symbol, []),
             "held": bool(held.get(symbol)),
         })

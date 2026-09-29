@@ -228,3 +228,11 @@ def _no_fetch_on_watch(monkeypatch):
     Yahoo; a test about the fetch itself patches its own fake over this one."""
     from optjournal import bars  # noqa: PLC0415 - local to the fixture
     monkeypatch.setattr(bars, "fetch_bars", lambda *a, **k: [])
+
+
+@pytest.fixture(autouse=True)
+def _no_earnings_fetch(monkeypatch):
+    """Adding a symbol and refreshing quotes both ask Nasdaq for earnings dates.
+    AUTOUSE so the suite never reaches it; a test about it patches its own."""
+    from optjournal import earnings  # noqa: PLC0415 - local to the fixture
+    monkeypatch.setattr(earnings, "fetch_earnings", lambda *a, **k: None)

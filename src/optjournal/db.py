@@ -47,7 +47,7 @@ __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -94,6 +94,15 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # the price on screen and never stored, so it cannot go stale.
     ("watchlist", "alert_above", "REAL"),
     ("watchlist", "alert_below", "REAL"),
+    # The next earnings date as FETCHED (Nasdaq, from Zacks), beside the typed
+    # `earnings_on` rather than over it: a date you typed is yours and outranks a
+    # feed's, and the feed's own confirmed-or-estimated flag travels with it.
+    # `earnings_checked_at` is when it was last asked, so a refresh spends a
+    # request only once a day per symbol.
+    ("watchlist", "earnings_next", "TEXT"),
+    ("watchlist", "earnings_confirmed", "INTEGER"),
+    ("watchlist", "earnings_timing", "TEXT"),
+    ("watchlist", "earnings_checked_at", "TEXT"),
     # WHICH FLEX QUERY DELIVERED THIS FILL, and therefore how much to trust it.
     #
     # A Trade Confirmation query reports a fill the same session; an Activity
@@ -455,6 +464,11 @@ CREATE TABLE IF NOT EXISTS watchlist (
   -- Price alerts the reader typed; see `_ADDED_COLUMNS` for why they are plain.
   alert_above REAL,
   alert_below REAL,
+  -- Fetched earnings; see `_ADDED_COLUMNS`.
+  earnings_next TEXT,
+  earnings_confirmed INTEGER,
+  earnings_timing TEXT,
+  earnings_checked_at TEXT,
   added_at   TEXT NOT NULL
 );
 

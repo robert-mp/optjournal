@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any
 
 from optjournal import __version__, journal, replay
+from optjournal import earnings as earnings_mod
 from optjournal import settings as prefs
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
@@ -235,6 +236,60 @@ _JOURNAL_CONTROL = frozenset({"anchor", "broker"})
 #: interpolated into the SQL: what is writable is a decision of this module's, and
 #: the derived and fetched figures on that table's tab have no column to write.
 _WATCH_FIELDS = ("note", "earnings_on", "alert_above", "alert_below")
+
+
+#: How old a fetched earnings date may be before a refresh asks again. A day:
+#: a company confirming its date is a once-a-quarter event, and one request per
+#: symbol per day is what that is worth.
+EARNINGS_MAX_AGE_S = 20 * 3600
+
+
+def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
+                      force: bool = False) -> tuple[list[str], int]:
+    """Fetch the next earnings date for symbols whose stored one is stale.
+
+    Returns the symbols whose fetch FAILED, so the reply can say so, and how
+    many were asked, so the page knows whether its payload is now stale; a symbol
+    with no earnings (a fund) is an answer and is stored as none. Every asked
+    symbol is stamped, success or not, so a dead endpoint costs one request per
+    symbol per day rather than one per refresh.
+    """
+    now = datetime.now(UTC)
+    failed: list[str] = []
+    asked = 0
+    for symbol in symbols:
+        row = conn.execute(
+            "SELECT earnings_checked_at FROM watchlist WHERE symbol = ?", (symbol,)
+        ).fetchone()
+        if row is None:
+            continue
+        checked = row["earnings_checked_at"]
+        if not force and checked:
+            try:
+                age = (now - datetime.fromisoformat(checked)).total_seconds()
+            except ValueError:
+                age = EARNINGS_MAX_AGE_S
+            if age < EARNINGS_MAX_AGE_S:
+                continue
+        asked += 1
+        try:
+            found = earnings_mod.fetch_earnings(symbol)
+        except earnings_mod.EarningsFetchError as exc:
+            log.debug("earnings %s failed: %s", symbol, exc)
+            failed.append(symbol)
+            conn.execute("UPDATE watchlist SET earnings_checked_at = ? WHERE symbol = ?",
+                         (now.isoformat(timespec="seconds"), symbol))
+            continue
+        conn.execute(
+            "UPDATE watchlist SET earnings_next = ?, earnings_confirmed = ?,"
+            " earnings_timing = ?, earnings_checked_at = ? WHERE symbol = ?",
+            (found.day if found else None,
+             (1 if found.confirmed else 0) if found else None,
+             found.timing if found else None,
+             now.isoformat(timespec="seconds"), symbol),
+        )
+    conn.commit()
+    return failed, asked
 
 
 def _iv_ranks(symbols: list[str]) -> dict[str, Any]:
@@ -994,6 +1049,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         with open_journal(self.cfg.db_path) as conn:
             symbols = [str(row["symbol"]) for row in conn.execute(
                 "SELECT symbol FROM watchlist ORDER BY symbol")]
+            # Earnings ride along, but only for dates over a day old: one request
+            # per symbol per day, whatever the quote cadence.
+            earnings_failed, earnings_asked = _refresh_earnings(conn, symbols)
         quotes: dict[str, Any] = {}
         failed: list[str] = []
         for symbol in symbols:
@@ -1021,6 +1079,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             "ok": True,
             "quotes": quotes,
             "failed": failed,
+            #: Symbols whose earnings date could not be refreshed; the stored one
+            #: stands and the page says so.
+            "earnings_failed": earnings_failed,
+            #: How many earnings dates were re-asked; nonzero means the state
+            #: payload's dates may have moved, so the page reloads it.
+            "earnings_asked": earnings_asked,
             #: IV ranks ride this route for the reason the route exists, and they
             #: are the most expensive thing on it: TWO requests per symbol, because
             #: CBOE serves the current implied vol and its trailing-year bounds from
@@ -1405,6 +1469,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # symbol is watched either way and the job will fill it in.
             fetched = (fetch_watch_bars(conn, symbol)
                        if action == "add" and not fields else None)
+            if action == "add" and not fields:
+                _refresh_earnings(conn, [symbol], force=True)
         return 200, {"ok": True, "kind": "watchlist", "action": action,
                      "symbol": symbol, "changed": changed, "fetch_error": fetched}
 

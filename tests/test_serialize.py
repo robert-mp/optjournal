@@ -808,3 +808,47 @@ def test_the_row_histogram_reads_each_session_as_it_closed(conn):
     assert row["bx_recent"][0] == pytest.approx(bxtrender_short(newest_first[4:]))
     assert row["bx_recent"][-1] == pytest.approx(bxtrender_short(newest_first))
     assert row["bx_recent"][0] != pytest.approx(row["bx_recent"][-1])
+
+
+# ---------------------------------------------------- earnings, typed and fetched
+
+
+def _watch_earnings(conn, symbol: str, **cols) -> None:
+    conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES (?, '2026-01-01')",
+                 (symbol,))
+    if cols:
+        sets = ", ".join(f"{k} = ?" for k in cols)
+        conn.execute(f"UPDATE watchlist SET {sets} WHERE symbol = ?",
+                     (*cols.values(), symbol))
+    conn.commit()
+
+
+def test_a_typed_earnings_date_outranks_the_fetched_one(conn):
+    """Yours is yours: the feed's date is stored beside it, never over it, and the
+    countdown follows the one on screen."""
+    _watch_earnings(conn, "AAA", earnings_on="2026-11-05",
+                    earnings_next="2026-10-28", earnings_confirmed=0)
+    row = watchlist_data(conn, now=datetime(2026, 10, 1, 16, 0, tzinfo=UTC))[0]
+    assert (row["earnings_date"], row["earnings_source"]) == ("2026-11-05", "typed")
+    assert row["earnings_in_days"] == 35, "the countdown follows the typed date"
+    assert row["earnings_on"] == "2026-11-05"
+
+
+@pytest.mark.parametrize("confirmed, source", [(1, "confirmed"), (0, "estimated")])
+def test_the_fetched_date_says_whether_it_was_announced(conn, confirmed, source):
+    """An estimate and an announced date are different claims, so the page is told
+    which it is rather than being handed a bare date."""
+    _watch_earnings(conn, "BBB", earnings_next="2026-10-28",
+                    earnings_confirmed=confirmed, earnings_timing="after close")
+    row = watchlist_data(conn, now=datetime(2026, 10, 1, 16, 0, tzinfo=UTC))[0]
+    assert (row["earnings_date"], row["earnings_source"]) == ("2026-10-28", source)
+    assert row["earnings_timing"] == "after close"
+    assert row["earnings_in_days"] == 27
+
+
+def test_no_date_anywhere_is_a_null_source(conn):
+    """A fund. Absent rather than 'estimated for never'."""
+    _watch_earnings(conn, "CCC")
+    row = watchlist_data(conn, now=datetime(2026, 10, 1, 16, 0, tzinfo=UTC))[0]
+    assert (row["earnings_date"], row["earnings_source"]) == (None, None)
+    assert row["earnings_in_days"] is None

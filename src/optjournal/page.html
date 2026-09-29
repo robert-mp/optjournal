@@ -904,6 +904,11 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number|null} alert_below -- the reader's alert level below, typed
  * @property {Array} bx_recent -- the daily arm over the last five sessions, oldest
  *   first; null where a session is inside the warm-up window
+ * @property {string|null} earnings_date -- the date in force: typed, else fetched
+ * @property {string|null} earnings_source -- typed | confirmed | estimated: whose
+ *   date it is, and for the feed's whether the company announced it or Zacks
+ *   estimated it from past reporting dates
+ * @property {string|null} earnings_timing -- the feed's "before open" / "after close"
  * @property {string|null} earnings_on -- the next earnings date, YYYY-MM-DD, as
  *   the reader TYPED it. Not fetched and not derivable: nothing this journal
  *   reaches publishes one (see db.py's column comment for what was probed), so
@@ -1318,6 +1323,10 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {boolean} ok
  * @property {Object} quotes -- symbol -> Quote (price, at, previous_close,
  *   currency, name)
+ * @property {Array} earnings_failed -- symbols whose earnings date could not be
+ *   refreshed; the stored date stands
+ * @property {number} earnings_asked -- how many earnings dates were re-asked; when
+ *   nonzero the state payload's dates may have moved
  * @property {Array} failed -- symbols the source would not answer for. One dead
  *   ticker must not blank the others, so it is a list rather than an error
  * @property {number} asked_at -- the SERVER's clock when it answered, so the page
@@ -4707,12 +4716,22 @@ function watchSort(rows){
 /* The earnings cell: the countdown IAG prints ("36d"), with the typed date in its
    title. A past date says so rather than counting backwards, and an empty cell
    means none RECORDED, never none due, so its dash says where to record one. */
+/* Whose date it is, in words, for the title and the drawer. An estimate says it
+   is one: Zacks derives it from past reporting dates and it moves when the
+   company announces. */
+const wearnWhose=w=>w.earnings_source==='typed'?'recorded by you'
+  :w.earnings_source==='confirmed'?`announced${w.earnings_timing
+    ?', '+w.earnings_timing:''} (Nasdaq, from Zacks)`
+  :'estimated by Zacks from past reporting dates, not yet announced';
 const wearn=w=>{
-  if(!w.earnings_on) return wdash(`no earnings date recorded for ${w.symbol}; `
-    +`open the row to add one`);
+  if(!w.earnings_date) return wdash(`no earnings date: a fund has none, and for a `
+    +`company the feed has not answered yet`);
   const days=w.earnings_in_days;
-  const when=days==null?esc(w.earnings_on):days<0?'past':days===0?'today':days+'d';
-  return `<span title="${esc(`recorded for ${w.earnings_on}`)}">${when}</span>`;
+  const when=days==null?esc(w.earnings_date):days<0?'past':days===0?'today':days+'d';
+  /* A tilde marks an estimate, so a guessed date never reads as a known one. */
+  return `<span class="${w.earnings_source==='estimated'?'dim':''}" title="${esc(
+    `${w.earnings_date}, ${wearnWhose(w)}`)}">${w.earnings_source==='estimated'
+    ?'~':''}${when}</span>`;
 };
 
 /* Why the rank is absent, in the count that explains it -- and the two reasons are
@@ -4839,7 +4858,7 @@ const wicon=name=>`<svg class="wico" viewBox="0 0 24 24" aria-hidden="true"
  * still one hover away, and the bar reads as controls. */
 function watchFilters(){
   const named=wnamed();
-  const dated=(S.state.watchlist||[]).some(w=>!!w.earnings_on);
+  const dated=(S.state.watchlist||[]).some(w=>!!w.earnings_date);
   /* One toggle builder: pressing the lit one turns it off, so every group can be
      emptied without a separate All. */
   const tog=(attr,val,on,body,hint,off)=>`<button class="wtog${on?' on':''}"
@@ -5126,15 +5145,19 @@ function watchDetail(w){
       wo.strike!=null?strike(wo.strike):''}${wo.put_call||''}${wo.expiry?
       ` <span class="dim">${esc(wo.expiry)}</span>`:''}</div>`).join('');
   const mine=sec('yours',
-    `${kv('earnings',w.earnings_on?`${esc(w.earnings_on)}${w.earnings_in_days==null?''
+    `${kv('earnings',w.earnings_date?`${w.earnings_source==='estimated'?'~':''}${
+      esc(w.earnings_date)}${w.earnings_in_days==null?''
       :` <span class="dim">${esc(w.earnings_in_days<0?'past'
         :w.earnings_in_days===0?'today':'in '+w.earnings_in_days+'d')}</span>`}`
-      :wdash(`no earnings date recorded for ${w.symbol}`),
-      'recorded by you, not fetched: no source this journal reaches publishes an '
-        +'earnings date, so the days are counted from the ET trading day on every load')}
+      :wdash(`no earnings date for ${w.symbol}`),
+      w.earnings_date?`${wearnWhose(w)}. Type a date below to override it; empty `
+        +`the box to go back to the feed's.`
+        :'a fund has no earnings; for a company, type one below')}
+    ${w.earnings_date&&w.earnings_source!=='typed'?`<div class="wkv"><span class="wkl"
+      ></span><span class="dim wkf">${esc(wearnWhose(w))}</span></div>`:''}
     <form class="wed" data-wsave="${esc(w.symbol)}" data-wfield="earnings_on">
       <input id="wearn" data-subject="${esc(w.symbol)}"
-      value="${esc(w.earnings_on||'')}" placeholder="YYYY-MM-DD" maxlength="10"
+      value="${esc(w.earnings_on||'')}" placeholder="override YYYY-MM-DD" maxlength="10"
       autocomplete="off" spellcheck="false">
       <button class="btn sm" type="submit">Save</button></form>
     ${kv('alert',bell==='hit'?'<span class="warn2">crossed</span>'
@@ -6757,6 +6780,7 @@ async function loadQuotes(announce){
        one lets the IV rank chips enable themselves honestly. */
     S.ivr={ranks:qres.ranks||{},unranked:qres.unranked||[],
            ranks_failed:qres.ranks_failed||[]};
+    if(qres.earnings_asked) await load();
     if(qres.failed&&qres.failed.length)
       note('No quote for '+esc(qres.failed.join(', ')),'warn');
     else if(qres.ranks_failed&&qres.ranks_failed.length)
