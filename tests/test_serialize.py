@@ -791,3 +791,20 @@ def test_the_ladder_is_for_the_next_session_once_today_has_settled(conn, when, s
     _seed_index(conn, "^GSPC", "2026-09-24", 7700.0)
     _seed_index(conn, "^VIX", "2026-09-24", 16.0)
     assert odte_context_data(conn, now=when)["today"] == session
+
+
+def test_the_row_histogram_reads_each_session_as_it_closed(conn):
+    """`bx_recent` is the daily arm at the close of each of the last five sessions,
+    OLDEST FIRST: its first bar drops the four newest closes, its last is today's
+    reading. Pinned against `trend` directly, because the newest bar and `bx_daily`
+    share one source and cannot catch an order flip between themselves.
+    """
+    from optjournal.trend import bxtrender_short  # noqa: PLC0415
+    days = _sessions(160)
+    prices = _wobble(160)
+    _seed_watched_symbol(conn, "WOB", days, prices, duplicated=False)
+    row = watchlist_data(conn)[0]
+    newest_first = list(reversed(prices))
+    assert row["bx_recent"][0] == pytest.approx(bxtrender_short(newest_first[4:]))
+    assert row["bx_recent"][-1] == pytest.approx(bxtrender_short(newest_first))
+    assert row["bx_recent"][0] != pytest.approx(row["bx_recent"][-1])

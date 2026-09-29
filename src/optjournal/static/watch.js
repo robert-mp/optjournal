@@ -241,3 +241,81 @@ export function ringPoint(pct, radius) {
   const turn = 2 * Math.PI * p;
   return { x: r * Math.sin(turn), y: -r * Math.cos(turn) };
 }
+
+/** Whether a row's price alert stands, and whether the price has crossed it.
+ *
+ * `"hit"` when the shown price is at or beyond either level, `"set"` when a level
+ * exists and has not been reached, `null` when there is no alert. Judged against
+ * the price ON SCREEN, `shownPrice`'s, so the bell and the close beside it cannot
+ * describe two different sessions. No price means no verdict: an alert that
+ * cannot be judged is `"set"`, not `"hit"`.
+ *
+ * @param {number|null} price
+ * @param {number|null} above
+ * @param {number|null} below
+ * @returns {"hit"|"set"|null}
+ */
+export function alertState(price, above, below) {
+  const up = above != null && above > 0 ? Number(above) : null;
+  const down = below != null && below > 0 ? Number(below) : null;
+  if (up == null && down == null) return null;
+  if (price == null) return "set";
+  if ((up != null && price >= up) || (down != null && price <= down)) return "hit";
+  return "set";
+}
+
+/** Where the $/$$/$$$ share-price filter cuts, in the quote's own currency. */
+export const PRICE_TIERS = [50, 200];
+
+/** The share-price tier: under 50, 50 to under 200, and 200 or more. Null
+ * without a price, so an unpriced row matches no tier.
+ *
+ * @param {number|null} price
+ * @returns {"1"|"2"|"3"|null}
+ */
+export function priceTier(price) {
+  if (price == null || !(price > 0)) return null;
+  if (price < PRICE_TIERS[0]) return "1";
+  return price < PRICE_TIERS[1] ? "2" : "3";
+}
+
+/** The row's five-session B-Xtrender histogram, as bars in a box.
+ *
+ * Every bar grows up from the BASELINE, its height the reading's size against the
+ * arm's own bound on that side (`box.hi` above zero, `box.lo` below), and the sign
+ * is carried by `pos` for the colour: IAG's shape, and twice the height a
+ * centre-line chart gets in a row this short, which is what made a -4.5 readable
+ * as red at all. A full bar means the indicator's limit on every row alike. A bar is `faded` when the
+ * arm moved TOWARD zero since the session before, the indicator's own light and
+ * dark shades. A warm-up session (null) draws nothing and keeps its slot, so the
+ * newest bar is always the rightmost.
+ *
+ * `min` is a floor on bar height, so a reading of 0.3 still draws a visible dash
+ * rather than nothing, which would read as a missing session.
+ *
+ * @param {Array<number|null>} values oldest first
+ * @param {{w: number, h: number, gap: number, lo: number, hi: number, min: number}} box
+ * @returns {Array<{x: number, y: number, w: number, h: number, pos: boolean, faded: boolean}>}
+ */
+export function histBars(values, box) {
+  const n = values.length;
+  if (!n) return [];
+  const width = (box.w - box.gap * (n - 1)) / n;
+  const out = [];
+  values.forEach((value, i) => {
+    if (value == null) return;
+    const limit = value >= 0 ? box.hi : -box.lo;
+    const share = Math.min(1, Math.abs(value) / limit);
+    const height = Math.max(box.min, share * box.h);
+    const prev = i > 0 ? values[i - 1] : null;
+    out.push({
+      x: i * (width + box.gap),
+      y: box.h - height,
+      w: width,
+      h: height,
+      pos: value >= 0,
+      faded: prev != null && Math.abs(value) < Math.abs(prev),
+    });
+  });
+  return out;
+}

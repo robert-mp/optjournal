@@ -1181,7 +1181,8 @@ def watchlist_data(
     "today" on this tab means the trading day the rest of the tab is stated in.
     """
     rows = conn.execute(
-        "SELECT symbol, note, earnings_on, added_at FROM watchlist ORDER BY symbol"
+        "SELECT symbol, note, earnings_on, alert_above, alert_below, added_at"
+        " FROM watchlist ORDER BY symbol"
     ).fetchall()
     # One ET day for the whole payload, so two rows of one response cannot land on
     # opposite sides of midnight and report countdowns a day apart.
@@ -1220,8 +1221,13 @@ def watchlist_data(
         # NEWEST close (the series is newest first) is what "one session ago" means,
         # and both calls are gated, so a symbol holding exactly `MIN_SETTLED`
         # sessions gets a value and no delta rather than a delta against nothing.
-        bx_daily = bxtrender_short(closes)
-        bx_previous = bxtrender_short(closes[1:])
+        # The last five sessions of the daily arm, OLDEST FIRST, for the row's
+        # histogram. Each is the arm as it read at the close of that session, the
+        # same drop-the-newest reading `bx_previous` takes one step further; a
+        # session inside the warm-up window is None and draws no bar.
+        bx_recent = [bxtrender_short(closes[back:]) for back in range(4, -1, -1)]
+        bx_daily = bx_recent[-1]
+        bx_previous = bx_recent[-2]
         weekly = weekly_closes(conn, symbol)
         # Oldest first out of `bars`, newest first into `trend`. The reversal is
         # here, once, at the seam between the two conventions.
@@ -1298,6 +1304,11 @@ def watchlist_data(
             #: only claim being made about it is that this is what the reader
             #: recorded -- there is no source to reconcile it against.
             "earnings_on": row["earnings_on"],
+            #: The reader's price alerts, verbatim. Crossed or not is the page's
+            #: to say, against the price it is showing (`watch.alertState`).
+            "alert_above": row["alert_above"],
+            "alert_below": row["alert_below"],
+            "bx_recent": bx_recent,
             #: Days from the ET trading day to that date, derived here and never
             #: stored. Negative for a date that has gone by, 0 for today, None when
             #: nothing is recorded. See `_days_until` for why it is signed.

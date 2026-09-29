@@ -1817,6 +1817,12 @@ def _post(base: str, path: str, body: dict | None = None) -> tuple[int, dict]:
     ({"symbol": "SPY", "earnings_on": "2026-13-45"}, "date"),
     ({"symbol": "SPY", "earnings_on": "20260827"}, "date"),
     ({"symbol": "SPY", "earnings_on": "next thursday"}, "date"),
+    # A price alert is a level above zero, or empty to clear it.
+    ({"symbol": "SPY", "alert_above": "abc"}, "alert"),
+    ({"symbol": "SPY", "alert_below": "-5"}, "alert"),
+    ({"symbol": "SPY", "alert_above": "0"}, "alert"),
+    ({"symbol": "SPY", "alert_above": "nan"}, "alert"),
+    ({"symbol": "SPY", "alert_above": "inf"}, "alert"),
 ])
 def test_the_watchlist_endpoint_refuses_a_bad_request(populated, body, kind):
     """A user-input table reached over HTTP, so the input is not trusted.
@@ -4861,8 +4867,10 @@ def test_the_row_and_the_panel_print_one_price():
     )
     # Both also render the price through one helper, so the stale marker and its
     # title cannot differ between the two.
+    # The row prints the price, once, through the one helper; the drawer under it
+    # does not repeat it, so the two cannot print the same price differently.
     assert _fn("watchTable").count("wprice(") == 1
-    assert _fn("watchDetail").count("wprice(") == 1
+    assert "wprice(" not in _fn("watchDetail")
 
 
 def test_exactly_one_row_is_marked_current_for_a_selection():
@@ -4875,17 +4883,18 @@ def test_exactly_one_row_is_marked_current_for_a_selection():
     """
     body = _fn("watchTable")
     marked = body.replace(" ", "").replace("\n", "")
-    assert "conston=w.symbol===chosen" in marked, (
-        "the selected row is no longer decided by one comparison, so the class and "
-        "the ARIA state can drift apart"
+    assert "conston=w.symbol===open" in marked, (
+        "the open row is no longer decided by one comparison, so the class, the "
+        "ARIA state and the drawer can drift apart"
     )
     assert 'class="${on?\'wsel\':\'\'}"' in marked, "the open row lost its tint"
-    assert "on?'aria-current=\"true\"':''" in marked, (
-        "the open row lost aria-current, so a screen reader cannot tell which row "
-        "the detail pane is describing"
+    assert "aria-expanded=\"${on?'true':'false'}\"" in marked, (
+        "the row lost aria-expanded, so a screen reader cannot tell which row the "
+        "drawer under it belongs to"
     )
-    # One row, because the selection is a single symbol and the pane shows one row.
-    assert "aria-current" not in _fn("watchDetail")
+    assert "${on?`<trclass=\"wdrawer\">" in marked, (
+        "the drawer is no longer rendered from the same comparison as the tint"
+    )
 
 
 def test_the_selected_symbol_round_trips_through_the_hash():
@@ -4932,10 +4941,13 @@ def test_the_symbol_cell_is_a_real_control():
     means one handler serves both paths and neither can rot separately.
     """
     body = _fn("watchTable").replace("\n", " ")
-    assert re.search(r'<button class="wselb"\s+data-wsel="\$\{esc\(w\.symbol\)\}"', body), (
+    assert '<button class="wselb"' in body, (
         "the symbol cell is no longer a button, so the list is unreachable from "
         "the keyboard"
     )
+    # The ROW carries the symbol and the one handler; the button's click bubbles to
+    # it, so a button carrying data-wsel too would toggle the drawer twice.
+    assert re.search(r'<tr class="[^"]*" data-wsel="\$\{esc\(w\.symbol\)\}"', body)
     # Its accessible name is the symbol, and the company name once one has arrived.
     assert "esc(w.symbol)}</b>" in body.replace(" ", "").replace("<b>", "<b>")
     # The full name must ride in the title, since the cell ellipses it. It reaches
@@ -4951,14 +4963,14 @@ def test_the_symbol_cell_is_a_real_control():
         "wselwhy no longer falls back to the company name, so the title on an unheld "
         "row says nothing the ellipsed cell does not already show"
     )
-    assert "el.onclick=()=>selectWatch(el.dataset.wsel)" in _fn(
-        "bindWatchlist").replace(" ", "").replace("\n", ""), (
-        "one handler must serve the row and the button, or mouse and keyboard "
-        "reach two code paths"
+    bind = _fn("bindWatchlist").replace(" ", "").replace("\n", "")
+    assert "querySelectorAll('tr[data-wsel]')" in bind and (
+        "el.onclick=()=>selectWatch(el.dataset.wsel)" in bind), (
+        "one handler on the row must serve the mouse and the button's keyboard click"
     )
-    # Re-clicking the open row must not clear it: this panel always shows a row,
-    # and clearing would leave the pane empty with no way back but a reload.
-    assert "symbol===S.wsym) return" in _fn("selectWatch").replace("\n", " ")
+    # Re-clicking the open row closes its drawer: the table opens with none open,
+    # and it must be able to return there.
+    assert "S.wsym=symbol===S.wsym?null:symbol" in _fn("selectWatch").replace(" ", "")
 
 
 def test_the_symbol_cell_carries_the_ellipsis_trio():
@@ -5116,7 +5128,7 @@ def test_the_attribution_sentence_survives_the_rewrite():
     The second is the only instruction that turns this tab's dashes into numbers, so
     it names the symbols that are waiting.
     """
-    body = _fn("watchlist")
+    body = _fn("watchlist") + _fn("watchTable")
     assert "realised vol is what the stock DID" in body
     assert "IVR is what the" in body and "market CHARGES" in body, (
         "the footer no longer contrasts the two volatilities, so a reader has no "
@@ -5126,7 +5138,7 @@ def test_the_attribution_sentence_survives_the_rewrite():
         "the footer is denying that implied vol is reachable while an IVR column is "
         "on screen two cells away"
     )
-    assert "no vol yet for ${esc(thin.join(', '))}: run" in body, (
+    assert "no stored history yet for ${\n      esc(thin.join(', '))}: run" in body, (
         "the remedy no longer names the thin symbols, so a reader cannot tell "
         "which rows a `bars` run would fill in"
     )
@@ -5550,20 +5562,22 @@ def test_an_unknown_earnings_date_is_not_excluded():
         "the earnings filter is comparing days inline again; `null >= 0` is true in "
         "JavaScript, so that spelling hides every row with no date recorded"
     )
-    assert "!(S.wearn&&earningsSoon(" in rows, (
-        "the filter must EXCLUDE the near ones rather than keep them, and only while "
-        "the chip is pressed"
+    assert "constsoon=w=>earningsSoon(w.earnings_in_days,WEARN_SOON)" in rows
+    assert "!(S.wearn==='out'&&soon(w))" in rows, (
+        "hiding must EXCLUDE the near ones rather than keep them, and only while the "
+        "toggle is pressed"
     )
+    assert "!(S.wearn==='in'&&!soon(w))" in rows, "the keep-only toggle is gone"
     # The chip says what it does, because both readings of it are defensible and they
     # differ by the whole table.
     chip = _fn("watchFilters")
-    assert "excludes only" in chip and "no earnings date is kept" in chip, (
-        "the chip's title no longer states that a row with no date is kept"
+    assert "Hiding keeps a row with no date" in chip, (
+        "the toggle's tip no longer states that a row with no date is kept"
     )
     # And it is disabled, with its own reason, when no row carries a date at all --
     # rather than offered as a control that would hide nothing.
     flat = chip.replace(" ", "").replace("\n", "")
-    assert "dated?'':'disabled'" in flat, (
+    assert flat.count("!dated)") == 2 and "${off?'disabled':''}" in flat, (
         "the chip is offered even when no date exists anywhere, where pressing it "
         "cannot change the list"
     )
@@ -5590,26 +5604,21 @@ def test_a_filter_matching_nothing_says_which_control_is_hiding_the_rows():
         assert control in active, f"an empty result cannot name {control}"
     # The search TERM is quoted back, because a typo is the likeliest cause.
     assert 'the search box ("${needle}")' in active
-    # Both panes: the table's colspan row and the detail pane's block, each with the
-    # way out beside it.
+    # The table's colspan row, with the way out beside it.
     table = _fn("watchTable").replace(" ", "").replace("\n", "")
-    assert 'colspan="5"' in table, "the empty row does not span the five columns"
+    assert 'colspan="7"' in table, "the empty row does not span the seven columns"
     assert "esc(wnorows())" in table and "data-wclear" in table
     assert "${body||none}" in table, (
         "the empty row is not rendered in place of an empty body, so the table shows "
         "a bare header and the reader is left guessing"
     )
-    pane = _fn("watchNone")
-    assert "wnorows()" in pane and "data-wclear" in pane
-    assert "wnone" in pane, "the detail pane has no block of its own to say it"
-    # The pane is chosen over the card only when there is no open row, and `S.wsym`
-    # survives it so clearing the filter restores the selection.
+    # With the drawer, an empty filtered set simply has no row to open; the table's
+    # sentence is the whole state. The open symbol survives it, so clearing the
+    # filter brings the drawer back.
     tab = _fn("watchlist").replace(" ", "").replace("\n", "")
-    assert "wopen?watchDetail(wopen):watchNone()" in tab, (
-        "the detail pane still renders from an undefined row when the filter matches "
-        "nothing"
+    assert "S.wsym&&rows.some(w=>w.symbol===S.wsym)?S.wsym:''" in tab, (
+        "the drawer can render from a row the filter is hiding"
     )
-    assert "rows[0]||null" in tab, "an empty filtered set must not yield undefined"
     assert "S.wsym=null" not in _fn("watchRows"), "the filter must not clear the choice"
     # Clearing empties the FIELD as well as the state. Caught in a browser: without
     # it, `preserveInputs` restored "nvidnvidzzz" over the freshly rendered empty box,
@@ -5647,7 +5656,7 @@ def test_the_search_input_carries_an_id():
     # The placeholder says whether company search is available yet, because the name
     # only exists after Refresh has run -- offering "symbol or company" before that
     # would silently match nothing.
-    assert "symbol or company" in filters and "company names arrive with" in filters
+    assert "Symbol or company" in filters and "company names arrive with" in filters
     assert "named" in filters, "the placeholder is not derived from what arrived"
 
 
@@ -7267,3 +7276,38 @@ def test_a_failed_odte_refresh_says_so_and_the_reading_is_not_fresh(populated, m
     assert (status, reply["ok"]) == (200, False)
     assert "URLError" in reply["error"]
     assert reply["context"]["fresh"] is False
+
+
+def test_a_price_alert_round_trips_and_an_empty_box_clears_it(populated):
+    """Set above and below, read them back, then clear one side only: key-present
+    semantics, the same as the earnings date."""
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _post(base, "/api/watchlist",
+              {"symbol": "SPY", "alert_above": "800", "alert_below": "650.5"})
+        _, state = _get(base, "/api/state")
+        spy = next(w for w in state["watchlist"] if w["symbol"] == "SPY")
+        assert (spy["alert_above"], spy["alert_below"]) == (800.0, 650.5)
+        _post(base, "/api/watchlist", {"symbol": "SPY", "alert_above": ""})
+        _, state = _get(base, "/api/state")
+    spy = next(w for w in state["watchlist"] if w["symbol"] == "SPY")
+    assert (spy["alert_above"], spy["alert_below"]) == (None, 650.5)
+
+
+def test_the_row_histogram_is_five_sessions_ending_at_the_daily_reading(populated):
+    """Oldest first, so the newest bar is the one the Daily column prints."""
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _post(base, "/api/watchlist", {"symbol": "SPY"})
+        _, state = _get(base, "/api/state")
+    for w in state["watchlist"]:
+        assert len(w["bx_recent"]) == 5
+        assert w["bx_recent"][-1] == w["bx_daily"]
+
+
+def test_the_row_filters_and_the_bell_read_the_shared_helpers():
+    """The price tier and the alert verdict are `watch.js`'s, node-tested; the page
+    must not grow its own comparison beside them, and both read the price the row
+    shows."""
+    rows = _fn("watchRows").replace(" ", "")
+    assert "priceTier(shownPrice(w,qs[w.symbol]).price)" in rows
+    table = _fn("watchTable").replace(" ", "")
+    assert "alertState(px.price,w.alert_above,w.alert_below)" in table

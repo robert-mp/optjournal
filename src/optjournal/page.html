@@ -159,8 +159,8 @@ import {
    knob or an arc scaled by the radius renders a well-formed picture with no
    `undefined` in it. Only an executed test sees those, so the numbers live where
    node can run them and this file keeps the markup they position. */
-import {bxDirection, earningsSoon, meterKnob, ringArc, ringPoint,
-  shownPrice} from '/static/watch.js';
+import {PRICE_TIERS, alertState, bxDirection, earningsSoon, histBars, meterKnob,
+  priceTier, ringArc, ringPoint, shownPrice} from '/static/watch.js';
 import {cls, dayLabel, dp, esc, level, money, monthLabel, num, pct, strike, sym}
   from '/static/format.js';
 import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
@@ -899,6 +899,10 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string|null} rv_rank_band -- upper|lower from vol.rank_band, cut at
  *   vol.RANK_MIDPOINT (the middle of this symbol's own year) and never at IV
  *   rank's 30. The edge belongs to lower, matching the chips' own wording
+ * @property {number|null} alert_above -- the reader's alert level above, typed
+ * @property {number|null} alert_below -- the reader's alert level below, typed
+ * @property {Array} bx_recent -- the daily arm over the last five sessions, oldest
+ *   first; null where a session is inside the warm-up window
  * @property {string|null} earnings_on -- the next earnings date, YYYY-MM-DD, as
  *   the reader TYPED it. Not fetched and not derivable: nothing this journal
  *   reaches publishes one (see db.py's column comment for what was probed), so
@@ -1353,7 +1357,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload res:SyncResponse sync:Sync pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
  * @payload e:Annotation
  * @payload mk:Market d:MarketDay mev:MarketEvent mf:MarketFacet
- * @payload w:Watch wo:WatchOption wopen:Watch wa:Watch wb:Watch
+ * @payload w:Watch wo:WatchOption wa:Watch wb:Watch
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
  * @payload ivr:IvRank ir:IvRank
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
@@ -1375,11 +1379,12 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local COST_OPTIONS bits cost fees on wh
  * @local STATS_KEYS_REQUIRED missing state
  * @local SCORINGS qidsave cqidsave tokcheck toksave
- * @local WBX_LABEL WIVR_LABEL WMETER WRING items it arc tin tout sb
+ * @local WMETER WRING arc tin tout sb
  * @local events
  * @local zrows clean
  * @local rails sessions sigma
  * @local body others pair pick said m r err Date
+ * @local WHIST bars hb cur wf3
  */
 
 const $=s=>document.querySelector(s);
@@ -1481,12 +1486,12 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      is the honest reading: an unmeasured symbol is not quietly inside the set the
      reader believes was measured. The empty-state prose names whichever control is
      doing it. */
-  wsearch:'',wbx:null,wivr:null,wearn:false,
+  wsearch:'',wbx:null,wivr:null,wearn:null,wtier:'',
   /* Live quotes, keyed by symbol, and the server clock when they were asked for.
      NOT part of `state`: they come from their own endpoint because each one costs
      an HTTP request, so they must not ride along on every payload reload. Null
      until the Watchlist tab asks. */
-  quotes:null,quotesAt:null,
+  quotes:null,quotesAt:null,wqat:0,
   /* The scoreboard's unit: null means "the server's default" (position), the
      same convention `cost` uses, so the page carries no duplicate of a decision
      that lives in stats.py and cannot drift from it.
@@ -4696,24 +4701,15 @@ function watchSort(rows){
   });
 }
 
-/* The one TYPED cell in the row, and the only one whose input is the reader.
-   Both halves are shown -- the date and the derived countdown -- because the date
-   alone makes the reader do the arithmetic and a bare countdown is a number with
-   no provenance in a row of measured figures.
-   A past date says so in words rather than rendering a negative day count, which
-   would read as a countdown running backwards; the date STANDS until the next one
-   is recorded, so the cell says that instead of hiding it.
-   The dash's title points at the panel, which is where the field that records one
-   lives: an empty cell here means none RECORDED, never none due, and a blank in a
-   column of measurements would say the other thing. */
+/* The earnings cell: the countdown IAG prints ("36d"), with the typed date in its
+   title. A past date says so rather than counting backwards, and an empty cell
+   means none RECORDED, never none due, so its dash says where to record one. */
 const wearn=w=>{
   if(!w.earnings_on) return wdash(`no earnings date recorded for ${w.symbol}; `
-    +`add one in the panel`);
+    +`open the row to add one`);
   const days=w.earnings_in_days;
-  const when=days==null?'':days<0?'recorded, now past'
-    :days===0?'today':`in ${days}d`;
-  return `${esc(w.earnings_on)}${when?
-    ` <span class="dim">${esc(when)}</span>`:''}`;
+  const when=days==null?esc(w.earnings_on):days<0?'past':days===0?'today':days+'d';
+  return `<span title="${esc(`recorded for ${w.earnings_on}`)}">${when}</span>`;
 };
 
 /* Why the rank is absent, in the count that explains it -- and the two reasons are
@@ -4764,27 +4760,17 @@ function wnamed(){
   return Object.values(S.quotes||{}).some(wq=>!!(wq&&wq.name));
 }
 
-/* Which rows the table shows: the four filters, then slice 5's sort.
+/* Which rows the table shows: the filters, then the sort.
  *
- * NARROWING ONLY. Every figure is already in the payload, so filtering is a pure
- * function of state -- no request, no server round trip, and the same reason
- * `S.wbx` and its three siblings stay out of the hash.
+ * NARROWING ONLY: every figure is already in the payload, so filtering is a pure
+ * function of state with no request. A row with no bucket, band or price is hidden
+ * by a filter on that axis, because an unmeasured row does not belong in a set the
+ * reader believes was measured.
  *
- * A ROW WITH NO BUCKET OR NO BAND IS HIDDEN by a chosen bucket or band, and that is
- * the honest reading rather than the convenient one: a symbol inside its warm-up
- * window has no B-Xtrender reading, so it is not "in the mid bucket" -- it is
- * unmeasured, and quietly including it would put an unmeasured row inside a set the
- * reader believes was measured. Whichever control is doing the hiding is named on
- * screen when the result is empty, which is what keeps that defensible.
- *
- * EARNINGS IS THE ONE FILTER THAT WORKS THE OTHER WAY, because its input is typed
- * rather than measured: it excludes only dates you recorded. A row with no date is
- * KEPT, since "nothing here reports within 28 days" and "nothing here reports
- * within 28 days that you have told me about" are different claims and only the
- * second one is true. That rule is `earningsSoon` in watch.js rather than a
- * comparison here, and the reason is executable: `null >= 0` is TRUE in JavaScript,
- * so the obvious inline spelling hides every dateless row the moment the filter goes
- * on, and only a node test over the three cases catches it. */
+ * EARNINGS IS THE EXCEPTION, because its input is typed: "out" hides only dates
+ * YOU recorded within 28 days, and keeps a row with no date, since an unknown date
+ * is not a known-clear one. "in" keeps only the rows recorded as reporting within
+ * 28 days. Both go through `earningsSoon`, whose `null >= 0` trap is node-tested. */
 function watchRows(){
   const ws=S.state.watchlist||[];
   const qs=S.quotes||{};
@@ -4796,38 +4782,32 @@ function watchRows(){
     const wq=qs[w.symbol];
     return named&&!!wq&&String(wq.name||'').toUpperCase().includes(needle);
   };
+  const soon=w=>earningsSoon(w.earnings_in_days,WEARN_SOON);
   return watchSort(ws.filter(w=>finds(w)
     &&(!S.wbx||w.bx_bucket===S.wbx)
-    /* The band is the SERVER's (`iv.band`), never a comparison spelled here, so
-       the cut point cannot end up in two places at different values. A symbol with
-       no rank has a null band and matches NEITHER chip -- which is the honest
-       answer: an unmeasured row does not belong in a set the reader believes was
-       measured, and it does not belong in that set's complement either. */
     &&(!S.wivr||(ivrOf(w.symbol)||{}).band===S.wivr)
-    &&!(S.wearn&&earningsSoon(w.earnings_in_days,WEARN_SOON))));
+    &&!(S.wearn==='out'&&soon(w))
+    &&!(S.wearn==='in'&&!soon(w))
+    &&(!S.wtier||S.wtier.includes(priceTier(shownPrice(w,qs[w.symbol]).price)||'-'))));
 }
 
-/* Which controls are narrowing the table right now, worded as the row words them.
-   Used only to explain an empty result, and it has to name the CONTROL rather than
-   say "the filters": a reader who typed a symbol into the search box and then
-   pressed a bucket chip cannot see which of the two emptied the table, and a blank
-   pane with a live filter row above it reads as a broken tab rather than a narrowed
-   one. The search term is quoted verbatim, because a typo is the likeliest cause. */
+/* Which controls are narrowing the table, worded as the controls word them. Used
+   only to explain an empty result, so it names the CONTROL rather than saying "the
+   filters", and quotes the search verbatim because a typo is the likeliest cause. */
 function wactive(){
   const on=[];
   const needle=String(S.wsearch||'').trim();
   if(needle) on.push(`the search box ("${needle}")`);
   if(S.wbx) on.push(`the BXTRENDER filter (${WBX_LABEL[S.wbx]})`);
   if(S.wivr) on.push(`the IV rank filter (${WIVR_LABEL[S.wivr]})`);
-  if(S.wearn) on.push(`the EARNINGS filter (exclude ≤ ${WEARN_SOON}d)`);
+  if(S.wearn) on.push(`the EARNINGS filter (${S.wearn==='out'
+    ?`hide ≤ ${WEARN_SOON}d`:`only ≤ ${WEARN_SOON}d`})`);
+  if(S.wtier) on.push(`the SHARE PRICE filter (${S.wtier.split('').map(t=>
+    '$'.repeat(Number(t))).join(', ')})`);
   return on;
 }
 
-/* The sentence BOTH panes print when the filtered set is empty, from one function
-   so the table's colspan row and the detail pane's block cannot describe two
-   different situations. `sweep.check_no_junk_bindings` is what makes this a state
-   rather than an edge to be found at runtime: the accidental implementation is an
-   empty <tbody> beside a pane reading from `undefined`. */
+/* The sentence an empty filtered table prints, naming what is hiding everything. */
 function wnorows(){
   const total=(S.state.watchlist||[]).length;
   const on=wactive();
@@ -4835,173 +4815,159 @@ function wnorows(){
     +`${on.join(' and ')||'the filter row'}`;
 }
 
-/* The filter row: four controls, each captioned with where its numbers came from,
- * plus the count that replaced the header's symbol pill.
- *
- * `.filters` is the page's existing filter-bar shape and `.wf` is the modifier that
- * makes it a five-track row inside a card -- see the CSS, which carries the two
- * specificity gotchas.
- *
- * WHY EACH CAPTION EXISTS. B-Xtrender at 5/20/5 and B-Xtrender at other settings
- * are different numbers, and the published indicator states NO oversold or
- * overbought level at all (no hline, no level inputs, only zero crossed with
- * rising-or-falling) -- so every band on this row is imported, and an imported band
- * with no provenance is a threshold its reader cannot audit. That is the gap
- * `impact_source` closes for the calendar, and the same answer applies twice here.
- * Both sentences are the Python constants' own, so a retune cannot leave the screen
- * quoting the old ones.
- *
- * The RVR caption carries a REFUSAL as well as a source, and it is the load-bearing
- * half: every reader arrives at a 0-to-100 gauge in an options journal expecting IV
- * rank's conventional 30, and this figure is one symbol's own realised vol against
- * its own year. Saying so is cheaper than being misread. */
-function watchFilters(shown,total){
+/* Stroked 24-unit glyphs for the filter toggles and the alert bell, drawn from
+   `currentColor` like the rail's, so a toggle's state colours its glyph with no
+   colour in the markup. */
+const W_ICONS={
+  down:'M12 4v12 M7 11l5 5 5-5 M5 20h14',
+  up:'M12 20V8 M7 13l5-5 5 5 M5 4h14',
+  cal:'M4 6h16v14H4z M4 10h16 M8 3v4 M16 3v4',
+  calx:'M4 6h16v14H4z M4 10h16 M8 3v4 M16 3v4 M9 13l6 5 M15 13l-6 5',
+  clear:'M21 12a9 9 0 1 1-18 0a9 9 0 1 1 18 0z M5.6 5.6l12.8 12.8',
+  bell:'M6 16v-5a6 6 0 0 1 12 0v5l2 2H4z M10 20a2 2 0 0 0 4 0',
+};
+const wicon=name=>`<svg class="wico" viewBox="0 0 24 24" aria-hidden="true"
+  focusable="false"><path d="${W_ICONS[name]}"/></svg>`;
+
+/* The filter bar: search with its add button, then four groups of icon toggles
+ * and a clear, IAG's shape. What each band MEANS and where its numbers come from is
+ * behind the group label's info tip rather than printed under it: the provenance is
+ * still one hover away, and the bar reads as controls. */
+function watchFilters(){
   const named=wnamed();
   const dated=(S.state.watchlist||[]).some(w=>!!w.earnings_on);
-  const hidden=total-shown;
-  /* One builder for both segmented controls, so "pick one" behaves identically on
-     each and All is the same absence of a value in both: the empty string, which is
-     what `dataset` gives back for `data-wbx=""` and what the handler maps to null.
-     The DOT is the bucket's own colour, and only the bucket rows carry one: a band
-     is a side of one number and has no third state to distinguish, so a dot there
-     would be decoration standing where information stands two tracks left. */
-  const seg=(attr,picked,items)=>`<div class="seg">${items.map(it=>
-    `<button data-${attr}="${it.val}" class="${(picked||'')===it.val?'on':''}"
-      title="${esc(it.hint)}">${it.dot?`<span class="wdot ${it.dot}"></span>`:''
-      }${esc(it.label)}</button>`).join('')}</div>`;
-  const bx=seg('wbx',S.wbx,[
-    {val:'',label:'all',dot:'',
-     hint:'every reading, and the symbols that have none yet'},
-    {val:'low',label:WBX_LABEL.low,dot:'lo',
-     hint:`the daily short arm at or below ${num(BX_LO,0)}`},
-    {val:'mid',label:WBX_LABEL.mid,dot:'mid',
-     hint:`the daily short arm between ${num(BX_LO,0)} and +${num(BX_HI,0)}`},
-    {val:'high',label:WBX_LABEL.high,dot:'hi',
-     hint:`the daily short arm at or above +${num(BX_HI,0)}`}]);
-  const ivr=seg('wivr',S.wivr,[
-    {val:'',label:'all',dot:'',
-     hint:'every rank, and the symbols that have none yet'},
-    {val:'upper',label:WIVR_LABEL.upper,dot:'',
-     hint:`implied vol more than ${num(IVR_HIGH,0)}% of the way up its own year: `
-       +`where premium is dear for THIS name, whatever the absolute level. `
-       +`Measured live: LOW ranked 78.7 on an iv30 of 33.6% while TSLA ranked 0.8 `
-       +`on a HIGHER 37.4%, because each is judged against its own year`},
-    {val:'lower',label:WIVR_LABEL.lower,dot:'',
-     hint:`at or below ${num(IVR_HIGH,0)}, the line itself included`}]);
+  /* One toggle builder: pressing the lit one turns it off, so every group can be
+     emptied without a separate All. */
+  const tog=(attr,val,on,body,hint,off)=>`<button class="wtog${on?' on':''}"
+    data-${attr}="${val}" aria-pressed="${on?'true':'false'}" title="${esc(hint)}"
+    ${off?'disabled':''}>${body}</button>`;
+  const any=!!(S.wsearch||S.wbx||S.wivr||S.wearn||S.wtier);
+  const undated='no watched symbol carries an earnings date yet, so this would '
+    +'change nothing. Record one in a row\'s drawer';
   return `<div class="filters wf">
     <div><div class="flabel">search</div>
-      <input id="wsearch" value="${esc(S.wsearch||'')}" maxlength="40"
-        autocomplete="off" spellcheck="false" placeholder="${esc(named
-          ?'symbol or company…'
-          :'symbol… (company names arrive with Refresh prices)')}"></div>
-    <div><div class="flabel">bxtrender</div>${bx}
-      <div class="wcap">${esc(`bands at ${num(BX_LO,0)} and +${num(BX_HI,0)} on `
-        +`the daily short arm, ${BX_BANDS}`)}</div></div>
-    <div><div class="flabel">iv rank</div>${ivr}
-      <div class="wcap">${esc(`cut at ${num(IVR_HIGH,0)}, ${IVR_BANDS}. `
-        +IVR_SOURCE)}</div></div>
-    <div><div class="flabel">earnings</div>
-      <button class="chip${S.wearn?' on':''}" data-wearn="1" ${dated?'':'disabled'}
-        aria-pressed="${S.wearn?'true':'false'}" title="${esc(dated
-          ?`hide the symbols reporting within ${WEARN_SOON} days. It excludes only `
-            +`dates YOU recorded: a row with no earnings date is kept, because an `
-            +`unknown date is not a known-clear one, and a date already past is `
-            +`kept too`
-          :'no watched symbol carries an earnings date yet, so this would hide '
-            +'nothing. Record one in the panel')}">exclude ≤ ${WEARN_SOON}d</button>
-      </div>
-    <div><div class="flabel">showing</div>
-      <div class="wshow">${shown} of ${total}${hidden>0
-        ?` <span class="dim">${hidden} hidden</span>`:''}</div></div>
+      <form id="waddf" class="wsrch"><input id="wsearch" value="${esc(S.wsearch||'')}"
+        maxlength="24" autocomplete="off" spellcheck="false"
+        placeholder="${esc(named?'Symbol or company…'
+          :'Symbol… (company names arrive with a refresh)')}">
+        <button class="btn wplus" type="submit" title="Watch the symbol you typed"
+          aria-label="Watch the symbol you typed">+</button></form></div>
+    <div class="wfgroups">
+      <div><div class="flabel">bxtrender ±${num(BX_HI,0)}${infoTip(esc(
+        `The daily short arm, ${BX_BANDS}. ${PARAMS_CAPTION}`))}</div>
+        <div class="wtogs">${tog('wbx','low',S.wbx==='low',wicon('down'),
+          `the daily short arm at or below ${num(BX_LO,0)}`)}${
+          tog('wbx','high',S.wbx==='high',wicon('up'),
+          `the daily short arm at or above +${num(BX_HI,0)}`)}</div></div>
+      <div><div class="flabel">iv rank ${num(IVR_HIGH,0)}${infoTip(esc(
+        `Cut at ${num(IVR_HIGH,0)}, ${IVR_BANDS}. ${IVR_SOURCE}`))}</div>
+        <div class="wtogs">${tog('wivr','upper',S.wivr==='upper',wicon('up'),
+          `IV rank above ${num(IVR_HIGH,0)}: premium dear for this name`)}${
+          tog('wivr','lower',S.wivr==='lower',wicon('down'),
+          `IV rank at or below ${num(IVR_HIGH,0)}`)}</div></div>
+      <div><div class="flabel">earnings ${WEARN_SOON}d${infoTip(esc(
+        `Dates you recorded, not fetched ones. Hiding keeps a row with no date, `
+        +`because an unknown date is not a known-clear one.`))}</div>
+        <div class="wtogs">${tog('wearn','out',S.wearn==='out',wicon('calx'),
+          dated?`hide the symbols you recorded as reporting within ${WEARN_SOON} days`
+            :undated,!dated)}${tog('wearn','in',S.wearn==='in',wicon('cal'),
+          dated?`only the symbols you recorded as reporting within ${WEARN_SOON} days`
+            :undated,!dated)}</div></div>
+      <div><div class="flabel">share price${infoTip(esc(
+        `$ under ${PRICE_TIERS[0]}, $$ ${PRICE_TIERS[0]} to ${PRICE_TIERS[1]}, `
+        +`$$$ ${PRICE_TIERS[1]} and over, on the price shown in the table. Pick `
+        +`any number of tiers.`))}</div>
+        <div class="wtogs">${['1','2','3'].map(t=>tog('wtier',t,
+          (S.wtier||'').includes(t),`<span class="wtier">${'$'.repeat(Number(t))
+          }</span>`,`share price tier ${'$'.repeat(Number(t))}`)).join('')}</div></div>
+      <div><div class="flabel">&nbsp;</div><div class="wtogs">${tog('wclear','1',
+        false,wicon('clear'),'clear every filter',!any)}</div></div>
+    </div>
   </div>`;
 }
 
-/* The detail pane when the filters match nothing. A block that says so, not a
-   half-populated card: the pane's every figure comes from an open row, and there is
-   no open row to read.
-   `S.wsym` is deliberately LEFT STANDING while this shows, so clearing the filter
-   brings back the row that was open rather than resetting to the first one. */
-function watchNone(){
-  return `<div class="wdpane"><div class="wnone">
-    <div class="wk">nothing to show</div>
-    <div>${esc(wnorows())}</div>
-    <div class="wcap">the row you had open is remembered — clearing the filter
-      brings it back</div>
-    <div class="mt-3"><button class="btn sm" data-wclear="1">Clear filters</button>
-    </div></div></div>`;
-}
-
-/* The master pane: five columns, one row per watched symbol.
+/* The table: seven columns, one row per watched symbol, and the open row's detail
+ * as a drawer directly beneath it.
  *
- * The symbol cell holds a real `<button>`, which is what makes the list reachable
- * from the keyboard: it brings the accessible name, the role, Enter and Space and
- * the page's global `:focus-visible` ring with it, none of which a `tabindex` on
- * the `<tr>` would. The whole row carries the same `data-wsel`, so a click
- * anywhere in it selects and one handler serves both paths.
- *
- * The company name appears only once quotes have arrived (`Quote.name`, at no
- * extra request), and the cell TRUNCATES rather than widening the pane:
- * "CrowdStrike Holdings, Inc." beside a symbol exceeds any share of a split card.
- * The `title` carries the full name, so the ellipsis loses nothing.
- */
-function watchTable(rows,chosen){
+ * The symbol cell holds a real `<button>` for the keyboard; the ROW carries
+ * `data-wsel` and the one handler, so a click anywhere in it toggles the drawer and
+ * the button's click bubbles to that same handler exactly once. */
+function watchTable(rows,open){
   const qs=S.quotes||{};
   const[col,dir]=String(S.wsort||'symbol:asc').split(':');
   const asc=dir!=='desc';
-  /* `aria-sort` because a glyph is not available to a screen reader, and an
-     INACTIVE double arrow on every unsorted column because one state cannot say
-     which column is deciding the order -- the reader would be left guessing
-     whether the unmarked columns are unsortable or merely not sorted. */
   const th=(key,label,hint,klass)=>`<th class="${klass}" aria-sort="${
     col===key?(asc?'ascending':'descending'):'none'}"><button class="wsb"
       data-wsort="${key}" title="${esc(hint)}">${esc(label)}<span class="wsg">${
       col===key?(asc?'↑':'↓'):'⇅'}</span></button></th>`;
+  const plain=(label,hint,klass)=>`<th class="${klass}" title="${esc(hint)}">${
+    esc(label)}</th>`;
   const body=rows.map(w=>{
     const wq=qs[w.symbol];
     const px=shownPrice(w,wq);
     const name=wq&&wq.name?wq.name:'';
-    const on=w.symbol===chosen;
-    const way=bxDirection(w.bx_daily_delta);
-    return `<tr class="${on?'wsel':''}" data-wsel="${esc(w.symbol)}"${
-      on?' aria-current="true"':''}>
-      <td><button class="wselb" data-wsel="${esc(w.symbol)}"
-        title="${esc(wselwhy(w,name))}">${w.held
+    const on=w.symbol===open;
+    const bell=alertState(px.price,w.alert_above,w.alert_below);
+    return `<tr class="${on?'wsel':''}" data-wsel="${esc(w.symbol)}"
+      aria-expanded="${on?'true':'false'}">
+      <td><button class="wselb" title="${esc(wselwhy(w,name))}">${w.held
           ?'<span class="whold" aria-hidden="true">◉</span>':''}<b>${
         esc(w.symbol)}</b> ${
         name?`<span class="dim">${esc(name)}</span>`:''}</button></td>
       <td class="n">${wprice(px,w)}</td>
+      <td class="whist">${whist(w)}</td>
       <td class="n ${cls(w.bx_daily)}">${w.bx_daily==null
         ?wdash(`${w.closes} of ${BX_SETTLED} sessions stored: inside that window `
           +`the reading is a warm-up figure and its sign can be wrong. Run `
           +`optjournal bars`)
-        :num(w.bx_daily,1)+(way?`<span class="wway" title="${
-          esc(num(w.bx_daily_delta,1)+' since the previous session')
-          }">${WDIR[way]}</span>`:'')}</td>
+        :num(w.bx_daily,1)}</td>
       <td class="n">${(()=>{const ir=ivrOf(w.symbol);
         return ir?num(ir.rank,1):wdash(ivrWhy(w.symbol));})()}</td>
       <td class="n">${wearn(w)}</td>
-    </tr>`;
+      <td class="center"><span class="wbell${bell?' '+bell:''}" title="${esc(
+        bell==='hit'?`${w.symbol} has crossed your alert`
+        :bell==='set'?`alert set${w.alert_above!=null?`, above ${num(w.alert_above,2)}`
+          :''}${w.alert_below!=null?`, below ${num(w.alert_below,2)}`:''}`
+        :'no alert: open the row to set one')}">${wicon('bell')}</span></td>
+    </tr>${on?`<tr class="wdrawer"><td colspan="7">${watchDetail(w)}</td></tr>`:''}`;
   }).join('');
-  /* An empty filtered set is a STATE, not an edge to discover at runtime: the
-     careless implementation is a blank <tbody>, which reads as a broken tab under a
-     live filter row. One row of prose naming the control that is hiding everything,
-     and the control to undo it, beside the header that is still standing. The
-     `colspan` tracks the header list above it -- five columns, one cell. */
-  const none=`<tr><td colspan="5" class="empty">${esc(wnorows())}
+  const none=`<tr><td colspan="7" class="empty">${esc(wnorows())}
     <button class="btn sm" data-wclear="1">Clear filters</button></td></tr>`;
   return `<table class="wtab"><thead><tr>
-    ${th('symbol','symbol','the ticker as stored, and the company name once a '
-      +'quote has been fetched','')}
+    ${th('symbol','symbol','the ticker, and the company name once a quote has '
+      +'been fetched','')}
     ${th('close','close','the fetched quote when there is one, else the newest '
       +'stored session close, marked with *','n')}
-    ${th('bxtrender','bxtrender',PARAMS_CAPTION,'n')}
+    ${plain('bxtrender','the daily short arm over the last five sessions, newest '
+      +'on the right: up is positive, down negative, and a lighter bar is one '
+      +'moving back toward zero. '+PARAMS_CAPTION,'whist')}
+    ${th('bxtrender','daily','the daily short arm at the newest close','n')}
     ${th('ivr','ivr','IV rank, 1y: where implied vol sits between this symbol\'s '
-      +'own yearly low and high, 0 to 100. NOT the absolute level -- a name can '
-      +'rank high on a modest implied vol, which is the whole point of a rank. '
+      +'own yearly low and high, 0 to 100. In the drawer, '
+      +'realised vol is what the stock DID; IVR is what the '
+      +'market CHARGES for what it might do. '
       +IVR_SOURCE,'n')}
-    ${th('earn','earnings','a date you recorded, not a fetched one: nothing this '
-      +'journal reaches publishes an earnings date','n')}
+    ${th('earn','earnings','days to the earnings date: '
+      +'earnings dates are ones you recorded, not fetched ones, '
+      +'since nothing this journal reaches publishes one','n')}
+    ${plain('alert','your price alert: lit when set, and marked when the price '
+      +'on screen has crossed it','center')}
   </tr></thead><tbody>${body||none}</tbody></table>`;
+}
+
+/* THE ROW HISTOGRAM: the daily arm over five sessions, as bars on a baseline
+   coloured by sign. Geometry is `histBars`'s (node-tested); colour is by class. */
+const WHIST={w:50,h:20,gap:2.5,lo:-50,hi:50,min:2.5};
+function whist(w){
+  const bars=histBars(w.bx_recent||[],WHIST);
+  if(!bars.length) return wdash(`${w.closes} of ${BX_SETTLED} sessions stored: `
+    +`no settled reading to draw yet`);
+  return `<svg class="whbars" viewBox="0 0 ${WHIST.w} ${WHIST.h}" role="img"
+    aria-label="${esc('last five daily readings: '+(w.bx_recent||[]).map(v=>
+      v==null?'none':num(v,1)).join(', '))}">${bars.map(hb=>`<rect class="whb ${
+      hb.pos?'pos':'neg'}${hb.faded?' faded':''}" x="${hb.x.toFixed(2)}" y="${
+      hb.y.toFixed(2)}" width="${hb.w.toFixed(2)}" height="${hb.h.toFixed(2)}"
+      rx="1"/>`).join('')}</svg>`;
 }
 
 /* One tile. Label left, figure right, plus the two things a figure on this tab
@@ -5017,13 +4983,15 @@ function watchTable(rows,chosen){
    things a reader is comparing, and the caption is the part they read last. */
 function wtile(label,value,opts){
   const tile=opts||{};
+  /* The caption rides behind the label's info tip rather than under the figure:
+     the provenance is one hover away and the drawer reads as figures. */
   return `<div class="stat wtile ${tile.klass||''}">
-    <div class="wth"><span class="wk">${esc(label)}</span>
+    <div class="wth"><span class="wk">${esc(label)}${tile.cap?infoTip(esc(tile.cap)):''
+      }</span>
       <span class="wtv"><span class="v ${tile.big?'':'sm'} ${tile.tint||''}"
         >${value}</span>${tile.delta?
         `<span class="wdelta">${tile.delta}</span>`:''}</span></div>
-    ${tile.kids||''}
-    ${tile.cap?`<div class="wcap">${esc(tile.cap)}</div>`:''}</div>`;
+    ${tile.kids||''}</div>`;
 }
 
 /* THE METER: one reading placed on the indicator's own fixed scale.
@@ -5180,7 +5148,7 @@ function watchDetail(w){
   const weekly=wtile('bxtrender · weekly',
     w.bx_weekly==null?wdash(`${w.weeks} of ${BX_SETTLED} ISO weeks stored`)
       :num(w.bx_weekly,1),
-    {tint:cls(w.bx_weekly),
+    {klass:'half',tint:cls(w.bx_weekly),
      cap:w.bx_weekly_week==null?'no closes stored yet, so there is no week to read'
        :`${w.bx_weekly_week}, ${w.bx_weekly_sessions||0} session(s) stored of a `
          +`full week's five: the newest week is usually partial, and a figure over `
@@ -5194,13 +5162,25 @@ function watchDetail(w){
     `<div class="mono">${wo.quantity>0?'+':''}${wo.quantity} ${
       wo.strike!=null?strike(wo.strike):''}${wo.put_call||''}${wo.expiry?
       ` <span class="dim">expires ${esc(wo.expiry)}</span>`:''}</div>`).join('');
+  /* The alert, typed like the earnings date: a level above and a level below,
+     either optional, cleared by emptying. Crossed or not is `alertState`'s, against
+     the price the row shows. */
+  const bell=alertState(px.price,w.alert_above,w.alert_below);
+  const alerts=wtile('alert',bell==='hit'?'crossed':bell==='set'?'set':wdash(
+      `no alert on ${w.symbol}; set a level below`),
+    {klass:'half',tint:bell==='hit'?'warn2':'',
+     cap:'a level you chose, judged against the price in the row; nothing is '
+       +'fetched to check it and nothing is sent anywhere',
+     kids:`<form class="wed walerts" data-walerts="${esc(w.symbol)}">
+       <input id="walup" data-subject="${esc(w.symbol)}" inputmode="decimal"
+         value="${esc(w.alert_above==null?'':String(w.alert_above))}"
+         placeholder="above" maxlength="12" autocomplete="off" spellcheck="false">
+       <input id="waldn" data-subject="${esc(w.symbol)}" inputmode="decimal"
+         value="${esc(w.alert_below==null?'':String(w.alert_below))}"
+         placeholder="below" maxlength="12" autocomplete="off" spellcheck="false">
+       <button class="btn sm" type="submit">Save</button></form>`});
   return `<div class="wdpane">
-    <div class="kicker">underlying</div>
-    <div class="wdh"><span class="wdsym">${esc(w.symbol)}</span>
-      <span class="big">${wprice(px,w)}</span>
-      ${name?`<span class="dim">${esc(name)}</span>`
-        :`<span class="dim2">press Refresh prices for the company name</span>`}</div>
-    <div class="wdet">${daily}${ring}${earnings}${weekly}</div>
+    <div class="wdet">${daily}${ring}${earnings}${weekly}${alerts}</div>
     <div class="stats c3 mt-3">
       ${wtile('1d',pc(px.chg1),{tint:cls(px.chg1),cap:px.live
         ?'from the quote\'s own previous close, so it describes the same session '
@@ -5238,74 +5218,36 @@ function watchDetail(w){
 
 function watchlist(){
   const ws=S.state.watchlist||[];
-  /* The add field lives in the header, so editing happens where you are looking.
-     Rendered even when the list is empty -- an empty state that only tells you to
-     run a CLI command is a dead end when the control could be right there. */
-  const adder=`<form id="waddf" class="wadd">
-    <input id="wadd" placeholder="+ add symbol" maxlength="24"
-      autocomplete="off" spellcheck="false">
-    <button class="btn sm" type="submit">Add</button></form>`;
-  /* EXACTLY TWO children in the `.crow`: a title cluster and an actions cluster.
-     It is `justify-content:space-between` with a two-child assumption, and the old
-     header's four children are why the "3 symbol(s)" pill floated to the middle of
-     it. That pill is retired rather than moved: once a filter row exists,
-     "12 symbol(s)" beside a table showing 7 rows contradicts itself.
-     `<h2>`, not the old `<h3>`: app.css styles `.card h2` and styles no h3 at all,
-     so this title wore the user agent's size and its 1em margins. BETA is the
-     `.pill.gap` the lifecycle headings already use for an inline label, and
-     Refresh is a labelled `.btn.sm` -- the Economic Calendar's precedent for a
-     section action, and a control whose accessible name is its own text. */
+  /* Title, BETA and the refresh glyph, IAG's header. Adding a symbol is the
+     search box's `+`, so the header carries no second input. */
   const header=`<div class="crow">
-    <div class="wtitle"><h2>Watchlist</h2><span class="pill gap">BETA</span></div>
-    <div class="wacts">${adder}
-      <button id="wquote" class="btn sm">Refresh prices</button></div></div>`;
-
-  if(!ws.length) return `<div class="card">${header}
-    <div class="empty">nothing watched yet — add a symbol above, or run
-      <code>optjournal watch AAPL</code></div></div>`;
-
-  /* Filtered THEN sorted, in `watchRows`, so the row that opens is the first row of
-     what is actually on screen. */
+    <div class="wtitle"><h2>Watchlist</h2><span class="pill gap">BETA</span>
+      <button id="wquote" class="btn wrefresh" title="Refresh prices and IV ranks"
+        aria-label="Refresh prices and IV ranks">⟳</button>${quoteNote()}</div>
+    <div class="wshow dim">${ws.length?`${watchRows().length} of ${ws.length}`:''}</div>
+  </div>`;
+  if(!ws.length) return `<div class="card">${header}${watchFilters()}
+    <div class="empty">nothing watched yet — type a symbol above and press +</div></div>`;
   const rows=watchRows();
-  /* Which row is open: the reader's choice when they have made one, else the first
-     row of the list AS IT IS SORTED AND FILTERED. Derived rather than stored, so the
-     URL stays clean until a row is clicked and a re-sort carries the default with it.
-     draw() has already healed a symbol the payload no longer holds, so the find can
-     only miss when the reader has chosen nothing -- or when the filter is hiding the
-     row they chose, which is the one case with NO first row to fall back to and the
-     reason both panes have an empty state. `S.wsym` is left standing through it. */
-  const wopen=rows.find(w=>w.symbol===S.wsym)||rows[0]||null;
-  /* The symbols with no realised vol at all, named in the footer. With the read
-     window at 1100 calendar days this is the one instruction that turns this tab's
-     dashes into numbers, so it stays a sentence rather than only a title.
-     Counted over the WHOLE list rather than the filtered one: the remedy is a `bars`
-     run, which is about what the journal stores and not about what is on screen. */
+  /* The open row is the reader's choice and only theirs: closed by default, so the
+     table opens as IAG's does. draw() heals a symbol the payload no longer holds. */
+  const open=S.wsym&&rows.some(w=>w.symbol===S.wsym)?S.wsym:'';
   const thin=ws.filter(w=>w.realised_vol==null).map(w=>w.symbol);
   return `<div class="card">${header}
-    ${quoteNote()}
-    ${watchFilters(rows.length,ws.length)}
-    <div class="wsplit">
-      <div class="wtpane">${watchTable(rows,wopen?wopen.symbol:'')}</div>
-      ${wopen?watchDetail(wopen):watchNone()}
-    </div>
-    <div class="dim mkattr">realised vol is what the stock DID; IVR is what the
-      market CHARGES for what it might do, ranked against its own year${
-      thin.length?` · no vol yet for ${esc(thin.join(', '))}: run
-      <code>optjournal bars</code>`:''} · earnings dates are ones you recorded, not
-      fetched ones — the days beside them are counted on every load</div>
+    ${watchFilters()}
+    <div class="wtpane">${watchTable(rows,open)}</div>
+    ${thin.length?`<div class="dim mkattr">no stored history yet for ${
+      esc(thin.join(', '))}: run <code>optjournal bars</code></div>`:''}
   </div>`;
 }
 
-/* Open one row in the detail pane. A pure redraw and no request: every figure is
-   already in the payload.
-   Re-selecting the OPEN row does nothing rather than clearing it -- the market
-   strip's rule rather than the calendar's toggle, because this panel always shows
-   SOME row and clearing would leave the pane empty with no way back but a reload.
-   That early return is also what makes the row's own click and the bubbled click
-   from the button inside it one selection instead of two renders. */
+/* Open or close one row's drawer. A pure redraw and no request: every figure is
+   already in the payload. Clicking the open row closes it, the calendar's toggle,
+   because the drawer is closed by default and the table must be able to return
+   to that. */
 function selectWatch(symbol){
-  if(!symbol||symbol===S.wsym) return;
-  S.wsym=symbol;
+  if(!symbol) return;
+  S.wsym=symbol===S.wsym?null:symbol;
   draw();
 }
 
@@ -5322,19 +5264,17 @@ function selectWatch(symbol){
  * own -- a guess presented beside measurements. */
 function quoteNote(){
   const meta=S.quotesAt;
-  if(!meta) return `<div class="dim wnote">prices are stored daily closes —
-    press <b>Refresh prices</b> for a quote</div>`;
+  if(!meta) return `<span class="dim wnote">stored closes</span>`;
   const ages=Object.values(S.quotes||{}).map(wq=>wq.at).filter(a=>a!=null);
-  if(!ages.length) return `<div class="dim wnote">no quote came back</div>`;
+  if(!ages.length) return `<span class="dim wnote">no quote came back</span>`;
   const newest=Math.max.apply(null,ages), age=meta-newest;
   const when=age<90?'just now'
     :age<3600?Math.round(age/60)+'m ago'
     :age<6*3600?Math.round(age/3600)+'h ago'
     :new Date(newest*1000).toISOString().slice(0,16).replace('T',' ')+' UTC';
   const stale=age>=6*3600;
-  return `<div class="dim wnote">quotes ${esc(when)}${
-    stale?' — <b>the market was closed</b>, so this is the last session\'s close'
-    :''}</div>`;
+  return `<span class="dim wnote">quotes ${esc(when)}${
+    stale?' · last session\'s close':''}</span>`;
 }
 
 /* ------------------------------------------------ 0DTE calculator
@@ -5699,6 +5639,13 @@ function zdue(){
      &&Date.now()-S.zat>=60000) zrefresh();
 }
 setInterval(zdue,15000);
+/* The watchlist's quotes go stale the same way: a tab left open read "quotes 5h
+   ago". Refetched every five minutes while the tab is open and visible, which is
+   two requests per symbol, so no faster. */
+setInterval(()=>{
+  if(S.tab==='watchlist'&&S.state&&document.visibilityState==='visible'
+     &&(S.state.watchlist||[]).length&&Date.now()-(S.wqat||0)>=5*60000) loadQuotes(false);
+},30000);
 document.addEventListener('visibilitychange',zdue);
 
 /* THE READING IN FORCE: what was typed, or the feed's where nothing has been.
@@ -6735,37 +6682,30 @@ function bindMarketFetch(){
  * DATABASE holds -- a row spliced in optimistically would show a symbol with no
  * bars, no vol and no options as though those were measured and empty. */
 function bindWatchlist(){
+  /* The search box's `+` watches what was typed: the field is the one place a
+     symbol is entered, IAG's shape. The search text is cleared on success. */
   const wf=$('#waddf');
   if(wf) wf.onsubmit=async ev=>{
     ev.preventDefault();
-    const input=$('#wadd'), symbol=(input.value||'').trim();
+    const input=$('#wsearch'), symbol=(input.value||'').trim();
     if(!symbol) return;
     input.disabled=true;
+    S.wsearch='';
     await watchWrite({symbol:symbol,action:'add'});
   };
   document.querySelectorAll('[data-wrm]').forEach(el=>
     el.onclick=async()=>{
       const symbol=el.dataset.wrm;
-      /* Confirmed, because removing drops the note with it and there is no undo.
-         Cheap to re-add, but the note is typed by hand and gone for good. */
       if(!confirm(`Stop watching ${symbol}?`)) return;
       el.disabled=true;
+      if(S.wsym===symbol) S.wsym=null;
       await watchWrite({symbol:symbol,action:'remove'});
     });
   const qb=$('#wquote'); if(qb) qb.onclick=()=>loadQuotes(true);
-  /* Selection: a pure redraw, no request -- every figure is already in the
-     payload, so opening a row costs nothing. Both the `<tr>` and the `<button>`
-     in its symbol cell carry `data-wsel`, so ONE handler serves mouse and
-     keyboard: the button brings Enter and Space with it, and the click that
-     bubbles from it up to the row is a no-op because `selectWatch` returns early
-     on the symbol already open. */
-  document.querySelectorAll('[data-wsel]').forEach(el=>
+  /* The ROW carries `data-wsel`; clicks inside the drawer row do not, so typing
+     into a drawer field never toggles it closed. */
+  document.querySelectorAll('tr[data-wsel]').forEach(el=>
     el.onclick=()=>selectWatch(el.dataset.wsel));
-  /* Sorting, also a pure redraw. A click on the SORTED column reverses it; a click
-     on a new one starts DESCENDING for the four derived columns, because the
-     interesting end of a B-Xtrender reading or a rank is the top, and ASCENDING
-     for the symbol, because that is alphabetical. Stated once here so the rule is
-     not rediscovered per header. */
   document.querySelectorAll('[data-wsort]').forEach(b=>
     b.onclick=()=>{
       const key=b.dataset.wsort, was=String(S.wsort||'').split(':');
@@ -6773,46 +6713,26 @@ function bindWatchlist(){
         :key+':'+(key==='symbol'?'asc':'desc');
       draw();
     });
-  /* The filter row. Every one of these is a pure redraw with no request, for the
-     same reason selection and sorting are: they narrow a list the payload has
-     already delivered in full.
-     The search box redraws on every keystroke, which it can afford to because
-     `preserveInputs` carries its text, its focus and its caret across the render --
-     that is why `#wsearch` has an id, and why it carries no `data-subject`: a search
-     box is not editing one symbol. */
   const sb=$('#wsearch');
   if(sb) sb.oninput=()=>{S.wsearch=sb.value;draw();};
-  /* Both segmented filters are single-select, and All is the ABSENCE of a value
-     rather than a fourth state: `data-wbx=""` gives back the empty string, which maps
-     to null, which is what `watchRows` reads as "no bucket chosen". */
+  /* Toggles: pressing the lit one turns its group off. Share price is the one
+     multi-select, kept as a string of tier digits. */
   document.querySelectorAll('[data-wbx]').forEach(b=>
-    b.onclick=()=>{S.wbx=b.dataset.wbx||null;draw();});
+    b.onclick=()=>{S.wbx=S.wbx===b.dataset.wbx?null:b.dataset.wbx;draw();});
   document.querySelectorAll('[data-wivr]').forEach(b=>
-    b.onclick=()=>{S.wivr=b.dataset.wivr||null;draw();});
-  /* A toggle, so it flips rather than reading a value out of the attribute:
-     "exclude the ones reporting soon" has no second setting. */
+    b.onclick=()=>{S.wivr=S.wivr===b.dataset.wivr?null:b.dataset.wivr;draw();});
   document.querySelectorAll('[data-wearn]').forEach(b=>
-    b.onclick=()=>{S.wearn=!S.wearn;draw();});
-  /* The way out of an empty table, offered in BOTH panes. It clears all four rather
-     than the one that emptied the list: the reader pressed it because nothing is
-     showing, and leaving a second filter standing would answer that with a second
-     empty table. `S.wsym` is untouched, so the row that was open comes back.
-     THE FIELD IS EMPTIED IN THE DOM TOO, and that line is not redundant. Caught in a
-     browser: clearing left the table showing all three rows with "nvidnvidzzz" still
-     sitting in the search box, because `preserveInputs` carries what the reader was
-     typing across the render and put it back over the freshly rendered empty value.
-     The box then described a filter that was no longer applied, which is this
-     project's own defect shape in a control instead of in a number. */
+    b.onclick=()=>{S.wearn=S.wearn===b.dataset.wearn?null:b.dataset.wearn;draw();});
+  document.querySelectorAll('[data-wtier]').forEach(b=>
+    b.onclick=()=>{const t=b.dataset.wtier, cur=S.wtier||'';
+      S.wtier=(cur.includes(t)?cur.replace(t,''):cur+t).split('').sort().join('');
+      draw();});
+  /* Clearing empties the DOM field too: `preserveInputs` would otherwise put the
+     typed search back over the freshly rendered empty value. */
   document.querySelectorAll('[data-wclear]').forEach(b=>
     b.onclick=()=>{if(sb) sb.value='';
-      S.wsearch='';S.wbx=null;S.wivr=null;S.wearn=false;draw();});
-  /* The typed fields, one form each and one handler for all of them: the form names
-     its column in `data-wfield`, so a second typed field is a tile rather than a
-     second code path. It stays generic now that only the earnings date is left,
-     because `_WATCH_FIELDS` still carries two columns and `note` is still writable
-     from the CLI -- the handler lost a caller, not its reason. The value is sent
-     UNMODIFIED, which is what makes clearing possible: `_watchlist_write` reads a
-     present-and-empty field as NULL, and an emptied box is how a stale date goes. */
+      S.wsearch='';S.wbx=null;S.wivr=null;S.wearn=null;S.wtier='';draw();});
+  /* Typed single fields (the earnings date): the form names its column. */
   document.querySelectorAll('form[data-wsave]').forEach(wf=>
     wf.onsubmit=async ev=>{
       ev.preventDefault();
@@ -6821,6 +6741,15 @@ function bindWatchlist(){
       const body={symbol:wf.dataset.wsave};
       body[wf.dataset.wfield]=el.value;
       await watchWrite(body,`Saved <b>${esc(wf.dataset.wsave)}</b>.`);
+    });
+  /* The alert pair, sent together; an emptied box clears that side. */
+  document.querySelectorAll('form[data-walerts]').forEach(wf3=>
+    wf3.onsubmit=async ev=>{
+      ev.preventDefault();
+      await watchWrite({symbol:wf3.dataset.walerts,
+        alert_above:($('#walup')||{}).value||'',
+        alert_below:($('#waldn')||{}).value||''},
+        `Alert saved for <b>${esc(wf3.dataset.walerts)}</b>.`);
     });
 }
 
@@ -6871,7 +6800,7 @@ async function loadQuotes(announce){
   try{
     const r=await fetch('/api/quotes');
     const qres=await r.json();
-    S.quotes=qres.quotes||{}; S.quotesAt=qres.asked_at||null;
+    S.quotes=qres.quotes||{}; S.quotesAt=qres.asked_at||null; S.wqat=Date.now();
     /* Set even when `ranks` is empty, because the OBJECT is the signal: null means
        never asked and `{}` means asked-and-nothing-came-back, and only the second
        one lets the IV rank chips enable themselves honestly. */

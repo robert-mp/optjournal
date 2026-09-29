@@ -21,9 +21,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  PRICE_TIERS,
+  alertState,
   bxDirection,
   earningsSoon,
+  histBars,
   meterKnob,
+  priceTier,
   ringArc,
   ringPoint,
   shownPrice,
@@ -205,3 +209,37 @@ test("the threshold tick and the arc read the same fraction", () => {
 function near0(v) {
   assert.ok(Math.abs(v) < 1e-9, `expected 0, got ${v}`);
 }
+
+test("an alert is hit at or beyond either level, and needs a price to be hit", () => {
+  assert.equal(alertState(100, null, null), null);
+  assert.equal(alertState(100, 110, null), "set");
+  assert.equal(alertState(110, 110, null), "hit");
+  assert.equal(alertState(90, null, 90), "hit");
+  assert.equal(alertState(95, 110, 90), "set");
+  assert.equal(alertState(null, 110, 90), "set", "no price, no verdict");
+  assert.equal(alertState(100, 0, null), null, "a zero level is no alert");
+});
+
+test("price tiers cut at 50 and 200, and an unpriced row has none", () => {
+  assert.deepEqual(PRICE_TIERS, [50, 200]);
+  assert.equal(priceTier(49.99), "1");
+  assert.equal(priceTier(50), "2");
+  assert.equal(priceTier(199.99), "2");
+  assert.equal(priceTier(200), "3");
+  assert.equal(priceTier(null), null);
+  assert.equal(priceTier(0), null);
+});
+
+test("histogram bars grow from the baseline, scale to the arm's bounds, and fade toward zero", () => {
+  const box = {w: 50, h: 20, gap: 2.5, lo: -50, hi: 50, min: 1};
+  const bars = histBars([null, 10, 25, -50, -20], box);
+  assert.equal(bars.length, 4, "a warm-up session draws nothing");
+  const [b1, b2, b3, b4] = bars;
+  assert.equal(b1.x, 1 * (8 + 2.5), "the slot is kept, so the newest is rightmost");
+  assert.equal(b4.x, 4 * (8 + 2.5));
+  assert.ok(b2.pos && b2.y + b2.h === 20, "every bar stands on the baseline");
+  assert.equal(b2.h, 10, "25 of 50 is half the height");
+  assert.ok(!b3.pos && b3.y === 0 && b3.h === 20, "the limit is a full bar, signed by colour");
+  assert.ok(b4.faded && !b3.faded, "moving toward zero fades");
+  assert.equal(histBars([0.1], box)[0].h, 1, "a tiny reading still draws a dash");
+});

@@ -47,7 +47,7 @@ __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -88,6 +88,12 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # recorded" is the normal state of this column and must stay distinguishable
     # from a date -- the same line every absent figure in this journal draws.
     ("watchlist", "earnings_on", "TEXT"),
+    # Price alerts, TYPED like the earnings date: a level the reader chose, above
+    # or below, and nothing else. Nullable with no default, because no alert is
+    # the normal state. Whether one has been crossed is derived on every load from
+    # the price on screen and never stored, so it cannot go stale.
+    ("watchlist", "alert_above", "REAL"),
+    ("watchlist", "alert_below", "REAL"),
     # WHICH FLEX QUERY DELIVERED THIS FILL, and therefore how much to trust it.
     #
     # A Trade Confirmation query reports a fill the same session; an Activity
@@ -446,6 +452,9 @@ CREATE TABLE IF NOT EXISTS watchlist (
   -- wrong tomorrow, so `serialize.watchlist_data` derives it against
   -- `clock.et_day` on every read and it cannot drift from the date it counts to.
   earnings_on TEXT,
+  -- Price alerts the reader typed; see `_ADDED_COLUMNS` for why they are plain.
+  alert_above REAL,
+  alert_below REAL,
   added_at   TEXT NOT NULL
 );
 

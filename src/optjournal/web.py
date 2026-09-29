@@ -40,6 +40,7 @@ import http.server
 import ipaddress
 import json
 import logging
+import math
 import re
 import signal
 import socket
@@ -232,7 +233,7 @@ _JOURNAL_CONTROL = frozenset({"anchor", "broker"})
 #: A tuple rather than "whatever keys the body has", because these names are
 #: interpolated into the SQL: what is writable is a decision of this module's, and
 #: the derived and fetched figures on that table's tab have no column to write.
-_WATCH_FIELDS = ("note", "earnings_on")
+_WATCH_FIELDS = ("note", "earnings_on", "alert_above", "alert_below")
 
 
 def _iv_ranks(symbols: list[str]) -> dict[str, Any]:
@@ -1359,6 +1360,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # Blank means CLEAR. Stripped first, so a field emptied to spaces by a
             # textarea clears rather than storing whitespace that renders as a
             # value the reader cannot see or delete.
+            if column.startswith("alert_") and typed:
+                try:
+                    level = float(typed)
+                except ValueError:
+                    level = -1.0
+                if not (level > 0 and math.isfinite(level)):
+                    return 400, {
+                        "ok": False, "kind": "alert",
+                        "message": f"{typed} is not a price. An alert is a level "
+                                   f"above zero, or empty to clear it.",
+                    }
             fields[column] = typed or None
         with open_journal(self.cfg.db_path) as conn:
             if action == "remove":
@@ -1375,13 +1387,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     for column in _WATCH_FIELDS if column in fields
                 )
                 conn.execute(
-                    "INSERT INTO watchlist (symbol, note, earnings_on, added_at)"
-                    " VALUES (:symbol, :note, :earnings_on, :added_at)"
+                    "INSERT INTO watchlist (symbol, note, earnings_on, alert_above,"
+                    " alert_below, added_at)"
+                    " VALUES (:symbol, :note, :earnings_on, :alert_above,"
+                    " :alert_below, :added_at)"
                     " ON CONFLICT(symbol) DO "
                     + (f"UPDATE SET {updates}" if updates else "NOTHING"),
                     {"symbol": symbol, "added_at": _now(),
-                     "note": fields.get("note"),
-                     "earnings_on": fields.get("earnings_on")},
+                     **{column: fields.get(column) for column in _WATCH_FIELDS}},
                 )
                 changed = 1
             conn.commit()
