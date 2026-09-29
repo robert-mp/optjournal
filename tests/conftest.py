@@ -219,3 +219,12 @@ def add_statement(
         (source_file, sha256, account_id, from_date, to_date,
          base_currency, asset_filter),
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_fetch_on_watch(monkeypatch):
+    """Adding a watched symbol fetches its history (`bars.fetch_watch_bars`), which
+    is a network request. AUTOUSE so no test that merely adds a symbol reaches
+    Yahoo; a test about the fetch itself patches its own fake over this one."""
+    from optjournal import bars  # noqa: PLC0415 - local to the fixture
+    monkeypatch.setattr(bars, "fetch_bars", lambda *a, **k: [])

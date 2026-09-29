@@ -1240,6 +1240,10 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .wtog:disabled{opacity:.4;cursor:not-allowed}
 .wico{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;
   stroke-linecap:round;stroke-linejoin:round}
+.wf .flabel{font-family:var(--mono);font-size:var(--t0);color:var(--dim);
+  letter-spacing:var(--tr-wide);text-transform:uppercase;font-weight:var(--w-label)}
+.wbxtogs .wtog:first-child{color:var(--bad)}
+.wbxtogs .wtog:last-child{color:var(--ok)}
 .wtier{font-family:var(--fig);font-variant-numeric:tabular-nums;
   font-weight:var(--w-label);letter-spacing:var(--tr-caps)}
 /* A disabled chip. `.chip` had no disabled rule because the calendar's chips are
@@ -1265,6 +1269,16 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .wtab thead th{position:sticky;top:0;z-index:1;background:var(--panel);
   box-shadow:inset 0 -1px 0 var(--line)}
 .wtab tbody tr[data-wsel]{cursor:pointer}
+.wtab th{font-family:var(--mono);font-size:var(--t0);color:var(--dim);
+  letter-spacing:var(--tr-wide);font-weight:var(--w-label)}
+.wtab td{padding-top:var(--s5);padding-bottom:var(--s5)}
+.wtab td.n{font-weight:var(--w-body)}
+.wselb b{font-family:var(--mono);letter-spacing:var(--tr-caps)}
+.wselb .dim{margin-left:var(--s3)}
+/* Daily: muted unless the reading is strengthening, the same rule the newest
+   histogram bar follows, so the column and the bars agree at a glance. */
+.wtab td.wdaily{opacity:.62}
+.wtab td.wdaily.strong{opacity:1}
 /* Except the one row that is not a row: the empty-filter message. It carries no
    `data-wsel`, so the pointer cursor above would promise a selection that clicking
    it cannot make. */
@@ -1300,41 +1314,10 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    because it is a mark beside a word, not a word -- and it reserves no space when
    absent, so an unheld row's symbol starts where the header does. */
 .whold{color:var(--accent);font-size:var(--t0);margin-right:var(--s2);vertical-align:middle}
-/* The drawer's grid. Four columns across the full table width, the daily arm
-   spanning two of them because its meter wants the room. */
-.wdet{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--s4)}
-.wdet>.wide{grid-column:1/3}
-.wdet>.half{grid-column:span 2}
-/* A tile is a `.stat` BOX with this layout inside it, so the padding, radius,
-   ground and border stay the dashboard's names instead of a second copy of their
-   values that would drift from them. */
-.wtile{display:flex;flex-direction:column;gap:var(--s2)}
-.wth{display:flex;align-items:baseline;justify-content:space-between;gap:var(--s4)}
-/* The NARROW tiles stack their label above their figure; only the wide daily arm
-   puts the two on one line. Both halves of that are measured rather than taste.
-   Label-left cost the earnings tile its date: at a 1600px viewport the tile's
-   header row is 222px and its parts are label 63px + gap 10px + value 149px, so
-   the value box grew to 44px against 22px for one line and "2026-08-27" rendered
-   as "2026-08-" over "27". A broken date is not a date. Stacking gives the figure
-   the tile's whole width, which is also the layout the earnings and weekly tiles
-   are drawn with, so the fix and the target agree. */
-.wtile:not(.wide) .wth{flex-direction:column;align-items:flex-start;gap:var(--s1)}
-/* And the figure never breaks mid-token even so. Stacking buys enough width for
-   today's strings; `nowrap` is what keeps a longer one (a date beside a delta on a
-   narrower pane) from splitting inside the number itself rather than wrapping at
-   the space between the two, which is the only break that stays readable. */
-.wtv{display:flex;align-items:baseline;gap:var(--s2);white-space:nowrap}
-/* A tile's or a block's label. Its own name rather than `.stat .k`, which carries
-   a 7px bottom margin for the label-ABOVE-value card and pushes the baseline off
-   in a label-left header row. */
-.wk{font-size:var(--t1);color:var(--dim);letter-spacing:var(--tr-caps);text-transform:uppercase}
-.wdelta{font-size:var(--t1);font-family:var(--fig);font-variant-numeric:tabular-nums}
 /* The provenance line under a figure: the window, the periods or the count it came
    from. Always present, because a figure on this tab that cannot say where it came
    from is one its reader cannot reproduce. */
 .wcap{font-size:var(--t0);color:var(--dim2);line-height:1.45}
-.wblk{margin-top:var(--s5);padding:var(--s5) var(--s6);border-radius:var(--r2);background:var(--bg2);
-  border:1px solid var(--line)}
 /* The two typed fields. `font-family:inherit` on the textarea because a textarea
    defaults to monospace and a note is prose, not a figure. */
 .wed{display:flex;gap:var(--s3);align-items:flex-start;margin-top:var(--s3)}
@@ -1351,14 +1334,43 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 /* The drawer stays in view while a narrow table scrolls sideways under it:
    pinned to the scroller's left edge and no wider than what is visible. */
 .wdrawer .wdpane{position:sticky;left:var(--s5);max-width:calc(100cqw - 2 * var(--s5))}
+/* Three sections side by side, each a column of label-and-figure lines under a
+   small tracked kicker: IAG's drawer is one card with kicker labels, not a grid
+   of tiles, and the quiet is most of why it reads easily. */
+.wdet{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--s8);
+  padding:var(--s6) var(--s7);border-radius:var(--r3);background:var(--panel);
+  border:1px solid var(--line)}
+.wsec{display:flex;flex-direction:column;gap:var(--s4);min-width:0}
+.wkick{font-family:var(--mono);font-size:var(--t0);color:var(--accentlit1);
+  letter-spacing:var(--tr-wide);text-transform:uppercase;
+  padding-bottom:var(--s3);border-bottom:1px solid var(--line)}
+.wkv{display:flex;align-items:baseline;justify-content:space-between;gap:var(--s4)}
+.wkl{font-family:var(--mono);font-size:var(--t0);color:var(--dim);
+  letter-spacing:var(--tr-caps);text-transform:uppercase}
+.wkf{font-family:var(--fig);font-variant-numeric:tabular-nums;font-size:var(--t3);
+  white-space:nowrap}
+.wbig{display:flex;align-items:baseline;gap:var(--s3);font-family:var(--fig);
+  font-variant-numeric:tabular-nums;font-size:var(--t6);font-weight:var(--w-label)}
+.wbig .wkl{margin-left:auto}
+.wdelta{font-size:var(--t1);font-family:var(--fig);font-variant-numeric:tabular-nums}
+.wvolrow{display:grid;grid-template-columns:auto minmax(0,1fr);gap:var(--s5);
+  align-items:start}
+.wvolrow>div{display:flex;flex-direction:column;gap:var(--s4)}
+.wpos{font-size:var(--t2);color:var(--fg)}
+/* A label with its provenance on hover says so with a dotted rule, in place of
+   an info glyph on every line. */
+.wkl[title],.wf .flabel[title]{text-decoration:underline dotted;
+  text-decoration-color:var(--line2);text-underline-offset:var(--s1);cursor:help}
+.wsec .wrm{align-self:flex-start;margin-top:var(--s3)}
 .walerts input{flex:1 1 0}
 /* The row's five-session histogram. Colour by class, the sign palette's own
    names; a faded bar is the arm moving back toward zero. */
 .whist{width:84px}
-.whbars{display:block;width:64px;height:22px}
-.whb.pos{fill:var(--ok)}
-.whb.neg{fill:var(--bad)}
-.whb.faded{opacity:.45}
+.whbars{display:block;width:62px;height:22px}
+/* History muted, the newest bright only when strengthening: IAG's reading. */
+.whb.pos{fill:var(--ok);opacity:.45}
+.whb.neg{fill:var(--bad);opacity:.45}
+.whb.strong{opacity:1}
 /* The alert bell: quiet when unset, brass when set, the warning colour when the
    price has crossed it. */
 .wbell{display:inline-grid;place-items:center;color:var(--dim2)}
@@ -1418,7 +1430,6 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    covering two rows describe a grid that is no longer on screen. */
 @media(max-width:1180px){
   .wdet{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .wdet>.wide,.wdet>.half{grid-column:auto}
 }
 /* The filter row's OWN entry at the narrow breakpoint, and it is not optional:
    `.filters.wf` is specificity (0,2,0) while the rule two lines below in the 760px

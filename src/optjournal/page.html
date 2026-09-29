@@ -159,7 +159,8 @@ import {
    knob or an arc scaled by the radius renders a well-formed picture with no
    `undefined` in it. Only an executed test sees those, so the numbers live where
    node can run them and this file keeps the markup they position. */
-import {PRICE_TIERS, alertState, bxDirection, earningsSoon, histBars, meterKnob,
+import {PRICE_TIERS, alertState, bxDirection, bxStrong, earningsSoon, histBars,
+  meterKnob,
   priceTier, ringArc, ringPoint, shownPrice} from '/static/watch.js';
 import {cls, dayLabel, dp, esc, level, money, monthLabel, num, pct, strike, sym}
   from '/static/format.js';
@@ -1272,6 +1273,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} [symbol] -- as STORED (upper-cased), not as typed
  * @property {number} [changed] -- rows affected; 0 on removing what was absent,
  *   which the page reports rather than claiming a removal that did nothing
+ * @property {string|null} [fetch_error] -- a new watch's history fetch, when it
+ *   failed; null when it landed or none was needed
  */
 
 /** @typedef {Object} Quote -- one symbol's last trade, from QuoteReply.quotes
@@ -1372,7 +1375,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local open opts out ps pts rows yrs active shown
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
  * @local play scrub speed loop ev reached stops at dismiss
- * @local chosen ws opts thin px tile
+ * @local chosen ws opts thin px
  * @local shownByDay next picked
  * @local JSON Object ages input mine qb wf was
  * @local when parts names raw err
@@ -4853,33 +4856,40 @@ function watchFilters(){
         <button class="btn wplus" type="submit" title="Watch the symbol you typed"
           aria-label="Watch the symbol you typed">+</button></form></div>
     <div class="wfgroups">
-      <div><div class="flabel">bxtrender ±${num(BX_HI,0)}${infoTip(esc(
-        `The daily short arm, ${BX_BANDS}. ${PARAMS_CAPTION}`))}</div>
-        <div class="wtogs">${tog('wbx','low',S.wbx==='low',wicon('down'),
+      <div><div class="flabel" title="${esc(
+        `The daily short arm, ${BX_BANDS}. ${PARAMS_CAPTION}`)}">bxtrender ±${
+        num(BX_HI,0)}</div>
+        <div class="wtogs wbxtogs">${tog('wbx','low',S.wbx==='low',wicon('down'),
           `the daily short arm at or below ${num(BX_LO,0)}`)}${
           tog('wbx','high',S.wbx==='high',wicon('up'),
           `the daily short arm at or above +${num(BX_HI,0)}`)}</div></div>
-      <div><div class="flabel">iv rank ${num(IVR_HIGH,0)}${infoTip(esc(
-        `Cut at ${num(IVR_HIGH,0)}, ${IVR_BANDS}. ${IVR_SOURCE}`))}</div>
+      <div><div class="flabel" title="${esc(
+        `Cut at ${num(IVR_HIGH,0)}, ${IVR_BANDS}. ${IVR_SOURCE}`)}">iv rank ${
+        num(IVR_HIGH,0)}</div>
         <div class="wtogs">${tog('wivr','upper',S.wivr==='upper',wicon('up'),
           `IV rank above ${num(IVR_HIGH,0)}: premium dear for this name`)}${
           tog('wivr','lower',S.wivr==='lower',wicon('down'),
           `IV rank at or below ${num(IVR_HIGH,0)}`)}</div></div>
-      <div><div class="flabel">earnings ${WEARN_SOON}d${infoTip(esc(
+      <div><div class="flabel" title="${esc(
         `Dates you recorded, not fetched ones. Hiding keeps a row with no date, `
-        +`because an unknown date is not a known-clear one.`))}</div>
+        +`because an unknown date is not a known-clear one.`)}">earnings ${
+        WEARN_SOON}d</div>
         <div class="wtogs">${tog('wearn','out',S.wearn==='out',wicon('calx'),
           dated?`hide the symbols you recorded as reporting within ${WEARN_SOON} days`
             :undated,!dated)}${tog('wearn','in',S.wearn==='in',wicon('cal'),
           dated?`only the symbols you recorded as reporting within ${WEARN_SOON} days`
             :undated,!dated)}</div></div>
-      <div><div class="flabel">share price${infoTip(esc(
-        `$ under ${PRICE_TIERS[0]}, $$ ${PRICE_TIERS[0]} to ${PRICE_TIERS[1]}, `
-        +`$$$ ${PRICE_TIERS[1]} and over, on the price shown in the table. Pick `
-        +`any number of tiers.`))}</div>
+      <div><div class="flabel" title="${esc(
+        `$ up to ${PRICE_TIERS[0]}, $$ over ${PRICE_TIERS[0]} and under `
+        +`${PRICE_TIERS[1]}, $$$ ${PRICE_TIERS[1]} and up, on the price shown in `
+        +`the table. Pick any number of tiers.`)}">share price</div>
         <div class="wtogs">${['1','2','3'].map(t=>tog('wtier',t,
           (S.wtier||'').includes(t),`<span class="wtier">${'$'.repeat(Number(t))
-          }</span>`,`share price tier ${'$'.repeat(Number(t))}`)).join('')}</div></div>
+          }</span>`,t==='1'?`include symbols with share price up to ${PRICE_TIERS[0]}`
+          :t==='2'?`include symbols with share price over ${PRICE_TIERS[0]}, under `
+            +PRICE_TIERS[1]
+          :`include symbols with share price of ${PRICE_TIERS[1]} and up`))
+          .join('')}</div></div>
       <div><div class="flabel">&nbsp;</div><div class="wtogs">${tog('wclear','1',
         false,wicon('clear'),'clear every filter',!any)}</div></div>
     </div>
@@ -4916,7 +4926,8 @@ function watchTable(rows,open){
         name?`<span class="dim">${esc(name)}</span>`:''}</button></td>
       <td class="n">${wprice(px,w)}</td>
       <td class="whist">${whist(w)}</td>
-      <td class="n ${cls(w.bx_daily)}">${w.bx_daily==null
+      <td class="n wdaily ${cls(w.bx_daily)}${bxStrong(w.bx_recent||[])?' strong':''
+        }">${w.bx_daily==null
         ?wdash(`${w.closes} of ${BX_SETTLED} sessions stored: inside that window `
           +`the reading is a warm-up figure and its sign can be wrong. Run `
           +`optjournal bars`)
@@ -4957,41 +4968,16 @@ function watchTable(rows,open){
 
 /* THE ROW HISTOGRAM: the daily arm over five sessions, as bars on a baseline
    coloured by sign. Geometry is `histBars`'s (node-tested); colour is by class. */
-const WHIST={w:50,h:20,gap:2.5,lo:-50,hi:50,min:2.5};
+/* IAG's proportions: five wide bars, a narrow gap, a full half-height at ±40. */
+const WHIST={w:60,h:22,gap:2.5,cap:40,min:1.2,r:1.8};
 function whist(w){
   const bars=histBars(w.bx_recent||[],WHIST);
   if(!bars.length) return wdash(`${w.closes} of ${BX_SETTLED} sessions stored: `
     +`no settled reading to draw yet`);
   return `<svg class="whbars" viewBox="0 0 ${WHIST.w} ${WHIST.h}" role="img"
     aria-label="${esc('last five daily readings: '+(w.bx_recent||[]).map(v=>
-      v==null?'none':num(v,1)).join(', '))}">${bars.map(hb=>`<rect class="whb ${
-      hb.pos?'pos':'neg'}${hb.faded?' faded':''}" x="${hb.x.toFixed(2)}" y="${
-      hb.y.toFixed(2)}" width="${hb.w.toFixed(2)}" height="${hb.h.toFixed(2)}"
-      rx="1"/>`).join('')}</svg>`;
-}
-
-/* One tile. Label left, figure right, plus the two things a figure on this tab
-   needs and `statCard` has nowhere to put: a DELTA beside the value (the
-   indicator's second published state) and a CAPTION under it naming the window,
-   the periods or the count the figure came from.
-   The BOX is `.stat`'s, through its own class rather than through copies of its
-   values, so the padding, radius, ground and border cannot drift from the
-   dashboard's cards; `.wtile` adds only the layout.
-   `kids` is the slot the two gauges sit in, and it comes BEFORE the caption on
-   purpose: figure, then the picture of it, then where the figure came from. A
-   provenance line wedged between a number and its own gauge separates the two
-   things a reader is comparing, and the caption is the part they read last. */
-function wtile(label,value,opts){
-  const tile=opts||{};
-  /* The caption rides behind the label's info tip rather than under the figure:
-     the provenance is one hover away and the drawer reads as figures. */
-  return `<div class="stat wtile ${tile.klass||''}">
-    <div class="wth"><span class="wk">${esc(label)}${tile.cap?infoTip(esc(tile.cap)):''
-      }</span>
-      <span class="wtv"><span class="v ${tile.big?'':'sm'} ${tile.tint||''}"
-        >${value}</span>${tile.delta?
-        `<span class="wdelta">${tile.delta}</span>`:''}</span></div>
-    ${tile.kids||''}</div>`;
+      v==null?'none':num(v,1)).join(', '))}">${bars.map(hb=>`<path class="whb ${
+      hb.pos?'pos':'neg'}${hb.strong?' strong':''}" d="${hb.d}"/>`).join('')}</svg>`;
 }
 
 /* THE METER: one reading placed on the indicator's own fixed scale.
@@ -5073,147 +5059,101 @@ function wring(w){
       y2="${(WRING.cy+tout.y).toFixed(2)}"/></svg>`;
 }
 
-/* The detail pane: the open row, with every figure's provenance beside it.
+/* The drawer: the open row's detail as ONE quiet card, IAG's shape, in three
+ * sections under small kicker labels -- the trend, the volatility, and what YOU
+ * recorded -- each a column of label-and-figure lines rather than a grid of big
+ * tiles. The row above already prints the price, so the drawer does not.
  *
- * Its own grid (`.wdet`), not `.stats`: that row is `display:flex` with an 18%
- * basis and lays equal tiles across one line, and `statCard` emits label ABOVE
- * value with no slot for a delta beside the figure and no way to make one tile
- * wider than its neighbours.
- *
- * Every absent figure is an em dash whose title names the count it waits on,
- * because `sweep.check_no_junk_bindings` fails on `undefined` or `NaN` anywhere in
- * the rendered text and the sweep is the only executed check of this tab.
+ * Every figure's provenance rides behind the info tip on its label, and every
+ * absent figure is an em dash whose title names what it waits on, because
+ * `sweep.check_no_junk_bindings` fails on `undefined` or `NaN` anywhere on screen.
  */
 function watchDetail(w){
   const wq=(S.quotes||{})[w.symbol];
-  /* The SAME derivation the row uses, from the same module and with the same
-     marker. A pane reading `w.last` beside a row reading `qs[sym].price` is the
-     strongest rule in this codebase broken, not a cosmetic slip -- see watch.js
-     for the browser-caught defect that produced the rule. */
   const px=shownPrice(w,wq);
-  const name=wq&&wq.name?wq.name:'';
-  /* Read ONCE per render and passed nowhere: `wring` reads it again through the
-     same helper rather than taking it as an argument, so the tile's figure and the
-     ring's arc are two reads of one object and cannot describe different symbols. */
   const ivr=ivrOf(w.symbol);
   const way=bxDirection(w.bx_daily_delta);
   const pc=v=>v==null?wdash('not enough stored sessions to measure a change over '
-    +'that span'):num(v,2)+'%';
+    +'that span'):`<span class="${cls(v)}">${num(v,2)}%</span>`;
+  /* One line: a label (with its provenance behind a tip) and a figure. */
+  const kv=(label,value,cap)=>`<div class="wkv"><span class="wkl"${
+    cap?` title="${esc(cap)}"`:''}>${esc(label)}</span><span class="wkf">${value}</span></div>`;
+  const sec=(title,body)=>`<div class="wsec"><div class="wkick">${esc(title)}</div>
+    ${body}</div>`;
 
-  const daily=wtile('bxtrender · daily',
-    w.bx_daily==null?wdash(`${w.closes} of ${BX_SETTLED} sessions stored: inside `
-      +`that window the reading is a warm-up figure and its sign can be wrong. `
-      +`Run optjournal bars`):num(w.bx_daily,1),
-    {klass:'wide',big:true,tint:cls(w.bx_daily),cap:PARAMS_CAPTION,kids:wmeter(w),
-     delta:w.bx_daily_delta==null?'':`<span class="${cls(w.bx_daily_delta)}">${
-       num(w.bx_daily_delta,1)}</span>${way?WDIR[way]:''}`});
-  /* The rank, with the sentence it can print about itself: a min-max rank states
-     its own meaning in one line, which is most of why it is the statistic here
-     rather than a percentile. The ring above the caption is the same figure as a
-     picture; the caption is what makes it readable, and what a ring cannot say. */
-  const ring=wtile('ivr · iv rank, 1y',
-    ivr?num(ivr.rank,1):wdash(ivrWhy(w.symbol)),
-    {klass:'tall',big:true,kids:wring(w),
-     /* Every term of the rank, because the rank alone is unfalsifiable: the same
-        76.7 inside a two-point year is a different fact from one inside a
-        seventy-point year, and the reader cannot tell which without the bounds.
-        The provenance sentence rides here too -- this is CBOE's figure, and the
-        one place it is guaranteed to be read is beside the number itself. */
-     cap:ivr?`implied vol is ${num(ivr.iv30,1)}%, ${num(ivr.rank,1)}% of the way `
-       +`from this year's low, ${num(ivr.low,1)}%, to its high, `
-       +`${num(ivr.high,1)}%. ${IVR_SOURCE}, as of ${ivr.as_of}`
-       :ivrWhy(w.symbol)});
-  /* The typed date, and the field that records one. The panel is where the table's
-     dash sends the reader, so the field has to be here or that title is a lie. An
-     empty value CLEARS: `_watchlist_write` reads a present-and-empty field as
-     NULL, which is how a date that has gone by is removed. */
-  const earnings=wtile('earnings',
-    w.earnings_on?esc(w.earnings_on):wdash(`no earnings date recorded for ${
-      w.symbol}; the field below records one`),
-    {delta:w.earnings_in_days==null?'':`<span class="dim">${esc(
-       w.earnings_in_days<0?'recorded, now past'
-       :w.earnings_in_days===0?'today':'in '+w.earnings_in_days+'d')}</span>`,
-     cap:'recorded by you, not fetched: no source this journal reaches publishes '
-       +'an earnings date, so the days beside it are counted from the ET trading '
-       +'day on every load and never stored',
-     kids:`<form class="wed" data-wsave="${esc(w.symbol)}"
-       data-wfield="earnings_on"><input id="wearn" data-subject="${esc(w.symbol)}"
-       value="${esc(w.earnings_on||'')}" placeholder="YYYY-MM-DD" maxlength="10"
-       autocomplete="off" spellcheck="false">
-       <button class="btn sm" type="submit">Save</button></form>`});
-  /* The weekly arm, and its week NAMED and COUNTED. The newest ISO week is
-     normally partial and a figure over it repaints every session -- measured on
-     TSLA: -19.02, -18.63, -19.71 across one week's three sessions -- so the count
-     travels with the value and this tile never prints a bare figure. */
-  const weekly=wtile('bxtrender · weekly',
-    w.bx_weekly==null?wdash(`${w.weeks} of ${BX_SETTLED} ISO weeks stored`)
-      :num(w.bx_weekly,1),
-    {klass:'half',tint:cls(w.bx_weekly),
-     cap:w.bx_weekly_week==null?'no closes stored yet, so there is no week to read'
-       :`${w.bx_weekly_week}, ${w.bx_weekly_sessions||0} session(s) stored of a `
-         +`full week's five: the newest week is usually partial, and a figure over `
-         +`it repaints as its sessions land`});
+  const trend=sec('bxtrender',
+    `<div class="wbig"><span class="${cls(w.bx_daily)}">${w.bx_daily==null
+      ?wdash(`${w.closes} of ${BX_SETTLED} sessions stored: inside that window the `
+        +`reading is a warm-up figure and its sign can be wrong`)
+      :num(w.bx_daily,1)}</span>${w.bx_daily_delta==null?'':`<span class="wdelta ${
+        cls(w.bx_daily_delta)}">${num(w.bx_daily_delta,1)}${way?WDIR[way]:''}</span>`}
+      <span class="wkl" title="${esc(PARAMS_CAPTION)}">daily</span></div>
+    ${wmeter(w)}
+    ${kv('weekly',w.bx_weekly==null?wdash(`${w.weeks} of ${BX_SETTLED} ISO weeks stored`)
+      :`<span class="${cls(w.bx_weekly)}">${num(w.bx_weekly,1)}</span>`,
+      w.bx_weekly_week==null?'no closes stored yet, so there is no week to read'
+        :`${w.bx_weekly_week}, ${w.bx_weekly_sessions||0} session(s) of a full week's `
+          +`five: the newest week is usually partial, and a figure over it repaints `
+          +`as its sessions land`)}`);
 
-  /* Which contracts, not just "held": the strike and the side are the reason to
-     look at this name rather than at a chart. Through `strike()`, which keeps a
-     half-strike -- 267.5 and 268 are different contracts, and the table cell this
-     replaced rounded them together. */
-  const opts=(w.options||[]).map(wo=>
-    `<div class="mono">${wo.quantity>0?'+':''}${wo.quantity} ${
-      wo.strike!=null?strike(wo.strike):''}${wo.put_call||''}${wo.expiry?
-      ` <span class="dim">expires ${esc(wo.expiry)}</span>`:''}</div>`).join('');
-  /* The alert, typed like the earnings date: a level above and a level below,
-     either optional, cleared by emptying. Crossed or not is `alertState`'s, against
-     the price the row shows. */
-  const bell=alertState(px.price,w.alert_above,w.alert_below);
-  const alerts=wtile('alert',bell==='hit'?'crossed':bell==='set'?'set':wdash(
-      `no alert on ${w.symbol}; set a level below`),
-    {klass:'half',tint:bell==='hit'?'warn2':'',
-     cap:'a level you chose, judged against the price in the row; nothing is '
-       +'fetched to check it and nothing is sent anywhere',
-     kids:`<form class="wed walerts" data-walerts="${esc(w.symbol)}">
-       <input id="walup" data-subject="${esc(w.symbol)}" inputmode="decimal"
-         value="${esc(w.alert_above==null?'':String(w.alert_above))}"
-         placeholder="above" maxlength="12" autocomplete="off" spellcheck="false">
-       <input id="waldn" data-subject="${esc(w.symbol)}" inputmode="decimal"
-         value="${esc(w.alert_below==null?'':String(w.alert_below))}"
-         placeholder="below" maxlength="12" autocomplete="off" spellcheck="false">
-       <button class="btn sm" type="submit">Save</button></form>`});
-  return `<div class="wdpane">
-    <div class="wdet">${daily}${ring}${earnings}${weekly}${alerts}</div>
-    <div class="stats c3 mt-3">
-      ${wtile('1d',pc(px.chg1),{tint:cls(px.chg1),cap:px.live
-        ?'from the quote\'s own previous close, so it describes the same session '
-          +'as the price above'
-        :'from the stored closes, the same series as the price above'})}
-      ${wtile('5d',pc(w.change_5d),{tint:cls(w.change_5d),
-        cap:'over five stored sessions, from the closes'})}
-      ${wtile('realised vol',w.realised_vol==null
-        ?wdash(`${w.closes} session(s) stored; six closes is the fewest a `
-          +`standard deviation is worth reporting over`)
+  const vol=sec('volatility',
+    `<div class="wvolrow">${wring(w)}<div>
+      ${kv('ivr · iv rank, 1y',ivr?num(ivr.rank,1):wdash(ivrWhy(w.symbol)),
+        ivr?`implied vol is ${num(ivr.iv30,1)}%, ${num(ivr.rank,1)}% of the way from `
+          +`this year's low, ${num(ivr.low,1)}%, to its high, ${num(ivr.high,1)}%. `
+          +`${IVR_SOURCE}, as of ${ivr.as_of}`:ivrWhy(w.symbol))}
+      ${kv('realised vol',w.realised_vol==null
+        ?wdash(`${w.closes} session(s) stored; six closes is the fewest a standard `
+          +`deviation is worth reporting over`)
         :num(w.realised_vol,1)+'%',
-        /* The REALISED rank lives here, in the caption of the realised figure it
-           ranks, rather than in a second ring. Two rings cut at two different
-           points would be a reader's problem, not a feature -- and the pairing is
-           the useful part: an implied rank high while the realised rank is low is
-           the market charging more than this stock has lately delivered, which is
-           the comparison the two numbers exist to support. */
-        {cap:'annualised from the stored daily closes'
+        'annualised from the stored daily closes: what the stock DID, where IV '
+          +'rank is what the market charges'
           +(w.expected_move_5d==null?''
-            :`, which implies ±${num(w.expected_move_5d,2)} over five sessions `
-              +`-- one standard deviation of what the stock DID`)
+            :`; it implies ±${num(w.expected_move_5d,2)} over five sessions`)
           +(w.rv_rank==null?`. No realised rank: ${wrankwhy(w)}`
-            :`. That is ${num(w.rv_rank,1)} of 100 against its own year, `
+            :`. ${num(w.rv_rank,1)} of 100 against its own year, `
               +`${num(w.rv_rank_low,1)}% to ${num(w.rv_rank_high,1)}% over `
-              +`${w.rv_rank_windows} windows`)})}
-    </div>
-    <div class="wblk"><div class="wk">your positions</div>
-      ${opts||`<div class="dim">no open option position on ${esc(w.symbol)} —
-        a name you are watching, not one you hold</div>`}</div>
-    <div class="mt-3"><button class="wrm" data-wrm="${esc(w.symbol)}"
+              +`${w.rv_rank_windows} windows`))}
+      ${kv('1d',pc(px.chg1),px.live?'from the quote\'s own previous close'
+        :'from the stored closes')}
+      ${kv('5d',pc(w.change_5d),'over five stored sessions')}
+    </div></div>`);
+
+  const bell=alertState(px.price,w.alert_above,w.alert_below);
+  const opts=(w.options||[]).map(wo=>
+    `<div class="mono wpos">${wo.quantity>0?'+':''}${wo.quantity} ${
+      wo.strike!=null?strike(wo.strike):''}${wo.put_call||''}${wo.expiry?
+      ` <span class="dim">${esc(wo.expiry)}</span>`:''}</div>`).join('');
+  const mine=sec('yours',
+    `${kv('earnings',w.earnings_on?`${esc(w.earnings_on)}${w.earnings_in_days==null?''
+      :` <span class="dim">${esc(w.earnings_in_days<0?'past'
+        :w.earnings_in_days===0?'today':'in '+w.earnings_in_days+'d')}</span>`}`
+      :wdash(`no earnings date recorded for ${w.symbol}`),
+      'recorded by you, not fetched: no source this journal reaches publishes an '
+        +'earnings date, so the days are counted from the ET trading day on every load')}
+    <form class="wed" data-wsave="${esc(w.symbol)}" data-wfield="earnings_on">
+      <input id="wearn" data-subject="${esc(w.symbol)}"
+      value="${esc(w.earnings_on||'')}" placeholder="YYYY-MM-DD" maxlength="10"
+      autocomplete="off" spellcheck="false">
+      <button class="btn sm" type="submit">Save</button></form>
+    ${kv('alert',bell==='hit'?'<span class="warn2">crossed</span>'
+      :bell==='set'?'set':wdash(`no alert on ${w.symbol}`),
+      'a level you chose, judged against the price in the row; nothing is '
+        +'fetched to check it and nothing is sent anywhere')}
+    <form class="wed walerts" data-walerts="${esc(w.symbol)}">
+      <input id="walup" data-subject="${esc(w.symbol)}" inputmode="decimal"
+        value="${esc(w.alert_above==null?'':String(w.alert_above))}"
+        placeholder="above" maxlength="12" autocomplete="off" spellcheck="false">
+      <input id="waldn" data-subject="${esc(w.symbol)}" inputmode="decimal"
+        value="${esc(w.alert_below==null?'':String(w.alert_below))}"
+        placeholder="below" maxlength="12" autocomplete="off" spellcheck="false">
+      <button class="btn sm" type="submit">Save</button></form>
+    ${kv('positions',opts?'':`<span class="dim">none open</span>`)}${opts}
+    <button class="wrm" data-wrm="${esc(w.symbol)}"
       title="stop watching ${esc(w.symbol)}: the note and the earnings date go
-      with it">stop watching ${esc(w.symbol)}</button></div>
-  </div>`;
+      with it">stop watching ${esc(w.symbol)}</button>`);
+
+  return `<div class="wdpane"><div class="wdet">${trend}${vol}${mine}</div></div>`;
 }
 
 function watchlist(){
@@ -6775,6 +6715,7 @@ async function save(body){
    editing a note describes something that did not happen. Pre-escaped by the
    caller, since it carries markup. */
 async function watchWrite(body,said){
+  let added=false;
   try{
     const r=await fetch('/api/watchlist',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -6782,13 +6723,17 @@ async function watchWrite(body,said){
     if(!wres.ok){note(esc(wres.message||'watchlist write failed'),'bad');return;}
     if(wres.action==='remove'&&!wres.changed)
       note(`${esc(wres.symbol)} was not on the watchlist.`,'warn');
+    else if(wres.fetch_error)
+      note(`Watching <b>${esc(wres.symbol)}</b>, but its history could not be
+        fetched (${esc(wres.fetch_error)}); the next bars run fills it in.`,'warn');
     else note(said||(wres.action==='add'?`Watching <b>${esc(wres.symbol)}</b>.`
       :`Stopped watching <b>${esc(wres.symbol)}</b>.`),'ok');
+    added=wres.action==='add'&&!said;
   }catch(e){note('Watchlist write failed: '+esc(e),'bad');return;}
   await load();
-  /* Quotes are keyed by symbol, so an added row simply has none until the next
-     refresh -- which is honest, and cheaper than spending a request per add. */
-  if(S.quotesAt) await loadQuotes(false);
+  /* A new watch gets its quote, name and IV rank at once as well, since the
+     server has just stored its history: the row is complete on arrival. */
+  if(added||S.quotesAt) await loadQuotes(false);
 }
 
 /* One HTTP request PER SYMBOL, so this is never automatic beyond the first view.

@@ -953,3 +953,34 @@ def replay_bars(
                 points = points[-SNAPSHOT_DRAW_BARS:]
             return ReplaySeries(conid=conid, bar_size=size, points=points)
     return ReplaySeries(conid=conid, bar_size=preferred)
+
+
+def fetch_watch_bars(
+    conn: sqlite3.Connection,
+    symbol: str,
+    *,
+    source: str = "yahoo",
+    fetch: Callable[..., list[Bar]] | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """Fetch one watched symbol's daily history now. The error text, or None.
+
+    What adding a symbol calls, so its B-Xtrender, realised vol and changes are
+    on screen at once instead of dashes until the next scheduled `bars` run. The
+    same window and the same key `bars_manifest` gives it -- the traded
+    underlying's conid when there is one, else `watch:SYMBOL` -- so the job and
+    this call write the same rows and neither duplicates the other.
+    """
+    name = symbol.strip().upper()
+    moment = now or datetime.now(UTC)
+    conid = _underlying_conids(conn).get(name) or f"watch:{name}"
+    start = int((moment - timedelta(days=WATCH_LOOKBACK_DAYS)).timestamp())
+    try:
+        bars = (fetch or fetch_bars)(name, bar_size="1d", start=start,
+                                     end=int(moment.timestamp()), source=source,
+                                     timeout=15)
+    except BarFetchError as exc:
+        return str(exc)
+    upsert_bars(conn, conid=conid, symbol=name, bar_size="1d", source=source,
+                bars=bars)
+    return None

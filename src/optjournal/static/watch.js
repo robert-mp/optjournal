@@ -264,58 +264,80 @@ export function alertState(price, above, below) {
   return "set";
 }
 
-/** Where the $/$$/$$$ share-price filter cuts, in the quote's own currency. */
-export const PRICE_TIERS = [50, 200];
+/** Where the $/$$/$$$ share-price filter cuts, in the quote's own currency.
+ * IAG's own, read off its tooltips: "up to $100", "over $100, under $500",
+ * "$500 and up". */
+export const PRICE_TIERS = [100, 500];
 
-/** The share-price tier: under 50, 50 to under 200, and 200 or more. Null
- * without a price, so an unpriced row matches no tier.
+/** The share-price tier: up to 100, over 100 and under 500, and 500 or more.
+ * Null without a price, so an unpriced row matches no tier.
  *
  * @param {number|null} price
  * @returns {"1"|"2"|"3"|null}
  */
 export function priceTier(price) {
   if (price == null || !(price > 0)) return null;
-  if (price < PRICE_TIERS[0]) return "1";
+  if (price <= PRICE_TIERS[0]) return "1";
   return price < PRICE_TIERS[1] ? "2" : "3";
 }
 
-/** The row's five-session B-Xtrender histogram, as bars in a box.
- *
- * Every bar grows up from the BASELINE, its height the reading's size against the
- * arm's own bound on that side (`box.hi` above zero, `box.lo` below), and the sign
- * is carried by `pos` for the colour: IAG's shape, and twice the height a
- * centre-line chart gets in a row this short, which is what made a -4.5 readable
- * as red at all. A full bar means the indicator's limit on every row alike. A bar is `faded` when the
- * arm moved TOWARD zero since the session before, the indicator's own light and
- * dark shades. A warm-up session (null) draws nothing and keeps its slot, so the
- * newest bar is always the rightmost.
- *
- * `min` is a floor on bar height, so a reading of 0.3 still draws a visible dash
- * rather than nothing, which would read as a missing session.
+/** Whether the newest B-Xtrender reading is STRENGTHENING: further from zero than
+ * the session before it, on either side. IAG's bright-versus-muted rule, for the
+ * newest bar and the Daily figure alike. Null without two readings to compare.
  *
  * @param {Array<number|null>} values oldest first
- * @param {{w: number, h: number, gap: number, lo: number, hi: number, min: number}} box
- * @returns {Array<{x: number, y: number, w: number, h: number, pos: boolean, faded: boolean}>}
+ * @returns {boolean|null}
+ */
+export function bxStrong(values) {
+  const known = values.filter((v) => v != null);
+  if (known.length < 2) return null;
+  const [prev, last] = known.slice(-2);
+  return Math.abs(last) > Math.abs(prev);
+}
+
+/** The row's five-session B-Xtrender histogram, as bars on a centre line.
+ *
+ * IAG's anatomy, measured off its own screen: bars rise above the centre line
+ * when the arm is positive and hang below it when negative, their outer corners
+ * rounded and their baseline edge flat, and a reading at or beyond `box.cap` is a
+ * full half-height. Every bar is muted except the NEWEST, which is `strong` when
+ * the reading is further from zero than the session before (`bxStrong`). A
+ * warm-up session (null) draws nothing and keeps its slot, so the newest bar is
+ * always the rightmost. `min` floors a tiny reading at a visible dash.
+ *
+ * `d` is the bar as an SVG path, so the rounding is drawn rather than approximated
+ * by a fully rounded rect.
+ *
+ * @param {Array<number|null>} values oldest first
+ * @param {{w: number, h: number, gap: number, cap: number, min: number, r: number}} box
+ * @returns {Array<{x: number, y: number, w: number, h: number, pos: boolean,
+ *   newest: boolean, strong: boolean, d: string}>}
  */
 export function histBars(values, box) {
   const n = values.length;
   if (!n) return [];
   const width = (box.w - box.gap * (n - 1)) / n;
+  const mid = box.h / 2;
+  let newest = -1;
+  values.forEach((v, i) => { if (v != null) newest = i; });
+  const strong = bxStrong(values) === true;
   const out = [];
   values.forEach((value, i) => {
     if (value == null) return;
-    const limit = value >= 0 ? box.hi : -box.lo;
-    const share = Math.min(1, Math.abs(value) / limit);
-    const height = Math.max(box.min, share * box.h);
-    const prev = i > 0 ? values[i - 1] : null;
-    out.push({
-      x: i * (width + box.gap),
-      y: box.h - height,
-      w: width,
-      h: height,
-      pos: value >= 0,
-      faded: prev != null && Math.abs(value) < Math.abs(prev),
-    });
+    const height = Math.max(box.min, Math.min(1, Math.abs(value) / box.cap) * mid);
+    const pos = value >= 0;
+    const x = i * (width + box.gap);
+    const y = pos ? mid - height : mid;
+    const r = Math.min(box.r, height, width / 2);
+    const edge = pos ? y : y + height;
+    const inward = pos ? r : -r;
+    const d = `M${x.toFixed(2)} ${mid}V${(edge + inward).toFixed(2)}`
+      + `Q${x.toFixed(2)} ${edge.toFixed(2)} ${(x + r).toFixed(2)} ${edge.toFixed(2)}`
+      + `H${(x + width - r).toFixed(2)}`
+      + `Q${(x + width).toFixed(2)} ${edge.toFixed(2)} ${(x + width).toFixed(2)} `
+      + `${(edge + inward).toFixed(2)}V${mid}Z`;
+    out.push({x, y, w: width, h: height, pos, newest: i === newest,
+      strong: i === newest && strong, d});
   });
   return out;
 }

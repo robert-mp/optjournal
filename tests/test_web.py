@@ -5410,7 +5410,7 @@ def test_the_indicator_parameters_are_on_screen():
     from optjournal import trend  # noqa: PLC0415 - local to this test
 
     assert trend.PARAMS_CAPTION in _code_only(_js())
-    assert "cap:PARAMS_CAPTION" in _fn("watchDetail").replace(" ", ""), (
+    assert "title=\"${esc(PARAMS_CAPTION)}\"" in _fn("watchDetail").replace(" ", ""), (
         "the daily tile no longer captions itself with the generated sentence"
     )
     # The column header spends it too, so a reader scanning the table can reach the
@@ -7311,3 +7311,36 @@ def test_the_row_filters_and_the_bell_read_the_shared_helpers():
     assert "priceTier(shownPrice(w,qs[w.symbol]).price)" in rows
     table = _fn("watchTable").replace(" ", "")
     assert "alertState(px.price,w.alert_above,w.alert_below)" in table
+
+
+def test_adding_a_symbol_fetches_its_history_at_once(populated, monkeypatch):
+    """A new watch arrives with its figures, not dashes until the next job: the
+    add fetches the daily history under the key the job would use."""
+    from optjournal import bars  # noqa: PLC0415 - local to this test
+    from optjournal.marketdata import Bar  # noqa: PLC0415 - local to this test
+
+    asked: list[tuple[str, str]] = []
+
+    def fake(symbol, *, bar_size, start, end, **_):
+        asked.append((symbol, bar_size))
+        return [Bar(ts=end - 86400 * i, open=10.0, high=10.0, low=10.0,
+                    close=10.0 + i % 3, volume=1) for i in range(200, 0, -1)]
+
+    monkeypatch.setattr(bars, "fetch_bars", fake)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/watchlist", {"symbol": "zzzq"})
+        _, state = _get(base, "/api/state")
+    assert (status, reply["fetch_error"]) == (200, None)
+    assert asked == [("ZZZQ", "1d")]
+    row = next(w for w in state["watchlist"] if w["symbol"] == "ZZZQ")
+    assert row["closes"] > 100 and row["bx_daily"] is not None
+
+
+def test_saving_a_field_does_not_refetch(populated, monkeypatch):
+    """Only a bare add is a new watch; saving an alert must not spend a request."""
+    from optjournal import bars  # noqa: PLC0415 - local to this test
+    calls: list[str] = []
+    monkeypatch.setattr(bars, "fetch_bars", lambda s, **k: calls.append(s) or [])
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _post(base, "/api/watchlist", {"symbol": "SPY", "alert_above": "900"})
+    assert calls == []

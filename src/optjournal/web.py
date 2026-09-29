@@ -59,6 +59,7 @@ from optjournal import __version__, journal, replay
 from optjournal import settings as prefs
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
+from optjournal.bars import fetch_watch_bars
 from optjournal.campaigns import position_count
 from optjournal.clock import parse_day
 from optjournal.costs import CostScope, build_costs
@@ -1398,8 +1399,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 )
                 changed = 1
             conn.commit()
+            # A bare add (no fields) is a new watch: fetch its history now, so the
+            # row arrives with its figures rather than dashes until the next job.
+            # One request, and a failure is reported rather than refused -- the
+            # symbol is watched either way and the job will fill it in.
+            fetched = (fetch_watch_bars(conn, symbol)
+                       if action == "add" and not fields else None)
         return 200, {"ok": True, "kind": "watchlist", "action": action,
-                     "symbol": symbol, "changed": changed}
+                     "symbol": symbol, "changed": changed, "fetch_error": fetched}
 
     def _journal_write(self) -> tuple[int, dict[str, Any]]:
         """Write one decision's journal entry.

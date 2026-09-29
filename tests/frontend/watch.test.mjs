@@ -24,6 +24,7 @@ import {
   PRICE_TIERS,
   alertState,
   bxDirection,
+  bxStrong,
   earningsSoon,
   histBars,
   meterKnob,
@@ -220,26 +221,37 @@ test("an alert is hit at or beyond either level, and needs a price to be hit", (
   assert.equal(alertState(100, 0, null), null, "a zero level is no alert");
 });
 
-test("price tiers cut at 50 and 200, and an unpriced row has none", () => {
-  assert.deepEqual(PRICE_TIERS, [50, 200]);
-  assert.equal(priceTier(49.99), "1");
-  assert.equal(priceTier(50), "2");
-  assert.equal(priceTier(199.99), "2");
-  assert.equal(priceTier(200), "3");
+test("price tiers are IAG's: up to 100, over 100 under 500, 500 and up", () => {
+  assert.deepEqual(PRICE_TIERS, [100, 500]);
+  assert.equal(priceTier(100), "1", "up to $100 includes 100");
+  assert.equal(priceTier(100.01), "2");
+  assert.equal(priceTier(499.99), "2");
+  assert.equal(priceTier(500), "3", "$500 and up includes 500");
   assert.equal(priceTier(null), null);
   assert.equal(priceTier(0), null);
 });
 
-test("histogram bars grow from the baseline, scale to the arm's bounds, and fade toward zero", () => {
-  const box = {w: 50, h: 20, gap: 2.5, lo: -50, hi: 50, min: 1};
-  const bars = histBars([null, 10, 25, -50, -20], box);
+test("histogram bars stand on a centre line, cap at the box's limit, and only the newest can be strong", () => {
+  const box = {w: 50, h: 20, gap: 2.5, cap: 40, min: 1, r: 1.5};
+  const bars = histBars([null, 10, 20, -40, -60], box);
   assert.equal(bars.length, 4, "a warm-up session draws nothing");
   const [b1, b2, b3, b4] = bars;
   assert.equal(b1.x, 1 * (8 + 2.5), "the slot is kept, so the newest is rightmost");
-  assert.equal(b4.x, 4 * (8 + 2.5));
-  assert.ok(b2.pos && b2.y + b2.h === 20, "every bar stands on the baseline");
-  assert.equal(b2.h, 10, "25 of 50 is half the height");
-  assert.ok(!b3.pos && b3.y === 0 && b3.h === 20, "the limit is a full bar, signed by colour");
-  assert.ok(b4.faded && !b3.faded, "moving toward zero fades");
+  assert.ok(b1.pos && b1.y + b1.h === 10, "positive rises from the centre");
+  assert.equal(b2.h, 5, "20 of a 40 cap is half the half-height");
+  assert.ok(!b3.pos && b3.y === 10 && b3.h === 10, "the cap is a full bar down");
+  assert.equal(b4.h, 10, "beyond the cap is clamped, not drawn past the box");
+  assert.ok(b4.newest && b4.strong, "-60 after -40 is strengthening");
+  assert.ok(!b3.newest && !b3.strong, "only the newest bar can be strong");
+  assert.ok(b1.d.startsWith("M10.50 10V"), "the path starts on the centre line");
   assert.equal(histBars([0.1], box)[0].h, 1, "a tiny reading still draws a dash");
+});
+
+test("strength is distance from zero growing, on either side", () => {
+  assert.equal(bxStrong([10, 20]), true);
+  assert.equal(bxStrong([20, 10]), false);
+  assert.equal(bxStrong([-10, -20]), true, "falling further below zero is strong");
+  assert.equal(bxStrong([-20, 5]), false);
+  assert.equal(bxStrong([null, 5]), null, "one reading has nothing to compare");
+  assert.equal(bxStrong([5, null, 9]), true, "a gap compares the two known readings");
 });
