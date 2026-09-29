@@ -4828,6 +4828,7 @@ const W_ICONS={
   calx:'M4 6h16v14H4z M4 10h16 M8 3v4 M16 3v4 M9 13l6 5 M15 13l-6 5',
   clear:'M21 12a9 9 0 1 1-18 0a9 9 0 1 1 18 0z M5.6 5.6l12.8 12.8',
   bell:'M6 16v-5a6 6 0 0 1 12 0v5l2 2H4z M10 20a2 2 0 0 0 4 0',
+  refresh:'M20 11a8 8 0 0 0-14.3-4.9L4 8 M4 4v4h4 M4 13a8 8 0 0 0 14.3 4.9L20 16 M20 20v-4h-4',
 };
 const wicon=name=>`<svg class="wico" viewBox="0 0 24 24" aria-hidden="true"
   focusable="false"><path d="${W_ICONS[name]}"/></svg>`;
@@ -5163,7 +5164,8 @@ function watchlist(){
   const header=`<div class="crow">
     <div class="wtitle"><h2>Watchlist</h2><span class="pill gap">BETA</span>
       <button id="wquote" class="btn wrefresh" title="Refresh prices and IV ranks"
-        aria-label="Refresh prices and IV ranks">⟳</button>${quoteNote()}</div>
+        aria-label="Refresh prices and IV ranks">${wicon('refresh')}</button>${
+        quoteNote()}</div>
     <div class="wshow dim">${ws.length?`${watchRows().length} of ${ws.length}`:''}</div>
   </div>`;
   if(!ws.length) return `<div class="card">${header}${watchFilters()}
@@ -5211,10 +5213,14 @@ function quoteNote(){
   const when=age<90?'just now'
     :age<3600?Math.round(age/60)+'m ago'
     :age<6*3600?Math.round(age/3600)+'h ago'
-    :new Date(newest*1000).toISOString().slice(0,16).replace('T',' ')+' UTC';
-  const stale=age>=6*3600;
-  return `<span class="dim wnote">quotes ${esc(when)}${
-    stale?' · last session\'s close':''}</span>`;
+    :null;
+  /* Past a session's length the quote IS the last close, so it is dated rather
+     than aged: "22h ago" invites reading a stale number as nearly current. */
+  const dated=new Date(newest*1000).toLocaleDateString('en-US',
+    {timeZone:MKT,month:'short',day:'numeric'});
+  return `<span class="dim wnote" title="${esc(`quotes fetched ${new Date(newest*1000)
+    .toISOString().slice(0,16).replace('T',' ')} UTC`)}">${esc(when
+      ?`updated ${when}`:`${dated} close`)}</span>`;
 }
 
 /* ------------------------------------------------ 0DTE calculator

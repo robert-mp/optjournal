@@ -1210,9 +1210,13 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    what makes styling `tbody tr` safe: an unscoped one would repaint the eight
    other tables on the page. */
 .wtitle{display:flex;align-items:center;gap:var(--s4)}
-.wtitle h2{margin:0}
+.wtitle h2{margin:0;font-size:var(--t7)}
+/* BETA in the reference's gold, small, beside the title rather than competing. */
+.wtitle .pill{color:var(--warnfg);background:var(--warnfill);border-color:var(--warnfill);
+  font-size:var(--t0);font-weight:var(--w-label);letter-spacing:var(--tr-caps);
+  padding:var(--s1) var(--s3)}
 /* The refresh glyph beside the title: a square icon button on `.btn`'s ground. */
-.wrefresh{padding:var(--s2) var(--s4);font-size:var(--t4);line-height:1}
+.wrefresh{display:grid;place-items:center;padding:var(--s3);line-height:1}
 /* The filter bar: the search box and its `+` on the left, the toggle groups on
    the right. `.filters.wf` is specificity (0,2,0), which beats the 760px query's
    `.filters` whatever the order, hence its own entry in that query below. The
@@ -1226,7 +1230,10 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .wf input::placeholder{color:var(--dim2)}
 .wf input:disabled{opacity:.5}
 .wsrch{display:flex;gap:var(--s3);align-items:center;max-width:520px}
-.wplus{padding:var(--s3) var(--s5);font-size:var(--t4);line-height:1}
+/* The add button is the bar's one filled control, brass like the reference's. */
+.wplus{padding:var(--s3) var(--s5);font-size:var(--t4);line-height:1;
+  color:var(--accentfg);background:linear-gradient(160deg,var(--accent),var(--accent2));
+  border-color:var(--accentedge)}
 .wfgroups{display:flex;gap:var(--s6);align-items:end;flex-wrap:wrap}
 /* A group's toggles as one joined unit, `.seg`'s ground without its fill. */
 .wtogs{display:flex;gap:var(--s1);padding:var(--s1);border-radius:var(--r2);
@@ -1241,7 +1248,7 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .wico{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;
   stroke-linecap:round;stroke-linejoin:round}
 .wf .flabel{font-family:var(--mono);font-size:var(--t0);color:var(--dim);
-  letter-spacing:var(--tr-wide);text-transform:uppercase;font-weight:var(--w-label)}
+  letter-spacing:var(--tr-wide);text-transform:uppercase;font-weight:var(--w-body)}
 .wbxtogs .wtog:first-child{color:var(--bad)}
 .wbxtogs .wtog:last-child{color:var(--ok)}
 .wtier{font-family:var(--fig);font-variant-numeric:tabular-nums;
@@ -1270,9 +1277,14 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
   box-shadow:inset 0 -1px 0 var(--line)}
 .wtab tbody tr[data-wsel]{cursor:pointer}
 .wtab th{font-family:var(--mono);font-size:var(--t0);color:var(--dim);
-  letter-spacing:var(--tr-wide);font-weight:var(--w-label)}
-.wtab td{padding-top:var(--s5);padding-bottom:var(--s5)}
-.wtab td.n{font-weight:var(--w-body)}
+  letter-spacing:var(--tr-wide);font-weight:var(--w-body)}
+.wtab td{padding-top:var(--s4);padding-bottom:var(--s4)}
+/* THE ONE TABLE WHOSE FIGURES ARE MONOSPACE, and on purpose. The page's rule is
+   `--fig` for measurements because Geist Mono's comma is a full digit wide, which
+   spreads a column of thousands. A watchlist is a column of share prices, almost
+   none of them past 999, and the reference app sets every figure here in mono:
+   it is most of why its table reads as one instrument rather than as prose. */
+.wtab td.n{font-family:var(--mono);font-weight:var(--w-body);font-size:var(--t3)}
 .wselb b{font-family:var(--mono);letter-spacing:var(--tr-caps)}
 .wselb .dim{margin-left:var(--s3)}
 /* Daily: muted unless the reading is strengthening, the same rule the newest
