@@ -203,3 +203,32 @@ def test_subsumed_files_are_reported_not_deleted(archive, conn):
     assert result.files_removed == 0, "subsumption alone must never delete"
     assert len(result.subsumed) == 1
     assert len(list(archive.glob("*.xml"))) == 2
+
+
+def _statement_file(directory, stamp: str, from_date: str, to_date: str):
+    path = directory / f"activity-{stamp}.xml"
+    path.write_text(
+        '<FlexQueryResponse queryName="q" type="AF">\n<FlexStatements count="1">\n'
+        f'<FlexStatement accountId="U1" fromDate="{from_date}" toDate="{to_date}">'
+        "</FlexStatement></FlexStatements></FlexQueryResponse>"
+    )
+    return path
+
+
+def test_newest_statement_is_the_latest_period_not_the_latest_download(tmp_path):
+    """A history import downloads 2022 today; the cost report must not read it."""
+    from optjournal.archive import newest_statement  # noqa: PLC0415 - local
+
+    current = _statement_file(tmp_path, "20260929T110034Z", "20260831", "20260928")
+    _statement_file(tmp_path, "20260929T120000Z", "20220519", "20230518")
+
+    assert newest_statement(tmp_path) == current
+
+
+def test_newest_statement_breaks_a_period_tie_by_download(tmp_path):
+    from optjournal.archive import newest_statement  # noqa: PLC0415 - local
+
+    _statement_file(tmp_path, "20260803T090622Z", "20260702", "20260731")
+    full_year = _statement_file(tmp_path, "20260803T091918Z", "20250801", "20260731")
+
+    assert newest_statement(tmp_path) == full_year

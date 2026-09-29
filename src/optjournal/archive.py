@@ -29,6 +29,7 @@ fudge: that file contains exactly the same statement.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -206,8 +207,26 @@ def prune_archive(
     return result
 
 
+#: How much of a statement to read for its period. The `FlexStatement` tag is
+#: the third line of every archived file, `toDate` at byte 149 in both a daily
+#: and a full-year statement; 4 KB leaves room for a long query name.
+_HEADER_BYTES = 4096
+_TO_DATE = re.compile(rb'<FlexStatement [^>]*?toDate="(\d{8})"')
+
+
+def _period_end(path: Path) -> str:
+    """The statement's own `toDate`, from its header. Empty when unreadable."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(_HEADER_BYTES)
+    except OSError:
+        return ""
+    found = _TO_DATE.search(head)
+    return found.group(1).decode() if found else ""
+
+
 def newest_statement(archive_dir: Path) -> Path | None:
-    """Most recently archived statement, or None if the archive is empty.
+    """The statement covering the latest period, or None if the archive is empty.
 
     Here rather than in `serialize.py`, which is where it used to sit: it
     returns a `Path`, and that module's contract is "take domain objects and
@@ -216,8 +235,12 @@ def newest_statement(archive_dir: Path) -> Path | None:
     entry points asked `serialize` for a filesystem fact, which is the sort of
     import that makes a layer look like it does more than it does.
 
-    Lexical sort is a real ordering, not a guess: archive filenames carry a
-    `YYYYMMDDTHHMMSSZ` stamp, so string order is time order.
+    ORDERED BY THE PERIOD, NOT THE FETCH. The filename stamp says when a file
+    was downloaded, and a history import downloads 2022 today: ordered by stamp,
+    the page's cost report would read a four-year-old statement until the next
+    daily sync. The stamp still breaks ties, so of two statements ending on the
+    same day the later download wins, which is what the stamp order gave before.
     """
-    files = sorted(archive_dir.glob("activity-*.xml"))
+    files = sorted(archive_dir.glob("activity-*.xml"),
+                   key=lambda p: (_period_end(p), p.name))
     return files[-1] if files else None
