@@ -193,6 +193,8 @@ def stage(release: Release, *, root: Path = ROOT) -> Path:
     if reason:
         raise UpdateRefused(reason)
     body = _get(release.zip_url, limit=MAX_DOWNLOAD_BYTES)
+    if not zipfile.is_zipfile(io.BytesIO(body)):
+        raise UpdateRefused("the download is not a release archive (an error page?)")
     with zipfile.ZipFile(io.BytesIO(body)) as archive:
         top, infos = _members(archive)
         meta = tomllib.loads(archive.read(f"{top}/pyproject.toml").decode())
