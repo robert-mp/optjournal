@@ -103,6 +103,40 @@ def test_an_order_without_a_time_is_never_merged():
     assert len(groups) == 2
 
 
+def test_orders_the_broker_generated_are_never_merged():
+    """IBKR stamps every expiration at 16:20:00, each under its own order id.
+
+    Two positions on one underlying that expire the same day then land inside
+    the window, so a short put opened in September and a long call opened three
+    weeks later scored as ONE decision (`pnl/s_expiry_merge.py`: 1W/1L became
+    0W/1L). The trader placed neither expiration, so there is no placement to
+    share. The caller names those orders; they stand alone.
+    """
+    items = [("9001", "2026-10-16 16:20:00", "SPY"),
+             ("9002", "2026-10-16 16:20:00", "SPY")]
+    assert len(cluster_orders(items)) == 1, "the control: the window alone merges"
+    assert len(cluster_orders(items, standalone={"9001", "9002"})) == 2
+    # A placed order in the same second still clusters with other placed ones.
+    placed = [*items, ("5", "2026-10-16 16:20:00", "SPY"),
+              ("6", "2026-10-16 16:20:30", "SPY")]
+    assert sorted(cluster_orders(placed, standalone={"9001", "9002"})) == [
+        ("5", "6"), ("9001",), ("9002",)]
+
+
+@pytest.mark.parametrize("notes, expected", [
+    ("Ep", True), ("A", True), ("A;P", True), ("Ex", True), ("AEx", True),
+    ("MEx", True), ("GEA", True), ("L", True), ("R", True),
+    ("AFx", False), ("P", False), ("SL", False), ("", False), (None, False),
+])
+def test_which_fills_the_broker_generated(notes, expected):
+    """Expiry, assignment, exercise, a margin liquidation and a dividend
+    reinvestment are stamped by IBKR. Matched as whole codes: `AFx` (an
+    auto-conversion) contains `A` (assignment) and is not one."""
+    from optjournal.campaigns import placed_by_broker
+
+    assert placed_by_broker(notes) is expected
+
+
 def test_window_constant_is_seconds_and_modest():
     """The window is the heuristic's whole risk surface, and a win rate now
     depends on it where before only a card layout did. Pin its scale so a

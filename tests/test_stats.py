@@ -197,6 +197,7 @@ def _leg(
     pnl: float | None,
     put_call: str = "P",
     open_close: str | None = None,
+    notes: str | None = None,
 ) -> None:
     """One OPT fill on `conid`, enough for `build_history` to fold into episodes.
 
@@ -209,17 +210,17 @@ def _leg(
         "INSERT INTO trades (broker, trade_id, ib_exec_id, transaction_id,"
         " ib_order_id, account_id, trade_date, date_time, asset_category,"
         " symbol, conid, underlying_symbol, put_call, strike, expiry,"
-        " multiplier, buy_sell, open_close, quantity, trade_price, currency,"
+        " multiplier, buy_sell, open_close, notes, quantity, trade_price, currency,"
         " fx_rate_to_base, proceeds, proceeds_base, ib_commission,"
         " ib_commission_base, fifo_pnl_realized, fifo_pnl_realized_base,"
         " raw, source_file, first_seen_at)"
         " VALUES ('IBKR',?,?,?,?,'U1',?,?,'OPT',?,?,'SPY',?,500,'2026-04-17',"
-        "100,?,?,?,?,'USD',1.0,?,?,-1.0,-1.0,?,?,'{}','t.xml',"
+        "100,?,?,?,?,?,'USD',1.0,?,?,-1.0,-1.0,?,?,'{}','t.xml',"
         "'2026-03-02T00:00:00Z')",
         (trade_id, trade_id, trade_id, order_id, at[:10], at,
          f"SPY  {put_call}{conid}", conid, put_call,
          "SELL" if qty < 0 else "BUY",
-         open_close or ("O" if pnl is None else "C"),
+         open_close or ("O" if pnl is None else "C"), notes,
          qty, abs(proceeds) / (abs(qty) * 100),
          proceeds, proceeds, pnl, pnl),
     )
@@ -439,3 +440,21 @@ def test_a_reversal_through_zero_scores_the_long_and_the_short_apart(conn):
     assert september.inflight_realized.base == 0.0
     assert (october.net_pnl.base, october.wins, october.decided_campaigns) == (
         149.0, 1, 1)
+
+
+def test_expirations_on_one_day_do_not_merge_unrelated_positions(conn):
+    """`pnl/s_expiry_merge.py`: a short put opened 2026-09-01 and a long call
+    opened three weeks later expire together. IBKR books both at 16:20:00 under
+    orders of its own, inside the 90-second window, so the two decisions scored
+    as one -102 loss where they were a +199 win and a -301 loss."""
+    _leg(conn, conid="1", order_id="1001", at="2026-09-01 10:00:00", qty=-1,
+         proceeds=200.0, pnl=None, put_call="P")
+    _leg(conn, conid="2", order_id="1002", at="2026-09-20 11:00:00", qty=1,
+         proceeds=-300.0, pnl=None, put_call="C")
+    _leg(conn, conid="1", order_id="9001", at="2026-10-16 16:20:00", qty=1,
+         proceeds=0.0, pnl=199.0, put_call="P", notes="Ep")
+    _leg(conn, conid="2", order_id="9002", at="2026-10-16 16:20:00", qty=-1,
+         proceeds=0.0, pnl=-301.0, put_call="C", notes="Ep")
+    s = month_stats(conn, None)
+    assert (s.decided_campaigns, s.wins, s.losses) == (2, 1, 1)
+    assert s.net_pnl.base == pytest.approx(-102.0), "the money never moved"

@@ -131,34 +131,35 @@ def strategy_groups(orders: list[Row]) -> list[Row]:
     scoreboard group the same fills the same way by construction.
     """
     by_id = {str(o.get("ib_order_id")): o for o in orders}
-    groups = [
-        [by_id[oid] for oid in ids]
+    out = [
+        _event([by_id[oid] for oid in ids])
         for ids in campaigns.cluster_orders(
             (str(o.get("ib_order_id")), o.get("first_fill_at"), _underlying(o))
             for o in orders
         )
     ]
-
-    out: list[Row] = []
-    for members in groups:
-        legs = [leg for o in members for leg in o.get("legs", ())]
-        out.append({
-            "underlying": _underlying(members[0]) or members[0].get("underlyings"),
-            "label": classify(legs),
-            "order_ids": [str(o.get("ib_order_id")) for o in members],
-            "first_fill_at": min(str(o.get("first_fill_at") or "") for o in members),
-            "fills": sum(o.get("fills") or 0 for o in members),
-            # Aggregated from `legs` -- the leaf fill rows already in hand --
-            # rather than by summing the orders' own figures. The base is the
-            # same either way, but the gate must be asked against the union of
-            # THESE legs' currencies: a group whose legs span currencies has no
-            # exact figure, and re-gating an already-gated order total cannot
-            # tell a withheld native from an absent one.
-            **{f: Money.from_rows(legs, f).payload() for f in FILL_MONEY_FIELDS},
-            "orders": members,
-        })
     out.sort(key=lambda g: g["first_fill_at"], reverse=True)
     return out
+
+
+def _event(members: list[Row]) -> Row:
+    """One strategy event: the orders placed together, named and totalled."""
+    legs = [leg for o in members for leg in o.get("legs", ())]
+    return {
+        "underlying": _underlying(members[0]) or members[0].get("underlyings"),
+        "label": classify(legs),
+        "order_ids": [str(o.get("ib_order_id")) for o in members],
+        "first_fill_at": min(str(o.get("first_fill_at") or "") for o in members),
+        "fills": sum(o.get("fills") or 0 for o in members),
+        # Aggregated from `legs` -- the leaf fill rows already in hand --
+        # rather than by summing the orders' own figures. The base is the
+        # same either way, but the gate must be asked against the union of
+        # THESE legs' currencies: a group whose legs span currencies has no
+        # exact figure, and re-gating an already-gated order total cannot
+        # tell a withheld native from an absent one.
+        **{f: Money.from_rows(legs, f).payload() for f in FILL_MONEY_FIELDS},
+        "orders": members,
+    }
 
 
 def position_groups(
@@ -190,8 +191,6 @@ def position_groups(
     Events whose orders map to no episode (nothing but snapshots, or an
     unmatched category) stay as singleton lifecycles.
     """
-    events = strategy_groups(orders)
-
     #: Which campaign each order filled, so an event is placed by its own
     #: orders. The campaign carries them because the leg views aggregate per
     #: contract and so carry no fill id for an event to join on.
@@ -207,6 +206,20 @@ def position_groups(
             if index is not None:
                 return index
         return None
+
+    # An event is drawn on ONE card, so it may not straddle two campaigns. The
+    # event grouping here reads orders, which carry no note codes, so it still
+    # puts two positions' expirations in one event (IBKR stamps both 16:20:00)
+    # after the campaigns have kept the positions apart. Split along campaign
+    # lines, each card keeps its own expiry rather than one card holding both.
+    events: list[Row] = []
+    for event in strategy_groups(orders):
+        parts: dict[int | None, list[Row]] = {}
+        for order in event["orders"]:
+            parts.setdefault(
+                campaign_of_order.get(str(order.get("ib_order_id"))), []
+            ).append(order)
+        events.extend([event] if len(parts) == 1 else map(_event, parts.values()))
 
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own

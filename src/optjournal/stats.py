@@ -203,9 +203,12 @@ def campaigns_for(
     )
     order_of_trade: dict[str, str] = {}
     first_fill: dict[str, tuple[str, str | None]] = {}
+    #: Orders IBKR generated (an expiry, an assignment), which the window must
+    #: not merge: every expiration is stamped 16:20:00. See `cluster_orders`.
+    by_broker: set[str] = set()
     for row in conn.execute(
         "SELECT trade_id, ib_order_id, date_time, trade_date, underlying_symbol,"
-        f" symbol FROM trades {clause}", params
+        f" symbol, notes FROM trades {clause}", params
     ):
         oid = str(row["ib_order_id"])
         order_of_trade[str(row["trade_id"])] = oid
@@ -213,10 +216,13 @@ def campaigns_for(
         under = row["underlying_symbol"] or row["symbol"]
         if oid not in first_fill or at < first_fill[oid][0]:
             first_fill[oid] = (at, under)
+        if campaigns.placed_by_broker(row["notes"]):
+            by_broker.add(oid)
     return campaigns.link(
         episodes,
         order_groups=campaigns.cluster_orders(
-            (oid, at, under) for oid, (at, under) in first_fill.items()
+            ((oid, at, under) for oid, (at, under) in first_fill.items()),
+            standalone=by_broker,
         ),
         order_of_trade=order_of_trade,
         links=journal.links(conn),

@@ -63,12 +63,15 @@ from datetime import datetime
 from typing import Any
 
 from optjournal.money import Money
+from optjournal.notes import split_notes
 
 __all__ = [
+    "BROKER_CODES",
     "Campaign",
     "WINDOW_S",
     "cluster_orders",
     "link",
+    "placed_by_broker",
     "position_count",
 ]
 
@@ -79,6 +82,19 @@ __all__ = [
 #: `strategies.py` because this is now the module that owns the union rule, and
 #: the constant is the whole risk surface of it.
 WINDOW_S = 90
+
+#: IBKR note codes on fills the BROKER generated rather than the trader placed:
+#: expiry (`Ep`), assignment (`A`), exercise (`Ex`, `AEx`, `MEx`, `GEA`), a
+#: margin liquidation (`L`) and a dividend reinvestment (`R`). IBKR stamps them
+#: with its own processing time, every expiration at 16:20:00, so the window
+#: would read unrelated positions expiring together as one placement.
+BROKER_CODES = frozenset({"Ep", "A", "Ex", "AEx", "MEx", "GEA", "L", "R"})
+
+
+def placed_by_broker(notes: Any) -> bool:
+    """Whether a fill's note codes say IBKR generated it. Whole codes only, so
+    `AFx` (an auto-conversion) is not read as `A` (an assignment)."""
+    return not BROKER_CODES.isdisjoint(split_notes(notes))
 
 
 def _dt(value: Any) -> datetime | None:
@@ -178,6 +194,8 @@ class Campaign:
 
 def cluster_orders(
     items: Iterable[tuple[str, Any, Any]],
+    *,
+    standalone: Iterable[str] = (),
 ) -> list[tuple[str, ...]]:
     """Order ids grouped into the decisions they were placed as.
 
@@ -187,11 +205,17 @@ def cluster_orders(
     spanning several) or no parseable time is never merged, because the
     heuristic only trusts itself where it can see both.
 
+    `standalone` names orders that are never merged either: the ones IBKR
+    generated (`placed_by_broker`). The window infers a shared placement from a
+    shared time, and nobody placed an expiration, so two positions expiring on
+    the same afternoon share IBKR's timestamp and nothing else.
+
     Returned as tuples of ids in fill order, so a caller can map back to
     whatever it holds those ids against.
     """
+    alone = {str(oid) for oid in standalone}
     rows = [
-        (str(oid), _dt(at), str(under) if under else None)
+        (str(oid), _dt(at), str(under) if under and str(oid) not in alone else None)
         for oid, at, under in items
     ]
     rows.sort(key=lambda r: (r[2] or f"￿{r[0]}", str(r[1] or ""), r[0]))
