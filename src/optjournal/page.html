@@ -1436,7 +1436,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local rails sessions sigma
  * @local body others pair pick said m r err Date
  * @local WHIST bars hb cur wf3
- * @local CSS document box fk node
+ * @local CSS document box fk node back typed
  */
 
 const $=s=>document.querySelector(s);
@@ -6884,15 +6884,28 @@ function bindMarketFetch(){
  * bars, no vol and no options as though those were measured and empty. */
 function bindWatchlist(){
   /* The search box's `+` watches what was typed: the field is the one place a
-     symbol is entered, IAG's shape. The search text is cleared on success. */
+     symbol is entered, IAG's shape.
+     On success the box AND the filter are cleared, together and before the
+     reload: `preserveInputs` used to put the typed symbol back over the empty
+     render, so the box kept the text while the filter it names was off. On a
+     refusal (`BRK B`) both come back and the box is live again, so one character
+     can be corrected; it used to stay disabled for good. Focus stays in the box
+     either way, ready for the next symbol. */
   const wf=$('#waddf');
   if(wf) wf.onsubmit=async ev=>{
     ev.preventDefault();
-    const input=$('#wsearch'), symbol=(input.value||'').trim();
+    const input=$('#wsearch'), typed=input.value||'', symbol=typed.trim();
     if(!symbol) return;
-    input.disabled=true;
-    S.wsearch='';
-    await watchWrite({symbol:symbol,action:'add'});
+    input.disabled=true; input.value=''; S.wsearch='';
+    const added=await watchWrite({symbol:symbol,action:'add'});
+    if(!added){
+      S.wsearch=typed;
+      const back=$('#wsearch'); if(back) back.value=typed;
+      draw();
+    }
+    const box=$('#wsearch');
+    if(box){box.disabled=false; box.focus();
+      box.setSelectionRange(box.value.length,box.value.length);}
   };
   document.querySelectorAll('[data-wrm]').forEach(el=>
     el.onclick=async()=>{
@@ -6974,14 +6987,14 @@ async function save(body){
    and a remove announce themselves by what they did to the LIST, while saving a
    field changed one row that is already on screen -- and "Watching DELL." after
    editing a note describes something that did not happen. Pre-escaped by the
-   caller, since it carries markup. */
+   caller, since it carries markup. Answers whether the server took the write. */
 async function watchWrite(body,said){
   let added=false;
   try{
     const r=await fetch('/api/watchlist',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const wres=await r.json();
-    if(!wres.ok){note(esc(wres.message||'watchlist write failed'),'bad');return;}
+    if(!wres.ok){note(esc(wres.message||'watchlist write failed'),'bad');return false;}
     if(wres.action==='remove'&&!wres.changed)
       note(`${esc(wres.symbol)} was not on the watchlist.`,'warn');
     else if(wres.fetch_error)
@@ -6990,11 +7003,12 @@ async function watchWrite(body,said){
     else note(said||(wres.action==='add'?`Watching <b>${esc(wres.symbol)}</b>.`
       :`Stopped watching <b>${esc(wres.symbol)}</b>.`),'ok');
     added=wres.action==='add'&&!said;
-  }catch(e){note('Watchlist write failed: '+esc(e),'bad');return;}
+  }catch(e){note('Watchlist write failed: '+esc(e),'bad');return false;}
   await load();
   /* A new watch gets its quote, name and IV rank at once as well, since the
      server has just stored its history: the row is complete on arrival. */
   if(added||S.quotesAt) await loadQuotes(false);
+  return true;
 }
 
 /* One HTTP request PER SYMBOL, so this is never automatic beyond the first view.

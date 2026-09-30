@@ -5316,6 +5316,59 @@ def test_the_attribution_sentence_survives_the_rewrite():
     assert "earnings dates are ones you recorded" in body
 
 
+def _submit_watch_search(typed: str, accepted: bool) -> dict:
+    """Submit the Watchlist search box through the page's own `bindWatchlist`.
+
+    `watchWrite` is the stand-in: it answers `accepted`, and records what the box
+    and the filter held at the moment of the write, which is what the reload a
+    success triggers renders from.
+    """
+    return _node_run([
+        "const S={wsearch:" + json.dumps(typed) + "}; let seen=null, draws=0;",
+        "const input={value:" + json.dumps(typed) + ",disabled:false,focused:false,",
+        "  focus(){this.focused=true;},setSelectionRange(a){this.caret=a;}};",
+        "const form={};",
+        "const $=sel=>sel==='#waddf'?form:sel==='#wsearch'?input:null;",
+        "const document={querySelectorAll:()=>[]};",
+        "function draw(){draws++;}",
+        "async function loadQuotes(){}",
+        "async function watchWrite(body){seen={body,value:input.value,",
+        "  filter:S.wsearch,disabled:input.disabled};" + (
+            " await 0; return true;}" if accepted else " return false;}"),
+        *_page_fns("bindWatchlist"),
+        "bindWatchlist();",
+        "await form.onsubmit({preventDefault(){}});",
+        "console.log(JSON.stringify({seen,value:input.value,disabled:input.disabled,",
+        "  focused:input.focused,caret:input.caret,filter:S.wsearch,draws}));",
+    ])
+
+
+def test_a_refused_watchlist_symbol_can_be_corrected():
+    """M30: the server refuses `BRK B`, and the search box stayed disabled with no
+    way to fix the one character. It is live again, holds what was typed, keeps
+    focus with the caret at the end, and the filter is the text in the box.
+    """
+    out = _submit_watch_search("BRK B", accepted=False)
+    assert out["seen"]["body"] == {"symbol": "BRK B", "action": "add"}
+    assert (out["disabled"], out["value"], out["focused"], out["filter"]) == (
+        False, "BRK B", True, "BRK B")
+    assert out["caret"] == len("BRK B"), "a correction would be typed at the start"
+
+
+def test_a_watched_symbol_clears_the_search_box_and_its_filter_together():
+    """L40: after a successful add the box kept the typed text while the filter it
+    names was off, because `preserveInputs` put the text back over the empty
+    render. Both are empty BEFORE the write's reload now, and the box is ready
+    for the next symbol.
+    """
+    out = _submit_watch_search(" spy ", accepted=True)
+    assert out["seen"]["body"] == {"symbol": "spy", "action": "add"}
+    assert (out["seen"]["value"], out["seen"]["filter"]) == ("", ""), (
+        "the reload after an add renders from a box and a filter still holding "
+        "the symbol")
+    assert (out["disabled"], out["focused"], out["value"]) == (False, True, "")
+
+
 def test_the_typed_field_is_preserved_across_a_render_and_not_across_subjects():
     """`loadQuotes()` calls `draw()` on its own, so a redraw lands mid-typing.
 
