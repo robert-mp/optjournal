@@ -8814,7 +8814,8 @@ def test_a_browser_without_container_queries_still_shows_a_fitting_figure():
         r"@supportsnot\(\(container-type:inline-size\)andselector\(:has\(\*\)\)\)\{(.*?)\}\}",
         css, re.S)
     assert fallback, "no fallback for a browser without container queries or :has()"
-    assert re.search(r"\.day\.dpln\{font-size:min\(var\(--t1\),[\d.]+vw\);min-height:100%", fallback.group(1)), (
+    sized = r"\.day\.dpln\{font-size:min\(var\(--t1\),[\d.]+vw\);min-height:100%"
+    assert re.search(sized, fallback.group(1)), (
         "the fallback does not size the compact form to a phone's cell")
 
 
