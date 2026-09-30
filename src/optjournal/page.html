@@ -6229,7 +6229,12 @@ function applyHash(){
      the old tab made syncHash rewrite it into the entry just navigated to. */
   S.tab=(tab&&HASH_TABS().includes(tab))?tab:'dashboard';
   S.type=hs.get('type')||null;
-  S.month=hs.get('month')||null;
+  /* `current` is the REQUEST's spelling of the default month (stateQuery), so a
+     link can carry it; on the page the default is null. Kept as a month it reached
+     load()'s out-of-range heal, which found it in no month_range and healed it to
+     all time, over September's figures. */
+  const mo=hs.get('month');
+  S.month=mo&&mo!=='current'?mo:null;
   S.ccy=(hs.get('ccy')||'').toUpperCase()||null;
   /* The drill-down selection was the one piece of view state the URL did not
      carry, so a link to "that day" was unshareable and a reload silently

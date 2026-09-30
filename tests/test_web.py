@@ -3337,6 +3337,85 @@ def test_a_hash_change_the_server_would_answer_differently_refetches():
         "load", "load", "load", "load", "draw", "draw", "draw"]
 
 
+def _hash_harness(script: list[str]) -> Any:
+    """The page's real `applyHash`, `stateQuery`, `load`, `syncHash` and hashchange
+    handler against a stand-in server with build_state's month rule.
+
+    The server's range is 2026-09 (current) and 2026-08, a month outside it is
+    answered with all-time figures, and every month holds fills on its 3rd. `draw`
+    is a stand-in that runs draw()'s own calday heal and whatever draw() calls after
+    it before `syncHash` (see `_draw_heals`), then records what the page shows:
+    `shown` (the figures' month), `hash` and `asks` (the next query). `fresh(hash)`
+    loads a hash as a new page would; `typed(hash)` changes it as the address bar
+    does and waits for any read the handler starts.
+    """
+    js = _code_only(_js())
+    handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
+    assert handler, "the hashchange handler moved"
+    consts = [_page_const(name) for name in
+              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS",
+               "SCOPE_KEYS")]
+    return _node_run([
+        f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
+        "const location={hash:'',pathname:'/'}, window={};",
+        "const history={replaceState:(a,b,u)=>{location.hash=u.slice(1);},",
+        "  pushState:(a,b,u)=>{location.hash=u.slice(1);}};",
+        "let S={}, LOADED={}, READ_NOTE=null, drawn=null;",
+        "const $=()=>({innerHTML:'',className:''});",
+        "const RANGE=['2026-09','2026-08'];",
+        # The server's month rule, as build_state applies it.
+        "async function fetch(url){",
+        "  const m=new URLSearchParams(url.split('?')[1]||'').get('month');",
+        "  const month=m==='current'?RANGE[0]:m;",
+        "  const selected=RANGE.includes(month)?month:null;",
+        "  const days=(selected?[selected]:RANGE).map(mo=>({day:mo+'-03'}));",
+        "  return {ok:true,json:async()=>({month_range:RANGE,months:RANGE,",
+        "    selected_month:selected,trade_type:'all',",
+        "    stats:{month:selected||'ALL',days}})};",
+        "}",
+        "function note(){} function staleServerCheck(){}",
+        f"function draw(){{{_draw_heals()} syncHash();drawn={{shown:S.state.stats.month,",
+        "  hash:location.hash,asks:stateQuery()};}",
+        *consts, *_page_fns("applyHash", "stateQuery", "syncHash", "load"),
+        *_page_fns("pinDayMonth"),
+        handler.group(0),
+        "const flush=()=>new Promise(r=>setTimeout(r,0));",
+        "async function fresh(hash){S={};location.hash=hash;applyHash();await load();",
+        "  return drawn;}",
+        "async function typed(hash){location.hash=hash;window.onhashchange();",
+        "  await flush();await flush();return drawn;}",
+        *script,
+    ])
+
+
+def _draw_heals() -> str:
+    """draw()'s own calday heal and every statement after it up to the replay heal:
+    the part of a redraw that decides which day and month the URL is written with.
+    """
+    draw = _code_only(_fn("draw"))
+    start = draw.index("if(S.calday&&S.state&&")
+    return draw[start:draw.index("if(S.replay&&S.state&&", start)]
+
+
+def test_the_wire_spelling_of_the_current_month_is_the_current_month():
+    """Follow-up review, finding 3. `current` is how the page asks the server for
+    the default month, so `#month=current` is a real link (the request's own
+    spelling). applyHash kept it as a month, the server resolved it to September,
+    and the out-of-range heal then found `current` in no month_range and healed it
+    to all: the header said "All time" over September's figures and card titles,
+    the URL became `#month=all`, and the next control or a reload showed all time.
+    It is read as the default now, on a fresh load and on a typed hash alike.
+    """
+    out = _hash_harness([
+        "const out={fresh:await fresh('#month=current')};",
+        "await fresh('#month=2026-08'); out.typed=await typed('#month=current');",
+        "console.log(JSON.stringify(out));",
+    ])
+    for path in ("fresh", "typed"):
+        assert out[path] == {"shown": "2026-09", "hash": "", "asks": "month=current"}, (
+            f"{path}: #month=current did not land on the current month: {out[path]}")
+
+
 def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_paths():
     """`#month=1999-01`, loaded fresh or typed into the address bar, is answered
     with all-time figures: `build_state` heals a month outside the account's life to
@@ -3352,41 +3431,11 @@ def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_path
     and hashchange handler, against a stand-in server that answers the way
     `build_state` does; only `fetch`, `draw` and `history` are stand-ins.
     """
-    js = _code_only(_js())
-    handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
-    assert handler, "the hashchange handler moved"
-    consts = [_page_const(name) for name in
-              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS",
-               "SCOPE_KEYS")]
-    out = _node_run([
-        f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
-        "const location={hash:'',pathname:'/'}, window={};",
-        "const history={replaceState:(a,b,u)=>{location.hash=u.slice(1);},",
-        "  pushState:(a,b,u)=>{location.hash=u.slice(1);}};",
-        "let S={}, LOADED={}, READ_NOTE=null, drawn=null;",
-        "const $=()=>({innerHTML:'',className:''});",
-        "const RANGE=['2026-09','2026-08'];",
-        # The server's month rule, as build_state applies it.
-        "async function fetch(url){",
-        "  const m=new URLSearchParams(url.split('?')[1]||'').get('month');",
-        "  const month=m==='current'?RANGE[0]:m;",
-        "  const selected=RANGE.includes(month)?month:null;",
-        "  return {ok:true,json:async()=>({month_range:RANGE,months:RANGE,",
-        "    selected_month:selected,trade_type:'all',stats:{month:selected||'ALL'}})};",
-        "}",
-        "function note(){} function staleServerCheck(){}",
-        "function draw(){syncHash();drawn={shown:S.state.stats.month,",
-        "  hash:location.hash,asks:stateQuery()};}",
-        *consts, *_page_fns("applyHash", "stateQuery", "syncHash", "load"),
-        handler.group(0),
-        "const flush=()=>new Promise(r=>setTimeout(r,0));",
-        "async function fresh(hash){S={};location.hash=hash;applyHash();await load();",
-        "  return drawn;}",
+    out = _hash_harness([
         "const out={};",
         "out.fresh=await fresh('#month=1999-01');",
         "await fresh('#month=2026-08');",
-        "location.hash='#month=1999-01'; window.onhashchange(); await flush(); await flush();",
-        "out.typed=drawn;",
+        "out.typed=await typed('#month=1999-01');",
         "out.reloaded=await fresh(out.fresh.hash);",
         "console.log(JSON.stringify(out));",
     ])
