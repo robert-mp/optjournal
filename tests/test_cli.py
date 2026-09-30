@@ -524,6 +524,17 @@ def test_update_has_no_json_output_and_says_so(tmp_path, monkeypatch, capsys):
     assert code == cli.EXIT_CONFIG and "--json" in text
 
 
+def test_friction_refuses_a_month_that_is_not_one(tmp_path, capsys):
+    """L24: `--month garbage` matched nothing and exited 3, "no data"."""
+    with pytest.raises(SystemExit) as refused:
+        main(["friction", "--month", "garbage", "--db", str(tmp_path / "j.db")])
+    assert refused.value.code == cli.EXIT_CONFIG
+    assert "--month" in capsys.readouterr().err
+    for period in ("2026-08", "2026"):
+        assert main(["friction", "--month", period, "--db", str(tmp_path / "j.db")]) \
+            == cli.EXIT_NO_DATA
+
+
 # --- watch: the two fields the reader types -----------------------------------
 #
 # `optjournal watch` is the only writer of user-typed facts in the CLI, and it is

@@ -11,6 +11,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import re
 import sqlite3
 import sys
 import tempfile
@@ -447,6 +448,18 @@ def cmd_history(args) -> int:
     data = history_data(report)
     _emit(data, render_history(data), args.json)
     return EXIT_OK if report.episodes else EXIT_NO_DATA
+
+
+def _month_or_year(text: str) -> str:
+    """`friction --month`: `2026-08` or `2026`, refused at the parser otherwise.
+
+    The period is a prefix match on stored ISO dates, so anything else matched
+    nothing and read as "no data" (exit 3) instead of a typo.
+    """
+    if re.fullmatch(r"\d{4}(-(0[1-9]|1[0-2]))?", text):
+        return text
+    raise argparse.ArgumentTypeError(
+        f"{text!r} is not a month like 2026-08 or a year like 2026")
 
 
 def cmd_friction(args) -> int:
@@ -1405,7 +1418,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="what the broker cost, from the journal (any scope)")
     p.add_argument("--assets", nargs="*", metavar="CAT",
                    help="asset categories to include (default: every category)")
-    p.add_argument("--month", metavar="YYYY-MM",
+    p.add_argument("--month", metavar="YYYY-MM", type=_month_or_year,
                    help="narrow to one month or year (default: the whole journal)")
     p.set_defaults(func=cmd_friction)
 
