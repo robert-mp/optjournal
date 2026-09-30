@@ -257,13 +257,19 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
 
     Returns the symbols whose fetch FAILED, so the reply can say so, and how
     many were asked, so the page knows whether its payload is now stale; a symbol
-    with no earnings (a fund) is an answer and is stored as none. Every asked
-    symbol is stamped, success or not, so a dead endpoint costs one request per
-    symbol per day rather than one per refresh.
+    with no earnings (a fund) is an answer and is stored as none, while a failed
+    fetch keeps the stored date. Every asked symbol is stamped, success or not,
+    so a dead endpoint costs one request per symbol per day rather than one per
+    refresh.
+
+    EVERY FETCH FIRST, THEN EVERY WRITE in one short transaction. A fetch can
+    take up to `earnings._TIMEOUT_S`, and writing after each one held the
+    journal's write lock across the next, so a watchlist save made meanwhile
+    waited out the busy timeout and got a 503.
     """
     now = datetime.now(UTC)
-    failed: list[str] = []
-    asked = 0
+    stamp = now.isoformat(timespec="seconds")
+    due: list[str] = []
     for symbol in symbols:
         row = conn.execute(
             "SELECT earnings_checked_at FROM watchlist WHERE symbol = ?", (symbol,)
@@ -278,25 +284,31 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
                 age = EARNINGS_MAX_AGE_S
             if age < EARNINGS_MAX_AGE_S:
                 continue
-        asked += 1
+        due.append(symbol)
+    failed: list[str] = []
+    found: dict[str, earnings_mod.Earnings | None] = {}
+    for symbol in due:
         try:
-            found = earnings_mod.fetch_earnings(symbol)
+            found[symbol] = earnings_mod.fetch_earnings(symbol)
         except earnings_mod.EarningsFetchError as exc:
             log.debug("earnings %s failed: %s", symbol, exc)
             failed.append(symbol)
+    for symbol in due:
+        if symbol not in found:
             conn.execute("UPDATE watchlist SET earnings_checked_at = ? WHERE symbol = ?",
-                         (now.isoformat(timespec="seconds"), symbol))
+                         (stamp, symbol))
             continue
+        answer = found[symbol]
         conn.execute(
             "UPDATE watchlist SET earnings_next = ?, earnings_confirmed = ?,"
             " earnings_timing = ?, earnings_checked_at = ? WHERE symbol = ?",
-            (found.day if found else None,
-             (1 if found.confirmed else 0) if found else None,
-             found.timing if found else None,
-             now.isoformat(timespec="seconds"), symbol),
+            (answer.day if answer else None,
+             (1 if answer.confirmed else 0) if answer else None,
+             answer.timing if answer else None,
+             stamp, symbol),
         )
     conn.commit()
-    return failed, asked
+    return failed, len(due)
 
 
 def _inverted_alert(conn: sqlite3.Connection, symbol: str,

@@ -7555,6 +7555,45 @@ def test_a_nasdaq_error_reply_keeps_the_stored_earnings_date(tmp_path, monkeypat
     assert tuple(row) == ("2026-10-28", 1, "after close")
 
 
+def test_the_earnings_refresh_holds_no_write_lock_while_it_asks_nasdaq(tmp_path, monkeypatch):
+    """L25: each fetch can take up to 15 s, and the refresh used to UPDATE after
+    the first symbol and commit after the last, so every later fetch ran inside
+    an open write transaction and a watchlist save meanwhile got 503. Probed
+    from inside the fetch: another connection must be able to start a write."""
+    from optjournal import earnings  # noqa: PLC0415 - local to this test
+
+    db = tmp_path / "j.db"
+    with open_journal(db) as conn:
+        for symbol in ("AAA", "BBB", "CCC"):
+            conn.execute("INSERT INTO watchlist (symbol, added_at)"
+                         " VALUES (?, '2026-01-01')", (symbol,))
+        conn.commit()
+    blocked: list[str] = []
+
+    def fetch(symbol, **_):
+        probe = sqlite3.connect(db, timeout=0)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+            probe.rollback()
+        except sqlite3.OperationalError:
+            blocked.append(symbol)
+        finally:
+            probe.close()
+        if symbol == "BBB":
+            raise earnings.EarningsFetchError("BBB earnings: URLError")
+        return earnings.Earnings(day="2026-10-28", confirmed=True, timing=None)
+
+    monkeypatch.setattr(earnings, "fetch_earnings", fetch)
+    with open_journal(db) as conn:
+        failed, asked = web._refresh_earnings(conn, ["AAA", "BBB", "CCC"])
+        rows = {r["symbol"]: (r["earnings_next"], bool(r["earnings_checked_at"]))
+                for r in conn.execute("SELECT * FROM watchlist")}
+    assert blocked == [], f"a fetch ran while the journal was write-locked: {blocked}"
+    assert (failed, asked) == (["BBB"], 3)
+    assert rows == {"AAA": ("2026-10-28", True), "BBB": (None, True),
+                    "CCC": ("2026-10-28", True)}
+
+
 def test_each_job_row_says_how_many_requests_one_run_spends():
     """The confirm dialogue reads this, so it must not say "one" for five."""
     from optjournal.web import _with_request_counts
