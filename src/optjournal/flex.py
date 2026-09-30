@@ -28,6 +28,7 @@ import json
 import logging
 import re
 import threading
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -222,6 +223,11 @@ FETCH_SOCKET_TIMEOUT_S = 60
 #: job while the fetch lock was held, with nothing in the ledger to say why.
 KEYRING_READ_TIMEOUT_S = 30.0
 
+#: Held from the start of a keyring read until the OS call returns, which for a
+#: keychain waiting on an unlock is never. ONE READ IN FLIGHT per process, for
+#: every caller: the fetches and the page's token check. See `_within`.
+_KEYRING_READ = threading.Lock()
+
 #: Worst-case wall time of one fetch, from taking the lock to stamping the
 #: cooldown: the keyring read, the polling sleeps, and every request of both
 #: stages running to its socket timeout. 30 + 420 + 480 = 930s.
@@ -391,13 +397,22 @@ class FetchResult:
 
 
 def _within(timeout_s: float, work: Callable[[], str | None]) -> tuple[bool, object]:
-    """Run `work` on a daemon thread. (finished, result or the exception raised).
+    """Run the keyring read `work` on a daemon thread. (finished, result or error).
 
     The pattern of `web._keyring_call`: a DAEMON thread, so a call still blocked
     in the OS cannot keep the process alive, and a late answer lands in a list
     nobody reads. Python cannot interrupt a thread blocked in a syscall, so a
     deadline has to be a wait on another thread rather than a timeout on the call.
+
+    ONE AT A TIME, the other half of that pattern: `_KEYRING_READ` is held by the
+    thread until its call returns, and a read that finds it held waits for it
+    inside the same deadline and gives up unfinished. Without it, a keychain that
+    never answers kept each timed-out thread and every later read started another:
+    one per fetch attempt and one per token check, for the life of the process.
     """
+    deadline = time.monotonic() + timeout_s
+    if not _KEYRING_READ.acquire(timeout=timeout_s):
+        return False, None
     outcome: list[object] = []
 
     def run() -> None:
@@ -405,10 +420,12 @@ def _within(timeout_s: float, work: Callable[[], str | None]) -> tuple[bool, obj
             outcome.append(work())
         except Exception as exc:  # noqa: BLE001 - handed back to the caller
             outcome.append(exc)
+        finally:
+            _KEYRING_READ.release()
 
     worker = threading.Thread(target=run, name="keyring-read", daemon=True)
     worker.start()
-    worker.join(timeout_s)
+    worker.join(max(0.0, deadline - time.monotonic()))
     return (True, outcome[0]) if outcome else (False, None)
 
 
