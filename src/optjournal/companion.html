@@ -20,9 +20,10 @@
 
   IT FOLLOWS WHAT IS TYPED. The opener posts a message on every render (see
   `companionPost` in page.html), so editing a level on the tab moves the figures
-  here without reopening anything. The hash is only the opening state, which is
-  also what makes the window survivable on its own: reload it, or bookmark it,
-  and it still reads.
+  here without reopening anything. Every change is written back into this
+  window's own hash, which is what makes it survivable on its own: reload it, or
+  bookmark it, and it reads the levels it last showed rather than the ones it
+  was opened with.
 
   Theme comes in with the rest, because this document renders outside the page
   where its `data-theme` attribute cannot reach -- the same reason `mark.svg`
@@ -49,7 +50,21 @@ function take(next){
   ['spx','call','put','theme'].forEach(key=>{
     if(next[key]!=null) Z[key]=String(next[key]);
   });
+  syncHash();
   render();
+}
+
+/* The levels on screen, in this window's own URL. Before this the hash was only
+   the opening state, so a reload after the tab had moved a level brought back
+   the old one. `replaceState`, the page's rule: it is not a navigation, and it
+   fires no hashchange to loop back through `fromHash`. The default theme stays
+   out, as it does from the URL the page opens this with. */
+function syncHash(){
+  const hs=new URLSearchParams();
+  ['spx','call','put'].forEach(key=>{if(Z[key]) hs.set(key,Z[key]);});
+  if(Z.theme&&Z.theme!=='leather') hs.set('theme',Z.theme);
+  const next=hs.toString()?'#'+hs:'';
+  if(next!==(location.hash||'')) history.replaceState(null,'',location.pathname+next);
 }
 
 /* One pad. Empty is a dash in every cell rather than a hidden block: a window
