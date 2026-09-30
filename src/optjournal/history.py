@@ -142,6 +142,11 @@ class Episode:
 
     opened_at: str | None = None
     closed_at: str | None = None
+    #: IBKR's trade date of the last closing fill: the day its statement books
+    #: the realised P&L on. Usually `closed_at`'s day, but `closed_at` is the ET
+    #: stamp (see `clock.epoch_et`), so a Korean sale at 20:03 ET on 31 August
+    #: closed on 1 September. The per-fill categories date their money by it.
+    closed_on: str | None = None
 
     open_fills: int = 0
     close_fills: int = 0
@@ -364,6 +369,7 @@ def _absorb(ep: Episode, row: Any) -> None:
         ep.close_fills += 1
         ep.closed_qty += qty
         ep.closed_at = row["date_time"] or row["trade_date"]
+        ep.closed_on = row["trade_date"] or row["date_time"]
     else:
         ep.open_fills += 1
         ep.opened_qty += qty

@@ -493,3 +493,32 @@ def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):
     s = month_stats(conn, "2026-09", scope=odte_scope(conn))
     assert (s.decided_campaigns, s.losses, s.inflight_realized.base) == (1, 1, 0.0)
     assert s.avg_pnl.base == -302.0
+
+
+def test_a_stock_outcome_lands_in_the_month_its_pnl_does(conn):
+    """`pnl/s_two_clocks.py`: a Korean stock sold at 20:03 ET on 31 August, which
+    is 1 September in Seoul, so IBKR's trade date is the 1st.
+
+    Stock P&L follows IBKR's per-fill realisation on the trade date, the month
+    the statement books it in, while the outcome followed the fill's ET stamp: the
+    win landed in August with no P&L and the P&L in September with no win. The
+    outcome now takes the closing fill's trade date, the same clock as its money.
+    """
+    for tid, at, day, oc, qty, pnl in (
+        ("k1", "2026-08-10 21:00:00", "2026-08-11", "O", 10, 0.0),
+        ("k2", "2026-08-31 20:03:00", "2026-09-01", "C", -10, 11.88),
+    ):
+        conn.execute(
+            "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
+            " account_id, trade_date, date_time, asset_category, symbol, conid,"
+            " underlying_symbol, open_close, quantity, trade_price, currency,"
+            " fx_rate_to_base, fifo_pnl_realized, fifo_pnl_realized_base, raw,"
+            " source_file, first_seen_at) VALUES (?,?,?,?,'U1',?,?,'STK',"
+            " '322310.KQ','K1','322310.KQ',?,?,10000,'KRW',0.0006,?,?,'{}','t.xml','now')",
+            (tid, tid, tid, tid, day, at, oc, qty, pnl / 0.0006, pnl),
+        )
+    august, september = (month_stats(conn, m, asset_category="STK")
+                         for m in ("2026-08", "2026-09"))
+    assert (august.net_pnl.base, august.decided_campaigns, august.wins) == (0.0, 0, 0)
+    assert (september.net_pnl.base, september.decided_campaigns,
+            september.wins, september.closed_episodes) == (11.88, 1, 1, 1)

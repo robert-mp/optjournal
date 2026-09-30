@@ -1106,9 +1106,19 @@ def month_stats(
     # opened in December and closed in January is a January outcome, and so a
     # 2026 one. Attributing by entry instead would make the annual rows stop
     # summing to the monthly ones.
+    #
+    # By the SAME clock as the category's money, so an outcome lands in the month
+    # its P&L does. Options money is the episode's, on its ET close stamp. The
+    # per-fill categories book money on IBKR's trade date, so their outcomes take
+    # the closing fill's trade date: a Korean sale at 20:03 ET on 31 August is a
+    # 1 September trade, and on the ET stamp its win landed in August with its
+    # P&L in September.
+    def close_of(e: Any) -> str | None:
+        return e.closed_at if episode_pnl else (e.closed_on or e.closed_at)
+
     closed = [
         e for e in report.closed
-        if _in_period(e.closed_at, period) and scope.has_episode(e)
+        if _in_period(close_of(e), period) and scope.has_episode(e)
     ]
     stats.closed_episodes = len(closed)
     stats.open_episodes = sum(1 for e in report.open if scope.has_episode(e))
@@ -1185,7 +1195,7 @@ def month_stats(
                                     for u in units)
         if scoped
         and all(e.is_closed for e in unit)
-        and _in_period(max(str(e.closed_at or "") for e in unit), period)
+        and _in_period(max(str(close_of(e) or "") for e in unit), period)
     ]
     stats.decided_campaigns = len(decided)
     won = [c for c in decided if _campaign_pnl(c).base > 0]
@@ -1231,7 +1241,7 @@ def month_stats(
         for unit in units
         if not all(e.is_closed for e in unit)
         for e in unit
-        if e.is_closed and _in_period(e.closed_at, period) and scope.has_episode(e)
+        if e.is_closed and _in_period(close_of(e), period) and scope.has_episode(e)
     )
     stats.net_liq_base, stats.net_liq_date = _net_liq_for(conn, period)
 

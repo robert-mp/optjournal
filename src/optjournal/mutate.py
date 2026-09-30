@@ -175,7 +175,7 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="episode-attrib",
         module="stats.py",
-        find="        if _in_period(e.closed_at, period) and scope.has_episode(e)",
+        find="        if _in_period(close_of(e), period) and scope.has_episode(e)",
         replace="        if _in_period(e.opened_at, period) and scope.has_episode(e)",
         breaks="a round trip would count in the month it opened, not the month it closed",
     ),
