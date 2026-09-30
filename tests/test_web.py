@@ -6578,8 +6578,8 @@ def test_an_over_long_entry_is_refused_rather_than_read_as_empty(populated):
 def test_a_refused_journal_entry_says_nothing_was_saved_once(populated):
     """L46: the page appended "Nothing was saved, and your text is still on
     screen." to the server's reason, and the size refusal's reason already said
-    "Nothing was saved and nothing was changed -- …", so the banner said it twice
-    and carried a double hyphen. The real server's 413 reply is pressed through
+    "Nothing was saved and nothing was changed", followed by a double hyphen, so
+    the banner said it twice. The real server's 413 reply is pressed through
     the page's own `bindJournal` here, and so is a refusal that does not say it.
     """
     anchor, _account = _an_anchor(populated)

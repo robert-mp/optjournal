@@ -205,8 +205,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} generated_at
  * @property {boolean} dev -- developer-only surfaces on (settings.dev). Off
  *   unless OPTJOURNAL_DEV or the stored flag says so; the web API cannot set it
- * @property {boolean} [demo] -- `serve --demo`: the synthetic journal, which the
- *   server never lets reach IBKR, so Sync and the request-spending jobs are off
+ * @property {boolean} [demo] set under `serve --demo`: the synthetic journal, which
+ *   the server never lets reach IBKR, so Sync and the request-spending jobs are off
  * @property {string} asset_category -- the journal's home category, OPT
  * @property {Object} asset_counts -- fills per category; derives offerable Trade Types
  * @property {string} db
@@ -5357,8 +5357,8 @@ const ZTIER=['the session is about this','moves the open, or the range','backgro
 function odte(){
   const od=S.state.odte;
   if(!od) return `<div class="card"><div class="empty">no data</div></div>`;
-  /* A null context is a real state -- no `bars` fetch has landed the index closes
-     yet -- and it says how to fix it. It used to say so INSTEAD of the calculator,
+  /* A null context is a real state (no `bars` fetch has landed the index closes
+     yet), and it says how to fix it. It used to say so INSTEAD of the calculator,
      which then had no fields and ignored a `#spx=…&vix=…` link; both readings can
      be typed, so the tab is drawn with empty fields and the note in the status
      line, and `oc` is an empty context rather than a branch per read. */
@@ -5965,7 +5965,7 @@ async function awaitRestart(){
 }
 
 /* One press of a banner button: POST, then wait for the restart. EVERY way this
-   can end short of a reload hands the button back with its own label -- a refusal,
+   can end short of a reload hands the button back with its own label: a refusal,
    a network error, a reply that is not JSON, or a server that never came back.
    Only the refusal did before, so any other failure left "Updating…" disabled
    with nothing to press. `textContent`, so the label is not escaped a second time
@@ -6303,7 +6303,7 @@ function draw(push){
     }
   }
   /* A running playback drives element ids that this render is about to
-     replace, so it stops here -- and resumes on the new panel below when that
+     replace, so it stops here, and resumes on the new panel below when that
      panel is the same replay. A theme toggle used to end it. */
   const replaying=RTIMER!==null?S.replay:null;
   replayStop();
@@ -6484,8 +6484,8 @@ function draw(push){
   };
   const qidsave=$('#qidsave');
   if(qidsave) qidsave.onclick=()=>saveQueryId('query_id','qid');
-  /* An EMPTY value is a real choice for the confirms id -- it turns the intraday
-     poll off -- so this sends the blank rather than refusing it the way the token
+  /* An EMPTY value is a real choice for the confirms id (it turns the intraday
+     poll off), so this sends the blank rather than refusing it the way the token
      field does. */
   const cqidsave=$('#cqidsave');
   if(cqidsave) cqidsave.onclick=()=>saveQueryId('confirm_query_id','cqid');
@@ -6708,8 +6708,8 @@ function restoreInputs(keep){
  * The key is the nearest element, from the focused one upward, that names itself
  * in a way a re-render keeps: an id, an aria-label, or its data attributes (the
  * page's behaviour hooks, `[data-cost="STK"]`). An aria-label outranks the data
- * attributes because a data VALUE can move under a control -- the month stepper's
- * `data-month` is the month it leads to -- while "Previous period" stays itself.
+ * attributes because a data VALUE can move under a control (the month stepper's
+ * `data-month` is the month it leads to), while "Previous period" stays itself.
  * Counted within the region draw() rewrote, so a rail tab and a sub-view button
  * that share `data-tab="annual"` are not confused; `inner` finds a keyless button
  * inside a keyed row (the watchlist's symbol button in `tr[data-wsel]`). */
