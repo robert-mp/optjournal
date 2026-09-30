@@ -522,3 +522,18 @@ def test_a_stock_outcome_lands_in_the_month_its_pnl_does(conn):
     assert (august.net_pnl.base, august.decided_campaigns, august.wins) == (0.0, 0, 0)
     assert (september.net_pnl.base, september.decided_campaigns,
             september.wins, september.closed_episodes) == (11.88, 1, 1, 1)
+
+
+def test_net_liquidation_is_every_accounts_newest_summary_summed(conn):
+    """Two accounts' NAV, one a day behind. The panel read one row, so the gain
+    as a share of net liquidation was measured against one account's value."""
+    for day, account, total in (("20260923", "U2", 220.0), ("20260924", "U1", 510.0),
+                                ("20260922", "U1", 400.0)):
+        conn.execute(
+            "INSERT INTO equity_summaries (report_date, account_id, currency,"
+            " cash_base, total_base, raw, source_file, ingested_at)"
+            " VALUES (?, ?, 'EUR', 0, ?, '{}', 't.xml', 'now')", (day, account, total))
+    s = month_stats(conn, None)
+    assert (s.net_liq_base, s.net_liq_date) == (730.0, "2026-09-24")
+    # A period ending before every summary has none, rather than a zero.
+    assert month_stats(conn, "2026-08").net_liq_base is None

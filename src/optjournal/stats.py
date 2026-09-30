@@ -982,19 +982,28 @@ def _net_liq_for(
     Comparing normalised day strings works because both sides are ISO-ordered;
     the period end key is the period prefix plus '\uffff', which sorts after
     every day inside it and before the next period.
+
+    Each account's newest summary, summed: the account's value is the sum of
+    its accounts' values, and one row read from a multi-account journal measured
+    the gain against one account. Per account rather than per date so an account
+    whose statements lag still counts. The date is the newest of them.
     """
     rows = conn.execute(
-        "SELECT report_date, total_base FROM equity_summaries"
+        "SELECT broker, account_id, report_date, total_base FROM equity_summaries"
         " ORDER BY report_date"
     ).fetchall()
     end_key = (period + "\uffff") if period else "\uffff"
-    best: tuple[float | None, str | None] = (None, None)
+    newest: dict[tuple[str, str], tuple[str, float]] = {}
     for row in rows:
         day = _day_of(row["report_date"])
         if day is None or day > end_key:
             continue
-        best = (row["total_base"], day)
-    return best
+        newest[(str(row["broker"]), str(row["account_id"]))] = (
+            day, row["total_base"] or 0.0)
+    if not newest:
+        return None, None
+    return (sum(total for _, total in newest.values()),
+            max(day for day, _ in newest.values()))
 
 
 def month_stats(

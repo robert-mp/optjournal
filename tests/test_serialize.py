@@ -661,6 +661,29 @@ def test_an_option_book_gone_flat_leaves_no_options_in_the_allocation(tmp_path):
         ("TSLA", 500.0, 0.0)]
 
 
+def test_allocation_sums_every_accounts_net_liquidation(tmp_path):
+    """Two accounts, each with its own NAV. Reading one row made the other
+    account's holdings a share of a total that excluded them. Each account's
+    newest summary counts, so an account whose statements lag still does."""
+    conn = connect_migrated(tmp_path / "journal.db")
+    _alloc_fixture(conn)
+    conn.execute(
+        "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
+        " underlying_symbol, asset_category, position, position_value, currency,"
+        " fx_rate_to_base, raw, source_file, ingested_at) VALUES ('20260923','9',"
+        " 'U2','MRVL','MRVL','STK',1,400.0,'USD',0.5,'{}','t.xml','now')")
+    conn.execute(
+        "INSERT INTO equity_summaries (report_date, account_id, currency,"
+        " cash_base, stock_base, options_base, total_base, raw, source_file,"
+        " ingested_at) VALUES ('20260923','U2','EUR',20,200,0,220,'{}','t.xml','now')")
+    conn.commit()
+    al = allocation_data(conn)
+    assert (al["nav"], al["cash"], al["nav_date"]) == (730, 100, "20260924")
+    by = {r["holding"]: r for r in al["rows"]}
+    assert (by["MRVL"]["stock"], by["MRVL"]["options"]) == (200.0, -20.0)
+    assert sum(r["net"] for r in al["rows"]) + al["cash"] == pytest.approx(al["nav"])
+
+
 def test_allocation_without_a_net_liquidation_figure_has_no_shares(tmp_path):
     """A share of some other total would be a different number wearing the same
     label, so without an equity summary there are none."""

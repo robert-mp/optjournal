@@ -283,11 +283,16 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
             row[key] += r["value"] or 0.0
             row["lines"] += r["n"]
     as_of = book_date(conn)
-    nav = conn.execute(
-        "SELECT total_base, cash_base, report_date FROM equity_summaries"
-        " ORDER BY report_date DESC LIMIT 1"
-    ).fetchone()
-    total = nav["total_base"] if nav else None
+    # Each account's newest NAV, summed, so a second account's holdings are a
+    # share of a total that includes them. Per account, like the holdings above,
+    # so an account whose statements lag still counts.
+    navs = conn.execute(
+        "SELECT total_base, cash_base, report_date FROM equity_summaries e"
+        " WHERE report_date = (SELECT MAX(report_date) FROM equity_summaries"
+        "  WHERE broker = e.broker AND account_id = e.account_id)"
+    ).fetchall()
+    total = sum(n["total_base"] or 0.0 for n in navs) if navs else None
+    cashes = [n["cash_base"] for n in navs if n["cash_base"] is not None]
 
     def share(value: float | None) -> float | None:
         return value / total if total and value is not None else None
@@ -298,11 +303,11 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
         row["share"] = share(row["net"])
         rows.append(row)
     rows.sort(key=lambda r: (-abs(r["net"]), r["holding"]))
-    cash = nav["cash_base"] if nav else None
+    cash = sum(cashes) if cashes else None
     return {
         "as_of": as_of,
         "nav": total,
-        "nav_date": nav["report_date"] if nav else None,
+        "nav_date": max(str(n["report_date"]) for n in navs) if navs else None,
         "cash": cash,
         "cash_share": share(cash),
         "rows": rows,
