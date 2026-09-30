@@ -20,14 +20,18 @@ string the user types, and the tuple the ingest receives.
 
 from __future__ import annotations
 
-import argparse
 import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from conftest import STATEMENTS, connect_migrated
 
 from optjournal import cli
 from optjournal.cli import _asset_filter, main
+from optjournal.db import SCHEMA_VERSION, connect
 from optjournal.ingest import ASSET_FILTER_ALL
 
 
@@ -247,88 +251,279 @@ def test_friction_prints_the_estimate_as_a_range(tmp_path, capsys):
     assert "ESTIMATE" in text, "the markup column is not labelled as estimated"
 
 
-def _run_update(monkeypatch, tmp_path, *, remote, dirty="", extra=None):
-    """Drive `cmd_update` against a scripted git, recording what it ran.
+# --- update: a friend's clone, fast-forwarded -----------------------------------
+#
+# Against REAL git: a bare "published" repository, the publisher's clone and the
+# friend's. The refusals are the point of `update`, and the ones that went wrong
+# (no upstream, a detached HEAD, a clone ahead of the remote) are states only git
+# itself describes faithfully. Each is a few commits in a temp folder.
+#
+# `uv` is the one stand-in: a script that records what it was asked to run, and
+# runs the migration snippet with this interpreter, so the schema step really
+# migrates the journal in a separate process. POSIX only, for its shebang.
 
-    Scripted rather than driven against a real clone: the refusals are the whole
-    point of this command, and provoking a diverged history and a dirty tree for
-    real costs more setup than it buys. What matters is that a refusal happens
-    BEFORE any command that writes -- which is a claim about the call order, and
-    the recorded list is what proves it.
+_POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32",
+                                 reason="the stand-in uv is a script with a shebang")
+
+
+def _git(cwd: Path, *argv: str) -> str:
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "-c", "advice.detachedHead=false", *argv],
+        cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _publish(repo: Path, text: str) -> None:
+    (repo / "README.md").write_text(text)
+    _git(repo, "commit", "-qam", text)
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+
+
+def _commit_locally(repo: Path) -> None:
+    (repo / "notes.txt").write_text("mine")
+    _git(repo, "add", "notes.txt")
+    _git(repo, "commit", "-qm", "local")
+
+
+@pytest.fixture
+def clones(tmp_path, monkeypatch):
+    """(publisher, friend): two clones of one published repository, in step.
+
+    `cli.ROOT` is the friend's, since `update` always works on the code folder.
     """
-    calls: list[tuple[str, ...]] = []
-    replies = {
-        ("remote",): (0, remote),
-        ("status", "--porcelain"): (0, dirty),
-        ("fetch", "--quiet"): (0, ""),
-        ("rev-parse", "HEAD"): (0, "aaaaaaaaa"),
-        ("rev-parse", "@{u}"): (0, "bbbbbbbbb"),
-        ("log", "--oneline", "HEAD..@{u}"): (0, "bbbbbbb feat: a thing"),
-        ("pull", "--ff-only", "--quiet"): (0, ""),
-    }
-    replies.update(extra or {})
-
-    def fake_git(*argv):
-        calls.append(argv)
-        return replies.get(argv, (0, ""))
-
-    monkeypatch.setattr(cli, "_git", fake_git)
-    args = argparse.Namespace(check=True, db=tmp_path / "absent.db")
-    return cli.cmd_update(args), calls
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "-q", "--bare", str(remote))
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    pub = tmp_path / "pub"
+    _git(tmp_path, "clone", "-q", str(remote), str(pub))
+    (pub / "README.md").write_text("v1")
+    _git(pub, "add", "README.md")
+    _git(pub, "commit", "-qm", "v1")
+    _git(pub, "push", "-q", "origin", "HEAD:main")
+    friend = tmp_path / "friend"
+    _git(tmp_path, "clone", "-q", str(remote), str(friend))
+    monkeypatch.setattr(cli, "ROOT", friend)
+    return pub, friend
 
 
-def test_update_refuses_without_a_remote_and_touches_nothing(monkeypatch, tmp_path):
-    """A clone with no remote has nothing to update from, and says so.
-
-    Checked FIRST, so the failure is one clear sentence rather than a git error
-    about `@{u}` being unresolvable -- which is the same fact spelled in a way
-    that sends the reader to the wrong place.
-    """
-    code, calls = _run_update(monkeypatch, tmp_path, remote="")
-    assert code == cli.EXIT_CONFIG
-    assert calls == [("remote",)], "nothing else may run once there is no remote"
-
-
-def test_update_refuses_a_dirty_tree_before_it_fetches(monkeypatch, tmp_path):
-    """Uncommitted work stops the update, and stops it early.
-
-    A pull that stashed someone's edits without being asked is a worse outcome
-    than stopping, so this refuses. It refuses before `git fetch` as well, which
-    is what keeps a refusal from touching the network at all.
-    """
-    code, calls = _run_update(
-        monkeypatch, tmp_path, remote="origin", dirty=" M src/optjournal/cli.py")
-    assert code == cli.EXIT_CONFIG
-    assert ("fetch", "--quiet") not in calls, "a refusal must not reach the network"
-    assert ("pull", "--ff-only", "--quiet") not in calls
-
-
-def test_update_check_reports_what_is_new_without_pulling(monkeypatch, tmp_path):
-    """`--check` is read-only, and that has to be true of the git calls too.
-
-    A dry run that fetches is fine -- fetching changes no working file -- but one
-    that pulls is not a dry run at all, and the flag exists for someone deciding
-    whether to update at a moment that suits them.
-    """
-    code, calls = _run_update(monkeypatch, tmp_path, remote="origin")
-    assert code == cli.EXIT_OK
-    assert ("fetch", "--quiet") in calls
-    assert ("pull", "--ff-only", "--quiet") not in calls
-
-
-def test_update_reports_up_to_date_when_the_heads_match(monkeypatch, tmp_path):
-    """Nothing new is a success, not a no-op worth a warning.
-
-    This runs on a schedule in the hands of anyone who wires it up, so the quiet
-    path has to be the common one.
-    """
-    code, calls = _run_update(
-        monkeypatch, tmp_path, remote="origin",
-        extra={("rev-parse", "@{u}"): (0, "aaaaaaaaa")})
-    assert code == cli.EXIT_OK
-    assert ("log", "--oneline", "HEAD..@{u}") not in calls, (
-        "there is no range to log when the heads agree"
+@pytest.fixture
+def fake_uv(tmp_path, monkeypatch):
+    """A `uv` that logs each call, as `[cwd, *argv]`, to the returned file."""
+    log = tmp_path / "uv.log"
+    script = tmp_path / "bin" / "uv"
+    script.parent.mkdir()
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, subprocess, sys\n"
+        f"with open({str(log)!r}, 'a') as f:\n"
+        "    f.write(json.dumps([os.getcwd(), *sys.argv[1:]]) + '\\n')\n"
+        "if sys.argv[1] == 'run':\n"
+        "    rest = sys.argv[sys.argv.index('python') + 1:]\n"
+        "    sys.exit(subprocess.call([sys.executable, *rest]))\n"
     )
+    script.chmod(0o755)
+    monkeypatch.setenv("UV", str(script))
+    return log
+
+
+def _uv_calls(log: Path) -> list[list[str]]:
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def _update(capsys, db: Path, *flags: str) -> tuple[int, str]:
+    capsys.readouterr()
+    code = main(["update", "--db", str(db), *flags])
+    out = capsys.readouterr()
+    return code, out.out + out.err
+
+
+def test_update_refuses_without_a_remote_and_touches_nothing(
+        tmp_path, monkeypatch, capsys):
+    """A clone with no remote has nothing to update from, and says so first."""
+    _git(tmp_path, "init", "-q", str(tmp_path / "solo"))
+    monkeypatch.setattr(cli, "ROOT", tmp_path / "solo")
+    code, text = _update(capsys, tmp_path / "journal.db")
+    assert code == cli.EXIT_CONFIG and "No git remote" in text
+
+
+def test_update_refuses_a_dirty_tree_before_it_fetches(clones, tmp_path, capsys):
+    """Uncommitted edits to tracked files stop the update, and stop it early.
+
+    Before `git fetch`: the remote is made unreachable here, so a refusal that
+    came after the fetch would report the network instead.
+    """
+    pub, friend = clones
+    _publish(pub, "v2")
+    (friend / "README.md").write_text("my edit")
+    (tmp_path / "remote.git").rename(tmp_path / "gone.git")
+    code, text = _update(capsys, tmp_path / "journal.db")
+    assert code == cli.EXIT_CONFIG and "uncommitted changes" in text
+    assert "README.md" in text
+
+
+def test_an_untracked_file_does_not_block_an_update(clones, tmp_path, capsys):
+    """M18: Finder's `.DS_Store` is not the reader's work, and blocked every update.
+
+    Safe to ignore because git itself refuses a pull that would overwrite an
+    untracked file, so nothing of the reader's can be lost this way.
+    """
+    pub, friend = clones
+    _publish(pub, "v2")
+    (friend / ".DS_Store").write_bytes(b"finder")
+    code, text = _update(capsys, tmp_path / "journal.db", "--check")
+    assert code == cli.EXIT_OK, text
+    assert "1 new commit(s)" in text and "v2" in text
+
+
+def test_update_check_reports_what_is_new_without_pulling(clones, tmp_path, capsys):
+    pub, friend = clones
+    before = _git(friend, "rev-parse", "HEAD")
+    _publish(pub, "v2")
+    code, text = _update(capsys, tmp_path / "journal.db", "--check")
+    assert code == cli.EXIT_OK and "1 new commit(s)" in text
+    assert _git(friend, "rev-parse", "HEAD") == before, "--check pulled"
+
+
+def test_update_reports_up_to_date_when_the_heads_match(clones, tmp_path, capsys):
+    code, text = _update(capsys, tmp_path / "journal.db")
+    assert code == cli.EXIT_OK and "Already up to date" in text
+
+
+@pytest.mark.parametrize("move", [("switch", "-q", "-c", "mine"), ("switch", "-q", "--detach")],
+                         ids=["no-upstream", "detached"])
+@pytest.mark.parametrize("flags", [(), ("--check",)], ids=["update", "check"])
+def test_a_clone_off_its_tracking_branch_is_told_so(clones, tmp_path, capsys, move, flags):
+    """L17: a branch with no upstream, or a detached HEAD, has nothing to pull.
+
+    It printed "1 new commit(s)" followed by git's own fatal text and exited 0,
+    then `update` called it a divergence.
+    """
+    pub, friend = clones
+    _publish(pub, "v2")
+    _git(friend, *move)
+    code, text = _update(capsys, tmp_path / "journal.db", *flags)
+    assert code == cli.EXIT_CONFIG, text
+    assert "not on a branch that tracks a remote" in text
+    assert "new commit" not in text and "fatal" not in text
+
+
+@pytest.mark.parametrize("flags", [(), ("--check",)], ids=["update", "check"])
+def test_a_clone_ahead_of_the_remote_is_up_to_date(clones, tmp_path, capsys, fake_uv, flags):
+    """L18: local commits and nothing new upstream is up to date, not an update.
+
+    It reported "0 new commit(s)", then ran the whole update and "Updated to".
+    """
+    _pub, friend = clones
+    _commit_locally(friend)
+    code, text = _update(capsys, tmp_path / "journal.db", *flags)
+    assert code == cli.EXIT_OK, text
+    assert "Already up to date" in text and "1 local commit" in text
+    assert "Updated to" not in text and "new commit" not in text
+    assert _uv_calls(fake_uv) == [], "nothing to install, so nothing may run"
+
+
+@pytest.mark.parametrize("flags", [(), ("--check",)], ids=["update", "check"])
+def test_a_diverged_clone_is_refused_before_anything_runs(
+        clones, tmp_path, capsys, fake_uv, flags):
+    pub, friend = clones
+    _publish(pub, "v2")
+    _commit_locally(friend)
+    before = _git(friend, "rev-parse", "HEAD")
+    code, text = _update(capsys, tmp_path / "journal.db", *flags)
+    assert code == cli.EXIT_ERROR and "diverged" in text, text
+    assert _git(friend, "rev-parse", "HEAD") == before
+    assert _uv_calls(fake_uv) == []
+
+
+@_POSIX_ONLY
+def test_update_migrates_with_the_new_code_in_a_fresh_process(
+        clones, tmp_path, capsys, fake_uv):
+    """M16: the migration is the PULLED code's, so it runs in a new process.
+
+    This process imported the old `db.py` before the pull, and migrating here
+    reported the old schema version and skipped every new migration. And every
+    uv call is `--frozen` (M17): an update must install the lock it pulled, not
+    write a new one that then blocks the next update as a dirty tree.
+    """
+    pub, friend = clones
+    _publish(pub, "v2")
+    db = tmp_path / "home" / "journal.db"
+    connect(db).close()                            # a journal, not yet migrated
+
+    code, text = _update(capsys, db)
+
+    assert code == cli.EXIT_OK, text
+    calls = _uv_calls(fake_uv)
+    assert [c[1] for c in calls] == ["sync", "run"], "sync first, then migrate"
+    assert all(c[0] == str(friend) for c in calls), "uv ran outside the code folder"
+    assert all("--frozen" in c for c in calls), calls
+    assert f"Schema at version {SCHEMA_VERSION}." in text
+    assert "Updated to" in text
+    conn = connect(db)
+    try:
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] \
+            == SCHEMA_VERSION
+    finally:
+        conn.close()
+    assert _git(friend, "status", "--porcelain") == ""
+
+
+@_POSIX_ONLY
+def test_a_failed_migration_is_reported_by_update(clones, tmp_path, capsys, fake_uv):
+    """Not left for `serve` to hit later, when nobody is watching the terminal."""
+    pub, _friend = clones
+    _publish(pub, "v2")
+    db = tmp_path / "journal.db"
+    db.write_bytes(b"this is not a database" * 100)
+
+    code, text = _update(capsys, db)
+
+    assert code == cli.EXIT_ERROR
+    assert "migrating the journal failed" in text and "not a database" in text
+    assert "Updated to" not in text
+
+
+def test_uv_is_found_through_its_own_variable_then_path_then_its_installer(
+        tmp_path, monkeypatch):
+    """L19: `uv run` exports `$UV`, and the installer puts uv in ~/.local/bin,
+    which a double-clicked Start file's PATH need not include."""
+    git_dir = str(Path(shutil.which("git") or "git").parent)
+    if shutil.which("uv", path=git_dir):
+        pytest.skip("uv sits beside git here, so PATH cannot exclude it")
+    monkeypatch.setenv("PATH", git_dir)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.delenv("UV", raising=False)
+    assert cli._find_uv() is None
+
+    installed = tmp_path / ".local" / "bin" / ("uv.exe" if sys.platform == "win32" else "uv")
+    installed.parent.mkdir(parents=True)
+    installed.write_text("")
+    assert cli._find_uv() == str(installed)
+
+    exported = tmp_path / "exported-uv"
+    exported.write_text("")
+    monkeypatch.setenv("UV", str(exported))
+    assert cli._find_uv() == str(exported)
+
+
+def test_update_without_uv_refuses_before_it_pulls(clones, tmp_path, monkeypatch, capsys):
+    """L19: it pulled, then found no uv, leaving new code on old dependencies."""
+    pub, friend = clones
+    _publish(pub, "v2")
+    before = _git(friend, "rev-parse", "HEAD")
+    monkeypatch.setattr(cli, "_find_uv", lambda: None)
+    code, text = _update(capsys, tmp_path / "journal.db")
+    assert code == cli.EXIT_CONFIG and "uv" in text
+    assert _git(friend, "rev-parse", "HEAD") == before, "pulled without a uv to finish"
+
+
+def test_update_has_no_json_output_and_says_so(tmp_path, monkeypatch, capsys):
+    """L24: `--json` printed plain text. `update` reports progress, not data."""
+    monkeypatch.setattr(cli, "ROOT", tmp_path)          # not a clone: nothing may run
+    code, text = _update(capsys, tmp_path / "journal.db", "--json")
+    assert code == cli.EXIT_CONFIG and "--json" in text
+
+
 # --- watch: the two fields the reader types -----------------------------------
 #
 # `optjournal watch` is the only writer of user-typed facts in the CLI, and it is

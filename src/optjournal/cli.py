@@ -916,6 +916,40 @@ def _git(*argv: str) -> tuple[int, str]:
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
+def _find_uv() -> str | None:
+    """The `uv` that installs this app's dependencies, or None if there is none.
+
+    `$UV` first, which `uv run` exports, so `uv run optjournal update` finds the
+    uv that started it. Then PATH. Then where uv's installer puts it, which a
+    shell that has not re-read its profile since the install (and a
+    double-clicked Start file) may not have on PATH.
+    """
+    import os
+    import shutil
+
+    exported = os.environ.get("UV")
+    if exported and Path(exported).is_file():
+        return exported
+    found = shutil.which("uv")
+    if found:
+        return found
+    name = "uv.exe" if sys.platform == "win32" else "uv"
+    for folder in (Path.home() / ".local" / "bin", Path.home() / ".cargo" / "bin"):
+        if (folder / name).is_file():
+            return str(folder / name)
+    return None
+
+
+#: Run by `update` in a NEW process once the pull is done. This process loaded
+#: the old `db.py` before pulling, so migrating in-process ran the old code's
+#: migrations and reported the old schema version.
+_MIGRATE = (
+    "import sys; from pathlib import Path; from optjournal.db import connect, migrate; "
+    "c = connect(Path(sys.argv[1])); migrate(c); "
+    "print(c.execute('SELECT MAX(version) FROM schema_version').fetchone()[0]); c.close()"
+)
+
+
 def cmd_update(args) -> int:
     """Fast-forward this journal to the latest published commit.
 
@@ -928,14 +962,25 @@ def cmd_update(args) -> int:
     Refuses rather than merges, always. `--ff-only` is the whole safety model: a
     friend running this has no local commits to preserve, so anything that is not
     a fast-forward means their clone has diverged in a way a tool should not
-    guess about. Dirty working trees are refused for the same reason -- a pull
-    that stashed someone's edits without being asked is a worse outcome than
-    stopping.
+    guess about. Uncommitted edits to tracked files are refused for the same
+    reason: a pull that stashed someone's edits without being asked is a worse
+    outcome than stopping. Untracked files are not edits (Finder writes
+    `.DS_Store` into every folder it opens), and git itself refuses a pull that
+    would overwrite one.
 
-    The database is NOT touched here beyond migration, and migration is
-    idempotent and already guarded by `locks.py`: `open_journal` runs it, so
-    opening the journal after an update is the migration.
+    Both uv calls are `--frozen`: the pulled `uv.lock` is what gets installed,
+    and nothing here rewrites it. A rewritten lock is a modified tracked file,
+    which would then block every later update.
+
+    The migration runs in a NEW process, after the pull and `uv sync`, so it is
+    the new code's (see `_MIGRATE`). A failing one is reported here, rather than
+    by the next `serve` at a moment nobody is watching.
     """
+    if args.json:
+        print("`update` reports its progress as it goes, so it has no --json output.",
+              file=sys.stderr)
+        return EXIT_CONFIG
+
     code, remote = _git("remote")
     if code != 0 or not remote:
         print(
@@ -945,7 +990,16 @@ def cmd_update(args) -> int:
         )
         return EXIT_CONFIG
 
-    code, dirty = _git("status", "--porcelain")
+    # Local, so a clone that cannot be updated is told so without a network call.
+    code, _ = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if code != 0:
+        print("Nothing to update from: this clone is not on a branch that tracks a "
+              "remote (a detached HEAD, or a branch of your own). Switch back to "
+              "the branch you cloned, usually with `git switch main`.",
+              file=sys.stderr)
+        return EXIT_CONFIG
+
+    code, dirty = _git("status", "--porcelain", "--untracked-files=no")
     if code == 0 and dirty:
         print("Refusing to update: this working tree has uncommitted changes.\n"
               f"{dirty}\n\nCommit or discard them first.", file=sys.stderr)
@@ -956,26 +1010,40 @@ def cmd_update(args) -> int:
         print(f"Could not reach the remote: {out}", file=sys.stderr)
         return EXIT_ERROR
 
-    _, local_head = _git("rev-parse", "HEAD")
-    _, upstream = _git("rev-parse", "@{u}")
-    if local_head == upstream:
-        print(f"Already up to date ({local_head[:9]}).")
+    _, head = _git("rev-parse", "--short=9", "HEAD")
+    _, counts = _git("rev-list", "--left-right", "--count", "HEAD...@{u}")
+    ahead, behind = (int(n) for n in counts.split())
+    if not behind:
+        extra = (f", with {ahead} local commit(s) the remote does not have"
+                 if ahead else "")
+        print(f"Already up to date ({head}){extra}.")
         return EXIT_OK
+    if ahead:
+        print(f"Refusing to update: this clone and the remote have diverged "
+              f"({ahead} local commit(s), {behind} new on the remote), so a "
+              "fast-forward is not possible. Sort that out by hand: a tool "
+              "guessing here would be guessing about your work.", file=sys.stderr)
+        return EXIT_ERROR
 
     _, log = _git("log", "--oneline", "HEAD..@{u}")
-    behind = len(log.splitlines()) if log else 0
     print(f"{behind} new commit(s):")
     print(log)
     if args.check:
         print("\n--check, so nothing was changed. Run `optjournal update` to apply.")
         return EXIT_OK
 
+    # Before the pull: new code on the old dependencies is an install that may
+    # not start, and without uv this command could not finish what it began.
+    uv = _find_uv()
+    if uv is None:
+        print("Refusing to update: uv was not found ($UV, PATH, ~/.local/bin), "
+              "so the new code's dependencies could not be installed. Run this "
+              "as `uv run optjournal update`.", file=sys.stderr)
+        return EXIT_CONFIG
+
     code, out = _git("pull", "--ff-only", "--quiet")
     if code != 0:
-        print(f"\nFast-forward refused, so nothing changed: {out}\n\n"
-              "This clone has commits the remote does not, or has diverged. "
-              "Sort that out by hand -- a tool guessing here would be guessing "
-              "about your work.", file=sys.stderr)
+        print(f"\nFast-forward refused, so nothing changed: {out}", file=sys.stderr)
         return EXIT_ERROR
 
     # Dependencies BEFORE the schema: a migration added in the new commits may
@@ -985,26 +1053,27 @@ def cmd_update(args) -> int:
     import subprocess
 
     print("\nResolving dependencies...")
-    synced = subprocess.run(["uv", "sync", "--quiet"], cwd=ROOT, check=False)
+    synced = subprocess.run([uv, "sync", "--frozen", "--quiet"], cwd=ROOT, check=False)
     if synced.returncode != 0:
         print("`uv sync` failed. The code is updated but its dependencies are "
-              "not, so run `uv sync` by hand before using the journal.",
+              "not, so run `uv sync --frozen` by hand before using the journal.",
               file=sys.stderr)
         return EXIT_ERROR
 
-    # Opening the journal IS the migration -- `open_journal` runs it under the
-    # cross-process lock. Done here rather than left to the next command so an
-    # update reports the schema move instead of the next `serve` doing it
-    # silently at a moment nobody is watching.
     db = args.db or DEFAULT_DB
     if db.exists():
-        with open_journal(db) as conn:
-            version = conn.execute(
-                "SELECT MAX(version) FROM schema_version").fetchone()[0]
-        print(f"Schema at version {version}.")
+        migrated = subprocess.run(
+            [uv, "run", "--frozen", "--quiet", "python", "-c", _MIGRATE, str(db)],
+            cwd=ROOT, capture_output=True, text=True, check=False)
+        if migrated.returncode != 0:
+            print(f"\nThe code is updated, but migrating the journal failed, and "
+                  f"optjournal will not open it until that is fixed:\n"
+                  f"{migrated.stderr.strip()}", file=sys.stderr)
+            return EXIT_ERROR
+        print(f"Schema at version {migrated.stdout.strip()}.")
 
-    _, now = _git("rev-parse", "HEAD")
-    print(f"\nUpdated to {now[:9]}. Restart `optjournal serve` to pick it up: "
+    _, now = _git("rev-parse", "--short=9", "HEAD")
+    print(f"\nUpdated to {now}. Restart `optjournal serve` to pick it up: "
           "the server re-reads the page on every request but loads its Python "
           "once, at startup.")
     return EXIT_OK
