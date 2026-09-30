@@ -4166,7 +4166,9 @@ function costs(){
   if(!bc) return costScope()
     +`<div class="card"><div class="empty">no cost data</div></div>`;
   const CT=bc.totals, F=CT.friction;
-  const nothing=!CT.fills&&!CT.unattributable.base;
+  /* Rows, not a sum: a fee and its refund net to zero, and withholding alone has
+     no fill and no fee, yet both have lines to show. */
+  const nothing=!CT.fills&&!(bc.fees||[]).length&&!(bc.withholding||[]).length;
   if(nothing) return costScope()
     +`<div class="card"><div class="empty">nothing in this selection</div></div>`;
   /* The headline is ONE figure, and it is the midpoint when any of it is

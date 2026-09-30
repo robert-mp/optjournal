@@ -513,7 +513,9 @@ def cmd_friction(args) -> int:
         report = build_costs(conn, scope=scope, period=args.month)
     data = broker_costs_data(report)
     _emit(data, render_friction(data), args.json)
-    return EXIT_OK if report.fills or report.unattributable.base else EXIT_NO_DATA
+    # Rows, not a sum: a fee and its refund net to zero, and a period holding only
+    # dividend withholding has neither fills nor fees, yet both have lines to show.
+    return EXIT_OK if report.fills or report.fees or report.withholding else EXIT_NO_DATA
 
 
 def cmd_watch(args) -> int:

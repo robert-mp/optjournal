@@ -338,3 +338,45 @@ def test_a_sign_class_is_judged_at_the_precision_its_figure_prints_at():
             missing.append(f"line {page.count(chr(10), 0, found.start()) + 1}: "
                            f"{found.group(0)} beside {printed.group(0)}")
     assert not missing, missing
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node runtime")
+def test_the_costs_tab_is_empty_only_when_the_report_has_no_lines(tmp_path):
+    """The tab decided "nothing in this selection" on the fee SUM, so a charge and
+    the CANCEL row refunding it, or a month of dividend withholding alone, hid
+    lines the report holds. The page's own predicate, run on the serializer's
+    payload, must agree with `friction`'s exit code on every month."""
+    from conftest import add_statement, connect_migrated
+
+    from optjournal.costs import build_costs
+    from optjournal.serialize import broker_costs_data
+
+    page = PAGE.read_text(encoding="utf-8")
+    found = re.search(r"const nothing=(.+);\n", page)
+    assert found, "costs() no longer decides its empty state in one expression"
+    conn = connect_migrated(tmp_path / "j.db")
+    add_statement(conn)
+    for tid, day, kind, symbol, amount in (
+        ("1", "2026-03-01", "Other Fees", None, -1.29),
+        ("2", "2026-03-02", "Other Fees", None, 1.29),
+        ("3", "2026-04-01", "Withholding Tax", "KO", -3.00),
+    ):
+        conn.execute(
+            "INSERT INTO cash_transactions (transaction_id, account_id, date_time,"
+            " type, description, symbol, amount, currency, fx_rate_to_base,"
+            " amount_base, raw, source_file, first_seen_at)"
+            " VALUES (?, 'U1', ?, ?, 'x', ?, ?, 'EUR', 1.0, ?, '{}', 't.xml', 'now')",
+            (tid, f"{day} 10:00:00", kind, symbol, amount, amount),
+        )
+    payloads = {m: broker_costs_data(build_costs(conn, period=m))
+                for m in ("2026-03", "2026-04", "2026-05")}
+    script = (
+        f"const out={{}};for(const [m,bc] of Object.entries({json.dumps(payloads)}))"
+        f"{{const CT=bc.totals;out[m]={found.group(1)};}}"
+        "console.log(JSON.stringify(out));"
+    )
+    run = subprocess.run(["node", "-e", script], capture_output=True, text=True,
+                         timeout=30)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout) == {"2026-03": False, "2026-04": False,
+                                      "2026-05": True}

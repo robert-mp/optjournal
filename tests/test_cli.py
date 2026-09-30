@@ -561,6 +561,36 @@ def test_friction_refuses_a_month_that_is_not_one(tmp_path, capsys):
             == cli.EXIT_NO_DATA
 
 
+def test_friction_has_data_when_its_lines_net_to_zero(tmp_path, capsys):
+    """"No data" was decided on the fee SUM, so a market-data charge and the
+    CANCEL row refunding it read as an empty month, and so did a month holding
+    only dividend withholding. Both have lines the report prints."""
+    from conftest import add_statement
+
+    db = tmp_path / "j.db"
+    conn = connect_migrated(db)
+    add_statement(conn)
+    rows = [
+        ("1", "2026-03-01", "Other Fees", "OPRA NP L1", None, -1.29),
+        ("2", "2026-03-02", "Other Fees", "CANCEL[OPRA NP L1]", None, 1.29),
+        ("3", "2026-04-01", "Withholding Tax", "KO CASH DIVIDEND", "KO", -3.00),
+    ]
+    for tid, day, kind, description, symbol, amount in rows:
+        conn.execute(
+            "INSERT INTO cash_transactions (transaction_id, account_id, date_time,"
+            " type, description, symbol, amount, currency, fx_rate_to_base,"
+            " amount_base, raw, source_file, first_seen_at)"
+            " VALUES (?, 'U1', ?, ?, ?, ?, ?, 'EUR', 1.0, ?, '{}', 't.xml', 'now')",
+            (tid, f"{day} 10:00:00", kind, description, symbol, amount, amount),
+        )
+    conn.commit()
+    conn.close()
+    for period in ("2026-03", "2026-04"):
+        assert main(["friction", "--month", period, "--db", str(db)]) == cli.EXIT_OK
+    assert main(["friction", "--month", "2026-05", "--db", str(db)]) \
+        == cli.EXIT_NO_DATA
+
+
 # --- watch: the two fields the reader types -----------------------------------
 #
 # `optjournal watch` is the only writer of user-typed facts in the CLI, and it is
