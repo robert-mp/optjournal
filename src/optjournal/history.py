@@ -176,6 +176,13 @@ class Episode:
     unrealized: float | None = None
     trade_ids: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: The half of a shared fill this episode took, keyed by trade id: its
+    #: quantity, and IBKR's own open/close marker for that half. Only a reversal
+    #: (`C;O`) is shared, and only between the two episodes `_through_zero` splits
+    #: it between, so this is empty for every other episode. Carried so a caller
+    #: holding whole order LEGS can divide one along the same zero instead of
+    #: re-deriving where it fell -- see `campaigns.Campaign.leg_parts`.
+    fill_parts: dict[str, tuple[float, str]] = field(default_factory=dict)
 
     @property
     def is_closed(self) -> bool:
@@ -715,12 +722,18 @@ def build_history(
         if past_flat and _reverses(row["open_close"]):
             # The fill finished one position and began the opposite one, so it
             # belongs to both episodes: the closing part ends this one, the
-            # leftover opens the next.
+            # leftover opens the next. Each records its own half, so a consumer
+            # holding the whole order leg can divide it the same way.
             close_part, open_part = _through_zero(current, row)
+            trade_id = str(row["trade_id"] or "")
             _absorb(current, close_part)
+            current.fill_parts[trade_id] = (
+                close_part["quantity"], close_part["open_close"])
             flush()
             current = _new_episode(row)
             _absorb(current, open_part)
+            current.fill_parts[trade_id] = (
+                open_part["quantity"], open_part["open_close"])
             continue
 
         _absorb(current, row)

@@ -508,6 +508,66 @@ def test_a_spreads_legs_expiring_together_stay_one_event(conn):
         ["1001", "1002"], ["9001", "9002"]]
 
 
+def test_a_reversal_order_is_drawn_in_both_positions_it_filled(conn):
+    """Long 2, SELL 3 in one `C;O` fill, buy 1 back: the fill closes the long and
+    opens a short, so its order belongs to BOTH campaigns.
+
+    The order-to-campaign map kept one index per order, so the last campaign won
+    and the order was drawn in a single card. The short's card then opened on the
+    day it was closed, labelled its opening event a close, and read -100 of
+    proceeds where the position took 150 in and paid 100 back; the long's card
+    took the whole 450 of a sale only two thirds of which was its own. Each card
+    now carries its own half of the leg: the quantity it took, that half's own
+    open/close marker, and the money divided the way `history._through_zero`
+    divides it -- IBKR reports all the realised P&L on the closing half."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for
+    from optjournal.strategies import position_groups
+
+    _leg(conn, conid="1", order_id="1001", at="2026-09-10 10:00:00", qty=2,
+         proceeds=-200.0, pnl=None, open_close="O")
+    _leg(conn, conid="1", order_id="1002", at="2026-09-15 10:00:00", qty=-3,
+         proceeds=450.0, pnl=95.0, open_close="C;O")
+    _leg(conn, conid="1", order_id="1003", at="2026-09-20 10:00:00", qty=1,
+         proceeds=-100.0, pnl=40.0, open_close="C")
+    episodes = build_history(conn, asset_category="OPT").episodes
+    cards = position_groups(
+        orders_data(conn), episodes=episodes,
+        campaign_list=campaigns_for(conn, "OPT", episodes),
+    )
+    got = {
+        card["opened_at"]: (
+            card["label"],
+            [event["order_ids"] for event in card["events"]],
+            round(card["proceeds"]["base"], 6),
+            card["realized_pnl"]["base"],
+        )
+        for card in cards
+    }
+    assert got == {
+        "2026-09-10 10:00:00": ("Long put", [["1001"], ["1002"]], 100.0, 95.0),
+        "2026-09-15 10:00:00": ("Short put", [["1002"], ["1003"]], 50.0, 40.0),
+    }
+    # The shared leg, as each card shows it: 2 of the 3 closing the long and the
+    # remaining 1 opening the short, each with two thirds and one third of the
+    # money it moved.
+    shared = {
+        card["opened_at"]: [
+            (leg["quantity"], leg["open_close"], round(leg["money"]["proceeds"]["base"], 6),
+             round(leg["money"]["commission"]["base"], 6),
+             leg["money"]["realized_pnl"]["base"])
+            for event in card["events"] if event["order_ids"] == ["1002"]
+            for order in event["orders"] for leg in order["legs"]
+        ]
+        for card in cards
+    }
+    assert shared == {
+        "2026-09-10 10:00:00": [(-2, "C", 300.0, round(-2 / 3, 6), 95.0)],
+        "2026-09-15 10:00:00": [(-1, "O", 150.0, round(-1 / 3, 6), 0.0)],
+    }
+
+
 def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):
     """`pnl/s_scope_inflight.py`: a 0DTE short put rolled at 15:55 into the next
     day's put, which is still open.
