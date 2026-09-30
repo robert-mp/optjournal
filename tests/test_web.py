@@ -8567,7 +8567,8 @@ def test_the_market_week_strip_is_seven_equal_columns_at_every_width():
     assert "repeat(7,minmax(0,1fr))" in wide.get(".cal.mkweek", ""), (
         "the week strip's tracks have an auto minimum again, so a long title widens "
         "its day and the strip runs past its card")
-    assert wide.get(".cal", "") == "display:grid;grid-template-columns:repeat(7,1fr);gap:var(--s3)", (
+    calendar_grid = "display:grid;grid-template-columns:repeat(7,1fr);gap:var(--s3)"
+    assert wide.get(".cal", "") == calendar_grid, (
         "the Calendar tab's grid moved; the strip's fix must stay scoped to the strip")
     assert '<div class="cal mkweek">' in _fn("market")
     # The ellipsis the strip always declared, now on a box it can apply to:
