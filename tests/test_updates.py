@@ -117,12 +117,13 @@ def test_a_path_outside_the_folder_is_refused(tmp_path, monkeypatch, supervised,
     assert not (tmp_path / "escape.py").exists()
 
 
-def test_a_download_that_is_not_a_zip_is_refused(tmp_path, monkeypatch, supervised):
-    """L27 (its update part): a non-zip body raised `BadZipFile`, which the
-    server's update endpoint does not catch, so the page got no reply at all."""
+def test_a_download_that_is_not_a_zip_stages_nothing(tmp_path, monkeypatch, supervised):
+    """L27 (its update part): a non-zip body (an error or rate-limit page) is a
+    failed download, which the endpoint answers as a retryable 502, and nothing
+    is staged from it."""
     root = _install(tmp_path)
     monkeypatch.setattr(updates, "_get", lambda _url, limit: b"<html>rate limited</html>")
-    with pytest.raises(updates.UpdateRefused, match="not a release archive"):
+    with pytest.raises(zipfile.BadZipFile, match="not a release archive"):
         updates.stage(_release(), root=root)
     assert not (root / updates.STAGING).exists()
 
