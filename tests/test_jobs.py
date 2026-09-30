@@ -2779,21 +2779,28 @@ def _confirm_due(conn, now) -> bool:
 _BUSY = "busy: another process held .fetch.lock for more than 30s."
 
 
-def test_a_busy_poll_does_not_postpone_the_next_one(conn):
+def test_a_busy_poll_is_retried_on_the_next_tick(conn, clock):
     """A busy run asked nothing, so it is not a poll: counted as one, a confirm
     poll that met the fetch lock (a page Sync overlapping it, now that the app's
     wait is short) pushed the next poll a whole 25-minute window out, and
-    same-day fills arrived that late."""
-    from optjournal.jobs import _ledger_snapshot, record_run
+    same-day fills arrived that late.
 
-    record_run(conn, "confirm", status="nothing", detail="busy: .fetch.lock held")
-    _claimed, last_poll, last_try, _ever, _failures = _ledger_snapshot(conn)
-    assert "confirm" not in last_poll, "a busy run counted as a finished poll"
-    assert "confirm" in last_try, "it is still an attempt, so it is not retried at once"
+    So the next tick tries again, at 15:31 for a busy run at 15:30. That costs no
+    request, only another wait of at most `flex.FETCH_LOCK_WAIT_S` while the other
+    fetch finishes. A run that did ask, and found nothing, brakes for the window.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    clock["t"] = datetime(2026, 9, 30, 15, 0, tzinfo=UTC)        # 11:00 ET, a Wednesday
+    record_run(conn, "confirm", status="nothing", detail="no new fills")
+    clock["t"] += timedelta(minutes=30)
+    record_run(conn, "confirm", status="nothing", detail=_BUSY)
+    next_tick = clock["t"] + timedelta(minutes=1)
+    assert _confirm_due(conn, next_tick), "a busy poll postponed the next one"
 
     record_run(conn, "confirm", status="nothing", detail="no new fills")
-    _claimed, last_poll, _last_try, _ever, _failures = _ledger_snapshot(conn)
-    assert "confirm" in last_poll, "a poll that asked and found nothing IS a poll"
+    assert not _confirm_due(conn, next_tick), (
+        "a poll that asked and found nothing IS a poll, and brakes for the window")
 
 
 def test_meeting_the_fetch_lock_does_not_lift_a_backoff(conn, clock):
