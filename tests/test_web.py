@@ -1981,6 +1981,83 @@ def test_a_refused_date_writes_nothing_at_all(tmp_path):
     assert _watch_row(db) == {"note": "keep me", "earnings_on": None}
 
 
+def _alerts(db: Path, symbol: str = "AMD") -> tuple:
+    """The stored alert levels and their SQLite storage classes."""
+    conn = connect(db)
+    try:
+        return tuple(conn.execute(
+            "SELECT alert_above, typeof(alert_above), alert_below,"
+            " typeof(alert_below) FROM watchlist WHERE symbol = ?", (symbol,)
+        ).fetchone())
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("typed", ["1_000", "١٢٣", "１２３", "8٠0"])
+def test_an_alert_level_is_refused_unless_it_is_ascii(tmp_path, typed):
+    """L29: `float()` reads "1_000" and other scripts' digits, SQLite does not, so
+    the level was stored as TEXT and the alert could never fire."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, reply = _post(base, "/api/watchlist",
+                              {"symbol": "AMD", "alert_above": typed})
+    assert (status, reply["kind"]) == (400, "alert")
+    assert _watch_row(db) == {}, "a refused level was stored anyway"
+
+
+def test_an_alert_level_is_stored_as_a_number(tmp_path):
+    """L29: what is stored is the parsed level, never the typed text."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, _ = _post(base, "/api/watchlist",
+                          {"symbol": "AMD", "alert_above": "1e3", "alert_below": "650.5"})
+    assert status == 200
+    assert _alerts(db) == (1000.0, "real", 650.5, "real")
+
+
+@pytest.mark.parametrize(("first", "second"), [
+    # Both sides in one request.
+    ({}, {"alert_above": "100", "alert_below": "900"}),
+    ({}, {"alert_above": "500", "alert_below": "500"}),
+    # One side against the level already stored for the other.
+    ({"alert_below": "900"}, {"alert_above": "100"}),
+    ({"alert_above": "100"}, {"alert_below": "900"}),
+])
+def test_an_inverted_alert_pair_is_refused(tmp_path, first, second):
+    """L30: above 100 and below 900 is crossed at every price, so the bell would
+    ring forever. The pair is judged with whatever the other side already
+    holds, because the page saves one row's two boxes together but a request
+    may carry only one."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        if first:
+            assert _post(base, "/api/watchlist", {"symbol": "AMD", **first})[0] == 200
+        before = _alerts(db) if first else None
+        status, reply = _post(base, "/api/watchlist", {"symbol": "AMD", **second})
+    assert (status, reply["kind"]) == (400, "alert")
+    assert (_alerts(db) if first else _watch_row(db)) == (before if first else {})
+
+
+def test_clearing_one_alert_side_is_never_refused_as_inverted(tmp_path):
+    """The other direction: an empty box clears its side whatever the other
+    holds, so an old inverted pair can always be undone."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        _post(base, "/api/watchlist",
+              {"symbol": "AMD", "alert_above": "900", "alert_below": "100"})
+        status, _ = _post(base, "/api/watchlist", {"symbol": "AMD", "alert_above": ""})
+    assert status == 200
+    assert _alerts(db) == (None, "null", 100.0, "real")
+
+
 def test_an_oversized_body_is_refused_rather_than_read(populated):
     """`rfile.read` on a client-chosen Content-Length is an unbounded allocation.
 

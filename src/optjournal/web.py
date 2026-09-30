@@ -299,6 +299,33 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
     return failed, asked
 
 
+def _inverted_alert(conn: sqlite3.Connection, symbol: str,
+                    fields: dict[str, Any]) -> str | None:
+    """Why this alert pair can never be quiet, or None when it can.
+
+    Above 100 and below 900 is crossed at every price, so the bell would ring
+    for ever. Judged with the level already stored for a side the request does
+    not carry, because a request may set one side only. Clearing a side is
+    never refused, so an old inverted pair can always be undone.
+    """
+    stored = conn.execute(
+        "SELECT alert_above, alert_below FROM watchlist WHERE symbol = ?", (symbol,)
+    ).fetchone()
+    pair = []
+    for column in ("alert_above", "alert_below"):
+        value = fields[column] if column in fields else (
+            stored[column] if stored else None)
+        try:
+            pair.append(float(value) if value is not None else None)
+        except (TypeError, ValueError):
+            pair.append(None)
+    above, below = pair
+    if above is None or below is None or above > below:
+        return None
+    return (f"an alert above {above:g} and below {below:g} is crossed at every "
+            f"price: the level above has to be higher than the level below.")
+
+
 def _iv_ranks(symbols: list[str]) -> dict[str, Any]:
     """CBOE's IV rank per symbol, and the two absences told apart.
 
@@ -1452,7 +1479,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # The typed fields, from a LITERAL tuple rather than from the body's own
         # keys: the column names are interpolated into SQL below, so what may be
         # written is decided here and not by the caller.
-        fields: dict[str, str | None] = {}
+        fields: dict[str, str | float | None] = {}
         for column in _WATCH_FIELDS:
             if column not in body:
                 continue
@@ -1469,8 +1496,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # textarea clears rather than storing whitespace that renders as a
             # value the reader cannot see or delete.
             if column.startswith("alert_") and typed:
+                # ASCII only, and no digit separators: `float` reads "1_000"
+                # and other scripts' digits, SQLite does not, and the level
+                # used to be stored as the typed TEXT, which never fires.
                 try:
-                    level = float(typed)
+                    level = (float(typed) if typed.isascii() and "_" not in typed
+                             else -1.0)
                 except ValueError:
                     level = -1.0
                 if not (level > 0 and math.isfinite(level)):
@@ -1479,8 +1510,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                         "message": f"{typed} is not a price. An alert is a level "
                                    f"above zero, or empty to clear it.",
                     }
+                fields[column] = level
+                continue
             fields[column] = typed or None
         with open_journal(self.cfg.db_path) as conn:
+            if action == "add" and ("alert_above" in fields or "alert_below" in fields):
+                problem = _inverted_alert(conn, symbol, fields)
+                if problem:
+                    return 400, {"ok": False, "kind": "alert", "message": problem}
             if action == "remove":
                 cursor = conn.execute(
                     "DELETE FROM watchlist WHERE symbol = ?", (symbol,))
