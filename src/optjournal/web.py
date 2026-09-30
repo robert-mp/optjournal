@@ -1027,10 +1027,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # served is not a degraded page but a completely blank one. On a
         # loopback-only, single-user server that is a bad trade. Revisit it if this
         # ever listens on anything but 127.0.0.1.
+        #
+        # NOTHING HERE MAY BE FRAMED, not even by this server's own pages: a page
+        # in another tab could load the journal in an invisible frame and have
+        # you click Update or "Use this journal", and the framed page's POSTs
+        # carry its own Origin, so the Origin guard lets them through.
+        # `frame-ancestors` is the CSP spelling and `X-Frame-Options` the older
+        # one. The Broker Companion is a `window.open` window, not a frame.
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self' 'unsafe-inline'",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
         )
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-Content-Type-Options", "nosniff")
         # NOTHING HERE IS CACHEABLE. The page is read from disk per request and the
         # payload is a live brokerage account, so a cached copy is a stale copy in

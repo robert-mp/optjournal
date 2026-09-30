@@ -2130,6 +2130,34 @@ def test_nothing_this_server_sends_is_cacheable():
     assert "no-store" in src
 
 
+def test_no_response_of_this_server_can_be_framed(tmp_path):
+    """M22: a page in another tab could load the journal in an invisible frame
+    and click Update or "Use this journal" for you; the framed page's own POSTs
+    carry its own Origin, so the Origin guard passes them. Refused by both the
+    CSP directive and the older header, on every response."""
+    import urllib.error  # noqa: PLC0415 - local to this test
+    import urllib.request  # noqa: PLC0415
+
+    db = tmp_path / "j.db"
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        for path in ("/", "/companion", "/static/app.css", "/api/missing"):
+            try:
+                with urllib.request.urlopen(f"{base}{path}", timeout=10) as response:  # noqa: S310
+                    headers = response.headers
+            except urllib.error.HTTPError as exc:
+                headers = exc.headers
+            assert headers["X-Frame-Options"] == "DENY", path
+            assert "frame-ancestors 'none'" in headers["Content-Security-Policy"], path
+
+
+def test_the_companion_is_a_window_not_a_frame():
+    """The other side of M22: `frame-ancestors 'none'` also refuses a frame of
+    the journal's own, so the Broker Companion must stay a real window."""
+    assert "window.open(companionUrl()" in _js().replace(" ", "")
+    for doc in (page_html(), companion_html()):
+        assert "<iframe" not in doc and "<frame" not in doc
+
+
 def test_dashboard_friction_is_split_by_scope(state):
     """The panel is headed by an asset category, so it must not blend scopes.
 
