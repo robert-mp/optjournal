@@ -7969,14 +7969,12 @@ def test_a_refresh_asks_for_an_earnings_date_once_a_day(populated, monkeypatch):
     """Earnings ride the quote route, but a company confirming its date is a
     quarterly event: one request per symbol per day, whatever the quote cadence.
     Ablated by dropping the age gate: the second refresh asks again."""
-    from optjournal import earnings, marketdata  # noqa: PLC0415 - local to this test
+    from optjournal import earnings  # noqa: PLC0415 - local to this test
 
     calls: list[str] = []
     monkeypatch.setattr(earnings, "fetch_earnings",
                         lambda s, **k: calls.append(s) or None)
-    monkeypatch.setattr(marketdata, "fetch_quote",
-                        lambda s, **k: (_ for _ in ()).throw(
-                            marketdata.BarFetchError("no network in tests")))
+    _offline_quotes(monkeypatch)
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         _post(base, "/api/watchlist", {"symbol": "zzzq"})
         calls.clear()
@@ -7991,7 +7989,7 @@ def test_a_refresh_asks_for_an_earnings_date_once_a_day(populated, monkeypatch):
 def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, monkeypatch):
     """A dead endpoint costs one request per symbol per day, not one per refresh,
     and the page is told which symbols it could not refresh."""
-    from optjournal import earnings, marketdata  # noqa: PLC0415 - local to this test
+    from optjournal import earnings  # noqa: PLC0415 - local to this test
 
     calls: list[str] = []
 
@@ -8000,9 +7998,7 @@ def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, 
         raise earnings.EarningsFetchError(f"{symbol} earnings: URLError")
 
     monkeypatch.setattr(earnings, "fetch_earnings", offline)
-    monkeypatch.setattr(marketdata, "fetch_quote",
-                        lambda s, **k: (_ for _ in ()).throw(
-                            marketdata.BarFetchError("no network in tests")))
+    _offline_quotes(monkeypatch)
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         _post(base, "/api/watchlist", {"symbol": "zzzq"})
         assert calls == ["ZZZQ"], "the add asked and the fetch failed"

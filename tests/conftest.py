@@ -19,9 +19,11 @@ back to the behaviour it exercises.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import shutil
+import socket
 import sqlite3
 from pathlib import Path
 
@@ -237,6 +239,69 @@ def _no_earnings_fetch(monkeypatch):
     AUTOUSE so the suite never reaches it; a test about it patches its own."""
     from optjournal import earnings  # noqa: PLC0415 - local to the fixture
     monkeypatch.setattr(earnings, "fetch_earnings", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_release_check(monkeypatch):
+    """Every rendered page asks /api/update, which asks GitHub for the newest
+    release. AUTOUSE so the suite reads as offline there; a test about updates
+    patches its own `latest_release`. The check's cache is cleared too, so one
+    test's answer cannot leak into the next."""
+    from urllib.error import URLError  # noqa: PLC0415 - local to the fixture
+
+    from optjournal import updates  # noqa: PLC0415
+
+    def offline(*_a, **_k):
+        raise URLError("no network in tests")
+
+    monkeypatch.setattr(updates, "latest_release", offline)
+    monkeypatch.setattr(updates, "_last", None)
+
+
+def _is_loopback(host: object) -> bool:
+    if isinstance(host, bytes):
+        host = host.decode()
+    if host in (None, "", "localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(str(host).split("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _no_internet(monkeypatch):
+    """The suite never reaches past this machine, and says so when a test tries.
+
+    Patching one fetcher per test is easy to get wrong: two tests patched
+    `marketdata.fetch_quote` while `web` holds its own reference, so their
+    requests went to Yahoo and CBOE for real and passed because the network was
+    up. A connection to anything but loopback raises OSError, the offline path
+    every fetcher already handles, and the attempt fails the test at teardown.
+    Subprocesses (git, uv) are not affected.
+    """
+    attempts: list[str] = []
+    real_getaddrinfo = socket.getaddrinfo
+    real_connect = socket.socket.connect
+
+    def refuse(host: object) -> OSError:
+        attempts.append(str(host))
+        return OSError(f"the test suite never uses the network: {host!r}")
+
+    def getaddrinfo(host, *args, **kwargs):
+        if not _is_loopback(host):
+            raise refuse(host)
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    def connect(self, address):
+        if self.family in (socket.AF_INET, socket.AF_INET6) and not _is_loopback(address[0]):
+            raise refuse(address[0])
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    yield
+    assert not attempts, f"this test tried to reach the network: {sorted(set(attempts))}"
 
 
 @pytest.fixture
