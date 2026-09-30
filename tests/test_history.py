@@ -491,6 +491,59 @@ def test_the_positions_view_and_the_episode_walk_read_the_same_book(conn):
     assert {conid for _, _, conid in held} == _current_option_conids(conn) == {"B1"}
 
 
+def test_every_category_at_once_is_each_category_read_at_its_own_book(conn):
+    """`history --assets ALL` read the mixed scope flat only where the NAV priced
+    stock AND options at nothing, so an options-only journal whose options went
+    flat by NAV alone (U2), and an account that sold its stock on a day whose
+    statement had no OpenPositions (U5), kept a position the per-category
+    readings, the Positions tab and the allocation all called gone. Each row is
+    now read at its own category's book, so the whole is the union of the parts,
+    including a category the NAV does not price (U6's fund), which no NAV row may
+    empty."""
+    from optjournal.history import _held, book_date
+
+    for account in ("U2", "U3", "U5", "U6"):
+        add_statement(conn, source_file=f"{account}.xml", account_id=account,
+                      asset_filter="ALL")
+
+    def snap(conid, account, date, asset):
+        add_snapshot(conn, conid, position=1, date=date, asset=asset, symbol=conid,
+                     account_id=account,
+                     source_file="t.xml" if account == "U1" else f"{account}.xml")
+
+    # U1: options sold on 0916, the stock still listed.
+    snap("U1OPT", "U1", "20260901", "OPT")
+    snap("U1STK", "U1", "20260901", "STK")
+    snap("U1STK", "U1", "20260916", "STK")
+    add_nav(conn, "20260916", stock=900, options=0)
+    # U2: an --assets OPT journal, whose options go flat by NAV alone.
+    snap("U2OPT", "U2", "20260901", "OPT")
+    add_nav(conn, "20260916", stock=5000, options=0, account_id="U2")
+    # U3: a 0916 statement without OpenPositions, the NAV pricing both.
+    snap("U3OPT", "U3", "20260901", "OPT")
+    snap("U3STK", "U3", "20260901", "STK")
+    add_nav(conn, "20260916", stock=900, options=100, account_id="U3")
+    # U5: the stock sold on 0916, no OpenPositions that day.
+    snap("U5OPT", "U5", "20260901", "OPT")
+    snap("U5STK", "U5", "20260901", "STK")
+    add_nav(conn, "20260916", stock=0, options=100, account_id="U5")
+    # U6: a fund, which the NAV has no column for, beside nothing else held.
+    snap("U6FUND", "U6", "20260901", "FUND")
+    add_nav(conn, "20260916", stock=0, options=0, account_id="U6")
+
+    def held(scope):
+        return {conid for _, _, conid in _held(conn, scope)[0]}
+
+    parts = {scope: held(scope) for scope in ("OPT", "STK", "FUND")}
+    assert parts == {"OPT": {"U3OPT", "U5OPT"}, "STK": {"U1STK", "U3STK"},
+                     "FUND": {"U6FUND"}}
+    assert held(None) == set().union(*parts.values())
+    assert {e.conid for e in build_history(conn, asset_category=None).open} == (
+        set().union(*parts.values()))
+    assert book_date(conn, None) == max(
+        book_date(conn, scope) for scope in ("OPT", "STK", "FUND")) == "20260916"
+
+
 def test_each_account_is_read_at_its_own_newest_date(conn):
     """U2's statements lag U1's. Measured against U1's newer date, U2's held
     position vanished from the book, and its pre-archive episode read CLOSED."""
@@ -933,6 +986,48 @@ def test_a_gap_present_on_every_snapshot_date_is_still_a_pre_archive_holding(con
     assert ep.entry_outside_window is True and ep.opened_at is None
 
 
+def _pre_archive_lines(tmp_path, n: int) -> int:
+    """Lines `_pre_archive` runs for `n` traded contracts in an account with `n`
+    snapshot dates, every one of them decided on the first date."""
+    import sys
+
+    from optjournal import history
+
+    conn = connect_migrated(tmp_path / f"walk{n}.db")
+    add_statement(conn, from_date="2026-01-01")
+    for day in range(1, n + 1):
+        add_snapshot(conn, "HELD", position=1, date=f"202607{day:02d}")
+    for c in range(n):
+        add_trade(conn, str(c), conid=f"C{c}", date="2026-09-30")
+    rows = conn.execute("SELECT * FROM trades").fetchall()
+    code, count = history._pre_archive.__code__, 0
+
+    def local(frame, event, arg):
+        nonlocal count
+        count += event == "line"
+        return local
+
+    sys.settrace(lambda frame, event, arg: local if frame.f_code is code else None)
+    try:
+        assert history._pre_archive(rows, conn) == {}
+    finally:
+        sys.settrace(None)
+    return count
+
+
+def test_the_pre_archive_walk_stops_once_its_answer_is_settled(tmp_path):
+    """Every contract with fills walked every snapshot date of its account, though
+    the first date already decides almost all of them (a flat gap seeds nothing),
+    so the walk grew as contracts times dates, twice per `/api/state`: 199ms on
+    two and a half years of synthetic daily statements, 23ms stopped where the
+    answer is settled. Counted in lines run rather than timed, which a loaded
+    machine cannot make flaky: tripling both contracts and dates must triple the
+    work (measured 592 to 1752 lines), where the full walk grew it sevenfold
+    (1712 to 12312)."""
+    small, large = _pre_archive_lines(tmp_path, 20), _pre_archive_lines(tmp_path, 60)
+    assert large < 4 * small, (small, large)
+
+
 # --- a bare close past flat -----------------------------------------------------
 
 
@@ -954,6 +1049,41 @@ def test_a_plain_close_past_flat_takes_the_position_flat(conn):
     assert ep.contracts == 2, "it closed 2, so it held 2"
     assert ep.proceeds == pytest.approx(-200.0 + 800.0), (
         "the whole sale, not the half a split at zero would have left here")
+
+
+def test_a_bare_close_past_flat_held_everything_it_found_the_whole_time(conn):
+    """Held 2 before the archive (nothing says so), buy 5, sell 3, then sell 4
+    marked `C`. The walk read 5, then 2; the overshoot shows the 2 it never saw
+    were held all along, so the position was 7, then 4. It reported 5 contracts,
+    and kept the add-on's date as when the position opened, though the entry
+    predates the archive: a 0DTE add-on to an older holding read as a 0DTE trade."""
+    add_trade(conn, "1", open_close="O", qty=5, date="2026-09-02")
+    add_trade(conn, "2", open_close="C", qty=-3, date="2026-09-05", realized=30.0)
+    add_trade(conn, "3", open_close="C", qty=-4, date="2026-09-09", realized=40.0)
+    (ep,) = build_history(conn).episodes
+    assert (ep.status, ep.net_qty, ep.pre_archive_qty) == ("CLOSED", 0, 2)
+    assert ep.contracts == 7
+    assert ep.entry_outside_window is True
+    assert (ep.opened_at, ep.holding_days) == (None, None)
+
+
+def test_a_bare_close_past_flat_counts_the_unseen_holding_once(conn):
+    """The overshoot is larger than anything the walk saw: held 3 before the
+    archive, buy 1, sell 4. The walk's own reading after the sale, 3 the wrong
+    side of flat, is the unseen holding and not a second one: 4 held at most."""
+    add_trade(conn, "1", open_close="O", qty=1, date="2026-09-02")
+    add_trade(conn, "2", open_close="C", qty=-4, date="2026-09-09", realized=40.0)
+    (ep,) = build_history(conn).episodes
+    assert (ep.pre_archive_qty, ep.contracts) == (3, 4)
+
+
+def test_a_bare_close_past_a_seeded_holding_adds_what_the_snapshot_missed(conn):
+    """The snapshot said 2 were held before the first fill, and a sale of 5 marked
+    `C` says 3 more were: 5 held, sold in one go."""
+    add_trade(conn, "1", open_close="C", qty=-5, date="2026-09-10", realized=90.0)
+    add_snapshot(conn, "C1", position=2, date="20260901")
+    (ep,) = build_history(conn).episodes
+    assert (ep.status, ep.pre_archive_qty, ep.contracts) == ("CLOSED", 5, 5)
 
 
 def test_a_bare_close_past_flat_does_not_absorb_a_later_re_entry(conn):

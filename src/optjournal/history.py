@@ -51,6 +51,7 @@ from optjournal.notes import split_notes
 
 __all__ = [
     "Episode",
+    "FillPart",
     "HistoryReport",
     "build_history",
     "disposition_of",
@@ -108,6 +109,34 @@ def _parse_dt(value: str | None) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class FillPart:
+    """What one episode took of one fill, in the terms an order leg is summed in.
+
+    The whole fill, or for a reversal (`C;O`) the half `_through_zero` gave this
+    episode. Named like `db.trade_legs`' columns, so a caller holding order LEGS
+    can sum these per (order, contract) into the share of a leg one position
+    took. See `campaigns.Campaign.leg_parts`.
+    """
+
+    quantity: float
+    #: IBKR's marker, or for a half of a reversal that half's own: `C` or `O`.
+    open_close: str
+    #: Executions this counts as: 1, except the opening half of a reversal. One
+    #: `C;O` execution split over two episodes is still one execution, so it
+    #: counts once, on the half it closed, which is the half IBKR books its
+    #: realised P&L on.
+    fills: int
+    date_time: str | None
+    trade_price: float | None
+    proceeds: float
+    proceeds_base: float
+    commission: float
+    commission_base: float
+    realized_pnl: float
+    realized_pnl_base: float
 
 
 @dataclass(slots=True)
@@ -176,13 +205,13 @@ class Episode:
     unrealized: float | None = None
     trade_ids: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
-    #: The half of a shared fill this episode took, keyed by trade id: its
-    #: quantity, and IBKR's own open/close marker for that half. Only a reversal
-    #: (`C;O`) is shared, and only between the two episodes `_through_zero` splits
-    #: it between, so this is empty for every other episode. Carried so a caller
-    #: holding whole order LEGS can divide one along the same zero instead of
-    #: re-deriving where it fell -- see `campaigns.Campaign.leg_parts`.
-    fill_parts: dict[str, tuple[float, str]] = field(default_factory=dict)
+    #: What this episode took of each of its fills, keyed by trade id (the keys
+    #: of `trade_ids`): the whole fill, or the half of a reversal `_through_zero`
+    #: gave it. Carried because an order LEG is per (order, contract), and one
+    #: order's fills can end one position and begin the next, so a caller holding
+    #: legs divides one by what each position actually took rather than by which
+    #: orders it lists. See `campaigns.Campaign.leg_parts`.
+    fill_parts: dict[str, FillPart] = field(default_factory=dict)
 
     @property
     def is_closed(self) -> bool:
@@ -384,8 +413,9 @@ def _through_zero(ep: Episode, row: Any) -> tuple[dict, dict]:
     return close_part, open_part
 
 
-def _absorb(ep: Episode, row: Any) -> None:
-    """Fold one fill into an episode."""
+def _absorb(ep: Episode, row: Any, *, fills: int = 1) -> None:
+    """Fold one fill into an episode. `fills` is what it counts as: see
+    `FillPart.fills`."""
     qty = row["quantity"] or 0
     closing = _is_close(row["open_close"])
 
@@ -411,7 +441,21 @@ def _absorb(ep: Episode, row: Any) -> None:
     ep.proceeds += row["proceeds"] or 0.0
     ep.proceeds_base += row["proceeds_base"] or 0.0
     if row["trade_id"]:
-        ep.trade_ids.append(str(row["trade_id"]))
+        trade_id = str(row["trade_id"])
+        ep.trade_ids.append(trade_id)
+        ep.fill_parts[trade_id] = FillPart(
+            quantity=qty,
+            open_close=str(row["open_close"] or ""),
+            fills=fills,
+            date_time=row["date_time"],
+            trade_price=row["trade_price"],
+            proceeds=row["proceeds"] or 0.0,
+            proceeds_base=row["proceeds_base"] or 0.0,
+            commission=row["ib_commission"] or 0.0,
+            commission_base=row["ib_commission_base"] or 0.0,
+            realized_pnl=row["fifo_pnl_realized"] or 0.0,
+            realized_pnl_base=row["fifo_pnl_realized_base"] or 0.0,
+        )
     for tok in split_notes(row["notes"]):
         if tok not in ep.notes:
             ep.notes.append(tok)
@@ -450,8 +494,8 @@ NAV_VALUE_BY_CATEGORY: dict[str, str] = {
 }
 
 
-def _nav_flat_where(asset_category: str | None) -> str:
-    """The equity-summary predicate saying this scope holds nothing, or "".
+def _nav_flat_where(asset_category: str) -> str:
+    """The equity-summary predicate saying this category holds nothing, or "".
 
     Per category, because each column speaks only for its own: the option book is
     flat when `options_base` is 0 whatever the stock figure. Reading the two
@@ -459,24 +503,47 @@ def _nav_flat_where(asset_category: str | None) -> str:
     for good, since the day its options go flat has no position row at all and its
     NAV still prices the stock that journal does not track.
 
-    A scope the NAV cannot price gets "" -- no NAV row may empty it. The mixed
-    scope takes every priced column being zero, which is as far as the NAV's own
-    columns reach: an account holding only funds or bonds still reads as flat
-    there on a day whose statement carried no positions.
+    A category the NAV cannot price gets "": no NAV row may empty it.
     """
-    if asset_category:
-        column = NAV_VALUE_BY_CATEGORY.get(asset_category.upper())
-        return f"{column} = 0" if column else ""
-    return " AND ".join(
-        f"{column} = 0" for column in sorted(NAV_VALUE_BY_CATEGORY.values())
+    column = NAV_VALUE_BY_CATEGORY.get(asset_category.upper())
+    return f"{column} = 0" if column else ""
+
+
+def _book_dates(flat: str) -> str:
+    """`book_dates_sql` for one category, whose NAV predicate is `flat`."""
+    nav = (
+        " UNION ALL SELECT broker, account_id, report_date FROM equity_summaries"
+        f"  WHERE {flat}"
+    ) if flat else ""
+    return (
+        "SELECT broker, account_id, MAX(d) AS book_date FROM ("
+        " SELECT broker, account_id, report_date AS d FROM position_snapshots"
+        f"{nav})"
+        " GROUP BY broker, account_id"
     )
+
+
+def _book_of(column: str) -> str:
+    """Which of the mixed scope's books a row with this `asset_category` reads:
+    its own category's if the NAV prices it, else the one no NAV row moves."""
+    priced = ", ".join(f"'{category}'" for category in sorted(NAV_VALUE_BY_CATEGORY))
+    return f"CASE WHEN {column} IN ({priced}) THEN {column} ELSE '' END"
 
 
 def book_dates_sql(asset_category: str | None = None) -> str:
     """The date each account's position book is as of, as a derived table.
 
     The newest day the account reported a position in ANY category, or on which
-    its NAV breakdown priced the scope at nothing.
+    its NAV breakdown priced the category at nothing.
+
+    `None`, every category at once, is each category read at its own book: one
+    row per account for each category the NAV prices, tagged with it in
+    `category`, and one tagged '' for every category it does not. So the whole is
+    the union of the parts. Taking the NAV flat only where it priced stock AND
+    options at nothing kept a position both halves called gone: the options of an
+    `--assets OPT` journal, whose NAV still prices stock, or the stock of an
+    account whose statement that day had no OpenPositions. `book_join_sql`
+    matches each row to its own.
 
     Any category, because IBKR's OpenPositions lists only what is held and every
     row of one statement carries the same reportDate (checked across the real
@@ -502,25 +569,26 @@ def book_dates_sql(asset_category: str | None = None) -> str:
     derived table joined on `(broker, account_id)` it is one pass: 2.2s back to
     1ms at that size.
     """
-    flat = _nav_flat_where(asset_category)
-    nav = (
-        " UNION ALL SELECT broker, account_id, report_date FROM equity_summaries"
-        f"  WHERE {flat}"
-    ) if flat else ""
-    return (
-        "SELECT broker, account_id, MAX(d) AS book_date FROM ("
-        " SELECT broker, account_id, report_date AS d FROM position_snapshots"
-        f"{nav})"
-        " GROUP BY broker, account_id"
+    if asset_category:
+        return _book_dates(_nav_flat_where(asset_category))
+    books = [(category, _book_dates(_nav_flat_where(category)))
+             for category in sorted(NAV_VALUE_BY_CATEGORY)]
+    books.append(("", _book_dates("")))
+    return " UNION ALL ".join(
+        f"SELECT broker, account_id, '{category}' AS category, book_date FROM ({sql})"
+        for category, sql in books
     )
 
 
 def book_join_sql(asset_category: str | None = None) -> str:
-    """The join narrowing a `position_snapshots p` to each account's current book."""
+    """The join narrowing a `position_snapshots p` to each account's current book:
+    for every category at once, each row to its own category's (`book_dates_sql`)."""
+    own = "" if asset_category else f"   AND b.category = {_book_of('p.asset_category')}"
     return (
         f" JOIN ({book_dates_sql(asset_category)}) b"
         "  ON b.broker = p.broker AND b.account_id = p.account_id"
         "   AND b.book_date = p.report_date"
+        f"{own}"
     )
 
 
@@ -666,17 +734,24 @@ def _pre_archive(
     for key, entries in fills.items():
         snapshot = positions.get(key, {})
         entries.sort()
-        gaps: list[float] = []
+        before: float | None = None
         net: float = 0
         index = 0
         for day in dates[key[:2]]:
             while index < len(entries) and entries[index][0] <= day:
                 net += entries[index][1]
                 index += 1
-            gaps.append((snapshot.get(day) or 0) - net)
-        before = gaps[0]
-        if not _flat(before) and all(_flat(gap - before) for gap in gaps):
-            out[key] = before
+            gap = (snapshot.get(day) or 0) - net
+            if before is None:
+                before = gap
+            # Settled by the first date whose gap is flat, or the first that moves
+            # off it: walking on to the end made this contracts times dates, and
+            # nearly every contract is decided on the first date.
+            if _flat(before) or not _flat(gap - before):
+                break
+        else:
+            if before is not None:
+                out[key] = before
     return out
 
 
@@ -769,30 +844,31 @@ def build_history(
         if past_flat and _reverses(row["open_close"]):
             # The fill finished one position and began the opposite one, so it
             # belongs to both episodes: the closing part ends this one, the
-            # leftover opens the next. Each records its own half, so a consumer
-            # holding the whole order leg can divide it the same way.
+            # leftover opens the next. Each records its own half (`fill_parts`),
+            # and the execution counts once, where it closed.
             close_part, open_part = _through_zero(current, row)
-            trade_id = str(row["trade_id"] or "")
             _absorb(current, close_part)
-            current.fill_parts[trade_id] = (
-                close_part["quantity"], close_part["open_close"])
             flush()
             current = _new_episode(row)
-            _absorb(current, open_part)
-            current.fill_parts[trade_id] = (
-                open_part["quantity"], open_part["open_close"])
+            _absorb(current, open_part, fills=0)
             continue
 
+        peak = current.peak_qty
         _absorb(current, row)
 
         if past_flat:
             # A bare `C` opens nothing, so closing more than the walk knew was
             # held says the rest was held before the archive began rather than
             # that a position opened. The close took it flat, and its size is now
-            # known: the whole fill went out of it.
-            current.pre_archive_qty += -current.net_qty
+            # known: the whole fill went out of it. Held all along, so every
+            # reading the walk took was short of it, the largest included, and
+            # the position opened before the archive rather than at the first
+            # fill the walk saw.
+            unseen = -current.net_qty
+            current.pre_archive_qty += unseen
             current.entry_outside_window = True
-            current.peak_qty = max(current.peak_qty, abs(row["quantity"] or 0))
+            current.peak_qty = peak + abs(unseen)
+            current.opened_at = None
             current.net_qty = 0
 
         if _known_size(current) and _flat(current.net_qty):
