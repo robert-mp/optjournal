@@ -470,7 +470,7 @@ def test_the_positions_view_and_the_episode_walk_read_the_same_book(conn):
     since a view cannot import it. Every case above, in three accounts at once."""
     from optjournal.history import _held
 
-    for account in ("U2", "U3"):
+    for account in ("U2", "U3", "U4"):
         add_statement(conn, source_file=f"{account}.xml", account_id=account)
     # U1: options sold, the stock still held.
     add_snapshot(conn, "A1", position=1, date="20260901")
@@ -482,6 +482,11 @@ def test_the_positions_view_and_the_episode_walk_read_the_same_book(conn):
     add_snapshot(conn, "C1", position=2, date="20260901", account_id="U3",
                  source_file="U3.xml")
     add_nav(conn, "20260916", stock=0, options=0, account_id="U3")
+    # U4: options sold, the stock untracked (`--assets OPT`), so only its NAV
+    # says the option book is flat, and it still prices the stock.
+    add_snapshot(conn, "D1", position=1, date="20260901", account_id="U4",
+                 source_file="U4.xml")
+    add_nav(conn, "20260916", stock=5000, options=0, account_id="U4")
     held, _ = _held(conn, "OPT")
     assert {conid for _, _, conid in held} == _current_option_conids(conn) == {"B1"}
 
