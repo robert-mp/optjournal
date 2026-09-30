@@ -237,6 +237,30 @@ def test_a_fetch_waits_for_the_fetch_lock_as_long_as_it_is_told(tmp_path):
     holder.join()
 
 
+def test_only_the_fetch_locks_own_wait_is_a_fetch_lock_timeout(tmp_path, monkeypatch):
+    """The CLI reads `FetchLockTimeout` as "another fetch is running" and any other
+    `LockTimeout` as an error, so the type must say which lock ran out: both
+    fetches raise it for the fetch lock, and a lock timeout from the work under
+    the lock is passed on as itself."""
+    from optjournal.locks import LockTimeout
+
+    holder = _hold_the_fetch_lock(tmp_path, 1.0)
+    with pytest.raises(flex.FetchLockTimeout):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True, lock_timeout_s=0.1)
+    with pytest.raises(flex.FetchLockTimeout):
+        flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True,
+                            lock_timeout_s=0.1)
+    holder.join()
+
+    def wedged(*_a, **_k):
+        raise LockTimeout("another process held some.lock for more than 120s.")
+
+    monkeypatch.setattr(flex, "read_token", wedged)
+    with pytest.raises(LockTimeout) as caught:
+        flex.fetch("1591754", archive_dir=tmp_path, force=True, lock_timeout_s=0.1)
+    assert not isinstance(caught.value, flex.FetchLockTimeout)
+
+
 def test_retry_budget_stays_within_a_daily_cron_window():
     """The guard that makes the timeout fix durable.
 

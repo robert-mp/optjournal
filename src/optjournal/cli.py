@@ -57,6 +57,7 @@ from optjournal.flex import (
     FETCH_LOCK_TIMEOUT_S,
     KEYRING_SERVICE,
     FetchCooldown,
+    FetchLockTimeout,
     StatementUnreadable,
     TokenMissing,
     TokenRejected,
@@ -1434,7 +1435,7 @@ def cmd_sync(args) -> int:
                 force=args.force,
                 lock_timeout_s=_lock_wait(),
             )
-        except (FetchCooldown, TokenMissing, TokenRejected, LockTimeout) as exc:
+        except (FetchCooldown, TokenMissing, TokenRejected, FetchLockTimeout) as exc:
             # RECORDED BEFORE RE-RAISING, so `main`'s handlers still decide the exit
             # code and the message. A hand-run sync used to be invisible to the
             # ledger, which is how a backed-off job stayed backed off while the
@@ -1777,11 +1778,17 @@ def main(argv: list[str] | None = None) -> int:
         # Callers (the daily cron) treat this as "try again later".
         print(f"\nThrottled by IBKR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_THROTTLED
-    except LockTimeout as exc:
+    except FetchLockTimeout as exc:
         # Another fetch held the lock past the whole wait: nothing was asked of
         # IBKR, so this is "try again later" as well, not a crash.
         print(f"\nBusy: another fetch is still running ({exc})", file=sys.stderr)
         return EXIT_THROTTLED
+    except LockTimeout as exc:
+        # Any other lock (the migration's, the settings file's) guards work that
+        # takes milliseconds, so outlasting its wait means something is wedged.
+        # An error, not "try later": the cron would otherwise skip it in silence.
+        print(f"\nGave up waiting for a lock: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     except FlexError as exc:
         print(
             f"\nFlex request failed: {type(exc).__name__}: {exc}", file=sys.stderr

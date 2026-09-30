@@ -15,7 +15,10 @@ Delivery policy, which is the part worth getting right for something that runs
                          query, which is expected, not a fault. Skipping means
                          no alert and a natural retry next tick. The CLI's
                          local fetch cooldown maps to the same exit code, so
-                         "we chose not to ask" is handled identically.
+                         "we chose not to ask" is handled identically, and so
+                         does another fetch holding the fetch lock past
+                         LOCK_WAIT_S. Any other lock timeout (the migration's,
+                         the settings file's) exits 1 and is raised.
 * No new data (3)     -> return quietly. `sync` does not currently emit this,
                          but every other command uses the
                          `EXIT_OK if data else EXIT_NO_DATA` idiom, so treating
