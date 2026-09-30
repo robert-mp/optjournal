@@ -2709,7 +2709,8 @@ def _hold_fetch_lock_briefly(monkeypatch):
 
     monkeypatch.setattr(flex, "read_token", blocked)
     monkeypatch.setattr(flex, "_client_factory", blocked)
-    monkeypatch.setattr(flex, "locked", lambda path: locks.locked(path, timeout_s=0))
+    monkeypatch.setattr(flex, "locked",
+                        lambda path, **_: locks.locked(path, timeout_s=0))
 
 
 def test_waiting_out_the_fetch_lock_is_busy_and_gives_the_sync_its_slot_back(
