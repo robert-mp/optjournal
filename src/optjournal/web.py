@@ -53,6 +53,7 @@ import signal
 import socket
 import sqlite3
 import threading
+import time
 import urllib.parse
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -973,7 +974,7 @@ def _do_sync(
 
 
 def _keyring_call(
-    work: Callable[[], tuple[str, str]],
+    work: Callable[[], tuple[str, str]], busy: threading.Lock,
 ) -> tuple[str, str] | None:
     """Run one keyring operation with a deadline. `None` means it never answered.
 
@@ -990,8 +991,20 @@ def _keyring_call(
     write that lands after the deadline is reported as a timeout and is still
     stored -- the page's advice, try again, costs nothing in that case.
 
+    ONE WORKER AT A TIME, per server, and that bound is the other half of the
+    daemon choice. A keychain waiting on an unlock never lets its worker
+    finish, so a thread per call leaked one stuck thread per click, or per
+    `<img src>` on a page elsewhere: 50 checks, 50 threads for the life of the
+    process. `busy` is held by the worker until its call returns, so a new
+    call first waits, inside the same deadline, for the one still pending, and
+    answers `None` like any other timeout if it never frees up. The keyring
+    answers one question at a time anyway.
+
     `work` returns its own (kind, message); any exception becomes ('error', str).
     """
+    deadline = time.monotonic() + KEYRING_TIMEOUT_S
+    if not busy.acquire(timeout=KEYRING_TIMEOUT_S):
+        return None
     outcome: list[tuple[str, str]] = []
 
     def run() -> None:
@@ -999,10 +1012,12 @@ def _keyring_call(
             outcome.append(work())
         except Exception as exc:  # pragma: no cover - backend failures
             outcome.append(("error", str(exc)))
+        finally:
+            busy.release()
 
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
-    worker.join(KEYRING_TIMEOUT_S)
+    worker.join(max(0.0, deadline - time.monotonic()))
     return outcome[0] if outcome else None
 
 
@@ -1027,6 +1042,8 @@ class ServeConfig:
     #: one lock per server -- not on the handler class, where it would be one
     #: lock per process.
     sync_lock: threading.Lock = field(default_factory=threading.Lock)
+    #: Held by the one keyring worker allowed at a time. See `_keyring_call`.
+    keyring_busy: threading.Lock = field(default_factory=threading.Lock)
     #: Set by an update or a journal import: `serve` stops and reports it, and
     #: the launcher starts it again (see `cli.EXIT_RESTART`).
     restart: threading.Event = field(default_factory=threading.Event)
@@ -1100,6 +1117,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if not self._addressed_here():
             return
         path, _, query = self.path.partition("?")
+        # EVERY API GET, not a list of the ones that do work today, for the
+        # reason the POST guard sits ahead of its router: a route added later is
+        # covered by default. Several do work a page elsewhere could trigger with
+        # an `<img src>`: /api/quotes spends Yahoo, CBOE and Nasdaq requests and
+        # writes the journal, /api/settings/token wakes the keyring, /api/update
+        # reaches GitHub. The page, its assets and the companion are not under
+        # /api/ and stay reachable from a link.
+        if path.startswith("/api/") and self._from_another_site():
+            self._json(403, {
+                "ok": False, "kind": "origin",
+                "message": "requests from another site's page are refused: this "
+                           "journal has no authentication.",
+            })
+            return
         params = urllib.parse.parse_qs(query)
         if path in ("/", "/index.html"):
             self._send(200, page_html().encode(), "text/html; charset=utf-8")
@@ -1257,6 +1288,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         host, port = self._bound()
         return _origin_is_same(self.headers.get("Origin"), host=host, port=port)
 
+    def _from_another_site(self) -> bool:
+        """Whether the browser says another site's page made this request.
+
+        `Sec-Fetch-Site` is set by the browser and cannot be changed by a page's
+        script. `same-origin` is this server's own page and `none` a typed URL
+        or a bookmark; `same-site` and `cross-site` are someone else's page,
+        and `same-site` includes another port on 127.0.0.1. A missing header is
+        a client that is not a browser (curl, urllib, the CLI), the same
+        reading `_origin_is_same` gives a missing `Origin`.
+        """
+        site = (self.headers.get("Sec-Fetch-Site") or "none").strip().lower()
+        return site not in ("same-origin", "none")
+
     def _addressed_here(self) -> bool:
         """Whether this request's `Host` names this server. See `_host_is_self`.
 
@@ -1352,7 +1396,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return "absent", str(exc)
             return "present", "a token is stored for this account"
 
-        answer = _keyring_call(probe)
+        answer = _keyring_call(probe, self.cfg.keyring_busy)
         if answer is None:
             log.warning("keyring did not answer within %ss", KEYRING_TIMEOUT_S)
             return 200, {
@@ -1433,7 +1477,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # Bounded like the read, and for the same measurement: a keychain waiting
         # on an unlock dialog blocks the call, and an unbounded write would hold
         # this request open with the Save button spinning forever.
-        answer = _keyring_call(store)
+        answer = _keyring_call(store, self.cfg.keyring_busy)
         if answer is None:
             log.warning("keyring did not accept a write within %ss",
                         KEYRING_TIMEOUT_S)

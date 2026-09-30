@@ -6640,6 +6640,98 @@ def test_a_keyring_that_will_not_answer_reports_it_rather_than_hanging(
     assert "Nothing was stored" in payload["message"]
 
 
+def _get_as(base: str, path: str, **headers: str) -> tuple[int, dict]:
+    """`_get` with request headers of our choosing, such as `Sec-Fetch-Site`."""
+    import urllib.error  # noqa: PLC0415 - local to this helper
+    import urllib.request  # noqa: PLC0415
+
+    request = urllib.request.Request(f"{base}{path}", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+def test_a_get_from_another_site_is_refused_before_it_does_any_work(
+    tmp_path, monkeypatch, site,
+):
+    """M21: `/api/quotes` spends Yahoo, CBOE and Nasdaq requests and writes the
+    journal, and `/api/settings/token` wakes the keyring, so an `<img src>` on
+    any page could trigger them. The browser labels such a request with
+    `Sec-Fetch-Site`, and only this server's own pages (`same-origin`) and a
+    typed URL (`none`) may use the API. `same-site` is refused too: another
+    port on 127.0.0.1 is the same site and a different origin."""
+    import keyring  # noqa: PLC0415 - local to this test
+
+    touched: list[str] = []
+    monkeypatch.setattr(keyring, "get_password",
+                        lambda service, account: touched.append("keyring"))
+    monkeypatch.setattr(web, "fetch_quote",
+                        lambda symbol, **_: touched.append("quote"))
+    db = tmp_path / "j.db"
+    with open_journal(db) as conn:
+        conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('AMD', 'x')")
+        conn.commit()
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        for path in ("/api/quotes", "/api/settings/token", "/api/state",
+                     "/api/update", "/api/jobs/run?id=1"):
+            status, reply = _get_as(base, path, **{"Sec-Fetch-Site": site})
+            assert (status, reply["kind"]) == (403, "origin"), path
+    assert touched == [], f"a refused request still did its work: {touched}"
+
+
+@pytest.mark.parametrize("site", ["same-origin", "none", None])
+def test_the_pages_own_gets_and_non_browsers_are_served(tmp_path, monkeypatch, site):
+    """The other direction: the page's fetches, a typed URL, and curl."""
+    import keyring  # noqa: PLC0415 - local to this test
+
+    monkeypatch.setattr(keyring, "get_password", lambda service, account: "tok")
+    headers = {} if site is None else {"Sec-Fetch-Site": site}
+    with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
+        status, reply = _get_as(base, "/api/settings/token", **headers)
+    assert (status, reply["present"]) == (200, True)
+
+
+def test_a_stuck_keyring_holds_one_thread_however_often_it_is_asked(
+    tmp_path, monkeypatch,
+):
+    """M21: each token check started a new worker thread, and a keychain waiting
+    on an unlock never lets one finish, so 50 checks left 50 threads stuck for
+    the life of the process. A new call now waits on the one still pending
+    instead of starting another, and reports the same "did not answer"."""
+    import threading  # noqa: PLC0415 - local to this test
+
+    import keyring  # noqa: PLC0415
+
+    release = threading.Event()
+    calls: list[int] = []
+
+    def locked_keychain(service, account):
+        calls.append(1)
+        release.wait(10)
+        return "tok"
+
+    monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(keyring, "get_password", locked_keychain)
+    try:
+        with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
+            replies = [_get(base, "/api/settings/token") for _ in range(20)]
+            assert len(calls) == 1, f"{len(calls)} keyring threads were started"
+            assert {(s, r["present"]) for s, r in replies} == {(200, None)}
+            release.set()
+            for _ in range(100):
+                status, reply = _get(base, "/api/settings/token")
+                if reply["present"] is not None:
+                    break
+    finally:
+        release.set()
+    assert (status, reply["present"], len(calls)) == (200, True, 2), (
+        "once the stuck call returned, the next check did not ask again"
+    )
+
+
 def test_the_settings_panel_offers_a_token_field_that_does_not_render_a_value():
     """The page half, pinned where the copy cannot quietly diverge from it.
 
