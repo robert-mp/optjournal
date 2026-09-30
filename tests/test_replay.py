@@ -56,17 +56,18 @@ def test_the_band_solves_vol_from_the_options_own_closes(conn):
     """
     spot, strike, vol = 100.0, 90.0, 0.40
     expiry = "2026-03-20"
-    expiry_ts = _ts("2026-03-20") + 16 * 3600
+    expiry_ts = epoch_et("2026-03-20 16:00:00")
     # Stamps built through epoch_et rather than by adding hours to a UTC
     # midnight, because the source's "midnight ET" is 04:00Z in summer and
     # 05:00Z in winter. Hand-adding 4h to a JANUARY date lands at 23:00 ET the
     # previous day, which is a different trading day and so a different join key.
+    # Each is PRICED at 16:00, though: a daily bar's price is its close.
     days = ["2026-01-05", "2026-01-06"]
     opt = []
     for day in days:
-        stamp = epoch_et(f"{day} 00:00:00")
-        years = (expiry_ts - stamp) / (365.0 * 86400)
-        opt.append(_bar(stamp, bs_price(spot, strike, years, vol, "P")))
+        years = (expiry_ts - epoch_et(f"{day} 16:00:00")) / (365.0 * 86400)
+        opt.append(_bar(epoch_et(f"{day} 00:00:00"),
+                        bs_price(spot, strike, years, vol, "P")))
     upsert_bars(conn, conid="OPT1", symbol="AAA  260320P00090000", bar_size="1d",
                 source="yahoo", bars=opt)
     # Underlying dailies stamped at the session open, as the source really does.
@@ -80,12 +81,13 @@ def test_the_band_solves_vol_from_the_options_own_closes(conn):
         [BandContract(conid="OPT1", strike=strike, right="P", expiry=expiry)],
         points,
         underlying_conid="U1",
+        bar_size="1d",
     )
     assert len(band) == 2, "no band -- the daily series failed to join"
     stamp, low, high = band[0]
-    years = (expiry_ts - epoch_et(f"{days[0]} 00:00:00")) / (365.0 * 86400)
+    years = (expiry_ts - epoch_et(f"{days[0]} 16:00:00")) / (365.0 * 86400)
     want = spot * vol * (years ** 0.5)
-    assert (high - low) / 2 == pytest.approx(want, rel=2e-2)
+    assert (high - low) / 2 == pytest.approx(want, abs=1e-4)
     assert low < spot < high
 
 
@@ -100,6 +102,7 @@ def test_the_band_is_absent_rather_than_narrow_without_a_vol(conn):
         [BandContract(conid="OPT1", strike=90.0, right="P", expiry="2026-03-20")],
         [(_ts("2026-01-05") + 13 * 3600, 100.0)],
         underlying_conid="U1",
+        bar_size="1d",
     )
     assert band == []
 
@@ -116,7 +119,7 @@ def test_marks_stop_at_expiry_rather_than_pricing_a_settled_contract(conn):
     position was live after the envelope said it had expired.
     """
     spot, strike, vol = 100.0, 90.0, 0.40
-    expiry, expiry_ts = "2026-01-16", _ts("2026-01-16") + 16 * 3600
+    expiry, expiry_ts = "2026-01-16", epoch_et("2026-01-16 16:00:00")
     # A daily series that runs a fortnight PAST expiry.
     days = [f"2026-01-{n:02d}" for n in (12, 13, 14, 15, 16, 20, 21, 22, 23)]
     opens = [epoch_et(f"{day} 09:30:00") for day in days]
@@ -124,11 +127,11 @@ def test_marks_stop_at_expiry_rather_than_pricing_a_settled_contract(conn):
                 bars=[_bar(stamp, spot) for stamp in opens])
     option = []
     for day in days:
-        stamp = epoch_et(f"{day} 00:00:00")
-        years = (expiry_ts - stamp) / (365.0 * 86400)
+        years = (expiry_ts - epoch_et(f"{day} 16:00:00")) / (365.0 * 86400)
         if years <= 0:
             continue      # the source stops too: an expired contract has no close
-        option.append(_bar(stamp, bs_price(spot, strike, years, vol, "P")))
+        option.append(_bar(epoch_et(f"{day} 00:00:00"),
+                           bs_price(spot, strike, years, vol, "P")))
     upsert_bars(conn, conid="OPT1", symbol="AAA  260116P00090000", bar_size="1d",
                 source="yahoo", bars=option)
 
@@ -137,11 +140,11 @@ def test_marks_stop_at_expiry_rather_than_pricing_a_settled_contract(conn):
         conid="OPT1", strike=strike, right="P", expiry=expiry,
         fills=((opens[0], -1.0, 3.0),),
     )
-    marks = modelled_marks(conn, [leg], points, underlying_conid="U1")
+    marks = modelled_marks(conn, [leg], points, underlying_conid="U1", bar_size="1d")
     band = expected_move_band(
         conn,
         [BandContract(conid="OPT1", strike=strike, right="P", expiry=expiry)],
-        points, underlying_conid="U1",
+        points, underlying_conid="U1", bar_size="1d",
     )
     assert marks, "the control: marks must exist while the contract is alive"
     assert max(row[0] for row in marks) <= expiry_ts, (
@@ -163,7 +166,7 @@ def test_a_fill_anchors_vol_where_the_source_has_no_history(conn):
     for an earlier window returns nothing; the data does not exist. The fill does.
     """
     spot, strike, vol = 100.0, 90.0, 0.40
-    expiry, expiry_ts = "2026-03-20", _ts("2026-03-20") + 16 * 3600
+    expiry, expiry_ts = "2026-03-20", epoch_et("2026-03-20 16:00:00")
     # An hourly chart over one session, with NO option bar anywhere.
     opens = [epoch_et("2026-01-05 09:30:00") + i * 3600 for i in range(4)]
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1h", source="yahoo",
@@ -171,23 +174,27 @@ def test_a_fill_anchors_vol_where_the_source_has_no_history(conn):
     points = [(s, spot) for s in opens]
     contract = BandContract(conid="OPT1", strike=strike, right="P", expiry=expiry)
 
-    assert expected_move_band(conn, [contract], points, underlying_conid="U1") == [], (
-        "the control: with no option price at all there is nothing to solve"
-    )
+    assert expected_move_band(
+        conn, [contract], points, underlying_conid="U1", bar_size="1h"
+    ) == [], "the control: with no option price at all there is nothing to solve"
 
-    # The same contract, priced by a fill in the second bar.
-    fill_at = opens[1]
+    # The same contract, priced by a fill halfway through the second bar.
+    fill_at = opens[1] + 1800
     years = (expiry_ts - fill_at) / (365.0 * 86400)
     priced = replace(
         contract, anchors=((fill_at, bs_price(spot, strike, years, vol, "P")),)
     )
-    band = expected_move_band(conn, [priced], points, underlying_conid="U1")
+    band = expected_move_band(
+        conn, [priced], points, underlying_conid="U1", bar_size="1h"
+    )
     assert [row[0] for row in band] == opens[1:], (
-        "the band should start AT the fill and not before it -- a vol held "
-        "backwards would price a position that did not exist yet"
+        "the band should start at the bar the fill falls in and not before it -- "
+        "a vol held backwards would price a position that did not exist yet"
     )
     stamp, low, high = band[0]
-    assert (high - low) / 2 == pytest.approx(spot * vol * (years ** 0.5), rel=2e-2)
+    # Read at that bar's close, an hour after its stamp.
+    closes = (expiry_ts - (opens[1] + 3600)) / (365.0 * 86400)
+    assert (high - low) / 2 == pytest.approx(spot * vol * (closes ** 0.5), abs=1e-4)
 
 
 def test_delta_around_reports_none_before_a_position_existed(conn):
@@ -195,12 +202,30 @@ def test_delta_around_reports_none_before_a_position_existed(conn):
     "we were delta-neutral" rather than "we were not in the trade" -- and for a
     roll, whose whole point is the exposure it removed, the pair is the number.
     """
-    marks = [[100, 0.0, 0.60], [200, 5.0, 0.40], [300, 9.0, 0.0]]
-    assert delta_around(marks, 100) == (None, 0.60), "an event on the first bar"
-    assert delta_around(marks, 250) == (0.40, 0.0), "a roll mid-series"
-    assert delta_around(marks, 50) == (None, 0.60), "before every mark"
-    assert delta_around(marks, 9999) == (0.0, None), "after every mark"
-    assert delta_around([], 100) == (None, None)
+    bars = [epoch_et(f"2026-01-05 {hour}:30:00") for hour in (9, 10, 11)]
+    marks = [[bars[0], 0.0, 0.60], [bars[1], 5.0, 0.40], [bars[2], 9.0, 0.0]]
+
+    def around(at: str):
+        return delta_around(marks, epoch_et(f"2026-01-05 {at}"), bar_size="1h")
+
+    assert around("10:30:00") == (None, 0.60), "an event at the first bar's close"
+    assert around("11:30:00") == (0.60, 0.40), "a roll mid-series"
+    assert around("09:00:00") == (None, 0.60), "before every mark"
+    assert around("13:00:00") == (0.0, None), "after every mark"
+    assert delta_around([], bars[0], bar_size="1h") == (None, None)
+
+
+def test_delta_around_reads_a_mark_at_its_bars_close(conn):
+    """A bar's mark is read at its close, so a fill inside the bar is AFTER it.
+
+    The 10:30 bar closes at 11:30, already holding a 10:35 fill. Compared by its
+    stamp, that mark counted as "before" the fill it contains, and an opening
+    card read the new position's delta on both sides of its arrow.
+    """
+    bars = [epoch_et(f"2026-01-05 {hour}:30:00") for hour in (9, 10, 11)]
+    marks = [[bars[0], 0.0, None], [bars[1], 5.0, 0.32], [bars[2], 9.0, 0.30]]
+    filled = epoch_et("2026-01-05 10:35:00")
+    assert delta_around(marks, filled, bar_size="1h") == (None, 0.32)
 
 
 def test_delta_around_carries_an_absent_delta_rather_than_flattening_it(conn):
@@ -212,9 +237,11 @@ def test_delta_around_carries_an_absent_delta_rather_than_flattening_it(conn):
     which on a symmetric axis claims the position ended delta-neutral rather than
     ended.
     """
-    marks = [[100, 0.0, None], [200, 5.0, 0.32], [300, 9.0, None]]
-    assert delta_around(marks, 250) == (0.32, None), "a CLOSING event"
-    assert delta_around(marks, 150) == (None, 0.32), "an OPENING event"
+    bars = [epoch_et(f"2026-01-05 {hour}:30:00") for hour in (9, 10, 11)]
+    marks = [[bars[0], 0.0, None], [bars[1], 5.0, 0.32], [bars[2], 9.0, None]]
+    closing, opening = epoch_et("2026-01-05 12:00:00"), epoch_et("2026-01-05 11:00:00")
+    assert delta_around(marks, closing, bar_size="1h") == (0.32, None), "a CLOSING event"
+    assert delta_around(marks, opening, bar_size="1h") == (None, 0.32), "an OPENING event"
 
 
 def test_delta_is_absent_off_position_while_pnl_keeps_reporting(conn):
@@ -261,7 +288,7 @@ def test_delta_is_absent_off_position_while_pnl_keeps_reporting(conn):
         conid="OPT1", strike=strike, right="P", expiry=expiry,
         fills=((opens[2], -1.0, 3.0), (opens[4], 1.0, 1.0)),
     )
-    marks = modelled_marks(conn, [leg], points, underlying_conid="U1")
+    marks = modelled_marks(conn, [leg], points, underlying_conid="U1", bar_size="1d")
     by_ts = {row[0]: row for row in marks}
 
     for stamp in opens[:2]:
@@ -316,7 +343,7 @@ def test_the_band_and_the_marks_share_one_vol_solve(conn, monkeypatch):
         fills=((_ts("2026-07-27"), -3.0, 5.24),),
     )
     points = [(_ts("2026-07-27") + h * 3600, 320.0 + h) for h in range(6)]
-    replay_mod.replay_model(conn, [leg], points, underlying_conid="U1")
+    replay_mod.replay_model(conn, [leg], points, underlying_conid="U1", bar_size="1h")
 
     assert len(calls) == 1, (
         f"replay_model solved vol {len(calls)} times; the band and the marks must "
@@ -343,9 +370,9 @@ def test_a_supplied_empty_vol_series_is_not_re_solved(conn, monkeypatch):
     leg = ReplayLeg(conid="C1", strike=270.0, right="P", expiry="2026-09-04")
 
     assert replay_mod.expected_move_band(
-        conn, [], points, underlying_conid="U1", vols={}) == []
+        conn, [], points, underlying_conid="U1", bar_size="1h", vols={}) == []
     assert replay_mod.modelled_marks(
-        conn, [leg], points, underlying_conid="U1", vols={}) == []
+        conn, [leg], points, underlying_conid="U1", bar_size="1h", vols={}) == []
     assert not calls, "an empty-but-supplied vol series was solved again"
 
 
@@ -384,3 +411,173 @@ def test_the_band_and_the_marks_solve_against_one_projection():
     # all three, and reading any of them off the wrong leg inverts the answer.
     assert (band[0].strike, band[0].right, band[0].expiry) == (270.0, "P", "2026-09-04")
     assert (band[1].strike, band[1].right, band[1].expiry) == (700.0, "C", "20270617")
+
+
+# --------------------------------------------------------------------------
+# Through `attach`, the interface `build_state` calls: when each price was
+# observed, and which legs a bar is modelled from.
+# --------------------------------------------------------------------------
+
+_YEAR = 365.0 * 86400
+
+
+def _hourly(conn, conid: str, closes: dict[str, float]) -> None:
+    """Hourly underlying bars, stamped at their OPEN as the source stamps them."""
+    upsert_bars(conn, conid=conid, symbol="AAA", bar_size="1h", source="yahoo",
+                bars=[_bar(epoch_et(stamp), close) for stamp, close in closes.items()])
+
+
+def _session(day: str, closes: list[float]) -> dict[str, float]:
+    """One regular session of hourly bars from 09:30, one close each."""
+    hours = ["09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30"]
+    return {f"{day} {hour}:00": close for hour, close in zip(hours, closes, strict=False)}
+
+
+def _option_close(conn, conid: str, day: str, price: float) -> None:
+    """A contract's daily close, stamped at midnight ET as the source stamps it."""
+    upsert_bars(conn, conid=conid, symbol=f"AAA {conid}", bar_size="1d",
+                source="yahoo", bars=[_bar(epoch_et(f"{day} 00:00:00"), price)])
+
+
+def _leg(conid, strike, right, expiry, at, quantity, price, marker="O") -> dict:
+    return {
+        "conid": conid, "strike": strike, "put_call": right, "expiry": expiry,
+        "first_fill_at": at, "quantity": quantity, "avg_price": price,
+        "multiplier": 100, "open_close": marker,
+    }
+
+
+def _replay(conn, legs: list[dict], *, closed: str | None = None) -> dict:
+    """The replay `attach` builds for one lifecycle of hand-stated legs."""
+    from optjournal.replay import attach
+
+    for leg in legs:
+        conn.execute(
+            "INSERT OR IGNORE INTO securities (conid, symbol, underlying_conid,"
+            " underlying_symbol, raw, updated_at) VALUES (?, ?, 'U1', 'AAA', '{}', 'now')",
+            (leg["conid"], f"AAA {leg['conid']}"),
+        )
+    state = {
+        "lifecycles": [{
+            "conids": sorted({leg["conid"] for leg in legs}),
+            "opened_at": legs[0]["first_fill_at"], "closed_at": closed,
+            "underlying": "AAA", "label": "test",
+            "status": "closed" if closed else "open",
+            "events": [{"first_fill_at": leg["first_fill_at"], "label": "e",
+                        "orders": [{"legs": [leg]}]} for leg in legs],
+        }],
+        "positions": [],
+    }
+    attach(conn, state)
+    return next(iter(state["replays"].values()))
+
+
+def _half(band: list[list[float]]) -> dict[int, float]:
+    """Each band row's half-width by stamp. The band is rounded to four places,
+    which is why the comparisons below allow 1e-4."""
+    return {row[0]: (row[2] - row[1]) / 2 for row in band}
+
+
+def test_each_bar_is_priced_at_its_close_and_a_close_is_known_only_after_it(conn):
+    """A bar is stamped at its OPEN and carries its CLOSE, so that is when it is priced.
+
+    Two defects with one cause. Pricing the 10:30 bar at 10:30 gave it an hour
+    more to expiry than its price had. And an option's daily bar, stamped at
+    midnight ET, was read as known from midnight: the whole session was banded
+    with the vol of a close that had not happened yet, measured on the real 0DTE
+    vertical of 2026-09-03 as a band a third of its true width at the open.
+    """
+    spot, strike = 100.0, 95.0
+    expiry = epoch_et("2026-01-07 16:00:00")
+    _hourly(conn, "U1",
+            _session("2026-01-05", [spot] * 7) | _session("2026-01-06", [spot] * 7))
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(epoch_et(f"{day} 09:30:00"), spot)
+                      for day in ("2026-01-05", "2026-01-06")])
+    # Monday's close at 30% vol and Tuesday's at 60%, each priced at 16:00.
+    for day, vol in (("2026-01-05", 0.30), ("2026-01-06", 0.60)):
+        years = (expiry - epoch_et(f"{day} 16:00:00")) / _YEAR
+        _option_close(conn, "OPT1", day, bs_price(spot, strike, years, vol, "P"))
+    sold = epoch_et("2026-01-06 09:45:00")
+    price = bs_price(spot, strike, (expiry - sold) / _YEAR, 0.30, "P")
+    # Closed the same session, so the window is short enough to draw hourly.
+    replay = _replay(conn, [_leg("OPT1", strike, "P", "2026-01-07",
+                                 "2026-01-06 09:45:00", -1, price)],
+                     closed="2026-01-06 15:50:00")
+
+    half = _half(replay["band"])
+    tuesday = [epoch_et(f"2026-01-06 {h}:30:00") for h in range(9, 16)]
+    for stamp in tuesday[:-1]:
+        closes = stamp + 3600
+        assert half[stamp] == pytest.approx(
+            spot * 0.30 * ((expiry - closes) / _YEAR) ** 0.5, abs=1e-4
+        ), "a bar before 16:00 used Tuesday's close, or its stamp rather than its close"
+    # The 15:30 bar closes at 16:00: the first moment Tuesday's close exists.
+    assert half[tuesday[-1]] == pytest.approx(
+        spot * 0.60 * ((expiry - epoch_et("2026-01-06 16:00:00")) / _YEAR) ** 0.5,
+        abs=1e-4,
+    )
+
+
+def test_the_settlement_bar_has_a_band_of_no_width_and_a_mark_at_intrinsic(conn):
+    """The last bar of an expiry session closes AT the expiry: nothing is left to move.
+
+    Stamped 15:30 and priced as if it were, it kept half an hour of expected move
+    and a time value the contract no longer had.
+    """
+    spot, strike = 100.0, 95.0
+    expiry = epoch_et("2026-01-06 16:00:00")
+    _hourly(conn, "U1",
+            _session("2026-01-05", [spot] * 7) | _session("2026-01-06", [spot] * 7))
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(epoch_et("2026-01-05 09:30:00"), spot)])
+    years = (expiry - epoch_et("2026-01-05 16:00:00")) / _YEAR
+    _option_close(conn, "OPT1", "2026-01-05", bs_price(spot, strike, years, 0.30, "P"))
+    # Held to expiry: the lifecycle ends that session with no closing fill yet.
+    replay = _replay(conn, [_leg("OPT1", strike, "P", "2026-01-06",
+                                 "2026-01-06 09:45:00", -1, 0.50)],
+                     closed="2026-01-06 16:20:00")
+
+    last = epoch_et("2026-01-06 15:30:00")
+    band = {row[0]: row for row in replay["band"]}
+    marks = {row[0]: row for row in replay["marks"]}
+    assert band[last][1] == band[last][2] == spot, "a band at settlement"
+    assert marks[last][1] == pytest.approx(50.0), (
+        "the put expired out of the money, so the trade kept its whole credit"
+    )
+
+
+@pytest.mark.parametrize(("filled", "spot_then"), [
+    # Inside a session: between the 10:30 close and the 11:30 close.
+    ("2026-01-06 10:45:00", 105.0),
+    # Fifteen minutes after the open: between the 102 the session opened at and
+    # the first bar's 104 close. Not across the night from Monday's 100 close.
+    ("2026-01-06 09:45:00", 102.5),
+])
+def test_a_fill_is_paired_with_the_spot_either_side_of_it(conn, filled, spot_then):
+    """A fill's vol is solved against the underlying AT the fill, not an hour later.
+
+    The chart's points are closes stamped at their bars' opens, and a fill was
+    interpolated between those stamps, so it was paired with a spot an hour after
+    it: measured on the real 7755C at 09:34, 7706.80 against 7688.02, which solved
+    14.1% for an 18.4% contract.
+    """
+    strike, vol = 100.0, 0.40
+    expiry = epoch_et("2026-01-09 16:00:00")
+    _hourly(conn, "U1", {"2026-01-05 15:30:00": 100.0}
+            | _session("2026-01-06", [104.0, 108.0, 112.0, 112.0]))
+    # Tuesday opened 2 above Monday's close, as a session often does.
+    opening = epoch_et("2026-01-06 09:30:00")
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1h", source="yahoo",
+                bars=[Bar(ts=opening, open=102.0, high=104.0, low=102.0, close=104.0,
+                          volume=1)])
+    at = epoch_et(filled)
+    price = bs_price(spot_then, strike, (expiry - at) / _YEAR, vol, "C")
+    replay = _replay(conn, [_leg("OPT1", strike, "C", "2026-01-09", filled, -1, price)])
+
+    # The first bar to close after the fill is the first one its vol reaches.
+    row = next(row for row in replay["band"] if row[0] + 3600 >= at)
+    bar_spot = {ts: close for ts, close in replay["points"]}[row[0]]
+    assert (row[2] - row[1]) / 2 == pytest.approx(
+        bar_spot * vol * ((expiry - (row[0] + 3600)) / _YEAR) ** 0.5, abs=1e-4
+    ), "the fill was paired with a spot other than the one around it"

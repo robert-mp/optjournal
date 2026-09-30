@@ -155,6 +155,15 @@ the ET trading **day**, not the timestamp, because the source does not stamp the
 alike: an option's daily bar arrives at 04:00Z (midnight ET) while its
 underlying's arrives at 13:30Z (the session open).
 
+Either way a stamp is the bar's OPEN and its price is the CLOSE, so the replay
+model reads every bar at its close (`replay._closed_at`): an hourly bar an hour
+after its stamp, the 15:30 bar at 16:00, and a daily bar at 16:00 whatever it is
+stamped. An option's close is therefore not known until 16:00 of its own session,
+and the last bar of an expiry session sits at the expiry itself, with no time
+left and no band width. A fill is paired with the underlying between the two
+prints around it, so a fill in a session's first hour starts from that session's
+open rather than from the prior close.
+
 ## Perishable data
 
 Bar retention is **asymmetric**, and the collection schedule follows from it
