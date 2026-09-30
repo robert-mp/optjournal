@@ -1436,7 +1436,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local JSON Object ages input mine qb wf was
  * @local when parts names raw err
  * @local COST_OPTIONS bits cost fees on wh
- * @local STATS_KEYS_REQUIRED missing state
+ * @local STATS_KEYS_REQUIRED missing state SCOPE_KEYS
  * @local SCORINGS qidsave cqidsave tokcheck toksave
  * @local WMETER WRING arc tin tout sb
  * @local events
@@ -7226,6 +7226,23 @@ function stateQuery(){
   return qs.toString();
 }
 
+/* THE SCOPE THE PAYLOAD IN HAND WAS READ FOR, so a failed read can put it back.
+ *
+ * Every control that changes the query writes its new value into S and THEN calls
+ * load(), which is right while the read succeeds and was a lie when it did not: the
+ * page redraws from the payload it still has, so pressing Previous period and then
+ * picking Equities against a 503 left the header saying "Aug 2026", the view button
+ * saying Equities and the URL saying both, over September's all-options figures --
+ * and it survived every later redraw until the next successful load. Recorded as
+ * each payload lands rather than at the top of load(), because by then S already
+ * holds the scope being asked for.
+ *
+ * The keys are the ones stateQuery() sends. Not `calday`: that is a selection WITHIN
+ * a payload rather than part of the request, and draw() already drops a day the
+ * payload holds no fills for. */
+const SCOPE_KEYS=['month','type','cost','scoring'];
+let LOADED={};
+
 async function load(){
   const qs=stateQuery();
   let st=null, why='';
@@ -7239,7 +7256,9 @@ async function load(){
      "running" with nothing left to wait for. */
   if(!st){
     note('Could not read state: '+esc(why),'bad');
-    if(S.state) draw();
+    /* Over figures that did not move, with the controls that produced them: the
+       banner says the read failed, and nothing else claims otherwise. */
+    if(S.state){Object.assign(S,LOADED);draw();}
     return;
   }
   S.state=st;
@@ -7254,6 +7273,9 @@ async function load(){
   /* Server-resolved, so an unrecognised type falls back to everything here too
      instead of leaving the button set out of step with the numbers. */
   S.type=S.state.trade_type==='all'?null:S.state.trade_type;
+  /* AFTER the heals, so what is remembered is the scope these figures are for
+     rather than the one that was asked for. */
+  LOADED=Object.fromEntries(SCOPE_KEYS.map(k=>[k,S[k]]));
   draw();
 }
 

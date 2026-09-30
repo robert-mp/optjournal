@@ -5332,11 +5332,56 @@ def test_a_state_reply_that_cannot_be_read_still_hands_the_buttons_back(reply):
         "function draw(){draws++;}",
         "function staleServerCheck(){}",
         f"let fetch; {reply}",
+        _page_const("SCOPE_KEYS"), "let LOADED={};",
         *_page_fns("stateQuery", "load"),
         "try{ await load(); }catch(e){ notes.push('threw'); }",
         "console.log(JSON.stringify({draws,notes}));",
     ])
     assert out == {"draws": 1, "notes": ["bad"]}
+
+
+def test_a_failed_state_read_leaves_the_controls_over_the_figures_in_hand():
+    """L51: the page showed the NEW scope over the OLD figures. Press Previous
+    period and pick Equities while `/api/state` answers 503 and the header said
+    "Aug 2026", the view button said "Equities" and the URL said
+    `month=2026-08&type=equities`, while Net P&L and the whole body were still
+    September's all-options numbers -- and every later redraw kept it that way until
+    the next successful load.
+
+    Each control writes into S and then calls load(), so the scope cannot be read
+    back at the top of load(): what is remembered is the scope each payload ARRIVED
+    with, and a failed read puts it back before redrawing. Driven in headless
+    Chromium as well (month step, then a trade-type change, both against a 503).
+    """
+    payload = {"month_range": ["2026-08", "2026-09"], "trade_type": "all", "stats": {}}
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const S={state:null,month:'2026-09',type:null,cost:['OPT'],scoring:null,"
+        "calday:null};",
+        "const notes=[]; let draws=0;",
+        "function note(text,kind){notes.push(kind);}",
+        "function draw(){draws++;}",
+        "function staleServerCheck(){}",
+        f"const payload={json.dumps(payload)};",
+        "let fetch=async()=>({ok:true,status:200,json:async()=>payload});",
+        _page_const("SCOPE_KEYS"), "let LOADED={};",
+        *_page_fns("stateQuery", "load"),
+        "await load();",
+        # What the month stepper and the trade-type buttons do, then a read that fails.
+        "S.month='2026-08';S.type='equities';S.cost=['OPT','STK'];S.scoring='campaign';",
+        "fetch=async()=>({ok:false,status:503,json:async()=>({})});",
+        "await load();",
+        "console.log(JSON.stringify({month:S.month,type:S.type,cost:S.cost,",
+        "  scoring:S.scoring,query:stateQuery(),draws,notes}));",
+    ])
+    assert out["notes"] == ["bad"], "the banner no longer says the read failed"
+    assert out["draws"] == 2, "a failed read must still redraw and hand the buttons back"
+    assert out["month"] == "2026-09", "the header still names a month the figures are not for"
+    assert out["type"] is None, "the view button still names a scope the figures are not for"
+    assert out["cost"] == ["OPT"], "the cost chips still name a scope the figures are not for"
+    assert out["scoring"] is None, "the scoreboard unit still disagrees with its figures"
+    # The URL is written from the same keys, so agreeing here is agreeing there.
+    assert out["query"] == "month=2026-09&cost=OPT"
 
 
 def test_only_the_job_that_spends_a_broker_request_asks_for_confirmation():
