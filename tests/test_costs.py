@@ -495,14 +495,20 @@ def test_the_odte_subset_narrows_a_journal_that_has_some(tmp_path):
 
 
 def test_withholding_reports_an_effective_rate(conn):
-    """IBKR reports dividends net, so gross is net plus withheld."""
-    add_cash(conn, "d1", kind="Dividends", symbol="IBKR", amount=78.5,
+    """Withheld over the GROSS dividend, which is what IBKR's Dividends row is.
+
+    Verified on the real account: 0.8609 IBKR shares at USD 0.0875 is 0.0753,
+    reported as a 0.08 Dividends row with 0.02 withheld beside it. So the row is
+    the gross, and dividing by gross plus withheld understated a 30% rate as
+    about 23%.
+    """
+    add_cash(conn, "d1", kind="Dividends", symbol="IBKR", amount=80.0,
              description="IBKR cash dividend")
-    add_cash(conn, "w1", kind="Withholding Tax", symbol="IBKR", amount=-21.5,
+    add_cash(conn, "w1", kind="Withholding Tax", symbol="IBKR", amount=-24.0,
              description="IBKR withholding")
     line = build_costs(conn).withholding[0]
     assert line.symbol == "IBKR"
-    assert line.effective_rate == pytest.approx(21.5)
+    assert line.effective_rate == pytest.approx(30.0)
 
 
 def test_a_withholding_refund_and_a_dividend_reversal_net_off(conn):

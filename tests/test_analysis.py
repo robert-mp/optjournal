@@ -149,17 +149,17 @@ def test_withholding_is_a_positive_amount_however_ibkr_signs_it():
     """IBKR sends WHTAX as a NEGATIVE amount; the rate must not invert.
 
     All ten archived withholding rows are negative. Accumulated verbatim, the
-    withheld total goes negative, and `effective_rate` -- withheld/(net+withheld)
-    -- returns a negative percentage on a real tax that was really paid. The
-    dividend keeps its sign because a dividend is income.
+    withheld total goes negative, and `effective_rate` -- withheld/gross -- returns
+    a negative percentage on a real tax that was really paid. The dividend keeps
+    its sign because a dividend is income.
     """
     r = analyse(_cash_stmt([
-        _cash("DIVIDEND", "0.85", symbol="ACME"),
+        _cash("DIVIDEND", "1.00", symbol="ACME"),
         _cash("WHTAX", "-0.15", symbol="ACME"),
     ]))
     line = next(w for w in r.withholding if w.symbol == "ACME")
     assert line.withheld_base == Decimal("0.15"), "the withheld amount stayed negative"
-    assert line.gross_base == Decimal("0.85")
+    assert line.gross_base == Decimal("1.00")
     assert line.effective_rate == Decimal("15")
     assert line.effective_rate > ZERO, "a tax paid cannot be a negative rate"
 
@@ -213,14 +213,17 @@ def test_withholding_without_dividend_has_no_rate():
 
 
 def test_withholding_rate_is_gross_relative():
-    """IBKR reports dividends net, so the rate is withheld/(net+withheld)."""
+    """IBKR's Dividends row is the GROSS amount, so the rate is withheld/gross.
+
+    Dividing by gross plus withheld read a 30% rate as about 23%.
+    """
     line = WithholdingLine(
         symbol="ACME",
         currency="USD",
-        gross_base=Decimal("85"),
-        withheld_base=Decimal("15"),
+        gross_base=Decimal("80"),
+        withheld_base=Decimal("24"),
     )
-    assert line.effective_rate == Decimal("15")
+    assert line.effective_rate == Decimal("30")
 
 
 def test_zero_notional_pair_has_no_bps():

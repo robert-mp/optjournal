@@ -273,19 +273,18 @@ class WithholdingLine:
 
     @property
     def effective_rate(self) -> Decimal | None:
-        """Withheld / (net + withheld), since IBKR reports dividends net.
+        """Withheld / gross, since IBKR's Dividends row is the gross amount.
+
+        The tax arrives as its own WHTAX row beside the gross dividend, so
+        dividing by the two together understated a 30% rate as about 23%.
 
         Returns None when there is no matching dividend. Withholding on
         credit interest, for instance, arrives as a WHTAX row with no
-        DIVIDEND counterpart, and dividing by the withholding alone would
-        report a meaningless 100%.
+        DIVIDEND counterpart, and there is no gross to divide by.
         """
         if not self.gross_base:
             return None
-        total = self.gross_base + self.withheld_base
-        if not total:
-            return None
-        return (self.withheld_base / total) * Decimal("100")
+        return (self.withheld_base / self.gross_base) * Decimal("100")
 
 
 @dataclass(slots=True)
@@ -720,7 +719,7 @@ def format_report(report: CostReport) -> str:
             out.append(f"    {c.name}: {c.examples[0]}")
 
     out.append("\nDividend withholding")
-    out.append(f"  {'symbol':<16}{'ccy':>5}{'net':>10}{'withheld':>11}{'eff rate':>10}")
+    out.append(f"  {'symbol':<16}{'ccy':>5}{'gross':>10}{'withheld':>11}{'eff rate':>10}")
     for w in report.withholding:
         rate = f"{w.effective_rate:.1f}%" if w.effective_rate is not None else "-"
         out.append(
