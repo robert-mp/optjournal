@@ -1046,6 +1046,8 @@ def load(path: Path) -> FlexQueryResponse:
     _check_root(root, expect=ACTIVITY_QUERY_TYPE, source=path.name)
     try:
         return parse_xml_file(str(path))
-    except ValueError as exc:  # pydantic's ValidationError is a ValueError
+    # pydantic's ValidationError is a ValueError; py_ibkr's `parse_decimal` raises
+    # decimal.InvalidOperation, an ArithmeticError, for a malformed number.
+    except (ValueError, ArithmeticError) as exc:
         first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
         raise StatementUnreadable(f"{path.name} could not be parsed: {first}") from exc

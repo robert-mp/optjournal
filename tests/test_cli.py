@@ -21,6 +21,7 @@ string the user types, and the tuple the ingest receives.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -742,3 +743,25 @@ def test_a_malformed_statement_is_one_line_not_a_traceback(tmp_path, capsys,
     assert "activity-bad.xml" in err
     assert len(err.splitlines()) == 1, err
     assert "request" not in err, "a local file is not a failed Flex request"
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+@pytest.mark.parametrize("command", ["costs", "show", "ingest"])
+def test_a_statement_with_a_malformed_number_is_one_line_not_a_traceback(
+    tmp_path, capsys, command,
+):
+    """Well-formed XML whose one number is not a number: py_ibkr raises
+    decimal.InvalidOperation, an ArithmeticError rather than a ValueError, so
+    it escaped as a traceback and stopped `ingest` before the files after it."""
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    assert 'quantity="' in text
+    bad = tmp_path / "activity-badnumber.xml"
+    bad.write_text(re.sub(r'quantity="[^"]*"', 'quantity="abc"', text, count=1),
+                   encoding="utf-8")
+    args = [command, str(bad)] + (["--db", str(tmp_path / "j.db")]
+                                  if command == "ingest" else [])
+    code = main(args)
+    out = capsys.readouterr()
+    assert code != 0
+    assert "Traceback" not in out.err
+    assert "activity-badnumber.xml" in out.out + out.err
