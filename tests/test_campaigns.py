@@ -258,17 +258,19 @@ def test_a_group_that_joins_nothing_lends_neither_side_its_other_order():
     """Sell a long, buy the same contract back 30 seconds later under a second
     order: one window group on one contract, so it joins nothing. Each campaign
     still listed every order of the group, and the Trades tab, which reaches a
-    campaign through its orders, drew both orders whole in both cards. The
-    re-entry's anchor was the sale's order, so its journal entry was filed under
-    a handle belonging to the other card. Each now lists the orders of its own
-    fills."""
+    campaign through its orders, drew both orders whole in both cards. Each now
+    lists the orders of its own fills.
+
+    The anchor does not follow: the re-entry's card has always answered to the
+    sale's order, 1002, and what was written or linked against it has to keep
+    finding it (`test_journal`), so it still does."""
     eps = [_Ep("C1", ["t1", "t2"], pnl=48.0), _Ep("C1", ["t3", "t4"], pnl=43.0)]
     camps = link(eps, order_groups=[("1001",), ("1002", "1003"), ("1004",)],
                  order_of_trade={"t1": "1001", "t2": "1002", "t3": "1003",
                                  "t4": "1004"})
     assert [c.order_ids for c in camps] == [
         frozenset({"1001", "1002"}), frozenset({"1003", "1004"})]
-    assert [c.anchor for c in camps] == ["1001", "1003"]
+    assert [c.anchor for c in camps] == ["1001", "1002"]
 
 
 def _part(quantity, open_close, at, price, *, proceeds=0.0, pnl=0.0):
