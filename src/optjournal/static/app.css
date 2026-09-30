@@ -1302,9 +1302,15 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .wselb b{font-family:var(--mono);letter-spacing:var(--tr-caps)}
 .wselb .dim{margin-left:var(--s3)}
 /* Daily: muted unless the reading is strengthening, the same rule the newest
-   histogram bar follows, so the column and the bars agree at a glance. */
-.wtab td.wdaily{opacity:.62}
-.wtab td.wdaily.strong{opacity:1}
+   histogram bar follows, so the column and the bars agree at a glance. Muted as
+   far as AA allows and no further: at .62 a loss read 3.55:1 on its row, and
+   `.85` is the lowest that keeps --ok and --bad at 4.5:1 on every row surface of
+   every theme (the open row's --seg1 is the binding one; a test recomputes it).
+   So the strengthening reading is also set in the label weight, which is what
+   still tells the two apart. Only a signed figure is muted: the dash for a
+   missing one is already --dim, and dimming that again read 2.85:1. */
+.wtab td.wdaily.signed{opacity:.85}
+.wtab td.wdaily.strong{opacity:1;font-weight:var(--w-label)}
 /* Except the one row that is not a row: the empty-filter message. It carries no
    `data-wsel`, so the pointer cursor above would promise a selection that clicking
    it cannot make. */
@@ -1887,7 +1893,9 @@ stop.gneg{stop-color:var(--bad)}
 .zread{padding:var(--s3) var(--s4);border-radius:var(--r2);border:1px solid var(--line)}
 .zpadcall .zread{background:var(--callwash)}
 .zpadput .zread{background:var(--putwash)}
-.zread .zk{font-size:var(--t0);letter-spacing:var(--tr-caps);color:var(--dim)}
+/* --kicker, like every other label on this tab: --dim on Leather's call wash read
+   4.45:1 at 10px. */
+.zread .zk{font-size:var(--t0);letter-spacing:var(--tr-caps);color:var(--kicker)}
 .zv{font-size:var(--t5);font-weight:var(--w-fig);font-family:var(--fig);margin-top:var(--s2);
   font-variant-numeric:tabular-nums}
 .zwarn{margin-top:var(--s3);color:var(--warnfg)}

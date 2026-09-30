@@ -3829,6 +3829,75 @@ def test_the_selected_tab_separates_from_an_unselected_one_in_every_theme():
         )
 
 
+def _washes() -> dict[str, dict[str, tuple[float, float, float, float]]]:
+    """Every theme's translucent names, as {selector: {name: (r, g, b, alpha)}}."""
+    return {
+        selector: {
+            name.lstrip("-"): tuple(float(part) for part in value.split(","))
+            for name, value in re.findall(
+                r"(--[a-z0-9]+)\s*:\s*rgba\(([^)]*)\)",
+                re.sub(r"/\*.*?\*/", "", body, flags=re.S),
+            )
+        }
+        for selector, body in re.findall(
+            r"^(:root[^{\n]*|\[data-theme=\"[a-z]+\"\])\{(.*?)\n\}",
+            _css(), flags=re.S | re.M,
+        )
+    }
+
+
+def _over(top: tuple[float, ...], alpha: float, ground: str) -> str:
+    """`top` at `alpha` over the hex `ground`, as a hex."""
+    below = [int(ground[i : i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(t * alpha + b * (1 - alpha)):02x}"
+                         for t, b in zip(top, below, strict=False))
+
+
+def _hex_rgb(colour: str) -> tuple[int, int, int]:
+    return (int(colour[1:3], 16), int(colour[3:5], 16), int(colour[5:7], 16))
+
+
+def test_the_watchlists_muted_daily_figure_meets_aa_in_every_theme():
+    """L43: the Daily column is muted with `opacity` unless the reading is
+    strengthening, and at .62 a loss read 3.55 to 3.70:1 on its row, with the
+    dash for a missing reading at 2.85:1. The opacity is read from the rule and
+    recomputed for both signs on every surface a row can sit on: the card, the
+    hover ground, and the open row's gradient stops.
+    """
+    rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "opacity" not in rules.get(".wtab td.wdaily", ""), (
+        "the whole cell is dimmed, including the --dim dash for a missing reading")
+    muted = re.search(r"opacity:([0-9.]+)", rules.get(".wtab td.wdaily.signed", ""))
+    assert muted, "the muted daily figure has no opacity rule to check"
+    alpha = float(muted.group(1))
+    for selector, palette in _themes().items():
+        for sign in ("ok", "bad"):
+            for surface in ("panel", "bg2", "seg1", "seg2"):
+                seen = _over(_hex_rgb(palette[sign]), alpha, palette[surface])
+                ratio = _ratio(seen, palette[surface])
+                assert ratio >= 4.5, (
+                    f"{selector}: --{sign} at opacity {alpha} reads {ratio:.2f}:1 on "
+                    f"--{surface}, below AA for the 13px Daily figure")
+
+
+def test_the_0dte_tile_labels_meet_aa_on_their_washes_in_every_theme():
+    """L43: "Points from SPX" and its neighbours sit on the pad's call or put wash
+    over --bg2, and in --dim they read 4.45:1 on Leather's call wash. Measured
+    against the wash as it composites, for whichever name the rule uses."""
+    body = next(b for s, b in _toplevel_rules() if s.strip() == ".zread .zk")
+    name = re.search(r"color:var\(--([a-z0-9]+)\)", body.replace(" ", ""))
+    assert name, "the tile label's colour is not a theme name"
+    washes = _washes()
+    for selector, palette in _themes().items():
+        for wash in ("callwash", "putwash"):
+            *rgb, alpha = washes[selector][wash]
+            ground = _over(tuple(rgb), alpha, palette["bg2"])
+            ratio = _ratio(palette[name.group(1)], ground)
+            assert ratio >= 4.5, (
+                f"{selector}: --{name.group(1)} is {ratio:.2f}:1 on --{wash} over "
+                f"--bg2, below AA for a 10px label")
+
+
 def test_every_theme_declares_the_same_palette():
     """A theme is a SWAP, not a patch.
 
