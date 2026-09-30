@@ -882,13 +882,13 @@ def test_sync_behind_another_fetch_is_busy_not_a_traceback(tmp_path, capsys, mon
     to do), and if another fetch holds it even longer, says busy, exits as
     throttled, and records it for the scheduler. It escaped as a traceback with
     no ledger row."""
-    from optjournal.locks import LockTimeout
+    from optjournal.flex import FetchLockTimeout
 
     seen: dict = {}
 
     def held(**kwargs):
         seen.update(kwargs)
-        raise LockTimeout("raw/.fetch.lock held by another fetch")
+        raise FetchLockTimeout("raw/.fetch.lock held by another fetch")
 
     monkeypatch.setattr(cli, "sync_journal", held)
     db = tmp_path / "j.db"
@@ -903,3 +903,73 @@ def test_sync_behind_another_fetch_is_busy_not_a_traceback(tmp_path, capsys, mon
         "SELECT status, detail FROM job_runs WHERE job = 'sync' ORDER BY id DESC"
     ).fetchone()
     assert (row["status"], row["detail"][:5]) == ("nothing", "busy:")
+
+
+def test_sync_waits_for_the_real_fetch_lock_as_long_as_it_is_told(
+    tmp_path, capsys, monkeypatch,
+):
+    """The whole path behind the test above, with a real holder: the wait the cron
+    hands over in `OPTJOURNAL_LOCK_WAIT_S`, then busy and throttled. Nothing past
+    the lock may run, so the keyring and IBKR are refused outright."""
+    import time
+
+    from optjournal import flex, locks
+
+    def refused(*_a, **_k):
+        raise AssertionError("got past the fetch lock: keyring/IBKR must not be reached")
+
+    monkeypatch.setattr(flex, "read_token", refused)
+    monkeypatch.setattr(flex, "_client_factory", refused)
+    monkeypatch.setenv(cli.LOCK_WAIT_ENV, "0.2")
+    archive = tmp_path / "raw"
+    started = time.monotonic()
+    with locks.locked(archive / flex.FETCH_LOCK):
+        code = main(["sync", "1591754", "--db", str(tmp_path / "j.db"),
+                     "--archive", str(archive)])
+    assert code == cli.EXIT_THROTTLED
+    assert "Busy" in capsys.readouterr().err
+    assert time.monotonic() - started < 5, "the wait it was told was not the one used"
+
+
+def _held_elsewhere(monkeypatch, module, path):
+    """Hold the lock file at `path` here, and make `module` wait for it not at all.
+
+    The two locks this is for wait `locks.DEFAULT_TIMEOUT_S` (120s), so the wait is
+    cut to one attempt: the lock itself is real, and so is the timeout it raises.
+    """
+    from optjournal import locks
+
+    monkeypatch.setattr(module, "locked",
+                        lambda target, **_: locks.locked(target, timeout_s=0))
+    return locks.locked(path)
+
+
+def test_a_migration_lock_timeout_is_an_error_not_busy(tmp_path, capsys, monkeypatch):
+    """Only the FETCH lock's timeout means "another fetch is running, try later".
+    Every `LockTimeout` read that way, so a migration wedged behind another
+    process exited EXIT_THROTTLED with "Busy: another fetch is still running",
+    which the cron turns into a silent Skip."""
+    from optjournal import db as dbmod
+
+    journal = tmp_path / "j.db"             # new, so the migration takes its lock
+    with _held_elsewhere(monkeypatch, dbmod, Path(f"{journal}.migrate.lock")):
+        code = main(["sync", "1591754", "--db", str(journal),
+                     "--archive", str(tmp_path / "raw")])
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_ERROR, err
+    assert "Busy" not in err and "another fetch" not in err, err
+    assert "migrate.lock" in err and "Traceback" not in err, err
+
+
+def test_a_settings_lock_timeout_is_an_error_not_busy(tmp_path, capsys, monkeypatch):
+    """The same for the settings file's lock, which `setup` takes to save the id."""
+    from optjournal import settings
+
+    _fake_keyring(monkeypatch)
+    home = tmp_path / "home"
+    home.mkdir()
+    with _held_elsewhere(monkeypatch, settings, settings.lock_path(home)):
+        code = _setup(monkeypatch, home)
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_ERROR, err
+    assert "Busy" not in err and settings.LOCK_FILENAME in err, err

@@ -145,7 +145,7 @@ def record_run(
             (job, fired_for, started_at or stamp, stamp, status, detail, done, total),
         )
         run_id = int(cursor.lastrowid or 0)
-        _upsert_state(conn, job, status, fired_for)
+        _upsert_state(conn, job, status, fired_for, busy=_is_busy(status, detail))
         prune_runs(conn, job)
         conn.commit()
         return run_id
@@ -161,7 +161,8 @@ def record_run(
 
 
 def _upsert_state(
-    conn: sqlite3.Connection, job: str, status: str, fired_for: int | None
+    conn: sqlite3.Connection, job: str, status: str, fired_for: int | None,
+    *, busy: bool = False,
 ) -> None:
     """Update the job's scheduling anchor. Does NOT commit; the caller owns that.
 
@@ -170,6 +171,11 @@ def _upsert_state(
     `consecutive_failures` rule is the subtle part: it must reset on anything that
     is not a failure, or "consecutive" means "ever" and a transient failure backs
     off forever. Three copies of that CASE is three chances for one to drift.
+
+    A BUSY run is the exception: it waited out another fetch's lock and asked
+    nothing, so it is neither a failure nor a recovery, and leaves the count as it
+    was. Resetting it made a backed-off `confirm` that met the lock once healthy
+    again, polling IBKR every tick until it failed five more times.
 
     `heartbeat_at` is deliberately untouched. It belongs to the TICK LOOP, not to
     a job outcome -- the whole point of the two signals being separate is that a
@@ -182,9 +188,10 @@ def _upsert_state(
         " ON CONFLICT(job) DO UPDATE SET"
         "   last_fired_for = COALESCE(excluded.last_fired_for, last_fired_for),"
         "   last_status = excluded.last_status,"
-        "   consecutive_failures = CASE WHEN excluded.last_status = 'failed'"
-        "     THEN consecutive_failures + 1 ELSE 0 END",
-        (job, fired_for, status, 1 if status == "failed" else 0),
+        "   consecutive_failures = CASE WHEN ? THEN consecutive_failures"
+        "     WHEN excluded.last_status = 'failed' THEN consecutive_failures + 1"
+        "     ELSE 0 END",
+        (job, fired_for, status, 1 if status == "failed" else 0, int(busy)),
     )
 
 
@@ -607,14 +614,20 @@ def sync_outcome(result: dict[str, Any] | Exception) -> Outcome:
     )
 
 
-#: How a busy run's detail begins. Read back by `_ledger_snapshot`, which must
-#: not count such a run as a poll, so the two spellings live in one place.
+#: How a busy run's detail begins. Read back by `_is_busy`, for the ledger code
+#: that must not count such a run as a poll, an attempt or a recovery, so the two
+#: spellings live in one place.
 _BUSY_DETAIL = "busy: "
 
 
 def _busy(exc: LockTimeout) -> Outcome:
     """A run that waited out a lock another process held, and so did nothing."""
     return Outcome("nothing", f"{_BUSY_DETAIL}{exc}"[:400], busy=True)
+
+
+def _is_busy(status: object, detail: object) -> bool:
+    """Whether a recorded run was busy, read back from the row `_busy` wrote."""
+    return status == "nothing" and str(detail or "").startswith(_BUSY_DETAIL)
 
 
 def record_manual_sync(
@@ -874,7 +887,8 @@ def _finish(
         row = conn.execute(
             "SELECT job, fired_for FROM job_runs WHERE id = ?", (run_id,)).fetchone()
         if row is not None:
-            _upsert_state(conn, str(row["job"]), outcome.status, row["fired_for"])
+            _upsert_state(conn, str(row["job"]), outcome.status, row["fired_for"],
+                          busy=outcome.busy)
             prune_runs(conn, str(row["job"]))
         conn.commit()
     except sqlite3.Error as exc:
@@ -1060,7 +1074,9 @@ def _window_due(
     A failed poll does not brake, so a transient failure retries on the next tick.
     Once the job is BACKED OFF, a failed attempt brakes like a poll, which slows it
     to one attempt per window: the cadence it keeps when healthy, so a backed-off
-    `confirm` never asks IBKR more often than a working one does.
+    `confirm` never asks IBKR more often than a working one does. `last_try` is
+    then the last attempt that could have asked (`due_jobs` passes it from
+    `tries`), so a busy run is retried on the next tick, backed off or not.
     """
     if not _in_session(now):
         return None
@@ -1121,10 +1137,12 @@ def due_jobs(
       backed off: its fast retries stop and it keeps only its healthy cadence, one
       attempt per window or one per scheduled instant (plus the one retry `tries`
       describes below). It is never parked.
-    * `tries` -- every attempt's epoch per job (`_tries_by_job`). A backed-off job
-      that spends no IBKR request keeps ONE delayed retry per instant: its attempt
-      is often the first tick after a wake, which fails while the network comes
-      up, and with no retry that failure took every day from a backed-off job.
+    * `tries`: every attempt's epoch per job (`_tries_by_job`), busy runs left
+      out because they asked nothing. A backed-off job's brakes count these: its
+      window runs from the last one, and a backed-off job that spends no IBKR
+      request keeps ONE delayed retry per instant: its attempt is often the first
+      tick after a wake, which fails while the network comes up, and with no
+      retry that failure took every day from a backed-off job.
 
     EMPTY LEDGER MEANS UNKNOWN, NOT OVERDUE. `job_runs` lives in `journal.db`,
     which a `raw/` restore rebuilds from scratch, so a rebuilt journal has no runs
@@ -1157,8 +1175,12 @@ def due_jobs(
     for job in (JOBS if registry is None else registry):
         backed_off = is_backed_off(failures.get(job.name, 0))
         if job.catchup is Catchup.WINDOW:
+            # A backed-off job's window runs from its last ATTEMPT, which `tries`
+            # knows and `last_try` does not: a busy run asked nothing.
+            asked = (last_try.get(job.name) if tries is None
+                     else max(tries.get(job.name, ()), default=None))
             found = _window_due(job, now, last_poll.get(job.name),
-                                last_try=last_try.get(job.name), backed_off=backed_off)
+                                last_try=asked, backed_off=backed_off)
             if found is not None:
                 out.append(found)
             continue
@@ -1183,10 +1205,13 @@ def due_jobs(
             # A run since the instant, and the instant still unclaimed: that run
             # gave it back. Retry, but not on the very next tick, and while backed
             # off only once, and only for a job that can spend nothing: a broker
-            # job's next instant is its retry.
+            # job's next instant is its retry. Busy runs are not in `tries`, so an
+            # instant only ever met with the fetch lock held still has its one
+            # attempt to make, broker job or not.
             if backed_off:
                 attempts = sum(t >= stamp for t in (tries or {}).get(job.name, ()))
-                if job.spends_broker_request or tries is None or attempts >= 2:
+                allowed = 1 if job.spends_broker_request else 2
+                if tries is None or attempts >= allowed:
                     continue
             waited = int(now.timestamp()) - tried
             if waited < RETRY_AFTER_S:
@@ -1231,7 +1256,8 @@ TICK_S = 60
 #: day. So a job failing for a real reason stops hammering the endpoint
 #: that is failing, and a backed-off job never asks IBKR more often than a healthy
 #: one does. Any healthy outcome resets the count, which is how it comes back on
-#: its own; it stays runnable by hand from the page as well.
+#: its own; it stays runnable by hand from the page as well. A busy run (another
+#: fetch held the lock) is neither, and leaves the count alone.
 #:
 #: It used to stop the reconciler starting the job at all, and only a manual run
 #: could reset the count, so backoff was terminal: five minutes of DNS failures
@@ -1303,7 +1329,7 @@ def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
         # short (`flex.FETCH_LOCK_WAIT_S`), a page Sync overlapping a confirm poll
         # delayed same-day fills by the confirm window, 25 minutes.
         if (row["status"] in ("ok", "nothing") and row["finished_at"]
-                and not str(row["detail"] or "").startswith(_BUSY_DETAIL)):
+                and not _is_busy(row["status"], row["detail"])):
             stamp = _epoch_of(str(row["finished_at"]))
             if stamp is not None:
                 last_poll[job] = max(last_poll.get(job, 0), stamp)
@@ -1315,12 +1341,21 @@ def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
 
 
 def _tries_by_job(conn: sqlite3.Connection) -> dict[str, list[int]]:
-    """Every recorded attempt's epoch per job: its end, or its start while running.
+    """Each attempt's epoch per job: its end, or its start while running.
+
+    An attempt is a run that could have asked IBKR, so a BUSY run is left out: it
+    waited out another fetch's lock and asked nothing. These are what a backed-off
+    job's brakes count (see `due_jobs`), and a busy run counted there cost a
+    backed-off `confirm` its window and a backed-off `sync` its day.
 
     The ledger is pruned per job (`prune_runs`), so this stays a few dozen rows.
     """
     tries: dict[str, list[int]] = {}
-    for row in conn.execute("SELECT job, started_at, finished_at FROM job_runs"):
+    for row in conn.execute(
+        "SELECT job, started_at, finished_at, status, detail FROM job_runs"
+    ):
+        if _is_busy(row["status"], row["detail"]):
+            continue
         tried = _epoch_of(str(row["finished_at"] or row["started_at"]))
         if tried is not None:
             tries.setdefault(str(row["job"]), []).append(tried)

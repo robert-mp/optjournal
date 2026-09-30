@@ -94,6 +94,7 @@ from optjournal.flex import (
     FetchCooldown,
     TokenMissing,
     TokenRejected,
+    TokenUnreadable,
     cooldown_remaining,
     last_fetch,
     load,
@@ -1496,6 +1497,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         Reports PRESENCE, never the value, and never whether IBKR accepts it:
         only a real fetch can answer that, and that costs a request.
+
+        The read is `flex.read_token`, whose own deadline (30s) ends this worker
+        while a stuck keychain call goes on, so `_keyring_call`'s one-worker bound
+        alone would let each check made after it start another stuck call. The
+        call itself is bounded to one in flight, in `flex`, for the fetches and
+        this check together.
         """
         import getpass
 
@@ -1504,6 +1511,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         def probe() -> tuple[str, str]:
             try:
                 read_token(account)
+            except TokenUnreadable:
+                # A `TokenMissing`, but not absent: `_keyring_call` reports it as
+                # unreadable, which is what a pending unlock prompt is.
+                raise
             except TokenMissing as exc:
                 return "absent", str(exc)
             return "present", "a token is stored for this account"
@@ -1520,7 +1531,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                            f"run `optjournal setup` in a terminal.",
             }
         kind, message = answer
-        if kind == "error":  # pragma: no cover - backend failures
+        if kind == "error":
             log.warning("keyring unreadable: %s", message)
             return 200, {"ok": False, "kind": "keyring", "present": None,
                          "account": account, "message": message}

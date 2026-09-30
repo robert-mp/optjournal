@@ -224,8 +224,9 @@ def test_the_timeout_ladder_is_ordered(sync_cron):
 def test_the_cron_bounds_the_wait_it_gives_the_cli(sync_cron, monkeypatch):
     """The CLI waits out a whole fetch for the shared lock by default, which is
     longer than this cron's own kill: the kill would land while nothing had been
-    asked and report "no statement after 720s". So the cron hands the CLI a wait
-    below its timeout, through the variable the CLI reads."""
+    asked and report "no statement after 720s". So the cron hands the CLI a
+    shorter wait, through the variable the CLI reads. How short is the next
+    test's subject."""
     from optjournal.cli import LOCK_WAIT_ENV, _lock_wait
     from optjournal.flex import FETCH_LOCK_TIMEOUT_S
 
@@ -248,6 +249,56 @@ class _Completed:
     returncode = 0
     stdout = "{}"
     stderr = ""
+
+
+def test_a_fetch_that_starts_at_the_end_of_the_lock_wait_still_finishes(sync_cron):
+    """The wait plus the polling budget fits under the kill, not the wait alone.
+
+    The wait was FETCH_TIMEOUT_S - 60 (660s). A CLI that queued that long behind
+    another fetch (the app's own sync of the same query, failing after ~450s with
+    "statement not ready", so no cooldown) then started one whose polling alone
+    can take 420s, and the kill at 720s landed mid-poll: a request spent, no
+    cooldown recorded, and a Report saying "timed out". Measured end to end at
+    1/10 scale before this was sized. The copy of the poll budget the cron sizes
+    from must also be the real one, which the cron cannot import.
+    """
+    from optjournal.flex import POLL_WORST_CASE_S
+
+    assert sync_cron.LOCK_WAIT_S + POLL_WORST_CASE_S < sync_cron.FETCH_TIMEOUT_S, (
+        "a fetch started when the lock wait runs out is killed mid-poll")
+    assert sync_cron.POLL_WORST_CASE_S == POLL_WORST_CASE_S, (
+        "the cron's copy of flex.POLL_WORST_CASE_S has drifted")
+    assert sync_cron.LOCK_WAIT_S > 0, "the CLI reads a wait of 0 as unset"
+
+
+def test_the_runtime_check_refuses_a_wait_that_leaves_no_time_to_poll(
+    sync_cron, monkeypatch,
+):
+    """`verify_timeouts` knew only LOCK_WAIT_S < FETCH_TIMEOUT_S, which the 660s
+    wait passed. It checks the sum now, against the venv's real poll budget."""
+    from optjournal.flex import POLL_WORST_CASE_S
+
+    monkeypatch.setattr(sync_cron, "_poll_worst_case", lambda: POLL_WORST_CASE_S)
+    sync_cron.verify_timeouts()                      # the ladder as shipped fits
+
+    monkeypatch.setattr(sync_cron, "LOCK_WAIT_S", sync_cron.FETCH_TIMEOUT_S - 60)
+    with pytest.raises(RuntimeError, match="killed mid-poll"):
+        sync_cron.verify_timeouts()
+
+
+@pytest.mark.parametrize("wait", ["timeout", 0])
+def test_the_lock_wait_is_checked_even_when_the_venv_cannot_answer(
+    sync_cron, monkeypatch, wait,
+):
+    """The wait is this file's own constant, so checking it needs no venv. It ran
+    after the early return for an unreadable poll budget, so a broken venv skipped
+    it. Zero is refused as well: the CLI reads it as unset and waits its full
+    default, far longer than the kill."""
+    monkeypatch.setattr(sync_cron, "_poll_worst_case", lambda: None)
+    monkeypatch.setattr(sync_cron, "LOCK_WAIT_S",
+                        sync_cron.FETCH_TIMEOUT_S if wait == "timeout" else wait)
+    with pytest.raises(RuntimeError, match="LOCK_WAIT_S"):
+        sync_cron.verify_timeouts()
 
 
 def test_a_sync_payload_key_the_cron_reads_still_exists():

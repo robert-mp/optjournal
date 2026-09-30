@@ -15,7 +15,10 @@ Delivery policy, which is the part worth getting right for something that runs
                          query, which is expected, not a fault. Skipping means
                          no alert and a natural retry next tick. The CLI's
                          local fetch cooldown maps to the same exit code, so
-                         "we chose not to ask" is handled identically.
+                         "we chose not to ask" is handled identically, and so
+                         does another fetch holding the fetch lock past
+                         LOCK_WAIT_S. Any other lock timeout (the migration's,
+                         the settings file's) exits 1 and is raised.
 * No new data (3)     -> return quietly. `sync` does not currently emit this,
                          but every other command uses the
                          `EXIT_OK if data else EXIT_NO_DATA` idiom, so treating
@@ -42,10 +45,11 @@ Register with (query ID passed via the cron's message field):
     )
 
 The cron timeout must exceed FETCH_TIMEOUT_S below, which must in turn exceed
-both `optjournal.flex.POLL_WORST_CASE_S` and the LOCK_WAIT_S this hands the CLI.
+the LOCK_WAIT_S this hands the CLI PLUS `optjournal.flex.POLL_WORST_CASE_S`, so a
+fetch that starts at the very end of the wait still has its whole polling budget.
 Get that ordering wrong and the outer killer fires first, replacing a clean
-Report with a raw traceback, or it kills a sync that is only queuing behind
-another fetch and calls that a timeout. `verify_timeouts` checks both.
+Report with a raw traceback, or it kills a fetch mid-poll, after its request was
+spent and before its cooldown was recorded. `verify_timeouts` checks both.
 
 Tuesday-Saturday is deliberate: an Activity Statement covers the previous
 trading day, so a Monday run would only re-fetch Friday's already-ingested
@@ -157,19 +161,20 @@ def verify_timeouts() -> None:
     Called at the top of `sync`, so a mismatch surfaces as a clear error on
     the next run instead of as a mysterious mid-poll kill weeks later.
 
-    Silent when the number cannot be read at all -- a broken venv is the
-    CLI's problem to report, and blocking the sync on a self-check that
+    The lock wait is checked first, because it needs nothing from the venv.
+    The rest is silent when the number cannot be read at all: a broken venv is
+    the CLI's problem to report, and blocking the sync on a self-check that
     cannot complete would be worse than running it.
     """
+    if not 0 < LOCK_WAIT_S < FETCH_TIMEOUT_S:
+        raise RuntimeError(
+            f"LOCK_WAIT_S ({LOCK_WAIT_S}s) must be positive and below "
+            f"FETCH_TIMEOUT_S ({FETCH_TIMEOUT_S}s). Zero or less reads as unset "
+            f"and the CLI waits its own default, longer than this cron's kill."
+        )
     worst_case = _poll_worst_case()
     if worst_case is None:
         return
-    if LOCK_WAIT_S >= FETCH_TIMEOUT_S:
-        raise RuntimeError(
-            f"LOCK_WAIT_S ({LOCK_WAIT_S}s) must be below FETCH_TIMEOUT_S "
-            f"({FETCH_TIMEOUT_S}s), or the sync is killed while it is still "
-            f"queuing behind another fetch and reports a timeout it never had."
-        )
     if worst_case >= FETCH_TIMEOUT_S:
         raise RuntimeError(
             f"FETCH_TIMEOUT_S ({FETCH_TIMEOUT_S}s) must exceed "
@@ -177,14 +182,37 @@ def verify_timeouts() -> None:
             f"statement generation is killed mid-poll. Raise it, and raise the "
             f"cron's own timeout above that, or lower MAX_RETRIES in flex.py."
         )
+    if LOCK_WAIT_S + worst_case >= FETCH_TIMEOUT_S:
+        raise RuntimeError(
+            f"LOCK_WAIT_S ({LOCK_WAIT_S}s) plus flex.POLL_WORST_CASE_S "
+            f"({worst_case}s) must stay below FETCH_TIMEOUT_S ({FETCH_TIMEOUT_S}s), "
+            f"or a fetch that starts at the end of the wait is killed mid-poll: "
+            f"its request spent and no cooldown recorded. Update "
+            f"POLL_WORST_CASE_S in this file to match flex.py."
+        )
 
+
+#: `optjournal.flex.POLL_WORST_CASE_S`, the value the lock wait below is sized
+#: against. A copy, because this script cannot import flex (see
+#: `_poll_worst_case`); `verify_timeouts` compares it with the real one on every
+#: run, and tests/test_cron.py in CI.
+POLL_WORST_CASE_S = 420
+
+#: What a fetch needs beyond its polling sleeps: the keyring read, the HTTP round
+#: trips, the XML parse and the ingest.
+FETCH_MARGIN_S = 60
 
 #: What the CLI is allowed to spend WAITING for another fetch to release the
-#: shared lock, below the timeout that kills it here. Its own default waits out a
-#: whole fetch, which a person would rather do than be refused; a supervised run
-#: that is about to be killed must not spend its budget queuing, or the kill lands
-#: while nothing has been asked and reports "no statement after 720s".
-LOCK_WAIT_S = FETCH_TIMEOUT_S - 60
+#: shared lock. Its own default waits out a whole fetch, which a person would
+#: rather do than be refused, and is longer than the timeout that kills it here.
+#:
+#: Sized so a fetch that starts at the very END of the wait still finishes before
+#: the kill: 720 - 420 - 60 = 240s. It was FETCH_TIMEOUT_S - 60 (660s), which let
+#: the CLI queue for 660s and then start a fetch whose polling alone can take
+#: 420s, so the kill landed mid-poll with the request spent and no cooldown
+#: recorded, and this reported a timeout. A wait that runs out instead asks IBKR
+#: nothing: the CLI exits EXIT_THROTTLED, because another fetch is running.
+LOCK_WAIT_S = FETCH_TIMEOUT_S - POLL_WORST_CASE_S - FETCH_MARGIN_S
 
 
 def _run(query_id: str) -> subprocess.CompletedProcess[str]:

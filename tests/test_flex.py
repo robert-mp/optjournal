@@ -237,6 +237,30 @@ def test_a_fetch_waits_for_the_fetch_lock_as_long_as_it_is_told(tmp_path):
     holder.join()
 
 
+def test_only_the_fetch_locks_own_wait_is_a_fetch_lock_timeout(tmp_path, monkeypatch):
+    """The CLI reads `FetchLockTimeout` as "another fetch is running" and any other
+    `LockTimeout` as an error, so the type must say which lock ran out: both
+    fetches raise it for the fetch lock, and a lock timeout from the work under
+    the lock is passed on as itself."""
+    from optjournal.locks import LockTimeout
+
+    holder = _hold_the_fetch_lock(tmp_path, 1.0)
+    with pytest.raises(flex.FetchLockTimeout):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True, lock_timeout_s=0.1)
+    with pytest.raises(flex.FetchLockTimeout):
+        flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True,
+                            lock_timeout_s=0.1)
+    holder.join()
+
+    def wedged(*_a, **_k):
+        raise LockTimeout("another process held some.lock for more than 120s.")
+
+    monkeypatch.setattr(flex, "read_token", wedged)
+    with pytest.raises(LockTimeout) as caught:
+        flex.fetch("1591754", archive_dir=tmp_path, force=True, lock_timeout_s=0.1)
+    assert not isinstance(caught.value, flex.FetchLockTimeout)
+
+
 def test_retry_budget_stays_within_a_daily_cron_window():
     """The guard that makes the timeout fix durable.
 
@@ -954,6 +978,37 @@ def test_a_keychain_that_does_not_answer_raises_within_the_deadline(monkeypatch)
     assert isinstance(caught.value, flex.TokenMissing), (
         "every caller that reports a missing token must report this one too"
     )
+
+
+def test_a_keychain_that_never_answers_holds_one_thread_however_often_it_is_read(
+    monkeypatch,
+):
+    """The read gave up at its deadline and left its thread stuck in the keychain
+    call, so each read after that started another: one stuck thread per fetch
+    attempt or token check, for the life of the process. One read is in flight at
+    a time now, and a read that finds it still pending gives up at its own
+    deadline, as unreadable, without starting a second."""
+    release = _keychain_waiting_for_an_unlock(monkeypatch)
+
+    def stuck() -> int:
+        return sum(t.name == "keyring-read" for t in threading.enumerate())
+
+    before = stuck()
+    try:
+        for _ in range(5):
+            with pytest.raises(flex.TokenUnreadable, match="did not answer"):
+                flex.read_token("someone")
+        assert stuck() - before <= 1, f"{stuck() - before} keyring reads stuck at once"
+    finally:
+        release.set()
+    for _ in range(100):                     # the stuck read returns, and frees it
+        try:
+            assert flex.read_token("someone") == "tok"
+            break
+        except flex.TokenUnreadable:
+            continue
+    else:
+        pytest.fail("the keyring stayed unreadable after the stuck read returned")
 
 
 def test_a_keychain_that_does_not_answer_fails_the_sync_job_with_the_cause(

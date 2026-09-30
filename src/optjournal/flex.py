@@ -21,14 +21,16 @@ This module adds the three things py_ibkr deliberately leaves to callers:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import json
 import logging
 import re
 import threading
+import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -42,7 +44,7 @@ from py_ibkr.flex.parser import parse_xml_file
 
 from optjournal.clock import MARKET_TZ
 from optjournal.confirms import CONFIRM_QUERY_TYPE
-from optjournal.locks import locked
+from optjournal.locks import LockTimeout, locked
 from optjournal.sections import stated_base_currency
 
 __all__ = [
@@ -54,6 +56,7 @@ __all__ = [
     "ACTIVITY_QUERY_TYPE",
     "FetchCooldown",
     "ConfirmFetch",
+    "FetchLockTimeout",
     "FetchResult",
     "FlexBusy",
     "StatementUnreadable",
@@ -107,6 +110,33 @@ ACTIVITY_QUERY_TYPE = "AF"
 #: state file it guards, in the archive directory, so one journal's fetches do
 #: not serialise against another's.
 FETCH_LOCK = ".fetch.lock"
+
+
+class FetchLockTimeout(LockTimeout):
+    """Another fetch held `FETCH_LOCK` for longer than this one would wait.
+
+    Nothing was sent, so nothing was spent: "busy, try later", which is how the
+    CLI (EXIT_THROTTLED), the page (409) and the job ledger (`busy`) read it.
+    Its own type because every OTHER `LockTimeout` means something is wedged: the
+    migration lock and the settings lock both wait two minutes for work that
+    takes milliseconds. Reading those as busy made the cron skip them silently.
+    A `LockTimeout`, so a caller that catches that still catches this.
+    """
+
+
+@contextlib.contextmanager
+def _fetch_lock(archive_dir: Path, timeout_s: float) -> Iterator[None]:
+    """Hold `FETCH_LOCK` for the block, its wait raising `FetchLockTimeout`.
+
+    Only the WAIT is translated: the block runs outside the `try`, so a lock
+    timeout from anything it calls keeps its own type.
+    """
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(locked(archive_dir / FETCH_LOCK, timeout_s=timeout_s))
+        except LockTimeout as exc:
+            raise FetchLockTimeout(str(exc)) from None
+        yield
 
 
 class FetchCooldown(RuntimeError):
@@ -192,6 +222,11 @@ FETCH_SOCKET_TIMEOUT_S = 60
 #: prompt on a machine nobody is at. On the scheduler thread that stalled every
 #: job while the fetch lock was held, with nothing in the ledger to say why.
 KEYRING_READ_TIMEOUT_S = 30.0
+
+#: Held from the start of a keyring read until the OS call returns, which for a
+#: keychain waiting on an unlock is never. ONE READ IN FLIGHT per process, for
+#: every caller: the fetches and the page's token check. See `_within`.
+_KEYRING_READ = threading.Lock()
 
 #: Worst-case wall time of one fetch, from taking the lock to stamping the
 #: cooldown: the keyring read, the polling sleeps, and every request of both
@@ -362,13 +397,22 @@ class FetchResult:
 
 
 def _within(timeout_s: float, work: Callable[[], str | None]) -> tuple[bool, object]:
-    """Run `work` on a daemon thread. (finished, result or the exception raised).
+    """Run the keyring read `work` on a daemon thread. (finished, result or error).
 
     The pattern of `web._keyring_call`: a DAEMON thread, so a call still blocked
     in the OS cannot keep the process alive, and a late answer lands in a list
     nobody reads. Python cannot interrupt a thread blocked in a syscall, so a
     deadline has to be a wait on another thread rather than a timeout on the call.
+
+    ONE AT A TIME, the other half of that pattern: `_KEYRING_READ` is held by the
+    thread until its call returns, and a read that finds it held waits for it
+    inside the same deadline and gives up unfinished. Without it, a keychain that
+    never answers kept each timed-out thread and every later read started another:
+    one per fetch attempt and one per token check, for the life of the process.
     """
+    deadline = time.monotonic() + timeout_s
+    if not _KEYRING_READ.acquire(timeout=timeout_s):
+        return False, None
     outcome: list[object] = []
 
     def run() -> None:
@@ -376,10 +420,12 @@ def _within(timeout_s: float, work: Callable[[], str | None]) -> tuple[bool, obj
             outcome.append(work())
         except Exception as exc:  # noqa: BLE001 - handed back to the caller
             outcome.append(exc)
+        finally:
+            _KEYRING_READ.release()
 
     worker = threading.Thread(target=run, name="keyring-read", daemon=True)
     worker.start()
-    worker.join(timeout_s)
+    worker.join(max(0.0, deadline - time.monotonic()))
     return (True, outcome[0]) if outcome else (False, None)
 
 
@@ -740,7 +786,7 @@ def fetch_confirms(
     """
     from_date, to_date = _check_period(
         from_date, to_date, latest=_market_today(), weekdays_only=False)
-    with locked(archive_dir / FETCH_LOCK, timeout_s=lock_timeout_s):
+    with _fetch_lock(archive_dir, lock_timeout_s):
         if not force:
             _check_cooldown(archive_dir, query_id, cooldown_s)
         token = read_token(account)
@@ -982,7 +1028,7 @@ def fetch(
     from_date, to_date = _check_period(
         from_date, to_date, latest=_market_today() - timedelta(days=1),
         weekdays_only=True)
-    with locked(archive_dir / FETCH_LOCK, timeout_s=lock_timeout_s):
+    with _fetch_lock(archive_dir, lock_timeout_s):
         return _fetch_locked(
             query_id, archive_dir=archive_dir, from_date=from_date,
             to_date=to_date, account=account, force=force, cooldown_s=cooldown_s,
