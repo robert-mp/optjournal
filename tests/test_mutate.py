@@ -16,6 +16,7 @@ asserting is the parsing, not pytest.
 from __future__ import annotations
 
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -240,6 +241,27 @@ def test_the_timeout_return_code_is_what_the_runner_signals():
         line.startswith(("FAILED ", "ERROR "))
         for line in killed.stdout.splitlines()
     ), "the premise: a killed suite leaves no failure lines to count"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in venv is a POSIX symlink")
+def test_a_forced_colour_terminal_still_reports_failures_as_failed(tmp_path, monkeypatch):
+    """`run_mutant` counts lines that START with "FAILED " or "ERROR ". With
+    FORCE_COLOR set (some terminals and CI runners set it), pytest wrapped those
+    words in colour codes, nothing matched, and every mutant read as uncaught.
+    Run for real against a one-test suite that fails."""
+    clone = tmp_path / "clone"
+    (clone / ".venv" / "bin").mkdir(parents=True)
+    (clone / ".venv" / "bin" / "python").symlink_to(sys.executable)
+    (clone / "test_one.py").write_text("def test_fails():\n    assert False\n",
+                                       encoding="utf-8")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("PY_COLORS", "1")
+
+    result = mutate._pytest(clone)
+
+    assert any(line.startswith("FAILED ") for line in result.stdout.splitlines()), (
+        result.stdout
+    )
 
 
 def test_the_clone_is_told_it_is_a_copy(tmp_path, monkeypatch):

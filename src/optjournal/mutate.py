@@ -678,8 +678,10 @@ def _pytest(clone: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env.pop("VIRTUAL_ENV", None)
     env[CLONE_ENV] = "1"
     proc = subprocess.Popen(
+        # --color=no: `run_mutant` matches lines starting "FAILED "/"ERROR ", and
+        # FORCE_COLOR in the environment otherwise wraps those words in escapes.
         [str(_venv_python(clone)), "-m", "pytest",
-         "-q", "--tb=no", "-p", "no:cacheprovider", *args],
+         "-q", "--tb=no", "--color=no", "-p", "no:cacheprovider", *args],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         cwd=str(clone),
         env=env,
