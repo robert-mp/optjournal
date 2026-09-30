@@ -15,6 +15,7 @@ generator surfaces here rather than quietly weakening every test that uses it.
 from __future__ import annotations
 
 import shutil
+import sys
 from decimal import Decimal
 from pathlib import Path
 
@@ -150,6 +151,30 @@ def test_refuses_to_touch_real_data_wherever_it_sits(tmp_path):
     demo_dir = tmp_path / "demo-out"
     write_demo_statement(demo_dir, demo_dir / "demo.db")
     assert_not_real(demo_dir, demo_dir / "demo.db")
+
+
+@pytest.mark.parametrize("folder", ["hash #1", "q?mark", "pct%41", "pct 100%", "ünï code"])
+def test_refuses_a_real_database_whatever_its_path_contains(tmp_path, folder):
+    """L22: the database path went into a `file:` URI unescaped. A `#` or `?`
+    cut it short, so the guard read some other (empty) file, found no real
+    account, and let demo data into the real journal."""
+    if "?" in folder and sys.platform == "win32":
+        pytest.skip("`?` is not allowed in a Windows file name")
+    db = tmp_path / folder / "journal.db"
+    conn = connect_migrated(db)
+    add_statement(conn, account_id="U7654321")
+    conn.commit()
+    conn.close()
+    # A read-only open of a WAL database may add its own `-shm`; anything else
+    # is a file the guard created by opening the wrong path.
+    def files() -> list[str]:
+        return sorted(p.name for p in tmp_path.rglob("*")
+                      if not p.name.endswith(("-wal", "-shm")))
+    before = files()
+
+    with pytest.raises(ValueError, match="U7654321"):
+        assert_not_real(tmp_path / "scratch", db)
+    assert files() == before, "the guard opened, and created, some other file"
 
 
 # ------------------------------------------------------------ what it unlocks

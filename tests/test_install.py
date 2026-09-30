@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -345,3 +346,22 @@ def test_a_corrupt_journal_beside_the_code_is_reported_and_left(tmp_path):
 
     assert done[0].startswith("journal left beside the code") and "not a readable" in done[0]
     assert (code / "journal.db").exists() and (code / "raw").exists()
+
+
+_ODD = ["hash #1", "pct 100%", "pct%41", "with space", "ünïcode"]
+if sys.platform != "win32":                  # `?` is not allowed in a Windows name
+    _ODD.append("q?mark")
+
+
+@pytest.mark.parametrize("folder", _ODD)
+def test_a_journal_in_a_folder_with_uri_characters_is_read_and_left_untouched(
+        tmp_path, folder):
+    """L22: the path went into a `file:` URI unescaped. `#` or `?` cut it short,
+    dropping `mode=ro`, so the read opened (and created) a different file, read
+    no statements, and wrote into someone else's folder."""
+    old = _download(tmp_path / "Downloads" / folder, statements=2)
+    before = sorted(p.name for p in old.parent.rglob("*"))
+
+    assert install._statement_count(old / "journal.db", foreign=True) == 2
+    assert install._statement_count(old / "journal.db") == 2
+    assert sorted(p.name for p in old.parent.rglob("*")) == before

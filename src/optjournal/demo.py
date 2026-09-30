@@ -745,7 +745,11 @@ def assert_not_real(archive_dir: Path, db_path: Path | None = None) -> None:
         )
     if db_path is not None and db_path.exists():
         try:
-            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            # `as_uri()` escapes the path. Interpolated as text, a `#` or `?` in
+            # it cut the URI short, so this read some other (empty) file and let
+            # demo data into a real journal.
+            uri = f"{db_path.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(uri, uri=True) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
                     "SELECT account_id FROM statements WHERE account_id IS NOT NULL"

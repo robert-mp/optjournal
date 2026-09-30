@@ -79,12 +79,15 @@ def _statement_count(db: Path, *, foreign: bool = False) -> int:
     and a scan must leave someone else's folder exactly as it found it. Not for
     this install's own journal, whose newest rows may still sit in its WAL.
 
+    The URI comes from `as_uri()`, which escapes the path: interpolated as text,
+    a `#` or `?` in a folder name cut the path short and dropped `mode=ro`, so
+    SQLite opened, and created, some other file.
     """
     if not db.exists():
         return 0
     try:
         mode = "ro&immutable=1" if foreign else "ro"
-        conn = sqlite3.connect(f"file:{db}?mode={mode}", uri=True)
+        conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode={mode}", uri=True)
         try:
             return int(conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0])
         finally:
