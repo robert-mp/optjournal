@@ -66,6 +66,7 @@ __all__ = [
     "UnknownJob",
     "due_jobs",
     "interrupted_runs",
+    "is_backed_off",
     "job_by_name",
     "prune_runs",
     "record_manual_sync",
@@ -1037,7 +1038,10 @@ def _in_session(now: datetime) -> bool:
     return opens <= local <= closes
 
 
-def _window_due(job: Job, now: datetime, last_poll: int | None) -> Due | None:
+def _window_due(
+    job: Job, now: datetime, last_poll: int | None, *,
+    last_try: int | None = None, backed_off: bool = False,
+) -> Due | None:
     """`Catchup.WINDOW`: inside the session, and the last POLL is old enough.
 
     SEVEN CRON SLOTS COLLAPSE INTO THIS ONE PREDICATE, and it is sound only because
@@ -1053,14 +1057,24 @@ def _window_due(job: Job, now: datetime, last_poll: int | None) -> Due | None:
     Claims NO `fired_for`, because there is no instant: the run is "this session, at
     whatever moment we woke". The partial unique index accepts repeats of NULL,
     which is what lets a session be polled several times.
+
+    A failed poll does not brake, so a transient failure retries on the next tick.
+    Once the job is BACKED OFF, a failed attempt brakes like a poll, which slows it
+    to one attempt per window: the cadence it keeps when healthy, so a backed-off
+    `confirm` never asks IBKR more often than a working one does.
     """
     if not _in_session(now):
         return None
-    if last_poll is not None:
-        age = int(now.timestamp()) - last_poll
-        if age < job.window_s:
+    epoch = int(now.timestamp())
+    if last_poll is not None and epoch - last_poll < job.window_s:
+        return None
+    if backed_off and last_try is not None:
+        waited = epoch - last_try
+        if waited < job.window_s:
             return None
-        return Due(job, None, f"in session, last poll {age}s ago")
+        return Due(job, None, f"in session, backed off, last attempt {waited}s ago")
+    if last_poll is not None:
+        return Due(job, None, f"in session, last poll {epoch - last_poll}s ago")
     return Due(job, None, "in session, no completed poll yet today")
 
 
@@ -1080,6 +1094,7 @@ def due_jobs(
     last_poll: dict[str, int],
     last_try: dict[str, int],
     ever_ran: set[str],
+    failures: dict[str, int],
     registry: tuple[Job, ...] | None = None,
 ) -> list[Due]:
     """Which jobs should run at `now`. Pure: no clock, no database, no I/O.
@@ -1101,6 +1116,9 @@ def due_jobs(
       while it is still running), whatever its status. An unclaimed instant with a
       run after it was given back, and waits `RETRY_AFTER_S` from that run.
     * `ever_ran` -- jobs with ANY recorded run.
+    * `failures` -- `consecutive_failures` per job. At `FAILURE_BACKOFF` a job is
+      backed off: its fast retries stop and it keeps only its healthy cadence, one
+      attempt per window or one per scheduled instant. It is never parked.
 
     EMPTY LEDGER MEANS UNKNOWN, NOT OVERDUE. `job_runs` lives in `journal.db`,
     which a `raw/` restore rebuilds from scratch, so a rebuilt journal has no runs
@@ -1123,8 +1141,10 @@ def due_jobs(
     # against a stubbed one-job registry and watching zero runs happen.
     out: list[Due] = []
     for job in (JOBS if registry is None else registry):
+        backed_off = is_backed_off(failures.get(job.name, 0))
         if job.catchup is Catchup.WINDOW:
-            found = _window_due(job, now, last_poll.get(job.name))
+            found = _window_due(job, now, last_poll.get(job.name),
+                                last_try=last_try.get(job.name), backed_off=backed_off)
             if found is not None:
                 out.append(found)
             continue
@@ -1146,7 +1166,10 @@ def due_jobs(
         tried = last_try.get(job.name)
         if tried is not None and tried >= stamp:
             # A run since the instant, and the instant still unclaimed: that run
-            # gave it back. Retry, but not on the very next tick.
+            # gave it back. Retry, but not on the very next tick, and not at all
+            # while backed off: then the next instant is the retry.
+            if backed_off:
+                continue
             waited = int(now.timestamp()) - tried
             if waited < RETRY_AFTER_S:
                 continue
@@ -1181,11 +1204,29 @@ def due_jobs(
 #: `job_runs` per minute (measured in microseconds on a 200-row-per-job table).
 TICK_S = 60
 
-#: Above this many consecutive failures a job stops being started by the
-#: reconciler. It stays runnable BY HAND from the page, which is the point: a job
-#: failing for a real reason should stop hammering the endpoint that is failing,
-#: without becoming invisible or requiring a restart to retry.
+#: At this many consecutive failures a job is BACKED OFF: its fast retries stop,
+#: and it runs only at its own healthy cadence. A window job gets one attempt per
+#: window (55 minutes for `bars_live`, 25 for `confirm`) instead of one per tick,
+#: and a daily job one attempt per scheduled instant instead of a retry every
+#: `RETRY_AFTER_S`. So a job failing for a real reason stops hammering the endpoint
+#: that is failing, and a backed-off job never asks IBKR more often than a healthy
+#: one does. Any healthy outcome resets the count, which is how it comes back on
+#: its own; it stays runnable by hand from the page as well.
+#:
+#: It used to stop the reconciler starting the job at all, and only a manual run
+#: could reset the count, so backoff was terminal: five minutes of DNS failures
+#: parked `bars_live` from 09-09 to 09-24, and eight sessions of hourly option
+#: bars were lost.
 FAILURE_BACKOFF = 5
+
+
+def is_backed_off(consecutive_failures: int) -> bool:
+    """Whether a job with this many consecutive failures is backed off.
+
+    One definition, for `due_jobs` and for the page's payload
+    (`serialize.jobs_data`), so the pill cannot disagree with the schedule.
+    """
+    return consecutive_failures >= FAILURE_BACKOFF
 
 #: How far the wall clock must run ahead of `monotonic` within one tick before the
 #: run is stamped `slept`. Generous: a normal 60 s tick shows sub-millisecond drift,
@@ -1265,8 +1306,8 @@ def _last_failure(conn: sqlite3.Connection, job: str) -> str | None:
     """The detail of this job's most recent failed run, for the backoff warning.
 
     Its own query rather than a column on `_ledger_snapshot`, because it is needed
-    only on the branch that logs -- at most once per backed-off job per tick, where
-    the snapshot runs every tick for every job. Failing quietly is right here: this
+    only on the branch that logs -- once per backed-off attempt, where the snapshot
+    runs every tick for every job. Failing quietly is right here: this
     exists to enrich a log line, and a broken read of the ledger must not stop the
     reconciler from running the work.
     """
@@ -1306,21 +1347,21 @@ def reconcile(
     claimed, last_poll, last_try, ever_ran, failures = _ledger_snapshot(conn)
     started: list[str] = []
     for due in due_jobs(moment, claimed=claimed, last_poll=last_poll,
-                        last_try=last_try, ever_ran=ever_ran):
-        if failures.get(due.job.name, 0) >= FAILURE_BACKOFF:
-            # Backed off, not disabled: still runnable by hand from the page, and
-            # the count resets on any healthy outcome.
+                        last_try=last_try, ever_ran=ever_ran, failures=failures):
+        if is_backed_off(failures.get(due.job.name, 0)):
+            # Backed off, so `due_jobs` only offers it at its healthy cadence, and
+            # this is one of those attempts.
             #
             # THE REASON IS LOGGED WITH IT, because the version that logged only
             # the count produced 344 identical lines across two weeks of a real
             # outage and named the cause in none of them -- the cause was sitting in
             # `job_runs.detail`, which takes a SQL client to read. One extra query
-            # per backed-off job per tick, on a table this loop already reads.
-            log.warning("%s: backed off after %d consecutive failures; last: %s",
-                        due.job.name, failures[due.job.name],
+            # per backed-off attempt, on a table this loop already reads.
+            log.warning("%s: retrying after %d consecutive failures (%s); last: %s",
+                        due.job.name, failures[due.job.name], due.reason,
                         _last_failure(conn, due.job.name) or "reason not recorded")
-            continue
-        log.info("%s is due (%s)", due.job.name, due.reason)
+        else:
+            log.info("%s is due (%s)", due.job.name, due.reason)
         try:
             # `slept`: why a noon job fired at 09:14 becomes a field rather than a
             # mystery. Both clocks are already read, so it is free.

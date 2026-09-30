@@ -912,6 +912,16 @@ consecutive failures now stops the RECONCILER starting it, while leaving it
 runnable by hand from the page — a brake, not a black hole, and the count clears on
 any healthy outcome so recovery needs no restart.
 
+*Revised after the 2026-09-30 QA pass (H7).* That was a black hole after all: the
+count only clears on a run, and the reconciler no longer started one, so only a
+manual run could end the backoff. Five minutes of DNS failures parked `bars_live`
+from 09-09 to 09-24. A backed-off job now keeps its healthy cadence and loses only
+its quick retries: a window job gets one attempt per window (55 minutes for
+`bars_live`, 25 for `confirm`), a daily job one per scheduled instant. So it comes
+back on its own, and it never asks IBKR more often than a working job does
+(`tests/test_jobs.py` simulates a week offline and holds it to that). The payload
+carries `backed_off`, and the page says so beside the failure count.
+
 **`tick_failures` beside `ticks`.** A test forced this: the first version counted
 only COMPLETED ticks, so a loop that was alive and failing every tick read as dead
 — 94 raises against a `ticks` of 0. That is `crons.json`'s two green days inverted,

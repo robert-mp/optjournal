@@ -1375,7 +1375,7 @@ def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
     # and `serialize` is imported by `render` for terminal output that needs
     # neither. The graph stays acyclic either way (`jobs` does not import
     # `serialize`), so this is about import cost, not direction.
-    from optjournal.jobs import JOBS  # noqa: PLC0415 - see above
+    from optjournal.jobs import JOBS, is_backed_off  # noqa: PLC0415 - see above
 
     state_by_job = {str(r["job"]): r for r in rows}
     jobs: list[Row] = []
@@ -1386,6 +1386,11 @@ def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
             "last_status": None if state is None else state["last_status"],
             "last_fired_for": None if state is None else state["last_fired_for"],
             "consecutive_failures": (
+                0 if state is None else (state["consecutive_failures"] or 0)),
+            #: Past `jobs.FAILURE_BACKOFF`: the reconciler has stopped the fast
+            #: retries and runs the job only at its healthy cadence until a run
+            #: succeeds. Decided by `jobs`, so the page holds no copy of the limit.
+            "backed_off": is_backed_off(
                 0 if state is None else (state["consecutive_failures"] or 0)),
             "last_run": latest.get(spec.name),
             #: Whether running this spends one of IBKR's rate-limited requests.
@@ -1405,6 +1410,8 @@ def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
             "last_status": state["last_status"],
             "last_fired_for": state["last_fired_for"],
             "consecutive_failures": state["consecutive_failures"] or 0,
+            #: Unregistered, so nothing schedules it either way.
+            "backed_off": False,
             "last_run": latest.get(name),
             #: Unregistered, so it cannot be run from the page and cannot spend
             #: anything.

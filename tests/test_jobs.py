@@ -1144,6 +1144,7 @@ def _due(now, **kw):
     kw.setdefault("claimed", {})
     kw.setdefault("last_poll", {})
     kw.setdefault("last_try", {})
+    kw.setdefault("failures", {})
     kw.setdefault("ever_ran", {job.name for job in JOBS})
     return due_jobs(now, **kw)
 
@@ -1368,7 +1369,7 @@ def test_the_repeated_hour_at_the_dst_fall_back_cannot_fire_twice():
 
     stamps = set()
     for probe in (early, late, datetime(2026, 10, 25, 3, 0, tzinfo=dublin)):
-        found = due_jobs(probe, claimed={}, last_poll={}, last_try={},
+        found = due_jobs(probe, claimed={}, last_poll={}, last_try={}, failures={},
                          ever_ran={"market"}, registry=(nightly,))
         stamps |= {d.fired_for for d in found}
     assert len(stamps) == 1, (
@@ -1400,8 +1401,8 @@ def test_a_schedule_in_the_missing_spring_forward_hour_still_runs():
     )
     # Mid-morning on the spring-forward day: the 01:30 slot is behind us.
     found = due_jobs(datetime(2026, 3, 29, 9, 0, tzinfo=dublin),
-                     claimed={}, last_poll={}, last_try={}, ever_ran={"market"},
-                     registry=(nightly,))
+                     claimed={}, last_poll={}, last_try={}, failures={},
+                     ever_ran={"market"}, registry=(nightly,))
     assert found, (
         "a schedule inside the missing hour produced no due instant, so that day "
         "is silently skipped"
@@ -1674,38 +1675,140 @@ def test_one_jobs_failure_does_not_stop_the_others(conn, ctx, monkeypatch):
     )
 
 
-def test_a_job_that_keeps_failing_is_backed_off_but_stays_runnable_by_hand(
-    conn, ctx, monkeypatch
+def test_a_backed_off_daily_job_keeps_its_schedule_but_loses_its_retries(
+    conn, ctx, clock, monkeypatch
 ):
-    """A brake that does not become a black hole.
+    """H7: a brake, never a black hole.
 
-    Five consecutive failures stops the RECONCILER starting it, because a job
-    failing for a real reason should not hammer the endpoint that is failing sixty
-    times an hour. It stays runnable from the page, and the count resets on any
-    healthy outcome -- so recovery needs no restart and no edit.
+    Five consecutive failures used to stop the reconciler starting the job at
+    all, and only a manual run could reset the count, so the backoff was terminal.
+    Now a backed-off daily job keeps one attempt per scheduled instant (the
+    cadence it has when healthy) and loses only the quick retries a failure
+    otherwise earns. It stays runnable by hand, and a success clears the backoff.
     """
-    from datetime import datetime
+    from datetime import UTC, datetime, timedelta
     from zoneinfo import ZoneInfo
 
-    from optjournal.jobs import FAILURE_BACKOFF, reconcile, run_job
+    from optjournal import jobs as mod
 
-    _registry(monkeypatch, "market")
+    _registry(monkeypatch, "market", outcome="failed")
     conn.execute("INSERT INTO job_runs (job, started_at, status) VALUES"
                  " ('market', '2026-08-11T11:00:00+00:00', 'ok')")
     conn.execute("INSERT OR REPLACE INTO job_state (job, last_status,"
                  " consecutive_failures) VALUES ('market', 'failed', ?)",
-                 (FAILURE_BACKOFF,))
+                 (mod.FAILURE_BACKOFF,))
     conn.commit()
-    now = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
 
-    assert reconcile(conn, ctx=ctx, now=now) == [], (
-        "a job past the failure threshold was still started by the reconciler"
+    def tick(at: datetime) -> list[str]:
+        clock["t"] = at.astimezone(UTC)
+        return mod.reconcile(conn, ctx=ctx, now=clock["t"])
+
+    noon = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    assert tick(noon) == ["market"], (
+        "a backed-off job was not attempted at its scheduled instant, so the "
+        "backoff is still terminal"
     )
-    # By hand, though, it runs -- and succeeding clears the backoff.
-    run_job(conn, "market", ctx=ctx)
+    # The attempt failed and gave its instant back, but a backed-off job does not
+    # get the quick retry a first failure would.
+    for minutes in (5, 30, 120, 600):
+        assert tick(noon + timedelta(minutes=minutes)) == [], (
+            f"a backed-off job was retried {minutes} min after a failure"
+        )
+    # The next scheduled instant is its next attempt.
+    assert tick(noon + timedelta(days=1)) == ["market"]
+
+    # By hand it runs too, and a success clears the backoff.
+    _registry(monkeypatch, "market", outcome="ok")
+    mod.run_job(conn, "market", ctx=ctx)
     assert conn.execute(
         "SELECT consecutive_failures FROM job_state WHERE job='market'"
     ).fetchone()[0] == 0, "a successful manual run did not clear the backoff"
+
+
+def test_a_backed_off_window_job_is_retried_once_per_window_not_never():
+    """H7 for `bars_live` and `confirm`: one attempt per window while backed off.
+
+    Their failures do not brake, so they retry on every 60 s tick, and five
+    minutes offline was enough to reach the limit. Backed off, a failed attempt
+    now brakes like a poll: once per `window_s`, which is also the cadence a
+    healthy poll keeps.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import FAILURE_BACKOFF, job_by_name
+
+    now = datetime(2026, 9, 24, 13, 0, tzinfo=ZoneInfo(_ET))       # in session
+    epoch = int(now.timestamp())
+    backed = {"bars_live": FAILURE_BACKOFF, "confirm": FAILURE_BACKOFF}
+    for name in ("bars_live", "confirm"):
+        window = job_by_name(name).window_s
+        just = _due(now, last_try={name: epoch - 60}, failures=backed)
+        assert name not in _names(just), f"a backed-off {name} retried after a tick"
+        late = _due(now, last_try={name: epoch - window}, failures=backed)
+        assert name in _names(late), f"a backed-off {name} is never retried"
+        # And below the limit a failure still retries on the next tick.
+        fresh = _due(now, last_try={name: epoch - 60}, failures={name: 1})
+        assert name in _names(fresh), f"{name} lost its quick retry before backing off"
+
+
+def test_the_payload_says_when_a_job_is_backed_off(conn):
+    """The page has to be able to say it; the heartbeat stays green meanwhile."""
+    from datetime import UTC, datetime
+
+    from optjournal.jobs import FAILURE_BACKOFF
+    from optjournal.serialize import jobs_data
+
+    for job, count in (("bars_live", FAILURE_BACKOFF), ("market", FAILURE_BACKOFF - 1)):
+        conn.execute("INSERT INTO job_state (job, last_status, consecutive_failures)"
+                     " VALUES (?, 'failed', ?)", (job, count))
+    conn.commit()
+    rows = {r["job"]: r for r in jobs_data(conn, now=datetime.now(UTC))["jobs"]}
+    assert rows["bars_live"]["backed_off"] is True
+    assert rows["market"]["backed_off"] is False
+    assert rows["sync"]["backed_off"] is False, "a job that never ran is not backed off"
+
+
+def test_five_minutes_offline_no_longer_parks_the_live_poll(conn, ctx, clock, monkeypatch):
+    """H7 end to end, as `evidence/jobs/v1_window_backoff.py` measured it.
+
+    DNS fails for the first five minutes of a session and then works. Before the
+    fix the live poll backed off at 09:44 and never ran again, which the real
+    ledger shows as runs 550-554 parking `bars_live` from 09-09 to 09-24.
+    """
+    from datetime import UTC, datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from optjournal import jobs as mod
+
+    start = datetime(2026, 10, 1, 9, 40, tzinfo=ZoneInfo(_ET))    # Thursday
+    online = start + timedelta(minutes=5)
+
+    def poll(_c, _x):
+        if clock["t"] < online:
+            return mod.Outcome("failed", "URLError: nodename nor servname provided")
+        return mod.Outcome("ok", "3 bar(s), 0 empty", 3, 3)
+
+    _stub(monkeypatch, "bars_live", poll)
+    monkeypatch.setattr(mod, "JOBS", tuple(j for j in mod.JOBS if j.name == "bars_live"))
+    for minute in range(6 * 60):                                    # to 15:40 ET
+        clock["t"] = (start + timedelta(minutes=minute)).astimezone(UTC)
+        mod.reconcile(conn, ctx=ctx, now=clock["t"])
+
+    statuses = [r[0] for r in conn.execute("SELECT status FROM job_runs ORDER BY id")]
+    assert statuses[:mod.FAILURE_BACKOFF] == ["failed"] * mod.FAILURE_BACKOFF
+    assert "ok" in statuses, "the live poll never ran again after backing off"
+    first_ok = conn.execute(
+        "SELECT started_at FROM job_runs WHERE status = 'ok' ORDER BY id").fetchone()[0]
+    last_fail = start + timedelta(minutes=mod.FAILURE_BACKOFF - 1)
+    window = mod.job_by_name("bars_live").window_s
+    assert first_ok == (last_fail + timedelta(seconds=window)).astimezone(
+        UTC).isoformat(timespec="seconds"), "the backed-off retry is not one window on"
+    assert conn.execute(
+        "SELECT consecutive_failures FROM job_state WHERE job='bars_live'"
+    ).fetchone()[0] == 0, "the success did not clear the backoff"
+    # Healthy again, it polls once per window for the rest of the session.
+    assert statuses.count("ok") >= 5
 
 
 def test_the_heartbeat_is_written_by_the_loop_not_by_a_job(conn):
@@ -1913,7 +2016,7 @@ def test_replacing_the_registry_actually_reaches_due_jobs(monkeypatch):
     )
     monkeypatch.setattr(mod, "JOBS", (only,))
     found = mod.due_jobs(datetime.now(UTC), claimed={}, last_poll={}, last_try={},
-                         ever_ran={"market"})
+                         failures={}, ever_ran={"market"})
     assert [d.job.hour for d in found] == [0], (
         f"due_jobs ignored the replaced registry and used the import-time one: "
         f"{[(d.job.name, d.job.hour) for d in found]}"
@@ -2104,7 +2207,8 @@ def test_the_backoff_warning_names_the_reason_not_just_the_count(conn, ctx,
 
     The reason was in `job_runs.detail` the whole time, which takes a SQL client to
     read -- so the log said a job was backed off and never why. A warning a human
-    cannot act on is the same as no warning.
+    cannot act on is the same as no warning. It is written once per backed-off
+    attempt now, since the job is retried at its healthy cadence rather than parked.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -2122,7 +2226,7 @@ def test_the_backoff_warning_names_the_reason_not_just_the_count(conn, ctx,
     now = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
 
     with caplog.at_level("WARNING"):
-        assert reconcile(conn, ctx=ctx, now=now) == []
+        assert reconcile(conn, ctx=ctx, now=now) == ["market"]
     assert "Token has expired" in caplog.text, (
         "the backoff warning still does not say why the job is backed off"
     )
@@ -2275,7 +2379,7 @@ def test_a_window_job_that_found_nothing_is_still_braked(conn):
         "has nothing to measure against"
     )
     due = due_jobs(now, claimed={}, last_poll=last_poll, last_try={},
-                   ever_ran=ever_ran)
+                   failures={}, ever_ran=ever_ran)
     assert "confirm" not in [d.job.name for d in due], (
         "a window job polled three minutes ago is due again, so it fires every tick"
     )
@@ -2302,7 +2406,7 @@ def test_a_window_job_that_failed_is_not_braked(conn):
     _claimed, last_poll, _last_try, ever_ran, _failures = _ledger_snapshot(conn)
     assert "confirm" not in last_poll, "a failed run braked the window"
     due = due_jobs(now, claimed={}, last_poll=last_poll, last_try={},
-                   ever_ran=ever_ran)
+                   failures={}, ever_ran=ever_ran)
     assert "confirm" in [d.job.name for d in due], (
         "a failed poll sits out the whole window instead of retrying"
     )
@@ -2317,7 +2421,8 @@ def test_the_history_import_is_never_due():
     start = datetime(2026, 1, 1, tzinfo=UTC)
     for hour in range(0, 24 * 14, 5):
         now = start + timedelta(hours=hour)
-        due = due_jobs(now, claimed={}, last_poll={}, last_try={}, ever_ran={"history"})
+        due = due_jobs(now, claimed={}, last_poll={}, last_try={}, failures={},
+                       ever_ran={"history"})
         assert "history" not in [d.job.name for d in due], f"history due at {now}"
 
 
@@ -2556,3 +2661,89 @@ def test_a_manual_sync_that_waited_out_the_fetch_lock_reads_busy_too(conn):
     record_manual_sync(conn, held)
     row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
     assert (row["status"], row["detail"][:5]) == ("nothing", "busy:")
+
+
+# --------------------------------------------------------------------------
+# The IBKR budget, over a week with the network down.
+# --------------------------------------------------------------------------
+
+
+def test_a_week_offline_never_asks_ibkr_faster_than_a_healthy_week(
+    conn, ctx, clock, tmp_path, monkeypatch
+):
+    """The guard on H7: a backoff that is no longer terminal must not hammer IBKR.
+
+    The real `sync` and `confirm` jobs, the real reconciler ticking every 60 s from
+    Monday 00:00 to the next Monday, and the real Flex client. Only the socket is
+    replaced: every request fails the way it does with no network, and is counted.
+
+    What the numbers mean. Before the fix `confirm` made its five quick retries on
+    Monday morning and then never ran again (that was H7), and `sync` made one
+    attempt per scheduled noon. Now `sync` is unchanged, and `confirm` keeps its
+    five quick retries and then asks once per 25-minute window, the cadence a
+    WORKING poll keeps. So an outage costs at most what a healthy week spends, plus
+    those five, and no two backed-off requests are closer than a window.
+    """
+    import socket
+    from datetime import UTC, datetime, timedelta
+    from urllib.error import URLError
+    from urllib.parse import parse_qs, urlsplit
+    from zoneinfo import ZoneInfo
+
+    from conftest import add_statement
+
+    from optjournal import flex, settings
+    from optjournal import jobs as mod
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv(settings.HOME_ENV, str(home))
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    monkeypatch.delenv("OPTJOURNAL_CONFIRM_QUERY_ID", raising=False)
+    settings.update(confirm_query_id="1621016")
+    add_statement(conn)                      # the confirm poll needs a base currency
+    mod.record_run(conn, "sync", status="ok", started_at="2026-10-02T11:00:00+00:00")
+    monkeypatch.setattr(mod, "JOBS", tuple(
+        j for j in mod.JOBS if j.name in ("sync", "confirm")))
+    monkeypatch.setattr(flex, "read_token", lambda *_a, **_k: "not-a-real-token")
+
+    asked: list[tuple[datetime, str]] = []
+
+    def offline(request, timeout=None):
+        query = parse_qs(urlsplit(request.full_url).query).get("q", ["?"])[0]
+        asked.append((clock["t"], query))
+        raise URLError(socket.gaierror(8, "nodename nor servname provided"))
+
+    monkeypatch.setattr(flex, "urlopen", offline)
+
+    start = datetime(2026, 10, 5, tzinfo=UTC)                      # a Monday
+    for minute in range(7 * 24 * 60):
+        clock["t"] = start + timedelta(minutes=minute)
+        mod.reconcile(conn, ctx=ctx, now=clock["t"])
+
+    sync = [t for t, q in asked if q == ctx.query_id]
+    confirm = [t for t, q in asked if q == "1621016"]
+    assert len(sync) + len(confirm) == len(asked), "a request for an unknown query"
+
+    # `sync`: one request per scheduled noon (Tuesday to Saturday), never more.
+    dublin = ZoneInfo("Europe/Dublin")
+    assert [t.astimezone(dublin).strftime("%a %H:%M") for t in sync] == [
+        "Tue 12:00", "Wed 12:00", "Thu 12:00", "Fri 12:00", "Sat 12:00"]
+
+    # `confirm`: at most a healthy week's polls, plus the five quick retries.
+    job = mod.job_by_name("confirm")
+    session_s = ((mod.SESSION_CLOSE_H * 60 + mod.SESSION_TAIL_M)
+                 - (mod.SESSION_OPEN_H * 60 + mod.SESSION_OPEN_M)) * 60
+    healthy_week = 5 * (session_s // job.window_s + 1)
+    assert len(confirm) <= healthy_week + mod.FAILURE_BACKOFF, (
+        f"{len(confirm)} confirm requests in a week offline, against "
+        f"{healthy_week} for a healthy week"
+    )
+    gaps = [(b - a).total_seconds() for a, b in zip(confirm, confirm[1:], strict=False)]
+    assert min(gaps) >= mod.TICK_S, "two confirm requests inside one tick"
+    assert min(gaps[mod.FAILURE_BACKOFF - 1:]) >= job.window_s, (
+        "a backed-off confirm poll asked IBKR more often than a healthy one"
+    )
+    assert all(mod._in_session(t) for t in confirm), "a confirm request out of session"
+    # And it is no longer parked: every session of the week was tried.
+    assert len({t.astimezone(ZoneInfo(_ET)).date() for t in confirm}) == 5
