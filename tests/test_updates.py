@@ -19,8 +19,9 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import zipfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import pytest
@@ -271,6 +272,38 @@ def test_the_launcher_knows_optjournal_from_anything_else_on_its_port(tmp_path):
         silent.listen()
         assert launcher._whats_on(silent.getsockname()[1], timeout_s=0.5) == "other"
     assert launcher._whats_on(_free_port()) is None
+
+
+def test_the_launchers_probe_is_bounded_by_a_program_that_streams(tmp_path):
+    """A program streaming on the port (a byte every tenth of a second) kept the
+    probe reading for as long as it streamed, because the timeout bounds each
+    read rather than the whole probe. Now it gives up at its own deadline."""
+    class Stream(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib naming
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            with suppress(OSError):
+                for _ in range(50):
+                    self.wfile.write(b".")
+                    self.wfile.flush()
+                    time.sleep(0.1)
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stream)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        started = time.monotonic()
+        seen = _launcher()._whats_on(int(server.server_address[1]), timeout_s=0.5)
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert seen == "other"
+    assert elapsed < 2.0, f"the probe read the stream for {elapsed:.1f}s"
 
 
 def _fake_uv_for_launcher(tmp_path: Path, serve_codes: list[int]) -> Path:

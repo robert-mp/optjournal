@@ -102,7 +102,18 @@ def _whats_on(port: int = PORT, timeout_s: float = 2.0) -> str | None:
     conn = http.client.HTTPConnection(HOST, port, timeout=timeout_s)
     try:
         conn.request("GET", "/")
-        head = conn.getresponse().read(8192).decode("utf-8", "replace")
+        response = conn.getresponse()
+        # Read what has arrived, up to the title, within one deadline for the
+        # whole probe. `timeout_s` alone bounds each read, so a program that
+        # streams a byte at a time held a single read(8192) for its whole stream.
+        deadline = time.monotonic() + timeout_s
+        raw = b""
+        while len(raw) < 8192 and b"</title>" not in raw and time.monotonic() < deadline:
+            chunk = response.read1(8192 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+        head = raw.decode("utf-8", "replace")
     except (OSError, http.client.HTTPException):
         return "other"
     finally:
