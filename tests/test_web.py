@@ -7672,6 +7672,19 @@ def test_a_banner_button_is_handed_back_after_any_failure(button, label, failure
         assert out["notes"] == ["bad"], "the failure was not reported"
 
 
+def test_a_late_update_banner_leaves_the_focused_field_where_it_was():
+    """L38: the update check answers seconds after the page, and the banner it
+    draws landed above a journal entry being typed, moving the field 123px under
+    the cursor (measured in a browser, and 0px after this fix at 1280 and 375).
+    `checkUpdate` measures the focused element before its redraw and scrolls by
+    exactly what moved it. Over the source, for the preserveInputs test's reason.
+    """
+    fn = _fn("checkUpdate")
+    before = fn.index("getBoundingClientRect().top")
+    assert before < fn.index("draw();") < fn.index("window.scrollBy("), (
+        "the focused field has to be measured before the redraw and put back after")
+
+
 def test_the_app_banners_wrap_on_a_phone():
     """L37: the "What's new" notes are a `<pre>`, which does not wrap, so at 375px
     the page scrolled sideways to 942px. L39: the banner is a flex row, so every

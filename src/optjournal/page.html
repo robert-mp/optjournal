@@ -5903,7 +5903,17 @@ async function checkUpdate(){
     S.update=await r.json();
   }catch(e){S.update=null;}
   /* The first load may still be in flight; it draws the banner when it lands. */
-  if(S.state) draw();
+  if(!S.state) return;
+  /* The answer can arrive seconds after the page, by which time the reader may be
+     typing into a journal entry, and a banner landing above it moved the field
+     123px under the cursor. So whatever holds focus stays where it was on screen:
+     the page scrolls by exactly the height the banner added above it. */
+  const was=document.activeElement, top=was&&was!==document.body
+    ?was.getBoundingClientRect().top:null;
+  draw();
+  const now=document.activeElement;
+  if(top!==null&&now&&now!==document.body)
+    window.scrollBy(0,now.getBoundingClientRect().top-top);
 }
 
 /* After a restart is asked for, wait for the server to come back, then reload
