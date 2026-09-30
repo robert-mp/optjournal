@@ -39,7 +39,9 @@ from optjournal.bars import (
 )
 from optjournal.blackscholes import bs_price, implied_vol
 from optjournal.clock import MARKET_TZ, epoch_et, et_day, expiry_epoch
+from optjournal.history import build_history
 from optjournal.marketdata import Bar
+from optjournal.stats import campaigns_for
 
 #: Marks the output unmistakably. `statements` and the UI show the query name.
 QUERY_NAME = "optjournal-demo"
@@ -1101,20 +1103,19 @@ def write_demo_journal(conn) -> int:
     reason. The cost is stated rather than hidden: editing the seeds above does not
     reach a demo database that already holds them.
     """
-    orders = [
-        str(row["ib_order_id"])
-        for row in conn.execute(
-            "SELECT DISTINCT ib_order_id FROM trades WHERE account_id = ?"
-            " AND ib_order_id IS NOT NULL"
-            " ORDER BY CAST(ib_order_id AS INTEGER)",
-            (DEMO_ACCOUNT,),
-        )
-    ]
+    # Filed under decisions' anchors, the key the Trades cards look an entry up
+    # by. The Nth order id was used once, and the second order is a close, so
+    # that write-up matched no card and showed only as an orphan.
+    report = build_history(conn, asset_category="OPT")
+    anchors = sorted(
+        {c.anchor for c in campaigns_for(conn, "OPT", report.episodes) if c.anchor},
+        key=lambda a: (int(a) if a.isdigit() else math.inf, a),
+    )
     written = 0
     for index, values in DEMO_JOURNAL:
-        if index >= len(orders):
+        if index >= len(anchors):
             continue
-        anchor = orders[index]
+        anchor = anchors[index]
         if journal.entry_for(conn, anchor, account_id=DEMO_ACCOUNT) is not None:
             continue
         target = conn.execute(

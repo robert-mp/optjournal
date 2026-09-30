@@ -1390,20 +1390,20 @@ def test_the_demo_seeds_write_ups_without_making_every_card_complete(conn):
     written = write_demo_journal(conn)
     assert written == len(DEMO_JOURNAL)
 
+    from optjournal.serialize import journal_data
+
     entries = journal.entries(conn)
     assert len(entries) == len(DEMO_JOURNAL)
-    orders = {
-        str(r["ib_order_id"]) for r in conn.execute(
-            "SELECT DISTINCT ib_order_id FROM trades WHERE ib_order_id IS NOT NULL")
-    }
-    for (_broker, account, anchor), entry in entries.items():
+    for (_broker, account, _anchor), entry in entries.items():
         assert account == DEMO_ACCOUNT
-        assert anchor in orders, (
-            f"{anchor} is no order in the demo, so no card could ever show it"
-        )
         assert entry.underlying_symbol and entry.opened_on, (
             "the entry cannot say which decision it belongs to"
         )
+    # Filed under a DECISION's anchor, not just any order id: a note keyed on a
+    # closing order matches no card and shows only as an orphan.
+    assert journal_data(conn)["orphans"] == [], (
+        "a seeded write-up is filed under an order no decision is anchored on"
+    )
 
     # One reviewed and one not, so both halves of the form have rendered state.
     reviewed = [e for e in entries.values() if e.values["exit_trigger"]]
