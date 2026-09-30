@@ -1394,6 +1394,27 @@ def test_a_failed_ingest_keeps_the_callers_own_pending_writes(conn, tmp_path):
 # --- confirm rows stored before M3 are rewritten on open -----------------------
 
 
+def test_a_journal_a_newer_optjournal_migrated_is_left_as_it_is(tmp_path):
+    """An old server still running after an update saw the new keys as wrong and
+    rebuilt the tables back to its own, and the new code rebuilt them forward:
+    back and forth on every request, dropping the views under readers. From this
+    version on, a schema newer than the code is refused, untouched."""
+    db = tmp_path / "j.db"
+    conn = connect(db)
+    migrate(conn)
+    conn.execute("INSERT INTO schema_version (version, applied_at)"
+                 " VALUES (?, datetime('now'))", (SCHEMA_VERSION + 1,))
+    conn.execute("DROP VIEW trade_legs")       # a newer code's own definitions
+    conn.commit()
+    before = conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall()
+
+    with pytest.raises(sqlite3.OperationalError, match="newer than this optjournal"):
+        migrate(conn)
+
+    after = conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall()
+    assert [tuple(r) for r in after] == [tuple(r) for r in before], "the schema was rebuilt"
+
+
 def test_opening_a_current_journal_needs_no_write_lock(tmp_path):
     """Every page request opens the journal, and so migrates it. The confirm date
     repair ran its UPDATEs every time, and an UPDATE that matches nothing still

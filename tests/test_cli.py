@@ -437,6 +437,30 @@ def test_a_diverged_clone_is_refused_before_anything_runs(
 
 
 @_POSIX_ONLY
+def test_update_leaves_the_migration_to_a_server_still_running(
+        clones, tmp_path, capsys, fake_uv, monkeypatch):
+    """The running `serve` is the OLD code and migrates on every request, so a
+    migration now was rolled back by its next page load and forward again at the
+    restart, dropping the views under readers each time. With optjournal answering
+    on its port, `update` installs the new code and leaves the migration to the
+    restart it asks for."""
+    from optjournal import web
+
+    pub, _friend = clones
+    _publish(pub, "v2")
+    db = tmp_path / "home" / "journal.db"
+    connect(db).close()
+    with web.serve_ephemeral(db_path=tmp_path / "served.db",
+                             archive_dir=tmp_path / "raw") as base:
+        monkeypatch.setenv("OPTJOURNAL_PORT", base.rsplit(":", 1)[1].strip("/"))
+        code, text = _update(capsys, db)
+
+    assert code == cli.EXIT_OK, text
+    assert [c[1] for c in _uv_calls(fake_uv)] == ["sync"], "it migrated anyway"
+    assert "not migrated: optjournal is running with the old code" in text
+
+
+@_POSIX_ONLY
 def test_update_migrates_with_the_new_code_in_a_fresh_process(
         clones, tmp_path, capsys, fake_uv):
     """M16: the migration is the PULLED code's, so it runs in a new process.

@@ -91,7 +91,9 @@ tracked files stop it before it touches the network. Untracked files (such as th
 overwrite one. It never runs `git stash`. It installs exactly the `uv.lock` it
 pulled (`uv sync --locked`, which also refuses a lock that does not match its
 `pyproject.toml`), then migrates the journal with the new code, so a migration
-that fails is reported by `update` rather than later by `serve`.
+that fails is reported by `update` rather than later by `serve`. While
+optjournal is running it leaves the migration to the restart it asks for,
+because the running copy is still the old code.
 
 It does not restart a running `serve`. The server re-reads the page on every
 request but loads its Python once at startup, so a code update needs a restart,

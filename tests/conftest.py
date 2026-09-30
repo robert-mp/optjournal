@@ -242,6 +242,19 @@ def _no_earnings_fetch(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_server(monkeypatch):
+    """The port the app, the launcher and `update` look for a running server on
+    points at a closed one. On a machine running the real journal, 8765 answers,
+    and a test would then see "optjournal is running" and behave differently (an
+    update skipping its migration), or talk to the live instance. A test about a
+    running server sets its own."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed = probe.getsockname()[1]
+    monkeypatch.setenv("OPTJOURNAL_PORT", str(closed))
+
+
+@pytest.fixture(autouse=True)
 def _no_release_check(monkeypatch):
     """Every rendered page asks /api/update, which asks GitHub for the newest
     release. AUTOUSE so the suite reads as offline there; a test about updates

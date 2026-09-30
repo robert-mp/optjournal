@@ -11,6 +11,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import re
 import sqlite3
 import sys
@@ -1006,6 +1007,24 @@ _MIGRATE = (
 )
 
 
+def _serving_here(timeout_s: float = 1.0) -> bool:
+    """Whether optjournal answers on this machine's port (`$OPTJOURNAL_PORT`, else
+    8765), judged by the page's title as the launcher does."""
+    import http.client
+
+    port = int(os.environ.get("OPTJOURNAL_PORT") or 8765)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout_s)
+    try:
+        conn.request("GET", "/")
+        head = conn.getresponse().read(4096).decode("utf-8", "replace")
+    except (OSError, http.client.HTTPException):
+        return False
+    finally:
+        conn.close()
+    title = re.search(r"<title>([^<]*)</title>", head)
+    return bool(title and "optjournal" in title.group(1))
+
+
 def cmd_update(args) -> int:
     """Fast-forward this journal to the latest published commit.
 
@@ -1122,7 +1141,14 @@ def cmd_update(args) -> int:
         return EXIT_ERROR
 
     db = args.db or DEFAULT_DB
-    if db.exists():
+    if db.exists() and _serving_here():
+        # The running server is the OLD code, and it migrates on every request:
+        # a migration now would be rolled back by it on its next page load, and
+        # forward again at the restart. The restart migrates with the new code.
+        print("\nThe journal was not migrated: optjournal is running with the old "
+              "code. Stop it and start it again, and it migrates the journal with "
+              "the new code as it starts.")
+    elif db.exists():
         migrated = subprocess.run(
             [uv, "run", "--frozen", "--quiet", "python", "-c", _MIGRATE, str(db)],
             cwd=ROOT, capture_output=True, text=True, check=False)

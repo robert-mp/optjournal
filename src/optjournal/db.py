@@ -1248,6 +1248,20 @@ def migrate(conn: sqlite3.Connection) -> int:
 
 def _migrate_unlocked(conn: sqlite3.Connection) -> int:
     """The migration itself. Call `migrate`, which holds the lock."""
+    # A journal a NEWER optjournal has migrated is left exactly as it is. Every
+    # step below brings a table to THIS code's definition, which for a newer
+    # schema is a rebuild backwards: an old server still running after an update
+    # rolled v17's keys back to v16's on its next request, and the new code rolled
+    # them forward again, dropping the views under readers each time.
+    try:
+        stamped = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+    except sqlite3.OperationalError:
+        stamped = None                      # no schema_version yet: a new journal
+    if stamped is not None and stamped > SCHEMA_VERSION:
+        raise sqlite3.OperationalError(
+            f"this journal is at schema version {stamped}, newer than this "
+            f"optjournal's {SCHEMA_VERSION}: a newer copy has opened it. Restart "
+            f"optjournal so the updated code serves it, or update this copy.")
     # ONLY the views whose definition has actually changed. This used to drop all
     # five unconditionally, which is what let one request delete the view another
     # request was mid-query on -- the HTTP 500. `executescript` below recreates
