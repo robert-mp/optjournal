@@ -124,11 +124,6 @@ class FillPart:
     quantity: float
     #: IBKR's marker, or for a half of a reversal that half's own: `C` or `O`.
     open_close: str
-    #: Executions this counts as: 1, except the opening half of a reversal. One
-    #: `C;O` execution split over two episodes is still one execution, so it
-    #: counts once, on the half it closed, which is the half IBKR books its
-    #: realised P&L on.
-    fills: int
     date_time: str | None
     trade_price: float | None
     proceeds: float
@@ -413,9 +408,8 @@ def _through_zero(ep: Episode, row: Any) -> tuple[dict, dict]:
     return close_part, open_part
 
 
-def _absorb(ep: Episode, row: Any, *, fills: int = 1) -> None:
-    """Fold one fill into an episode. `fills` is what it counts as: see
-    `FillPart.fills`."""
+def _absorb(ep: Episode, row: Any) -> None:
+    """Fold one fill into an episode."""
     qty = row["quantity"] or 0
     closing = _is_close(row["open_close"])
 
@@ -446,7 +440,6 @@ def _absorb(ep: Episode, row: Any, *, fills: int = 1) -> None:
         ep.fill_parts[trade_id] = FillPart(
             quantity=qty,
             open_close=str(row["open_close"] or ""),
-            fills=fills,
             date_time=row["date_time"],
             trade_price=row["trade_price"],
             proceeds=row["proceeds"] or 0.0,
@@ -844,13 +837,12 @@ def build_history(
         if past_flat and _reverses(row["open_close"]):
             # The fill finished one position and began the opposite one, so it
             # belongs to both episodes: the closing part ends this one, the
-            # leftover opens the next. Each records its own half (`fill_parts`),
-            # and the execution counts once, where it closed.
+            # leftover opens the next. Each records its own half (`fill_parts`).
             close_part, open_part = _through_zero(current, row)
             _absorb(current, close_part)
             flush()
             current = _new_episode(row)
-            _absorb(current, open_part, fills=0)
+            _absorb(current, open_part)
             continue
 
         peak = current.peak_qty

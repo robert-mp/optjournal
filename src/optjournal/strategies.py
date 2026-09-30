@@ -328,8 +328,10 @@ def position_groups(
 
     An order whose fills ended one position and began the next is drawn in both
     cards, each with its own share (`_campaign_events`), so every fill's
-    quantity and money is drawn once across the cards and a card's `fills`
-    counts its own executions.
+    quantity and money is drawn once across the cards. A card's `fills` counts
+    every execution it draws, so a split `C;O` one counts in both of its cards:
+    no total adds cards' fills up, and the ones that count executions across
+    cards (the Dashboard's, the Calendar's) count each once.
     """
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own

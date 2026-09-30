@@ -362,7 +362,7 @@ def link(
     # What each campaign took of each order leg, per (order, contract), which is
     # the shape a leg has: its episodes' own fill parts. A leg more than one
     # campaign took is divided between them; see `Campaign.leg_parts`.
-    took: dict[int, dict[tuple[str, str], list[Any]]] = {}
+    took: dict[int, dict[tuple[str, str], list[tuple[str, Any]]]] = {}
     for root, idxs in members.items():
         for i in idxs:
             conid = str(getattr(episodes[i], "conid", "") or "")
@@ -370,7 +370,7 @@ def link(
                 order_id = order_of_trade.get(str(tid))
                 if order_id is not None:
                     took.setdefault(root, {}).setdefault(
-                        (order_id, conid), []).append(part)
+                        (order_id, conid), []).append((str(tid), part))
     takers: dict[tuple[str, str], int] = {}
     for legs in took.values():
         for key in legs:
@@ -402,8 +402,8 @@ def link(
                 (e.commission_base, e.commission, e.currency) for e in eps
             ) if decided else None,
             links=tuple(sorted(links_of_root.get(root, ()))),
-            leg_parts={key: _leg_share(parts)
-                       for key, parts in took.get(root, {}).items()
+            leg_parts={key: _leg_share(taken)
+                       for key, taken in took.get(root, {}).items()
                        if takers[key] > 1},
         ))
     return out
@@ -411,22 +411,29 @@ def link(
 
 #: The columns of a leg that are sums over its fills, named as `db.trade_legs`
 #: and `history.FillPart` both name them.
-_LEG_TOTALS = ("quantity", "fills", "proceeds", "proceeds_base", "commission",
+_LEG_TOTALS = ("quantity", "proceeds", "proceeds_base", "commission",
                "commission_base", "realized_pnl", "realized_pnl_base")
 
 
-def _leg_share(parts: Sequence[Any]) -> dict[str, Any]:
+def _leg_share(taken: Sequence[tuple[str, Any]]) -> dict[str, Any]:
     """The share of one order leg a campaign took, in the leg's own columns.
 
-    Summed from the fill parts its episodes took, so every figure is those fills'
-    own, a reversal's half included, and the shares of the campaigns dividing a
-    leg add back up to it. The price is `trade_legs`' average, over this share's
-    fills. The open/close marker is that of what the share took first
-    (`first_take`), which is every part's when they agree, and which says, of two
-    shares starting on one split execution, which took its closing half.
+    Summed from the fill parts its episodes took, `(trade id, part)`, so every
+    figure is those fills' own, a reversal's half included, and the shares of the
+    campaigns dividing a leg add back up to it. `fills` counts the executions it
+    drew from, a split one included, so each card counts every execution it
+    draws and a split one counts in both of its cards (once in one card holding
+    both of its halves); a total across cards counts executions from the fills
+    themselves instead (the Dashboard's, and the Calendar's, which lists an
+    order whole). The price is `trade_legs`' average, over this share's fills.
+    The open/close marker is that of what the share took first (`first_taken`),
+    which is every part's when they agree, and which says, of two shares
+    starting on one split execution, which took its closing half.
     """
+    parts = [part for _tid, part in taken]
     share: dict[str, Any] = {
         name: sum(getattr(part, name) for part in parts) for name in _LEG_TOTALS}
+    share["fills"] = len({tid for tid, _part in taken})
     size = sum(abs(part.quantity) for part in parts)
     share["avg_price"] = sum(
         abs(part.quantity) * part.trade_price

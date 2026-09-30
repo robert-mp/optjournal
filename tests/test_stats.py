@@ -684,11 +684,17 @@ def test_every_fill_is_drawn_once_across_the_cards_and_once_on_the_calendar(conn
         for field in ("proceeds", "commission", "realized_pnl"):
             assert leg["money"][field]["base"] == pytest.approx(leg[f"{field}_base"] or 0.0)
             assert (leg["money"][field]["native"] or 0.0) == pytest.approx(leg[field] or 0.0)
-    # One execution is one fill on the page, wherever the cards divide it.
+    # A card counts every execution it draws, a split one in each card drawing a
+    # half. The totals across cards count each once: the Dashboard's fills, and
+    # the Calendar's, which lists an execution whole.
+    took = [len({t for i in c.episode_indices for t in report.episodes[i].trade_ids})
+            for c in camps]
+    assert sorted(card["fills"] for card in cards) == sorted(took)
     executions = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    assert sum(card["fills"] for card in cards) == executions
-    # And the Dashboard counts the outcomes the cards show.
+    assert sum(ev["fills"] for ev in events) == executions
     stats = month_stats(conn, None, asset_category="OPT", report=report, campaign_list=camps)
+    assert stats.total_trades == executions
+    # And the Dashboard counts the outcomes the cards show.
     decided = [card["realized_pnl"]["base"] for card in cards if card["realized_pnl"]]
     assert (stats.wins, stats.losses) == (
         sum(pnl > 0 for pnl in decided), sum(pnl < 0 for pnl in decided))
@@ -757,7 +763,7 @@ def test_one_order_filled_c_then_c_o_gives_the_long_both_its_closes(conn):
     *_, cards, _events = _meet(conn, "B: one order filled C, then C;O")
     assert _cards_read(cards) == {
         "2026-09-10 10:00:00": ("Long put", [["1001"], ["1002"]], 100.0, 95.0, 3),
-        "2026-09-15 10:00:01": ("Short put", [["1002"], ["1003"]], 50.0, 40.0, 1),
+        "2026-09-15 10:00:01": ("Short put", [["1002"], ["1003"]], 50.0, 40.0, 2),
     }
 
 
@@ -771,19 +777,38 @@ def test_a_close_only_run_and_the_opening_fill_after_it_divide_their_order(conn)
     }
 
 
-def test_a_split_execution_is_one_fill_on_the_calendar_and_in_the_cards(conn):
-    """A: one `C;O` execution divided between the long and the short. Both cards
-    counted it, so the page read four fills for three executions, and the
-    Calendar's day detail drew its two halves as two rows ("2 fill(s)"). It counts
-    once, in the card it closed (the half IBKR books its P&L on), and the
-    Calendar, a list of the day's executions, shows it whole."""
+def test_a_split_execution_is_one_row_on_the_calendar_and_counted_in_each_card(conn):
+    """A: one `C;O` execution divided between the long and the short. The
+    Calendar's day detail drew its two halves as two rows ("2 fill(s)"); it lists
+    the day's executions, so it shows it whole. Each card counts it, since each
+    draws a half of it."""
     *_, cards, events = _meet(conn, "A: one C;O fill")
     assert {card["opened_at"]: card["fills"] for card in cards} == {
-        "2026-09-10 10:00:00": 2, "2026-09-15 10:00:00": 1}
+        "2026-09-10 10:00:00": 2, "2026-09-15 10:00:00": 2}
     day = [(o["ib_order_id"], lg["quantity"], lg["proceeds"]) for ev in events
            for o in ev["orders"] for lg in o["legs"]
            if lg["first_fill_at"].startswith("2026-09-15")]
     assert day == [("1002", -3, 450.0)]
+
+
+def test_a_position_opened_by_the_far_half_of_a_split_counts_that_fill(conn):
+    """Long 2, then SELL 3 as `C;O`, and the short is still open. Counted only
+    where it closed, the execution left the short's card reading "0 fill(s)" over
+    the STO it drew."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for
+    from optjournal.strategies import position_groups
+
+    _leg(conn, conid="1", order_id="1001", at="2026-09-10 10:00:00", qty=2,
+         proceeds=-200.0, pnl=None, open_close="O")
+    _leg(conn, conid="1", order_id="1002", at="2026-09-15 10:00:00", qty=-3,
+         proceeds=450.0, pnl=95.0, open_close="C;O")
+    episodes = build_history(conn, asset_category="OPT").episodes
+    cards = position_groups(orders_data(conn), episodes=episodes,
+                            campaign_list=campaigns_for(conn, "OPT", episodes))
+    assert {(card["label"], card["status"]): card["fills"] for card in cards} == {
+        ("Long put", "closed"): 2, ("Short put", "open"): 1}
 
 
 def test_a_split_execution_is_listed_under_the_position_it_closed(conn):
