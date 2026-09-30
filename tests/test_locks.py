@@ -179,9 +179,11 @@ def test_two_processes_cannot_both_clear_the_fetch_cooldown(tmp_path):
             def __init__(self, *a, **k): pass
             def download(self, *a, **k):
                 time.sleep(1.5)
-                # The smallest body `fetch` accepts as a statement.
+                # The smallest body `fetch` accepts as a statement: one block,
+                # stating the base currency ingest needs.
                 return (b"<FlexQueryResponse><FlexStatements count='1'>"
-                        b"<FlexStatement/></FlexStatements></FlexQueryResponse>")
+                        b"<FlexStatement><AccountInformation currency='USD'/>"
+                        b"</FlexStatement></FlexStatements></FlexQueryResponse>")
 
         flex.read_token = lambda account=None: "token"
         # `_client_factory`, the module's single seam: `fetch` used to construct
