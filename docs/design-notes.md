@@ -94,8 +94,10 @@ own fills**, which are option prices the market really charged. Fills matter
 because a price source's history can begin after a trade did: this journal's TSLA
 270P was sold on 2026-07-24 and the source's first bar for it is 2026-07-27, so
 without the fill the band, the delta and the P&L were all absent across the entry
-session. The fill-derived vol came out at 49.3% against 50.0% for the next daily
-close, so it agrees with the source rather than distorting it.
+session. The fill-derived vol came out at 50.6% against 50.4% for the next daily
+close, each solved at the instant it was printed (49.3% against 50.0% while bars
+were still read at their stamps), so it agrees with the source rather than
+distorting it.
 
 Two assumptions live in `blackscholes.py` as named constants rather than
 literals, so they are auditable: `RISK_FREE` (0.04) and `DIVIDEND_YIELD` (0.0,
