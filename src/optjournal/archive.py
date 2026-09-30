@@ -17,14 +17,18 @@ Two kinds of redundancy, treated very differently:
   despite covering more days. These are *reported* and never deleted.
 
 Provenance is preserved rather than broken. Rows in `trades`,
-`cash_transactions` and `position_snapshots` carry the `source_file` they came
-from, and the three tables disagree about which duplicate that is -- trades
-and cash are first-write-wins so they point at the oldest copy, while
-position_snapshots replaces on conflict so it points at the newest. Deleting
+`cash_transactions`, `position_snapshots` and `equity_summaries` carry the
+`source_file` they came from, and the tables disagree about which duplicate that
+is -- trades and cash are first-write-wins so they point at the oldest copy, while
+the snapshots and NAV replace on conflict so they point at the newest. Deleting
 files without fixing that would dangle a foreign key and leave rows claiming
 to originate from a file that no longer exists. Because the duplicates are
 byte-identical, re-pointing them at the retained copy is accurate, not a
 fudge: that file contains exactly the same statement.
+
+The retained copy is one the journal has a `statements` row for, when there is
+one: a copy restored under an older name was skipped at ingest as a duplicate and
+has none, and re-pointing rows at it would leave them referencing nothing.
 """
 
 from __future__ import annotations
@@ -48,8 +52,10 @@ __all__ = [
 ]
 
 #: Tables carrying a source_file provenance column, all of which must be
-#: re-pointed before a retained duplicate's siblings are removed.
-_PROVENANCE_TABLES = ("trades", "cash_transactions", "position_snapshots")
+#: re-pointed before a retained duplicate's siblings are removed. Every table
+#: with a foreign key to `statements(source_file)`.
+_PROVENANCE_TABLES = ("trades", "cash_transactions", "position_snapshots",
+                      "equity_summaries")
 
 
 @dataclass(slots=True)
@@ -57,8 +63,9 @@ class DuplicateGroup:
     """One set of byte-identical archive files."""
 
     digest: str
-    #: The copy to retain. Deterministically the oldest filename, which is
-    #: also the one first-write-wins tables already reference.
+    #: The copy to retain. The oldest filename the journal holds a `statements`
+    #: row for, or the oldest filename when it holds none (or there is no
+    #: journal). Deterministic either way.
     keep: Path
     redundant: list[Path] = field(default_factory=list)
     #: Captured at construction. Reading sizes lazily would report zero once
@@ -83,8 +90,13 @@ class PruneResult:
         return sum(g.bytes_reclaimed for g in self.groups)
 
 
-def duplicate_groups(archive_dir: Path) -> list[DuplicateGroup]:
-    """Group archived statements by content, returning only real duplicates."""
+def duplicate_groups(
+    archive_dir: Path, conn: sqlite3.Connection | None = None,
+) -> list[DuplicateGroup]:
+    """Group archived statements by content, returning only real duplicates.
+
+    With a journal, each group keeps a copy the journal ingested (see `keep`).
+    """
     if not archive_dir.is_dir():
         return []
 
@@ -100,21 +112,32 @@ def duplicate_groups(archive_dir: Path) -> list[DuplicateGroup]:
         for path in paths:
             by_digest[archive_digest(path)].append(path)
 
+    ingested = _ingested_names(conn)
     groups = []
     for digest, paths in by_digest.items():
         if len(paths) < 2:
             continue
         ordered = sorted(paths)
-        redundant = ordered[1:]
+        keep = next((p for p in ordered if p.name in ingested), ordered[0])
+        redundant = [p for p in ordered if p != keep]
         groups.append(
             DuplicateGroup(
                 digest=digest,
-                keep=ordered[0],
+                keep=keep,
                 redundant=redundant,
                 bytes_reclaimed=sum(p.stat().st_size for p in redundant),
             )
         )
     return sorted(groups, key=lambda g: g.keep.name)
+
+
+def _ingested_names(conn: sqlite3.Connection | None) -> set[str]:
+    if conn is None:
+        return set()
+    try:
+        return {r[0] for r in conn.execute("SELECT source_file FROM statements")}
+    except sqlite3.OperationalError:
+        return set()
 
 
 def subsumed_candidates(conn: sqlite3.Connection) -> list[tuple[str, str]]:
@@ -164,8 +187,11 @@ def prune_archive(
     project that deletes archived source data. Provenance is re-pointed to the
     retained copy before anything is removed, and the whole database change is
     one transaction so a failure cannot leave rows pointing at a deleted file.
+
+    The groups, and so the keep and drop lists a dry run reports, are chosen
+    the same way in both modes, so the dry run describes what --apply does.
     """
-    groups = duplicate_groups(archive_dir)
+    groups = duplicate_groups(archive_dir, conn)
     result = PruneResult(applied=apply, groups=groups)
     if not apply or not groups:
         # Dry run: report against current state, nothing has changed.
