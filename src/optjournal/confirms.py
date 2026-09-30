@@ -140,17 +140,19 @@ def _quantity(attrs: dict[str, str], name: str) -> int | float | None:
 def split_codes(code: str | None) -> tuple[str | None, str | None]:
     """`code` into (open_close, notes), the way the Activity statement splits it.
 
-    Returns the FIRST open/close marker and every other code, semicolon-joined in
+    Returns the open/close markers and every other code, each semicolon-joined in
     the order IBKR sent them. Two columns rather than one string because that is
     what the rest of this journal reads: `history.py` tests `open_close`, and a
-    reader filtering on notes='O' would find nothing on an activity row.
+    reader filtering on notes='O' would find nothing on an activity row. A fill
+    through zero carries both markers, stored as "C;O" like the Activity
+    Statement's `openCloseIndicator`.
     """
     if not code:
         return None, None
     parts = [p.strip() for p in code.split(";") if p.strip()]
-    marker = next((p for p in parts if p in _OPEN_CLOSE_CODES), None)
-    rest = [p for p in parts if p != marker]
-    return marker, (";".join(rest) or None)
+    markers = [p for p in parts if p in _OPEN_CLOSE_CODES]
+    rest = [p for p in parts if p not in _OPEN_CLOSE_CODES]
+    return (";".join(markers) or None), (";".join(rest) or None)
 
 
 def _root(path: Path) -> ET.Element:

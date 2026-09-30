@@ -150,6 +150,9 @@ def test_open_close_comes_out_of_the_code_field(confirm_file):
 
     # And the mixed case, which is what a real close with a code looks like.
     assert split_codes("C;P") == ("C", "P")
+    # A fill through zero carries both markers, which the Activity Statement
+    # stores as "C;O"; keeping only the first made it read as a plain close.
+    assert split_codes("C;O;P") == ("C;O", "P")
     assert split_codes("IPO;M") == (None, "IPO;M")
     assert split_codes(None) == (None, None)
 
