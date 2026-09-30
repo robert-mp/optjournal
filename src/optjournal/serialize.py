@@ -190,10 +190,12 @@ def orders_data(
     for o in orders:
         if order_ids is not None and str(o["ib_order_id"]) not in order_ids:
             continue
+        # By broker as well: an order id is the issuing broker's, and read by id
+        # alone each broker's order 5000 took the other's legs too.
         legs = conn.execute(
-            "SELECT * FROM trade_legs WHERE ib_order_id = ?"
+            "SELECT * FROM trade_legs WHERE broker = ? AND ib_order_id = ?"
             " AND asset_category = ? ORDER BY expiry, strike",
-            (o["ib_order_id"], asset_category),
+            (o["broker"], o["ib_order_id"], asset_category),
         ).fetchall()
         row = dict(o)
         leg_rows = [dict(lg) for lg in legs]
@@ -1697,15 +1699,16 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     """
     written = journal_entries(conn)
     live: set[str] = set()
-    shared: set[str] = set()
+    shared: set[tuple[str, str]] = set()
     if written:
         for category in ("OPT", EQUITY_CATEGORY):
             report = build_history(conn, asset_category=category)
             for c in campaigns_for(conn, category, report.episodes):
                 live |= {c.anchor} if c.anchor else set()
-                shared |= {c.shared_anchor} if c.shared_anchor else set()
+                shared |= {(broker, c.shared_anchor) for broker in c.brokers
+                           if c.shared_anchor}
     orphans = journal_orphans(conn, live) if written else []
-    orphans += [entry for key, entry in written.items() if key[2] in shared]
+    orphans += [entry for key, entry in written.items() if (key[0], key[2]) in shared]
     return {
         "entries": {
             anchor: entry.payload()

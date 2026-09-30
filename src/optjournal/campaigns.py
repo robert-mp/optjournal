@@ -140,7 +140,7 @@ class Campaign:
     #: campaign: the leg views aggregate per contract and carry no fill id, so an
     #: order is the only handle the Trades tab has. One order is in two campaigns
     #: when its fills ended one position and began the next; `leg_parts` says
-    #: what each took.
+    #: what each took. `orders` says which broker issued each.
     order_ids: frozenset[str]
     #: Every episode closed. A roll into a still-open position leaves this
     #: False, which is the entire behavioural change: the near leg's realised
@@ -164,6 +164,10 @@ class Campaign:
     #: seconds later is two campaigns, and the re-entry's card has always
     #: answered to 100.
     handles: frozenset[str] = frozenset()
+    #: `order_ids` with the broker that issued each, `(broker, order id)`, which
+    #: is how the Trades tab finds an order's campaigns: an order id is the
+    #: issuing broker's own, and two brokers can both number an order 5000.
+    orders: frozenset[tuple[str, str]] = frozenset()
     #: What this campaign took of an order LEG another campaign also took, keyed
     #: by `(order id, conid)`, in the leg's own columns (`_leg_share`): quantity,
     #: fills, prices, times, money, and the open/close marker of what it took.
@@ -212,6 +216,11 @@ class Campaign:
     #: so writing filed under it may be about either (`serialize.journal_data`
     #: lists it). None for every campaign whose lowest handle is its own alone.
     shared_anchor: str | None = None
+
+    @property
+    def brokers(self) -> frozenset[str]:
+        """The brokers whose fills it holds; one, in all but a hand-made case."""
+        return frozenset(broker for broker, _oid in self.orders)
 
     @property
     def is_win(self) -> bool:
@@ -327,7 +336,10 @@ def link(
     for oid, index in group_of_order.items():
         orders_of_group.setdefault(index, set()).add(oid)
 
-    members_of_group: dict[int, list[int]] = {}
+    #: Per broker as well: a decision is placed at one broker, and an order id is
+    #: the issuing broker's own, so two brokers' order 5000 are not one order
+    #: touching two contracts, which is what a spread looks like.
+    members_of_group: dict[tuple[int, str], list[int]] = {}
     #: Orders reached per episode, so the campaign can carry the union of them.
     #: Only the orders of the episode's OWN fills. A group that joins episodes
     #: (below) makes every one of its orders some member's own anyway; one that
@@ -338,6 +350,7 @@ def link(
     #: ... and those plus every order of their groups, which is what anchors and
     #: hand links have always been read against (`Campaign.handles`).
     handles_of_episode: dict[int, set[str]] = {}
+    broker_of = [str(getattr(episode, "broker", "") or "") for episode in episodes]
     for i, episode in enumerate(episodes):
         for tid in getattr(episode, "trade_ids", ()) or ():
             order_id = order_of_trade.get(str(tid))
@@ -349,7 +362,7 @@ def link(
             group = group_of_order.get(order_id)
             if group is not None:
                 handles |= orders_of_group[group]
-                members_of_group.setdefault(group, []).append(i)
+                members_of_group.setdefault((group, broker_of[i]), []).append(i)
     # A group joins DIFFERENT contracts: a roll's two expiries, a spread's legs.
     # A group that touched episodes of only ONE contract has reversed it -- a fill
     # through zero (IBKR's `C;O`) belongs to the long it closed and the short it
@@ -384,7 +397,7 @@ def link(
     # What each campaign took of each order leg, per (order, contract), which is
     # the shape a leg has: its episodes' own fill parts. A leg more than one
     # campaign took is divided between them; see `Campaign.leg_parts`.
-    took: dict[int, dict[tuple[str, str], list[tuple[str, Any]]]] = {}
+    took: dict[int, dict[tuple[str, str, str], list[tuple[str, Any]]]] = {}
     for root, idxs in members.items():
         for i in idxs:
             conid = str(getattr(episodes[i], "conid", "") or "")
@@ -392,14 +405,14 @@ def link(
                 order_id = order_of_trade.get(str(tid))
                 if order_id is not None:
                     took.setdefault(root, {}).setdefault(
-                        (order_id, conid), []).append((str(tid), part))
-    takers: dict[tuple[str, str], int] = {}
+                        (broker_of[i], order_id, conid), []).append((str(tid), part))
+    takers: dict[tuple[str, str, str], int] = {}
     for legs in took.values():
         for key in legs:
             takers[key] = takers.get(key, 0) + 1
 
     roots = sorted(members)
-    own = {root: frozenset(oid for i in members[root]
+    own = {root: frozenset((broker_of[i], oid) for i in members[root]
                            for oid in orders_of_episode.get(i, ())) for root in roots}
     handles_of = {root: frozenset(oid for i in members[root]
                                   for oid in handles_of_episode.get(i, ()))
@@ -415,7 +428,8 @@ def link(
         out.append(Campaign(
             episode_indices=tuple(idxs),
             conids=tuple(sorted({str(getattr(e, "conid", "") or "") for e in eps})),
-            order_ids=own[root],
+            order_ids=frozenset(oid for _broker, oid in own[root]),
+            orders=own[root],
             handles=handles_of[root],
             anchor=anchor_of.get(root),
             shared_anchor=shared_of.get(root),
@@ -434,9 +448,9 @@ def link(
                 (e.commission_base, e.commission, e.currency) for e in eps
             ) if decided else None,
             links=tuple(sorted(links_of_root.get(root, ()))),
-            leg_parts={key: _leg_share(taken)
-                       for key, taken in took.get(root, {}).items()
-                       if takers[key] > 1},
+            leg_parts={(order_id, conid): _leg_share(taken)
+                       for (broker, order_id, conid), taken in took.get(root, {}).items()
+                       if takers[(broker, order_id, conid)] > 1},
         ))
     return out
 
@@ -457,9 +471,9 @@ def _taken_first(part: Any) -> tuple[bool, str, bool]:
 
 def _anchors(
     roots: list[int],
-    own: Mapping[int, frozenset[str]],
+    own: Mapping[int, frozenset[tuple[str, str]]],
     handles: Mapping[int, frozenset[str]],
-    took: Mapping[int, Mapping[tuple[str, str], list[tuple[str, Any]]]],
+    took: Mapping[int, Mapping[tuple[str, str, str], list[tuple[str, Any]]]],
     campaign_of_order: Mapping[str, int],
 ) -> tuple[dict[int, str | None], dict[int, str]]:
     """Each campaign's anchor, one per card, and the anchor any gave up.
@@ -471,33 +485,38 @@ def _anchors(
     campaign that took the anchor order's first execution keeps it
     (`_taken_first`, then the lower root); each other takes the lowest of its
     own orders that no campaign is anchored at and that a link naming it would
-    find it by (`campaign_of_order`), or None when it has none.
+    find it by (`campaign_of_order`), or None when it has none. Per broker: an
+    entry is filed under `(broker, account, anchor)`, so two brokers' cards
+    answering to one order id do not clash.
     """
     anchor_of: dict[int, str | None] = {root: _lowest(handles[root]) for root in roots}
-    claims: dict[str, list[int]] = {}
+    claims: dict[tuple[str, str], list[int]] = {}
     for root in roots:
         anchor = anchor_of[root]
-        if anchor is not None:
-            claims.setdefault(anchor, []).append(root)
+        for broker in sorted({broker for broker, _oid in own[root]}):
+            if anchor is not None:
+                claims.setdefault((broker, anchor), []).append(root)
     used = set(claims)
     shared_of: dict[int, str] = {}
-    for anchor in sorted(claims, key=lambda oid: (_order_sort_key(oid), oid)):
-        claimants = claims[anchor]
+    for broker, anchor in sorted(claims, key=lambda key: (
+            key[0], _order_sort_key(key[1]), key[1])):
+        claimants = claims[(broker, anchor)]
         if len(claimants) < 2:
             continue
-        taken = {root: [part for (order_id, _conid), pairs in took.get(root, {}).items()
-                        if order_id == anchor for _tid, part in pairs]
+        taken = {root: [part for (at, order_id, _conid), pairs in took.get(root, {}).items()
+                        if (at, order_id) == (broker, anchor) for _tid, part in pairs]
                  for root in claimants}
         owner = min(claimants, key=lambda root: (
             min(map(_taken_first, taken[root]), default=(True, "", True)), root))
         for root in claimants:
-            if root == owner:
+            if root == owner or root in shared_of:
                 continue
-            spare = _lowest(oid for oid in own[root] if oid not in used
-                            and campaign_of_order.get(oid) == root)
-            anchor_of[root] = spare
+            spare = min(((at, oid) for at, oid in own[root] if (at, oid) not in used
+                         and campaign_of_order.get(oid) == root),
+                        key=lambda pair: (_order_sort_key(pair[1]), pair), default=None)
+            anchor_of[root] = spare[1] if spare else None
             shared_of[root] = anchor
-            if spare is not None:
+            if spare:
                 used.add(spare)
     return anchor_of, shared_of
 
