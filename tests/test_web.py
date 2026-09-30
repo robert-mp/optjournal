@@ -2063,7 +2063,7 @@ def test_dashboard_friction_is_split_by_scope(state):
     """
     s = state["stats"]
     assert s["options_friction"]["base"] == abs(s["commissions"]["base"])
-    assert s["account_friction_base"] == abs(s["fees"]["base"])
+    assert s["account_friction_base"] == -s["fees"]["base"]
     # The split reapportions; it must not change or drop anything.
     assert (
         s["options_friction"]["base"] + s["account_friction_base"]

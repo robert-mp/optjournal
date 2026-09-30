@@ -519,8 +519,12 @@ class MonthStats:
         cannot see commission on other instruments at all, while the cost
         report reads the raw statement and includes it. Do not present the two
         under the same label -- they differ by the whole of stock commission.
+
+        The signed sum flipped once, not its magnitude: a period whose refunds
+        exceed its charges (September 2026 on the real account, +0.01) is a net
+        credit, and the Costs tab (`costs.build_costs`) reports it as one.
         """
-        return abs(self.fees.base)
+        return -self.fees.base
 
     @property
     def total_friction_base(self) -> float:

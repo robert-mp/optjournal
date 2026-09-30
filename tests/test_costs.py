@@ -156,6 +156,38 @@ def test_fees_are_never_narrowed_by_the_scope(conn):
         assert r.unattributable.base == pytest.approx(1.30), scope
 
 
+def test_a_fee_refund_reduces_the_total_it_reverses(conn):
+    """IBKR cancels a charge with a POSITIVE row of the same size.
+
+    The real archive, EUR market data: 1.30 charged for August, the same 1.30
+    cancelled (`CANCEL[...]`), 1.29 charged for September. Taking each row's
+    magnitude booked the cancellation as a third charge, 3.89 where the account
+    paid 1.29.
+    """
+    add_cash(conn, "f1", amount=-1.30, description="OPRA NP L1 FOR AUG 2026")
+    add_cash(conn, "f2", amount=1.30,
+             description="CANCEL[OPRA NP L1] FOR AUG 2026")
+    add_cash(conn, "f3", amount=-1.29, description="OPRA NP L1 FOR SEP 2026")
+    r = build_costs(conn)
+    assert r.unattributable.base == pytest.approx(1.29)
+    (group,) = r.fees
+    assert group.count == 3, "a refund is still a row the reader can see"
+    assert dict(group.total.by_ccy) == {"EUR": pytest.approx(1.29)}
+
+
+def test_a_period_refunded_more_than_it_was_charged_is_a_net_credit(conn):
+    """September 2026 on the real account: the August cancellation (+1.30) and
+    the September charge (-1.29) both land in it, so the month cost -0.01."""
+    add_cash(conn, "f1", amount=-1.30, date="2026-08-04")
+    add_cash(conn, "f2", amount=1.30, date="2026-09-02",
+             description="CANCEL[OPRA NP L1] FOR AUG 2026")
+    add_cash(conn, "f3", amount=-1.29, date="2026-09-02")
+    assert build_costs(conn, period="2026-09").unattributable.base == (
+        pytest.approx(-0.01))
+    assert build_costs(conn, period="2026-08").unattributable.base == (
+        pytest.approx(1.30))
+
+
 def test_fees_are_not_mixed_into_the_attributable_figure(conn):
     """Two properties on the report, because they answer different questions:
     'what did trading this cost' and 'what did the account cost'."""
@@ -471,6 +503,23 @@ def test_withholding_reports_an_effective_rate(conn):
     line = build_costs(conn).withholding[0]
     assert line.symbol == "IBKR"
     assert line.effective_rate == pytest.approx(21.5)
+
+
+def test_a_withholding_refund_and_a_dividend_reversal_net_off(conn):
+    """Both carry signs, and both were summed as magnitudes.
+
+    A reclaimed withholding arrives positive and a reversed dividend negative;
+    read as magnitudes they doubled the tax and the dividend instead of
+    cancelling them.
+    """
+    add_cash(conn, "d1", kind="Dividends", symbol="ACME", amount=100.0)
+    add_cash(conn, "d2", kind="Dividends", symbol="ACME", amount=-100.0)
+    add_cash(conn, "d3", kind="Dividends", symbol="ACME", amount=100.0)
+    add_cash(conn, "w1", kind="Withholding Tax", symbol="ACME", amount=-30.0)
+    add_cash(conn, "w2", kind="Withholding Tax", symbol="ACME", amount=15.0)
+    (line,) = build_costs(conn).withholding
+    assert line.gross.base == pytest.approx(100.0)
+    assert line.withheld.base == pytest.approx(15.0)
 
 
 def test_withholding_with_no_dividend_reports_no_rate(conn):

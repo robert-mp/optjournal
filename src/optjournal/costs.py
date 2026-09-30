@@ -613,7 +613,15 @@ def _read_cash(
     ):
         kind = str(row["type"] or "").upper()
         currency = str(row["currency"] or "").upper()
-        # Cost positive, like every other figure here.
+        # SIGNED, and summed with the sign. A refund is a real row: IBKR cancels
+        # a market-data charge with a positive `CANCEL[...]` row of the same
+        # size, reclaims withholding the same way, and reverses a dividend with a
+        # negative one. Taking each row's magnitude booked every reversal as a
+        # further charge (3.89 of EUR market data where the account paid 1.29).
+        # Cost positive, like every other figure here: the sign flips once, on
+        # the charge, and a period refunded more than it paid is a net credit.
+        stated = Charge.of([(row["amount_base"] or 0.0, row["amount"] or 0.0,
+                             currency)])
         charge = Charge.of([(-(row["amount_base"] or 0.0), -(row["amount"] or 0.0),
                              currency)])
 
@@ -621,18 +629,18 @@ def _read_cash(
             name = categorise_fee(row["description"])
             group = fees.setdefault(name, FeeGroup(name=name))
             group.count += 1
-            group.total += abs(charge)
+            group.total += charge
             if len(group.examples) < 3 and row["description"]:
                 group.examples.append(str(row["description"]))
         elif "WITHHOLDING" in kind or "WHTAX" in kind:
             key = str(row["symbol"] or "") or "(non-dividend)"
-            withheld[key] = withheld.get(key, Charge()) + abs(charge)
+            withheld[key] = withheld.get(key, Charge()) + charge
             ccy_of.setdefault(key, currency)
         elif "DIVIDEND" in kind:
             key = str(row["symbol"] or "") or "(unknown)"
-            # A dividend is a credit, so its magnitude is the gross figure the
+            # Income, so read as stated rather than flipped: the gross figure the
             # withholding is a fraction of.
-            dividends[key] = dividends.get(key, Charge()) + abs(charge)
+            dividends[key] = dividends.get(key, Charge()) + stated
             ccy_of.setdefault(key, currency)
 
     report.fees = sorted(fees.values(), key=lambda f: -f.total.base)
