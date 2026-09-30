@@ -162,14 +162,93 @@ def _event(members: list[Row]) -> Row:
     }
 
 
-def _campaign_of_order(campaign_list: list[campaigns.Campaign]) -> dict[str, int]:
-    """Which campaign each order filled, so an event is placed by its own orders.
+def _campaign_of_order(
+    campaign_list: list[campaigns.Campaign],
+) -> dict[str, list[int]]:
+    """Which campaigns each order filled, so an event is placed by its own orders.
 
     The campaign carries them because the leg views aggregate per contract and so
     carry no fill id for an event to join on.
+
+    A LIST, because one order can fill two campaigns: a fill through zero (IBKR's
+    `C;O`) closes one position and opens the opposite one, so its order belongs to
+    the decision it ended and the one it began. Keeping a single index let the
+    last campaign win, and the order was then drawn in one card only -- the other
+    read its opening date and its proceeds from whatever event was left to it.
     """
-    return {oid: index for index, camp in enumerate(campaign_list)
-            for oid in camp.order_ids}
+    out: dict[str, list[int]] = {}
+    for index, camp in enumerate(campaign_list):
+        for oid in camp.order_ids:
+            out.setdefault(str(oid), []).append(index)
+    return out
+
+
+def _leg_part(leg: Row, part: tuple[float, str] | None) -> Row:
+    """One campaign's half of a leg two campaigns filled, or the leg itself.
+
+    `part` is `campaigns.Campaign.leg_parts`: the quantity this campaign took and
+    that half's own open/close marker. The marker is what makes the closing half
+    read STC and the opening half STO, and it is also what divides the realised
+    P&L, which IBKR reports whole on the half that closed. Everything else
+    divides by quantity, which is `history._through_zero`'s rule.
+    """
+    if part is None:
+        return leg
+    quantity, open_close = part
+    whole = leg.get("quantity") or 0
+    share = quantity / whole if whole else 0.0
+    out = {**leg, "quantity": quantity, "open_close": open_close}
+    for name in ("proceeds", "proceeds_base", "commission", "commission_base"):
+        out[name] = (leg.get(name) or 0.0) * share
+    closed = open_close.upper() == "C"
+    for name in ("realized_pnl", "realized_pnl_base"):
+        out[name] = (leg.get(name) or 0.0) if closed else 0.0
+    out["money"] = {f: Money.from_rows([out], f).payload()
+                    for f in FILL_MONEY_FIELDS}
+    return out
+
+
+def _order_part(order: Row, camp: campaigns.Campaign) -> Row:
+    """The order as one campaign filled it, when another filled the rest."""
+    if not camp.leg_parts:
+        return order
+    oid = str(order.get("ib_order_id"))
+    return {**order, "legs": [
+        _leg_part(leg, camp.leg_parts.get((oid, str(leg.get("conid")))))
+        for leg in order.get("legs", ())
+    ]}
+
+
+def _campaign_events(
+    orders: list[Row], campaign_list: list[campaigns.Campaign],
+) -> list[tuple[int | None, Row]]:
+    """Every strategy event with the campaign that filled it, newest first.
+
+    The event grouping reads orders, which carry no note codes, so it puts two
+    positions' expirations in one event (IBKR stamps both 16:20:00) after the
+    campaigns have kept the positions apart. Split along campaign lines, each
+    position keeps its own expiry, while a spread's legs expiring together (one
+    campaign) stay one event.
+
+    An order two campaigns filled joins both, each part carrying its own half of
+    the shared leg (`_leg_part`). `None` for an event no campaign claims.
+    """
+    campaign_of_order = _campaign_of_order(campaign_list)
+    out: list[tuple[int | None, Row]] = []
+    for event in strategy_groups(orders):
+        parts: dict[int | None, list[Row]] = {}
+        for order in event["orders"]:
+            for index in campaign_of_order.get(str(order.get("ib_order_id")),
+                                               [None]):
+                parts.setdefault(index, []).append(
+                    order if index is None
+                    else _order_part(order, campaign_list[index]))
+        if len(parts) == 1:
+            out.append((next(iter(parts)), event))
+        else:
+            out.extend((index, _event(members))
+                       for index, members in parts.items())
+    return out
 
 
 def campaign_events(
@@ -177,23 +256,11 @@ def campaign_events(
 ) -> list[Row]:
     """`strategy_groups`, with no event straddling two campaigns, newest first.
 
-    The event grouping reads orders, which carry no note codes, so it puts two
-    positions' expirations in one event (IBKR stamps both 16:20:00) after the
-    campaigns have kept the positions apart. Split along campaign lines, each
-    position keeps its own expiry, while a spread's legs expiring together (one
-    campaign) stay one event. The Trades cards and the Calendar's day detail both
-    read this, so they cannot disagree about what one event was.
+    The Trades cards and the Calendar's day detail both read this, so they cannot
+    disagree about what one event was. See `_campaign_events`, which the cards use
+    for the campaign each event belongs to as well.
     """
-    campaign_of_order = _campaign_of_order(campaign_list)
-    events: list[Row] = []
-    for event in strategy_groups(orders):
-        parts: dict[int | None, list[Row]] = {}
-        for order in event["orders"]:
-            parts.setdefault(
-                campaign_of_order.get(str(order.get("ib_order_id"))), []
-            ).append(order)
-        events.extend([event] if len(parts) == 1 else map(_event, parts.values()))
-    return events
+    return [event for _index, event in _campaign_events(orders, campaign_list)]
 
 
 def position_groups(
@@ -225,23 +292,16 @@ def position_groups(
     Events whose orders map to no episode (nothing but snapshots, or an
     unmatched category) stay as singleton lifecycles.
     """
-    campaign_of_order = _campaign_of_order(campaign_list)
-
-    def campaign_of(event: Row) -> int | None:
-        for oid in event.get("order_ids", ()):
-            index = campaign_of_order.get(str(oid))
-            if index is not None:
-                return index
-        return None
-
-    events = campaign_events(orders, campaign_list)
-
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own
-    # rather than pooling every orphan into one.
+    # rather than pooling every orphan into one. The index comes from the split
+    # itself: a reversal order's two parts differ only in which campaign claimed
+    # them, so reading it back off the event's order ids could not tell them
+    # apart.
     grouped: dict[tuple[bool, int], list[Row]] = {}
-    for position, event in enumerate(events):
-        index = campaign_of(event)
+    for position, (index, event) in enumerate(
+        _campaign_events(orders, campaign_list)
+    ):
         key = (True, index) if index is not None else (False, position)
         grouped.setdefault(key, []).append(event)
 

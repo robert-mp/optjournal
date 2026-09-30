@@ -51,14 +51,14 @@ and every case below is testable against literals.
 
 Episodes are duck-typed rather than imported. Everything here reads is
 `conid`, `trade_ids`, `is_closed`, `closed_at`, `realized_pnl{,_base}`,
-`commission{,_base}` and `currency`, which is why this stays a leaf holder
-instead of acquiring `history.py`.
+`commission{,_base}`, `currency` and `fill_parts`, which is why this stays a
+leaf holder instead of acquiring `history.py`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -154,6 +154,20 @@ class Campaign:
     #: campaign, as stored. Empty for a campaign the window alone built, which is
     #: how the Trades tab knows which cards it may offer to unlink.
     links: tuple[tuple[str, str], ...] = ()
+    #: What this campaign took from an order LEG another campaign also filled:
+    #: `(quantity, open_close)` keyed by `(order id, conid)`. Only a reversal
+    #: (IBKR's `C;O`) leg is shared, by the position it closed and the one it
+    #: opened, and the Trades tab needs the halves to draw that order in both
+    #: cards rather than whichever one it happened to reach. From the episodes'
+    #: own `fill_parts`, so the division is `history._through_zero`'s and not a
+    #: second reading of it. Empty for every campaign that shares no leg, which
+    #: is all of them on either journal today.
+    #:
+    #: `hash=False` because a mapping is not hashable and this dataclass is
+    #: frozen, so including it would turn `hash(campaign)` from working into a
+    #: TypeError. Equality still reads it.
+    leg_parts: Mapping[tuple[str, str], tuple[float, str]] = field(
+        default_factory=dict, hash=False)
 
     @property
     def anchor(self) -> str | None:
@@ -346,6 +360,17 @@ def link(
         idxs = members[root]
         eps = [episodes[i] for i in idxs]
         decided = bool(eps) and all(e.is_closed for e in eps)
+        # The halves of a shared fill, per (order, contract), which is the shape a
+        # leg has. A key BOTH halves reached is a leg this campaign filled whole
+        # (a hand link joined the two sides of the reversal), so there is nothing
+        # to divide and it is dropped.
+        halves: dict[tuple[str, str], list[tuple[float, str]]] = {}
+        for episode in eps:
+            conid = str(getattr(episode, "conid", "") or "")
+            for tid, part in (getattr(episode, "fill_parts", None) or {}).items():
+                order_id = order_of_trade.get(str(tid))
+                if order_id is not None:
+                    halves.setdefault((order_id, conid), []).append(part)
         out.append(Campaign(
             episode_indices=tuple(idxs),
             conids=tuple(sorted({str(getattr(e, "conid", "") or "") for e in eps})),
@@ -367,6 +392,7 @@ def link(
                 (e.commission_base, e.commission, e.currency) for e in eps
             ) if decided else None,
             links=tuple(sorted(links_of_root.get(root, ()))),
+            leg_parts={k: v[0] for k, v in halves.items() if len(v) == 1},
         ))
     return out
 

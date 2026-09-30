@@ -24,13 +24,14 @@ Three properties of IBKR's data drive the design:
 
 * A position opened before the earliest statement has no opening fill on
   record, so its episode can never balance to zero from trades alone. Those
-  are marked `entry_outside_window`. The newest position snapshot says how
-  much each account holds, so the difference between it and the fills up to
-  its date is the quantity held before the archive began (`_pre_archive`),
-  and the walk starts from it. Only an account with no snapshot at all falls
-  back to the old reading: a close-only run whose open/closed verdict is the
-  snapshot's. This is the second place snapshots carry information trades
-  cannot.
+  are marked `entry_outside_window`. The position snapshots say how much each
+  account holds, so a gap between one and the fills up to its date is quantity
+  the archive cannot account for; a gap that is the SAME on every snapshot date
+  is a holding from before the archive (`_pre_archive`), and the walk starts
+  from it. A gap that appears part way through is a change no trade made (a
+  split, a transfer), and those keep the older reading: a close-only run whose
+  open/closed verdict is the snapshot's. This is the second place snapshots
+  carry information trades cannot.
 
 Note codes are read through `notes.py`, which owns that rule for both readers of
 them: tokens are split and matched exactly, because substring matching would read
@@ -175,6 +176,13 @@ class Episode:
     unrealized: float | None = None
     trade_ids: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: The half of a shared fill this episode took, keyed by trade id: its
+    #: quantity, and IBKR's own open/close marker for that half. Only a reversal
+    #: (`C;O`) is shared, and only between the two episodes `_through_zero` splits
+    #: it between, so this is empty for every other episode. Carried so a caller
+    #: holding whole order LEGS can divide one along the same zero instead of
+    #: re-deriving where it fell -- see `campaigns.Campaign.leg_parts`.
+    fill_parts: dict[str, tuple[float, str]] = field(default_factory=dict)
 
     @property
     def is_closed(self) -> bool:
@@ -326,27 +334,43 @@ def _known_size(ep: Episode) -> bool:
     return not ep.entry_outside_window or bool(ep.pre_archive_qty)
 
 
-def _through_zero(ep: Episode | None, row: Any) -> tuple[dict, dict] | None:
-    """A closing fill that takes the position past flat, split at zero.
+def _reverses(open_close: str | None) -> bool:
+    """Whether the fill closed one side and OPENED the other: IBKR's `C;O`.
 
-    Long 2 calls then SELL 3 in one fill (IBKR marks it `C;O`): the first 2
-    close the long and the last 1 opens a short. Returned as the closing part
-    and the opening part, or None when the fill stops at or before zero.
+    A bare `C` closes only, so the quantity past flat in one is not a new
+    position. Splitting every overshoot invented one out of a holding the archive
+    had simply never seen the entry of.
+    """
+    tokens = split_notes((open_close or "").upper())
+    return "C" in tokens and "O" in tokens
 
-    The closing part takes all of IBKR's realised P&L, which is what it is: the
-    opening part realises nothing. Commission and proceeds divide by quantity.
+
+def _past_flat(ep: Episode | None, row: Any) -> bool:
+    """Whether this closing fill takes the position beyond flat.
 
     Only for an episode whose quantity is known (`_known_size`): one whose entry
     predates the archive with nothing saying how large it was has no zero to
-    split at.
+    pass.
     """
     if ep is None or not _known_size(ep) or _flat(ep.net_qty):
-        return None
+        return False
     qty = row["quantity"] or 0
     if not _is_close(row["open_close"]) or (qty > 0) == (ep.net_qty > 0):
-        return None
-    if abs(qty) <= abs(ep.net_qty) or _flat(abs(qty) - abs(ep.net_qty)):
-        return None
+        return False
+    return abs(qty) > abs(ep.net_qty) and not _flat(abs(qty) - abs(ep.net_qty))
+
+
+def _through_zero(ep: Episode, row: Any) -> tuple[dict, dict]:
+    """A reversing fill past flat, split at zero. See `_past_flat`, which gates it.
+
+    Long 2 calls then SELL 3 in one fill (IBKR marks it `C;O`): the first 2
+    close the long and the last 1 opens a short. Returned as the closing part
+    and the opening part.
+
+    The closing part takes all of IBKR's realised P&L, which is what it is: the
+    opening part realises nothing. Commission and proceeds divide by quantity.
+    """
+    qty = row["quantity"] or 0
     closing = -ep.net_qty
     share = closing / qty
     close_part, open_part = dict(row), dict(row)
@@ -415,56 +439,101 @@ def _finalise(ep: Episode, still_held: bool) -> None:
         ep.status = STATUS_OPEN
 
 
-#: The date an account's position book is as of, for a `position_snapshots p`
-#: row in the enclosing query: the newest day that account reported a position
-#: in ANY category, or on which its NAV breakdown held no stock and no options.
-#:
-#: Any category, because IBKR's OpenPositions lists only what is held and every
-#: row of one statement carries the same reportDate (checked across the real
-#: archive). The day the option book goes flat there is no OPT row at all, so the
-#: newest date that had an option is a stale book: a sold LEAP stayed OPEN with
-#: its realised P&L missing. A Trade Confirmation carries no positions, so it
-#: never moves this date.
-#:
-#: The NAV clause is the one case no position row can speak for: everything sold,
-#: an empty OpenPositions section, no row in any category. A statement whose
-#: query lacks the section leaves no row either, but the account still holds
-#: things and its NAV says so, so that silence keeps the older book rather than
-#: reading as flat.
-#:
-#: Per `(broker, account_id)`, so an account whose statements lag is read at its
-#: own date rather than against another's. `db.current_option_positions` spells
-#: the same rule for the Positions tab; `tests/test_history.py` holds them equal.
-#: GROUPED, not one subquery per row. Spelled as a correlated scalar subquery it
-#: ran the UNION once for every snapshot row it filtered, which is quadratic in
-#: the snapshot count and reached `/api/state` three times over: measured 0.14s to
-#: 0.34s on 398 rows, and 0.2s to 21.5s on the 4,558 rows two more years of daily
-#: statements bring. As a derived table joined on `(broker, account_id)` it is one
-#: pass: 2.2s back to 1ms at that size.
-BOOK_DATES_SQL = (
-    "SELECT broker, account_id, MAX(d) AS book_date FROM ("
-    " SELECT broker, account_id, report_date AS d FROM position_snapshots"
-    " UNION ALL SELECT broker, account_id, report_date FROM equity_summaries"
-    "  WHERE stock_base = 0 AND options_base = 0)"
-    " GROUP BY broker, account_id"
-)
-
-#: The join that narrows a `position_snapshots p` to each account's current book.
-BOOK_JOIN_SQL = (
-    f" JOIN ({BOOK_DATES_SQL}) b"
-    "  ON b.broker = p.broker AND b.account_id = p.account_id"
-    "   AND b.book_date = p.report_date"
-)
+#: The equity-summary column that prices each position-bearing category, so a
+#: zero in it says the book in that category is empty. IBKR's NAV breakdown
+#: prices stock and options separately and under their own names, and nothing
+#: else a journal can hold: a fund, a bond or a future has no column here, so no
+#: NAV row ever calls one of those flat.
+NAV_VALUE_BY_CATEGORY: dict[str, str] = {
+    "STK": "stock_base",
+    "OPT": "options_base",
+}
 
 
-def book_date(conn: sqlite3.Connection) -> str | None:
+def _nav_flat_where(asset_category: str | None) -> str:
+    """The equity-summary predicate saying this scope holds nothing, or "".
+
+    Per category, because each column speaks only for its own: the option book is
+    flat when `options_base` is 0 whatever the stock figure. Reading the two
+    together left a journal ingested with `--assets OPT` on a stale option book
+    for good, since the day its options go flat has no position row at all and its
+    NAV still prices the stock that journal does not track.
+
+    A scope the NAV cannot price gets "" -- no NAV row may empty it. The mixed
+    scope takes every priced column being zero, which is as far as the NAV's own
+    columns reach: an account holding only funds or bonds still reads as flat
+    there on a day whose statement carried no positions.
+    """
+    if asset_category:
+        column = NAV_VALUE_BY_CATEGORY.get(asset_category.upper())
+        return f"{column} = 0" if column else ""
+    return " AND ".join(
+        f"{column} = 0" for column in sorted(NAV_VALUE_BY_CATEGORY.values())
+    )
+
+
+def book_dates_sql(asset_category: str | None = None) -> str:
+    """The date each account's position book is as of, as a derived table.
+
+    The newest day the account reported a position in ANY category, or on which
+    its NAV breakdown priced the scope at nothing.
+
+    Any category, because IBKR's OpenPositions lists only what is held and every
+    row of one statement carries the same reportDate (checked across the real
+    archive). The day the option book goes flat there is no OPT row at all, so the
+    newest date that had an option is a stale book: a sold LEAP stayed OPEN with
+    its realised P&L missing. A Trade Confirmation carries no positions, so it
+    never moves this date.
+
+    The NAV clause is the one case no position row can speak for: everything in
+    the scope sold, and no row for it in any category. A statement whose query
+    lacks the OpenPositions section leaves no row either, but the account still
+    holds things and its NAV says so, so that silence keeps the older book rather
+    than reading as flat. `_nav_flat_where` says which column answers.
+
+    Per `(broker, account_id)`, so an account whose statements lag is read at its
+    own date rather than against another's. `db.current_option_positions` spells
+    this again for the Positions tab, at `asset_category='OPT'`;
+    `tests/test_history.py` holds the two equal. GROUPED, not one subquery per
+    row: spelled as a correlated scalar subquery it ran the UNION once for every
+    snapshot row it filtered, which is quadratic in the snapshot count and reached
+    `/api/state` three times over (measured 0.14s to 0.34s on 398 rows, and 0.2s
+    to 21.5s on the 4,558 rows two more years of daily statements bring). As a
+    derived table joined on `(broker, account_id)` it is one pass: 2.2s back to
+    1ms at that size.
+    """
+    flat = _nav_flat_where(asset_category)
+    nav = (
+        " UNION ALL SELECT broker, account_id, report_date FROM equity_summaries"
+        f"  WHERE {flat}"
+    ) if flat else ""
+    return (
+        "SELECT broker, account_id, MAX(d) AS book_date FROM ("
+        " SELECT broker, account_id, report_date AS d FROM position_snapshots"
+        f"{nav})"
+        " GROUP BY broker, account_id"
+    )
+
+
+def book_join_sql(asset_category: str | None = None) -> str:
+    """The join narrowing a `position_snapshots p` to each account's current book."""
+    return (
+        f" JOIN ({book_dates_sql(asset_category)}) b"
+        "  ON b.broker = p.broker AND b.account_id = p.account_id"
+        "   AND b.book_date = p.report_date"
+    )
+
+
+def book_date(
+    conn: sqlite3.Connection, asset_category: str | None = None
+) -> str | None:
     """The newest account's book date, for labelling a book "as of".
 
     The newest across accounts because a label for a mixed-date book should name
     its most recent statement. Deciding what is held stays per account.
     """
     row = conn.execute(
-        f"SELECT MAX(book_date) FROM ({BOOK_DATES_SQL})"
+        f"SELECT MAX(book_date) FROM ({book_dates_sql(asset_category)})"
     ).fetchone()
     return str(row[0]) if row and row[0] else None
 
@@ -479,9 +548,10 @@ def _held(
     positions, so a conid-only key would let one account's holding answer the
     open/closed question for another's.
 
-    "Current" is `BOOK_DATES_SQL`, per account. This dict decides open versus
-    closed, so a stale book here is not cosmetic: a contract read from an older
-    date than its account's newest is judged still held after it was sold.
+    "Current" is `book_dates_sql`, for this scope and per account. This dict
+    decides open versus closed, so a stale book here is not cosmetic: a contract
+    read from an older date than its account's newest is judged still held after
+    it was sold.
 
     The date is returned even when nothing in `asset_category` is held: a flat
     book is still a book as of that day.
@@ -490,12 +560,13 @@ def _held(
     held = {
         (str(r["broker"] or ""), str(r["account_id"] or ""), str(r["conid"])): dict(r)
         for r in conn.execute(
-            f"SELECT p.* FROM position_snapshots p{BOOK_JOIN_SQL} {where}"
+            "SELECT p.* FROM position_snapshots p"
+            f"{book_join_sql(asset_category)} {where}"
             "  AND p.position != 0",
             params,
         )
     }
-    return held, book_date(conn)
+    return held, book_date(conn, asset_category)
 
 
 def _from_snapshot(row: dict[str, Any]) -> Episode:
@@ -543,43 +614,68 @@ def _day_key(value: Any) -> str:
 
 def _pre_archive(
     rows: list[Any],
-    held: dict[tuple[str, str, str], dict[str, Any]],
     conn: sqlite3.Connection,
 ) -> dict[tuple[str, str, str], float]:
-    """What each contract held before its first fill on record, per the snapshot.
+    """What each contract held before its first fill on record, per the snapshots.
 
-    Reconciles the fills against the book (`BOOK_DATES_SQL`): the snapshot's
-    quantity less the fills up to the book's date is what the account held before
-    the archive began. Only fills up to that date, because a Trade Confirmation
-    fill from today postdates the newest statement and the snapshot cannot know
-    it. Nothing for an account with no snapshot at all, since there is then no
-    book to reconcile against.
+    A gap between what a snapshot says an account holds and what its fills up to
+    that date add up to is quantity the archive cannot account for. It is seeded
+    as a pre-archive holding only when it is the SAME on every snapshot date the
+    account has, which is the property a real one has: every later change to a
+    pre-archive holding is a trade, the sale of the pre-archive shares included,
+    so the gap never moves. A gap that appears part way through is a quantity
+    change no trade made -- a share split, which arrives as a corporate action, or
+    a transfer between brokers -- and seeding one started the walk with shares
+    nothing had bought: the closed round trip before it fused with the position
+    after it into a single open episode, and its realised P&L left the closed
+    totals. Those keep the close-only reading.
+
+    Only fills up to each date, because a Trade Confirmation fill from today
+    postdates the newest statement and no snapshot can know it. Nothing for an
+    account with no snapshot at all, since there is then no book to reconcile
+    against.
 
     Real data: TSLA stock read 96 shares where the account held 206 (110 bought
-    before the archive), and IBKR 0.0019 where it held 0.8615. Checked over every
-    snapshot date in the archive: those two are the only disagreements, and each
-    is the same quantity on every date, as a pre-archive holding must be.
+    before the archive), and IBKR 0.0019 where it held 0.8615. Those two are the
+    only disagreements anywhere in the archive, and each is the same quantity on
+    all 28 of its snapshot dates.
     """
-    books = {
-        (str(r[0] or ""), str(r[1] or "")): _day_key(r[2])
-        for r in conn.execute(
-            f"SELECT broker, account_id, book_date FROM ({BOOK_DATES_SQL})"
-        )
-    }
-    through: dict[tuple[str, str, str], float] = {}
+    days: dict[tuple[str, str], set[str]] = {}
+    positions: dict[tuple[str, str, str], dict[str, float]] = {}
+    for row in conn.execute(
+        "SELECT broker, account_id, conid, report_date, position"
+        " FROM position_snapshots"
+    ):
+        account = (str(row["broker"] or ""), str(row["account_id"] or ""))
+        day = _day_key(row["report_date"])
+        days.setdefault(account, set()).add(day)
+        key = (*account, str(row["conid"] or ""))
+        positions.setdefault(key, {})[day] = row["position"] or 0
+    dates = {account: sorted(seen) for account, seen in days.items()}
+
+    fills: dict[tuple[str, str, str], list[tuple[str, float]]] = {}
     for row in rows:
         key = (str(row["broker"] or ""), str(row["account_id"] or ""),
                str(row["conid"] or ""))
-        book = books.get(key[:2])
-        if book is None:
-            continue
-        through.setdefault(key, 0)
-        if _day_key(row["trade_date"] or row["date_time"]) <= book:
-            through[key] += row["quantity"] or 0
+        if key[:2] in dates:
+            fills.setdefault(key, []).append(
+                (_day_key(row["trade_date"] or row["date_time"]),
+                 row["quantity"] or 0))
+
     out: dict[tuple[str, str, str], float] = {}
-    for key, net in through.items():
-        before = (held[key]["position"] if key in held else 0) - net
-        if not _flat(before):
+    for key, entries in fills.items():
+        snapshot = positions.get(key, {})
+        entries.sort()
+        gaps: list[float] = []
+        net: float = 0
+        index = 0
+        for day in dates[key[:2]]:
+            while index < len(entries) and entries[index][0] <= day:
+                net += entries[index][1]
+                index += 1
+            gaps.append((snapshot.get(day) or 0) - net)
+        before = gaps[0]
+        if not _flat(before) and all(_flat(gap - before) for gap in gaps):
             out[key] = before
     return out
 
@@ -611,7 +707,7 @@ def build_history(
         params,
     ).fetchall()
 
-    pre_archive = _pre_archive(rows, held, conn)
+    pre_archive = _pre_archive(rows, conn)
 
     episodes: list[Episode] = []
     current: Episode | None = None
@@ -669,18 +765,35 @@ def build_history(
             flush(closed_by_reentry=True)
             current = _new_episode(row)
 
-        split = _through_zero(current, row)
-        if split is not None:
+        past_flat = _past_flat(current, row)
+        if past_flat and _reverses(row["open_close"]):
             # The fill finished one position and began the opposite one, so it
             # belongs to both episodes: the closing part ends this one, the
-            # leftover opens the next.
-            _absorb(current, split[0])
+            # leftover opens the next. Each records its own half, so a consumer
+            # holding the whole order leg can divide it the same way.
+            close_part, open_part = _through_zero(current, row)
+            trade_id = str(row["trade_id"] or "")
+            _absorb(current, close_part)
+            current.fill_parts[trade_id] = (
+                close_part["quantity"], close_part["open_close"])
             flush()
             current = _new_episode(row)
-            _absorb(current, split[1])
+            _absorb(current, open_part)
+            current.fill_parts[trade_id] = (
+                open_part["quantity"], open_part["open_close"])
             continue
 
         _absorb(current, row)
+
+        if past_flat:
+            # A bare `C` opens nothing, so closing more than the walk knew was
+            # held says the rest was held before the archive began rather than
+            # that a position opened. The close took it flat, and its size is now
+            # known: the whole fill went out of it.
+            current.pre_archive_qty += -current.net_qty
+            current.entry_outside_window = True
+            current.peak_qty = max(current.peak_qty, abs(row["quantity"] or 0))
+            current.net_qty = 0
 
         if _known_size(current) and _flat(current.net_qty):
             flush()
