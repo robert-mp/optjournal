@@ -1091,6 +1091,7 @@ def due_jobs(
     failures: dict[str, int],
     since: int | None = None,
     registry: tuple[Job, ...] | None = None,
+    tries: dict[str, list[int]] | None = None,
 ) -> list[Due]:
     """Which jobs should run at `now`. Pure: no clock, no database, no I/O.
 
@@ -1114,6 +1115,10 @@ def due_jobs(
     * `failures` -- `consecutive_failures` per job. At `FAILURE_BACKOFF` a job is
       backed off: its fast retries stop and it keeps only its healthy cadence, one
       attempt per window or one per scheduled instant. It is never parked.
+    * `tries` -- every attempt's epoch per job (`_tries_by_job`). A backed-off job
+      that spends no IBKR request keeps ONE delayed retry per instant: its attempt
+      is often the first tick after a wake, which fails while the network comes
+      up, and with no retry that failure took every day from a backed-off job.
 
     EMPTY LEDGER MEANS UNKNOWN, NOT OVERDUE. `job_runs` lives in `journal.db`,
     which a `raw/` restore rebuilds from scratch, so a rebuilt journal has no runs
@@ -1170,10 +1175,13 @@ def due_jobs(
         tried = last_try.get(job.name)
         if tried is not None and tried >= stamp:
             # A run since the instant, and the instant still unclaimed: that run
-            # gave it back. Retry, but not on the very next tick, and not at all
-            # while backed off: then the next instant is the retry.
+            # gave it back. Retry, but not on the very next tick, and while backed
+            # off only once, and only for a job that can spend nothing: a broker
+            # job's next instant is its retry.
             if backed_off:
-                continue
+                attempts = sum(t >= stamp for t in (tries or {}).get(job.name, ()))
+                if job.spends_broker_request or tries is None or attempts >= 2:
+                    continue
             waited = int(now.timestamp()) - tried
             if waited < RETRY_AFTER_S:
                 continue
@@ -1291,6 +1299,19 @@ def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
     return claimed, last_poll, last_try, ever_ran, failures
 
 
+def _tries_by_job(conn: sqlite3.Connection) -> dict[str, list[int]]:
+    """Every recorded attempt's epoch per job: its end, or its start while running.
+
+    The ledger is pruned per job (`prune_runs`), so this stays a few dozen rows.
+    """
+    tries: dict[str, list[int]] = {}
+    for row in conn.execute("SELECT job, started_at, finished_at FROM job_runs"):
+        tried = _epoch_of(str(row["finished_at"] or row["started_at"]))
+        if tried is not None:
+            tries.setdefault(str(row["job"]), []).append(tried)
+    return tries
+
+
 def _epoch_of(stamp: str) -> int | None:
     """Epoch seconds from an ISO timestamp written by this package.
 
@@ -1356,7 +1377,8 @@ def reconcile(
     started: list[str] = []
     for due in due_jobs(moment, claimed=claimed, last_poll=last_poll,
                         last_try=last_try, ever_ran=ever_ran, failures=failures,
-                        since=None if since is None else int(since.timestamp())):
+                        since=None if since is None else int(since.timestamp()),
+                        tries=_tries_by_job(conn)):
         if is_backed_off(failures.get(due.job.name, 0)):
             # Backed off, so `due_jobs` only offers it at its healthy cadence, and
             # this is one of those attempts.

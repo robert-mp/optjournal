@@ -1786,8 +1786,11 @@ def test_a_backed_off_daily_job_keeps_its_schedule_but_loses_its_retries(
     Five consecutive failures used to stop the reconciler starting the job at
     all, and only a manual run could reset the count, so the backoff was terminal.
     Now a backed-off daily job keeps one attempt per scheduled instant (the
-    cadence it has when healthy) and loses only the quick retries a failure
-    otherwise earns. It stays runnable by hand, and a success clears the backoff.
+    cadence it has when healthy), plus, because `market` spends no IBKR request,
+    ONE delayed retry of it: the attempt is often the first tick after a wake,
+    which fails while the network comes up, and without the retry a backed-off
+    job lost every such day. The rest of the quick retries stay lost. It stays
+    runnable by hand, and a success clears the backoff.
     """
     from datetime import UTC, datetime, timedelta
     from zoneinfo import ZoneInfo
@@ -1811,11 +1814,13 @@ def test_a_backed_off_daily_job_keeps_its_schedule_but_loses_its_retries(
         "a backed-off job was not attempted at its scheduled instant, so the "
         "backoff is still terminal"
     )
-    # The attempt failed and gave its instant back, but a backed-off job does not
-    # get the quick retry a first failure would.
-    for minutes in (5, 30, 120, 600):
+    # The attempt failed and gave its instant back: one delayed retry, no more.
+    assert tick(noon + timedelta(minutes=1)) == [], "retried on the very next tick"
+    assert tick(noon + timedelta(minutes=5)) == ["market"], (
+        "a backed-off job that spends nothing lost its one retry of the instant")
+    for minutes in (10, 30, 120, 600):
         assert tick(noon + timedelta(minutes=minutes)) == [], (
-            f"a backed-off job was retried {minutes} min after a failure"
+            f"a backed-off job was retried again {minutes} min after its instant"
         )
     # The next scheduled instant is its next attempt.
     assert tick(noon + timedelta(days=1)) == ["market"]
