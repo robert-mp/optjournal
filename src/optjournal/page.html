@@ -1183,6 +1183,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   in this database a re-ingest cannot rebuild
  * @property {Array} triggers -- Trigger options, in the order they read
  * @property {Array} adherence -- the answers `followed_*` accepts
+ * @property {Array} orphans -- JournalEntry rows no current decision claims
  * @property {JournalReview} review -- set by web.build_state over the scoped cards
  */
 
@@ -3504,8 +3505,8 @@ function trades(){
      Realised P&L and commission are episode-sourced and appear only once
      the lifecycle is closed -- the same rule the Dashboard follows. */
   const lcs=S.state.lifecycles||[];
-  if(!lcs.length) return `${scopeNote()}<div class="card"><div class="empty">no option orders</div></div>`;
-  return scopeNote()+lcs.map(lc=>{
+  if(!lcs.length) return `${scopeNote()}${orphanNotes()}<div class="card"><div class="empty">no option orders</div></div>`;
+  return scopeNote()+orphanNotes()+lcs.map(lc=>{
     const evs=lc.events||[];
     const legs=evs.flatMap(g=>(g.orders||[]).flatMap(o=>o.legs||[]));
     const nat=legs[0]?legs[0].currency:'';
@@ -3596,6 +3597,27 @@ const JADHERE=()=>((S.state.journal||{}).adherence||['yes','no','na']);
 function jcount(je){
   if(!je) return 0;
   return JFIELDS.filter(jf=>je[jf.name]!=null&&String(je[jf.name])!=='').length;
+}
+
+/* Writing no card claims. A decision's anchor can move when a late fill joins it,
+   and a note filed under the old one matched no card and simply vanished; the
+   server lists those (serialize.journal_data) so they stay readable, with the
+   underlying and open date they were written against. */
+function orphanNotes(){
+  const rows=(S.state.journal||{}).orphans||[];
+  if(!rows.length) return '';
+  return `<div class="card">
+    <div class="crow"><div><h2>Notes no position claims${infoTip(
+      `Written against a decision whose grouping has since changed, so its anchor
+       order no longer names a card below. Nothing was deleted.`)}</h2>
+      <div class="sub">${rows.length} entr${rows.length===1?'y':'ies'}, kept as written.</div></div></div>
+    ${rows.map(je=>`<div class="note"><b>${esc(je.underlying||'?')}</b>
+      <span class="dim2 mono">opened ${esc(String(je.opened_on||'?').slice(0,10))}
+        · order ${esc(je.anchor)}</span>
+      ${JFIELDS.filter(jf=>je[jf.name]!=null&&String(je[jf.name])!=='').map(jf=>
+        `<div><span class="dim">${esc(jf.label)}:</span> ${esc(je[jf.name])}</div>`
+      ).join('')}</div>`).join('')}
+  </div>`;
 }
 
 /* Every writable field, ONE list, in the order the form shows them. The names

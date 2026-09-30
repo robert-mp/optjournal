@@ -6195,6 +6195,18 @@ def test_a_decision_with_no_anchor_says_so_instead_of_offering_a_button():
     )
 
 
+def test_a_note_no_card_claims_is_drawn_on_the_trades_tab():
+    """`serialize.journal_data` lists orphaned entries; the Trades tab draws them,
+    with every reader-typed value escaped, whether or not any card is drawn."""
+    src = _fn("orphanNotes")
+    assert "(S.state.journal||{}).orphans" in src
+    for value in ("esc(je.underlying", "esc(String(je.opened_on",
+                  "esc(je.anchor)", "esc(je[jf.name])"):
+        assert value in src, f"{value} is not escaped"
+    assert _fn("trades").count("orphanNotes()") == 2, (
+        "drawn on both the empty and the populated Trades tab")
+
+
 def test_a_failed_journal_save_keeps_the_text_on_screen():
     """The one write on this page whose input cannot be recovered.
 

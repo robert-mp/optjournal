@@ -51,15 +51,16 @@ from optjournal.events import (
     default_scope,
     upcoming,
 )
-from optjournal.history import BOOK_DATE_SQL, HistoryReport, book_date
+from optjournal.history import BOOK_DATE_SQL, HistoryReport, book_date, build_history
 from optjournal.journal import ADHERENCE as JOURNAL_ADHERENCE
 from optjournal.journal import FIELDS as JOURNAL_FIELDS
 from optjournal.journal import TRIGGERS as JOURNAL_TRIGGERS
 from optjournal.journal import entries as journal_entries
+from optjournal.journal import orphans as journal_orphans
 from optjournal.marketdata import BarFetchError, fetch_bars
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
-from optjournal.stats import first_activity
+from optjournal.stats import EQUITY_CATEGORY, campaigns_for, first_activity
 from optjournal.trend import bucket, bxtrender_short
 from optjournal.vol import (
     expected_move,
@@ -1639,12 +1640,28 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     The whole map in one payload, rather than a lookup per card. The Trades tab
     asks "has this decision been written up" for every card it draws, and a
     request each would put a network round trip inside a render loop.
+
+    `orphans` are the entries no current decision claims: a campaign can change
+    membership when a fill lands inside its window, and its anchor with it, and
+    a note keyed on the old anchor then matched no card and vanished from the
+    page without a word. Listed so the reader sees the writing and what it was
+    about. Checked against the decisions the Trades tab can draw, options and
+    equities, and not computed at all when nothing has been written.
     """
+    written = journal_entries(conn)
+    live: set[str] = set()
+    if written:
+        for category in ("OPT", EQUITY_CATEGORY):
+            report = build_history(conn, asset_category=category)
+            live |= {c.anchor for c in campaigns_for(conn, category, report.episodes)
+                     if c.anchor}
     return {
         "entries": {
             anchor: entry.payload()
-            for (_broker, _account, anchor), entry in journal_entries(conn).items()
+            for (_broker, _account, anchor), entry in written.items()
         },
+        "orphans": [entry.payload() for entry in journal_orphans(conn, live)]
+        if written else [],
         "triggers": [{"key": key, "label": label}
                      for key, label in JOURNAL_TRIGGERS.items()],
         "adherence": list(JOURNAL_ADHERENCE),
