@@ -7172,7 +7172,8 @@ def test_the_settings_endpoint_stores_and_clears_the_confirm_query(populated):
 
 
 def _capture_sync_job(monkeypatch) -> list:
-    """Replace the `sync` job's work with a stub that records its Context."""
+    """Replace the `sync` job's work with a stub that records its Context and
+    the id it would use, resolved the way the real job resolves it per run."""
     import dataclasses  # noqa: PLC0415 - local helper
 
     from optjournal import jobs as mod  # noqa: PLC0415
@@ -7180,7 +7181,7 @@ def _capture_sync_job(monkeypatch) -> list:
     seen: list = []
 
     def run(_conn, ctx):
-        seen.append(ctx)
+        seen.append((ctx.query_id, web.prefs.query_id(ctx.query_id)))
         return mod.Outcome("nothing", "stubbed")
 
     monkeypatch.setattr(mod, "JOBS", tuple(
@@ -7195,8 +7196,9 @@ def test_a_query_id_saved_while_serving_is_the_one_in_force(
 ):
     """M10: the stored id was frozen into the server at startup, so after a new
     one was saved in Settings the Run button still used the old one and the page
-    labelled it an override. Now the payload, the Sync button's id and a hand-run
-    job all resolve the stored step per request."""
+    labelled it an override. Now the payload and the Sync button resolve the
+    stored step per request, and a hand-run job is handed only the override
+    (none here) and resolves the rest per run."""
     from optjournal import settings  # noqa: PLC0415 - local to this test
 
     monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
@@ -7212,27 +7214,49 @@ def test_a_query_id_saved_while_serving_is_the_one_in_force(
     assert (state["settings"]["query_id"], state["settings"]["query_id_source"],
             state["sync"]["query_id"]) == ("222222", "stored", "222222")
     assert status == 202
-    assert [ctx.query_id for ctx in seen] == ["222222"]
+    assert seen == [(None, "222222")], "the job was not handed the override only"
 
 
-def test_the_demo_never_resolves_a_real_query_id(tmp_path, monkeypatch):
+def _record_ibkr_attempts(monkeypatch) -> list[str]:
+    """A stored token, and the one seam every Flex request goes through
+    (`flex._client_factory`) replaced by one that records and refuses."""
+    import keyring  # noqa: PLC0415 - local helper
+
+    from optjournal import flex  # noqa: PLC0415
+
+    attempts: list[str] = []
+
+    class Refused:
+        def __init__(self, **_kwargs):
+            attempts.append("client")
+            raise flex.TokenMissing("no IBKR in tests")
+
+    monkeypatch.setattr(keyring, "get_password", lambda service, account: "123456789")
+    monkeypatch.setattr(flex, "_client_factory", Refused)
+    return attempts
+
+
+def test_the_demo_never_resolves_a_real_query_id(populated, tmp_path, monkeypatch):
     """H6: `serve --demo` passed `query_id=None`, but `_effective_query_id` fell
     back to the stored id, so the demo page showed the real id with Sync
     enabled, and Sync fetched the real statement into `demo/` and the demo
-    database. Under the demo flag no path resolves one: the payload, the Sync
-    button, and every job that spends an IBKR request."""
+    database. The jobs resolve the stored ids per run as well, so under the demo
+    flag the payload shows none, and Sync and every job that spends an IBKR
+    request (sync, confirm, history) are refused before any fetch is tried.
+
+    Over a journal with statements, a stored token and both stored ids, so each
+    of those jobs WOULD reach the Flex client without the refusal: ablated,
+    the recorder below sees one attempt per job."""
     from optjournal import settings  # noqa: PLC0415 - local to this test
     from optjournal.jobs import JOBS  # noqa: PLC0415
 
     monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
     monkeypatch.setenv(settings.HOME_ENV, str(tmp_path / "home"))
     settings.update(query_id="1591754", confirm_query_id="1621016")
-    seen = _capture_sync_job(monkeypatch)
-    monkeypatch.setattr(web, "sync_journal", lambda **kw: pytest.fail(
-        f"the demo reached IBKR with {kw.get('query_id')}"))
-    spending = [job.name for job in JOBS if job.spends_broker_request]
-    assert "sync" in spending and "confirm" in spending
-    with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path,
+    attempts = _record_ibkr_attempts(monkeypatch)
+    spending = sorted(job.name for job in JOBS if job.spends_broker_request)
+    assert spending == ["confirm", "history", "sync"]
+    with web.serve_ephemeral(db_path=populated, archive_dir=tmp_path / "demo",
                              demo=True) as base:
         _, state = _get(base, "/api/state")
         sync_status, sync_reply = _post(base, "/api/sync")
@@ -7244,7 +7268,7 @@ def test_the_demo_never_resolves_a_real_query_id(tmp_path, monkeypatch):
     assert (sync_status, sync_reply["kind"]) == (400, "demo")
     assert {name: (status, reply["kind"]) for name, (status, reply) in runs.items()} == {
         name: (400, "demo") for name in spending}
-    assert seen == [], "a job that spends a request ran in the demo"
+    assert attempts == [], "the demo tried to fetch from IBKR"
 
 
 @pytest.mark.parametrize(("flag", "env", "source"), [
