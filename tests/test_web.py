@@ -5460,6 +5460,28 @@ def test_a_watched_symbol_clears_the_search_box_and_its_filter_together():
     assert (out["disabled"], out["focused"], out["value"]) == (False, True, "")
 
 
+def test_a_refused_stop_watching_hands_its_button_back():
+    """The same failure one button over: "stop watching" disabled itself and a
+    refusal (any `!ok` reply, `busy` or `database` included) draws nothing, so
+    the button stayed dead with the drawer still open under it.
+    """
+    out = _node_run([
+        "const S={wsym:'SPY'};",
+        "const b={dataset:{wrm:'SPY'},disabled:false};",
+        "const $=()=>null;",
+        "const document={querySelectorAll:sel=>sel==='[data-wrm]'?[b]:[]};",
+        "const confirm=()=>true;",
+        "function draw(){}",
+        "async function loadQuotes(){}",
+        "async function watchWrite(){return false;}",
+        *_page_fns("bindWatchlist"),
+        "bindWatchlist();",
+        "await b.onclick();",
+        "console.log(JSON.stringify({disabled:b.disabled,wsym:S.wsym}));",
+    ])
+    assert out == {"disabled": False, "wsym": "SPY"}
+
+
 def test_the_typed_field_is_preserved_across_a_render_and_not_across_subjects():
     """`loadQuotes()` calls `draw()` on its own, so a redraw lands mid-typing.
 

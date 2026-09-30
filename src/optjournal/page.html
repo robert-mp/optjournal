@@ -6941,7 +6941,9 @@ function bindWatchlist(){
       if(!confirm(`Stop watching ${symbol}?`)) return;
       el.disabled=true;
       if(S.wsym===symbol) S.wsym=null;
-      await watchWrite({symbol:symbol,action:'remove'});
+      /* A refusal draws nothing, so the button is handed back here. */
+      if(!await watchWrite({symbol:symbol,action:'remove'})){
+        el.disabled=false; S.wsym=symbol;}
     });
   const qb=$('#wquote'); if(qb) qb.onclick=()=>loadQuotes(true);
   /* The ROW carries `data-wsel`; clicks inside the drawer row do not, so typing
