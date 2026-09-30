@@ -198,6 +198,7 @@ def _leg(
     put_call: str = "P",
     open_close: str | None = None,
     notes: str | None = None,
+    expiry: str = "2026-04-17",
 ) -> None:
     """One OPT fill on `conid`, enough for `build_history` to fold into episodes.
 
@@ -214,11 +215,11 @@ def _leg(
         " fx_rate_to_base, proceeds, proceeds_base, ib_commission,"
         " ib_commission_base, fifo_pnl_realized, fifo_pnl_realized_base,"
         " raw, source_file, first_seen_at)"
-        " VALUES ('IBKR',?,?,?,?,'U1',?,?,'OPT',?,?,'SPY',?,500,'2026-04-17',"
+        " VALUES ('IBKR',?,?,?,?,'U1',?,?,'OPT',?,?,'SPY',?,500,?,"
         "100,?,?,?,?,?,'USD',1.0,?,?,-1.0,-1.0,?,?,'{}','t.xml',"
         "'2026-03-02T00:00:00Z')",
         (trade_id, trade_id, trade_id, order_id, at[:10], at,
-         f"SPY  {put_call}{conid}", conid, put_call,
+         f"SPY  {put_call}{conid}", conid, put_call, expiry,
          "SELL" if qty < 0 else "BUY",
          open_close or ("O" if pnl is None else "C"), notes,
          qty, abs(proceeds) / (abs(qty) * 100),
@@ -458,3 +459,37 @@ def test_expirations_on_one_day_do_not_merge_unrelated_positions(conn):
     s = month_stats(conn, None)
     assert (s.decided_campaigns, s.wins, s.losses) == (2, 1, 1)
     assert s.net_pnl.base == pytest.approx(-102.0), "the money never moved"
+
+
+def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):
+    """`pnl/s_scope_inflight.py`: a 0DTE short put rolled at 15:55 into the next
+    day's put, which is still open.
+
+    The scoreboard decided a unit by its IN-SCOPE episodes (only the 0DTE leg,
+    closed) while the in-flight figure read the whole campaign (still running),
+    so the same -302 was shown as a decided loss AND as cash inside a position
+    still running. Both now read the campaign the Trades tab draws: open until
+    its last leg closes, and its in-scope cash in flight until then.
+    """
+    from optjournal.stats import odte_scope
+
+    _leg(conn, conid="1", order_id="1", at="2026-09-10 10:00:00", qty=-1,
+         proceeds=200.0, pnl=None, expiry="2026-09-10")
+    _leg(conn, conid="1", order_id="2", at="2026-09-10 15:55:00", qty=1,
+         proceeds=-500.0, pnl=-302.0, expiry="2026-09-10")
+    _leg(conn, conid="2", order_id="3", at="2026-09-10 15:55:00", qty=-1,
+         proceeds=600.0, pnl=None, expiry="2026-09-11")
+    scope = odte_scope(conn)
+    s = month_stats(conn, "2026-09", scope=scope)
+    assert s.net_pnl.base == -302.0
+    assert (s.decided_campaigns, s.losses) == (0, 0)
+    assert s.inflight_realized.base == -302.0
+    assert s.avg_pnl is None
+
+    # The roll's far leg closes the next day: the decision is now finished, and
+    # under the scope its outcome is the in-scope cash, counted once.
+    _leg(conn, conid="2", order_id="4", at="2026-09-11 15:00:00", qty=1,
+         proceeds=-100.0, pnl=498.0, expiry="2026-09-11")
+    s = month_stats(conn, "2026-09", scope=odte_scope(conn))
+    assert (s.decided_campaigns, s.losses, s.inflight_realized.base) == (1, 1, 0.0)
+    assert s.avg_pnl.base == -302.0

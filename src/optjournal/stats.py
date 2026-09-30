@@ -1174,11 +1174,18 @@ def month_stats(
         units = [
             [report.episodes[i] for i in c.episode_indices] for c in campaign_list
         ]
+    # Decided when the WHOLE unit is closed, and in the period its last episode
+    # closed, whatever the scope: the same test the in-flight figure below and the
+    # Trades tab's cards apply. The scope only picks which episodes' cash the
+    # outcome carries. Judging a unit by its in-scope episodes alone decided a
+    # 0DTE leg rolled into a next-day contract still open, so under the 0DTE scope
+    # the same -302 was a decided loss AND cash inside a position still running.
     decided = [
-        scoped for scoped in ([e for e in u if scope.has_episode(e)] for u in units)
+        scoped for unit, scoped in ((u, [e for e in u if scope.has_episode(e)])
+                                    for u in units)
         if scoped
-        and all(e.is_closed for e in scoped)
-        and _in_period(max(str(e.closed_at or "") for e in scoped), period)
+        and all(e.is_closed for e in unit)
+        and _in_period(max(str(e.closed_at or "") for e in unit), period)
     ]
     stats.decided_campaigns = len(decided)
     won = [c for c in decided if _campaign_pnl(c).base > 0]
