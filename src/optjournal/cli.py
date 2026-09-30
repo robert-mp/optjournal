@@ -31,7 +31,7 @@ from optjournal.bars import (
     bars_manifest,
 )
 from optjournal.clock import MARKET_TZ, parse_day
-from optjournal.compat import unknown_codes
+from optjournal.compat import unknown_codes, unknown_values
 from optjournal.config import (
     DATA_HOME,
     DEFAULT_ARCHIVE,
@@ -1730,6 +1730,14 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"\nnote: IBKR sent trade codes py_ibkr does not declare: "
             f"{', '.join(sorted(unknown_codes))}",
+            file=sys.stderr,
+        )
+    # Accepted rather than refused, so the statement still ingests, but a value
+    # no reader knows (a new side, say) can drop a leg from what reads it.
+    if unknown_values and not args.quiet and not args.json:
+        print(
+            f"\nnote: IBKR sent values py_ibkr does not declare, kept as sent: "
+            f"{', '.join(sorted(unknown_values))}",
             file=sys.stderr,
         )
     return code

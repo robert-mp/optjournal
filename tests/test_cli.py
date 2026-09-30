@@ -746,6 +746,23 @@ def test_a_malformed_statement_is_one_line_not_a_traceback(tmp_path, capsys,
 
 
 @pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_ingest_names_a_value_py_ibkr_does_not_declare(tmp_path, capsys):
+    """Such a value is accepted so the statement still ingests, but it was
+    accepted SILENTLY, while a reader that knows only the declared values can
+    drop the row from what it reads. The run now says which values arrived."""
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    assert 'orderType="LMT"' in text
+    path = tmp_path / "activity-unfamiliar.xml"
+    path.write_text(text.replace('orderType="LMT"', 'orderType="LIT"', 1), encoding="utf-8")
+
+    code = main(["ingest", str(path), "--db", str(tmp_path / "j.db")])
+
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "does not declare, kept as sent" in err and "LIT" in err, err
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
 @pytest.mark.parametrize("command", ["costs", "show", "ingest"])
 def test_a_statement_with_a_malformed_number_is_one_line_not_a_traceback(
     tmp_path, capsys, command,
