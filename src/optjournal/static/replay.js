@@ -264,21 +264,24 @@ export function bandEdges(band, geometry) {
   return { upper, lower };
 }
 
-/** The bar an instant belongs to: the last bar at or before it.
+/** The bar an instant belongs to: the first bar whose close is at or after it.
  *
- * The bar CONTAINING the event, not the nearest one. A fill at 10:35 belongs to
- * the 10:30 bar because that bar spans 10:30-11:30; rounding to the nearest
- * would attribute it to 11:30, which on a daily chart moves an event a whole
- * session and puts it after bars that were actually later than it.
+ * A point is stamped at its bar's CLOSE (replay._drawn), the instant the bar is
+ * priced at, so a fill at 10:35 belongs to the bar stamped 11:30: that bar spans
+ * 10:30 to 11:30, and its P&L already holds the fill. The nearer point, stamped
+ * 10:30, closed before the fill happened; taking it would place the event a bar
+ * early, which on a daily chart is a whole session.
+ *
+ * It is the frame `reachedEvents` first lights the event at, so a card seeks
+ * to, and playback stops on, the frame where the card, its dot and the P&L
+ * readout all show it. An instant after the last close clamps to the last bar.
  */
 export function indexOfTs(points, ts) {
   if (!points.length || ts == null || !Number.isFinite(ts)) return 0;
-  let found = 0;
   for (let i = 0; i < points.length; i++) {
-    if (points[i][0] > ts) break;
-    found = i;
+    if (points[i][0] >= ts) return i;
   }
-  return found;
+  return points.length - 1;
 }
 
 /** Which event annotations the replay has reached, by timestamp.
@@ -286,8 +289,9 @@ export function indexOfTs(points, ts) {
  * `ts <= frame` rather than a pixel comparison, but chosen to agree with one:
  * the fill dots are clipped by the reveal edge, so a card appearing while its
  * dot is still hidden (or the reverse) would have the panel contradict itself
- * mid-scrub. An event inside a bar is reached at the FOLLOWING bar, which is
- * where its interpolated x actually falls.
+ * mid-scrub. An event inside a bar is reached at THAT bar, since the bar's point
+ * is stamped at its close: its interpolated x falls between the previous point
+ * and this one, and the bar's mark already counts it.
  *
  * Returns the timestamps rather than the objects, so the caller can toggle
  * existing DOM by key instead of re-rendering cards on every scrub tick.
@@ -305,8 +309,8 @@ export function reachedEvents(events, ts) {
  * second and the reader saw a strike move with no idea why.
  *
  * The bar an event stops on is `indexOfTs`'s, the same one its card seeks to and
- * its dot is drawn at, so the pause lands exactly where the annotation is rather
- * than a bar either side of it.
+ * the first whose frame reveals its dot and lights its card, so the pause lands
+ * exactly where the annotation is rather than a bar either side of it.
  *
  * `from` is EXCLUSIVE, which is what lets play resume: standing on a stop and
  * pressing play again looks past it to the next one instead of halting on the

@@ -166,6 +166,15 @@ left and no band width. A fill is paired with the underlying between the two
 prints around it, so a fill in a session's first hour starts from that session's
 open rather than from the prior close.
 
+The replay payload keeps that one meaning of time: every point, band row and
+mark is stamped at the bar's close, not at the stamp the source gave it. So the
+chart draws a close where it was printed, and an event inside a bar lies between
+the previous point and that bar's point. The page reaches an event at the first
+point at or after it, which is the frame where its card lights, its dot is
+revealed and the P&L readout already counts it, and where a click on the card and
+a stop in playback land. Stamped at the open, the readout counted a fill one bar
+before its card and dot appeared.
+
 ## Perishable data
 
 Bar retention is **asymmetric**, and the collection schedule follows from it

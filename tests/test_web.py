@@ -3711,7 +3711,7 @@ def test_an_events_kind_comes_from_its_legs_not_its_label():
         _event("Roll", _leg(420, "C", "BUY", "C", 1, 1.10),
                _leg(410, "C", "SELL", "O", -1, 2.30), at="2026-08-10 11:00:00"),
     ]}
-    kinds = [row["kind"] for row in replay_mod._annotations(lifecycle, [], "1h")]
+    kinds = [row["kind"] for row in replay_mod._annotations(lifecycle, [])]
     assert kinds == ["open", "close", "roll"]
 
 
@@ -3725,13 +3725,13 @@ def test_an_opening_event_reports_no_realised_pnl():
         _event("Short put", _leg(270, "P", "SELL", "O", -3, 5.24),
                realized_pnl=zero),
     ]}
-    assert replay_mod._annotations(lifecycle, [], "1h")[0]["realized"] is None
+    assert replay_mod._annotations(lifecycle, [])[0]["realized"] is None
 
     closed = {"events": [
         _event("Short put close", _leg(270, "P", "BUY", "C", 3, 2.60),
                realized_pnl={"base": 684.59, "native": 787.86, "ccy": "USD"}),
     ]}
-    got = replay_mod._annotations(closed, [], "1h")[0]["realized"]
+    got = replay_mod._annotations(closed, [])[0]["realized"]
     assert got is not None and got["native"] == 787.86, (
         "the control: a CLOSING event must keep its realised figure"
     )
@@ -3746,13 +3746,13 @@ def test_annotations_carry_the_delta_an_event_changed():
         _event("Short put close", _leg(270, "P", "BUY", "C", 3, 2.60),
                at="2026-08-03 09:55:23"),
     ]}
-    # Hourly marks, keyed by bar stamp and read at each bar's close: the 10:30
-    # bar holds the 10:35 sale, and the 09:30 bar of 08-03 the 09:55 buyback.
-    marks = [[epoch_et("2026-07-24 09:30:00"), 0.0, None],
-             [epoch_et("2026-07-24 10:30:00"), 0.0, 0.52],
-             [epoch_et("2026-07-31 15:30:00"), 700.0, 0.32],
-             [epoch_et("2026-08-03 09:30:00"), 792.0, None]]
-    rows = replay_mod._annotations(lifecycle, marks, "1h")
+    # Hourly marks, keyed by each bar's close: the 10:30 bar, stamped 11:30,
+    # holds the 10:35 sale, and the 09:30 bar of 08-03 (10:30) the 09:55 buyback.
+    marks = [[epoch_et("2026-07-24 10:30:00"), 0.0, None],
+             [epoch_et("2026-07-24 11:30:00"), 0.0, 0.52],
+             [epoch_et("2026-07-31 16:00:00"), 700.0, 0.32],
+             [epoch_et("2026-08-03 10:30:00"), 792.0, None]]
+    rows = replay_mod._annotations(lifecycle, marks)
     assert (rows[0]["delta_before"], rows[0]["delta_after"]) == (None, 0.52)
     assert (rows[1]["delta_before"], rows[1]["delta_after"]) == (0.32, None)
 
@@ -3764,7 +3764,7 @@ def test_an_event_without_a_timestamp_is_dropped():
     lifecycle = {"events": [
         _event("Short put", _leg(270, "P", "SELL", "O", -3, 5.24), at=None),
     ]}
-    assert replay_mod._annotations(lifecycle, [], "1h") == []
+    assert replay_mod._annotations(lifecycle, []) == []
 
 
 def test_a_stat_cards_note_is_a_hoverable_element_not_a_title_attribute():
