@@ -6,8 +6,11 @@ import {
   dayLabel,
   dp,
   esc,
+  level,
   money,
   monthLabel,
+  num,
+  pct,
   strike,
 } from "../../src/optjournal/static/format.js";
 
@@ -36,6 +39,44 @@ test("sign classes distinguish gain, loss, and measured zero", () => {
   assert.equal(cls(-1), "neg signed");
   assert.equal(cls(0), "");
   assert.equal(cls(null), "");
+});
+
+test("a value that prints as zero prints no sign", () => {
+  /* Measured on the real 2026-09-22 vertical: a delta of -0.0028 read "Δ -0.00",
+     a watchlist change of -0.004% read a red "-0.00%", and money kept its minus
+     on a figure it printed as zero. */
+  assert.equal(num(-0.0028, 2), "0.00");
+  assert.equal(num(-0), "0.00");
+  assert.equal(pct(-0.04), "0.0%");
+  assert.equal(pct(-0.004, 2), "0.00%");
+  assert.equal(money(-0.00001, "USD"), "$0.0000");
+  assert.equal(money(-0.001, "USD", 2), "$0.00");
+  assert.equal(level(-0.001), "0.00");
+  /* A real negative still has its sign, at every precision it shows. */
+  assert.equal(money(-0.004, "USD"), "−$0.0040");
+  assert.equal(num(-0.006, 2), "−0.01");
+});
+
+test("the class that colours a figure agrees with the figure", () => {
+  /* Red and a leading + are both claims about the sign, so they follow what is
+     PRINTED: at money's own precision by default, at the caller's when given. */
+  assert.equal(cls(-0.00001), "", "money prints $0.0000 for it");
+  assert.equal(cls(-0.004), "neg signed", "money prints −$0.0040 for it");
+  assert.equal(cls(-0.004, 2), "", "num(v, 2) prints 0.00 for it");
+  assert.equal(cls(0.04, 1), "", "num(v, 1) prints 0.0 for it");
+  assert.equal(cls(0.05, 1), "pos signed");
+  assert.equal(cls(-0), "");
+  assert.equal(cls(Number.NaN), "");
+});
+
+test("one minus sign, the typographic one, across every number formatter", () => {
+  /* money has always used U+2212; num and pct used the hyphen, so one card could
+     read "−€174" beside "-12.5%". Nothing parses these strings back: inputs are
+     filled with toFixed (see the 0DTE pads), never with a formatted figure. */
+  assert.equal(num(-1.5), "−1.50");
+  assert.equal(pct(-12.46), "−12.5%");
+  assert.equal(level(-3, 0), "−3");
+  assert.equal(money(-174, "EUR", 0), "−€174");
 });
 
 test("date labels are short and unambiguous", () => {

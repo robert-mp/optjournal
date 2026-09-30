@@ -2445,7 +2445,7 @@ function dashboard(){
       cls(s.avg_loss?.base),'avg_loss'),
     gain:()=>nl!=null
       ? statCard('Gain % of Net Liq', pct(s.gain_pct_of_net_liq,2),
-          `NAV ${cash(nl)} · ${s.net_liq_date||''}`, cls(s.gain_pct_of_net_liq),'gain')
+          `NAV ${cash(nl)} · ${s.net_liq_date||''}`, cls(s.gain_pct_of_net_liq,2),'gain')
       : statCard('Gain % of Net Liq', '—',
           'enable Equity Summary on the Flex query', 'dim2','gain'),
     /* The ratio is tinted by which side of 1 it falls, not by `cls()`: it is not a
@@ -4983,7 +4983,7 @@ function watchTable(rows,open){
         name?`<span class="dim">${esc(name)}</span>`:''}</button></td>
       <td class="n">${wprice(px,w)}</td>
       <td class="whist">${whist(w)}</td>
-      <td class="n wdaily ${cls(w.bx_daily)}${bxStrong(w.bx_recent||[])?' strong':''
+      <td class="n wdaily ${cls(w.bx_daily,1)}${bxStrong(w.bx_recent||[])?' strong':''
         }">${w.bx_daily==null
         ?wdash(`${w.closes} of ${BX_SETTLED} sessions stored: inside that window `
           +`the reading is a warm-up figure and its sign can be wrong. Run `
@@ -5131,7 +5131,7 @@ function watchDetail(w){
   const ivr=ivrOf(w.symbol);
   const way=bxDirection(w.bx_daily_delta);
   const pc=v=>v==null?wdash('not enough stored sessions to measure a change over '
-    +'that span'):`<span class="${cls(v)}">${num(v,2)}%</span>`;
+    +'that span'):`<span class="${cls(v,2)}">${num(v,2)}%</span>`;
   /* One line: a label (with its provenance behind a tip) and a figure. */
   const kv=(label,value,cap)=>`<div class="wkv"><span class="wkl"${
     cap?` title="${esc(cap)}"`:''}>${esc(label)}</span><span class="wkf">${value}</span></div>`;
@@ -5139,15 +5139,15 @@ function watchDetail(w){
     ${body}</div>`;
 
   const trend=sec('bxtrender',
-    `<div class="wbig"><span class="${cls(w.bx_daily)}">${w.bx_daily==null
+    `<div class="wbig"><span class="${cls(w.bx_daily,1)}">${w.bx_daily==null
       ?wdash(`${w.closes} of ${BX_SETTLED} sessions stored: inside that window the `
         +`reading is a warm-up figure and its sign can be wrong`)
       :num(w.bx_daily,1)}</span>${w.bx_daily_delta==null?'':`<span class="wdelta ${
-        cls(w.bx_daily_delta)}">${num(w.bx_daily_delta,1)}${way?WDIR[way]:''}</span>`}
+        cls(w.bx_daily_delta,1)}">${num(w.bx_daily_delta,1)}${way?WDIR[way]:''}</span>`}
       <span class="wkl" title="${esc(PARAMS_CAPTION)}">daily</span></div>
     ${wmeter(w)}
     ${kv('weekly',w.bx_weekly==null?wdash(`${w.weeks} of ${BX_SETTLED} ISO weeks stored`)
-      :`<span class="${cls(w.bx_weekly)}">${num(w.bx_weekly,1)}</span>`,
+      :`<span class="${cls(w.bx_weekly,1)}">${num(w.bx_weekly,1)}</span>`,
       w.bx_weekly_week==null?'no closes stored yet, so there is no week to read'
         :`${w.bx_weekly_week}, ${w.bx_weekly_sessions||0} session(s) of a full week's `
           +`five: the newest week is usually partial, and a figure over it repaints `

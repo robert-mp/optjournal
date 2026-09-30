@@ -10,12 +10,33 @@ export const esc = (value) => String(value ?? "").replace(
   (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char],
 );
 
-export const num = (value, digits = 2) => value == null
-  ? null
-  : Number(value).toLocaleString(undefined, {
+/** The minus sign every formatter here prints: U+2212, the typographic minus,
+ * which `money` always used. Nothing parses a formatted figure back into a number
+ * (an <input> is filled with `toFixed`), so the hyphen buys nothing. */
+const MINUS = "−";
+
+/* `value` at `digits` places without its sign, and whether what prints is ZERO.
+ * Zero is decided on the printed text, by the same formatter at the same
+ * precision, so a value that rounds away is exactly one that prints as zero:
+ * -0.0028 at two places is "0.00", and a minus before it would say it was below
+ * something it prints as equal to. */
+function figure(value, digits, grouping = true) {
+  const options = {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
-  });
+    useGrouping: grouping,
+  };
+  const text = Math.abs(value).toLocaleString(undefined, options);
+  return { text, zero: text === (0).toLocaleString(undefined, options) };
+}
+
+function signed(value, digits, grouping) {
+  const amount = Number(value);
+  const { text, zero } = figure(amount, digits, grouping);
+  return amount < 0 && !zero ? `${MINUS}${text}` : text;
+}
+
+export const num = (value, digits = 2) => value == null ? null : signed(value, digits);
 
 const CURRENCIES = { EUR: "€", USD: "$", GBP: "£", JPY: "¥", KRW: "₩" };
 
@@ -33,14 +54,24 @@ export function money(value, currency, digits) {
   if (value == null) return "—";
   const amount = Number(value);
   if (!Number.isFinite(amount)) return "—";
-  return `${amount < 0 ? "−" : ""}${sym(currency)}${
-    num(Math.abs(amount), digits == null ? dp(amount) : digits)
-  }`;
+  const { text, zero } = figure(amount, digits == null ? dp(amount) : digits);
+  return `${amount < 0 && !zero ? MINUS : ""}${sym(currency)}${text}`;
 }
 
-export const cls = (value) => value == null || Number(value) === 0
-  ? ""
-  : Number(value) > 0 ? "pos signed" : "neg signed";
+/** The sign class for a figure: "pos signed", "neg signed", or "" for zero.
+ *
+ * Judged on the figure AS PRINTED, because both halves of the class are claims
+ * about its sign: the hue, and the "+" that `.pos.signed` draws. `digits` is the
+ * precision the caller prints at; without it, the one `money` would choose. A
+ * value that rounds to zero there is zero, so it is neither red nor "+0.00".
+ */
+export function cls(value, digits) {
+  if (value == null) return "";
+  const amount = Number(value);
+  if (!(amount > 0 || amount < 0)) return "";
+  if (figure(amount, digits == null ? dp(amount) : digits).zero) return "";
+  return amount > 0 ? "pos signed" : "neg signed";
+}
 
 /** An index level or a listed strike, UNGROUPED: 7706.03, never 7,706.03.
  *
@@ -54,11 +85,7 @@ export const cls = (value) => value == null || Number(value) === 0
  */
 export const level = (value, digits = 2) => value == null
   ? "—"
-  : Number(value).toLocaleString(undefined, {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-    useGrouping: false,
-  });
+  : signed(value, digits, false);
 
 export function strike(value) {
   if (value == null) return "";
