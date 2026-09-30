@@ -225,7 +225,9 @@ def link(
 
     Two episodes are one campaign when one order group touched both: that is a
     roll (the group's order closed one expiry and opened the next) or a spread
-    (its legs are separate contracts filled together). `order_of_trade` maps a
+    (its legs are separate contracts filled together). A group that touched only
+    ONE contract joins nothing: that is a fill through zero, a reversal rather
+    than a continuation, and its two sides are two decisions. `order_of_trade` maps a
     fill id to its order, which is how an episode -- which knows only its trade
     ids -- reaches the group.
 
@@ -267,7 +269,7 @@ def link(
         for oid in ids:
             group_of_order[str(oid)] = index
 
-    first_in_group: dict[int, int] = {}
+    members_of_group: dict[int, list[int]] = {}
     #: Orders reached per episode, so the campaign can carry the union of them.
     orders_of_episode: dict[int, set[str]] = {}
     for i, episode in enumerate(episodes):
@@ -285,7 +287,17 @@ def link(
             orders_of_episode[i].update(
                 oid2 for oid2, g in group_of_order.items() if g == group
             )
-            union(first_in_group.setdefault(group, i), i)
+            members_of_group.setdefault(group, []).append(i)
+    # A group joins DIFFERENT contracts: a roll's two expiries, a spread's legs.
+    # A group that touched episodes of only ONE contract has reversed it -- a fill
+    # through zero (IBKR's `C;O`) belongs to the long it closed and the short it
+    # opened -- and the finished side is an outcome of its own, not cash in
+    # flight inside the other. Not reachable on either journal today: no
+    # campaign there holds two episodes of one contract.
+    for members in members_of_group.values():
+        if len({str(getattr(episodes[i], "conid", "") or "") for i in members}) > 1:
+            for i in members:
+                union(members[0], i)
 
     episode_of_order: dict[str, int] = {}
     for i, oids in orders_of_episode.items():

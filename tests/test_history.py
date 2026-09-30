@@ -161,6 +161,51 @@ def test_contracts_of_a_position_still_open_is_what_it_reached(conn):
     assert ep.contracts == 5
 
 
+def test_a_fill_through_zero_closes_the_position_and_opens_the_opposite(conn):
+    """Long 2, then SELL 3 in one fill: IBKR marks it `C;O` and realises the long.
+
+    Only a bare `C` counted as a close, so the fill was read as an opening sale:
+    the long never went flat, the +198 IBKR realised in September waited inside
+    one open episode, and the whole outcome later landed in October as a single
+    +347. The fill is split at zero: its closing 2 finish the long, which takes
+    all of the realised P&L, and its leftover 1 opens the short. Commission and
+    proceeds divide by quantity.
+    """
+    add_trade(conn, "1", open_close="O", qty=2, date="2026-09-01")
+    add_trade(conn, "2", open_close="C;O", qty=-3, price=2.0, date="2026-09-10",
+              realized=198.0, commission=-3.0)
+    report = build_history(conn)
+    (long_leg,), (short,) = report.closed, report.open
+    assert long_leg.status == "CLOSED"
+    assert long_leg.realized_pnl == pytest.approx(198.0)
+    assert long_leg.closed_at == "2026-09-10 10:00:00"
+    assert long_leg.contracts == 2
+    assert long_leg.commission == pytest.approx(-1.0 - 2.0)
+    assert long_leg.proceeds == pytest.approx(-200.0 + 400.0)
+    assert short.net_qty == -1
+    assert short.opened_at == "2026-09-10 10:00:00"
+    assert short.entry_outside_window is False
+    assert short.realized_pnl == 0.0
+    assert short.commission == pytest.approx(-1.0)
+    assert short.proceeds == pytest.approx(200.0)
+    assert short.trade_ids == ["2"]
+
+    add_trade(conn, "3", open_close="C", qty=1, price=0.5, date="2026-10-05",
+              realized=149.0)
+    closed = sorted(build_history(conn).closed, key=lambda e: e.closed_at)
+    assert [(e.closed_at[:10], e.realized_pnl, e.contracts) for e in closed] == [
+        ("2026-09-10", 198.0, 2), ("2026-10-05", 149.0, 1)]
+
+
+def test_a_fill_marked_close_and_open_that_stops_at_zero_is_not_split(conn):
+    """The split needs the fill to go THROUGH zero. One that only reaches it
+    closes the position and opens nothing, whatever the marker says."""
+    add_trade(conn, "1", open_close="O", qty=2, date="2026-09-01")
+    add_trade(conn, "2", open_close="C;O", qty=-2, date="2026-09-10", realized=50.0)
+    (ep,) = build_history(conn).episodes
+    assert ep.status == "CLOSED" and ep.net_qty == 0
+
+
 def test_reentry_after_close_is_a_separate_episode(conn):
     """The SIVE shape: open, fully close, then re-open the same contract."""
     add_trade(conn, "1", open_close="O", qty=2, date="2026-03-01")

@@ -196,6 +196,7 @@ def _leg(
     proceeds: float,
     pnl: float | None,
     put_call: str = "P",
+    open_close: str | None = None,
 ) -> None:
     """One OPT fill on `conid`, enough for `build_history` to fold into episodes.
 
@@ -217,7 +218,8 @@ def _leg(
         "'2026-03-02T00:00:00Z')",
         (trade_id, trade_id, trade_id, order_id, at[:10], at,
          f"SPY  {put_call}{conid}", conid, put_call,
-         "SELL" if qty < 0 else "BUY", "O" if pnl is None else "C",
+         "SELL" if qty < 0 else "BUY",
+         open_close or ("O" if pnl is None else "C"),
          qty, abs(proceeds) / (abs(qty) * 100),
          proceeds, proceeds, pnl, pnl),
     )
@@ -415,3 +417,25 @@ def test_account_fees_are_signed_so_a_refund_month_agrees_with_the_costs_tab(con
     assert s.account_friction_base == pytest.approx(-0.01)
     assert s.account_friction_base == pytest.approx(
         build_costs(conn, period="2026-09").unattributable.base)
+
+
+def test_a_reversal_through_zero_scores_the_long_and_the_short_apart(conn):
+    """`pnl/s_cross_zero.py`: long 2 calls, one SELL 3 (`C;O`) realising +198 in
+    September, the leftover short bought back in October for +149.
+
+    Read as one opening sale, September showed no P&L and no outcome, and
+    October one +347 win. The long finished in September, so September has its
+    money and its win; the short is its own decision, decided in October.
+    """
+    _leg(conn, conid="1", order_id="10", at="2026-09-01 10:00:00",
+         qty=2, proceeds=-200.0, pnl=None, put_call="C")
+    _leg(conn, conid="1", order_id="11", at="2026-09-10 10:00:00",
+         qty=-3, proceeds=600.0, pnl=198.0, put_call="C", open_close="C;O")
+    _leg(conn, conid="1", order_id="12", at="2026-10-05 10:00:00",
+         qty=1, proceeds=-50.0, pnl=149.0, put_call="C")
+    september, october = (month_stats(conn, m) for m in ("2026-09", "2026-10"))
+    assert (september.net_pnl.base, september.wins, september.decided_campaigns) == (
+        198.0, 1, 1)
+    assert september.inflight_realized.base == 0.0
+    assert (october.net_pnl.base, october.wins, october.decided_campaigns) == (
+        149.0, 1, 1)

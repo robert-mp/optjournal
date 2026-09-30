@@ -295,10 +295,52 @@ def _new_episode(row: Any) -> Episode:
     )
 
 
+def _is_close(open_close: str | None) -> bool:
+    """Whether a fill closed anything: `C`, or IBKR's `C;O` for a fill that
+    closed one side and opened the other. Only a bare `C` used to count, so a
+    fill through zero was read as an opening fill and its position never went
+    flat."""
+    return "C" in split_notes((open_close or "").upper())
+
+
+def _through_zero(ep: Episode | None, row: Any) -> tuple[dict, dict] | None:
+    """A closing fill that takes the position past flat, split at zero.
+
+    Long 2 calls then SELL 3 in one fill (IBKR marks it `C;O`): the first 2
+    close the long and the last 1 opens a short. Returned as the closing part
+    and the opening part, or None when the fill stops at or before zero.
+
+    The closing part takes all of IBKR's realised P&L, which is what it is: the
+    opening part realises nothing. Commission and proceeds divide by quantity.
+
+    Only for an episode whose quantity is known. One whose entry predates the
+    archive with nothing saying how large it was (`entry_outside_window` without
+    a snapshot) has no zero to split at.
+    """
+    if ep is None or ep.entry_outside_window or _flat(ep.net_qty):
+        return None
+    qty = row["quantity"] or 0
+    if not _is_close(row["open_close"]) or (qty > 0) == (ep.net_qty > 0):
+        return None
+    if abs(qty) <= abs(ep.net_qty) or _flat(abs(qty) - abs(ep.net_qty)):
+        return None
+    closing = -ep.net_qty
+    share = closing / qty
+    close_part, open_part = dict(row), dict(row)
+    close_part.update(quantity=closing, open_close="C")
+    open_part.update(quantity=qty - closing, open_close="O",
+                     fifo_pnl_realized=0.0, fifo_pnl_realized_base=0.0)
+    for name in ("ib_commission", "ib_commission_base", "proceeds", "proceeds_base"):
+        whole = row[name] or 0.0
+        close_part[name] = whole * share
+        open_part[name] = whole - close_part[name]
+    return close_part, open_part
+
+
 def _absorb(ep: Episode, row: Any) -> None:
     """Fold one fill into an episode."""
     qty = row["quantity"] or 0
-    closing = (row["open_close"] or "").upper() == "C"
+    closing = _is_close(row["open_close"])
 
     if closing:
         ep.close_fills += 1
@@ -479,7 +521,7 @@ def build_history(
     for row in rows:
         conid = str(row["conid"] or "")
         key = (str(row["broker"] or ""), str(row["account_id"] or ""), conid)
-        closing = (row["open_close"] or "").upper() == "C"
+        closing = _is_close(row["open_close"])
 
         if key != current_key:
             flush()
@@ -494,6 +536,17 @@ def build_history(
             # unresolvable episode ends here and a clean one begins.
             flush(closed_by_reentry=True)
             current = _new_episode(row)
+
+        split = _through_zero(current, row)
+        if split is not None:
+            # The fill finished one position and began the opposite one, so it
+            # belongs to both episodes: the closing part ends this one, the
+            # leftover opens the next.
+            _absorb(current, split[0])
+            flush()
+            current = _new_episode(row)
+            _absorb(current, split[1])
+            continue
 
         _absorb(current, row)
 

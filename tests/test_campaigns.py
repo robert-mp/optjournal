@@ -201,6 +201,37 @@ def test_re_entering_the_same_contract_is_a_new_decision():
     assert camps[0].realized.base == pytest.approx(300.0)
 
 
+def test_a_fill_through_zero_is_two_decisions_not_a_roll():
+    """Long 2 calls, then one SELL 3 (IBKR `C;O`): the long closed and a short
+    opened, in the same contract, by the same fill.
+
+    `history.py` splits that fill across the two episodes, so both hold its
+    trade id and one order touches both. A roll or a spread joins DIFFERENT
+    contracts; an order touching two episodes of the SAME contract has reversed
+    the position, and the finished long is an outcome of its own rather than
+    cash in flight inside the short.
+    """
+    eps = [_Ep("C1", ["t1", "t2"], pnl=198.0),
+           _Ep("C1", ["t2"], closed=False)]
+    camps = link(eps, order_groups=[("open",), ("flip",)],
+                 order_of_trade={"t1": "open", "t2": "flip"})
+    assert len(camps) == 2
+    assert [c.is_decided for c in camps] == [True, False]
+    assert camps[0].realized.base == pytest.approx(198.0)
+
+
+def test_a_flip_placed_with_another_contract_is_still_one_decision():
+    """The same-contract exception only covers a group of ONE contract. A
+    reversal filled in the same second as a leg on another contract is a
+    multi-leg placement, and the group joins all of it as before."""
+    eps = [_Ep("C1", ["t1", "t2"], pnl=198.0),
+           _Ep("C1", ["t2"], closed=False),
+           _Ep("P1", ["t3"], closed=False)]
+    (camp,) = link(eps, order_groups=[("open",), ("flip", "hedge")],
+                   order_of_trade={"t1": "open", "t2": "flip", "t3": "hedge"})
+    assert camp.episode_indices == (0, 1, 2)
+
+
 def test_an_episode_no_order_reached_is_its_own_decision():
     """The LEAP: held from before the archive begins, so it has no fills at all
     and no order to group by. Still a position, and dropping it would
