@@ -362,6 +362,21 @@ def test_the_committed_lockfile_matches_the_committed_pyproject(tmp_path):
         "`uv lock` and commit uv.lock with the change")
 
 
+def test_the_start_files_keep_their_line_endings_and_the_mac_one_its_mode():
+    """cmd.exe misreads a `.bat` with bare LF, bash a `.command` with CR, and a
+    `.command` without its executable bit does not open on double-click. Kept by
+    `.gitattributes` and the index; a release is `git archive` of both."""
+    bat = (ROOT / "Start optjournal.bat").read_bytes()
+    command = (ROOT / "Start optjournal.command").read_bytes()
+    assert bat.count(b"\r\n") == bat.count(b"\n") > 0, "the .bat lost its CRLF"
+    assert b"\r" not in command, "the .command has CR line endings"
+    if not (ROOT / ".git").exists():
+        pytest.skip("not a git checkout, so there is no index to read the mode from")
+    staged = subprocess.run(["git", "ls-files", "-s", "Start optjournal.command"],
+                            cwd=ROOT, capture_output=True, text=True, check=False)
+    assert staged.stdout.startswith("100755"), staged.stdout
+
+
 def test_the_launcher_and_the_app_agree_on_the_contract():
     launcher = _launcher()
     assert (launcher.STAGING, launcher.READY) == (updates.STAGING, updates.READY)
