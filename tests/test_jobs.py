@@ -2753,11 +2753,30 @@ def test_waiting_out_the_fetch_lock_is_busy_for_the_confirm_poll_too(
     _hold_fetch_lock_briefly(monkeypatch)
     monkeypatch.setattr(jobs.prefs, "confirm_query_id", lambda *a, **k: "1621016")
     add_statement(conn)
+    conn.execute("INSERT INTO job_state (job, last_status, consecutive_failures)"
+                 " VALUES ('confirm', 'failed', ?)", (jobs.FAILURE_BACKOFF,))
     conn.commit()
     with locks.locked(ctx.archive_dir / flex.FETCH_LOCK):
         jobs.run_job(conn, "confirm", ctx=ctx)
     row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
     assert (row["status"], row["detail"][:5]) == ("nothing", "busy:")
+    assert conn.execute(
+        "SELECT consecutive_failures FROM job_state WHERE job='confirm'"
+    ).fetchone()[0] == jobs.FAILURE_BACKOFF, "the runner's busy run lifted the backoff"
+
+
+def _confirm_due(conn, now) -> bool:
+    """Whether `confirm` is due at `now`, read from the ledger as `reconcile` does."""
+    from optjournal import jobs as mod
+
+    claimed, last_poll, last_try, ever_ran, failures = mod._ledger_snapshot(conn)
+    return bool(mod.due_jobs(
+        now, claimed=claimed, last_poll=last_poll, last_try=last_try,
+        ever_ran=ever_ran, failures=failures, tries=mod._tries_by_job(conn),
+        registry=(mod.job_by_name("confirm"),)))
+
+
+_BUSY = "busy: another process held .fetch.lock for more than 30s."
 
 
 def test_a_busy_poll_does_not_postpone_the_next_one(conn):
@@ -2775,6 +2794,85 @@ def test_a_busy_poll_does_not_postpone_the_next_one(conn):
     record_run(conn, "confirm", status="nothing", detail="no new fills")
     _claimed, last_poll, _last_try, _ever, _failures = _ledger_snapshot(conn)
     assert "confirm" in last_poll, "a poll that asked and found nothing IS a poll"
+
+
+def test_meeting_the_fetch_lock_does_not_lift_a_backoff(conn, clock):
+    """A busy run is neither a failure nor a success, so it leaves the count alone.
+
+    `_upsert_state` reset `consecutive_failures` on anything that was not
+    `failed`, busy included, so a backed-off confirm that met the fetch lock once
+    was healthy again and polled on every tick: measured with these same calls,
+    ten IBKR requests in 45 minutes of failing, five of them a minute apart,
+    against six with no busy run. Now it keeps its backoff, and the busy run does
+    not cost it the window either: it asked nothing, so the attempt it stood for
+    is made on the next tick.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from optjournal import jobs as mod
+
+    def failures() -> int:
+        row = conn.execute("SELECT consecutive_failures FROM job_state"
+                           " WHERE job='confirm'").fetchone()
+        return 0 if row is None else row[0]
+
+    window = timedelta(seconds=mod.job_by_name("confirm").window_s)
+    start = datetime(2026, 9, 30, 15, 0, tzinfo=UTC)             # 11:00 ET
+    asked: list[datetime] = []
+    busy_at = None
+    for minute in range(45):
+        clock["t"] = start + timedelta(minutes=minute)
+        if not _confirm_due(conn, clock["t"]):
+            continue
+        if mod.is_backed_off(failures()) and busy_at is None:
+            busy_at = clock["t"]
+            before = failures()
+            record_run(conn, "confirm", status="nothing", detail=_BUSY)
+            assert failures() == before, "a busy run changed the failure count"
+            continue
+        asked.append(clock["t"])
+        record_run(conn, "confirm", status="failed", detail="StatementUnreadable")
+
+    assert busy_at is not None, "the job never backed off, so nothing was tested"
+    quick = mod.FAILURE_BACKOFF
+    assert len(asked) == quick + 1, f"{len(asked)} requests in 45 minutes: {asked}"
+    assert asked[quick] == busy_at + timedelta(minutes=1), (
+        "the attempt a busy run stood for waited a window instead of the next tick")
+    assert all(b - a >= window for a, b in zip(asked[quick - 1:], asked[quick:],
+                                               strict=False)), (
+        "a backed-off confirm asked IBKR more often than a healthy one")
+
+
+def test_a_backed_off_sync_that_met_the_fetch_lock_keeps_its_day(conn, clock):
+    """Keeping the backoff must not cost a broker job its instant. A backed-off
+    `sync` has no retry of a claimed instant (a failed fetch may have reached
+    IBKR), but a busy run asked nothing and gave the instant back, so it is still
+    that instant's one attempt to make, `RETRY_AFTER_S` later."""
+    from datetime import UTC, datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from optjournal import jobs as mod
+
+    sync = mod.job_by_name("sync")
+    noon = datetime(2026, 9, 30, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    for day in range(mod.FAILURE_BACKOFF, 0, -1):
+        clock["t"] = (noon - timedelta(days=day)).astimezone(UTC)
+        record_run(conn, "sync", status="failed", detail="URLError",
+                   fired_for=int(clock["t"].timestamp()))
+    clock["t"] = (noon + timedelta(seconds=30)).astimezone(UTC)
+    record_run(conn, "sync", status="nothing", detail=_BUSY)
+
+    def due(at):
+        claimed, last_poll, last_try, ever_ran, failures = mod._ledger_snapshot(conn)
+        assert mod.is_backed_off(failures["sync"]), "the busy run lifted the backoff"
+        return mod.due_jobs(at, claimed=claimed, last_poll=last_poll,
+                            last_try=last_try, ever_ran=ever_ran, failures=failures,
+                            tries=mod._tries_by_job(conn), registry=(sync,))
+
+    assert due(clock["t"] + timedelta(minutes=1)) == [], "retried on the next tick"
+    later = due(clock["t"] + timedelta(seconds=mod.RETRY_AFTER_S))
+    assert [d.fired_for for d in later] == [int(noon.timestamp())], (
+        "a backed-off sync lost its day to another fetch holding the lock")
 
 
 def test_a_manual_sync_that_waited_out_the_fetch_lock_reads_busy_too(conn):
