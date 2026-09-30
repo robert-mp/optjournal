@@ -13,7 +13,10 @@ import http.server
 import importlib.util
 import io
 import json
+import os
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import zipfile
@@ -313,6 +316,50 @@ def test_the_launcher_restarts_after_an_update_and_never_relocks(tmp_path, monke
     assert all(c[0] == str(launcher.ROOT) for c in calls)
     assert all("--frozen" in c for c in calls), calls
     assert opened == [], "a server that never answered was opened in the browser"
+
+
+def _uv_lock_check(project: Path, *, offline: bool) -> subprocess.CompletedProcess[str]:
+    uv = os.environ.get("UV") or shutil.which("uv")
+    if not uv:
+        pytest.skip("uv is not on PATH")
+    argv = [uv, "lock", "--check", *(["--offline"] if offline else [])]
+    try:
+        return subprocess.run(argv, cwd=project, capture_output=True, text=True,
+                              timeout=120, check=False)
+    except subprocess.TimeoutExpired:
+        pytest.skip("uv lock --check timed out (no network?)")
+
+
+def test_the_committed_lockfile_matches_the_committed_pyproject(tmp_path):
+    """M17: a version bump committed without `uv lock` ships a stale lock.
+
+    Every friend's install then re-locks it: `update` and the launcher install
+    with `--frozen` and leave it alone, but a hand-typed `uv run` rewrites
+    `uv.lock`, and that modified tracked file refuses the next update.
+
+    The COMMITTED pair, from git, not the working tree: `uv run pytest` (and CI's
+    first `uv run`) re-locks the working tree before this test can see it. Checked
+    offline first, which needs no network when the lock is current; only when
+    that cannot decide (a dependency not in this machine's cache) is the index
+    asked, and the test is skipped if it cannot be reached.
+    """
+    if not (ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    for name in ("pyproject.toml", "uv.lock"):
+        shown = subprocess.run(["git", "show", f"HEAD:{name}"], cwd=ROOT,
+                               capture_output=True, check=False)
+        if shown.returncode:
+            pytest.skip(f"git cannot show HEAD:{name}")
+        (tmp_path / name).write_bytes(shown.stdout)
+
+    checked = _uv_lock_check(tmp_path, offline=True)
+    if checked.returncode and "needs to be updated" not in checked.stderr + checked.stdout:
+        checked = _uv_lock_check(tmp_path, offline=False)
+        if checked.returncode and "needs to be updated" not in checked.stderr + checked.stdout:
+            pytest.skip(f"uv could not check the lock: {checked.stderr.strip()[-300:]}")
+    assert checked.returncode == 0, (
+        "the committed uv.lock does not match the committed pyproject.toml: run "
+        "`uv lock` and commit uv.lock with the change")
 
 
 def test_the_launcher_and_the_app_agree_on_the_contract():

@@ -151,7 +151,9 @@ Otherwise it is the per-user folder, which is where a download's journal lives.
 Friends on a downloaded ZIP update from GitHub Releases, not from `main`, so you
 choose when they get a version:
 
-1. Bump `version` in `pyproject.toml` (the one place it is written), commit, push.
+1. Bump `version` in `pyproject.toml` (the one place it is written), run `uv lock`,
+   and commit both files, then push. `uv.lock` records the version too, and the
+   test suite fails on a commit whose lock does not match its `pyproject.toml`.
 2. Publish a release tagged with that version:
    `gh release create v0.2.0 --title "0.2.0" --notes "What changed"`.
 
