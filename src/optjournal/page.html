@@ -7072,6 +7072,11 @@ async function saveQueryId(key,id){
   if(msg) msg.textContent='saving...';
   const res=await save({[key]:value});
   if(!res||!res.ok){
+    /* The refusal ENDS any held "saved": a hold outlives the render it was written
+       for, so saving a valid id and then a bad one within the four seconds had the
+       next redraw put "saved" back beside the value the server had just refused,
+       while the stored id was still the previous one. */
+    if(S.held) delete S.held[id+'msg'];
     const now=$('#'+id+'msg'); if(now) now.textContent=(res&&res.message)||'failed';
     return;
   }

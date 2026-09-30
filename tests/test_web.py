@@ -5853,23 +5853,32 @@ def test_a_watched_symbol_clears_the_search_box_and_its_filter_together():
     assert (out["disabled"], out["focused"], out["value"]) == (False, True, "")
 
 
-def _save_query_id(typed: str, reply: dict) -> dict:
-    """Save the Flex query id through the page's own `saveQueryId`.
+def _save_query_id(*saves: tuple[str, dict], redraw: bool = False) -> dict:
+    """Save the Flex query id through the page's own `saveQueryId`, once per
+    (typed, reply) pair, and report the field and its status span at the end.
 
-    `load` stands in for the reload a success triggers, doing what the real one
-    does to this panel: the status span is rebuilt from `settingsPanel`'s markup,
-    and the field keeps whatever `preserveInputs` read off the old one.
+    `redraw` stands in for the render a success triggers, and for any other one that
+    lands while a status word is still held, doing what the real one does to this
+    panel: the status span is rebuilt from `settingsPanel`'s markup, and the field
+    keeps whatever `preserveInputs` read off the old one.
     """
+    typed, replies = [t for t, _ in saves], [r for _, r in saves]
     return _node_run([
         "const S={}; const sent=[]; const setTimeout=()=>0;",
-        "const nodes={'#qid':{value:" + json.dumps(typed) + "},'#qidmsg':{textContent:''}};",
+        "const nodes={'#qid':{value:''},'#qidmsg':{textContent:''}};",
         "const $=sel=>nodes[sel]||null;",
-        f"async function save(body){{sent.push(body); return {json.dumps(reply)};}}",
-        "function load(){nodes['#qid']={value:nodes['#qid'].value};",
+        f"const replies={json.dumps(replies)};",
+        "async function save(body){sent.push(body); return replies[sent.length-1];}",
+        "function redraw(){nodes['#qid']={value:nodes['#qid'].value};",
         "  nodes['#qidmsg']={textContent:heldNote('qidmsg')};}",
+        "function load(){redraw();}",
         *([_page_const("HELD_MS")] if "const HELD_MS=" in _js() else []),
         *_page_fns("saveQueryId", "holdNote", "heldNote"),
-        "await saveQueryId('query_id','qid');",
+        f"for(const t of {json.dumps(typed)})"
+        "{nodes['#qid'].value=t; await saveQueryId('query_id','qid');}",
+        # One more redraw (a theme chip, a landing load) INSIDE the hold, which is
+        # where a stale "saved" comes back from.
+        *(["redraw();"] if redraw else []),
         "console.log(JSON.stringify({sent,field:nodes['#qid'].value,",
         "  said:nodes['#qidmsg'].textContent}));",
     ])
@@ -5881,7 +5890,7 @@ def test_a_saved_query_id_says_so_after_the_redraw_and_shows_what_was_stored():
     read; and the field kept "  123  " because `preserveInputs` put the typed text
     back over the stored, trimmed value.
     """
-    out = _save_query_id("  1591754  ", {"ok": True, "kind": "settings"})
+    out = _save_query_id(("  1591754  ", {"ok": True, "kind": "settings"}))
     assert out == {"sent": [{"query_id": "1591754"}], "field": "1591754",
                    "said": "saved"}
     panel = _fn("settingsPanel")
@@ -5890,10 +5899,31 @@ def test_a_saved_query_id_says_so_after_the_redraw_and_shows_what_was_stored():
 
 
 def test_a_refused_query_id_shows_the_servers_reason_and_keeps_the_text():
-    out = _save_query_id("abc", {"ok": False, "kind": "query_id",
-                                  "message": "'abc' is not a Flex query id"})
+    out = _save_query_id(("abc", {"ok": False, "kind": "query_id",
+                                  "message": "'abc' is not a Flex query id"}))
     assert out == {"sent": [{"query_id": "abc"}], "field": "abc",
                    "said": "'abc' is not a Flex query id"}
+
+
+def test_a_refusal_ends_the_saved_that_was_being_held():
+    """L53: "saved" is held for four seconds so a reload cannot wipe it, and the
+    refusal branch left that hold standing. Save a valid id, type `bad!`, save
+    again within the four seconds, and the next redraw -- the theme chip, a load,
+    anything -- rebuilt the span from the hold and put "saved" back beside the
+    value the server had just refused, while the stored id was still the previous
+    one. Driven in headless Chromium on a copy of the real journal too.
+    """
+    refusal = "'bad!' is not a Flex query id"
+    out = _save_query_id(
+        ("1591754", {"ok": True, "kind": "settings"}),
+        ("bad!", {"ok": False, "kind": "query_id", "message": refusal}),
+        redraw=True,
+    )
+    assert out["sent"] == [{"query_id": "1591754"}, {"query_id": "bad!"}]
+    assert out["field"] == "bad!", "the refused text is what the reader must correct"
+    assert out["said"] == "", (
+        f"a redraw after the refusal says {out['said']!r}: the held word outlived "
+        "the claim it was making")
 
 
 def test_a_refused_stop_watching_hands_its_button_back():
