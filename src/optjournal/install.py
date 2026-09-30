@@ -10,10 +10,11 @@ Two ways a journal arrives, and they are treated differently on purpose:
   running an old install. Moved by `prepare()` without asking: it is this
   install's own journal, and the launcher runs `prepare()` before the server
   starts, so nothing has it open.
-* IN ANOTHER DOWNLOAD. Found by `previous_journals()` in Downloads, Desktop and
-  Documents, and moved only after the reader confirms it in the page. Someone
-  may keep two journals on purpose, and guessing which one is theirs is not
-  this module's decision.
+* IN ANOTHER DOWNLOAD. Found by `previous_journals()` in Downloads, Desktop,
+  Documents and the home folder itself (where a `git clone` typed into a new
+  terminal lands), and moved only after the reader confirms it in the page.
+  Someone may keep two journals on purpose, and guessing which one is theirs is
+  not this module's decision.
 
 NEVER OVERWRITES A JOURNAL WITH DATA. A home that already has statements is left
 alone and the move is refused. A home with an empty journal (what the server
@@ -56,6 +57,9 @@ PENDING_IMPORT = ".pending-import.json"
 #: of a Documents folder cost seconds on a page load for a case nobody has.
 SEARCH_DIRS = ("Downloads", "Desktop", "Documents")
 SEARCH_DEPTH = 2
+#: The home folder is searched one level only: `~/optjournal` is where a clone
+#: typed into a new terminal lands, and walking deeper would reach `~/Library`.
+HOME_DEPTH = 1
 
 
 class RelocateRefused(RuntimeError):
@@ -153,23 +157,22 @@ def previous_journals(
         return []
     base = search_root or Path.home()
     found: list[Path] = []
-    frontier = [base / name for name in SEARCH_DIRS]
-    for _depth in range(SEARCH_DEPTH):
-        nxt: list[Path] = []
-        for directory in frontier:
-            try:
-                children = [c for c in directory.iterdir() if c.is_dir()]
-            except OSError:
+    frontier = [(base / name, SEARCH_DEPTH) for name in SEARCH_DIRS]
+    frontier.append((base, HOME_DEPTH))
+    while frontier:
+        directory, depth = frontier.pop()
+        try:
+            children = [c for c in directory.iterdir() if c.is_dir()]
+        except OSError:
+            continue
+        for child in children:
+            if child.resolve() in (config.ROOT.resolve(), home.resolve()):
                 continue
-            for child in children:
-                if child.resolve() in (config.ROOT.resolve(), home.resolve()):
-                    continue
-                if (_is_optjournal(child)
-                        and _statement_count(child / "journal.db", foreign=True)):
-                    found.append(child)
-                else:
-                    nxt.append(child)
-        frontier = nxt
+            if (_is_optjournal(child)
+                    and _statement_count(child / "journal.db", foreign=True)):
+                found.append(child)
+            elif depth > 1:
+                frontier.append((child, depth - 1))
     return sorted(found, key=lambda p: (p / "journal.db").stat().st_mtime, reverse=True)
 
 
