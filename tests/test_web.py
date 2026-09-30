@@ -2241,13 +2241,19 @@ def test_a_redraw_hands_focus_back_to_the_control_that_had_it():
         "the message banner is not announced")
 
 
-def _bind_replay(resume: bool) -> dict:
-    """The page's own `bindReplayControls` on a panel parked at bar 3 of 10."""
+def _bind_replay(resume: bool, key: str = "lc:a") -> dict:
+    """The page's own `bindReplayControls` on a panel parked at bar 3 of 10.
+
+    `key` is the replay the panel shows, so the harness can also report which key
+    the frame loop recorded itself against (`RPKEY`).
+    """
     js = _code_only(_js())
     consts = [_page_const("REPLAY_SECONDS")] if "const REPLAY_SECONDS=" in js else []
     return _node_run([
         f"import {{barsPerMs, nextStop}} from '{_static('replay.js')}';",
         "let RGEO={points:Array.from({length:10},(_,i)=>[i,1]),events:[]}, RTIMER=null;",
+        "let RPKEY=null;",
+        f"const S={{replay:{json.dumps(key)}}};",
         "let frames=0; const requestAnimationFrame=()=>++frames;",
         "const cancelAnimationFrame=()=>{};",
         "const scrub={value:'3',max:'9'}, play={textContent:'▶ play'};",
@@ -2259,7 +2265,23 @@ def _bind_replay(resume: bool) -> dict:
         *consts, *_page_fns("replayStop", "bindReplayControls"),
         f"bindReplayControls({json.dumps(resume)});",
         "console.log(JSON.stringify({playing:RTIMER!==null,label:play.textContent,",
-        "  at:scrub.value}));",
+        "  at:scrub.value,key:RPKEY}));",
+    ])
+
+
+def _resume_decision(playing_for: str, opened: str) -> bool:
+    """draw()'s own two lines: a loop is running for `playing_for` and the render
+    about to happen is for `opened`. True means the new panel carries on playing.
+    """
+    draw = _fn("draw")
+    capture = re.search(r"^\s*const replaying=.*?;$", draw, re.M)
+    decide = re.search(r"bindReplayControls\(([^;]*)\);", draw)
+    assert capture and decide, "draw() no longer decides whether to resume playback"
+    return _node_run([
+        f"const S={{replay:{json.dumps(opened)}}};",
+        f"let RPKEY={json.dumps(playing_for)}, RTIMER=1;",
+        capture.group(0),
+        f"console.log(JSON.stringify({decide.group(1)}));",
     ])
 
 
@@ -2270,13 +2292,37 @@ def test_a_redraw_during_playback_keeps_the_replay_playing():
     the scrubber held comes back through `preserveInputs`, which now also carries
     a checkbox's `checked`, so "stop on events" no longer comes back ticked.
     """
-    assert _bind_replay(resume=True) == {"playing": True, "label": "❚❚ pause", "at": "3"}
+    started = _bind_replay(resume=True)
+    assert started == {"playing": True, "label": "❚❚ pause", "at": "3", "key": "lc:a"}
     assert _bind_replay(resume=False)["playing"] is False, "a parked replay started"
     draw = _fn("draw")
-    assert draw.index("RTIMER!==null?S.replay:null") < draw.index("replayStop()"), (
+    assert draw.index("RTIMER!==null?RPKEY:null") < draw.index("replayStop()"), (
         "whether it was playing has to be read before the loop is stopped")
     assert "bindReplayControls(replaying!==null&&replaying===S.replay)" in draw
     assert "el.checked=was.checked" in _fn("restoreInputs")
+
+
+def test_a_second_replay_opened_over_a_playing_one_opens_paused():
+    """L50: pressing play on one replay and then opening another started the SECOND
+    one playing, from the first one's bar. The `[data-replay]` handler writes the new
+    key into `S.replay` before it redraws, so draw() comparing "was playing" against
+    `S.replay` was comparing the new key with itself and always found them equal.
+
+    Playback now records the key it was started FOR, which is the question draw()
+    was trying to ask, and the scrubber names the replay it belongs to so
+    `restoreInputs` refuses to carry a bar index into a different trade. Driven in
+    headless Chromium on the demo journal both ways round.
+    """
+    assert _resume_decision(playing_for="lc:a", opened="lc:a") is True, (
+        "a redraw of the replay that is playing must carry on")
+    assert _resume_decision(playing_for="lc:a", opened="lc:b") is False, (
+        "opening a second replay while one plays must leave the new one paused")
+    assert _resume_decision(playing_for="lc:a", opened="") is False, (
+        "closing the panel that was playing must not resume anything")
+    chart = _fn("replayChart")
+    assert 'id="rscrub" data-subject="${esc(S.replay||\'\')}"' in chart, (
+        "the scrubber does not name its replay, so the bar index of the one that "
+        "was playing is restored onto the one just opened")
 
 
 def test_nothing_this_server_sends_is_cacheable():

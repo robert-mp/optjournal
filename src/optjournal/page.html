@@ -3081,6 +3081,12 @@ const etday=ts=>new Date(ts*1000).toLocaleDateString('en-CA',{timeZone:MKT});
    Everything else on this page redraws wholesale on interaction, which is right
    for a click and wrong for a continuous drag. */
 let RGEO=null, RTIMER=null;
+/* WHICH replay the running loop belongs to, recorded where playback is armed and
+   read only while RTIMER is set. draw() cannot ask S.replay for this: the
+   `[data-replay]` handler writes the new key BEFORE it redraws, so "is this the
+   same replay" was the new key compared with itself -- always true -- and opening
+   a second chart while the first played started the second one playing too. */
+let RPKEY=null;
 /* The events a replay can place on the timeline: those carrying a real epoch.
    ONE filter, because two readers must agree about the set -- the geometry
    decides which cards `replaySeek` reveals, and the renderer decides which cards
@@ -3227,7 +3233,11 @@ function replayChart(rp){
     <button class="rbtn" data-rseek="0" title="to the start">|◀</button>
     <button class="rbtn" data-rplay="1">▶ play</button>
     <button class="rbtn" data-rseek="${pts.length-1}" title="to the end">▶|</button>
-    <input class="rscrub" id="rscrub" type="range" min="0" max="${pts.length-1}"
+    <!-- The scrubber names the replay it belongs to, so restoreInputs drops its
+         position rather than carrying it into another trade: opening a second
+         replay used to land on the bar the first one was parked at. -->
+    <input class="rscrub" id="rscrub" data-subject="${esc(S.replay||'')}"
+      type="range" min="0" max="${pts.length-1}"
       value="${pts.length-1}" step="1" aria-label="replay position">
     <!-- A MULTIPLIER of the whole replay's duration, not milliseconds per bar.
          The old values were ms/bar, which made one setting mean a different
@@ -3493,6 +3503,8 @@ function bindReplayControls(resume){
       replaySeek(position);
       RTIMER=requestAnimationFrame(tick);
     };
+    /* Armed for THIS replay, beside the timer it belongs to. */
+    RPKEY=S.replay;
     RTIMER=requestAnimationFrame(tick);
   };
   if(speed) speed.onchange=()=>{ if(RTIMER!==null&&play){play.onclick();play.onclick();} };
@@ -6337,8 +6349,10 @@ function draw(push){
   }
   /* A running playback drives element ids that this render is about to
      replace, so it stops here, and resumes on the new panel below when that
-     panel is the same replay. A theme toggle used to end it. */
-  const replaying=RTIMER!==null?S.replay:null;
+     panel is the same replay. A theme toggle used to end it. The key comes from
+     RPKEY, the one playback was started for: S.replay is already the panel this
+     render is about to OPEN, which is a different question. */
+  const replaying=RTIMER!==null?RPKEY:null;
   replayStop();
   const fk=focusKey();
   syncHash(push);
