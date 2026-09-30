@@ -638,3 +638,119 @@ def test_the_band_measures_to_the_legs_held_at_each_bar(conn):
         assert epoch_et(f"{day} 09:30:00") in half, f"{day}: the band vanished with the put held"
         assert half[epoch_et(f"{day} 09:30:00")] == pytest.approx(
             want(day, 0.50, far), abs=1e-4), f"{day}: measured to a leg rolled away"
+
+
+def _closes(conn, conid, strike, right, expiry, vol, spots: dict[str, float]) -> None:
+    """A contract's daily closes at one vol, each priced at its own 16:00 close."""
+    for day, spot in spots.items():
+        at = epoch_et(f"{day} 16:00:00")
+        if at < expiry:
+            _option_close(conn, conid, day,
+                          bs_price(spot, strike, (expiry - at) / _YEAR, vol, right))
+
+
+def test_a_held_leg_the_model_cannot_price_yet_books_neither_its_cash_nor_its_value(conn):
+    """P&L is cash plus value, so a leg must bring both or neither.
+
+    A leg with no vol yet had its cash booked and its value dropped, so the P&L
+    carried the whole premium as if it had been lost. A LEAP bought at 100.00 for
+    a strike 100 in the money is below the European floor at 4%, so no vol
+    reprices it, and until its first close the covered call it pays for read
+    -$10,000 on the day it was opened.
+    """
+    spots = {"2026-01-05": 250.0, "2026-01-06": 250.0, "2026-01-07": 250.0}
+    _daily(conn, list(spots), 250.0)
+    leap, short = epoch_et("2028-01-21 16:00:00"), epoch_et("2026-02-20 16:00:00")
+    _closes(conn, "SHORT", 270.0, "C", short, 0.30, spots)
+    # The LEAP's first close is Tuesday's: nothing prices it on Monday.
+    _closes(conn, "LEAP", 150.0, "C", leap, 0.30,
+            {day: spot for day, spot in spots.items() if day != "2026-01-05"})
+    opened = "2026-01-05 10:15:00"
+    credit = bs_price(250.0, 270.0, (short - epoch_et(opened)) / _YEAR, 0.30, "C")
+    replay = _replay(conn, [
+        _leg("LEAP", 150.0, "C", "2028-01-21", opened, 1, 100.0),
+        _leg("SHORT", 270.0, "C", "2026-02-20", opened, -1, credit),
+    ])
+    marks = {row[0]: row for row in replay["marks"]}
+
+    monday = epoch_et("2026-01-05 09:30:00")
+    worth = bs_price(250.0, 270.0, (short - epoch_et("2026-01-05 16:00:00")) / _YEAR,
+                     0.30, "C")
+    assert marks[monday][1] == pytest.approx((credit - worth) * 100, abs=0.01), (
+        "the LEAP's debit was booked without the LEAP"
+    )
+    assert marks[monday][2] == pytest.approx(
+        -_delta(250.0, 270.0, short, "2026-01-05", 0.30, "C"), abs=1e-4)
+    # From its first close the LEAP is priced, cash and value together.
+    at = epoch_et("2026-01-06 16:00:00")
+    both = (bs_price(250.0, 150.0, (leap - at) / _YEAR, 0.30, "C") - 100.0
+            + credit - bs_price(250.0, 270.0, (short - at) / _YEAR, 0.30, "C")) * 100
+    assert marks[epoch_et("2026-01-06 09:30:00")][1] == pytest.approx(both, abs=0.01)
+
+
+def _delta(spot, strike, expiry, day, vol, right):
+    from optjournal.blackscholes import bs_delta
+
+    at = epoch_et(f"{day} 16:00:00")
+    return bs_delta(spot, strike, (expiry - at) / _YEAR, vol, right)
+
+
+def test_a_leg_that_never_prices_still_books_its_cash_once_flat(conn):
+    """Flat, a leg's value is zero whatever the model can say, so its cash counts.
+
+    A leg with no solvable vol was skipped whole, even after it was closed, so a
+    lifecycle holding one never ended at what it made.
+    """
+    spots = {"2026-01-05": 250.0, "2026-01-06": 250.0, "2026-01-07": 250.0}
+    _daily(conn, list(spots), 250.0)
+    short = epoch_et("2026-02-20 16:00:00")
+    _closes(conn, "SHORT", 270.0, "C", short, 0.30, spots)
+    opened, closed = "2026-01-05 10:15:00", "2026-01-06 10:15:00"
+
+    def price(at):
+        return bs_price(250.0, 270.0, (short - epoch_et(at)) / _YEAR, 0.30, "C")
+
+    replay = _replay(conn, [
+        _leg("LEAP", 150.0, "C", "2028-01-21", opened, 1, 100.0),
+        _leg("SHORT", 270.0, "C", "2026-02-20", opened, -1, price(opened)),
+        _leg("LEAP", 150.0, "C", "2028-01-21", closed, -1, 101.0, marker="C"),
+        _leg("SHORT", 270.0, "C", "2026-02-20", closed, 1, price(closed), marker="C"),
+    ], closed=closed)
+    gross = (101.0 - 100.0 + price(opened) - price(closed)) * 100
+    assert replay["marks"][-1][1] == pytest.approx(gross, abs=0.01), (
+        "the flat LEAP's $100 of realised cash never reached the modelled P&L"
+    )
+
+
+def test_an_expired_leg_still_held_is_valued_at_its_settlement(conn):
+    """A contract past expiry with no closing fill yet is worth what it settled at.
+
+    A calendar's near short call expired $10 in the money while the far call kept
+    the series going. Dropped from the value but not from the cash, the near
+    leg's credit stayed in the P&L and its $1,000 settlement never did.
+    """
+    spots = {"2026-01-05": 100.0, "2026-01-06": 100.0, "2026-01-07": 110.0,
+             "2026-01-08": 110.0, "2026-01-09": 110.0}
+    for day, spot in spots.items():
+        _daily(conn, [day], spot)
+    near, far = epoch_et("2026-01-07 16:00:00"), epoch_et("2026-02-20 16:00:00")
+    _closes(conn, "NEAR", 100.0, "C", near, 0.30, spots)
+    _closes(conn, "FAR", 100.0, "C", far, 0.30, spots)
+    opened = "2026-01-05 10:15:00"
+    credit = bs_price(100.0, 100.0, (near - epoch_et(opened)) / _YEAR, 0.30, "C")
+    debit = bs_price(100.0, 100.0, (far - epoch_et(opened)) / _YEAR, 0.30, "C")
+    replay = _replay(conn, [
+        _leg("NEAR", 100.0, "C", "2026-01-07", opened, -1, credit),
+        _leg("FAR", 100.0, "C", "2026-02-20", opened, 1, debit),
+    ])
+    marks = {row[0]: row for row in replay["marks"]}
+
+    thursday = epoch_et("2026-01-08 09:30:00")
+    worth = bs_price(110.0, 100.0, (far - epoch_et("2026-01-08 16:00:00")) / _YEAR,
+                     0.30, "C")
+    assert marks[thursday][1] == pytest.approx(
+        (credit - 10.0 - debit + worth) * 100, abs=0.01
+    ), "the expired leg's settlement is missing from the P&L"
+    assert marks[thursday][2] == pytest.approx(
+        _delta(110.0, 100.0, far, "2026-01-08", 0.30, "C"), abs=1e-4
+    ), "an expired contract has no delta left"

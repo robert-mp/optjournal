@@ -478,6 +478,20 @@ def modelled_marks(
     is opened in -- so reporting it for an empty position states a position that
     was never held. P&L keeps reporting through the same bars; see the note at
     the append.
+
+    A LEG BRINGS ITS CASH AND ITS VALUE TOGETHER, OR NEITHER. A held leg the
+    model cannot price on a bar (no vol observed yet, or none ever solved) is
+    left out of that bar whole: booking the cash it paid without the value it
+    bought made a covered LEAP read as its whole debit lost until its first
+    close. Once flat a leg's value is zero whatever the model can say, so its
+    cash always counts, and a closed trade ends at what its fills made. A leg
+    past its expiry and still held (no closing fill yet) is worth its
+    settlement: intrinsic at the expiry's own spot, frozen there, with no delta.
+
+    A bar is modelled on the same terms as the band (see `_basis`): when a leg it
+    is measured from has a vol. So the two series start and end together, and a
+    trade whose every contract has expired ends where the envelope does rather
+    than drawing a P&L that swings with spot for a contract that settled.
     """
     if vols is None:
         vols = _vol_series(
@@ -485,72 +499,61 @@ def modelled_marks(
         )
     if not vols:
         return []
+    closes = [(_closed_at(stamp, bar_size), spot) for stamp, spot in points]
     marks: list[list[float | None]] = []
-    for stamp, spot in points:
-        at = _closed_at(stamp, bar_size)
-        cash = 0.0
-        value = 0.0
+    for (stamp, spot), (at, _) in zip(points, closes, strict=True):
+        if not any(
+            _held_forward(vols.get(leg.conid, []), at) is not None
+            for leg, _ in _basis(legs, at)
+        ):
+            continue
+        pnl = 0.0
         delta = 0.0
-        priced = False
-        # Separate from `priced`, and that distinction is the whole point. A bar
-        # can be PRICEABLE (its contract has a solvable vol) while nothing is
-        # HELD -- before the opening fill, and after a close takes the position
-        # flat. Sharing one flag made those bars report `delta` as the sum of
-        # `0 * bs_delta(...)`, an exact 0.0, and on a SYMMETRIC axis 0.0 is not
-        # an absence: it is the centre line, the state a strangle is opened in.
-        # So a closed trade drew twelve bars of "we were delta-neutral" when the
-        # truth was "we were not in the trade" -- the same fabrication
-        # `delta_around` already refuses to make for an opening event, and the
-        # same rule `markAt` follows in returning null rather than a neighbour's
-        # figure. Measured on this journal: the TSLA short put reported +0.3171
-        # then 0.0000 for twelve bars after its buyback, and every replay with
-        # context before entry did the mirror image.
-        held = False
+        # Whether any held leg was priced, which is a different question from
+        # whether the bar could be, and that distinction is the whole point. A
+        # bar can be priced while nothing is HELD -- before the opening fill, and
+        # after a close takes the position flat. Sharing one flag made those bars
+        # report `delta` as the sum of `0 * bs_delta(...)`, an exact 0.0, and on
+        # a SYMMETRIC axis 0.0 is not an absence: it is the centre line, the
+        # state a strangle is opened in. So a closed trade drew twelve bars of
+        # "we were delta-neutral" when the truth was "we were not in the trade"
+        # -- the same fabrication `delta_around` already refuses to make for an
+        # opening event, and the same rule `markAt` follows in returning null
+        # rather than a neighbour's figure. Measured on this journal: the TSLA
+        # short put reported +0.3171 then 0.0000 for twelve bars after its
+        # buyback, and every replay with context before entry did the mirror.
+        exposed = False
         for leg in legs:
-            expiry = expiry_epoch(leg.expiry)
-            series = vols.get(leg.conid)
-            if expiry is None or not series:
+            quantity, cash = _position(leg, at)
+            if not quantity:
+                pnl += cash
                 continue
-            # Position and cash as of this bar. A snapshot-only contract has no
-            # fills anywhere -- that is what makes it snapshot-only -- so it is
-            # seeded from its cost basis and held flat across the window.
-            quantity = leg.seed_quantity
-            cash -= leg.seed_quantity * leg.seed_price * leg.multiplier
-            for fill_at, delta_qty, price in leg.fills:
-                if fill_at > at:
-                    break
-                quantity += delta_qty
-                cash -= delta_qty * price * leg.multiplier
-            vol = _held_forward(series, at)
+            expiry = expiry_epoch(leg.expiry)
+            if expiry is None:
+                continue
+            if at > expiry:
+                # Settled. Priced at the spot of the moment, an expired contract
+                # drew a P&L that kept swinging with spot for as long as the
+                # window ran, and a delta pinned at the top of its axis.
+                settled = _spot_at(closes, expiry)
+                if settled is not None:
+                    unit = bs_price(settled, leg.strike, 0.0, 0.0, leg.right)
+                    pnl += cash + quantity * unit * leg.multiplier
+                continue
+            vol = _held_forward(vols.get(leg.conid, []), at)
             if vol is None:
                 continue
             years = (expiry - at) / _YEAR
-            if years < 0:
-                # The contract is gone. Pricing past expiry is not merely
-                # imprecise, it is confidently wrong: bs_price clamps to
-                # intrinsic and bs_delta to 1.0, so a held position draws a P&L
-                # that keeps swinging with spot and a delta pinned at the top of
-                # its axis for as long as the window runs. Measured on the demo's
-                # snapshot-only call, that was two months of tail on a contract
-                # that had settled. Skipping means the series ENDS at expiry,
-                # which is where the band already ends.
-                continue
             unit = bs_price(spot, leg.strike, years, vol, leg.right)
-            value += quantity * unit * leg.multiplier
+            pnl += cash + quantity * unit * leg.multiplier
             delta += quantity * bs_delta(spot, leg.strike, years, vol, leg.right)
-            priced = True
-            if quantity:
-                held = True
-        if not priced:
-            continue
+            exposed = True
         # P&L is still reported when nothing is held, and that asymmetry is
         # deliberate rather than an oversight. Cash flow to date with no open leg
         # left to mark IS the trade's result: it is frozen because the trade
         # finished, so the figure is true. Exposure has no such post-close value
         # -- there is nothing to be exposed by -- so it is absent instead.
-        marks.append([
-            stamp, round(cash + value, 2), round(delta, 4) if held else None,
-        ])
+        marks.append([stamp, round(pnl, 2), round(delta, 4) if exposed else None])
     return marks
 
 
