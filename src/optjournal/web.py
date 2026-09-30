@@ -2225,11 +2225,18 @@ def serve(
     # observe the bound socket immediately, and the shutdown tests do exactly
     # that; installing below `_Server(...)` left a real interval where SIGINT,
     # SIGTERM or Windows Ctrl+Break took its default action or was missed.
-    stop = threading.Event()
+    #
+    # A LIST THE HANDLER APPENDS TO, not an Event it sets, and not a print.
+    # CPython runs the handler on the main thread between two bytecodes, and that
+    # can be inside `Event.wait` just as it re-acquires the event's lock: `set()`
+    # then waits for a lock its own thread holds, for ever, and every later
+    # signal lands in the same wait. Observed once on a real `serve` after
+    # SIGTERM. `print` has the same shape through the stdout buffer's lock. An
+    # append takes no lock, and the main loop below polls for it.
+    stopped: list[int] = []
 
     def _bye(signum: int, _frame: Any) -> None:
-        print(f"\nsignal {signum}, stopping")
-        stop.set()
+        stopped.append(signum)
 
     # Installed only when this is the main thread. `signal.signal` raises
     # ValueError elsewhere, and `serve` is importable and callable from a test.
@@ -2301,24 +2308,25 @@ def serve(
             if not server_thread.is_alive():
                 raise RuntimeError("HTTP serving thread exited during startup")
         try:
-            # LOOPED WITH A TIMEOUT, for the same reason the `serving` barrier above
-            # is, and this asymmetry was a real bug: a bare `Event.wait()` parks the
-            # main thread in a lock acquire that Windows does not interrupt, so
-            # CPython -- which runs signal and console-control handlers on the main
-            # thread only -- could not run `_bye` until the wait returned. Nothing
-            # returns it but `_bye`. Whether that deadlocked depended purely on
-            # whether Ctrl+Break arrived before or after the main thread entered the
-            # wait, which is why it presented as flakiness: three consecutive
+            # POLLED ON A SHORT SLEEP, for the same reason the `serving` barrier
+            # above is, and this asymmetry was a real bug: a bare `Event.wait()`
+            # parks the main thread in a lock acquire that Windows does not
+            # interrupt, so CPython -- which runs signal and console-control
+            # handlers on the main thread only -- could not run `_bye` until the
+            # wait returned. Whether that deadlocked depended purely on whether
+            # Ctrl+Break arrived before or after the main thread entered the wait,
+            # which is why it presented as flakiness: three consecutive
             # windows-latest runs failed `tests/test_shutdown.py`, each on a
             # different test in the file, while the same suite passed on ubuntu and
-            # on the commit before. Adding imports to the startup path was enough to
-            # move the window.
+            # on the commit before. A sleep holds no lock the handler could want,
+            # and ends in at most 0.2 s on every platform.
             #
             # Waking five times a second costs nothing measurable and makes the stop
             # deterministic on every platform.
-            while not stop.wait(0.2):
-                if cfg.restart.is_set():
-                    break
+            while not stopped and not cfg.restart.is_set():
+                time.sleep(0.2)
+            if stopped:
+                print(f"\nsignal {stopped[0]}, stopping")
         except KeyboardInterrupt:
             print("\nstopped")
         finally:

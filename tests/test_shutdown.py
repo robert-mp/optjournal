@@ -259,16 +259,16 @@ def test_serve_forever_runs_on_a_thread_not_the_main_one():
         "serve_forever is not being run on a thread, so any shutdown() from a "
         "signal handler will deadlock (socketserver's own docstring says so)"
     )
-    # `stop.wait(` rather than `stop.wait()`: the wait is LOOPED on a short
-    # timeout now, because a bare one is not interruptible on Windows -- see
-    # test_the_stop_wait_is_interruptible_rather_than_bare. The claim this makes is
-    # unchanged, that the main thread blocks on an event and so has something a
-    # signal can interrupt.
-    assert "stop.wait(" in body, (
-        "the main thread no longer blocks on an event, so it has nothing to be "
-        "interrupted by a signal"
+    # The main thread POLLS on a short sleep for the flag the handler sets, where
+    # it used to wait on an event: a bare wait is not interruptible on Windows
+    # (test_the_stop_wait_is_interruptible_rather_than_bare) and an event's lock
+    # can deadlock the handler (test_the_signal_handler_takes_no_lock). The claim
+    # this makes is unchanged: the main thread is free for a signal to reach.
+    assert "time.sleep(" in body, (
+        "the main thread no longer polls for the stop, so it has nothing a signal "
+        "can interrupt"
     )
-    assert body.index("serving.wait(") < body.index("stop.wait("), (
+    assert body.index("serving.wait(") < body.index("time.sleep("), (
         "the main thread can enter shutdown before serve_forever has entered its "
         "loop; socketserver.shutdown() deadlocks in that startup interval"
     )
@@ -314,12 +314,49 @@ def test_the_stop_wait_is_interruptible_rather_than_bare():
 
     body = code_only((ROOT / "src" / "optjournal" / "web.py").read_text(
         encoding="utf-8"))
-    assert re.search(r"while not stop\.wait\(0?\.\d+\):", body), (
-        "serve() waits on its stop event without a timeout. On Windows that parks "
-        "the main thread where the console-control handler cannot run, so Ctrl+Break "
-        "never stops the process -- loop on a short timeout instead"
+    assert re.search(
+        r"while not stopped and not cfg\.restart\.is_set\(\):\s*time\.sleep\(0?\.\d+\)",
+        body,
+    ), (
+        "serve() no longer polls for the stop on a short sleep. A blocking wait on "
+        "Windows parks the main thread where the console-control handler cannot "
+        "run, so Ctrl+Break never stops the process"
     )
     assert "stop.wait()\n" not in body, "a bare stop.wait() is back"
+
+
+def test_the_signal_handler_takes_no_lock():
+    """M15: the handler used to call `stop.set()` and `print()`.
+
+    CPython runs a signal handler on the main thread BETWEEN TWO BYTECODES,
+    which can be inside `Event.wait` just as it re-acquires that event's lock.
+    `Event.set` then waits for a lock its own thread holds and never gets it:
+    `serve` sat alive after SIGTERM, and every later signal ran into the same
+    wait. `print` has the same shape (the stdout buffer's lock is not
+    reentrant). So the handler only records the signal, and the main loop,
+    which polls, does everything else.
+
+    Pinned as SOURCE for the reason the Windows wait above is: the window is a
+    few bytecodes every 200 ms, seen once in the field and not reproducible on
+    demand. Checked with `ast`, over the calls the handler makes.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from optjournal import web
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(web.serve)))
+    handler = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef) and node.name == "_bye")
+    called = {
+        call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", "?")
+        for call in ast.walk(handler) if isinstance(call, ast.Call)
+    }
+    assert called <= {"append"}, (
+        f"the signal handler calls {sorted(called - {'append'})}, which can wait on a "
+        "lock the interrupted main thread already holds"
+    )
 
 
 #: How long the injected job sleeps. Comfortably past `Scheduler.stop()`'s 10s
