@@ -738,7 +738,8 @@ def run_job(
     queue behind something that spends IBKR requests.
 
     Raises `UnknownJob` (no such name) or `JobBusy` (already running). Any other
-    exception is recorded as `failed` and re-raised, because a caller that asked
+    exception rolls back the run's uncommitted writes, is recorded as `failed`
+    and is re-raised, because a caller that asked
     for a run is entitled to the traceback -- swallowing it here is what turned
     the keychain failure into a message that reached nobody.
     """
@@ -780,6 +781,14 @@ def _run_locked(
     try:
         outcome = job.run(conn, ctx)
     except Exception as exc:                      # noqa: BLE001 - recorded, re-raised
+        # ROLLED BACK BEFORE THE BOOKKEEPING, because `_finish` commits on this
+        # same connection and would otherwise commit whatever the crashed work had
+        # written so far. That is how a sync that raised half-way through an
+        # ingest left its `statements` row committed with the rest missing, and
+        # every retry then skipped the file as already ingested. The claim row
+        # itself was committed before the work began, so it survives this.
+        if conn.in_transaction:
+            conn.rollback()
         _finish(conn, run_id, Outcome("failed", f"{type(exc).__name__}: {exc}"[:400]))
         raise
     _finish(conn, run_id, outcome)

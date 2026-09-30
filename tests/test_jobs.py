@@ -758,6 +758,74 @@ def test_a_job_that_raises_is_recorded_failed_and_the_error_still_travels(
         "SELECT consecutive_failures FROM job_state").fetchone()[0] == 1
 
 
+def test_a_sync_that_raises_mid_ingest_leaves_nothing_half_written(
+    ctx, tmp_path, monkeypatch
+):
+    """H1: the bookkeeping for a failed run must not commit the run's half-work.
+
+    `_finish` commits on the job's own connection, so before the fix it committed
+    whatever the crashed ingest had written so far, `statements` row included. The
+    next sync of the same bytes then short-circuited as "byte-identical, nothing to
+    do", and the statement stayed half-ingested for good. The live journal holds
+    three of these (runs 443, 471 and 506, each an `IntegrityError`), with their
+    position snapshots missing.
+
+    Real ingest of the fixture statement, with one failure injected after the
+    trades have landed. Only the IBKR fetch is replaced, by the archived file.
+    """
+    import shutil
+
+    from conftest import STATEMENTS
+
+    from optjournal import ingest, sync
+    from optjournal.db import connect
+    from optjournal.flex import FetchResult
+    from optjournal.jobs import run_job
+
+    raw = ctx.archive_dir
+    raw.mkdir(parents=True)
+    statement = raw / STATEMENTS[0].name
+    shutil.copy(STATEMENTS[0], statement)
+    monkeypatch.setattr(sync, "fetch", lambda *_a, **_k: FetchResult(
+        response=None, raw_path=statement, raw_bytes=statement.stat().st_size))
+
+    real_cash = ingest._ingest_cash
+    failures = {"left": 1}
+
+    def flaky_cash(*args, **kwargs):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise sqlite3.IntegrityError(
+                "UNIQUE constraint failed: trades.broker, trades.ib_exec_id")
+        return real_cash(*args, **kwargs)
+
+    monkeypatch.setattr(ingest, "_ingest_cash", flaky_cash)
+
+    def counts() -> dict[str, int]:
+        other = connect(ctx.db_path)
+        try:
+            return {table: other.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in ("statements", "trades")}
+        finally:
+            other.close()
+
+    conn = connect_migrated(ctx.db_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        run_job(conn, "sync", ctx=ctx)
+    assert counts() == {"statements": 0, "trades": 0}, (
+        "the failed run's bookkeeping committed a half-written ingest, so every "
+        "retry will skip this statement as already ingested"
+    )
+    row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
+    assert row["status"] == "failed" and "IntegrityError" in row["detail"]
+
+    # The retry, with the fault gone, ingests the whole statement.
+    run_job(conn, "sync", ctx=ctx)
+    after = counts()
+    assert after["statements"] == 1 and after["trades"] > 0
+    conn.close()
+
+
 def test_an_interrupted_run_is_resolved_by_the_kernel_not_by_a_timeout(conn, ctx):
     """(b) A `running` row whose file lock is free had its process killed.
 
