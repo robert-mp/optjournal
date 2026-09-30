@@ -152,22 +152,91 @@ def test_shim_exposes_unmodelled_sections(statement: Path):
 # cron can wait for.
 
 
-def test_poll_worst_case_matches_backoff_arithmetic():
-    """Recomputed independently of the module's own expression."""
-    per_stage = sum(
-        min(flex.RETRY_INTERVAL * (2**i), flex.MAX_RETRY_INTERVAL)
-        for i in range(flex.MAX_RETRIES)
-    )
-    assert 2 * per_stage == flex.POLL_WORST_CASE_S, (
-        "worst case must cover both py_ibkr poll stages (SendRequest and "
-        "GetStatement), each of which gets the full retry budget"
-    )
+def test_poll_worst_case_matches_what_py_ibkr_actually_sleeps(monkeypatch):
+    """MEASURED against py_ibkr's own loop, not recomputed from a formula.
+
+    The formula this replaced summed MAX_RETRIES sleeps per stage. py_ibkr
+    sleeps BETWEEN attempts, so MAX_RETRIES - 1 times, and the last attempt
+    raises: the constant was one sleep per stage too long (660 against 420),
+    while leaving the requests themselves out entirely (M12).
+
+    The worst case is driven here: SendRequest reports "in progress" until its
+    last attempt, then GetStatement reports "not ready" on every attempt.
+    """
+    from py_ibkr.flex import client as client_module
+    from py_ibkr.flex.client import FlexInProgressError, FlexNotReadyError
+
+    slept: list[float] = []
+    monkeypatch.setattr(client_module.time, "sleep", slept.append)
+    sends: list[int] = []
+
+    def send_request(self, *args, **kwargs):
+        sends.append(1)
+        if len(sends) < flex.MAX_RETRIES:
+            raise FlexInProgressError("in progress")
+        return "REF"
+
+    def get_statement(self, *args, **kwargs):
+        raise FlexNotReadyError("not ready")
+
+    monkeypatch.setattr(client_module.FlexClient, "send_request", send_request)
+    monkeypatch.setattr(client_module.FlexClient, "get_statement", get_statement)
+    with pytest.raises(FlexNotReadyError):
+        client_module.FlexClient().download(
+            "tok", "1", max_retries=flex.MAX_RETRIES,
+            retry_interval=flex.RETRY_INTERVAL,
+            max_retry_interval=flex.MAX_RETRY_INTERVAL)
+    assert sum(slept) == flex.POLL_WORST_CASE_S
 
 
 def test_poll_worst_case_is_hand_computable():
-    """MAX_RETRIES=4 -> [30, 60, 120, 120] = 330s/stage -> 660s."""
+    """MAX_RETRIES=4 -> [30, 60, 120] = 210s/stage -> 420s."""
     assert flex.MAX_RETRIES == 4
-    assert flex.POLL_WORST_CASE_S == 660
+    assert flex.POLL_WORST_CASE_S == 420
+
+
+def test_the_fetch_worst_case_counts_every_request_and_the_keyring():
+    """The whole wall clock a fetch can hold the lock for: 30 + 420 + 480."""
+    assert flex.FETCH_WORST_CASE_S == (
+        flex.KEYRING_READ_TIMEOUT_S + flex.POLL_WORST_CASE_S
+        + 2 * flex.MAX_RETRIES * flex.FETCH_SOCKET_TIMEOUT_S)
+    assert flex.FETCH_LOCK_TIMEOUT_S > flex.FETCH_WORST_CASE_S, (
+        "a fetch waiting behind a slow one would give up while it still works"
+    )
+
+
+def _hold_the_fetch_lock(archive: Path, seconds: float) -> threading.Thread:
+    from optjournal.locks import locked
+
+    held = threading.Event()
+
+    def hold() -> None:
+        with locked(archive / flex.FETCH_LOCK):
+            held.set()
+            threading.Event().wait(seconds)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    held.wait(5)
+    return holder
+
+
+def test_a_fetch_waits_for_the_fetch_lock_as_long_as_the_fetch_lock_timeout(
+    tmp_path, monkeypatch,
+):
+    """M12: the wait was the lock module's 120s default, not the fetch's own.
+
+    Scaled down: the timeout is patched to a fraction of a second and the other
+    holder keeps the lock for longer, so a fetch that used any other timeout
+    would not raise here.
+    """
+    from optjournal.locks import LockTimeout
+
+    monkeypatch.setattr(flex, "FETCH_LOCK_TIMEOUT_S", 0.2)
+    holder = _hold_the_fetch_lock(tmp_path, 1.0)
+    with pytest.raises(LockTimeout):
+        flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True)
+    holder.join()
 
 
 def test_retry_budget_stays_within_a_daily_cron_window():
@@ -419,9 +488,9 @@ def test_the_real_client_is_the_one_with_the_timeout():
 def test_the_socket_timeout_sits_below_the_polling_ceiling():
     """Two different budgets, and confusing them is the mistake to avoid.
 
-    `POLL_WORST_CASE_S` (660s) is the wall clock for the whole two-stage fetch
-    INCLUDING the retry ladder that waits for IBKR to generate a statement. The
-    socket timeout bounds ONE request inside that. A socket timeout above the
+    `POLL_WORST_CASE_S` (420s) is the sleeping in the two-stage retry ladder
+    that waits for IBKR to generate a statement. The socket timeout bounds ONE
+    request inside the fetch. A socket timeout above the
     ceiling could never fire; one at a few seconds would kill a legitimately slow
     download.
     """

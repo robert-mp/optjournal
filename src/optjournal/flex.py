@@ -44,6 +44,8 @@ from optjournal.locks import locked
 
 __all__ = [
     "FETCH_COOLDOWN_S",
+    "FETCH_LOCK_TIMEOUT_S",
+    "FETCH_WORST_CASE_S",
     "POLL_WORST_CASE_S",
     "ACTIVITY_QUERY_TYPE",
     "FetchCooldown",
@@ -128,10 +130,15 @@ class FetchCooldown(RuntimeError):
 #: py_ibkr backs off as ``min(RETRY_INTERVAL * 2**i, MAX_RETRY_INTERVAL)`` and
 #: applies the budget to *each* of its two stages independently (SendRequest,
 #: which retries while another statement is generating, and GetStatement,
-#: which retries while the statement is not ready). So the worst case is
-#: twice the per-stage sum:
+#: which retries while the statement is not ready). It makes MAX_RETRIES
+#: attempts per stage and sleeps BETWEEN them, so MAX_RETRIES - 1 times; the
+#: last attempt raises. So the sleeping is twice the per-stage sum:
 #:
-#:     MAX_RETRIES=4  ->  [30, 60, 120, 120] = 330s/stage  ->  660s (11 min)
+#:     MAX_RETRIES=4  ->  [30, 60, 120] = 210s/stage  ->  420s (7 min)
+#:
+#: This read [30, 60, 120, 120] = 660s until the QA pass of 2026-09-30, one
+#: sleep too many, while leaving out the requests themselves. `FETCH_WORST_CASE_S`
+#: is the whole wall clock.
 #:
 #: Four is chosen so that ceiling fits inside a daily cron's timeout. It was
 #: 10, which is 1,050s per stage and 35 minutes end to end -- far longer than
@@ -141,23 +148,23 @@ class FetchCooldown(RuntimeError):
 #: Activity statement is regenerated once a day, so a statement that is not
 #: ready in five minutes will still be there at the next scheduled run.
 #:
-#: Keep any caller-side timeout above 660s, and the cron timeout above that,
-#: so the caller's own handler runs before anything kills the process.
+#: Keep any caller-side timeout above `FETCH_WORST_CASE_S`, and the cron timeout
+#: above that, so the caller's own handler runs before anything kills the process.
 MAX_RETRIES = 4
 RETRY_INTERVAL = 30
 MAX_RETRY_INTERVAL = 120
 
-#: Worst-case wall time of `fetch`'s polling, derived from the constants
-#: above. Exported so callers can size their timeouts from the real number
-#: rather than guessing -- guessing is what produced the 240s-vs-2100s
-#: mismatch this replaces.
+#: Worst-case time `fetch` spends SLEEPING between polls, derived from the
+#: constants above and measured against py_ibkr's own loop in a test. Exported so
+#: callers can size their timeouts from the real number rather than guessing --
+#: guessing is what produced the 240s-vs-2100s mismatch this replaces.
 POLL_WORST_CASE_S = 2 * sum(
-    min(RETRY_INTERVAL * (2**i), MAX_RETRY_INTERVAL) for i in range(MAX_RETRIES)
+    min(RETRY_INTERVAL * (2**i), MAX_RETRY_INTERVAL) for i in range(MAX_RETRIES - 1)
 )
 
 
 #: Per-HTTP-REQUEST socket timeout for the Flex calls. Not a budget for the whole
-#: fetch: `download` polls, so the wall-clock ceiling is `POLL_WORST_CASE_S` and
+#: fetch: `download` polls, so the wall-clock ceiling is `FETCH_WORST_CASE_S` and
 #: this bounds each individual request inside it.
 #:
 #: IT EXISTS BECAUSE NOTHING ELSE BOUNDS A HUNG SOCKET. `py_ibkr` calls
@@ -173,6 +180,31 @@ POLL_WORST_CASE_S = 2 * sum(
 #: and `download`'s own retry ladder handles a slow GENERATION. A request that has
 #: produced nothing in a minute is a stall, not slowness.
 FETCH_SOCKET_TIMEOUT_S = 60
+
+#: How long `read_token` waits for the OS keyring before giving up.
+#:
+#: A normal read measured 8.2s on this machine, so this is well above that. The
+#: bound exists for the read that NEVER returns: a keychain waiting for an unlock
+#: prompt on a machine nobody is at. On the scheduler thread that stalled every
+#: job while the fetch lock was held, with nothing in the ledger to say why.
+KEYRING_READ_TIMEOUT_S = 30.0
+
+#: Worst-case wall time of one fetch, from taking the lock to stamping the
+#: cooldown: the keyring read, the polling sleeps, and every request of both
+#: stages running to its socket timeout. 30 + 420 + 480 = 930s.
+FETCH_WORST_CASE_S = int(
+    KEYRING_READ_TIMEOUT_S + POLL_WORST_CASE_S
+    + 2 * MAX_RETRIES * FETCH_SOCKET_TIMEOUT_S
+)
+
+#: How long a fetch waits for another fetch to release `FETCH_LOCK`.
+#:
+#: LONGER THAN THE FETCH IT WAITS FOR, with a minute to spare. It was the lock
+#: module's 120s default, counted in sleep ticks, against a fetch that can run
+#: for over fifteen minutes: a confirm poll behind a slow statement generation
+#: raised `LockTimeout` and was recorded as a failure while the other fetch was
+#: working normally.
+FETCH_LOCK_TIMEOUT_S = FETCH_WORST_CASE_S + 60
 
 
 class _TimeoutFlexClient(FlexClient):
@@ -312,15 +344,6 @@ class FetchResult:
     @property
     def is_duplicate(self) -> bool:
         return self.duplicate_of is not None
-
-
-#: How long `read_token` waits for the OS keyring before giving up.
-#:
-#: A normal read measured 8.2s on this machine, so this is well above that. The
-#: bound exists for the read that NEVER returns: a keychain waiting for an unlock
-#: prompt on a machine nobody is at. On the scheduler thread that stalled every
-#: job while the fetch lock was held, with nothing in the ledger to say why.
-KEYRING_READ_TIMEOUT_S = 30.0
 
 
 def _within(timeout_s: float, work: Callable[[], str | None]) -> tuple[bool, object]:
@@ -696,7 +719,7 @@ def fetch_confirms(
     parameter: confirms change through the session, where an Activity Statement is
     regenerated once a day. See `jobs.CONFIRM_COOLDOWN_S`.
     """
-    with locked(archive_dir / FETCH_LOCK):
+    with locked(archive_dir / FETCH_LOCK, timeout_s=FETCH_LOCK_TIMEOUT_S):
         if not force:
             _check_cooldown(archive_dir, query_id, cooldown_s)
         token = read_token(account)
@@ -869,7 +892,7 @@ def fetch(
     judgement about whether new data can exist; it does not make two simultaneous
     downloads writing one archive directory a good idea.
     """
-    with locked(archive_dir / FETCH_LOCK):
+    with locked(archive_dir / FETCH_LOCK, timeout_s=FETCH_LOCK_TIMEOUT_S):
         return _fetch_locked(
             query_id, archive_dir=archive_dir, from_date=from_date,
             to_date=to_date, account=account, force=force, cooldown_s=cooldown_s,
