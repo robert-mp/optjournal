@@ -89,8 +89,9 @@ It refuses rather than merges: fast-forward only, and uncommitted changes to
 tracked files stop it before it touches the network. Untracked files (such as the
 `.DS_Store` Finder leaves) do not, since git itself refuses a pull that would
 overwrite one. It never runs `git stash`. It installs exactly the `uv.lock` it
-pulled (`uv sync --frozen`), then migrates the journal with the new code, so a
-migration that fails is reported by `update` rather than later by `serve`.
+pulled (`uv sync --locked`, which also refuses a lock that does not match its
+`pyproject.toml`), then migrates the journal with the new code, so a migration
+that fails is reported by `update` rather than later by `serve`.
 
 It does not restart a running `serve`. The server re-reads the page on every
 request but loads its Python once at startup, so a code update needs a restart,

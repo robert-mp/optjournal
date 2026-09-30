@@ -441,9 +441,10 @@ def test_update_migrates_with_the_new_code_in_a_fresh_process(
     """M16: the migration is the PULLED code's, so it runs in a new process.
 
     This process imported the old `db.py` before the pull, and migrating here
-    reported the old schema version and skipped every new migration. And every
-    uv call is `--frozen` (M17): an update must install the lock it pulled, not
-    write a new one that then blocks the next update as a dirty tree.
+    reported the old schema version and skipped every new migration. And no uv
+    call may rewrite the lock (M17): the sync is `--locked`, which refuses a
+    stale lock by name, and the migration `--frozen`, so an update never writes a
+    new lock that then blocks the next update as a dirty tree.
     """
     pub, friend = clones
     _publish(pub, "v2")
@@ -456,7 +457,7 @@ def test_update_migrates_with_the_new_code_in_a_fresh_process(
     calls = _uv_calls(fake_uv)
     assert [c[1] for c in calls] == ["sync", "run"], "sync first, then migrate"
     assert all(c[0] == str(friend) for c in calls), "uv ran outside the code folder"
-    assert all("--frozen" in c for c in calls), calls
+    assert "--locked" in calls[0] and "--frozen" in calls[1], calls
     assert f"Schema at version {SCHEMA_VERSION}." in text
     assert "Updated to" in text
     conn = connect(db)

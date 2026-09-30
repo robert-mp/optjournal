@@ -1020,9 +1020,12 @@ def cmd_update(args) -> int:
     `.DS_Store` into every folder it opens), and git itself refuses a pull that
     would overwrite one.
 
-    Both uv calls are `--frozen`: the pulled `uv.lock` is what gets installed,
-    and nothing here rewrites it. A rewritten lock is a modified tracked file,
-    which would then block every later update.
+    Neither uv call rewrites `uv.lock`: a rewritten lock is a modified tracked
+    file, which would then block every later update. The sync is `--locked`, so
+    a release whose lock does not match its pyproject (a publishing mistake) is
+    refused by name before anything is migrated, rather than installing the old
+    lock and failing later on a missing module. The migration then runs
+    `--frozen` against the lock the sync has just checked.
 
     The migration runs in a NEW process, after the pull and `uv sync`, so it is
     the new code's (see `_MIGRATE`). A failing one is reported here, rather than
@@ -1105,10 +1108,12 @@ def cmd_update(args) -> int:
     import subprocess
 
     print("\nResolving dependencies...")
-    synced = subprocess.run([uv, "sync", "--frozen", "--quiet"], cwd=ROOT, check=False)
+    synced = subprocess.run([uv, "sync", "--locked", "--quiet"], cwd=ROOT, check=False)
     if synced.returncode != 0:
-        print("`uv sync` failed. The code is updated but its dependencies are "
-              "not, so run `uv sync --frozen` by hand before using the journal.",
+        print("`uv sync` failed, so the journal was not migrated. The code is "
+              "updated but its dependencies are not. If uv says the lockfile needs "
+              "to be updated, the release was published with a stale uv.lock: wait "
+              "for a fixed release and run `optjournal update` again.",
               file=sys.stderr)
         return EXIT_ERROR
 
