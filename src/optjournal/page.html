@@ -3816,8 +3816,12 @@ function bindJournal(){
       }
       if(!jnres.ok){
         b.disabled=false; b.classList.remove('busy');
-        note(esc(jnres.message||'the journal write was refused')
-          +' Nothing was saved, and your text is still on screen.','bad');
+        /* The server's reason, then what did NOT happen, said once: the size
+           refusal already says nothing was saved, and the banner said it twice. */
+        const why=jnres.message||'the journal write was refused';
+        note(esc(why)+(why.toLowerCase().includes('nothing was saved')
+          ?' Your text is still on screen.'
+          :' Nothing was saved, and your text is still on screen.'),'bad');
         return;
       }
       /* Closed on success, because the reader has finished the act. Reopening is

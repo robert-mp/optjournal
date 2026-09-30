@@ -976,6 +976,9 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
         problems.append(
             f"the VIX was last fetched "
             f"{vix_at.astimezone(MARKET_TZ).strftime('%a %d %b %H:%M ET') if vix_at else 'never'}")
+    # A sentence of its own: the page prints it after "Not current, so not
+    # shown.", where a lower-case "the S&P close" read as a typo.
+    reason = "; ".join(problems)
 
     return {
         "spx_prev_close": spx_close,
@@ -986,7 +989,7 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
         "vix_fetched_at": vix_at.isoformat() if vix_at else None,
         "live": live,
         "fresh": not problems,
-        "stale_reason": "; ".join(problems) or None,
+        "stale_reason": reason[:1].upper() + reason[1:] if reason else None,
         "events_today": events,
         "today": session.isoformat(),
     }

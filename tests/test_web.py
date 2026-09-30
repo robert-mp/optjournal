@@ -6530,6 +6530,37 @@ def test_an_over_long_entry_is_refused_rather_than_read_as_empty(populated):
     )
 
 
+def test_a_refused_journal_entry_says_nothing_was_saved_once(populated):
+    """L46: the page appended "Nothing was saved, and your text is still on
+    screen." to the server's reason, and the size refusal's reason already said
+    "Nothing was saved and nothing was changed -- …", so the banner said it twice
+    and carried a double hyphen. The real server's 413 reply is pressed through
+    the page's own `bindJournal` here, and so is a refusal that does not say it.
+    """
+    anchor, _account = _an_anchor(populated)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _, too_long = _post(base, "/api/journal", {
+            "anchor": anchor, "lessons": "x" * (web.JOURNAL_BODY_LIMIT + 1)})
+    other = {"ok": False, "kind": "anchor", "message": "no decision named"}
+    for reply in (too_long, other):
+        said = _node_run([
+            f"import {{esc}} from '{_static('format.js')}';",
+            "const notes=[]; function note(text){notes.push(text);}",
+            "const b={dataset:{jsave:'1'},disabled:false,",
+            "  classList:{add(){},remove(){}}};",
+            "const document={querySelectorAll:sel=>sel==='[data-jsave]'?[b]:[]};",
+            "const $=()=>({value:''}); const S={};",
+            f"const fetch=async()=>({{json:async()=>({json.dumps(reply)})}});",
+            _page_const("JFIELDS"),
+            *_page_fns("bindJournal"),
+            "bindJournal(); await b.onclick();",
+            "console.log(JSON.stringify(notes));",
+        ])
+        assert len(said) == 1, said
+        assert said[0].lower().count("nothing was saved") == 1, said[0]
+        assert "--" not in said[0] and "still on screen" in said[0], said[0]
+
+
 def test_the_lifecycle_cards_carry_the_anchor_the_journal_is_keyed_on(populated):
     """Without it the page has a journal it cannot attach to anything.
 

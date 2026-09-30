@@ -1545,7 +1545,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "ok": False, "kind": "too-long",
                 "message": f"that entry is {length:,} bytes, over the "
                            f"{JOURNAL_BODY_LIMIT:,} this endpoint accepts. Nothing "
-                           f"was saved and nothing was changed -- shorten it and "
+                           f"was saved and nothing was changed: shorten it and "
                            f"save again, or the text would have been lost.",
             }
         body = self._body(limit=JOURNAL_BODY_LIMIT)

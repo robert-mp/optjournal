@@ -738,6 +738,9 @@ def test_a_close_fetched_before_the_last_settle_is_stale(conn):
     ctx = odte_context_data(conn, now=datetime(2026, 9, 28, 10, 0, tzinfo=_ET))
     assert ctx is not None and ctx["fresh"] is False
     assert "S&P" in ctx["stale_reason"] and "Fri 25 Sep" in ctx["stale_reason"]
+    # L46: the page prints this after "Not current, so not shown.", so it is a
+    # sentence: "the S&P close…" there read as a typo.
+    assert ctx["stale_reason"].startswith("The S&P close was last fetched")
 
 
 def test_a_close_fetched_after_the_settle_with_a_recent_vix_is_fresh(conn):
@@ -762,7 +765,7 @@ def test_a_live_vix_older_than_ten_minutes_in_session_is_stale(conn):
     _fetched(conn, "^GSPC", now - timedelta(minutes=1))
     _fetched(conn, "^VIX", now - timedelta(minutes=11))
     ctx = odte_context_data(conn, now=now)
-    assert ctx["fresh"] is False and "VIX" in ctx["stale_reason"]
+    assert ctx["fresh"] is False and ctx["stale_reason"].startswith("The VIX was")
 
 
 def test_after_the_settle_todays_close_is_the_prior_close(conn):
