@@ -35,7 +35,10 @@ times a session -- roughly 1,800 times a year:
                          session*: a 13:00 poll returns every completed bar
                          since the open, so one lost poll costs nothing as long
                          as a later one lands. Reporting a transient network
-                         blip seven times a day would be noise.
+                         blip seven times a day would be noise. Only an exit 1
+                         whose JSON names the failed windows is this case: a
+                         database error or a crash exits 1 too, printing no
+                         payload, and is raised.
 * CLI missing         -> raise. The job is registered but its code is gone;
                          that needs a human, not a retry.
 * Anything else       -> raise. MeshClaw's failure dedup suppresses repeats.
@@ -111,6 +114,9 @@ CLI = PROJECT / ".venv" / "bin" / "optjournal"
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NO_DATA = 3
+#: A lock other than the fetch lock timed out, so something is wedged. Raised
+#: by the "anything else" branch, like every code not named above.
+EXIT_LOCKED = 5
 
 #: Generous for four keyless HTTP requests, but the CLI's own per-request
 #: timeout is 25s and a full daily run asks for around fifteen windows, so the
@@ -128,6 +134,20 @@ def _run(*flags: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _payload(proc: subprocess.CompletedProcess[str]) -> dict:
+    """The JSON object the CLI printed, or {} when it printed none.
+
+    Exit 1 means two things: the run's own report (failed windows, missing
+    bars), and every error the CLI maps to EXIT_ERROR or dies of, which print
+    nothing on stdout. Only the first carries this payload.
+    """
+    try:
+        data = json.loads(proc.stdout or "")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _collect(*flags: str) -> None:
     """Run `optjournal bars`, staying silent unless a human is needed."""
     if not CLI.exists():
@@ -142,7 +162,7 @@ def _collect(*flags: str) -> None:
 
     if proc.returncode == EXIT_NO_DATA:
         return  # nothing to fetch; the normal state outside the session
-    if proc.returncode == EXIT_ERROR:
+    if proc.returncode == EXIT_ERROR and _payload(proc).get("failures"):
         # Per-window fetch failures. The intraday series is cumulative within a
         # session, so the next poll re-collects whatever this one missed.
         raise Skip()
@@ -188,14 +208,14 @@ def audit(ctx) -> None:
     proc = _run("--audit")
     if proc.returncode in (EXIT_OK, EXIT_NO_DATA):
         return  # covered, or nothing to check: both silent by design
-    if proc.returncode != EXIT_ERROR:
+    result = _payload(proc) if proc.returncode == EXIT_ERROR else {}
+    missing = result.get("missing") or []
+    if not missing:
+        # Not the audit's own report: an error, with its cause in stderr.
         raise RuntimeError(
             f"optjournal bars --audit exited {proc.returncode}: "
             f"{(proc.stderr or proc.stdout or '').strip()[:500]}"
         )
-
-    result = json.loads(proc.stdout)
-    missing = result.get("missing") or []
     eligible = len(missing) + len(result.get("covered") or [])
     raise Report(
         f"optjournal: no hourly option bars for {len(missing)} of {eligible} "

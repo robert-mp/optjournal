@@ -245,7 +245,9 @@ It runs *after* `optjournal-bars-daily`, not before, precisely because that orac
 depends on the daily run having topped the underlying up. Run first, it would read
 a stale series, conclude the market was shut, and pass a genuinely lost session.
 Exit codes are the whole interface: `0` covered, `1` bars missing (report), `3`
-nothing to check.
+nothing to check. A `1` whose JSON names no missing contract is an error, and so
+is any other code (`5` is a lock held elsewhere): both are raised with the CLI's
+own message.
 
 `marketdata.parse_chart` drops bars off the series' own grid. The source appends
 a synthetic bar for the moment you asked, stamped at that moment: a 13:17 request

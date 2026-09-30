@@ -948,7 +948,9 @@ def test_a_migration_lock_timeout_is_an_error_not_busy(tmp_path, capsys, monkeyp
     """Only the FETCH lock's timeout means "another fetch is running, try later".
     Every `LockTimeout` read that way, so a migration wedged behind another
     process exited EXIT_THROTTLED with "Busy: another fetch is still running",
-    which the cron turns into a silent Skip."""
+    which the cron turns into a silent Skip. Not EXIT_ERROR either: the bars cron
+    reads 1 as a per-window fetch failure and skips it. Its own code, which
+    every cron raises."""
     from optjournal import db as dbmod
 
     journal = tmp_path / "j.db"             # new, so the migration takes its lock
@@ -956,7 +958,7 @@ def test_a_migration_lock_timeout_is_an_error_not_busy(tmp_path, capsys, monkeyp
         code = main(["sync", "1591754", "--db", str(journal),
                      "--archive", str(tmp_path / "raw")])
     err = capsys.readouterr().err
-    assert code == cli.EXIT_ERROR, err
+    assert code == cli.EXIT_LOCKED, err
     assert "Busy" not in err and "another fetch" not in err, err
     assert "migrate.lock" in err and "Traceback" not in err, err
 
@@ -971,5 +973,5 @@ def test_a_settings_lock_timeout_is_an_error_not_busy(tmp_path, capsys, monkeypa
     with _held_elsewhere(monkeypatch, settings, settings.lock_path(home)):
         code = _setup(monkeypatch, home)
     err = capsys.readouterr().err
-    assert code == cli.EXIT_ERROR, err
+    assert code == cli.EXIT_LOCKED, err
     assert "Busy" not in err and settings.LOCK_FILENAME in err, err
