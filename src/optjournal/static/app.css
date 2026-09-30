@@ -1098,11 +1098,23 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .day.clk:hover{border-color:var(--dayhover)}
 .day.selected{outline:2px solid var(--accentlit1);outline-offset:-2px}
 /* Market strip. Reuses .cal/.day so the two calendars look like one idea; the
-   difference is what a cell holds -- a P&L figure there, event titles here. */
+   difference is what a cell holds -- a P&L figure there, event titles here.
+   Seven EQUAL columns at every width, with a zero minimum. `.cal`'s `1fr` tracks
+   have an `auto` minimum, so each day refused to shrink below its longest title:
+   only the phone rule used to zero it, and from 761px, where the rail is back and
+   the card is narrow, the strip ran 207px past its card on the real journal and
+   drew its days 64 to 155px wide. A title is cut with an ellipsis instead; the
+   selected day's list below carries it in full. Scoped by class, so the Calendar
+   tab's grid is not touched. */
+.cal.mkweek{grid-template-columns:repeat(7,minmax(0,1fr))}
 .mktoday{border-color:var(--accentedge)}
 .mkdots{display:flex;flex-direction:column;gap:var(--s1);margin-top:var(--s2)}
 .mkdot{font-size:var(--t0);color:var(--dim);display:flex;align-items:center;gap:var(--s2);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  white-space:nowrap;overflow:hidden}
+/* The line's text, in a box of its own because `text-overflow` applies to a block
+   container and the row is a flex one: set on `.mkdot` it did nothing, and a
+   clipped title ended mid-word ("Fina") rather than with "…". */
+.mkt{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .mkdot.dim{color:var(--dim2)}
 /* Impact as a colour AND a word (the row shows the country pill and the title);
    colour alone would make High indistinguishable from Low to a reader who
@@ -2059,11 +2071,13 @@ stop.gneg{stop-color:var(--bad)}
    row. The `:has()` form is restated because the 1320px rule's is specificity
    (0,3,0) and a bare `.brand` would lose to it here, source order or not.
 
-   THE WEEK STRIP'S CELLS get a zero minimum and clip, because seven `1fr` tracks
-   each refused to shrink below their longest event title -- the Market page ran
-   to 467px. The selected day's list beneath the strip carries every title in
-   full, so clipping here loses nothing. The watchlist detail's three columns go
-   to one, as its tiles cannot fit three across a phone. */
+   THE CALENDAR GRIDS' CELLS get a zero minimum and clip. This was written for
+   the Market strip, whose seven `1fr` tracks each refused to shrink below their
+   longest event title (the Market page ran to 467px); the strip now carries that
+   minimum at every width (`.cal.mkweek`), because 761px needed it as much, and
+   what is left here holds the Calendar tab's grids to a phone. The watchlist
+   detail's three columns go to one, as its tiles cannot fit three across a
+   phone. */
 @media(max-width:760px){
   .shell{grid-template-columns:minmax(0,1fr)}
   .rail{flex-direction:row;overflow-x:auto;z-index:30;background:var(--bg);

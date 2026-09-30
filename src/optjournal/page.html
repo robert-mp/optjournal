@@ -4544,11 +4544,11 @@ function market(){
     const shown=mine.slice(0,3);
     const dots=shown.map(mev=>
       `<div class="mkdot"><span class="mkimp ${
-        mev.impact==='High'?'hi':mev.impact==='Medium'?'md':'lo'}"></span>${
-        esc(mev.title.length>22?mev.title.slice(0,21)+'…':mev.title)}</div>`).join('');
+        mev.impact==='High'?'hi':mev.impact==='Medium'?'md':'lo'}"></span><span class="mkt">${
+        esc(mev.title.length>22?mev.title.slice(0,21)+'…':mev.title)}</span></div>`).join('');
     const more=mine.length>shown.length?
-      `<div class="mkdot dim">+${mine.length-shown.length} more</div>`:'';
-    const quiet=mine.length?'':`<div class="mkdot dim">—</div>`;
+      `<div class="mkdot dim"><span class="mkt">+${mine.length-shown.length} more</span></div>`:'';
+    const quiet=mine.length?'':`<div class="mkdot dim"><span class="mkt">—</span></div>`;
     return `<div class="day${d.day===sel?' selected':''}${
       d.today?' mktoday':''}" data-marketday="${d.day}" role="button" tabindex="0">
       <div class="top"><span class="dim">${esc(d.label)}</span><b>${d.dom}</b></div>
@@ -4617,7 +4617,7 @@ function market(){
       <span class="pill">${esc(mk.from_day)} – ${esc(mk.to_day)}</span>
       <button id="mkfetch" class="btn sm">Refresh</button></div>
     ${filters}
-    <div class="cal">${cells}</div>
+    <div class="cal mkweek">${cells}</div>
     ${sel?`<div class="crow mksel"><h3>${esc(sel)}</h3>
       <span class="dim">${chosen.length} event(s)${
         hidden?` · ${hidden} hidden by the filter`:''}</span></div>${rows}`

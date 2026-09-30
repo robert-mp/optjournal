@@ -8455,6 +8455,43 @@ def test_a_calendar_day_prints_its_figure_whole_at_every_width():
     assert "compact(amountOf(dy.realized))" in cal and "aria-label=" in cal
 
 
+def test_the_market_week_strip_is_seven_equal_columns_at_every_width():
+    """The strip reuses `.cal`, whose tracks are `1fr` with an `auto` minimum, so
+    each day refused to shrink below its longest event title. Only the phone rule
+    (760px and under) gave the cells a zero minimum; from 761px the rail is back,
+    the card is narrow, and on the real journal the strip ran 207px past its card
+    and the page scrolled sideways up to 985px wide, with the seven days drawn at
+    64 to 155px each until 1285px. The zero minimum now belongs to the strip at
+    every width, so the week is seven equal columns and a long title is cut with an
+    ellipsis (its full text is in the selected day's list below). Measured from
+    320px to 2560px in 5px steps after the fix: the strip is inside its card at
+    every width.
+
+    The Calendar tab keeps its own `.cal` rules untouched: the strip is scoped by
+    its own class, so this cannot move a single day of the P&L grid.
+    """
+    wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "repeat(7,minmax(0,1fr))" in wide.get(".cal.mkweek", ""), (
+        "the week strip's tracks have an auto minimum again, so a long title widens "
+        "its day and the strip runs past its card")
+    assert wide.get(".cal", "") == "display:grid;grid-template-columns:repeat(7,1fr);gap:var(--s3)", (
+        "the Calendar tab's grid moved; the strip's fix must stay scoped to the strip")
+    assert '<div class="cal mkweek">' in _fn("market")
+    # The ellipsis the strip always declared, now on a box it can apply to:
+    # `text-overflow` does nothing on a flex container, so `.mkdot` cut a title
+    # mid-word ("Fina") instead of ending it with "…".
+    title = wide.get(".mkt", "")
+    for prop in ("min-width:0", "overflow:hidden", "text-overflow:ellipsis"):
+        assert prop in title, f".mkt lost {prop}, so a clipped title shows no ellipsis"
+    assert "white-space:nowrap" in wide.get(".mkdot", "")
+    assert "text-overflow" not in wide.get(".mkdot", ""), (
+        "text-overflow on the flex row is inert; it belongs on the title's own box")
+    cells = _fn("market")
+    assert cells.count('<span class="mkt">') == 3, (
+        "every line of a day (a title, the '+N more' count, the quiet dash) is its "
+        "own truncating box")
+
+
 def test_the_content_column_can_shrink_below_its_widest_child():
     """A `1fr` track has an `auto` minimum, so one wide table widened `.wrap`
     past the viewport and the whole page scrolled sideways. `minmax(0,1fr)` is
