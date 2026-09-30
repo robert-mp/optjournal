@@ -30,7 +30,7 @@ import threading
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -40,6 +40,7 @@ from py_ibkr import FlexClient, FlexError, FlexQueryResponse, FlexRateLimitError
 from py_ibkr.flex.client import FlexAuthError
 from py_ibkr.flex.parser import parse_xml_file
 
+from optjournal.clock import MARKET_TZ
 from optjournal.confirms import CONFIRM_QUERY_TYPE
 from optjournal.locks import locked
 
@@ -725,7 +726,12 @@ def fetch_confirms(
     A shorter `cooldown_s` than the statement's default is the point of the
     parameter: confirms change through the session, where an Activity Statement is
     regenerated once a day. See `jobs.CONFIRM_COOLDOWN_S`.
+
+    A period override must have both ends and end no later than today: a confirm
+    is same-session, so today is the day it is for.
     """
+    from_date, to_date = _check_period(
+        from_date, to_date, latest=_market_today(), weekdays_only=False)
     with locked(archive_dir / FETCH_LOCK, timeout_s=FETCH_LOCK_TIMEOUT_S):
         if not force:
             _check_cooldown(archive_dir, query_id, cooldown_s)
@@ -843,6 +849,54 @@ def _norm_date(value: str | None) -> str | None:
     return compact
 
 
+def _check_period(
+    from_date: str | None, to_date: str | None, *, latest: date,
+    weekdays_only: bool,
+) -> tuple[str | None, str | None]:
+    """The `fd`/`td` pair as YYYYMMDD, or ValueError for one IBKR would refuse.
+
+    Checked HERE, before the lock, the cooldown or the keyring, because a refused
+    request still counts against IBKR's lockout allowance. The rules are the ones
+    `sync.first_sync_window` already keeps: both ends or neither, the end no later
+    than `latest`, and (for an Activity Statement) no weekend dates. Refused
+    rather than snapped to a weekday, so what is asked for is what was typed.
+    """
+    fd, td = _norm_date(from_date), _norm_date(to_date)
+    if (fd is None) != (td is None):
+        raise ValueError(
+            "a period override needs both ends (--from and --to): IBKR refuses one "
+            "without the other, and the refusal costs a request"
+        )
+    if fd is None or td is None:
+        return None, None
+    try:
+        start = datetime.strptime(fd, "%Y%m%d").date()
+        end = datetime.strptime(td, "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError(f"not a calendar date: {exc}") from None
+    if start > end:
+        raise ValueError(f"--from {fd} is after --to {td}")
+    if end > latest:
+        raise ValueError(
+            f"--to {td} is later than {latest:%Y%m%d}, the last day IBKR can report "
+            f"for this query")
+    if weekdays_only:
+        for flag, day, step in (("--from", start, 1), ("--to", end, -1)):
+            if day.weekday() < 5:
+                continue
+            nearest = day
+            while nearest.weekday() >= 5:
+                nearest += timedelta(days=step)
+            raise ValueError(
+                f"{flag} {day:%Y%m%d} is a {day:%A}, and IBKR refuses weekend dates;"
+                f" use {nearest:%Y%m%d}")
+    return fd, td
+
+
+def _market_today() -> date:
+    return datetime.now(MARKET_TZ).date()
+
+
 def fetch(
     query_id: str,
     *,
@@ -898,7 +952,13 @@ def fetch(
     The lock covers `force=True` too. Forcing skips the COOLDOWN, which is a
     judgement about whether new data can exist; it does not make two simultaneous
     downloads writing one archive directory a good idea.
+
+    A period override IBKR would refuse (one end only, a weekend, an end of today
+    or later) raises ValueError before any of that, so it spends nothing.
     """
+    from_date, to_date = _check_period(
+        from_date, to_date, latest=_market_today() - timedelta(days=1),
+        weekdays_only=True)
     with locked(archive_dir / FETCH_LOCK, timeout_s=FETCH_LOCK_TIMEOUT_S):
         return _fetch_locked(
             query_id, archive_dir=archive_dir, from_date=from_date,

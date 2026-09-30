@@ -976,3 +976,92 @@ def test_a_reply_broken_off_mid_way_is_a_flex_error(broken_http, mode):
 
     with pytest.raises(FlexError):
         _TimeoutFlexClient(user_agent="test", timeout_s=5)._get(broken_http(mode))
+
+
+# --------------------------------------------------------------------------
+# A period override IBKR would refuse is refused here, for free (L7).
+# --------------------------------------------------------------------------
+
+def _no_request_allowed(monkeypatch) -> None:
+    def spent(account=None):
+        raise AssertionError("reached the keyring, so a request was about to be spent")
+
+    monkeypatch.setattr(flex, "read_token", spent)
+
+
+def _weekday_before(day, weekday: int):
+    from datetime import timedelta as _td
+
+    while day.weekday() != weekday:
+        day -= _td(days=1)
+    return day
+
+
+def _market_today():
+    from optjournal.clock import MARKET_TZ
+
+    return datetime.now(MARKET_TZ).date()
+
+
+@pytest.mark.parametrize(("from_date", "to_date"), [
+    ("20260105", None),
+    (None, "20260105"),
+], ids=["from-only", "to-only"])
+def test_one_end_of_a_period_is_refused_before_anything_is_spent(
+    tmp_path, monkeypatch, from_date, to_date,
+):
+    _no_request_allowed(monkeypatch)
+    with pytest.raises(ValueError, match="both"):
+        flex.fetch("1591754", archive_dir=tmp_path, from_date=from_date,
+                   to_date=to_date, force=True)
+
+
+def test_a_weekend_end_is_refused_naming_the_weekday_to_use(tmp_path, monkeypatch):
+    _no_request_allowed(monkeypatch)
+    saturday = _weekday_before(_market_today() - timedelta(days=7), 5)
+    friday = saturday - timedelta(days=1)
+    with pytest.raises(ValueError, match="Saturday") as caught:
+        flex.fetch("1591754", archive_dir=tmp_path,
+                   from_date=(friday - timedelta(days=4)).strftime("%Y%m%d"),
+                   to_date=saturday.strftime("%Y%m%d"), force=True)
+    assert friday.strftime("%Y%m%d") in str(caught.value)
+
+
+def test_a_statement_period_ending_today_or_later_is_refused(tmp_path, monkeypatch):
+    """An Activity Statement ends at the previous day; IBKR refuses a later `td`."""
+    _no_request_allowed(monkeypatch)
+    today = _market_today()
+    with pytest.raises(ValueError, match="later than"):
+        flex.fetch("1591754", archive_dir=tmp_path,
+                   from_date=(today - timedelta(days=30)).strftime("%Y%m%d"),
+                   to_date=today.strftime("%Y%m%d"), force=True)
+
+
+def test_an_inverted_period_is_refused(tmp_path, monkeypatch):
+    _no_request_allowed(monkeypatch)
+    with pytest.raises(ValueError, match="after"):
+        flex.fetch("1591754", archive_dir=tmp_path, from_date="20260109",
+                   to_date="20260105", force=True)
+
+
+def test_a_valid_period_and_a_same_day_confirm_still_go_through(tmp_path,
+                                                                 monkeypatch):
+    """The checks must not refuse what IBKR accepts: a weekday period ending
+    yesterday or earlier, and a confirm covering today (it is same-session)."""
+    friday = _weekday_before(_market_today() - timedelta(days=1), 4)
+    asked: list[dict] = []
+
+    def download(self, *args, **kwargs):
+        asked.append(kwargs)
+        return _TCF if kwargs.get("to_date") == today else STATEMENTS_FIRST.read_bytes()
+
+    today = _market_today().strftime("%Y%m%d")
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory",
+                        lambda **kw: type("C", (), {"download": download})())
+    flex.fetch("1591754", archive_dir=tmp_path, force=True,
+               from_date=(friday - timedelta(days=4)).strftime("%Y%m%d"),
+               to_date=friday.strftime("%Y-%m-%d"))
+    flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True,
+                        from_date=today, to_date=today)
+    assert [a["to_date"] for a in asked] == [friday.strftime("%Y%m%d"), today]
