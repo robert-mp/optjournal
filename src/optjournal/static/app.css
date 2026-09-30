@@ -1307,9 +1307,14 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    `.85` is the lowest that keeps --ok and --bad at 4.5:1 on every row surface of
    every theme (the open row's --seg1 is the binding one; a test recomputes it).
    So the strengthening reading is also set in the label weight, which is what
-   still tells the two apart. Only a signed figure is muted: the dash for a
-   missing one is already --dim, and dimming that again read 2.85:1. */
-.wtab td.wdaily.signed{opacity:.85}
+   still tells the two apart. Every READING is muted, and the dash for a missing one
+   is not: that is already --dim and dimming it again read 2.85:1. Said as "a cell
+   that does not hold the dash" rather than as `.signed`, which `cls()` withholds
+   from a figure that prints as zero -- deliberately, a sign it does not have -- so
+   a reading of 0.0 was the one number in the column at full strength, wearing the
+   emphasis this column keeps for a strengthening one. `.strong` follows, and the
+   order matters: the two selectors tie on specificity. */
+.wtab td.wdaily:not(:has(>.dim)){opacity:.85}
 .wtab td.wdaily.strong{opacity:1;font-weight:var(--w-label)}
 /* Except the one row that is not a row: the empty-filter message. It carries no
    `data-wsel`, so the pointer cursor above would promise a selection that clicking

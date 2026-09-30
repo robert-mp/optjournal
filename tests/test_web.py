@@ -4136,27 +4136,62 @@ def _hex_rgb(colour: str) -> tuple[int, int, int]:
     return (int(colour[1:3], 16), int(colour[3:5], 16), int(colour[5:7], 16))
 
 
+#: The rule that mutes a Daily reading. Keyed on the cell NOT holding the dash for
+#: a missing reading, which is the distinction the column is drawing; `.signed` used
+#: to stand in for it and let a reading of 0.0 through at full strength.
+_DAILY_MUTED = ".wtab td.wdaily:not(:has(>.dim))"
+
+
 def test_the_watchlists_muted_daily_figure_meets_aa_in_every_theme():
     """L43: the Daily column is muted with `opacity` unless the reading is
     strengthening, and at .62 a loss read 3.55 to 3.70:1 on its row, with the
     dash for a missing reading at 2.85:1. The opacity is read from the rule and
-    recomputed for both signs on every surface a row can sit on: the card, the
-    hover ground, and the open row's gradient stops.
+    recomputed for both signs -- and for the plain foreground a reading of zero
+    wears -- on every surface a row can sit on: the card, the hover ground, and the
+    open row's gradient stops.
     """
     rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
     assert "opacity" not in rules.get(".wtab td.wdaily", ""), (
         "the whole cell is dimmed, including the --dim dash for a missing reading")
-    muted = re.search(r"opacity:([0-9.]+)", rules.get(".wtab td.wdaily.signed", ""))
+    muted = re.search(r"opacity:([0-9.]+)", rules.get(_DAILY_MUTED, ""))
     assert muted, "the muted daily figure has no opacity rule to check"
     alpha = float(muted.group(1))
     for selector, palette in _themes().items():
-        for sign in ("ok", "bad"):
+        for sign in ("ok", "bad", "fg"):
             for surface in ("panel", "bg2", "seg1", "seg2"):
                 seen = _over(_hex_rgb(palette[sign]), alpha, palette[surface])
                 ratio = _ratio(seen, palette[surface])
                 assert ratio >= 4.5, (
                     f"{selector}: --{sign} at opacity {alpha} reads {ratio:.2f}:1 on "
                     f"--{surface}, below AA for the 13px Daily figure")
+
+
+def test_a_daily_reading_of_zero_is_muted_like_every_other_reading():
+    """L54: the muting keyed on `.signed`, which `cls()` withholds from a figure that
+    prints as zero -- deliberately, because the hue and the "+" are both claims about
+    a sign it does not have. So a reading of 0.0 was the one number in the column at
+    full strength, wearing the emphasis this column keeps for a strengthening one.
+
+    The rule now says what it always meant: a cell holding a reading rather than the
+    dash for a missing one. Measured in headless Chromium with a 0.0 reading injected
+    into the payload: the cell computed opacity 1 beside 0.85 on its neighbours, and
+    0.85 now, with the dash still at 1 and a strengthening reading still at 1.
+    """
+    rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "opacity" in rules.get(_DAILY_MUTED, ""), (
+        "the Daily column is no longer muted by whether the cell holds a reading")
+    assert not any("opacity" in body for sel, body in rules.items()
+                   if sel == ".wtab td.wdaily.signed"), (
+        "the muting is back on `.signed`, which a reading of 0.0 does not carry")
+    # The dash is the only thing left out, and it is a `.dim` span (page.html
+    # `wdash`), which is what the selector above names.
+    assert 'wdash=why=>`<span class="dim"' in _code_only(_js()), (
+        "the missing-reading dash is not a `.dim` child any more, so the rule above "
+        "either mutes it or mutes nothing")
+    # And the strengthening reading still wins, which here is source order.
+    css = re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)
+    assert css.index(_DAILY_MUTED) < css.index(".wtab td.wdaily.strong"), (
+        "the two selectors tie on specificity, so the muting rule must come first")
 
 
 def test_the_0dte_tile_labels_meet_aa_on_their_washes_in_every_theme():
