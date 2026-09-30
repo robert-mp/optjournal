@@ -503,7 +503,7 @@ def _nav_flat_where(asset_category: str) -> str:
     for good, since the day its options go flat has no position row at all and its
     NAV still prices the stock that journal does not track.
 
-    A category the NAV cannot price gets "" -- no NAV row may empty it.
+    A category the NAV cannot price gets "": no NAV row may empty it.
     """
     column = NAV_VALUE_BY_CATEGORY.get(asset_category.upper())
     return f"{column} = 0" if column else ""

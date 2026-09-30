@@ -175,7 +175,7 @@ def _campaign_of_order(
     position and begin the next, a fill through zero (IBKR's `C;O`) most plainly,
     so its order belongs to the decision it ended and the one it began. Keeping a
     single index let the last campaign win, and the order was then drawn in one
-    card only -- the other read its opening date and its proceeds from whatever
+    card only, and the other read its opening date and its proceeds from whatever
     event was left to it.
     """
     out: dict[str, list[int]] = {}
