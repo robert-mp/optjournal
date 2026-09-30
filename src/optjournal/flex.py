@@ -25,7 +25,9 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -51,6 +53,7 @@ __all__ = [
     "StatementUnreadable",
     "TokenMissing",
     "TokenRejected",
+    "TokenUnreadable",
     "TokenWriteRefused",
     "archive_digest",
     "cooldown_remaining",
@@ -261,6 +264,17 @@ class TokenRejected(RuntimeError):
     """
 
 
+class TokenUnreadable(TokenMissing):
+    """The OS keyring did not answer within `KEYRING_READ_TIMEOUT_S`.
+
+    A `TokenMissing`, because for this run there is no usable token and every
+    caller already reports that as a credentials failure with its message: the
+    job ledger, the Sync button and the CLI. Its own type because the remedy
+    differs: the token is probably stored, and the keychain is waiting for an
+    unlock nobody is there to give.
+    """
+
+
 class TokenWriteRefused(RuntimeError):
     """The OS credential store would not store the token.
 
@@ -300,18 +314,64 @@ class FetchResult:
         return self.duplicate_of is not None
 
 
+#: How long `read_token` waits for the OS keyring before giving up.
+#:
+#: A normal read measured 8.2s on this machine, so this is well above that. The
+#: bound exists for the read that NEVER returns: a keychain waiting for an unlock
+#: prompt on a machine nobody is at. On the scheduler thread that stalled every
+#: job while the fetch lock was held, with nothing in the ledger to say why.
+KEYRING_READ_TIMEOUT_S = 30.0
+
+
+def _within(timeout_s: float, work: Callable[[], str | None]) -> tuple[bool, object]:
+    """Run `work` on a daemon thread. (finished, result or the exception raised).
+
+    The pattern of `web._keyring_call`: a DAEMON thread, so a call still blocked
+    in the OS cannot keep the process alive, and a late answer lands in a list
+    nobody reads. Python cannot interrupt a thread blocked in a syscall, so a
+    deadline has to be a wait on another thread rather than a timeout on the call.
+    """
+    outcome: list[object] = []
+
+    def run() -> None:
+        try:
+            outcome.append(work())
+        except Exception as exc:  # noqa: BLE001 - handed back to the caller
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run, name="keyring-read", daemon=True)
+    worker.start()
+    worker.join(timeout_s)
+    return (True, outcome[0]) if outcome else (False, None)
+
+
 def read_token(account: str | None = None) -> str:
     """Return the Flex token from the OS keyring.
 
     `account` defaults to the current user, matching how the entry is
     created:  security add-generic-password -a "$USER" -s ibkr-flex-token -w
+
+    Bounded by `KEYRING_READ_TIMEOUT_S`; raises `TokenUnreadable` past it. An
+    error the keyring backend raises is raised as itself.
     """
     if account is None:
         import getpass
 
         account = getpass.getuser()
 
-    token = keyring.get_password(KEYRING_SERVICE, account)
+    who = account
+    finished, answer = _within(
+        KEYRING_READ_TIMEOUT_S, lambda: keyring.get_password(KEYRING_SERVICE, who))
+    if not finished:
+        raise TokenUnreadable(
+            f"the OS keyring did not answer within {KEYRING_READ_TIMEOUT_S:g}s, "
+            f"usually because it is waiting for you to unlock it. Nothing was sent "
+            f"to IBKR. Check for a system prompt, or run `optjournal setup` in a "
+            f"terminal, then try again."
+        )
+    if isinstance(answer, Exception):
+        raise answer
+    token = answer if isinstance(answer, str) else None
     if not token:
         raise TokenMissing(
             f"No keyring entry {KEYRING_SERVICE!r} for account {account!r}. "

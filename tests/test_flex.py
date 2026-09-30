@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -825,3 +826,67 @@ def test_py_ibkr_still_has_the_error_table_the_code_shim_rewrites():
     assert {"1009", "1012"} <= set(table)
     for code, (_cls, template) in table.items():
         assert template.startswith(f"Flex API Error {code}: "), template
+
+
+# --------------------------------------------------------------------------
+# A keychain that never answers is a failure with a cause, not a hang (L11).
+# --------------------------------------------------------------------------
+
+def _keychain_waiting_for_an_unlock(monkeypatch) -> threading.Event:
+    """`get_password` blocks until released, like a keychain prompt nobody sees."""
+    release = threading.Event()
+
+    def blocked(service, account):
+        release.wait(30)
+        return "tok"
+
+    monkeypatch.setattr(flex.keyring, "get_password", blocked)
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.2)
+    return release
+
+
+def test_a_keychain_that_does_not_answer_raises_within_the_deadline(monkeypatch):
+    """L11: the read had no deadline, so a prompt stalled the scheduler thread,
+    and with it every job, while the fetch lock was held."""
+    import time
+
+    release = _keychain_waiting_for_an_unlock(monkeypatch)
+    started = time.monotonic()
+    try:
+        with pytest.raises(flex.TokenUnreadable, match="did not answer") as caught:
+            flex.read_token("someone")
+    finally:
+        release.set()
+    assert time.monotonic() - started < 5
+    assert isinstance(caught.value, flex.TokenMissing), (
+        "every caller that reports a missing token must report this one too"
+    )
+
+
+def test_a_keychain_that_does_not_answer_fails_the_sync_job_with_the_cause(
+    tmp_path, monkeypatch,
+):
+    """Recorded by the job as a failure that says what to do, not a silent stall."""
+    from conftest import connect_migrated
+
+    from optjournal import jobs
+
+    release = _keychain_waiting_for_an_unlock(monkeypatch)
+    ctx = jobs.Context(archive_dir=tmp_path, db_path=tmp_path / "j.db",
+                       query_id="1591754")
+    try:
+        outcome = jobs._sync(connect_migrated(tmp_path / "j.db"), ctx)
+    finally:
+        release.set()
+    assert outcome.status == "failed"
+    assert "keyring did not answer" in outcome.detail
+
+
+def test_a_keychain_error_is_still_raised_as_itself(monkeypatch):
+    """The deadline must not swallow what the backend actually said."""
+    def broken(service, account):
+        raise RuntimeError("(-25320, 'Unknown Error')")
+
+    monkeypatch.setattr(flex.keyring, "get_password", broken)
+    with pytest.raises(RuntimeError, match="-25320"):
+        flex.read_token("someone")
