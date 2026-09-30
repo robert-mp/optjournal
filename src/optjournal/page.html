@@ -7262,9 +7262,11 @@ function stateQuery(){
  * each payload lands rather than at the top of load(), because by then S already
  * holds the scope being asked for.
  *
- * The keys are the ones stateQuery() sends. Not `calday`: that is a selection WITHIN
- * a payload rather than part of the request, and draw() already drops a day the
- * payload holds no fills for. */
+ * The keys are the ones stateQuery() sends. Not `calday`, although with no month
+ * key it does name the month asked for: load() pins that month into `month` once
+ * its figures land, so the month is recorded here and the day stays what it is, a
+ * selection within the payload that draw() drops when the payload holds no fills
+ * for it. */
 const SCOPE_KEYS=['month','type','cost','scoring'];
 let LOADED={};
 
@@ -7288,6 +7290,17 @@ async function load(){
   }
   S.state=st;
   staleServerCheck(S.state);
+  /* A linked day with no month key names its own month (stateQuery), and these
+     figures are for it, so it is pinned as the month here. It lived nowhere else:
+     the day heals away when it holds no fills, and a failed read rolls back to
+     LOADED, and either one left the figures of the day's month under a URL that
+     means the current month, which a reload then opened. The current month keeps
+     its default spelling, null, as the stepper leaves it. Before the heal below,
+     so a day in a month the account never had still heals to all time. */
+  if(!S.month&&S.calday){
+    const dm=S.calday.slice(0,7);
+    if(dm!==(S.state.month_range||[])[0]) S.month=dm;
+  }
   /* A month outside the account's lifetime heals to ALL TIME, because that is
      what the server answered it with (selected_month null, all-time figures).
      It healed to null, which was right while an absent month meant all time and

@@ -3399,17 +3399,15 @@ def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_path
     assert out["fresh"]["asks"] == ""
 
 
-def _load_under(stored: str, steps: list[str]) -> list[dict]:
-    """The page's real `load()` against a stand-in server with a stored scoring unit.
+def _load_harness(stored: str = "position") -> list[str]:
+    """The page's real `stateQuery` and `load()` against a stand-in server.
 
-    Each step is `ok` (a good read) or `503`, optionally prefixed `pick:<unit>=`
-    to apply the scoring switch's own write first (S.scoring, as its handler sets
-    it, after a save that stored the unit). After each step: the unit the control
-    shows, the unit the figures on screen were counted in, and the month the page
-    would ask for next.
+    The server answers the month it is asked for (current = 2026-09), scores by
+    the request's unit or else the stored one, and fails with 503 while `down`.
+    `draw`, `note` and the payload guard are stand-ins.
     """
     consts = [_page_const(name) for name in ("SCORINGS", "SCOPE_KEYS")]
-    return _node_run([
+    return [
         "let S={month:null,type:null,cost:null,scoring:null,calday:null}, LOADED={};",
         f"let stored={json.dumps(stored)}, down=false;",
         "async function fetch(url){",
@@ -3424,6 +3422,55 @@ def _load_under(stored: str, steps: list[str]) -> list[dict]:
         "function esc(s){return String(s);}",
         *consts, "const SCORING=()=>S.scoring||SCORINGS[0];",
         *_page_fns("stateQuery", "load"),
+    ]
+
+
+def test_a_month_named_only_by_the_linked_day_survives_the_day_and_a_failed_read():
+    """Reviewer finding C. `#tab=calendar&calday=2026-01-16` has no month key, and
+    stateQuery asks for the day's month, so January's figures load. The month
+    lived nowhere else: press Previous period against a 503 and the rollback
+    (LOADED, which recorded S.month as null) put back "the current month" over
+    January's figures, so the URL became `#tab=calendar`, a reload opened the
+    current month, and the next good control loaded it. On the real-journal copy it
+    happens with no failure at all: January 2026 holds no fills, so draw() heals
+    the day away on the first render and leaves January's figures under a URL
+    that means the current month. The month a read was asked for is now pinned as
+    S.month once its figures are in hand, so the day can go and the month stays.
+    """
+    out = _node_run([
+        *_load_harness(),
+        "S.calday='2026-01-16'; await load();",
+        "const landed=stateQuery();",
+        # The day heals away (no fills), or the reader clears it.
+        "S.calday=null; const dayGone=stateQuery();",
+        # Previous period, as its handler writes it, against a failed read.
+        "S.calday='2026-01-16'; await load();",
+        "S.calday=null; S.month='2025-12'; down=true; await load();",
+        "const rolledBack=stateQuery();",
+        # A day in the current month keeps the default spelling of that month.
+        "down=false; S={month:null,type:null,cost:null,scoring:null,calday:'2026-09-18'};",
+        "await load(); const current=S.month;",
+        "console.log(JSON.stringify({landed,dayGone,rolledBack,current}));",
+    ])
+    assert out["landed"] == "month=2026-01"
+    assert out["dayGone"] == "month=2026-01", (
+        "without the day the page asks for the current month over January's figures")
+    assert out["rolledBack"] == "month=2026-01", (
+        "a failed read rolled the page back to a month it was not showing")
+    assert out["current"] is None
+
+
+def _load_under(stored: str, steps: list[str]) -> list[dict]:
+    """The page's real `load()` against a stand-in server with a stored scoring unit.
+
+    Each step is `ok` (a good read) or `503`, optionally prefixed `pick:<unit>=`
+    to apply the scoring switch's own write first (S.scoring, as its handler sets
+    it, after a save that stored the unit). After each step: the unit the control
+    shows, the unit the figures on screen were counted in, and the month the page
+    would ask for next.
+    """
+    return _node_run([
+        *_load_harness(stored),
         f"const steps={json.dumps(steps)}, out=[];",
         "for(const step of steps){",
         "  const [pick,read]=step.includes('=')?step.split('='):[null,step];",
