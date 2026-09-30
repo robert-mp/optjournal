@@ -131,7 +131,9 @@ mirrored rather than imported for that reason, and a test holds the copies to
   cannot have changed. `--force` overrides.
 * `optjournal demo` refuses to write into the real archive or database,
   and `serve --demo --query-id` is refused outright: one Sync click would
-  ingest real trades into the synthetic database.
+  ingest real trades into the synthetic database. A demo server also ignores
+  the stored query ids: Sync, and every job that spends an IBKR request, are
+  refused there.
 * `demo.write_demo_bars` refuses a database holding any statement that is not
   a demo one. Every row in `price_bars` is supposed to be something a source
   really served, so a **computed** bar in the real journal would break the

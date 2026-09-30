@@ -565,6 +565,7 @@ def build_state(
     cost_scope: list[str] | None = None,
     scoring: str | None = None,
     query_id_source: str | None = None,
+    demo: bool = False,
 ) -> dict[str, Any]:
     """Everything the page renders, in one JSON-safe payload.
 
@@ -572,6 +573,8 @@ def build_state(
     `settings.query_id`'s precedence supplied it (`settings.query_id_source`).
     A caller that passes an id without a source resolved it itself, which by
     that precedence is an argument, so the source defaults to "override".
+    `demo` blanks the confirm query id the same way the handler blanks the
+    statement's: the demo journal shows no real id and fetches with none.
 
     Opens its own connection: sqlite3 objects cannot cross threads and the
     server is threaded, so a shared handle would fail intermittently under the
@@ -872,7 +875,7 @@ def build_state(
         # The intraday query. No `_source` twin: it has no `--confirm-query-id`
         # flag, so the stored value is the only thing that can be in force and a
         # form offering to edit it can never be lying about taking effect.
-        "confirm_query_id": prefs.confirm_query_id(),
+        "confirm_query_id": None if demo else prefs.confirm_query_id(),
         "scoring": state["stats"]["scoring"],
         # The reader's dashboard tiles, or null for the default arrangement.
         "tiles": prefs.tiles(),
@@ -1094,6 +1097,11 @@ class ServeConfig:
     #: request.
     query_id: str | None
     assets: tuple[str, ...]
+    #: Serving the synthetic journal from `optjournal demo`. Nothing may then
+    #: resolve a real query id: not the payload, not Sync, not a job that spends
+    #: an IBKR request. `query_id=None` alone did not do it, because the stored
+    #: id is resolved per request.
+    demo: bool = False
     #: Serialised because two concurrent syncs would each spend an IBKR
     #: request and race on the same archive directory. Lives on the config --
     #: one lock per server -- not on the handler class, where it would be one
@@ -1252,7 +1260,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     # reading `cfg.query_id` here left the page showing "no query
                     # id" immediately after a save that had genuinely worked.
                     query_id=self._effective_query_id(),
-                    query_id_source=prefs.query_id_source(self.cfg.query_id),
+                    query_id_source=("unset" if self.cfg.demo
+                                     else prefs.query_id_source(self.cfg.query_id)),
+                    demo=self.cfg.demo,
                     month=month[0] if month else None,
                     trade_type=trade_type[0] if trade_type else None,
                     # Repeatable, so `?cost=OPT&cost=CASH` is a multi-select
@@ -1456,7 +1466,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         can change it while this process runs and `ServeConfig` is frozen. The
         alternative was telling the reader to restart the server after saving,
         which for a setting this basic is not a workable answer.
+
+        None for the demo, whatever is stored: one Sync there fetched the real
+        statement into `demo/` and the synthetic database.
         """
+        if self.cfg.demo:
+            return None
         return prefs.query_id(self.cfg.query_id)
 
     def _token_status(self) -> tuple[int, dict[str, Any]]:
@@ -1993,6 +2008,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """
         body = self._body()
         name = str(body.get("job") or "").strip()
+        if self.cfg.demo and any(job.name == name and job.spends_broker_request
+                                 for job in JOBS):
+            # The jobs resolve the stored query id themselves, so the demo's
+            # refusal has to be here rather than in an id it hands them.
+            return 400, {"ok": False, "kind": "demo",
+                         "message": f"{name} fetches from IBKR, and the demo journal "
+                                    f"never does."}
         try:
             with open_journal(self.cfg.db_path) as conn:
                 run_id = run_job(
@@ -2138,6 +2160,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path != "/api/sync":
             self._json(404, {"error": "not found"})
             return
+        if self.cfg.demo:
+            self._json(400, {"ok": False, "kind": "demo",
+                             "message": "this is the demo journal, which never "
+                                        "fetches from IBKR."})
+            return
         query_id = self._effective_query_id()
         if not query_id:
             self._json(400, {
@@ -2173,6 +2200,7 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     scheduler: bool = True,
+    demo: bool = False,
 ) -> bool:
     """Serve the UI until interrupted. Loopback only, by construction.
 
@@ -2202,6 +2230,7 @@ def serve(
         archive_dir=archive_dir,
         query_id=query_id,
         assets=tuple(assets),
+        demo=demo,
     )
 
     # `ThreadingHTTPServer(...)` binds and starts listening in its constructor,
@@ -2264,7 +2293,7 @@ def serve(
         actual = httpd.socket.getsockname()[1]
         print(f"optjournal UI on http://{host}:{actual}")
         print("  loopback only, no authentication -- do not expose this port")
-        if not prefs.query_id(query_id):
+        if not demo and not prefs.query_id(query_id):
             # NAMES THE SCHEDULER, not just the button. The button being disabled is
             # visible in the page; the sync JOB failing on every due tick is only
             # visible to someone who opens the ledger, and that is the shape this
@@ -2358,6 +2387,7 @@ def serve_ephemeral(
     archive_dir: Path,
     query_id: str | None = None,
     assets: tuple[str, ...] = DEFAULT_ASSET_FILTER,
+    demo: bool = False,
 ) -> Iterator[str]:
     """A real server on an OS-picked port, for the duration of the block.
 
@@ -2391,6 +2421,7 @@ def serve_ephemeral(
         archive_dir=archive_dir,
         query_id=query_id,
         assets=tuple(assets),
+        demo=demo,
     )
 
     class _Ephemeral(http.server.ThreadingHTTPServer):

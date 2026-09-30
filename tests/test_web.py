@@ -7215,6 +7215,38 @@ def test_a_query_id_saved_while_serving_is_the_one_in_force(
     assert [ctx.query_id for ctx in seen] == ["222222"]
 
 
+def test_the_demo_never_resolves_a_real_query_id(tmp_path, monkeypatch):
+    """H6: `serve --demo` passed `query_id=None`, but `_effective_query_id` fell
+    back to the stored id, so the demo page showed the real id with Sync
+    enabled, and Sync fetched the real statement into `demo/` and the demo
+    database. Under the demo flag no path resolves one: the payload, the Sync
+    button, and every job that spends an IBKR request."""
+    from optjournal import settings  # noqa: PLC0415 - local to this test
+    from optjournal.jobs import JOBS  # noqa: PLC0415
+
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    monkeypatch.setenv(settings.HOME_ENV, str(tmp_path / "home"))
+    settings.update(query_id="1591754", confirm_query_id="1621016")
+    seen = _capture_sync_job(monkeypatch)
+    monkeypatch.setattr(web, "sync_journal", lambda **kw: pytest.fail(
+        f"the demo reached IBKR with {kw.get('query_id')}"))
+    spending = [job.name for job in JOBS if job.spends_broker_request]
+    assert "sync" in spending and "confirm" in spending
+    with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path,
+                             demo=True) as base:
+        _, state = _get(base, "/api/state")
+        sync_status, sync_reply = _post(base, "/api/sync")
+        runs = {name: _post(base, "/api/jobs/run", {"job": name})
+                for name in spending}
+    assert (state["settings"]["query_id"], state["settings"]["query_id_source"],
+            state["settings"]["confirm_query_id"]) == (None, "unset", None)
+    assert (state["sync"]["query_id"], state["sync"]["configured"]) == (None, False)
+    assert (sync_status, sync_reply["kind"]) == (400, "demo")
+    assert {name: (status, reply["kind"]) for name, (status, reply) in runs.items()} == {
+        name: (400, "demo") for name in spending}
+    assert seen == [], "a job that spends a request ran in the demo"
+
+
 @pytest.mark.parametrize(("flag", "env", "source"), [
     ("333333", None, "override"),
     (None, "444444", "override"),

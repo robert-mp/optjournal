@@ -70,6 +70,13 @@ def test_demo_refuses_a_query_id(monkeypatch, capsys):
     assert "Refused" in capsys.readouterr().err
 
 
+def test_the_server_is_told_when_it_serves_the_demo(monkeypatch):
+    """H6: `query_id=None` alone did not keep the demo off IBKR, because the
+    server resolves the stored id per request. The flag is what it checks."""
+    assert _serve_kwargs(monkeypatch, ["serve", "--demo"])["demo"] is True
+    assert _serve_kwargs(monkeypatch, ["serve"])["demo"] is False
+
+
 def test_the_stored_query_id_is_not_frozen_into_the_server(monkeypatch, tmp_path):
     """M10: `serve` resolved the stored id once at startup and handed it to the
     server and the scheduler as if it had been typed, so an id saved in Settings

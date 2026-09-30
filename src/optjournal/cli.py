@@ -886,6 +886,10 @@ def cmd_serve(args) -> int:
             # demo journal must never fetch anything, and a scheduler pointed at a
             # synthetic archive would spend a real IBKR request to fill it.
             scheduler=bool(args.scheduler) and not args.demo,
+            # And told, because the server resolves the stored query id per
+            # request: `query_id=None` above did not stop a Sync click from
+            # fetching the real statement into the demo.
+            demo=bool(args.demo),
         )
     except ValueError as exc:
         print(f"\n{exc}", file=sys.stderr)
