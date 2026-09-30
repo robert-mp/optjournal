@@ -782,3 +782,31 @@ def test_a_statement_with_a_malformed_number_is_one_line_not_a_traceback(
     assert code != 0
     assert "Traceback" not in out.err
     assert "activity-badnumber.xml" in out.out + out.err
+
+
+def test_sync_behind_another_fetch_is_busy_not_a_traceback(tmp_path, capsys, monkeypatch):
+    """`optjournal sync` waits out a whole fetch for the lock (it has nothing else
+    to do), and if another fetch holds it even longer, says busy, exits as
+    throttled, and records it for the scheduler. It escaped as a traceback with
+    no ledger row."""
+    from optjournal.locks import LockTimeout
+
+    seen: dict = {}
+
+    def held(**kwargs):
+        seen.update(kwargs)
+        raise LockTimeout("raw/.fetch.lock held by another fetch")
+
+    monkeypatch.setattr(cli, "sync_journal", held)
+    db = tmp_path / "j.db"
+
+    code = main(["sync", "1591754", "--db", str(db), "--archive", str(tmp_path / "raw")])
+
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_THROTTLED
+    assert "Traceback" not in err and "Busy" in err, err
+    assert seen["lock_timeout_s"] == cli.FETCH_LOCK_TIMEOUT_S
+    row = connect_migrated(db).execute(
+        "SELECT status, detail FROM job_runs WHERE job = 'sync' ORDER BY id DESC"
+    ).fetchone()
+    assert (row["status"], row["detail"][:5]) == ("nothing", "busy:")

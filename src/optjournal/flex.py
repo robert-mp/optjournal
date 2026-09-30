@@ -48,6 +48,7 @@ from optjournal.sections import stated_base_currency
 __all__ = [
     "FETCH_COOLDOWN_S",
     "FETCH_LOCK_TIMEOUT_S",
+    "FETCH_LOCK_WAIT_S",
     "FETCH_WORST_CASE_S",
     "POLL_WORST_CASE_S",
     "ACTIVITY_QUERY_TYPE",
@@ -200,14 +201,19 @@ FETCH_WORST_CASE_S = int(
     + 2 * MAX_RETRIES * FETCH_SOCKET_TIMEOUT_S
 )
 
-#: How long a fetch waits for another fetch to release `FETCH_LOCK`.
-#:
-#: LONGER THAN THE FETCH IT WAITS FOR, with a minute to spare. It was the lock
+#: How long a command-line fetch waits for another fetch to release `FETCH_LOCK`:
+#: LONGER THAN THE FETCH IT WAITS FOR, with a minute to spare, so `optjournal
+#: sync` run beside the app waits its turn rather than failing. It was the lock
 #: module's 120s default, counted in sleep ticks, against a fetch that can run
-#: for over fifteen minutes: a confirm poll behind a slow statement generation
-#: raised `LockTimeout` and was recorded as a failure while the other fetch was
-#: working normally.
+#: for over fifteen minutes.
 FETCH_LOCK_TIMEOUT_S = FETCH_WORST_CASE_S + 60
+
+#: How long the APP's fetches wait for it, the default: the scheduler's jobs and
+#: the page's Sync. Short, because both read `LockTimeout` as "busy, try later"
+#: (the job gives its instant back, the page answers 409), and a long wait held
+#: the scheduler's one thread, so every other job stalled and the page called the
+#: scheduler dead while a statement generated elsewhere.
+FETCH_LOCK_WAIT_S = 30
 
 
 class _TimeoutFlexClient(FlexClient):
@@ -715,6 +721,7 @@ def fetch_confirms(
     account: str | None = None,
     force: bool = False,
     cooldown_s: int = FETCH_COOLDOWN_S,
+    lock_timeout_s: float = FETCH_LOCK_WAIT_S,
 ) -> ConfirmFetch:
     """Download a Trade Confirmation query and archive it. No parse.
 
@@ -733,7 +740,7 @@ def fetch_confirms(
     """
     from_date, to_date = _check_period(
         from_date, to_date, latest=_market_today(), weekdays_only=False)
-    with locked(archive_dir / FETCH_LOCK, timeout_s=FETCH_LOCK_TIMEOUT_S):
+    with locked(archive_dir / FETCH_LOCK, timeout_s=lock_timeout_s):
         if not force:
             _check_cooldown(archive_dir, query_id, cooldown_s)
         token = read_token(account)
@@ -917,6 +924,7 @@ def fetch(
     account: str | None = None,
     force: bool = False,
     cooldown_s: int = FETCH_COOLDOWN_S,
+    lock_timeout_s: float = FETCH_LOCK_WAIT_S,
 ) -> FetchResult:
     """Download and parse a Flex query.
 
@@ -966,11 +974,15 @@ def fetch(
 
     A period override IBKR would refuse (one end only, a weekend, an end of today
     or later) raises ValueError before any of that, so it spends nothing.
+
+    `lock_timeout_s` is how long to wait for another fetch to finish: short for
+    the app (`FETCH_LOCK_WAIT_S`), whose callers read the timeout as busy, and
+    `FETCH_LOCK_TIMEOUT_S` for a command line that should wait its turn.
     """
     from_date, to_date = _check_period(
         from_date, to_date, latest=_market_today() - timedelta(days=1),
         weekdays_only=True)
-    with locked(archive_dir / FETCH_LOCK, timeout_s=FETCH_LOCK_TIMEOUT_S):
+    with locked(archive_dir / FETCH_LOCK, timeout_s=lock_timeout_s):
         return _fetch_locked(
             query_id, archive_dir=archive_dir, from_date=from_date,
             to_date=to_date, account=account, force=force, cooldown_s=cooldown_s,

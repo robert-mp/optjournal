@@ -451,12 +451,13 @@ def test_history_chunks_hold_ibkrs_rules_and_leave_no_gap(covered_from):
             "gap before the oldest statement")
 
 
-def _stub_history(monkeypatch, *, plan, refuse_after=None):
+def _stub_history(monkeypatch, *, plan, refuse_after=None, busy_after=None):
     """`import_history` with the plan fixed and the network replaced."""
     from py_ibkr import FlexError  # noqa: PLC0415 - local to this test
 
     from optjournal import sync as mod  # noqa: PLC0415 - local to this test
     from optjournal.archive import newest_statement  # noqa: PLC0415 - local
+    from optjournal.locks import LockTimeout  # noqa: PLC0415 - local
 
     archive = newest_statement(RAW_DIR)
     calls: list[dict] = []
@@ -468,6 +469,9 @@ def _stub_history(monkeypatch, *, plan, refuse_after=None):
         if refuse_after is not None and len(calls) >= refuse_after:
             calls.append(kwargs)
             raise FlexError("1003: Statement is not available.")
+        if busy_after is not None and len(calls) >= busy_after:
+            calls.append(kwargs)
+            raise LockTimeout("raw/.fetch.lock held by another fetch")
         calls.append(kwargs)
         return _Fetched()
 
@@ -508,6 +512,47 @@ def test_import_history_stops_at_the_first_refusal(tmp_path, monkeypatch):
     assert result["fetched"] == ["20240802-20250801"]
     assert "20230804 to 20240802 refused" in result["stopped"]
     assert "stopped at" in result["summary"]
+
+
+def test_import_history_behind_another_fetch_says_what_it_had_already_done(
+    tmp_path, monkeypatch,
+):
+    """A lock wait after the first chunk is a stop, like a refusal: that chunk
+    spent its request and is ingested, and the job reading a raised LockTimeout
+    as busy would have recorded "nothing asked". Before any chunk it IS nothing
+    asked, so it is still raised for the caller to read as busy."""
+    from optjournal.db import open_journal  # noqa: PLC0415 - local to this test
+    from optjournal.locks import LockTimeout  # noqa: PLC0415
+
+    plan = [("20240802", "20250801"), ("20230804", "20240802"), ("20220805", "20230804")]
+    mod, calls = _stub_history(monkeypatch, plan=plan, busy_after=1)
+    with open_journal(tmp_path / "journal.db") as conn:
+        result = mod.import_history(conn=conn, archive_dir=tmp_path, query_id="1",
+                                    sleep=lambda _s: None)
+    assert len(calls) == 2
+    assert result["fetched"] == ["20240802-20250801"]
+    assert "20230804 to 20240802 not asked" in result["stopped"]
+
+    mod, calls = _stub_history(monkeypatch, plan=plan, busy_after=0)
+    with open_journal(tmp_path / "journal.db") as conn, pytest.raises(LockTimeout):
+        mod.import_history(conn=conn, archive_dir=tmp_path, query_id="1",
+                           sleep=lambda _s: None)
+
+
+def test_the_apps_fetches_wait_for_the_lock_less_than_the_scheduler_can_stall(
+):
+    """The scheduler runs its jobs on one thread and the page calls it dead past
+    `HEARTBEAT_STALE_S`, while its jobs and the page's Sync read a lock timeout
+    as busy. So the app's default wait is short; only the command line, which
+    has nothing else to do, waits out a whole fetch."""
+    import inspect  # noqa: PLC0415 - local to this test
+
+    from optjournal import flex, serialize, sync  # noqa: PLC0415
+
+    for fn in (flex.fetch, flex.fetch_confirms, sync.sync_journal):
+        wait = inspect.signature(fn).parameters["lock_timeout_s"].default
+        assert wait == flex.FETCH_LOCK_WAIT_S < serialize.HEARTBEAT_STALE_S, fn
+    assert flex.FETCH_LOCK_TIMEOUT_S > flex.FETCH_WORST_CASE_S
 
 
 def test_import_history_with_nothing_owed_spends_nothing(tmp_path, monkeypatch):

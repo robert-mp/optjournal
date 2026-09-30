@@ -53,6 +53,7 @@ from optjournal.events import (
     upcoming,
 )
 from optjournal.flex import (
+    FETCH_LOCK_TIMEOUT_S,
     KEYRING_SERVICE,
     FetchCooldown,
     StatementUnreadable,
@@ -76,6 +77,7 @@ from optjournal.jobs import (
     record_manual_sync,
     record_run,
 )
+from optjournal.locks import LockTimeout
 from optjournal.render import (
     render_friction,
     render_history,
@@ -174,6 +176,8 @@ def cmd_fetch(args) -> int:
         from_date=args.from_date,
         to_date=args.to_date,
         force=args.force,
+        # A command line waits its turn behind another fetch rather than giving up.
+        lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
     )
     data = summary_data(result.response, result.raw_path)
     data["raw_path"] = str(result.raw_path)
@@ -1241,7 +1245,8 @@ def cmd_setup(args) -> int:
         print("\nVerifying against IBKR (one request)...")
         try:
             read_token(account)
-            result = fetch(effective_qid, archive_dir=DEFAULT_ARCHIVE)
+            result = fetch(effective_qid, archive_dir=DEFAULT_ARCHIVE,
+                           lock_timeout_s=FETCH_LOCK_TIMEOUT_S)
         except FetchCooldown as exc:
             print(f"  skipped: {exc}")
         else:
@@ -1293,6 +1298,7 @@ def cmd_confirms(args) -> int:
             # said the same thing twice, and two spellings of one intent are how
             # they eventually disagree.
             cooldown_s=CONFIRM_COOLDOWN_S,
+            lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
         )
         ingested = ingest_confirms(
             conn, result.raw_path, base_currency=base,
@@ -1364,8 +1370,9 @@ def cmd_sync(args) -> int:
                 from_date=args.from_date,
                 to_date=args.to_date,
                 force=args.force,
+                lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
             )
-        except (FetchCooldown, TokenMissing, TokenRejected) as exc:
+        except (FetchCooldown, TokenMissing, TokenRejected, LockTimeout) as exc:
             # RECORDED BEFORE RE-RAISING, so `main`'s handlers still decide the exit
             # code and the message. A hand-run sync used to be invisible to the
             # ledger, which is how a backed-off job stayed backed off while the
@@ -1707,6 +1714,11 @@ def main(argv: list[str] | None = None) -> int:
         # Not a failure: IBKR throttles repeat generation of the same query.
         # Callers (the daily cron) treat this as "try again later".
         print(f"\nThrottled by IBKR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_THROTTLED
+    except LockTimeout as exc:
+        # Another fetch held the lock past the whole wait: nothing was asked of
+        # IBKR, so this is "try again later" as well, not a crash.
+        print(f"\nBusy: another fetch is still running ({exc})", file=sys.stderr)
         return EXIT_THROTTLED
     except FlexError as exc:
         print(

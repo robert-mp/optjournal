@@ -38,8 +38,9 @@ from py_ibkr import FlexError
 
 from optjournal.archive import account_opened
 from optjournal.clock import MARKET_TZ
-from optjournal.flex import fetch
+from optjournal.flex import FETCH_LOCK_WAIT_S, fetch
 from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
+from optjournal.locks import LockTimeout
 
 __all__ = [
     "SNAPSHOTS_KEPT", "SNAPSHOT_DIR", "first_sync_window", "history_chunks",
@@ -121,6 +122,7 @@ def sync_journal(
     from_date: str | None = None,
     to_date: str | None = None,
     force: bool = False,
+    lock_timeout_s: float = FETCH_LOCK_WAIT_S,
 ) -> dict[str, Any]:
     """Fetch the newest statement, fold it in, snapshot. THE one sync path.
 
@@ -174,6 +176,7 @@ def sync_journal(
     result = fetch(
         query_id, archive_dir=archive_dir,
         from_date=from_date, to_date=to_date, force=force,
+        lock_timeout_s=lock_timeout_s,
     )
     ingested = ingest_file(conn, result.raw_path, assets=assets)
     # `first_seen_at` is stamped per row at insert, so anything at or after this
@@ -339,6 +342,15 @@ def import_history(
                            from_date=fd, to_date=td, force=True)
         except FlexError as exc:
             stopped = f"{fd} to {td} refused: {exc}"
+            log.warning("history import stopped: %s", stopped)
+            break
+        except LockTimeout as exc:
+            # Before any chunk, nothing was asked, so it stays the caller's busy.
+            # After one, a stop like a refusal: the chunks already fetched spent
+            # their requests and are ingested, which "busy, nothing asked" denies.
+            if not fetched:
+                raise
+            stopped = f"{fd} to {td} not asked: another fetch is running ({exc})"
             log.warning("history import stopped: %s", stopped)
             break
         ingest_file(conn, result.raw_path, assets=assets)

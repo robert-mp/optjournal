@@ -665,7 +665,7 @@ JOBS: tuple[Job, ...] = (
         # 12:30, thirty minutes behind the sync: a position opened yesterday is
         # only in the database once that sync has ingested it, and the manifest is
         # derived from positions. The gap clears the sync's worst case, the
-        # 660s of `flex.POLL_WORST_CASE_S`.
+        # 930s of `flex.FETCH_WORST_CASE_S`.
         minute=30, hour=12, weekdays=(2, 3, 4, 5, 6), zone="Europe/Dublin",
         catchup=Catchup.LATEST, window_s=20 * 3600,   # re-fetchable by definition
     ),

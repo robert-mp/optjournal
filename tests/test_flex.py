@@ -221,21 +221,19 @@ def _hold_the_fetch_lock(archive: Path, seconds: float) -> threading.Thread:
     return holder
 
 
-def test_a_fetch_waits_for_the_fetch_lock_as_long_as_the_fetch_lock_timeout(
-    tmp_path, monkeypatch,
-):
+def test_a_fetch_waits_for_the_fetch_lock_as_long_as_it_is_told(tmp_path):
     """M12: the wait was the lock module's 120s default, not the fetch's own.
 
-    Scaled down: the timeout is patched to a fraction of a second and the other
-    holder keeps the lock for longer, so a fetch that used any other timeout
-    would not raise here.
+    Scaled down: the wait asked for is a fraction of a second and the other
+    holder keeps the lock for longer, so a fetch that used any other wait would
+    not raise here.
     """
     from optjournal.locks import LockTimeout
 
-    monkeypatch.setattr(flex, "FETCH_LOCK_TIMEOUT_S", 0.2)
     holder = _hold_the_fetch_lock(tmp_path, 1.0)
     with pytest.raises(LockTimeout):
-        flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True)
+        flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True,
+                            lock_timeout_s=0.2)
     holder.join()
 
 
