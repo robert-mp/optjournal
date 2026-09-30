@@ -36,6 +36,9 @@ KNOWN_UNMODELLED_SECTIONS = {
 }
 
 
+STATEMENTS_FIRST = sorted(RAW_DIR.glob("activity-*.xml"))[0]
+
+
 def statements() -> list[Path]:
     return sorted(RAW_DIR.glob("activity-*.xml"))
 
@@ -636,3 +639,107 @@ def test_the_error_code_pattern_still_matches_what_py_ibkr_writes():
         "flex._FLEX_CODE no longer matches it"
     )
     assert flex._FLEX_CODE.search("Flex API Error 1015: Token is invalid.")
+
+
+# --------------------------------------------------------------------------
+# A response body that is not a statement is refused before it is archived.
+# --------------------------------------------------------------------------
+
+_NO_STATEMENTS = (b'<FlexQueryResponse queryName="q" type="AF">'
+                  b'<FlexStatements count="0"></FlexStatements></FlexQueryResponse>')
+_TCF = (b'<FlexQueryResponse queryName="Confirms" type="TCF">'
+        b'<FlexStatements count="1"><FlexStatement accountId="U1" fromDate="20260924"'
+        b' toDate="20260924" whenGenerated="20260924;111200"><TradeConfirms/>'
+        b'</FlexStatement></FlexStatements></FlexQueryResponse>')
+
+
+def _serve(monkeypatch, body: bytes) -> None:
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory", lambda **kw: type(
+        "C", (), {"download": lambda self, *a, **k: body})())
+
+
+@pytest.mark.parametrize("body", [
+    b"<html><body>Scheduled maintenance</body></html>\n",
+    b"",
+    b'<FlexQueryResponse queryName="q" type="AF"><FlexStatements count="1">',
+    _NO_STATEMENTS,
+], ids=["html", "empty", "truncated", "no-statements"])
+def test_a_body_that_is_not_a_statement_is_neither_archived_nor_stamped(
+    tmp_path, monkeypatch, body,
+):
+    """M6: an HTML maintenance page used to become `activity-*.xml`.
+
+    Archived first and stamped first, it then halted `optjournal ingest` at that
+    file on every run, and the cooldown made the retry wait fifteen minutes for a
+    request that had produced nothing.
+    """
+    _serve(monkeypatch, body)
+    with pytest.raises(flex.StatementUnreadable):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("activity-*.xml"))
+    assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+
+
+def test_a_statement_that_is_not_read_is_still_an_ordinary_flex_error(tmp_path,
+                                                                       monkeypatch):
+    """Every caller already handles `FlexError`; the new type must reach them."""
+    from py_ibkr import FlexError
+
+    _serve(monkeypatch, _NO_STATEMENTS)
+    with pytest.raises(FlexError):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+
+
+def test_a_trade_confirmation_under_the_activity_query_id_is_refused(tmp_path,
+                                                                     monkeypatch):
+    """L1: accepted silently, it became the newest statement and blanked costs."""
+    _serve(monkeypatch, _TCF)
+    with pytest.raises(flex.StatementUnreadable, match="Trade Confirmation"):
+        flex.fetch("1621016", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("*.xml"))
+
+
+def test_an_activity_statement_under_the_confirm_query_id_is_refused(tmp_path,
+                                                                     monkeypatch):
+    """The mirror of L1, refused before archiving too rather than at the parse."""
+    _serve(monkeypatch, STATEMENTS_FIRST.read_bytes())
+    with pytest.raises(flex.StatementUnreadable, match="Activity"):
+        flex.fetch_confirms("1591754", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("*.xml"))
+
+
+def test_a_trade_confirmation_in_the_archive_is_refused_by_the_ingest(tmp_path):
+    """L1, for a file already on disk: nothing is written from it."""
+    from conftest import connect_migrated
+
+    from optjournal.ingest import ingest_file
+
+    path = tmp_path / "activity-20260924T111200Z.xml"
+    path.write_bytes(_TCF)
+    conn = connect_migrated(tmp_path / "j.db")
+    with pytest.raises(flex.StatementUnreadable, match="Trade Confirmation"):
+        ingest_file(conn, path)
+    assert conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("body", [b"", b"<FlexQueryResponse", _NO_STATEMENTS],
+                         ids=["empty", "malformed", "no-statements"])
+def test_loading_an_unreadable_file_raises_the_typed_error(tmp_path, body):
+    """So the CLI can print one line about it instead of a ParseError traceback."""
+    path = tmp_path / "activity-bad.xml"
+    path.write_bytes(body)
+    with pytest.raises(flex.StatementUnreadable, match="activity-bad.xml"):
+        load(path)
+
+
+def test_ingesting_a_malformed_file_raises_the_typed_error_too(tmp_path):
+    """The ingest reads the base currency first; it must not beat `load` to it."""
+    from conftest import connect_migrated
+
+    from optjournal.ingest import ingest_file
+
+    path = tmp_path / "activity-bad.xml"
+    path.write_bytes(b"<FlexQueryResponse")
+    with pytest.raises(flex.StatementUnreadable, match="activity-bad.xml"):
+        ingest_file(connect_migrated(tmp_path / "j.db"), path)

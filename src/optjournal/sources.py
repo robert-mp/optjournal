@@ -169,8 +169,12 @@ class IbkrSource:
     def metadata(self, path: Path) -> Iterator[StatementMeta]:
         from optjournal.flex import load
 
+        # Loaded BEFORE the base currency is read, so a file that is not a
+        # statement is refused with `load`'s named error rather than with the
+        # section reader's bare parse error.
+        response = load(path)
         base = self.base_currency(path)
-        for stmt in load(path).FlexStatements:
+        for stmt in response.FlexStatements:
             yield StatementMeta(
                 account_id=_s(stmt.accountId),
                 from_date=_s(stmt.fromDate),

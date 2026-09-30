@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,14 +37,17 @@ from py_ibkr import FlexClient, FlexError, FlexQueryResponse
 from py_ibkr.flex.client import FlexAuthError
 from py_ibkr.flex.parser import parse_xml_file
 
+from optjournal.confirms import CONFIRM_QUERY_TYPE
 from optjournal.locks import locked
 
 __all__ = [
     "FETCH_COOLDOWN_S",
     "POLL_WORST_CASE_S",
+    "ACTIVITY_QUERY_TYPE",
     "FetchCooldown",
     "ConfirmFetch",
     "FetchResult",
+    "StatementUnreadable",
     "TokenMissing",
     "TokenRejected",
     "TokenWriteRefused",
@@ -84,6 +88,10 @@ STATE_FILE = ".fetch-state.json"
 #: `_archive`.
 ACTIVITY_PREFIX = "activity"
 CONFIRM_PREFIX = "confirm"
+
+#: The `type` attribute on an Activity Statement payload's root element, the
+#: counterpart of `confirms.CONFIRM_QUERY_TYPE`.
+ACTIVITY_QUERY_TYPE = "AF"
 
 #: Sibling lock file for the whole check-download-record sequence. Beside the
 #: state file it guards, in the archive directory, so one journal's fetches do
@@ -205,6 +213,18 @@ class _TimeoutFlexClient(FlexClient):
 #: What `fetch` constructs. A module-level indirection so there is exactly ONE name
 #: to replace when a test needs the network stubbed -- see `_fetch_locked`.
 _client_factory = _TimeoutFlexClient
+
+
+class StatementUnreadable(FlexError):
+    """A response body or an archived file that is not a statement we can read.
+
+    A `FlexError`, so every caller that already handles a failed Flex request
+    handles this too. Raised by `fetch` BEFORE the body is archived or the
+    cooldown stamped: an HTML maintenance page archived as `activity-*.xml` used
+    to halt `optjournal ingest` at that file on every run. Raised by `load` for
+    a file already on disk, so a caller can skip it with one line rather than a
+    parser traceback.
+    """
 
 
 class TokenMissing(RuntimeError):
@@ -603,6 +623,8 @@ def fetch_confirms(
         except FlexError as exc:
             _reraise_if_token_rejected(exc)
             raise
+        _check_payload(raw, expect=CONFIRM_QUERY_TYPE,
+                       source=f"IBKR's reply to query {query_id}")
         # ONE FILE PER DAY, overwritten by each poll, where the statement gets one
         # per fetch. The reason is in the payload: `whenGenerated` changes on every
         # request, so the bytes are never identical and the content dedupe cannot
@@ -633,6 +655,48 @@ def fetch_confirms(
 
 
 _PAYLOAD_TO_DATE = re.compile(rb'<FlexStatement\s[^>]*?toDate="(\d{8})"')
+
+
+#: Each query type as a refusal names it: (with an article, without).
+_QUERY_NAMES = {
+    ACTIVITY_QUERY_TYPE: ("an Activity Statement", "Activity Statement"),
+    CONFIRM_QUERY_TYPE: ("a Trade Confirmation", "Trade Confirmation"),
+}
+
+
+def _check_root(root: ET.Element, *, expect: str, source: str) -> None:
+    """Refuse a Flex document that is not a statement of the `expect` type.
+
+    A missing `type` is accepted: every payload IBKR has sent carries one, and a
+    hand-built statement without it is still a statement. A different one is not:
+    a Trade Confirmation under the Activity query id became the newest statement
+    and blanked the cost report, silently.
+    """
+    if root.tag != "FlexQueryResponse":
+        raise StatementUnreadable(
+            f"{source} is a <{root.tag}> document, not a Flex statement")
+    kind = (root.get("type") or "").strip()
+    if kind and kind != expect:
+        got, got_bare = _QUERY_NAMES.get(kind, (f"a {kind!r} payload", repr(kind)))
+        want, want_bare = _QUERY_NAMES.get(expect, (repr(expect), repr(expect)))
+        raise StatementUnreadable(
+            f"{source} is {got} (type {kind!r}), not {want} (type {expect!r}). "
+            f"The query id looks like your {got_bare} query; this needs the "
+            f"{want_bare} query's id."
+        )
+    if root.find("FlexStatements/FlexStatement") is None:
+        raise StatementUnreadable(f"{source} holds no FlexStatement")
+
+
+def _check_payload(raw: bytes, *, expect: str, source: str) -> None:
+    """`_check_root` for a response body that has not been written anywhere yet."""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        start = raw[:60].decode("utf-8", "replace").strip() or "(empty)"
+        raise StatementUnreadable(
+            f"{source} is not readable XML ({exc}); it starts {start!r}") from exc
+    _check_root(root, expect=expect, source=source)
 
 
 def _payload_to_date(raw: bytes) -> str | None:
@@ -686,7 +750,10 @@ def fetch(
       then, so this protects the archive rather than the budget.
 
     The raw XML is archived before parsing, so a parse failure still leaves
-    the response on disk rather than costing another request.
+    the response on disk rather than costing another request. Only a body that
+    IS an Activity Statement gets that far: one that is not XML, has another
+    root, holds no FlexStatement or is a Trade Confirmation raises
+    `StatementUnreadable` before anything is archived or stamped.
 
     HELD UNDER A CROSS-PROCESS LOCK FROM THE CHECK TO THE STAMP, because the
     cooldown was otherwise check-then-act and the budget it guards is real. The
@@ -756,6 +823,12 @@ def _fetch_locked(
         _reraise_if_token_rejected(exc)
         raise
 
+    # Checked BEFORE archiving and before the stamp. The request is spent either
+    # way, but a body that is not a statement must not become `activity-*.xml`,
+    # where every later ingest would trip over it, and must not start a cooldown
+    # that makes the retry wait for nothing.
+    _check_payload(raw, expect=ACTIVITY_QUERY_TYPE,
+                   source=f"IBKR's reply to query {query_id}")
     path, duplicate_of = _archive(raw, archive_dir)
     if duplicate_of is not None:
         log.info("statement identical to %s; not archiving a second copy", path.name)
@@ -777,5 +850,20 @@ def _fetch_locked(
 
 
 def load(path: Path) -> FlexQueryResponse:
-    """Parse a previously archived statement, making no network request."""
-    return parse_xml_file(str(path))
+    """Parse a previously archived statement, making no network request.
+
+    Raises `StatementUnreadable`, naming the file, for anything that is not an
+    Activity Statement with at least one statement block: malformed XML, another
+    root, a Trade Confirmation, or a value py_ibkr refuses.
+    """
+    path = Path(path)
+    try:
+        root = ET.parse(str(path)).getroot()
+    except ET.ParseError as exc:
+        raise StatementUnreadable(f"{path.name} is not readable XML: {exc}") from exc
+    _check_root(root, expect=ACTIVITY_QUERY_TYPE, source=path.name)
+    try:
+        return parse_xml_file(str(path))
+    except ValueError as exc:  # pydantic's ValidationError is a ValueError
+        first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        raise StatementUnreadable(f"{path.name} could not be parsed: {first}") from exc
