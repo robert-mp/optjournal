@@ -2035,6 +2035,32 @@ def test_a_render_preserves_what_the_user_was_typing():
     )
 
 
+def test_a_redraw_hands_focus_back_to_the_control_that_had_it():
+    """M32: every redraw replaced the pressed button, and focus fell to <body> --
+    Enter on a cost chip, a sort header or the month stepper left a keyboard reader
+    at the top of the page. `preserveInputs` only carried a text field.
+
+    Pinned over the source for that test's reason (no DOM under node); checked in a
+    browser on the rail, sub-view, cost chip, market day, sort header, watchlist
+    row, month stepper, 0DTE toggles, journal button and scoring switch. The key is
+    taken before ANY region is rewritten (the rail goes first) and answered after
+    the body is written; an aria-label outranks the data attributes because the
+    stepper's `data-month` moves with every step while its label does not.
+    """
+    draw = _fn("draw")
+    assert draw.index("focusKey()") < draw.index("renderRail()"), (
+        "the focus key has to be read before the first region is rewritten")
+    assert draw.index("restoreFocus(") > draw.index("$('#body').innerHTML=html"), (
+        "focus can only be handed back once the new markup exists")
+    key = _fn("focusKey")
+    assert key.index("aria-label") < key.index("data-"), (
+        "a data value can move under a control; its label is the stabler name")
+    assert "isConnected" in _fn("restoreFocus"), (
+        "a control draw() did not rewrite never lost focus and must be left alone")
+    assert re.search(r'<div id="msg" role="status" aria-live="polite">', page_html()), (
+        "the message banner is not announced")
+
+
 def test_nothing_this_server_sends_is_cacheable():
     """A cached page is a stale page, and a cached payload is a stale account.
 
