@@ -6121,8 +6121,12 @@ function applyHash(){
      already models a repeated key, and `getAll` is the whole parser -- inventing
      a separator would mean the page and the server each carrying a split rule
      that has to agree. Empty stays null ("not chosen") rather than becoming an
-     empty array, which the server would read as a selection of nothing. */
-  const cost=hs.getAll('cost').filter(Boolean);
+     empty array, which the server would read as a selection of nothing.
+     Validated against COST_OPTIONS like the tab and the theme: `#cost=BOGUS`
+     used to reach the server and render a scope with no chip lit, so an unknown
+     key is dropped and a hash naming none falls back to the default. */
+  const cost=hs.getAll('cost').map(c=>c.toUpperCase())
+    .filter(c=>COST_OPTIONS.some(([key])=>key===c));
   S.cost=cost.length?cost:null;
   /* Validated against the two units the server knows, like the tab and the
      theme: an unknown value would otherwise put a chip in an impossible state
@@ -6993,7 +6997,12 @@ function staleServerCheck(state){
     +`(missing: ${missing.map(esc).join(', ')})`,'bad');
 }
 
-async function load(){
+/* The query `/api/state` is asked with, from the view state. ONE function, read by
+   load() and by the hashchange handler, so "which keys does the server see" has a
+   single answer: the handler used to compare the type and the month only, so a
+   typed or back/forward change of `cost`, `scoring` or a `calday` in another month
+   redrew figures for the previous scope. */
+function stateQuery(){
   /* Not `q` -- that name is the FX quote everywhere else in this page, and one
      name for two shapes is what makes the payload guard unable to check either. */
   const qs=new URLSearchParams();
@@ -7010,7 +7019,12 @@ async function load(){
      'position' mean the same thing to the server, and one spelling of a default
      is one fewer place for the page and stats.py to disagree. */
   if(S.scoring) qs.set('scoring',S.scoring);
-  const r=await fetch('/api/state'+(qs.toString()?'?'+qs:''));
+  return qs.toString();
+}
+
+async function load(){
+  const qs=stateQuery();
+  const r=await fetch('/api/state'+(qs?'?'+qs:''));
   if(!r.ok){note('Could not read state: HTTP '+r.status,'bad');return;}
   S.state=await r.json();
   staleServerCheck(S.state);
@@ -7055,13 +7069,13 @@ $('#sync').onclick=async()=>{
    truth rather than a write-only echo of it. `replaceState` does not fire
    hashchange, so `syncHash` cannot feed this back into a loop.
 
-   Reloads only when the server-side keys moved: the tab is drawn from state
-   already in hand, and refetching for it would spend a request to render the
-   same payload. */
+   Reloads only when the query load() would send moved: the tab is drawn from
+   state already in hand, and refetching for it would spend a request to render
+   the same payload. The back and forward buttons arrive here too. */
 window.onhashchange=()=>{
-  const was=[S.type,S.month].join('|');
+  const was=stateQuery();
   applyHash();
-  if([S.type,S.month].join('|')!==was) load(); else draw();
+  if(stateQuery()!==was) load(); else draw();
 };
 
 applyHash();

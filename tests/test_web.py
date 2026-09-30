@@ -18,8 +18,10 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import shutil
 import socket
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -2692,8 +2694,9 @@ def test_a_calday_the_payload_cannot_show_heals_out_of_the_hash():
     dayDetail has its own guard, but it runs during render -- by which point the
     stale key is already in the address bar. A day from another month, or one
     the current filter excludes, must not survive in a URL describing nothing.
-    Client-side only, so a calday change redraws without refetching: the
-    hashchange handler compares only the server-side keys.
+    The handler never names calday itself: it compares the query load() sends,
+    so a day inside the month on screen redraws, and a day in another month
+    (with no month pinned) refetches that month instead of healing away.
     """
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
     assert "if(S.calday&&S.state&&!(((S.state.stats||{}).days)||[])" in js, \
@@ -2828,6 +2831,94 @@ def test_hashchange_only_refetches_when_the_server_side_keys_moved():
     assert "load()" in handler and "draw()" in handler, (
         "the handler must choose between refetching and redrawing"
     )
+
+
+def _page_const(name: str) -> str:
+    """One top-level `const` declaration of the page, whole."""
+    js = _code_only(_js())
+    found = (re.search(rf"^const {name}=\[.*?\n\];", js, re.S | re.M)
+             or re.search(rf"^const {name}=.*?;$", js, re.M))
+    assert found, f"no top-level const {name} in the page"
+    return found.group(0)
+
+
+def _run_hash_handler(steps: list[tuple[str, str]]) -> list[dict]:
+    """Drive the page's real `applyHash` and `onhashchange` under node.
+
+    Each step lands on its first hash, then moves to the second and fires the
+    handler, reporting whether it asked for a refetch (`load`) or a redraw and
+    which cost scope it parsed. Everything the two read is the page's own code;
+    only `load`, `draw` and `location` are stand-ins.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("no node runtime")
+    js = _code_only(_js())
+    handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
+    assert handler, "the hashchange handler moved"
+    # `_fn` runs to the next plain `function`, so an `async function` after one is
+    # cut off here: `load` is a stand-in below and must not be declared twice.
+    fns = [_fn(name).split("\nasync function ")[0]
+           for name in ("applyHash", "stateQuery") if f"function {name}(" in js]
+    consts = [_page_const(name) for name in
+              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS")]
+    zdte = (ROOT / "src" / "optjournal" / "static" / "zdte.js").as_uri()
+    script = "\n".join([
+        f"import {{sanitizeLevel}} from '{zdte}';",
+        "const location={hash:''}, window={}, calls=[];",
+        "const S={};",
+        "function load(){calls.push('load');}",
+        "function draw(){calls.push('draw');}",
+        *consts, *fns, handler.group(0),
+        f"const steps={json.dumps(steps)};",
+        "const out=[];",
+        "for(const [from,to] of steps){",
+        "  location.hash=from; applyHash(); calls.length=0;",
+        "  location.hash=to; window.onhashchange();",
+        "  out.push({call:calls[0],cost:S.cost});",
+        "}",
+        "console.log(JSON.stringify(out));",
+    ])
+    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+    return json.loads(result.stdout)
+
+
+def test_a_hash_change_the_server_would_answer_differently_refetches():
+    """M28: editing `cost`, `scoring` or a `calday` in the hash, typed or by the
+    back and forward buttons, redrew the payload already in hand, so the Costs
+    tab and the win rate stayed on the previous scope (82.8% against 71.9% on a
+    fresh load of the same URL). The handler compared the type and the month
+    only; it now compares the query load() would send.
+    """
+    moves = _run_hash_handler([
+        ("#tab=costs&cost=OPT", "#tab=costs&cost=STK"),
+        ("#month=all", "#month=all&scoring=contract"),
+        ("#tab=calendar", "#tab=calendar&calday=2026-08-03"),
+        ("#month=2026-09&type=odte", "#month=2026-09"),
+        # Nothing the server reads moved, so no request is spent.
+        ("#tab=calendar", "#tab=trades"),
+        ("#tab=costs&cost=OPT", "#tab=costs&cost=OPT&theme=ledger"),
+        ("#month=2026-08&calday=2026-08-03", "#month=2026-08&calday=2026-08-04"),
+    ])
+    assert [m["call"] for m in moves] == [
+        "load", "load", "load", "load", "draw", "draw", "draw"]
+
+
+def test_an_unknown_cost_key_in_the_hash_falls_back_to_the_default():
+    """L42: `#cost=BOGUS` reached the server and rendered a scope with no chip lit.
+    Validated like the tab, the theme and the scoring unit: an unknown key is
+    dropped, and a hash naming no known key means the server's default (null).
+    """
+    moves = _run_hash_handler([
+        ("", "#tab=costs&cost=BOGUS"),
+        ("", "#tab=costs&cost=opt&cost=BOGUS&cost=0DTE"),
+        ("", "#tab=costs&cost=CASH"),
+    ])
+    assert [m["cost"] for m in moves] == [None, ["OPT", "0DTE"], ["CASH"]]
 
 
 def test_serves_path_defaults_do_not_poison_other_subcommands():
