@@ -205,6 +205,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} generated_at
  * @property {boolean} dev -- developer-only surfaces on (settings.dev). Off
  *   unless OPTJOURNAL_DEV or the stored flag says so; the web API cannot set it
+ * @property {boolean} [demo] -- `serve --demo`: the synthetic journal, which the
+ *   server never lets reach IBKR, so Sync and the request-spending jobs are off
  * @property {string} asset_category -- the journal's home category, OPT
  * @property {Object} asset_counts -- fills per category; derives offerable Trade Types
  * @property {string} db
@@ -2626,6 +2628,9 @@ function dashboard(){
  * scheduler without a status surface makes the system quieter AND less
  * trustworthy in the same change.
  */
+/* What a control that would reach IBKR says under `serve --demo`: the Sync button,
+   and every job run that spends a Flex request. */
+const DEMO_NO_IBKR='The demo journal is synthetic data and never fetches from IBKR.';
 function collection(){
   const sc=S.state.scheduler, au=S.state.audit;
   if(!sc||!au) return '';
@@ -2701,16 +2706,23 @@ function collection(){
      dialogues, which is how the one that matters stops being read. */
   const rows=(sc.jobs||[]).map(j=>{
     const run=j.last_run;
-    const busy=j.last_status==='running';
-    const tint=j.last_status==='failed'||j.last_status==='interrupted'?'neg'
-      :j.last_status==='ok'?'pos':'';
+    /* In flight is the newest RUN's status, never `last_status`: the job's state
+       row is written when a run finishes, so it held the previous outcome for the
+       whole of a run and the button stayed live under a job already running. */
+    const status=run&&run.status==='running'?'running':j.last_status;
+    const busy=status==='running';
+    /* The demo journal never reaches IBKR, and the server refuses such a run
+       there; a live button would ask to spend a request and then be refused. */
+    const demoOff=!!S.state.demo&&j.spends_request;
+    const tint=status==='failed'||status==='interrupted'?'neg'
+      :status==='ok'?'pos':'';
     const detail=run&&run.detail?run.detail:'';
     /* `finished_at` over `started_at`: for a job that is still running the
        former is null, and "started 3m ago" is the honest thing to say then. */
     const when=run?(run.finished_at||run.started_at||''):'';
     return `<div class="jobrow">
       <span class="jobname mono">${esc(j.job)}</span>
-      <span class="jobstat ${tint}">${esc(j.last_status||'never run')}</span>
+      <span class="jobstat ${tint}">${esc(status||'never run')}</span>
       <span class="dim jobdet">${esc(detail)}</span>
       <span class="dim2 jobwhen mono">${esc(when.slice(0,16).replace('T',' '))}</span>
       ${j.consecutive_failures>1?`<span class="pill gap neg"
@@ -2724,8 +2736,8 @@ function collection(){
             history is kept so a rename does not erase what it did."
             >retired</span>`
         : `<button class="btn sm jobrun" data-job="${esc(j.job)}"
-        data-requests="${j.requests??1}"${busy?' disabled':''}
-        title="${j.spends_request
+        data-requests="${j.requests??1}"${busy||demoOff?' disabled':''}
+        title="${demoOff?DEMO_NO_IBKR:j.spends_request
           ? `Spends ${(j.requests??1)===1?'one IBKR Flex request':j.requests+' IBKR Flex requests'} against a rate-limited budget.`
           : 'Costs no IBKR request.'}">${busy?'running':'run'}</button>`}
     </div>`;
@@ -6103,8 +6115,8 @@ function historyImport(plan){
       <span>Fetch back to <b class="mono">${esc(day(hc.from))}</b>:
         ${plan.length} IBKR request${plan.length===1?'':'s'}, one per year,
         newest first, 30 seconds apart.</span>
-      <button class="btn sm" data-job="history" data-requests="${plan.length}"
-        >Import full history</button>
+      <button class="btn sm" data-job="history" data-requests="${plan.length}"${
+        S.state.demo?` disabled title="${DEMO_NO_IBKR}"`:''}>Import full history</button>
     </div>
     <div class="note">It runs on the server, so closing this page does not stop
     it. The Collection card shows how it ended.</div>`;
@@ -6617,7 +6629,8 @@ function draw(push){
      the button disables, which is the safe direction. */
   const b=$('#sync'), sync=st.sync||{}, rem=sync.cooldown_remaining_s;
   b.classList.remove('busy');
-  if(!sync.configured){b.disabled=true;b.title='No query id — start with --query-id';}
+  if(st.demo){b.disabled=true;b.title=DEMO_NO_IBKR;}
+  else if(!sync.configured){b.disabled=true;b.title='No query id — start with --query-id';}
   else if(rem>0){b.disabled=true;
     b.title=`Cooldown: ${Math.ceil(rem/60)}m left. Prevents spending an IBKR request for data that cannot have changed.`;}
   else {b.disabled=false;b.title='Fetch from IBKR — spends one request';}
@@ -6806,8 +6819,11 @@ function bindJobRuns(){
          for a sync, one per year for a history import. Zero means nothing is left
          to ask for, so there is nothing to confirm either. */
       const n=Number(b.dataset.requests??1);
+      /* No dialogue in the demo: nothing is spent there, because the server
+         refuses the run, and asking first would be asking about a cost that
+         does not exist. */
       const spends=(((S.state.scheduler||{}).jobs)||[])
-        .some(j=>j.job===job&&j.spends_request)&&n>0;
+        .some(j=>j.job===job&&j.spends_request)&&n>0&&!S.state.demo;
       if(spends&&!confirm(
         `Run ${job}? This spends ${n===1?'one IBKR Flex request':n+' IBKR Flex requests'} `
         +`against a rate-limited budget.`)) return;
@@ -7128,9 +7144,21 @@ function stateQuery(){
 
 async function load(){
   const qs=stateQuery();
-  const r=await fetch('/api/state'+(qs?'?'+qs:''));
-  if(!r.ok){note('Could not read state: HTTP '+r.status,'bad');return;}
-  S.state=await r.json();
+  let st=null, why='';
+  try{
+    const r=await fetch('/api/state'+(qs?'?'+qs:''));
+    if(r.ok) st=await r.json(); else why='HTTP '+r.status;
+  }catch(err){why=String(err);}
+  /* Every action button ends in load(), which is how it is handed back: the
+     redraw replaces it. A reply that cannot be read therefore still redraws, from
+     the payload already in hand, or a Sync or a job's Run stays disabled on
+     "running" with nothing left to wait for. */
+  if(!st){
+    note('Could not read state: '+esc(why),'bad');
+    if(S.state) draw();
+    return;
+  }
+  S.state=st;
   staleServerCheck(S.state);
   /* A month outside the account's lifetime heals away (the server answers with
      selected_month null rather than inventing one). Months WITH no fills are

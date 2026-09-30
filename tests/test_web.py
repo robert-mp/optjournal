@@ -651,7 +651,7 @@ def test_the_stale_server_guard_runs_before_anything_renders(state):
     card is built.
     """
     js = _js()
-    assign = js.index("S.state=await r.json();")
+    assign = js.index("S.state=st;")
     check = js.index("staleServerCheck(S.state);")
     drawn = js.index("draw();", assign)
     assert assign < check < drawn, (
@@ -2894,14 +2894,15 @@ def _page_const(name: str) -> str:
 def _page_fns(*names: str) -> list[str]:
     """The page's own functions by name, skipping any this version lacks.
 
-    `_fn` runs to the next plain `function`, so an `async function` after one is
-    cut off here: a harness declares its own stand-ins, and a second copy of one
-    would be a redeclaration. `_fn` also starts at `function`, so an async one
-    gets its keyword back.
+    `_fn` runs to the next plain `function`, which for the last one in the file
+    is the page's whole top level, so each is cut at its own closing brace (every
+    function here closes on a `}` in column 0): a harness declares its own
+    stand-ins, and page code after the function would run against them. `_fn`
+    also starts at `function`, so an async one gets its keyword back.
     """
     js = _code_only(_js())
     return [("async " if f"async function {name}(" in js else "")
-            + _fn(name).split("\nasync function ")[0]
+            + re.split(r"\n\}(?=\n|$)", _fn(name), maxsplit=1)[0] + "\n}"
             for name in names if f"function {name}(" in js]
 
 
@@ -4820,8 +4821,9 @@ def test_the_job_status_word_is_rendered_not_collapsed_to_a_colour():
     strip = _fn("collection")
     # NOT space-stripped, unlike most pins in this file: the fallback string holds
     # a space, and stripping turns `'never run'` into `'neverrun'`, so the
-    # assertion could never match whatever the code said.
-    assert "esc(j.last_status||'never run')" in strip, (
+    # assertion could never match whatever the code said. `status` is
+    # `last_status` unless the newest run is still in flight.
+    assert "esc(status||'never run')" in strip, (
         "the status word is gone, so the row carries only a colour"
     )
     # `nothing` must not be tinted as either success or failure.
@@ -4893,11 +4895,100 @@ def test_every_runnable_job_gets_a_button_and_a_retired_one_does_not():
         "no longer knows, which the endpoint answers 400 to"
     )
     # The button is disabled while the job is running, or a second click races the
-    # first and gets a 409 for a system that is working.
-    assert "busy?'disabled':''" in strip.replace('"', "'"), (
+    # first and gets a 409 for a system that is working. (And in the demo, for a
+    # job that would reach IBKR: see the executed test below.)
+    assert "busy||demoOff?'disabled':''" in strip.replace('"', "'"), (
         "the button stays enabled during a run, so a double click reports a "
         "conflict for a job that is simply still going"
     )
+
+
+def _collection_rows(demo: bool) -> dict[str, str]:
+    """The jobs strip rendered by the page's own `collection`, row by job name.
+
+    `bars_live` has a run in flight (the ledger's newest row says `running`) while
+    its state row still holds the previous outcome, `ok`: that is the payload a
+    page reads for the whole of a run. `sync` is idle and spends a request.
+    """
+    js = _code_only(_js())
+    consts = [_page_const("DEMO_NO_IBKR")] if "const DEMO_NO_IBKR=" in js else []
+    state = {
+        "demo": demo,
+        "audit": {"ever_collected": False},
+        "scheduler": {"ever_ran": False, "jobs": [
+            {"job": "bars_live", "last_status": "ok", "consecutive_failures": 0,
+             "spends_request": False, "requests": 1,
+             "last_run": {"status": "running", "started_at": "2026-09-30T14:00:00",
+                          "finished_at": None, "detail": None}},
+            {"job": "sync", "last_status": "nothing", "consecutive_failures": 0,
+             "spends_request": True, "requests": 1,
+             "last_run": {"status": "nothing", "started_at": "2026-09-30T11:00:00",
+                          "finished_at": "2026-09-30T11:00:04", "detail": None}},
+        ]},
+    }
+    html = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        f"const S={{state:{json.dumps(state)}}};",
+        *consts, *_page_fns("infoTip", "ago", "collection"),
+        "console.log(JSON.stringify(collection()));",
+    ])
+    return dict(re.findall(r'<div class="jobrow">\s*<span class="jobname mono">([a-z_]+)'
+                           r"</span>(.*?)</div>", html, re.S))
+
+
+def test_a_job_in_flight_reads_running_and_cannot_be_started_twice():
+    """L10: while a job ran, its row showed the PREVIOUS outcome and Run stayed
+    live, because `last_status` is written when a run finishes and so is never
+    `running`. The newest run's own status is what says a run is in flight.
+    """
+    rows = _collection_rows(demo=False)
+    running = rows["bars_live"]
+    assert '<span class="jobstat ">running</span>' in running, running
+    assert re.search(r"<button[^>]*\bdisabled\b[^>]*>running</button>", running), running
+    assert not re.search(r"<button[^>]*\bdisabled\b", rows["sync"]), rows["sync"]
+
+
+def test_the_demo_offers_no_run_that_would_reach_ibkr():
+    """Under `serve --demo` the server refuses a job that spends an IBKR request,
+    and the page used to ask the reader to confirm spending one first. That Run is
+    disabled there and says why; a job that costs nothing stays live. The Sync
+    button says the same thing rather than "start with --query-id", and the
+    confirm is skipped in the demo whatever the button's state.
+    """
+    rows = _collection_rows(demo=True)
+    assert re.search(r"<button[^>]*\bdisabled\b[^>]*title=\"The demo journal",
+                     rows["sync"], re.S), rows["sync"]
+    tail = _fn("draw").replace(" ", "")
+    assert "if(st.demo){b.disabled=true;b.title=DEMO_NO_IBKR;}" in tail
+    assert "&&!S.state.demo;" in _fn("bindJobRuns").replace(" ", "").replace("\n", "")
+    assert "S.state.demo?" in _fn("historyImport"), (
+        "the history import spends one request per year and is offered in the demo")
+
+
+@pytest.mark.parametrize("reply", [
+    "fetch=async()=>{throw new TypeError('Failed to fetch');};",
+    "fetch=async()=>({ok:false,status:403,json:async()=>({ok:false,kind:'host'})});",
+    "fetch=async()=>({ok:true,status:200,json:async()=>{throw new SyntaxError('<');}});",
+])
+def test_a_state_reply_that_cannot_be_read_still_hands_the_buttons_back(reply):
+    """Every action button ends in `load()`, and the redraw is what replaces it. A
+    state reply that could not be read returned (or threw) before drawing, so a
+    Sync or a job's Run stayed disabled on "running". It now redraws from the
+    payload already in hand and says why.
+    """
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const S={state:{stats:{}},month:null,type:null,cost:null,scoring:null,calday:null};",
+        "const notes=[]; let draws=0;",
+        "function note(text,kind){notes.push(kind);}",
+        "function draw(){draws++;}",
+        "function staleServerCheck(){}",
+        f"let fetch; {reply}",
+        *_page_fns("stateQuery", "load"),
+        "try{ await load(); }catch(e){ notes.push('threw'); }",
+        "console.log(JSON.stringify({draws,notes}));",
+    ])
+    assert out == {"draws": 1, "notes": ["bad"]}
 
 
 def test_only_the_job_that_spends_a_broker_request_asks_for_confirmation():
