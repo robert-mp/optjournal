@@ -46,7 +46,7 @@ order grouping, event labelling and Money aggregation, where the stats layer
 could not reach it, so the Dashboard counted a roll as two wins while the
 Trades tab drew it as one card. That is `notes.py`'s situation exactly: one
 rule, two readers that cannot see each other, the previous state being the rule
-written twice. This holds `money.py` and nothing else, so any layer may hold it
+written twice. This holds `money.py` and `notes.py`, both leaves, so any layer may hold it
 and every case below is testable against literals.
 
 Episodes are duck-typed rather than imported. Everything here reads is
