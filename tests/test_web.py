@@ -3432,7 +3432,7 @@ def _load_harness(stored: str = "position", real_note: bool = False) -> list[str
         "}",
         *banner, "function staleServerCheck(){} function draw(){}",
         "function esc(s){return String(s);}",
-        *consts, "const SCORING=()=>S.scoring||SCORINGS[0];",
+        *consts, _page_const("SCORING"),
         *_page_fns("stateQuery", "load"),
     ]
 
@@ -3501,17 +3501,19 @@ def _load_under(stored: str, steps: list[str]) -> list[dict]:
 
     Each step is `ok` (a good read) or `503`, optionally prefixed `pick:<unit>=`
     to apply the scoring switch's own write first (S.scoring, as its handler sets
-    it, after a save that stored the unit). After each step: the unit the control
-    shows, the unit the figures on screen were counted in, and the month the page
-    would ask for next.
+    it, after a save that stored the unit), or `link:<unit>=` for a unit the URL
+    names (S.scoring, as applyHash sets it; nothing is stored). After each step:
+    the unit the control shows, the unit the figures on screen were counted in,
+    and the query the page would send next.
     """
     return _node_run([
         *_load_harness(stored),
         f"const steps={json.dumps(steps)}, out=[];",
         "for(const step of steps){",
-        "  const [pick,read]=step.includes('=')?step.split('='):[null,step];",
-        "  if(pick){const unit=pick.split(':')[1];",
-        "    S.scoring=unit===SCORINGS[0]?null:unit; stored=unit;}",
+        "  const [act,read]=step.includes('=')?step.split('='):[null,step];",
+        "  if(act){const [how,unit]=act.split(':');",
+        "    if(how==='pick'){S.scoring=unit===SCORINGS[0]?null:unit; stored=unit;}",
+        "    else S.scoring=unit;}",
         "  down=read==='503'; await load();",
         "  out.push({control:SCORING(),figures:S.state.stats.scoring,asks:stateQuery()});",
         "}",
@@ -3539,6 +3541,35 @@ def test_the_scoring_control_shows_the_unit_the_figures_were_counted_in():
     assert picked[2]["control"] == picked[2]["figures"] == "contract", picked
     back = _load_under("contract", ["ok", "pick:position=ok"])[1]
     assert back["control"] == back["figures"] == "position", back
+
+
+def test_the_stored_scoring_unit_is_never_written_back_as_if_the_reader_chose_it():
+    """Follow-up review, findings 1 and 2. The fix above lit the switch by copying
+    the payload's unit into S.scoring, but on the wire an absent unit means "use
+    the stored one", and S.scoring is what the request sends. So the unit the
+    server INFERRED became one the page NAMED: with contract stored, the page wrote
+    `#scoring=contract`, and after "Per position" (saved) against a 503 the
+    rollback restored that explicit contract, the next read sent it, the server let
+    it win, and the page stayed per contract although the preference said position
+    (a reload too). And a link naming `#scoring=position` collapsed to null, so the
+    next unrelated control switched to the stored contract. The switch now reads
+    the payload's unit and S.scoring stays the unit the request explicitly named.
+    """
+    fresh = _load_under("contract", ["ok"])[0]
+    assert (fresh["control"], fresh["figures"], fresh["asks"]) == (
+        "contract", "contract", "month=current"), (
+        "the stored unit leaked into the request, or the switch does not show it")
+    rolled = _load_under("contract", ["ok", "pick:position=503", "ok"])
+    assert rolled[1]["control"] == rolled[1]["figures"] == "contract", (
+        "a failed read must leave the switch on the figures still on screen")
+    assert "scoring" not in rolled[1]["asks"], (
+        "the rollback restored an inferred unit as an explicit one")
+    assert rolled[2]["control"] == rolled[2]["figures"] == "position", (
+        f"the next good read kept the old stored unit over the new one: {rolled}")
+    linked = _load_under("contract", ["link:position=ok", "ok"])
+    assert [x["figures"] for x in linked] == ["position", "position"], (
+        f"a link's explicit unit gave way to the stored one on the next read: {linked}")
+    assert all(x["control"] == "position" for x in linked)
 
 
 def test_an_unknown_cost_key_in_the_hash_falls_back_to_the_default():
