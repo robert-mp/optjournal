@@ -104,9 +104,14 @@ EXIT_THROTTLED = 4
 DEFAULT_QUERY_ID = "1591754"
 
 #: Ceiling on the CLI subprocess, sized from the real polling budget rather
-#: than estimated. `optjournal.flex.POLL_WORST_CASE_S` is currently 660s
-#: (two retry stages of 330s), so this allows that plus margin for the HTTP
+#: than estimated. `optjournal.flex.POLL_WORST_CASE_S` is currently 420s
+#: (two retry stages of 210s), so this allows that plus margin for the HTTP
 #: round trips, XML parse and SQLite ingest that follow.
+#:
+#: It sits below `flex.FETCH_WORST_CASE_S` (930s, every request also running to
+#: its socket timeout) on purpose: raising it past that would put it above the
+#: runner's own 900s timeout, and the outer killer firing first is the worse
+#: failure. A fetch that slow is cut off here and reported by this script.
 #:
 #: This was 240s against a then-actual worst case of 2,100s, on a comment
 #: claiming "~84s" that had been carried over from a since-deleted script.
