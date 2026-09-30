@@ -316,8 +316,8 @@ def _position(leg: ReplayLeg, at: int) -> tuple[float, float]:
     """A leg's signed quantity and the cash it has moved by ``at``: ``(quantity, cash)``.
 
     A fill counts once it has happened, one at exactly ``at`` included. A
-    snapshot-only contract has no fills anywhere -- that is what makes it
-    snapshot-only -- so it is seeded from its cost basis and held flat across the
+    snapshot-only contract has no fills anywhere (that is what makes it
+    snapshot-only), so it is seeded from its cost basis and held flat across the
     window. Cash is money received, so a sale is positive.
     """
     quantity = leg.seed_quantity
@@ -461,7 +461,7 @@ def modelled_marks(
     from the snapshot's unrealised on a $3,000 position, measured while option
     closes were still read at their midnight stamps, which is that drift plus the
     snapshot being a day older than the latest bar. Close enough to trust the
-    shape, not close enough to quote as the position's value -- which is why the
+    shape, not close enough to quote as the position's value, which is why the
     card beside the chart still states the broker's figure.
 
     Gross of commission, unlike every accounting figure in this journal. A
@@ -511,13 +511,13 @@ def modelled_marks(
         delta = 0.0
         # Whether any held leg was priced, which is a different question from
         # whether the bar could be, and that distinction is the whole point. A
-        # bar can be priced while nothing is HELD -- before the opening fill, and
+        # bar can be priced while nothing is HELD: before the opening fill, and
         # after a close takes the position flat. Sharing one flag made those bars
         # report `delta` as the sum of `0 * bs_delta(...)`, an exact 0.0, and on
         # a SYMMETRIC axis 0.0 is not an absence: it is the centre line, the
         # state a strangle is opened in. So a closed trade drew twelve bars of
-        # "we were delta-neutral" when the truth was "we were not in the trade"
-        # -- the same fabrication `delta_around` already refuses to make for an
+        # "we were delta-neutral" when the truth was "we were not in the trade",
+        # the same fabrication `delta_around` already refuses to make for an
         # opening event, and the same rule `markAt` follows in returning null
         # rather than a neighbour's figure. Measured on this journal: the TSLA
         # short put reported +0.3171 then 0.0000 for twelve bars after its

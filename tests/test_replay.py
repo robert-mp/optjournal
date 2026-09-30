@@ -186,7 +186,7 @@ def test_a_fill_anchors_vol_where_the_source_has_no_history(conn):
         conn, [sold], points, underlying_conid="U1", bar_size="1h"
     )
     assert [row[0] for row in band] == opens[1:], (
-        "the band should start at the bar the fill falls in and not before it -- "
+        "the band should start at the bar the fill falls in and not before it: "
         "a vol held backwards would price a position that did not exist yet"
     )
     stamp, low, high = band[0]
