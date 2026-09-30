@@ -948,7 +948,8 @@ def test_a_plain_close_past_flat_takes_the_position_flat(conn):
     assert (ep.status, ep.net_qty, ep.realized_pnl) == ("CLOSED", 0, 398.0)
     assert (ep.entry_outside_window, ep.pre_archive_qty) == (True, 1)
     assert ep.contracts == 2, "it closed 2, so it held 2"
-    assert ep.proceeds == pytest.approx(800.0), "the whole fill, not half of it"
+    assert ep.proceeds == pytest.approx(-200.0 + 800.0), (
+        "the whole sale, not the half a split at zero would have left here")
 
 
 def test_a_bare_close_past_flat_does_not_absorb_a_later_re_entry(conn):

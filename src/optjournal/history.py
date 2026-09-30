@@ -327,27 +327,43 @@ def _known_size(ep: Episode) -> bool:
     return not ep.entry_outside_window or bool(ep.pre_archive_qty)
 
 
-def _through_zero(ep: Episode | None, row: Any) -> tuple[dict, dict] | None:
-    """A closing fill that takes the position past flat, split at zero.
+def _reverses(open_close: str | None) -> bool:
+    """Whether the fill closed one side and OPENED the other: IBKR's `C;O`.
 
-    Long 2 calls then SELL 3 in one fill (IBKR marks it `C;O`): the first 2
-    close the long and the last 1 opens a short. Returned as the closing part
-    and the opening part, or None when the fill stops at or before zero.
+    A bare `C` closes only, so the quantity past flat in one is not a new
+    position. Splitting every overshoot invented one out of a holding the archive
+    had simply never seen the entry of.
+    """
+    tokens = split_notes((open_close or "").upper())
+    return "C" in tokens and "O" in tokens
 
-    The closing part takes all of IBKR's realised P&L, which is what it is: the
-    opening part realises nothing. Commission and proceeds divide by quantity.
+
+def _past_flat(ep: Episode | None, row: Any) -> bool:
+    """Whether this closing fill takes the position beyond flat.
 
     Only for an episode whose quantity is known (`_known_size`): one whose entry
     predates the archive with nothing saying how large it was has no zero to
-    split at.
+    pass.
     """
     if ep is None or not _known_size(ep) or _flat(ep.net_qty):
-        return None
+        return False
     qty = row["quantity"] or 0
     if not _is_close(row["open_close"]) or (qty > 0) == (ep.net_qty > 0):
-        return None
-    if abs(qty) <= abs(ep.net_qty) or _flat(abs(qty) - abs(ep.net_qty)):
-        return None
+        return False
+    return abs(qty) > abs(ep.net_qty) and not _flat(abs(qty) - abs(ep.net_qty))
+
+
+def _through_zero(ep: Episode, row: Any) -> tuple[dict, dict]:
+    """A reversing fill past flat, split at zero. See `_past_flat`, which gates it.
+
+    Long 2 calls then SELL 3 in one fill (IBKR marks it `C;O`): the first 2
+    close the long and the last 1 opens a short. Returned as the closing part
+    and the opening part.
+
+    The closing part takes all of IBKR's realised P&L, which is what it is: the
+    opening part realises nothing. Commission and proceeds divide by quantity.
+    """
+    qty = row["quantity"] or 0
     closing = -ep.net_qty
     share = closing / qty
     close_part, open_part = dict(row), dict(row)
@@ -695,18 +711,29 @@ def build_history(
             flush(closed_by_reentry=True)
             current = _new_episode(row)
 
-        split = _through_zero(current, row)
-        if split is not None:
+        past_flat = _past_flat(current, row)
+        if past_flat and _reverses(row["open_close"]):
             # The fill finished one position and began the opposite one, so it
             # belongs to both episodes: the closing part ends this one, the
             # leftover opens the next.
-            _absorb(current, split[0])
+            close_part, open_part = _through_zero(current, row)
+            _absorb(current, close_part)
             flush()
             current = _new_episode(row)
-            _absorb(current, split[1])
+            _absorb(current, open_part)
             continue
 
         _absorb(current, row)
+
+        if past_flat:
+            # A bare `C` opens nothing, so closing more than the walk knew was
+            # held says the rest was held before the archive began rather than
+            # that a position opened. The close took it flat, and its size is now
+            # known: the whole fill went out of it.
+            current.pre_archive_qty += -current.net_qty
+            current.entry_outside_window = True
+            current.peak_qty = max(current.peak_qty, abs(row["quantity"] or 0))
+            current.net_qty = 0
 
         if _known_size(current) and _flat(current.net_qty):
             flush()
