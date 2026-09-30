@@ -33,19 +33,25 @@ the shipped app.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
 from optjournal.config import HOME_ENV, data_home
+from optjournal.locks import locked
 
 __all__ = [
     "DEV_ENV",
     "FILENAME",
     "HOME_ENV",
+    "LOCK_FILENAME",
     "confirm_query_id",
     "dev",
+    "lock_path",
     "path_for",
     "read",
     "query_id",
@@ -72,6 +78,14 @@ _KEYS = frozenset({"query_id", "confirm_query_id", "scoring", "tiles", "dev"})
 #: turns developer-only surfaces on for one session without touching the file.
 DEV_ENV = "OPTJOURNAL_DEV"
 
+#: The lock `update` holds across processes. Gitignored like the file it guards.
+LOCK_FILENAME = ".optjournal.lock"
+
+#: The same guard inside one process. `locks.locked` would serialise threads as
+#: well, by polling; this makes two saves from one server wait on each other
+#: directly.
+_WRITE_LOCK = threading.Lock()
+
 
 def path_for(root: Path | None = None) -> Path:
     """The settings file: in `root` when given, else in the journal's home.
@@ -87,14 +101,23 @@ def path_for(root: Path | None = None) -> Path:
     return data_home() / FILENAME
 
 
+def lock_path(root: Path | None = None) -> Path:
+    """The sidecar `update` locks, beside the settings file. See `locks.py`."""
+    return path_for(root).with_name(LOCK_FILENAME)
+
+
 def read(root: Path | None = None) -> dict[str, Any]:
     """Every stored preference, or an empty mapping if there are none.
 
     Absent, empty, malformed and not-an-object all answer the same way, because
     the caller's next move is identical in every case: use the default.
+
+    `utf-8-sig` so a byte order mark is read past rather than read as damage:
+    Windows Notepad writes one, and treating a hand-edited file as empty would
+    also let the next `update` save over every setting in it.
     """
     try:
-        loaded = json.loads(path_for(root).read_text(encoding="utf-8"))
+        loaded = json.loads(path_for(root).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     return loaded if isinstance(loaded, dict) else {}
@@ -110,6 +133,16 @@ def update(root: Path | None = None, **values: Any) -> dict[str, Any]:
     A `None` value DELETES its key, which is how "back to the default" is
     spelled. Storing null instead would make every reader distinguish "chosen
     as empty" from "never chosen", and no caller wants that distinction.
+
+    The folder is created if it is missing: on a fresh machine the per-user
+    home does not exist until something writes to it, and `optjournal setup`
+    is usually that first write.
+
+    The read, the merge and the write happen under one lock, a threading lock
+    for this process and `locks.locked` for the others. The settings page saves
+    each field on its own request, so two saves can overlap, and without the
+    lock the second one merged into a copy read before the first had landed
+    and dropped its value.
     """
     unknown = sorted(set(values) - _KEYS)
     if unknown:
@@ -117,22 +150,31 @@ def update(root: Path | None = None, **values: Any) -> dict[str, Any]:
             f"not settings this journal stores: {unknown}. Known keys: "
             f"{sorted(_KEYS)}"
         )
-    merged = read(root)
-    for key, value in values.items():
-        if value is None:
-            merged.pop(key, None)
-        else:
-            merged[key] = value
-
     target = path_for(root)
-    # Written via a temporary file in the same directory and renamed, so a
-    # crash mid-write cannot leave a truncated file where a valid one was.
-    # `read` would fail open on the wreckage, which means the failure would be
-    # SILENT: the journal would come back with every preference reset.
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n",
-                   encoding="utf-8")
-    os.replace(tmp, target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _WRITE_LOCK, locked(lock_path(root)):
+        merged = read(root)
+        for key, value in values.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+        # Written via a temporary file in the same directory and renamed, so a
+        # crash mid-write cannot leave a truncated file where a valid one was.
+        # `read` would fail open on the wreckage, which means the failure would
+        # be SILENT: the journal would come back with every preference reset.
+        # A unique name, so a writer that does not take the lock (an older
+        # version still running) cannot rename this one's file away.
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".optjournal.",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(merged, indent=2, sort_keys=True) + "\n")
+            os.replace(tmp, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
     return merged
 
 
