@@ -42,6 +42,7 @@ simpler than five and the panels can never disagree with each other.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import http.server
 import ipaddress
 import json
@@ -55,6 +56,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -471,6 +473,18 @@ def _host_is_self(header: str | None, *, host: str, port: int) -> bool:
     if header is None:
         return False
     return header.strip().lower() in _authorities(host, port, *_HOST_NAMES)
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    """Whether SQLite raised because another connection holds the journal.
+
+    By the primary result code (the low byte of the extended one), because the
+    wording is SQLite's to change, and BUSY and LOCKED are its only two
+    "someone else has it" answers.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) in (sqlite3.SQLITE_BUSY,
+                                                  sqlite3.SQLITE_LOCKED)
 
 
 def _now() -> str:
@@ -1056,12 +1070,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # Assigned before super().__init__, which handles the request inside
         # the constructor -- stdlib quirk, not a style choice.
         self.cfg = cfg
+        #: Whether a status line has gone out, so `_failed` never sends a
+        #: second response into one that is already half written.
+        self._replied = False
         super().__init__(*args, **kwargs)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         log.debug("%s - %s", self.address_string(), fmt % args)
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self._replied = True
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -1113,6 +1131,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, code: int, payload: Any) -> None:
         self._send(code, json.dumps(payload, default=str).encode(), "application/json")
 
+    def _failed(self, exc: Exception) -> None:
+        """The last resort: an exception no route caught still gets a JSON 500.
+
+        `BaseHTTPRequestHandler` has no error handler of its own. An exception
+        that escapes a handler closes the connection with no reply at all, which
+        the page can only show as "Failed to fetch", naming neither the route nor
+        the cause. Found on several shapes (a huge run id, a NUL in a static path,
+        deeply nested JSON, a download that was not a zip), each fixed where it
+        happens; this is for the next one. Called from an `except` block, so the
+        log line carries the traceback.
+        """
+        log.exception("%s %s failed", self.command, self.path.partition("?")[0])
+        if not self._replied:
+            self._json(500, {"ok": False, "kind": "internal",
+                             "message": f"{type(exc).__name__}: {exc}"})
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
         if not self._addressed_here():
             return
@@ -1131,7 +1165,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                            "journal has no authentication.",
             })
             return
-        params = urllib.parse.parse_qs(query)
+        try:
+            self._route_get(path, urllib.parse.parse_qs(query))
+        except Exception as exc:  # noqa: BLE001 - the last resort, see `_failed`
+            self._failed(exc)
+
+    def _route_get(self, path: str, params: dict[str, list[str]]) -> None:
+        """The GET routing, so `do_GET` can wrap all of it in one guard."""
         if path in ("/", "/index.html"):
             self._send(200, page_html().encode(), "text/html; charset=utf-8")
         elif path == "/companion":
@@ -1145,6 +1185,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # CSP is `default-src 'self'`, and a path that could escape this
             # directory would turn a local journal viewer into a file server.
             name = path[len("/static/"):]
+            if "\0" in name:
+                # `Path.resolve` raises on a NUL rather than answering False.
+                self._json(404, {"error": "not found"})
+                return
             asset = (Path(__file__).parent / "static" / name).resolve()
             root = (Path(__file__).parent / "static").resolve()
             ctype = STATIC_TYPES.get(asset.suffix)
@@ -1334,7 +1378,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return {}
         try:
             parsed = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, OSError):
+        except (ValueError, OSError, RecursionError):
+            # RecursionError is what deeply nested JSON raises ("[" repeated
+            # 60,000 times fits the journal endpoint's cap), and it is not a
+            # ValueError.
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
@@ -1858,7 +1905,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             updates.stage(release)
         except updates.UpdateRefused as exc:
             return 409, {"ok": False, "kind": "refused", "message": str(exc)}
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile,
+                http.client.HTTPException) as exc:
+            # BadZipFile for a body that is not a zip (an error page), and
+            # HTTPException for one cut off mid-download (IncompleteRead):
+            # neither is an OSError.
             return 502, {"ok": False, "kind": "download",
                          "message": f"could not download the update: {exc}"}
         self._restart_soon()
@@ -1934,6 +1985,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             run_id = int((params.get("id") or ["0"])[0])
         except ValueError:
             return 400, {"ok": False, "kind": "id", "message": "id must be an integer"}
+        if not 0 < run_id < 2**63:
+            # No run has it, and SQLite cannot bind an integer past 64 bits
+            # (OverflowError), so this is answered before asking.
+            return 404, {"ok": False, "kind": "missing",
+                         "message": f"no run {run_id}"}
         conn = connect(self.cfg.db_path)
         try:
             row = conn.execute(
@@ -1965,6 +2021,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             self._route_post(path)
         except sqlite3.OperationalError as exc:
+            if not _is_busy(exc):
+                # Only a busy journal is "locked, try again". A read-only file,
+                # a full disk or a damaged database will not change by waiting,
+                # so the reply carries SQLite's own words instead.
+                log.warning("POST %s hit a database error: %s", path, exc)
+                self._json(500, {"ok": False, "kind": "database",
+                                 "message": f"the journal could not be written: "
+                                            f"{exc}"})
+                return
             # A LOCKED DATABASE OTHERWISE ANSWERS NOTHING AT ALL, and that was
             # measured rather than assumed: `do_POST` caught nothing, and
             # `BaseHTTPRequestHandler` has no error handler, so the exception
@@ -1985,6 +2050,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                            "a moment.",
             })
             return
+        except Exception as exc:  # noqa: BLE001 - the last resort, see `_failed`
+            self._failed(exc)
 
     def _route_post(self, path: str) -> None:
         """The routing itself, so `do_POST` can wrap all of it in one guard."""

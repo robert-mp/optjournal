@@ -6046,6 +6046,112 @@ def test_the_locked_database_guard_covers_every_post_route_not_just_one():
     ), "the guard is duplicated inside the router as well as around it"
 
 
+def test_only_a_busy_database_is_reported_as_locked(tmp_path):
+    """L28: every OperationalError used to answer 503 "locked, try again", so a
+    journal on a read-only volume told the reader to wait for something that
+    would never change. Only SQLITE_BUSY and SQLITE_LOCKED are "locked"; the
+    rest are a 500 that carries SQLite's own words."""
+    import os  # noqa: PLC0415 - local to this test
+
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    files = [db, *tmp_path.glob("j.db-*")]
+    for path in files:
+        os.chmod(path, 0o444)
+    try:
+        with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+            status, reply = _post(base, "/api/watchlist", {"symbol": "SPY", "note": "x"})
+    finally:
+        for path in files:
+            os.chmod(path, 0o644)
+    assert (status, reply["kind"]) == (500, "database")
+    assert "readonly" in reply["message"]
+
+
+def _raw_for(base: str, head: bytes, body: bytes = b"") -> tuple[int, dict]:
+    """`_raw` with this server's own Host, for a request urllib will not send."""
+    port = base.rsplit(":", 1)[1].encode()
+    length = f"Content-Length: {len(body)}\r\n".encode() if body else b""
+    return _raw(base, head + b"\r\nHost: 127.0.0.1:" + port + b"\r\n" + length
+                + b"Connection: close\r\n\r\n" + body)
+
+
+def _post_bytes(base: str, path: str, body: bytes) -> tuple[int, dict]:
+    """A POST whose body is not JSON we built, so it can be malformed on purpose."""
+    import urllib.error  # noqa: PLC0415 - local to this helper
+    import urllib.request  # noqa: PLC0415
+
+    request = urllib.request.Request(f"{base}{path}", method="POST", data=body,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_no_malformed_request_ends_with_an_empty_reply(tmp_path):
+    """L27: each of these escaped its handler, and `BaseHTTPRequestHandler`
+    then closes the connection with no reply at all."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        # 60,000 `[` fits the journal endpoint's larger cap, and json.loads
+        # raises RecursionError on it, which is not a ValueError.
+        status, reply = _post_bytes(base, "/api/journal", b"[" * 60000)
+        assert (status, reply["kind"]) == (400, "anchor")
+        # An integer SQLite cannot bind raises OverflowError, not ValueError.
+        status, reply = _get(base, "/api/jobs/run?id=99999999999999999999")
+        assert (status, reply["kind"]) == (404, "missing")
+        # A NUL byte makes `Path.resolve` raise.
+        status, reply = _raw_for(base, b"GET /static/app.css\x00.js HTTP/1.1")
+        assert (status, reply["error"]) == (404, "not found")
+
+
+@pytest.mark.parametrize("download", ["html", "truncated"])
+def test_a_download_that_is_not_a_release_is_a_502(populated, monkeypatch, download):
+    """L27: a non-zip body raises BadZipFile and a cut-off one IncompleteRead,
+    neither an OSError, so the Update button got no reply."""
+    import http.client  # noqa: PLC0415 - local to this test
+
+    from optjournal import updates  # noqa: PLC0415
+
+    def get(url, *, limit):
+        if download == "truncated":
+            raise http.client.IncompleteRead(b"PK\x03\x04")
+        return b"<html>GitHub is having a bad day</html>"
+
+    monkeypatch.setattr(updates, "latest_release", lambda: updates.Release(
+        version="9.9.9", notes="", page_url="", zip_url="https://x/y.zip"))
+    monkeypatch.setattr(updates, "cannot_apply", lambda root=None: None)
+    monkeypatch.setattr(updates, "_get", get)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/update")
+    assert (status, reply["kind"]) == (502, "download")
+
+
+def test_an_unexpected_error_is_a_json_500_on_both_verbs(tmp_path, monkeypatch):
+    """L27, the last resort: whatever a handler did not foresee still answers,
+    so the page shows the cause instead of "Failed to fetch"."""
+    def boom(*_a, **_k):
+        raise RuntimeError("something nobody planned for")
+
+    monkeypatch.setattr(web, "fetch_quote", boom)
+    monkeypatch.setattr(web, "fetch_iv_rank", boom)
+    monkeypatch.setattr(web, "fetch_events", boom)
+    db = tmp_path / "j.db"
+    with open_journal(db) as conn:
+        conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('AMD', 'x')")
+        conn.commit()
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        for status, reply in (_get(base, "/api/quotes"),
+                              _post(base, "/api/market/fetch")):
+            assert (status, reply["ok"], reply["kind"]) == (500, False, "internal")
+            assert "something nobody planned for" in reply["message"]
+
+
 def test_serve_ephemeral_never_starts_a_scheduler():
     """A SAFETY PROPERTY, not a preference, and it is about this test suite.
 
