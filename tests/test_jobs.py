@@ -1698,6 +1698,35 @@ def test_a_run_after_a_suspend_is_stamped_slept(conn, ctx, monkeypatch):
         "SELECT slept FROM job_runs WHERE fired_for IS NOT NULL").fetchone()[0] == 1
 
 
+def test_a_run_that_raised_after_a_suspend_is_stamped_slept_too(conn, ctx, monkeypatch):
+    """L9: the flag matters most on the runs that FAILED after a wake.
+
+    The keychain's -25320 refusals happened on the first tick after a sleep, and
+    those runs raise. Stamping `slept` only when `run_job` returned left exactly
+    those rows at 0, which hid the pattern the flag exists to show.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal import jobs as mod
+
+    def dark_wake(_c, _x):
+        raise RuntimeError("Can't get password from keychain: (-25320, 'Unknown Error')")
+
+    _stub(monkeypatch, "market", dark_wake)
+    monkeypatch.setattr(mod, "JOBS", tuple(j for j in mod.JOBS if j.name == "market"))
+    conn.execute("INSERT INTO job_runs (job, started_at, status) VALUES"
+                 " ('market', '2026-08-11T11:00:00+00:00', 'ok')")
+    conn.commit()
+    now = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+
+    assert mod.reconcile(conn, ctx=ctx, now=now, slept=True) == []
+    row = conn.execute(
+        "SELECT status, slept FROM job_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "failed"
+    assert row["slept"] == 1, "a run that raised after a suspend is not marked slept"
+
+
 def test_the_loop_survives_a_tick_that_raises(ctx, tmp_path, monkeypatch):
     """The containment that matters most, at the loop level rather than the job's.
 

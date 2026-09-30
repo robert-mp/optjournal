@@ -717,6 +717,7 @@ def run_job(
     *,
     ctx: Context,
     fired_for: int | None = None,
+    slept: bool = False,
 ) -> int:
     """Run one job under its own lock, recording before and after. Returns run id.
 
@@ -747,7 +748,7 @@ def run_job(
     lock = job_lock_path(ctx.archive_dir, job.name)
     try:
         with locked(lock, timeout_s=0):
-            return _run_locked(conn, job, ctx=ctx, fired_for=fired_for)
+            return _run_locked(conn, job, ctx=ctx, fired_for=fired_for, slept=slept)
     except LockTimeout:
         # Held by another runner. The row it committed before starting is what
         # tells the caller which run to watch.
@@ -755,15 +756,22 @@ def run_job(
 
 
 def _run_locked(
-    conn: sqlite3.Connection, job: Job, *, ctx: Context, fired_for: int | None
+    conn: sqlite3.Connection, job: Job, *, ctx: Context, fired_for: int | None,
+    slept: bool,
 ) -> int:
-    """The body of `run_job`, with the lock held. See its docstring for the why."""
+    """The body of `run_job`, with the lock held. See its docstring for the why.
+
+    `slept` goes into the claim row itself, so a run that raises carries it too.
+    Stamping it after a successful return left exactly the runs that mattered at
+    0: the keychain's -25320 refusals came on the first tick after a sleep, and
+    those runs raised.
+    """
     started = datetime.now(UTC).isoformat(timespec="seconds")
     try:
         cursor = conn.execute(
-            "INSERT INTO job_runs (job, fired_for, started_at, status, detail)"
-            " VALUES (?,?,?,'running',NULL)",
-            (job.name, fired_for, started),
+            "INSERT INTO job_runs (job, fired_for, started_at, status, detail, slept)"
+            " VALUES (?,?,?,'running',NULL,?)",
+            (job.name, fired_for, started, int(slept)),
         )
         run_id = int(cursor.lastrowid or 0)
         conn.commit()          # COMMITTED before the work: see run_job's docstring
@@ -1230,13 +1238,10 @@ def reconcile(
             continue
         log.info("%s is due (%s)", due.job.name, due.reason)
         try:
-            run_id = run_job(conn, due.job.name, ctx=ctx, fired_for=due.fired_for)
+            # `slept`: why a noon job fired at 09:14 becomes a field rather than a
+            # mystery. Both clocks are already read, so it is free.
+            run_job(conn, due.job.name, ctx=ctx, fired_for=due.fired_for, slept=slept)
             started.append(due.job.name)
-            if slept and run_id:
-                # Why a noon job fired at 09:14 becomes a field rather than a
-                # mystery. Both clocks are already read, so this is free.
-                conn.execute("UPDATE job_runs SET slept = 1 WHERE id = ?", (run_id,))
-                conn.commit()
         except JobBusy:
             # Another runner has it -- the page, or a previous tick still working.
             # Not an error: the file lock and the unique index are doing their job.
