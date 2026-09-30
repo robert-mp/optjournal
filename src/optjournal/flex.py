@@ -30,7 +30,7 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -223,10 +223,16 @@ FETCH_SOCKET_TIMEOUT_S = 60
 #: job while the fetch lock was held, with nothing in the ledger to say why.
 KEYRING_READ_TIMEOUT_S = 30.0
 
-#: Held from the start of a keyring read until the OS call returns, which for a
-#: keychain waiting on an unlock is never. ONE READ IN FLIGHT per process, for
-#: every caller: the fetches and the page's token check. See `_within`.
-_KEYRING_READ = threading.Lock()
+#: A keyring call pending for this many read deadlines is taken to be stuck for
+#: good (a keychain waiting on an unlock prompt nobody will answer), and the next
+#: read starts a fresh call instead of waiting on it. Until then reads share the
+#: pending call. So a stuck call costs one more thread per this many deadlines.
+KEYRING_STUCK_AFTER_DEADLINES = 3
+
+#: The most keyring calls ever pending at once. A keychain that answers nothing
+#: costs this many threads, and then reads stop starting calls: they say the
+#: keyring is wedged and that restarting optjournal clears it.
+KEYRING_MAX_PENDING = 3
 
 #: Worst-case wall time of one fetch, from taking the lock to stamping the
 #: cooldown: the keyring read, the polling sleeps, and every request of both
@@ -347,9 +353,10 @@ class TokenRejected(RuntimeError):
 
 
 class TokenUnreadable(TokenMissing):
-    """The OS keyring did not answer within `KEYRING_READ_TIMEOUT_S`.
+    """The OS keyring did not answer in time, or a call to it is stuck.
 
-    A `TokenMissing`, because for this run there is no usable token and every
+    The message says which, and for a stuck call that restarting optjournal
+    clears it. A `TokenMissing`, because for this run there is no usable token and every
     caller already reports that as a credentials failure with its message: the
     job ledger, the Sync button and the CLI. Its own type because the remedy
     differs: the token is probably stored, and the keychain is waiting for an
@@ -396,63 +403,128 @@ class FetchResult:
         return self.duplicate_of is not None
 
 
-def _within(timeout_s: float, work: Callable[[], str | None]) -> tuple[bool, object]:
-    """Run the keyring read `work` on a daemon thread. (finished, result or error).
+class _KeyringCall:
+    """One keyring read on a daemon thread, whose answer any reader may wait for.
 
-    The pattern of `web._keyring_call`: a DAEMON thread, so a call still blocked
-    in the OS cannot keep the process alive, and a late answer lands in a list
-    nobody reads. Python cannot interrupt a thread blocked in a syscall, so a
-    deadline has to be a wait on another thread rather than a timeout on the call.
-
-    ONE AT A TIME, the other half of that pattern: `_KEYRING_READ` is held by the
-    thread until its call returns, and a read that finds it held waits for it
-    inside the same deadline and gives up unfinished. Without it, a keychain that
-    never answers kept each timed-out thread and every later read started another:
-    one per fetch attempt and one per token check, for the life of the process.
+    A DAEMON thread, so a call still blocked in the OS cannot keep the process
+    alive. Python cannot interrupt a thread blocked in a syscall, so a deadline
+    has to be a wait on another thread rather than a timeout on the call.
     """
-    deadline = time.monotonic() + timeout_s
-    if not _KEYRING_READ.acquire(timeout=timeout_s):
-        return False, None
-    outcome: list[object] = []
 
-    def run() -> None:
+    def __init__(self, account: str) -> None:
+        self.account = account
+        self.started = time.monotonic()
+        self.done = threading.Event()
+        self.answer: object = None
+
+    def run(self) -> None:
         try:
-            outcome.append(work())
-        except Exception as exc:  # noqa: BLE001 - handed back to the caller
-            outcome.append(exc)
+            self.answer = keyring.get_password(KEYRING_SERVICE, self.account)
+        except Exception as exc:  # noqa: BLE001 - handed to every reader
+            self.answer = exc
         finally:
-            _KEYRING_READ.release()
-
-    worker = threading.Thread(target=run, name="keyring-read", daemon=True)
-    worker.start()
-    worker.join(max(0.0, deadline - time.monotonic()))
-    return (True, outcome[0]) if outcome else (False, None)
+            self.done.set()
 
 
-def read_token(account: str | None = None) -> str:
+class _Keyring:
+    """The keyring reads pending in this process, shared by every reader.
+
+    SHARED, NOT ONE PER READER, and bounded, for two measured failures. One call
+    per read leaked a stuck thread per fetch attempt and per token check while a
+    keychain waited on an unlock. One call at a time, held until it returned,
+    meant a single call that never returns blocked every read until a restart:
+    each fetch failed as unreadable and a stored token could not be seen. So a
+    read waits on the pending call, a call pending past its deadlines is given
+    up on, and a call from before a token was stored is not waited on at all.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pending: list[_KeyringCall] = []
+        #: When a token was last stored, per account. A read pending from before
+        #: then cannot return it, and the keychain has plainly answered since.
+        self.stored_at: dict[str, float] = {}
+
+    def stored(self, account: str) -> None:
+        with self.lock:
+            self.stored_at[account] = time.monotonic()
+
+    def call_for(self, account: str, now: float) -> _KeyringCall | None:
+        """The call a read arriving `now` waits on, started if need be.
+
+        None when `KEYRING_MAX_PENDING` calls are stuck, and no more may start.
+        """
+        stuck_after = KEYRING_STUCK_AFTER_DEADLINES * KEYRING_READ_TIMEOUT_S
+        with self.lock:
+            self.pending = [c for c in self.pending if not c.done.is_set()]
+            stored = self.stored_at.get(account, float("-inf"))
+            for call in reversed(self.pending):
+                if (call.account == account and call.started > stored
+                        and now - call.started < stuck_after):
+                    return call
+            if len(self.pending) >= KEYRING_MAX_PENDING:
+                return None
+            call = _KeyringCall(account)
+            self.pending.append(call)
+        threading.Thread(target=call.run, name="keyring-read", daemon=True).start()
+        return call
+
+    def oldest_age(self, now: float) -> float:
+        with self.lock:
+            return max((now - c.started for c in self.pending), default=0.0)
+
+
+_KEYRING = _Keyring()
+
+
+def _unreadable(call: _KeyringCall | None, arrived: float, wait_s: float) -> str:
+    """Why a read got no answer, and what clears it."""
+    now = time.monotonic()
+    if call is None:
+        return (
+            f"{KEYRING_MAX_PENDING} reads of the OS keyring have not returned, the "
+            f"oldest after {_KEYRING.oldest_age(now):.0f}s, so no more are started. "
+            f"Nothing was sent to IBKR. The keychain is waiting on an unlock prompt: "
+            f"unlock it if one is showing, and if none is, restart optjournal, "
+            f"which clears them."
+        )
+    if arrived - call.started >= KEYRING_READ_TIMEOUT_S:
+        return (
+            f"a read of the OS keyring has not returned after "
+            f"{now - call.started:.0f}s, usually a keychain waiting on an unlock "
+            f"prompt nobody answered. Nothing was sent to IBKR. Unlock the keychain "
+            f"if a prompt is showing; if none is, restart optjournal, which clears it."
+        )
+    return (
+        f"the OS keyring did not answer within {wait_s:g}s, usually because it is "
+        f"waiting for you to unlock it. Nothing was sent to IBKR. Check for a "
+        f"system prompt, then try again."
+    )
+
+
+def read_token(account: str | None = None, *, timeout_s: float | None = None) -> str:
     """Return the Flex token from the OS keyring.
 
     `account` defaults to the current user, matching how the entry is
     created:  security add-generic-password -a "$USER" -s ibkr-flex-token -w
 
-    Bounded by `KEYRING_READ_TIMEOUT_S`; raises `TokenUnreadable` past it. An
-    error the keyring backend raises is raised as itself.
+    Waits `timeout_s` (default `KEYRING_READ_TIMEOUT_S`) and raises
+    `TokenUnreadable` past it, saying whether the keychain is merely slow to
+    answer or a call is stuck. A read already pending is waited on rather than
+    repeated (see `_Keyring`). An error the keyring backend raises is raised as
+    itself.
     """
     if account is None:
         import getpass
 
         account = getpass.getuser()
 
-    who = account
-    finished, answer = _within(
-        KEYRING_READ_TIMEOUT_S, lambda: keyring.get_password(KEYRING_SERVICE, who))
-    if not finished:
-        raise TokenUnreadable(
-            f"the OS keyring did not answer within {KEYRING_READ_TIMEOUT_S:g}s, "
-            f"usually because it is waiting for you to unlock it. Nothing was sent "
-            f"to IBKR. Check for a system prompt, or run `optjournal setup` in a "
-            f"terminal, then try again."
-        )
+    wait_s = KEYRING_READ_TIMEOUT_S if timeout_s is None else timeout_s
+    arrived = time.monotonic()
+    call = _KEYRING.call_for(account, arrived)
+    if call is None or not call.done.wait(wait_s):
+        raise TokenUnreadable(_unreadable(call, arrived, wait_s))
+    answer = call.answer
     if isinstance(answer, Exception):
         raise answer
     token = answer if isinstance(answer, str) else None
@@ -502,6 +574,11 @@ def write_token(token: str, account: str | None = None) -> str:
         keyring.set_password(KEYRING_SERVICE, account, token)
     except Exception as exc:
         raise TokenWriteRefused(_write_refusal(exc, account)) from exc
+    finally:
+        # A read still pending from before this cannot return the token just
+        # stored, so the next read asks afresh rather than wait on it (for as
+        # long as a stuck call's deadlines, before this).
+        _KEYRING.stored(account)
     return account
 
 
