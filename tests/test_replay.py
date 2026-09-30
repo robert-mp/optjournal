@@ -24,7 +24,6 @@ from optjournal.blackscholes import bs_price
 from optjournal.clock import epoch_et, expiry_epoch
 from optjournal.marketdata import Bar
 from optjournal.replay import (
-    BandContract,
     ReplayLeg,
     delta_around,
     expected_move_band,
@@ -78,7 +77,7 @@ def test_the_band_solves_vol_from_the_options_own_closes(conn):
     points = [(s, spot) for s in opens]
     band = expected_move_band(
         conn,
-        [BandContract(conid="OPT1", strike=strike, right="P", expiry=expiry)],
+        [ReplayLeg(conid="OPT1", strike=strike, right="P", expiry=expiry)],
         points,
         underlying_conid="U1",
         bar_size="1d",
@@ -99,7 +98,7 @@ def test_the_band_is_absent_rather_than_narrow_without_a_vol(conn):
                 bars=[_bar(_ts("2026-01-05") + 13 * 3600, 100.0)])
     band = expected_move_band(
         conn,
-        [BandContract(conid="OPT1", strike=90.0, right="P", expiry="2026-03-20")],
+        [ReplayLeg(conid="OPT1", strike=90.0, right="P", expiry="2026-03-20")],
         [(_ts("2026-01-05") + 13 * 3600, 100.0)],
         underlying_conid="U1",
         bar_size="1d",
@@ -142,9 +141,7 @@ def test_marks_stop_at_expiry_rather_than_pricing_a_settled_contract(conn):
     )
     marks = modelled_marks(conn, [leg], points, underlying_conid="U1", bar_size="1d")
     band = expected_move_band(
-        conn,
-        [BandContract(conid="OPT1", strike=strike, right="P", expiry=expiry)],
-        points, underlying_conid="U1", bar_size="1d",
+        conn, [leg], points, underlying_conid="U1", bar_size="1d",
     )
     assert marks, "the control: marks must exist while the contract is alive"
     assert max(row[0] for row in marks) <= expiry_ts, (
@@ -172,20 +169,21 @@ def test_a_fill_anchors_vol_where_the_source_has_no_history(conn):
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1h", source="yahoo",
                 bars=[_bar(s, spot) for s in opens])
     points = [(s, spot) for s in opens]
-    contract = BandContract(conid="OPT1", strike=strike, right="P", expiry=expiry)
+    leg = ReplayLeg(conid="OPT1", strike=strike, right="P", expiry=expiry)
 
     assert expected_move_band(
-        conn, [contract], points, underlying_conid="U1", bar_size="1h"
+        conn, [leg], points, underlying_conid="U1", bar_size="1h"
     ) == [], "the control: with no option price at all there is nothing to solve"
 
-    # The same contract, priced by a fill halfway through the second bar.
+    # The same contract, sold halfway through the second bar: the fill is an
+    # option price the market really charged.
     fill_at = opens[1] + 1800
     years = (expiry_ts - fill_at) / (365.0 * 86400)
-    priced = replace(
-        contract, anchors=((fill_at, bs_price(spot, strike, years, vol, "P")),)
+    sold = replace(
+        leg, fills=((fill_at, -1.0, bs_price(spot, strike, years, vol, "P")),)
     )
     band = expected_move_band(
-        conn, [priced], points, underlying_conid="U1", bar_size="1h"
+        conn, [sold], points, underlying_conid="U1", bar_size="1h"
     )
     assert [row[0] for row in band] == opens[1:], (
         "the band should start at the bar the fill falls in and not before it -- "
@@ -581,3 +579,62 @@ def test_a_fill_is_paired_with_the_spot_either_side_of_it(conn, filled, spot_the
     assert (row[2] - row[1]) / 2 == pytest.approx(
         bar_spot * vol * ((expiry - (row[0] + 3600)) / _YEAR) ** 0.5, abs=1e-4
     ), "the fill was paired with a spot other than the one around it"
+
+
+def _daily(conn, days: list[str], spot: float) -> None:
+    """Daily underlying bars, stamped at the session open as the source stamps them."""
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(epoch_et(f"{day} 09:30:00"), spot) for day in days])
+
+
+def test_the_band_measures_to_the_legs_held_at_each_bar(conn):
+    """After a roll the envelope is the NEW leg's: its expiry and its vol.
+
+    The horizon was the nearest expiry over every leg the lifecycle ever held,
+    and the vol their average, so a roll outward kept measuring to the contract
+    it had just closed. Measured on the real open QCOM position, a short 10/16
+    call rolled into an 11/20 put: the band was 43% too narrow, and it vanished on
+    10/16 while the put was still open. On a bar holding nothing (the context
+    before entry) every leg still alive is the basis, as before.
+    """
+    spot = 100.0
+    days = ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08",
+            "2026-01-09", "2026-01-12", "2026-01-13"]
+    _daily(conn, days, spot)
+    near, far = epoch_et("2026-01-09 16:00:00"), epoch_et("2026-01-23 16:00:00")
+    for conid, strike, right, expiry, vol in (("CALL", 110.0, "C", near, 0.30),
+                                              ("PUT", 90.0, "P", far, 0.50)):
+        for day in days:
+            closes = epoch_et(f"{day} 16:00:00")
+            if closes < expiry:
+                years = (expiry - closes) / _YEAR
+                _option_close(conn, conid, day, bs_price(spot, strike, years, vol, right))
+
+    def price(strike, right, expiry, vol, at):
+        return bs_price(spot, strike, (expiry - epoch_et(at)) / _YEAR, vol, right)
+
+    rolled = "2026-01-07 10:15:00"
+    replay = _replay(conn, [
+        _leg("CALL", 110.0, "C", "2026-01-09", "2026-01-05 10:15:00", -1,
+             price(110.0, "C", near, 0.30, "2026-01-05 10:15:00")),
+        _leg("CALL", 110.0, "C", "2026-01-09", rolled, 1,
+             price(110.0, "C", near, 0.30, rolled), marker="C"),
+        _leg("PUT", 90.0, "P", "2026-01-23", rolled, -1,
+             price(90.0, "P", far, 0.50, rolled)),
+    ])
+
+    half = _half(replay["band"])
+
+    def want(day, vol, horizon):
+        return spot * vol * ((horizon - epoch_et(f"{day} 16:00:00")) / _YEAR) ** 0.5
+
+    # Before entry nothing is held: both legs are the basis, as they always were.
+    assert half[epoch_et("2026-01-02 09:30:00")] == pytest.approx(
+        want("2026-01-02", 0.40, near), abs=1e-4)
+    for day in ("2026-01-05", "2026-01-06"):
+        assert half[epoch_et(f"{day} 09:30:00")] == pytest.approx(
+            want(day, 0.30, near), abs=1e-4), f"{day}: the call alone was held"
+    for day in ("2026-01-07", "2026-01-08", "2026-01-09", "2026-01-12", "2026-01-13"):
+        assert epoch_et(f"{day} 09:30:00") in half, f"{day}: the band vanished with the put held"
+        assert half[epoch_et(f"{day} 09:30:00")] == pytest.approx(
+            want(day, 0.50, far), abs=1e-4), f"{day}: measured to a leg rolled away"

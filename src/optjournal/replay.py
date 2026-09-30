@@ -312,9 +312,44 @@ def _held_forward(series: list[tuple[int, float]], stamp: int) -> float | None:
     return found
 
 
+def _position(leg: ReplayLeg, at: int) -> tuple[float, float]:
+    """A leg's signed quantity and the cash it has moved by ``at``: ``(quantity, cash)``.
+
+    A fill counts once it has happened, one at exactly ``at`` included. A
+    snapshot-only contract has no fills anywhere -- that is what makes it
+    snapshot-only -- so it is seeded from its cost basis and held flat across the
+    window. Cash is money received, so a sale is positive.
+    """
+    quantity = leg.seed_quantity
+    cash = -leg.seed_quantity * leg.seed_price * leg.multiplier
+    for fill_at, delta_qty, price in leg.fills:
+        if fill_at > at:
+            break
+        quantity += delta_qty
+        cash -= delta_qty * price * leg.multiplier
+    return quantity, cash
+
+
+def _basis(legs: list[ReplayLeg], at: int) -> list[tuple[ReplayLeg, int]]:
+    """The legs a bar is modelled from, each with its expiry epoch.
+
+    The legs HELD at ``at``, or every leg when nothing is held (the context either
+    side of the trade), less any that have expired by then: an expired contract
+    has no horizon left to measure. Held rather than ever-held, because a roll
+    closes one contract and opens another, and the position after it is the new
+    one's. Empty when everything held has expired, which is a settled position.
+    """
+    held = [leg for leg in legs if _position(leg, at)[0]]
+    return [
+        (leg, expiry)
+        for leg in (held or legs)
+        if (expiry := expiry_epoch(leg.expiry)) is not None and expiry >= at
+    ]
+
+
 def expected_move_band(
     conn: sqlite3.Connection,
-    contracts: list[BandContract],
+    legs: list[ReplayLeg],
     points: list[tuple[int, float]],
     *,
     underlying_conid: str | None,
@@ -331,35 +366,33 @@ def expected_move_band(
     expiry session, which closes AT the expiry, is drawn with no width: nothing
     is left to move.
 
-    The horizon is the NEAREST expiry among the legs, which is the one that
-    dominates the risk. That is also what makes the envelope narrow as a trade
-    ages and step outward when a roll pushes expiry further out.
+    Each bar is measured from its `_basis`, the legs held at that bar: the vol is
+    their average and the horizon the NEAREST of their expiries, which is the one
+    that dominates the risk. That is what makes the envelope narrow as a trade
+    ages and step outward when a roll pushes expiry further out. It was once the
+    nearest expiry over every leg the trade ever held, so after a roll it kept
+    measuring to the contract just closed, and vanished at that contract's
+    expiry while the new one was still open.
     """
     # `is None`, not `vols or ...`: an empty dict is the legitimate answer when
     # nothing solved, and the truthiness spelling would re-run the whole solve
     # for exactly that case.
     if vols is None:
-        vols = _vol_series(conn, contracts, points, underlying_conid, bar_size)
+        vols = _vol_series(conn, band_contracts(legs), points, underlying_conid, bar_size)
     if not vols:
         return []
-    expiries = [
-        expiry
-        for expiry in (expiry_epoch(c.expiry) for c in contracts if c.conid in vols)
-        if expiry is not None
-    ]
-    if not expiries:
-        return []
-    horizon = min(expiries)
     band: list[list[float]] = []
     for stamp, spot in points:
         at = _closed_at(stamp, bar_size)
+        basis = _basis(legs, at)
         observed = [
             vol
-            for vol in (_held_forward(series, at) for series in vols.values())
+            for vol in (_held_forward(vols.get(leg.conid, []), at) for leg, _ in basis)
             if vol is not None
         ]
         if not observed:
             continue
+        horizon = min(expiry for _, expiry in basis)
         average = sum(observed) / len(observed)
         move = 0.0 if at == horizon else expected_move(spot, average, (horizon - at) / _YEAR)
         if move is None:
@@ -552,10 +585,9 @@ def replay_model(
     """
     if not points or bar_size is None:
         return [], []
-    contracts = band_contracts(legs)
-    vols = _vol_series(conn, contracts, points, underlying_conid, bar_size)
+    vols = _vol_series(conn, band_contracts(legs), points, underlying_conid, bar_size)
     band = expected_move_band(
-        conn, contracts, points, underlying_conid=underlying_conid,
+        conn, legs, points, underlying_conid=underlying_conid,
         bar_size=bar_size, vols=vols,
     )
     marks = modelled_marks(
