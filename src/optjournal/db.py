@@ -22,8 +22,8 @@ Design notes, and the reasoning behind the non-obvious choices:
 
 * Three write semantics. trades/cash are append-only with first-write-wins,
   so `first_seen_at` stays truthful and "new since yesterday" is answerable.
-  position_snapshots replaces on (report_date, conid) so re-fetching a day
-  corrects rather than duplicates. securities upserts.
+  position_snapshots replaces on (account, report_date, conid) so re-fetching a
+  day corrects rather than duplicates. securities upserts.
 
 * position_snapshots is not optional. A position opened before the earliest
   statement has no opening trade on record, so the snapshot is the only
@@ -47,7 +47,7 @@ __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -262,8 +262,10 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
   source_file          TEXT    NOT NULL REFERENCES statements(source_file),
   ingested_at          TEXT    NOT NULL,
   -- A conid is IBKR's numbering; another broker may reuse the integer. Two
-  -- brokers holding "contract 12345" on the same date are two positions.
-  PRIMARY KEY (broker, report_date, conid)
+  -- brokers holding "contract 12345" on the same date are two positions, and so
+  -- are two ACCOUNTS: one Flex file can hold several, and without the account
+  -- in the key the second account's row replaced the first's (v17).
+  PRIMARY KEY (broker, account_id, report_date, conid)
 );
 """
 
@@ -280,11 +282,11 @@ CREATE TABLE IF NOT EXISTS equity_summaries (
   raw           TEXT NOT NULL,
   source_file   TEXT NOT NULL REFERENCES statements(source_file),
   ingested_at   TEXT NOT NULL,
-  -- Per broker: each reports the value of ITS OWN account. Keyed on the date
-  -- alone, the second broker's NAV for a day overwrites the first's, so the
-  -- "gain as % of net liquidation" denominator silently becomes one account's
-  -- value measured against both accounts' P&L.
-  PRIMARY KEY (broker, report_date)
+  -- Per broker AND account: each row is the value of ONE account. Keyed on the
+  -- date alone, the second broker's (or the second account's) NAV for a day
+  -- overwrites the first's, so the "gain as % of net liquidation" denominator
+  -- silently becomes one account's value measured against both accounts' P&L.
+  PRIMARY KEY (broker, account_id, report_date)
 );
 """
 
@@ -789,7 +791,7 @@ def _backfill_commission_currency(conn: sqlite3.Connection) -> int:
     Returns the number of rows filled, so a caller can log or test it.
     """
     pending = conn.execute(
-        "SELECT trade_id, raw FROM trades"
+        "SELECT broker, trade_id, raw FROM trades"
         " WHERE ib_commission_currency IS NULL"
         "   AND raw LIKE '%ibCommissionCurrency%'"
     ).fetchall()
@@ -802,9 +804,12 @@ def _backfill_commission_currency(conn: sqlite3.Connection) -> int:
         ccy = payload.get("ibCommissionCurrency")
         if not ccy:
             continue
+        # Keyed like the table, (broker, trade_id): another broker may number a
+        # fill the same, and its row must not take this one's currency.
         conn.execute(
-            "UPDATE trades SET ib_commission_currency = ? WHERE trade_id = ?",
-            (str(ccy), row["trade_id"]),
+            "UPDATE trades SET ib_commission_currency = ?"
+            " WHERE broker = ? AND trade_id = ?",
+            (str(ccy), row["broker"], row["trade_id"]),
         )
         filled += 1
     return filled
@@ -829,7 +834,7 @@ def _repair_base_commission(conn: sqlite3.Connection) -> int:
     matches the WHERE, so this costs one count per open. Returns rows repaired.
     """
     rows = conn.execute(
-        "SELECT t.trade_id, t.ib_commission, s.base_currency"
+        "SELECT t.broker, t.trade_id, t.ib_commission, s.base_currency"
         " FROM trades t JOIN statements s ON s.source_file = t.source_file"
         " WHERE t.ib_commission IS NOT NULL AND t.ib_commission <> 0"
         "   AND t.ib_commission_currency IS NOT NULL"
@@ -839,22 +844,83 @@ def _repair_base_commission(conn: sqlite3.Connection) -> int:
     ).fetchall()
     for row in rows:
         conn.execute(
-            "UPDATE trades SET ib_commission_base = ib_commission WHERE trade_id = ?",
-            (row["trade_id"],),
+            "UPDATE trades SET ib_commission_base = ib_commission"
+            " WHERE broker = ? AND trade_id = ?",
+            (row["broker"], row["trade_id"]),
         )
     return len(rows)
+
+
+#: IBKR's compact forms, as SQLite GLOB patterns: `20260924` and `20260924;101659`.
+_COMPACT_DAY = "[0-9]" * 8
+_COMPACT_STAMP = _COMPACT_DAY + ";" + "[0-9]" * 6
+
+
+def _iso_day_sql(column: str) -> str:
+    return (f"substr({column}, 1, 4) || '-' || substr({column}, 5, 2) || '-' ||"
+            f" substr({column}, 7, 2)")
+
+
+def _iso_stamp_sql(column: str) -> str:
+    return (f"{_iso_day_sql(column)} || ' ' || substr({column}, 10, 2) || ':' ||"
+            f" substr({column}, 12, 2) || ':' || substr({column}, 14, 2)")
+
+
+#: Every column a Trade Confirmation wrote in IBKR's compact form before
+#: `confirms._date` existed: (table, column, pattern, rewrite, scope).
+_COMPACT_DATE_COLUMNS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("trades", "trade_date", _COMPACT_DAY, _iso_day_sql("trade_date"),
+     f"source_kind = '{CONFIRM_SOURCE}'"),
+    ("trades", "date_time", _COMPACT_STAMP, _iso_stamp_sql("date_time"),
+     f"source_kind = '{CONFIRM_SOURCE}'"),
+    ("trades", "expiry", _COMPACT_DAY, _iso_day_sql("expiry"),
+     f"source_kind = '{CONFIRM_SOURCE}'"),
+    ("statements", "from_date", _COMPACT_DAY, _iso_day_sql("from_date"), "1"),
+    ("statements", "to_date", _COMPACT_DAY, _iso_day_sql("to_date"), "1"),
+    ("statements", "when_generated", _COMPACT_STAMP,
+     _iso_stamp_sql("when_generated"), "1"),
+    ("journal_entries", "opened_on", _COMPACT_DAY, _iso_day_sql("opened_on"), "1"),
+)
+
+
+def _normalise_confirm_dates(conn: sqlite3.Connection) -> int:
+    """Rewrite confirm dates stored as `20260924` into the statement's `2026-09-24`.
+
+    A confirm used to be stored with IBKR's compact text while every Activity
+    Statement row, parsed by py_ibkr, is ISO. Every reader was written against
+    the ISO form, so the compact rows were dropped by replay, missed by a
+    month filter and printed raw. `confirms._date` fixes new rows; this fixes
+    the ones already written, including the statements rows the confirms
+    opened and the journal entries that took their `opened_on` from a confirm.
+
+    Self-terminating like the backfills: it touches only values still in the
+    compact form, which no parsed row is. Trades are scoped to confirm rows so a
+    hand-built activity row is never rewritten. Returns rows changed.
+    """
+    changed = 0
+    for table, column, pattern, rewrite, scope in _COMPACT_DATE_COLUMNS:
+        cur = conn.execute(
+            f"UPDATE {table} SET {column} = {rewrite}"
+            f" WHERE {column} GLOB '{pattern}' AND {scope}"
+        )
+        changed += cur.rowcount
+    return changed
 
 
 #: The tables whose identity was IBKR's own numbering, and the key each needs
 #: once a second broker exists. One entry per table, so the rebuild below is
 #: written once: `trades` needed it first and the other two need it for exactly
 #: the same reason, which was easy to miss because each looks fine alone.
+#:
+#: The snapshot and NAV keys also carry the account (v17): one Flex file can
+#: hold several accounts, and each holds its own positions and has its own NAV.
 _REKEYED_TABLES: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("trades", ("broker", "trade_id"), _TRADES_DDL),
     ("cash_transactions", ("broker", "transaction_id"), _CASH_DDL),
-    ("position_snapshots", ("broker", "report_date", "conid"), _POSITIONS_DDL),
+    ("position_snapshots", ("broker", "account_id", "report_date", "conid"),
+     _POSITIONS_DDL),
     ("securities", ("broker", "conid"), _SECURITIES_DDL),
-    ("equity_summaries", ("broker", "report_date"), _NAV_DDL),
+    ("equity_summaries", ("broker", "account_id", "report_date"), _NAV_DDL),
 )
 
 
@@ -1201,6 +1267,7 @@ def _migrate_unlocked(conn: sqlite3.Connection) -> int:
     # repair's WHERE compares ib_commission_currency, so on a journal that has
     # not been backfilled yet there is nothing for it to find.
     _repair_base_commission(conn)
+    _normalise_confirm_dates(conn)
     row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
     current = row["v"] if row and row["v"] is not None else 0
     if current < SCHEMA_VERSION:

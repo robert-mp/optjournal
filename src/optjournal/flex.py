@@ -22,30 +22,42 @@ This module adds the three things py_ibkr deliberately leaves to callers:
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import re
+import threading
+import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import keyring
-from py_ibkr import FlexClient, FlexError, FlexQueryResponse
+from py_ibkr import FlexClient, FlexError, FlexQueryResponse, FlexRateLimitError
 from py_ibkr.flex.client import FlexAuthError
 from py_ibkr.flex.parser import parse_xml_file
 
+from optjournal.clock import MARKET_TZ
+from optjournal.confirms import CONFIRM_QUERY_TYPE
 from optjournal.locks import locked
 
 __all__ = [
     "FETCH_COOLDOWN_S",
+    "FETCH_LOCK_TIMEOUT_S",
+    "FETCH_WORST_CASE_S",
     "POLL_WORST_CASE_S",
+    "ACTIVITY_QUERY_TYPE",
     "FetchCooldown",
     "ConfirmFetch",
     "FetchResult",
+    "FlexBusy",
+    "StatementUnreadable",
     "TokenMissing",
     "TokenRejected",
+    "TokenUnreadable",
     "TokenWriteRefused",
     "archive_digest",
     "cooldown_remaining",
@@ -85,6 +97,10 @@ STATE_FILE = ".fetch-state.json"
 ACTIVITY_PREFIX = "activity"
 CONFIRM_PREFIX = "confirm"
 
+#: The `type` attribute on an Activity Statement payload's root element, the
+#: counterpart of `confirms.CONFIRM_QUERY_TYPE`.
+ACTIVITY_QUERY_TYPE = "AF"
+
 #: Sibling lock file for the whole check-download-record sequence. Beside the
 #: state file it guards, in the archive directory, so one journal's fetches do
 #: not serialise against another's.
@@ -116,10 +132,15 @@ class FetchCooldown(RuntimeError):
 #: py_ibkr backs off as ``min(RETRY_INTERVAL * 2**i, MAX_RETRY_INTERVAL)`` and
 #: applies the budget to *each* of its two stages independently (SendRequest,
 #: which retries while another statement is generating, and GetStatement,
-#: which retries while the statement is not ready). So the worst case is
-#: twice the per-stage sum:
+#: which retries while the statement is not ready). It makes MAX_RETRIES
+#: attempts per stage and sleeps BETWEEN them, so MAX_RETRIES - 1 times; the
+#: last attempt raises. So the sleeping is twice the per-stage sum:
 #:
-#:     MAX_RETRIES=4  ->  [30, 60, 120, 120] = 330s/stage  ->  660s (11 min)
+#:     MAX_RETRIES=4  ->  [30, 60, 120] = 210s/stage  ->  420s (7 min)
+#:
+#: This read [30, 60, 120, 120] = 660s until the QA pass of 2026-09-30, one
+#: sleep too many, while leaving out the requests themselves. `FETCH_WORST_CASE_S`
+#: is the whole wall clock.
 #:
 #: Four is chosen so that ceiling fits inside a daily cron's timeout. It was
 #: 10, which is 1,050s per stage and 35 minutes end to end -- far longer than
@@ -129,23 +150,23 @@ class FetchCooldown(RuntimeError):
 #: Activity statement is regenerated once a day, so a statement that is not
 #: ready in five minutes will still be there at the next scheduled run.
 #:
-#: Keep any caller-side timeout above 660s, and the cron timeout above that,
-#: so the caller's own handler runs before anything kills the process.
+#: Keep any caller-side timeout above `FETCH_WORST_CASE_S`, and the cron timeout
+#: above that, so the caller's own handler runs before anything kills the process.
 MAX_RETRIES = 4
 RETRY_INTERVAL = 30
 MAX_RETRY_INTERVAL = 120
 
-#: Worst-case wall time of `fetch`'s polling, derived from the constants
-#: above. Exported so callers can size their timeouts from the real number
-#: rather than guessing -- guessing is what produced the 240s-vs-2100s
-#: mismatch this replaces.
+#: Worst-case time `fetch` spends SLEEPING between polls, derived from the
+#: constants above and measured against py_ibkr's own loop in a test. Exported so
+#: callers can size their timeouts from the real number rather than guessing --
+#: guessing is what produced the 240s-vs-2100s mismatch this replaces.
 POLL_WORST_CASE_S = 2 * sum(
-    min(RETRY_INTERVAL * (2**i), MAX_RETRY_INTERVAL) for i in range(MAX_RETRIES)
+    min(RETRY_INTERVAL * (2**i), MAX_RETRY_INTERVAL) for i in range(MAX_RETRIES - 1)
 )
 
 
 #: Per-HTTP-REQUEST socket timeout for the Flex calls. Not a budget for the whole
-#: fetch: `download` polls, so the wall-clock ceiling is `POLL_WORST_CASE_S` and
+#: fetch: `download` polls, so the wall-clock ceiling is `FETCH_WORST_CASE_S` and
 #: this bounds each individual request inside it.
 #:
 #: IT EXISTS BECAUSE NOTHING ELSE BOUNDS A HUNG SOCKET. `py_ibkr` calls
@@ -161,6 +182,31 @@ POLL_WORST_CASE_S = 2 * sum(
 #: and `download`'s own retry ladder handles a slow GENERATION. A request that has
 #: produced nothing in a minute is a stall, not slowness.
 FETCH_SOCKET_TIMEOUT_S = 60
+
+#: How long `read_token` waits for the OS keyring before giving up.
+#:
+#: A normal read measured 8.2s on this machine, so this is well above that. The
+#: bound exists for the read that NEVER returns: a keychain waiting for an unlock
+#: prompt on a machine nobody is at. On the scheduler thread that stalled every
+#: job while the fetch lock was held, with nothing in the ledger to say why.
+KEYRING_READ_TIMEOUT_S = 30.0
+
+#: Worst-case wall time of one fetch, from taking the lock to stamping the
+#: cooldown: the keyring read, the polling sleeps, and every request of both
+#: stages running to its socket timeout. 30 + 420 + 480 = 930s.
+FETCH_WORST_CASE_S = int(
+    KEYRING_READ_TIMEOUT_S + POLL_WORST_CASE_S
+    + 2 * MAX_RETRIES * FETCH_SOCKET_TIMEOUT_S
+)
+
+#: How long a fetch waits for another fetch to release `FETCH_LOCK`.
+#:
+#: LONGER THAN THE FETCH IT WAITS FOR, with a minute to spare. It was the lock
+#: module's 120s default, counted in sleep ticks, against a fetch that can run
+#: for over fifteen minutes: a confirm poll behind a slow statement generation
+#: raised `LockTimeout` and was recorded as a failure while the other fetch was
+#: working normally.
+FETCH_LOCK_TIMEOUT_S = FETCH_WORST_CASE_S + 60
 
 
 class _TimeoutFlexClient(FlexClient):
@@ -200,11 +246,47 @@ class _TimeoutFlexClient(FlexClient):
             # have seen a raw traceback -- exactly the shape of the 2026-08-07
             # keychain failure this plan exists to stop.
             raise FlexError(f"timed out after {self.timeout_s}s: {exc}") from exc
+        except (http.client.HTTPException, OSError) as exc:
+            # The same gap one level over: a body cut short raises IncompleteRead,
+            # an `http.client.HTTPException` and not an `OSError`, and a server
+            # that hangs up raises RemoteDisconnected or ConnectionResetError. None
+            # is a `URLError` once the response has started.
+            raise FlexError(f"connection failed: {type(exc).__name__}: {exc}") from exc
 
 
 #: What `fetch` constructs. A module-level indirection so there is exactly ONE name
 #: to replace when a test needs the network stubbed -- see `_fetch_locked`.
 _client_factory = _TimeoutFlexClient
+
+
+class FlexBusy(FlexRateLimitError):
+    """IBKR could not answer now, for a reason that clears by itself.
+
+    IBKR documents these codes with "Please try again shortly": a server under
+    heavy load (1009), P&L data not ready (1008 and its siblings), too many
+    requests (1018), generation still in progress (1019). Nothing about the
+    token, the query or the journal is wrong, and the remedy is to wait.
+
+    A `FlexRateLimitError`, and so a `FlexError`: every existing handler of a
+    failed Flex request keeps catching it, and the CLI's exit code for
+    throttling ("try again later") already applies. `code` is IBKR's number.
+    """
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class StatementUnreadable(FlexError):
+    """A response body or an archived file that is not a statement we can read.
+
+    A `FlexError`, so every caller that already handles a failed Flex request
+    handles this too. Raised by `fetch` BEFORE the body is archived or the
+    cooldown stamped: an HTML maintenance page archived as `activity-*.xml` used
+    to halt `optjournal ingest` at that file on every run. Raised by `load` for
+    a file already on disk, so a caller can skip it with one line rather than a
+    parser traceback.
+    """
 
 
 class TokenMissing(RuntimeError):
@@ -219,6 +301,17 @@ class TokenRejected(RuntimeError):
     retry will either -- somebody has to generate a new token. The scheduler
     treats it as a credentials failure, the same as a missing one, so it stops
     spending requests on a token IBKR has already rejected.
+    """
+
+
+class TokenUnreadable(TokenMissing):
+    """The OS keyring did not answer within `KEYRING_READ_TIMEOUT_S`.
+
+    A `TokenMissing`, because for this run there is no usable token and every
+    caller already reports that as a credentials failure with its message: the
+    job ledger, the Sync button and the CLI. Its own type because the remedy
+    differs: the token is probably stored, and the keychain is waiting for an
+    unlock nobody is there to give.
     """
 
 
@@ -261,18 +354,55 @@ class FetchResult:
         return self.duplicate_of is not None
 
 
+def _within(timeout_s: float, work: Callable[[], str | None]) -> tuple[bool, object]:
+    """Run `work` on a daemon thread. (finished, result or the exception raised).
+
+    The pattern of `web._keyring_call`: a DAEMON thread, so a call still blocked
+    in the OS cannot keep the process alive, and a late answer lands in a list
+    nobody reads. Python cannot interrupt a thread blocked in a syscall, so a
+    deadline has to be a wait on another thread rather than a timeout on the call.
+    """
+    outcome: list[object] = []
+
+    def run() -> None:
+        try:
+            outcome.append(work())
+        except Exception as exc:  # noqa: BLE001 - handed back to the caller
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run, name="keyring-read", daemon=True)
+    worker.start()
+    worker.join(timeout_s)
+    return (True, outcome[0]) if outcome else (False, None)
+
+
 def read_token(account: str | None = None) -> str:
     """Return the Flex token from the OS keyring.
 
     `account` defaults to the current user, matching how the entry is
     created:  security add-generic-password -a "$USER" -s ibkr-flex-token -w
+
+    Bounded by `KEYRING_READ_TIMEOUT_S`; raises `TokenUnreadable` past it. An
+    error the keyring backend raises is raised as itself.
     """
     if account is None:
         import getpass
 
         account = getpass.getuser()
 
-    token = keyring.get_password(KEYRING_SERVICE, account)
+    who = account
+    finished, answer = _within(
+        KEYRING_READ_TIMEOUT_S, lambda: keyring.get_password(KEYRING_SERVICE, who))
+    if not finished:
+        raise TokenUnreadable(
+            f"the OS keyring did not answer within {KEYRING_READ_TIMEOUT_S:g}s, "
+            f"usually because it is waiting for you to unlock it. Nothing was sent "
+            f"to IBKR. Check for a system prompt, or run `optjournal setup` in a "
+            f"terminal, then try again."
+        )
+    if isinstance(answer, Exception):
+        raise answer
+    token = answer if isinstance(answer, str) else None
     if not token:
         raise TokenMissing(
             f"No keyring entry {KEYRING_SERVICE!r} for account {account!r}. "
@@ -326,37 +456,50 @@ def write_token(token: str, account: str | None = None) -> str:
 #: actually telling you. Measured against the live endpoint on 2026-09-24: a token
 #: past its lifetime answered 1012, and the same token after being regenerated in
 #: Client Portal answered 1015 -- so the pair is how you tell "it aged out" from
-#: "it was replaced", which is worth keeping distinct in the message.
+#: "it was replaced", which is worth keeping distinct in the message. These are
+#: the only two codes IBKR's error table describes as a token problem.
 _TOKEN_CODES = {
     "1012": "expired",
     "1015": "invalid, which is also what a token reads as once it has been "
             "regenerated in Client Portal",
-    "1009": "not accepted",
 }
 
-#: How py_ibkr renders an IBKR error code it has no specific class for:
-#: `f"Flex API Error {code}: {msg}"`. Parsed rather than read off an attribute
-#: because `FlexError` carries no code -- checked in the installed source, and
-#: pinned by a test, so an upstream wording change fails loudly here instead of
-#: quietly losing the remedy.
+#: IBKR error codes whose documented message ends "Please try again shortly".
+#: 1009 was in `_TOKEN_CODES`, because py_ibkr files it beside 1012 as an
+#: authentication error; IBKR's own text for it is "The server is under heavy
+#: load", and treating it as a dead token sent the reader to Client Portal to
+#: replace one that worked. See `FlexBusy`.
+_TRANSIENT_CODES = frozenset({
+    "1001", "1004", "1005", "1006", "1007", "1008", "1009", "1018", "1019", "1021",
+})
+
+#: How py_ibkr renders an IBKR error code: `f"Flex API Error {code}: {msg}"`, and,
+#: through `compat._keep_error_codes`, the same prefix on the codes it maps to a
+#: class. Parsed rather than read off an attribute because `FlexError` carries
+#: no code (checked in the installed source, and pinned by a test), so an
+#: upstream wording change fails loudly here instead of quietly losing the remedy.
 _FLEX_CODE = re.compile(r"Flex API Error (\d+)")
 
 
 def _reraise_if_token_rejected(exc: FlexError) -> None:
-    """Raise `TokenRejected` if IBKR's complaint is about the token. Else return.
+    """Raise `TokenRejected` or `FlexBusy` when the code says which. Else return.
 
-    TWO DETECTIONS, because py_ibkr reports the same class of problem two ways:
-    1009 and 1012 arrive as `FlexAuthError` with the code stripped out of the
-    message, while 1015 falls through to a bare `FlexError` whose text still
-    carries "Flex API Error 1015". Matching on the class alone missed 1015 -- the
-    code this journal actually hit -- and matching on the text alone would miss
-    1012.
+    The code comes from the message, where py_ibkr (with the compat shim) always
+    puts it. A `FlexAuthError` WITHOUT one did not come from py_ibkr's error
+    table, so it keeps the meaning its class gives it: the token.
     """
     code = None
     found = _FLEX_CODE.search(str(exc))
     if found:
         code = found.group(1)
-    if code not in _TOKEN_CODES and not isinstance(exc, FlexAuthError):
+    if code in _TRANSIENT_CODES:
+        raise FlexBusy(
+            f"IBKR could not answer just now (error {code}); nothing is wrong "
+            f"with the token or the query, try again later.\n  IBKR said: {exc}",
+            code,
+        ) from exc
+    if code not in _TOKEN_CODES and not (code is None
+                                         and isinstance(exc, FlexAuthError)):
         return
     reads_as = _TOKEN_CODES.get(code or "", "not accepted")
     raise TokenRejected(
@@ -517,7 +660,7 @@ def _archive(
     archive_dir: Path,
     *,
     prefix: str = ACTIVITY_PREFIX,
-    stamp_format: str = "%Y%m%dT%H%M%SZ",
+    stamp: str | None = None,
 ) -> tuple[Path, Path | None]:
     """Archive raw XML, reusing an identical existing file if there is one.
 
@@ -535,7 +678,8 @@ def _archive(
         return existing, existing
 
     archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime(stamp_format)
+    if stamp is None:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     dest = archive_dir / f"{prefix}-{stamp}.xml"
     dest.write_bytes(raw)
     return dest, None
@@ -582,8 +726,13 @@ def fetch_confirms(
     A shorter `cooldown_s` than the statement's default is the point of the
     parameter: confirms change through the session, where an Activity Statement is
     regenerated once a day. See `jobs.CONFIRM_COOLDOWN_S`.
+
+    A period override must have both ends and end no later than today: a confirm
+    is same-session, so today is the day it is for.
     """
-    with locked(archive_dir / FETCH_LOCK):
+    from_date, to_date = _check_period(
+        from_date, to_date, latest=_market_today(), weekdays_only=False)
+    with locked(archive_dir / FETCH_LOCK, timeout_s=FETCH_LOCK_TIMEOUT_S):
         if not force:
             _check_cooldown(archive_dir, query_id, cooldown_s)
         token = read_token(account)
@@ -602,6 +751,8 @@ def fetch_confirms(
         except FlexError as exc:
             _reraise_if_token_rejected(exc)
             raise
+        _check_payload(raw, expect=CONFIRM_QUERY_TYPE,
+                       source=f"IBKR's reply to query {query_id}")
         # ONE FILE PER DAY, overwritten by each poll, where the statement gets one
         # per fetch. The reason is in the payload: `whenGenerated` changes on every
         # request, so the bytes are never identical and the content dedupe cannot
@@ -611,8 +762,14 @@ def fetch_confirms(
         # Nothing is lost by overwriting. A confirm payload is CUMULATIVE for its
         # period, so the last poll of the day is a superset of every earlier one,
         # and the Activity Statement supersedes all of it tomorrow anyway.
+        #
+        # The DAY is the payload's own `toDate`, not the poll's UTC date: an
+        # evening poll in Europe is already tomorrow in UTC, and filed Monday's
+        # session under Tuesday's name, where Tuesday's first poll then
+        # overwrote it.
         path, duplicate_of = _archive(
-            raw, archive_dir, prefix=CONFIRM_PREFIX, stamp_format="%Y%m%d",
+            raw, archive_dir, prefix=CONFIRM_PREFIX,
+            stamp=_payload_to_date(raw) or datetime.now(UTC).strftime("%Y%m%d"),
         )
         if duplicate_of is not None:
             log.info("confirms identical to %s; not archiving a second copy",
@@ -623,6 +780,57 @@ def fetch_confirms(
         return ConfirmFetch(
             raw_path=path, raw_bytes=len(raw), duplicate_of=duplicate_of,
         )
+
+
+_PAYLOAD_TO_DATE = re.compile(rb'<FlexStatement\s[^>]*?toDate="(\d{8})"')
+
+
+#: Each query type as a refusal names it: (with an article, without).
+_QUERY_NAMES = {
+    ACTIVITY_QUERY_TYPE: ("an Activity Statement", "Activity Statement"),
+    CONFIRM_QUERY_TYPE: ("a Trade Confirmation", "Trade Confirmation"),
+}
+
+
+def _check_root(root: ET.Element, *, expect: str, source: str) -> None:
+    """Refuse a Flex document that is not a statement of the `expect` type.
+
+    A missing `type` is accepted: every payload IBKR has sent carries one, and a
+    hand-built statement without it is still a statement. A different one is not:
+    a Trade Confirmation under the Activity query id became the newest statement
+    and blanked the cost report, silently.
+    """
+    if root.tag != "FlexQueryResponse":
+        raise StatementUnreadable(
+            f"{source} is a <{root.tag}> document, not a Flex statement")
+    kind = (root.get("type") or "").strip()
+    if kind and kind != expect:
+        got, got_bare = _QUERY_NAMES.get(kind, (f"a {kind!r} payload", repr(kind)))
+        want, want_bare = _QUERY_NAMES.get(expect, (repr(expect), repr(expect)))
+        raise StatementUnreadable(
+            f"{source} is {got} (type {kind!r}), not {want} (type {expect!r}). "
+            f"The query id looks like your {got_bare} query; this needs the "
+            f"{want_bare} query's id."
+        )
+    if root.find("FlexStatements/FlexStatement") is None:
+        raise StatementUnreadable(f"{source} holds no FlexStatement")
+
+
+def _check_payload(raw: bytes, *, expect: str, source: str) -> None:
+    """`_check_root` for a response body that has not been written anywhere yet."""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        start = raw[:60].decode("utf-8", "replace").strip() or "(empty)"
+        raise StatementUnreadable(
+            f"{source} is not readable XML ({exc}); it starts {start!r}") from exc
+    _check_root(root, expect=expect, source=source)
+
+
+def _payload_to_date(raw: bytes) -> str | None:
+    """The first statement block's `toDate`, as YYYYMMDD, or None if absent."""
+    found = _PAYLOAD_TO_DATE.search(raw)
+    return found.group(1).decode() if found else None
 
 
 def _norm_date(value: str | None) -> str | None:
@@ -639,6 +847,54 @@ def _norm_date(value: str | None) -> str | None:
             f"date {value!r} is not YYYYMMDD or YYYY-MM-DD"
         )
     return compact
+
+
+def _check_period(
+    from_date: str | None, to_date: str | None, *, latest: date,
+    weekdays_only: bool,
+) -> tuple[str | None, str | None]:
+    """The `fd`/`td` pair as YYYYMMDD, or ValueError for one IBKR would refuse.
+
+    Checked HERE, before the lock, the cooldown or the keyring, because a refused
+    request still counts against IBKR's lockout allowance. The rules are the ones
+    `sync.first_sync_window` already keeps: both ends or neither, the end no later
+    than `latest`, and (for an Activity Statement) no weekend dates. Refused
+    rather than snapped to a weekday, so what is asked for is what was typed.
+    """
+    fd, td = _norm_date(from_date), _norm_date(to_date)
+    if (fd is None) != (td is None):
+        raise ValueError(
+            "a period override needs both ends (--from and --to): IBKR refuses one "
+            "without the other, and the refusal costs a request"
+        )
+    if fd is None or td is None:
+        return None, None
+    try:
+        start = datetime.strptime(fd, "%Y%m%d").date()
+        end = datetime.strptime(td, "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError(f"not a calendar date: {exc}") from None
+    if start > end:
+        raise ValueError(f"--from {fd} is after --to {td}")
+    if end > latest:
+        raise ValueError(
+            f"--to {td} is later than {latest:%Y%m%d}, the last day IBKR can report "
+            f"for this query")
+    if weekdays_only:
+        for flag, day, step in (("--from", start, 1), ("--to", end, -1)):
+            if day.weekday() < 5:
+                continue
+            nearest = day
+            while nearest.weekday() >= 5:
+                nearest += timedelta(days=step)
+            raise ValueError(
+                f"{flag} {day:%Y%m%d} is a {day:%A}, and IBKR refuses weekend dates;"
+                f" use {nearest:%Y%m%d}")
+    return fd, td
+
+
+def _market_today() -> date:
+    return datetime.now(MARKET_TZ).date()
 
 
 def fetch(
@@ -670,7 +926,10 @@ def fetch(
       then, so this protects the archive rather than the budget.
 
     The raw XML is archived before parsing, so a parse failure still leaves
-    the response on disk rather than costing another request.
+    the response on disk rather than costing another request. Only a body that
+    IS an Activity Statement gets that far: one that is not XML, has another
+    root, holds no FlexStatement or is a Trade Confirmation raises
+    `StatementUnreadable` before anything is archived or stamped.
 
     HELD UNDER A CROSS-PROCESS LOCK FROM THE CHECK TO THE STAMP, because the
     cooldown was otherwise check-then-act and the budget it guards is real. The
@@ -693,8 +952,14 @@ def fetch(
     The lock covers `force=True` too. Forcing skips the COOLDOWN, which is a
     judgement about whether new data can exist; it does not make two simultaneous
     downloads writing one archive directory a good idea.
+
+    A period override IBKR would refuse (one end only, a weekend, an end of today
+    or later) raises ValueError before any of that, so it spends nothing.
     """
-    with locked(archive_dir / FETCH_LOCK):
+    from_date, to_date = _check_period(
+        from_date, to_date, latest=_market_today() - timedelta(days=1),
+        weekdays_only=True)
+    with locked(archive_dir / FETCH_LOCK, timeout_s=FETCH_LOCK_TIMEOUT_S):
         return _fetch_locked(
             query_id, archive_dir=archive_dir, from_date=from_date,
             to_date=to_date, account=account, force=force, cooldown_s=cooldown_s,
@@ -740,6 +1005,12 @@ def _fetch_locked(
         _reraise_if_token_rejected(exc)
         raise
 
+    # Checked BEFORE archiving and before the stamp. The request is spent either
+    # way, but a body that is not a statement must not become `activity-*.xml`,
+    # where every later ingest would trip over it, and must not start a cooldown
+    # that makes the retry wait for nothing.
+    _check_payload(raw, expect=ACTIVITY_QUERY_TYPE,
+                   source=f"IBKR's reply to query {query_id}")
     path, duplicate_of = _archive(raw, archive_dir)
     if duplicate_of is not None:
         log.info("statement identical to %s; not archiving a second copy", path.name)
@@ -761,5 +1032,20 @@ def _fetch_locked(
 
 
 def load(path: Path) -> FlexQueryResponse:
-    """Parse a previously archived statement, making no network request."""
-    return parse_xml_file(str(path))
+    """Parse a previously archived statement, making no network request.
+
+    Raises `StatementUnreadable`, naming the file, for anything that is not an
+    Activity Statement with at least one statement block: malformed XML, another
+    root, a Trade Confirmation, or a value py_ibkr refuses.
+    """
+    path = Path(path)
+    try:
+        root = ET.parse(str(path)).getroot()
+    except ET.ParseError as exc:
+        raise StatementUnreadable(f"{path.name} is not readable XML: {exc}") from exc
+    _check_root(root, expect=ACTIVITY_QUERY_TYPE, source=path.name)
+    try:
+        return parse_xml_file(str(path))
+    except ValueError as exc:  # pydantic's ValidationError is a ValueError
+        first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        raise StatementUnreadable(f"{path.name} could not be parsed: {first}") from exc

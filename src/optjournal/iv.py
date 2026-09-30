@@ -56,6 +56,7 @@ that does not exist.
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -255,7 +256,9 @@ def _get(template: str, symbol: str, *, what: str, timeout: int) -> Any | None:
         if exc.code == _NOT_CARRIED:
             return None
         raise IvFetchError(f"{symbol} {what}: HTTP {exc.code}") from exc
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, OSError, ValueError,
+            http.client.HTTPException) as exc:
+        # `HTTPException` for a body cut short (IncompleteRead): see marketdata.
         raise IvFetchError(f"{symbol} {what}: {type(exc).__name__}: {exc}") from exc
 
 

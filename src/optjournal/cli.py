@@ -55,6 +55,7 @@ from optjournal.events import (
 from optjournal.flex import (
     KEYRING_SERVICE,
     FetchCooldown,
+    StatementUnreadable,
     TokenMissing,
     TokenRejected,
     TokenWriteRefused,
@@ -269,11 +270,21 @@ def cmd_prune(args) -> int:
     return EXIT_OK
 
 
+def _unreadable(exc: StatementUnreadable) -> int:
+    """One line for a statement file that cannot be read, not a parser traceback."""
+    print(f"Unreadable statement: {exc}", file=sys.stderr)
+    return EXIT_ERROR
+
+
 def cmd_show(args) -> int:
     path = _resolve_path(args)
     if path is None:
         return _no_statements(args)
-    data = summary_data(load(path), path)
+    try:
+        response = load(path)
+    except StatementUnreadable as exc:
+        return _unreadable(exc)
+    data = summary_data(response, path)
     data["source_file"] = path.name
     _emit(data, render_summary(data), args.json)
     return EXIT_OK
@@ -283,7 +294,11 @@ def cmd_costs(args) -> int:
     path = _resolve_path(args)
     if path is None:
         return _no_statements(args)
-    reports = [analyse(s) for s in load(path).FlexStatements]
+    try:
+        response = load(path)
+    except StatementUnreadable as exc:
+        return _unreadable(exc)
+    reports = [analyse(s) for s in response.FlexStatements]
     _emit(
         [costs_data(r) for r in reports],
         "\n\n".join(format_report(r) for r in reports),
@@ -387,10 +402,18 @@ def cmd_ingest(args) -> int:
     if not paths:
         return _no_statements(args)
 
+    results = []
+    # SKIPPED, not fatal: one unreadable file used to stop every run at that
+    # file, so nothing archived after it was ever ingested. Named in the summary
+    # and in the exit code, so a skip never reads as a clean run.
+    unreadable: list[dict[str, str]] = []
     with open_journal(args.db) as conn:
-        results = [
-            ingest_file(conn, p, assets=assets, reingest=args.reingest) for p in paths
-        ]
+        for p in paths:
+            try:
+                results.append(
+                    ingest_file(conn, p, assets=assets, reingest=args.reingest))
+            except StatementUnreadable as exc:
+                unreadable.append({"file": Path(p).name, "reason": str(exc)})
         totals = {
             t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
             for t in ("trades", "cash_transactions", "position_snapshots", "securities")
@@ -400,6 +423,7 @@ def cmd_ingest(args) -> int:
         "db": str(args.db),
         "assets": ",".join(assets) or "ALL",
         "files": [dataclasses.asdict(r) for r in results],
+        "unreadable": unreadable,
         "totals": totals,
     }
     lines = [f"Ingesting {len(paths)} statement(s) -> {args.db}"
@@ -422,9 +446,14 @@ def cmd_ingest(args) -> int:
         )
         for w in r.warnings:
             lines.append(f"    ! {w}")
+    for u in unreadable:
+        lines.append(f"  {u['file']}: UNREADABLE, skipped")
+        lines.append(f"    ! {u['reason']}")
     lines.append("  totals: " + ", ".join(f"{k}={v}" for k, v in totals.items()))
+    if unreadable:
+        lines.append(f"  {len(unreadable)} file(s) could not be read; see above")
     _emit(data, "\n".join(lines), args.json)
-    return EXIT_OK
+    return EXIT_ERROR if unreadable else EXIT_OK
 
 
 def cmd_orders(args) -> int:

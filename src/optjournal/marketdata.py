@@ -39,6 +39,7 @@ trading date, and adding one would be a change in behaviour, not a fix.
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -270,7 +271,10 @@ def _get_chart(symbol: str, query: str, *, what: str, timeout: int) -> Any:
         if exc.code == 404:
             raise BarNotFound(error) from exc
         raise BarFetchError(error) from exc
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, OSError, ValueError,
+            http.client.HTTPException) as exc:
+        # `HTTPException` for a body cut short (IncompleteRead), which is neither
+        # an `OSError` nor a `URLError` and used to abort a whole bars run.
         raise BarFetchError(
             f"{source_symbol(symbol)} {what}: {type(exc).__name__}: {exc}"
         ) from exc

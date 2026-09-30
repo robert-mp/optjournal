@@ -8,6 +8,11 @@ untyped attribute dicts rather than being silently discarded.
 Untyped is deliberate: promoting a section to a Pydantic model is only
 worth doing once we consume its fields, and `MODELLED_SECTIONS` plus the
 drift test in tests/test_flex.py keep the boundary honest.
+
+EVERY statement block is read. A Flex file holds one FlexStatement per account,
+and each row carries its own `accountId`, so the rows are concatenated in
+document order. Reading the first block only kept one account's positions,
+contracts and NAV from a file that held two.
 """
 
 from __future__ import annotations
@@ -21,31 +26,36 @@ __all__ = ["MODELLED_SECTIONS", "raw_sections", "section_tags"]
 MODELLED_SECTIONS = frozenset({"Trades", "CashTransactions", "CashReport"})
 
 
-def _statement(path: Path) -> ET.Element:
+def _statements(path: Path) -> list[ET.Element]:
     root = ET.parse(str(path)).getroot()
-    stmt = root.find(".//FlexStatement")
-    if stmt is None:
+    found = root.findall(".//FlexStatement")
+    if not found:
         raise ValueError(f"{path}: no FlexStatement element")
-    return stmt
+    return found
 
 
 def section_tags(path: Path) -> list[str]:
-    """Return every section tag present in the statement, in document order."""
-    return [child.tag for child in _statement(path)]
+    """Every section tag present in the file's statements, in document order."""
+    tags: list[str] = []
+    for stmt in _statements(path):
+        tags += [child.tag for child in stmt if child.tag not in tags]
+    return tags
 
 
 def raw_sections(path: Path) -> dict[str, list[dict[str, str]]]:
     """Return the unmodelled sections as lists of raw attribute dicts.
 
     AccountInformation carries its data on the element itself rather than on
-    child rows, so it is normalised to a single-item list for consistency.
+    child rows, so each statement contributes one item to its list.
     """
     out: dict[str, list[dict[str, str]]] = {}
-    for child in _statement(path):
-        if child.tag in MODELLED_SECTIONS:
-            continue
-        if child.tag == "AccountInformation":
-            out[child.tag] = [dict(child.attrib)] if child.attrib else []
-        else:
-            out[child.tag] = [dict(row.attrib) for row in child]
+    for stmt in _statements(path):
+        for child in stmt:
+            if child.tag in MODELLED_SECTIONS:
+                continue
+            rows = out.setdefault(child.tag, [])
+            if child.tag == "AccountInformation":
+                rows += [dict(child.attrib)] if child.attrib else []
+            else:
+                rows += [dict(row.attrib) for row in child]
     return out

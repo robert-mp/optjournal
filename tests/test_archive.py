@@ -232,3 +232,64 @@ def test_newest_statement_breaks_a_period_tie_by_download(tmp_path):
     full_year = _statement_file(tmp_path, "20260803T091918Z", "20250801", "20260731")
 
     assert newest_statement(tmp_path) == full_year
+
+
+# ------------------------------------------ the keeper is the ingested copy (L4)
+
+
+def add_nav_row(conn, day: str, source_file: str) -> None:
+    conn.execute(
+        "INSERT INTO equity_summaries (report_date, account_id, currency,"
+        " total_base, raw, source_file, ingested_at)"
+        " VALUES (?, 'U1', 'EUR', 100.0, '{}', ?, 'now')",
+        (day, source_file),
+    )
+
+
+def test_nav_rows_are_repointed_too(archive, conn):
+    """L4: `equity_summaries` references `statements` and was not re-pointed, so
+    deleting the redundant copy's statement row failed the foreign key."""
+    keep = "activity-20260301T000000Z.xml"
+    drop = "activity-20260302T000000Z.xml"
+    write_statement(archive, "20260301T000000Z", "<x>same</x>")
+    write_statement(archive, "20260302T000000Z", "<x>same</x>")
+    add_statement_row(conn, keep, "2026-03-01", "2026-03-31")
+    add_statement_row(conn, drop, "2026-03-01", "2026-03-31")
+    add_nav_row(conn, "20260331", drop)   # replaces on conflict: the newest copy
+    conn.commit()
+
+    result = prune_archive(archive, conn, apply=True)
+
+    assert result.rows_repointed.get("equity_summaries") == 1
+    assert conn.execute(
+        "SELECT source_file FROM equity_summaries").fetchone()[0] == keep
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_the_copy_the_journal_ingested_is_the_one_kept(archive, conn):
+    """L4: the oldest NAME was kept even when only its newer twin was ingested.
+
+    That happens when a copy is restored under an older stamp: the ingest skips
+    it as byte-identical, so it has no `statements` row. Re-pointing every row at
+    it and deleting the ingested copy's row then failed the foreign key.
+    """
+    ingested = "activity-20260929T110034Z.xml"
+    restored = "activity-20260929T090000Z.xml"
+    write_statement(archive, "20260929T110034Z", "<x>same</x>")
+    write_statement(archive, "20260929T090000Z", "<x>same</x>")
+    add_statement_row(conn, ingested, "2026-08-31", "2026-09-28")
+    add_trade_row(conn, "1", ingested)
+    add_nav_row(conn, "20260928", ingested)
+    conn.commit()
+
+    dry = prune_archive(archive, conn, apply=False)
+    applied = prune_archive(archive, conn, apply=True)
+
+    for result in (dry, applied):
+        assert result.groups[0].keep.name == ingested
+        assert [p.name for p in result.groups[0].redundant] == [restored]
+    assert [p.name for p in archive.glob("*.xml")] == [ingested]
+    assert [r[0] for r in conn.execute("SELECT source_file FROM statements")] == [
+        ingested]
+    assert conn.execute("SELECT source_file FROM trades").fetchone()[0] == ingested
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

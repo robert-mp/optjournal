@@ -34,6 +34,7 @@ project keeps finding.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import sqlite3
 import urllib.error
@@ -258,7 +259,9 @@ def fetch_events(*, url: str = _URL, timeout: int = _TIMEOUT_S) -> list[MarketEv
                 retry_after = 60
             raise EventRateLimited(retry_after) from exc
         raise EventFetchError(f"fetching {url} failed: {exc}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError,
+            http.client.HTTPException) as exc:
+        # `HTTPException` for a body cut short (IncompleteRead): see marketdata.
         raise EventFetchError(f"fetching {url} failed: {exc}") from exc
     try:
         payload = json.loads(body)

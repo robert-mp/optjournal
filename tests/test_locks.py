@@ -114,13 +114,33 @@ def test_a_timeout_raises_rather_than_proceeding(tmp_path):
 
 
 def test_the_timeout_default_covers_the_slowest_thing_it_guards():
-    """Pinned so shortening it means reckoning with what a fetch actually costs.
+    """Pinned so shortening it means reckoning with what a holder actually costs.
 
-    The slowest holder is `flex.fetch`: keyring (measured at 8.2s on the machine
-    this was written on) plus an IBKR download that retries while the statement
-    generates -- `flex.POLL_WORST_CASE_S` is 660.
+    The fetch lock is the slow one and passes its own timeout; the default must
+    still outlast a migration by a wide margin.
     """
     assert DEFAULT_TIMEOUT_S >= 60
+
+
+def test_the_wait_is_measured_on_the_clock_not_by_counting_sleeps(tmp_path,
+                                                                   monkeypatch):
+    """M12: each 50ms sleep overshoots, so a count of sleeps runs behind the clock.
+
+    Exaggerated here: every sleep takes 0.2s. Counted in ticks, a 0.5s timeout
+    would wait ten sleeps, two seconds; on the clock it gives up after 0.5s.
+    """
+    import time
+
+    from optjournal import locks
+
+    real_sleep = time.sleep
+    monkeypatch.setattr(locks.time, "sleep", lambda s: real_sleep(0.2))
+    lock = tmp_path / "x.lock"
+    started = time.monotonic()
+    with locked(lock), pytest.raises(LockTimeout):
+        with locked(lock, timeout_s=0.5):
+            pass
+    assert time.monotonic() - started < 1.2
 
 
 # --- the two bugs -----------------------------------------------------------
@@ -159,7 +179,9 @@ def test_two_processes_cannot_both_clear_the_fetch_cooldown(tmp_path):
             def __init__(self, *a, **k): pass
             def download(self, *a, **k):
                 time.sleep(1.5)
-                return b"<FlexQueryResponse></FlexQueryResponse>"
+                # The smallest body `fetch` accepts as a statement.
+                return (b"<FlexQueryResponse><FlexStatements count='1'>"
+                        b"<FlexStatement/></FlexStatements></FlexQueryResponse>")
 
         flex.read_token = lambda account=None: "token"
         # `_client_factory`, the module's single seam: `fetch` used to construct

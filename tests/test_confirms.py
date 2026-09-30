@@ -195,9 +195,9 @@ def test_the_statement_metadata_takes_the_base_currency_from_the_caller(confirm_
     """
     meta = statement_meta(confirm_file, base_currency="EUR")
     assert len(meta) == 1
-    assert meta[0].from_date == "20260924"
+    assert meta[0].from_date == "2026-09-24"
     assert meta[0].base_currency == "EUR"
-    assert meta[0].generated_at == "20260924;111200"
+    assert meta[0].generated_at == "2026-09-24 11:12:00"
 
 
 def test_a_base_currency_fill_is_not_an_estimate(monkeypatch):
@@ -339,3 +339,115 @@ def test_a_confirm_cannot_walk_a_settled_row_back(tmp_path, confirm_file):
     row = conn.execute("SELECT * FROM trades").fetchone()
     assert (row["source_kind"], row["fx_rate_estimated"]) == ("activity", 0)
     assert row["ib_commission"] == -1.5, "a confirm overwrote the settled commission"
+
+
+def test_a_confirm_that_fails_part_way_leaves_nothing_behind(tmp_path):
+    """H1, for the confirm writer: the job commits on the same connection.
+
+    A fill with no symbol violates `trades.symbol NOT NULL` after the provenance
+    row is written, so without the savepoint that row survived the caller's
+    commit and claimed a file whose fills never landed.
+    """
+    conn = connect_migrated(tmp_path / "j.db")
+    path = tmp_path / "confirm-20260924.xml"
+    path.write_text(CONFIRM_XML.replace('symbol="GOOG  261030P00310000"',
+                                        'symbol=""'), encoding="utf-8")
+    with pytest.raises(Exception, match="NOT NULL"):
+        ingest_confirms(conn, path, base_currency="EUR", rate_for=_fixed_rate())
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+
+    path.write_text(CONFIRM_XML, encoding="utf-8")
+    result = ingest_confirms(conn, path, base_currency="EUR", rate_for=_fixed_rate())
+    assert result.trades_inserted == 1
+
+
+def test_a_confirm_stores_its_dates_in_the_forms_the_statement_does(
+    tmp_path, confirm_file,
+):
+    """M3: every reader of these columns was written against the statement's forms.
+
+    py_ibkr turns the statement's `20260924;101659` into `2026-09-24 10:16:59`, and
+    a confirm stored IBKR's compact text as it came. So replay's `epoch_et` read a
+    same-session fill as no time at all, a month filter's `LIKE '2026-09%'` missed
+    it, and the page showed the raw stamp. Compared against the activity row for
+    the SAME execution, so the two forms cannot drift apart again.
+    """
+    from optjournal.clock import epoch_et
+
+    columns = "trade_date, date_time, expiry"
+    confirm_db = connect_migrated(tmp_path / "c.db")
+    ingest_confirms(confirm_db, confirm_file, base_currency="EUR",
+                    rate_for=_fixed_rate())
+    from_confirm = tuple(confirm_db.execute(f"SELECT {columns} FROM trades").fetchone())
+
+    activity = tmp_path / "activity-20260925T050000Z.xml"
+    activity.write_text(ACTIVITY_XML, encoding="utf-8")
+    activity_db = connect_migrated(tmp_path / "a.db")
+    ingest_file(activity_db, activity)
+    from_activity = tuple(
+        activity_db.execute(f"SELECT {columns} FROM trades").fetchone())
+
+    assert from_confirm == from_activity == (
+        "2026-09-24", "2026-09-24 10:16:59", "2026-10-30")
+    assert epoch_et(from_confirm[1]) is not None
+
+    stored = confirm_db.execute(
+        "SELECT from_date, to_date, when_generated FROM statements").fetchone()
+    assert tuple(stored) == ("2026-09-24", "2026-09-24", "2026-09-24 11:12:00")
+    statement = activity_db.execute(
+        "SELECT from_date, when_generated FROM statements").fetchone()
+    assert tuple(statement) == ("2026-09-24", "2026-09-25 05:00:00"), (
+        "the statement's own forms moved; the confirm must follow them"
+    )
+
+
+def test_a_date_the_parser_cannot_read_is_kept_as_sent(tmp_path):
+    """Normalising must not lose a value: an unreadable one stays as IBKR wrote it."""
+    path = tmp_path / "confirm-odd.xml"
+    path.write_text(CONFIRM_XML.replace('expiry="20261030"', 'expiry="2026-10"'),
+                    encoding="utf-8")
+    _account, fill = parse_confirms(path, rate_for=lambda c: 1.0)[0]
+    assert fill.expiry == "2026-10"
+    assert fill.trade_date == "2026-09-24"
+
+
+def test_a_confirm_archive_is_named_for_the_session_it_holds(tmp_path, monkeypatch):
+    """L5: named by the poll's UTC date, an evening poll filed Monday under Tuesday.
+
+    The live archive held `confirm-20260929.xml` whose payload covered 2026-09-28.
+    The name now comes from the payload's own `toDate`, so a file holds what its
+    name says and the next day's first poll cannot overwrite it.
+    """
+    from optjournal import flex
+
+    payload = CONFIRM_XML.replace('fromDate="20260924" toDate="20260924"',
+                                  'fromDate="20260928" toDate="20260928"').encode()
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory", lambda **kw: type(
+        "C", (), {"download": lambda self, *a, **k: payload})())
+    result = flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True)
+    assert result.raw_path.name == "confirm-20260928.xml"
+    assert result.raw_path.read_bytes() == payload
+
+
+def test_re_ingesting_a_grown_confirm_refreshes_its_statement_row(tmp_path):
+    """L5: the upsert kept the FIRST poll's period and stamp forever.
+
+    Each poll overwrites the day's file with a payload that is later and may cover
+    more, so the provenance row has to follow the file it describes.
+    """
+    conn = connect_migrated(tmp_path / "j.db")
+    path = tmp_path / "confirm-20260924.xml"
+    path.write_text(CONFIRM_XML, encoding="utf-8")
+    ingest_confirms(conn, path, base_currency="EUR", rate_for=_fixed_rate())
+
+    path.write_text(CONFIRM_XML.replace(
+        'toDate="20260924"', 'toDate="20260925"').replace(
+        'whenGenerated="20260924;111200"', 'whenGenerated="20260925;153000"'),
+        encoding="utf-8")
+    ingest_confirms(conn, path, base_currency="EUR", rate_for=_fixed_rate())
+    row = conn.execute(
+        "SELECT from_date, to_date, when_generated FROM statements").fetchone()
+    assert tuple(row) == ("2026-09-24", "2026-09-25", "2026-09-25 15:30:00")

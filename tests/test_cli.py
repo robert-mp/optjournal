@@ -686,3 +686,58 @@ def test_setup_stores_no_token_when_the_query_id_cannot_be_saved(
     assert _setup(monkeypatch, blocker / "optjournal") == 1
     assert wrote == [], "the token was stored although the query id was not"
     assert "Nothing was stored" in capsys.readouterr().err
+
+
+# --- an unreadable file in the archive (M6, L24) ------------------------------
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_an_unreadable_archive_file_is_skipped_and_the_rest_still_ingest(
+    tmp_path, capsys,
+):
+    """M6: one bad file used to halt `optjournal ingest` at that file forever.
+
+    It sorts FIRST here, so the old behaviour ingests nothing at all. Now it is
+    named and skipped, every later statement lands, and the exit code still says
+    something went wrong.
+    """
+    archive = tmp_path / "raw"
+    archive.mkdir()
+    (archive / "activity-20200101T000000Z.xml").write_bytes(
+        b"<html><body>Scheduled maintenance</body></html>")
+    (archive / STATEMENTS[0].name).write_bytes(STATEMENTS[0].read_bytes())
+    db = tmp_path / "cli.db"
+
+    code = main(["ingest", "--archive", str(archive), "--db", str(db)])
+
+    out = capsys.readouterr()
+    assert code != 0, "a skipped file must not read as a clean run"
+    assert "activity-20200101T000000Z.xml" in out.out
+    assert "Traceback" not in out.err
+    conn = connect_migrated(db)
+    names = [r[0] for r in conn.execute("SELECT source_file FROM statements")]
+    assert names == [STATEMENTS[0].name]
+    assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] > 0
+
+
+def test_ingest_reports_an_unreadable_file_in_its_json(tmp_path, capsys):
+    bad = tmp_path / "activity-bad.xml"
+    bad.write_bytes(b"<FlexQueryResponse")
+    code = main(["ingest", str(bad), "--db", str(tmp_path / "cli.db"), "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert code != 0
+    assert [u["file"] for u in data["unreadable"]] == ["activity-bad.xml"]
+
+
+@pytest.mark.parametrize("command", ["costs", "show"])
+def test_a_malformed_statement_is_one_line_not_a_traceback(tmp_path, capsys,
+                                                            command):
+    """L24: `costs <file>` printed a raw ParseError traceback."""
+    bad = tmp_path / "activity-bad.xml"
+    bad.write_bytes(b"<FlexQueryResponse")
+    code = main([command, str(bad)])
+    err = capsys.readouterr().err.strip()
+    assert code != 0
+    assert "activity-bad.xml" in err
+    assert len(err.splitlines()) == 1, err
+    assert "request" not in err, "a local file is not a failed Flex request"

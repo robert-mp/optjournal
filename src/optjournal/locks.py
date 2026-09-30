@@ -56,11 +56,11 @@ __all__ = ["LockTimeout", "locked"]
 
 log = logging.getLogger(__name__)
 
-#: Long enough for the slowest thing a lock covers, short enough that a wedged
-#: process surfaces as an error rather than a hang. The slowest holder is a fetch:
-#: keyring (8.2s measured) plus an IBKR download that retries while the statement
-#: generates. A migration is the other candidate; its table rebuilds run in
-#: milliseconds on this journal (5,000 bar upserts committed in 6ms).
+#: Long enough for the slowest thing a lock covers by default, short enough that a
+#: wedged process surfaces as an error rather than a hang. The migration lock is
+#: the main user; its table rebuilds run in milliseconds on this journal (5,000
+#: bar upserts committed in 6ms). The fetch lock is held far longer and passes its
+#: own, `flex.FETCH_LOCK_TIMEOUT_S`, sized from the fetch it waits for.
 DEFAULT_TIMEOUT_S = 120
 
 #: Poll interval while another process holds the lock.
@@ -110,7 +110,7 @@ def _unlock(handle: BinaryIO) -> None:
 
 
 @contextlib.contextmanager
-def locked(path: Path, *, timeout_s: int = DEFAULT_TIMEOUT_S) -> Iterator[None]:
+def locked(path: Path, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> Iterator[None]:
     """Hold an exclusive cross-process lock on `path` for the block.
 
     `path` is a lock FILE, not the resource: locking the database or the state
@@ -123,6 +123,10 @@ def locked(path: Path, *, timeout_s: int = DEFAULT_TIMEOUT_S) -> Iterator[None]:
     Implemented with signal-free polling: neither backend provides the timeout
     contract this application needs, and an alarm would not be safe on a
     non-main thread -- which the web server's handlers are.
+
+    The wait is measured on the monotonic clock, not by counting sleeps: each
+    `time.sleep` overshoots its 50ms, so the count ran behind the real wait
+    (a 120s timeout measured 128s).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     # Append mode never truncates, so two processes racing to create the file
@@ -133,22 +137,23 @@ def locked(path: Path, *, timeout_s: int = DEFAULT_TIMEOUT_S) -> Iterator[None]:
         if handle.tell() == 0:
             handle.write(b"\0")
             handle.flush()
-        waited = 0.0
+        deadline = time.monotonic() + timeout_s
+        first = True
         while True:
             if _try_lock(handle):
                 break
-            if waited >= timeout_s:
+            if time.monotonic() >= deadline:
                 raise LockTimeout(
                     f"another process held {path.name} for more than "
-                    f"{timeout_s}s. Stop the other optjournal process or wait "
+                    f"{timeout_s:g}s. Stop the other optjournal process or wait "
                     f"for its current operation to finish."
                 )
-            if waited == 0.0:
+            if first:
                 log.debug("waiting for %s", path.name)
+                first = False
             # 50ms: fast enough that contention is invisible to a person,
             # slow enough not to spin a core while a fetch runs.
             time.sleep(_POLL_S)
-            waited += _POLL_S
         try:
             yield
         finally:

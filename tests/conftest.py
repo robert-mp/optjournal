@@ -237,3 +237,43 @@ def _no_earnings_fetch(monkeypatch):
     AUTOUSE so the suite never reaches it; a test about it patches its own."""
     from optjournal import earnings  # noqa: PLC0415 - local to the fixture
     monkeypatch.setattr(earnings, "fetch_earnings", lambda *a, **k: None)
+
+
+@pytest.fixture
+def broken_http():
+    """A local HTTP server that breaks off mid-reply, for the transport tests.
+
+    `url("truncated")` answers 200 with a `Content-Length` of 100 and sends ten
+    bytes before closing, which `http.client` reports as `IncompleteRead`.
+    `url("hangup")` accepts the connection and closes it without a word, which it
+    reports as `RemoteDisconnected`. Both are what a flaky link or an overloaded
+    source actually does, and neither is a `URLError`, which is why each fetcher
+    has to name them.
+
+    A real socket rather than a patched `urlopen`, so the exceptions are the
+    ones the standard library really raises.
+    """
+    import socket  # noqa: PLC0415 - local to the fixture
+    import threading  # noqa: PLC0415
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            with conn:
+                request = conn.recv(65536).decode("latin-1")
+                if "/truncated" in request.split("\r\n", 1)[0]:
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json"
+                                 b"\r\nContent-Length: 100\r\n\r\n{\"chart\": ")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    yield lambda mode: f"http://127.0.0.1:{port}/{mode}"
+    listener.close()

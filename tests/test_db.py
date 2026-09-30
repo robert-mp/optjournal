@@ -214,9 +214,10 @@ def test_current_positions_uses_latest_report_date(conn):
 def test_snapshot_reingest_updates_rather_than_duplicates(conn):
     """Re-ingesting the same date's snapshot updates the row, never adds one.
 
-    The conflict target names `broker` because the key does. It was
-    `(report_date, conid)` and moved when snapshot identity became per-broker --
-    a conid is IBKR's numbering, so two brokers can each hold "contract 12345".
+    The conflict target names `broker` and `account_id` because the key does. It
+    was `(report_date, conid)` and moved when snapshot identity became per-broker
+    (a conid is IBKR's numbering, so two brokers can each hold "contract 12345"),
+    and then per-account, because two accounts in one file can hold it too.
     """
     _statement_row(conn)
     for mark in (1.0, 5.0):
@@ -225,7 +226,7 @@ def test_snapshot_reingest_updates_rather_than_duplicates(conn):
             " asset_category, position, mark_price, currency, fx_rate_to_base, raw,"
             " source_file, ingested_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(broker, report_date, conid)"
+            " ON CONFLICT(broker, account_id, report_date, conid)"
             " DO UPDATE SET mark_price=excluded.mark_price",
             ("20260731", "C1", "U1", "TSLA P", "OPT", -3, mark, "USD", 0.9,
              "{}", "s.xml", "now"),
@@ -1323,3 +1324,267 @@ def test_a_superseded_row_equals_one_the_statement_wrote_from_scratch(tmp_path):
     )
     superseded.close()
     direct.close()
+
+
+# --- a statement that fails part-way leaves nothing behind (H1) ---------------
+
+
+def _positions_break_ingest(tmp_path: Path, name: str = "activity-broken.xml") -> Path:
+    """The fixture with one open position missing its symbol.
+
+    The trades and cash sections are written before the positions, so the NOT
+    NULL on `position_snapshots.symbol` raises part-way through the file, after
+    the provenance row and every fill have been written.
+    """
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    old = 'symbol="NVDA  260320P00140000"'
+    assert old in text, "fixture position changed; update this seam"
+    path = tmp_path / name
+    path.write_text(text.replace(old, 'symbol=""', 1), encoding="utf-8")
+    return path
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_a_statement_that_fails_part_way_leaves_nothing_for_the_caller_to_commit(
+    conn, tmp_path,
+):
+    """The job runner commits on the same connection after a failure.
+
+    Before, the half-written statement survived that commit, and every later
+    run skipped the file as "byte-identical, nothing to do": the live journal
+    kept three statements with zero position snapshots that way.
+    """
+    broken = _positions_break_ingest(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        ingest_file(conn, broken)
+    conn.commit()  # what `jobs._finish` does next, on this connection
+
+    for table in ("statements", "trades", "cash_transactions",
+                  "position_snapshots", "equity_summaries"):
+        n = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        assert n == 0, f"{table} kept {n} row(s) from the failed statement"
+
+    # The same bytes are not "already ingested": the retry tries again.
+    with pytest.raises(sqlite3.IntegrityError):
+        ingest_file(conn, broken)
+    conn.commit()
+
+    # And once the file reads cleanly, it is ingested in full.
+    broken.write_bytes(STATEMENTS[0].read_bytes())
+    result = ingest_file(conn, broken)
+    assert not result.already_ingested
+    assert result.trades_inserted > 0
+    assert result.positions_written > 0
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM position_snapshots").fetchone()["n"] == \
+        result.positions_written
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_a_failed_ingest_keeps_the_callers_own_pending_writes(conn, tmp_path):
+    """Undoing the statement must not undo what the caller wrote before it."""
+    add_statement(conn, source_file="caller.xml")  # uncommitted, the caller's
+    with pytest.raises(sqlite3.IntegrityError):
+        ingest_file(conn, _positions_break_ingest(tmp_path))
+    conn.commit()
+    names = [r["source_file"] for r in conn.execute("SELECT source_file FROM statements")]
+    assert names == ["caller.xml"]
+
+
+# --- confirm rows stored before M3 are rewritten on open -----------------------
+
+
+def test_compact_confirm_dates_already_stored_are_rewritten_on_open(tmp_path):
+    """M3: the live journal holds confirm rows written as IBKR's compact text.
+
+    Opening the journal rewrites them into the forms an Activity Statement row
+    has, and leaves everything else alone: an activity row, and a confirm row
+    whose date is already ISO. Run twice to show it settles.
+    """
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    add_statement(conn, source_file="confirm-20260924.xml",
+                  from_date="20260924", to_date="20260924")
+    conn.execute("UPDATE statements SET when_generated = '20260924;114524'")
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="C1", ib_exec_id="EC1", source_kind=CONFIRM_SOURCE,
+                  source_file="confirm-20260924.xml", trade_date="20260924",
+                  date_time="20260924;101659", expiry="20261016")
+    _insert_trade(conn, trade_id="A1", ib_exec_id="EA1", expiry="2026-09-04")
+    conn.execute(
+        "INSERT INTO journal_entries (account_id, anchor_order_id, opened_on,"
+        " created_at, updated_at) VALUES ('U1', 'O1', '20260924', 'now', 'now')")
+    conn.commit()
+
+    migrate(conn)
+    migrate(conn)
+
+    confirm = conn.execute(
+        "SELECT trade_date, date_time, expiry FROM trades WHERE trade_id = 'C1'"
+    ).fetchone()
+    assert tuple(confirm) == ("2026-09-24", "2026-09-24 10:16:59", "2026-10-16")
+    activity = conn.execute(
+        "SELECT trade_date, date_time, expiry FROM trades WHERE trade_id = 'A1'"
+    ).fetchone()
+    assert tuple(activity) == ("2026-07-24", "2026-07-24 10:00:00", "2026-09-04")
+    stmt = conn.execute(
+        "SELECT from_date, to_date, when_generated FROM statements"
+        " WHERE source_file = 'confirm-20260924.xml'").fetchone()
+    assert tuple(stmt) == ("2026-09-24", "2026-09-24", "2026-09-24 11:45:24")
+    assert conn.execute(
+        "SELECT opened_on FROM journal_entries").fetchone()[0] == "2026-09-24"
+    conn.close()
+
+
+# --- the commission repairs stay inside the row's own broker (L6) -------------
+
+
+def test_the_commission_backfill_writes_only_the_row_whose_raw_it_read(conn):
+    """L6: the UPDATE matched on `trade_id` alone, so another broker's fill with
+    the same id took this one's commission currency."""
+    from optjournal.db import _backfill_commission_currency
+
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="ibkr",
+                  raw='{"ibCommissionCurrency": "USD"}')
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="schwab", raw="{}")
+    conn.execute("UPDATE trades SET ib_commission_currency = NULL")
+
+    assert _backfill_commission_currency(conn) == 1
+    got = dict(conn.execute("SELECT broker, ib_commission_currency FROM trades"))
+    assert got == {"ibkr": "USD", "schwab": None}
+
+
+def test_the_base_commission_repair_writes_only_the_row_it_found(conn):
+    """L6, the same key in the repair: only the mis-converted row is rewritten."""
+    from optjournal.db import _repair_base_commission
+
+    conn.execute(
+        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
+        " to_date, base_currency, asset_filter, ingested_at)"
+        " VALUES ('s.xml', 'x', 'U1', '2026-07-01', '2026-07-31', 'EUR', 'ALL', 'now')")
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="ibkr",
+                  currency="SEK", ib_commission=-1.7,
+                  ib_commission_currency="EUR", ib_commission_base=-0.15)
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="schwab",
+                  currency="SEK", ib_commission=-3.0,
+                  ib_commission_currency="SEK", ib_commission_base=-0.27)
+
+    assert _repair_base_commission(conn) == 1
+    got = dict(conn.execute("SELECT broker, ib_commission_base FROM trades"))
+    assert got == {"ibkr": -1.7, "schwab": -0.27}
+
+
+# --- a statement file holding two accounts (M4) --------------------------------
+
+
+def _two_accounts(tmp_path: Path) -> Path:
+    """The fixture with its FlexStatement block repeated for a second account.
+
+    The second block renumbers every IBKR id so nothing dedupes across accounts,
+    and keeps every CONTRACT id, so the same option held in both accounts on the
+    same day is two positions. That is the case the snapshot key collapsed.
+    """
+    import re
+
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    start = text.index("<FlexStatement ")
+    end = text.index("</FlexStatement>") + len("</FlexStatement>")
+    second = text[start:end].replace('accountId="U0000000"', 'accountId="U9999999"')
+    for attr in ("tradeID", "transactionID", "ibOrderID"):
+        second = re.sub(rf'{attr}="(\d+)"', rf'{attr}="9\1"', second)
+    second = re.sub(r'ibExecID="([^"]+)"', r'ibExecID="X\1"', second)
+    doc = text[:end] + "\n" + second + text[end:]
+    doc = doc.replace('<FlexStatements count="1">', '<FlexStatements count="2">')
+    path = tmp_path / "activity-two-accounts.xml"
+    path.write_text(doc, encoding="utf-8")
+    return path
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_every_account_in_a_file_is_read_not_only_the_first(tmp_path):
+    """`raw_sections` read the first FlexStatement only, so a second account's
+    positions, contracts and NAV were never seen."""
+    from optjournal.sections import raw_sections
+
+    single = raw_sections(STATEMENTS[0])
+    both = raw_sections(_two_accounts(tmp_path))
+    for name in ("OpenPositions", "EquitySummaryInBase", "AccountInformation"):
+        assert len(both[name]) == 2 * len(single[name]), name
+        assert {r["accountId"] for r in both[name]} == {"U0000000", "U9999999"}
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_the_same_contract_held_in_two_accounts_is_two_snapshot_rows(conn,
+                                                                     tmp_path):
+    """The snapshot key had no account, so the second account overwrote the
+    first's row for every contract both held (7 open episodes instead of 8)."""
+    single = ingest_file(conn, STATEMENTS[0])
+    conn.execute("DELETE FROM position_snapshots")
+    conn.execute("DELETE FROM equity_summaries")
+    conn.execute("DELETE FROM trades")
+    conn.execute("DELETE FROM cash_transactions")
+    conn.execute("DELETE FROM statements")
+    conn.commit()
+
+    both = ingest_file(conn, _two_accounts(tmp_path))
+
+    assert both.trades_inserted == 2 * single.trades_inserted
+    per_account = dict(conn.execute(
+        "SELECT account_id, COUNT(*) FROM position_snapshots GROUP BY account_id"))
+    assert per_account == {"U0000000": single.positions_written,
+                           "U9999999": single.positions_written}
+    navs = dict(conn.execute(
+        "SELECT account_id, COUNT(*) FROM equity_summaries GROUP BY account_id"))
+    assert navs == {"U0000000": single.equity_summaries_written,
+                    "U9999999": single.equity_summaries_written}
+    book = {r[0] for r in conn.execute(
+        "SELECT DISTINCT account_id FROM current_option_positions")}
+    assert book == {"U0000000", "U9999999"}
+
+
+def test_existing_snapshots_and_nav_are_rekeyed_by_account_losslessly(tmp_path):
+    """The v17 rebuild, run on tables with the v16 keys and real-shaped rows."""
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    _statement_row(conn)
+    for table, old_key in (
+        ("position_snapshots", "PRIMARY KEY (broker, report_date, conid)"),
+        ("equity_summaries", "PRIMARY KEY (broker, report_date)"),
+    ):
+        ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?",
+                           (table,)).fetchone()[0]
+        new_key = ddl[ddl.index("PRIMARY KEY"):ddl.rindex(")")]
+        conn.execute("DROP VIEW IF EXISTS current_option_positions")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(ddl.replace(new_key, old_key))
+    conn.execute(
+        "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
+        " asset_category, position, mark_price, currency, fx_rate_to_base, raw,"
+        " source_file, ingested_at) VALUES ('20260929', 'C1', 'U1', 'TSLA C',"
+        " 'OPT', -2, 4.5, 'USD', 0.86, '{}', 's.xml', 'then')")
+    conn.execute(
+        "INSERT INTO equity_summaries (report_date, account_id, currency,"
+        " total_base, raw, source_file, ingested_at)"
+        " VALUES ('20260929', 'U1', 'EUR', 25000.5, '{}', 's.xml', 'then')")
+    conn.commit()
+
+    migrate(conn)
+    migrate(conn)
+
+    def key(table: str) -> list[str]:
+        info = sorted((r["pk"], r["name"]) for r in conn.execute(
+            f"PRAGMA table_info({table})") if r["pk"])
+        return [name for _rank, name in info]
+
+    assert key("position_snapshots") == ["broker", "account_id", "report_date",
+                                         "conid"]
+    assert key("equity_summaries") == ["broker", "account_id", "report_date"]
+    snap = dict(conn.execute("SELECT * FROM position_snapshots").fetchone())
+    assert (snap["conid"], snap["account_id"], snap["position"],
+            snap["mark_price"], snap["ingested_at"]) == ("C1", "U1", -2, 4.5, "then")
+    nav = dict(conn.execute("SELECT * FROM equity_summaries").fetchone())
+    assert (nav["account_id"], nav["total_base"]) == ("U1", 25000.5)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM current_option_positions").fetchone()[0] == 1
+    conn.close()

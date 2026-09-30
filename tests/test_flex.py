@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,6 +35,9 @@ KNOWN_UNMODELLED_SECTIONS = {
     # this set means: unmodelled by the parser, whatever we then do with it.
     "EquitySummaryInBase",
 }
+
+
+STATEMENTS_FIRST = sorted(RAW_DIR.glob("activity-*.xml"))[0]
 
 
 def statements() -> list[Path]:
@@ -148,22 +152,91 @@ def test_shim_exposes_unmodelled_sections(statement: Path):
 # cron can wait for.
 
 
-def test_poll_worst_case_matches_backoff_arithmetic():
-    """Recomputed independently of the module's own expression."""
-    per_stage = sum(
-        min(flex.RETRY_INTERVAL * (2**i), flex.MAX_RETRY_INTERVAL)
-        for i in range(flex.MAX_RETRIES)
-    )
-    assert 2 * per_stage == flex.POLL_WORST_CASE_S, (
-        "worst case must cover both py_ibkr poll stages (SendRequest and "
-        "GetStatement), each of which gets the full retry budget"
-    )
+def test_poll_worst_case_matches_what_py_ibkr_actually_sleeps(monkeypatch):
+    """MEASURED against py_ibkr's own loop, not recomputed from a formula.
+
+    The formula this replaced summed MAX_RETRIES sleeps per stage. py_ibkr
+    sleeps BETWEEN attempts, so MAX_RETRIES - 1 times, and the last attempt
+    raises: the constant was one sleep per stage too long (660 against 420),
+    while leaving the requests themselves out entirely (M12).
+
+    The worst case is driven here: SendRequest reports "in progress" until its
+    last attempt, then GetStatement reports "not ready" on every attempt.
+    """
+    from py_ibkr.flex import client as client_module
+    from py_ibkr.flex.client import FlexInProgressError, FlexNotReadyError
+
+    slept: list[float] = []
+    monkeypatch.setattr(client_module.time, "sleep", slept.append)
+    sends: list[int] = []
+
+    def send_request(self, *args, **kwargs):
+        sends.append(1)
+        if len(sends) < flex.MAX_RETRIES:
+            raise FlexInProgressError("in progress")
+        return "REF"
+
+    def get_statement(self, *args, **kwargs):
+        raise FlexNotReadyError("not ready")
+
+    monkeypatch.setattr(client_module.FlexClient, "send_request", send_request)
+    monkeypatch.setattr(client_module.FlexClient, "get_statement", get_statement)
+    with pytest.raises(FlexNotReadyError):
+        client_module.FlexClient().download(
+            "tok", "1", max_retries=flex.MAX_RETRIES,
+            retry_interval=flex.RETRY_INTERVAL,
+            max_retry_interval=flex.MAX_RETRY_INTERVAL)
+    assert sum(slept) == flex.POLL_WORST_CASE_S
 
 
 def test_poll_worst_case_is_hand_computable():
-    """MAX_RETRIES=4 -> [30, 60, 120, 120] = 330s/stage -> 660s."""
+    """MAX_RETRIES=4 -> [30, 60, 120] = 210s/stage -> 420s."""
     assert flex.MAX_RETRIES == 4
-    assert flex.POLL_WORST_CASE_S == 660
+    assert flex.POLL_WORST_CASE_S == 420
+
+
+def test_the_fetch_worst_case_counts_every_request_and_the_keyring():
+    """The whole wall clock a fetch can hold the lock for: 30 + 420 + 480."""
+    assert flex.FETCH_WORST_CASE_S == (
+        flex.KEYRING_READ_TIMEOUT_S + flex.POLL_WORST_CASE_S
+        + 2 * flex.MAX_RETRIES * flex.FETCH_SOCKET_TIMEOUT_S)
+    assert flex.FETCH_LOCK_TIMEOUT_S > flex.FETCH_WORST_CASE_S, (
+        "a fetch waiting behind a slow one would give up while it still works"
+    )
+
+
+def _hold_the_fetch_lock(archive: Path, seconds: float) -> threading.Thread:
+    from optjournal.locks import locked
+
+    held = threading.Event()
+
+    def hold() -> None:
+        with locked(archive / flex.FETCH_LOCK):
+            held.set()
+            threading.Event().wait(seconds)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    held.wait(5)
+    return holder
+
+
+def test_a_fetch_waits_for_the_fetch_lock_as_long_as_the_fetch_lock_timeout(
+    tmp_path, monkeypatch,
+):
+    """M12: the wait was the lock module's 120s default, not the fetch's own.
+
+    Scaled down: the timeout is patched to a fraction of a second and the other
+    holder keeps the lock for longer, so a fetch that used any other timeout
+    would not raise here.
+    """
+    from optjournal.locks import LockTimeout
+
+    monkeypatch.setattr(flex, "FETCH_LOCK_TIMEOUT_S", 0.2)
+    holder = _hold_the_fetch_lock(tmp_path, 1.0)
+    with pytest.raises(LockTimeout):
+        flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True)
+    holder.join()
 
 
 def test_retry_budget_stays_within_a_daily_cron_window():
@@ -415,9 +488,9 @@ def test_the_real_client_is_the_one_with_the_timeout():
 def test_the_socket_timeout_sits_below_the_polling_ceiling():
     """Two different budgets, and confusing them is the mistake to avoid.
 
-    `POLL_WORST_CASE_S` (660s) is the wall clock for the whole two-stage fetch
-    INCLUDING the retry ladder that waits for IBKR to generate a statement. The
-    socket timeout bounds ONE request inside that. A socket timeout above the
+    `POLL_WORST_CASE_S` (420s) is the sleeping in the two-stage retry ladder
+    that waits for IBKR to generate a statement. The socket timeout bounds ONE
+    request inside the fetch. A socket timeout above the
     ceiling could never fire; one at a few seconds would kill a legitimately slow
     download.
     """
@@ -636,3 +709,359 @@ def test_the_error_code_pattern_still_matches_what_py_ibkr_writes():
         "flex._FLEX_CODE no longer matches it"
     )
     assert flex._FLEX_CODE.search("Flex API Error 1015: Token is invalid.")
+
+
+# --------------------------------------------------------------------------
+# A response body that is not a statement is refused before it is archived.
+# --------------------------------------------------------------------------
+
+_NO_STATEMENTS = (b'<FlexQueryResponse queryName="q" type="AF">'
+                  b'<FlexStatements count="0"></FlexStatements></FlexQueryResponse>')
+_TCF = (b'<FlexQueryResponse queryName="Confirms" type="TCF">'
+        b'<FlexStatements count="1"><FlexStatement accountId="U1" fromDate="20260924"'
+        b' toDate="20260924" whenGenerated="20260924;111200"><TradeConfirms/>'
+        b'</FlexStatement></FlexStatements></FlexQueryResponse>')
+
+
+def _serve(monkeypatch, body: bytes) -> None:
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory", lambda **kw: type(
+        "C", (), {"download": lambda self, *a, **k: body})())
+
+
+@pytest.mark.parametrize("body", [
+    b"<html><body>Scheduled maintenance</body></html>\n",
+    b"",
+    b'<FlexQueryResponse queryName="q" type="AF"><FlexStatements count="1">',
+    _NO_STATEMENTS,
+], ids=["html", "empty", "truncated", "no-statements"])
+def test_a_body_that_is_not_a_statement_is_neither_archived_nor_stamped(
+    tmp_path, monkeypatch, body,
+):
+    """M6: an HTML maintenance page used to become `activity-*.xml`.
+
+    Archived first and stamped first, it then halted `optjournal ingest` at that
+    file on every run, and the cooldown made the retry wait fifteen minutes for a
+    request that had produced nothing.
+    """
+    _serve(monkeypatch, body)
+    with pytest.raises(flex.StatementUnreadable):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("activity-*.xml"))
+    assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+
+
+def test_a_statement_that_is_not_read_is_still_an_ordinary_flex_error(tmp_path,
+                                                                       monkeypatch):
+    """Every caller already handles `FlexError`; the new type must reach them."""
+    from py_ibkr import FlexError
+
+    _serve(monkeypatch, _NO_STATEMENTS)
+    with pytest.raises(FlexError):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+
+
+def test_a_trade_confirmation_under_the_activity_query_id_is_refused(tmp_path,
+                                                                     monkeypatch):
+    """L1: accepted silently, it became the newest statement and blanked costs."""
+    _serve(monkeypatch, _TCF)
+    with pytest.raises(flex.StatementUnreadable, match="Trade Confirmation"):
+        flex.fetch("1621016", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("*.xml"))
+
+
+def test_an_activity_statement_under_the_confirm_query_id_is_refused(tmp_path,
+                                                                     monkeypatch):
+    """The mirror of L1, refused before archiving too rather than at the parse."""
+    _serve(monkeypatch, STATEMENTS_FIRST.read_bytes())
+    with pytest.raises(flex.StatementUnreadable, match="Activity"):
+        flex.fetch_confirms("1591754", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("*.xml"))
+
+
+def test_a_trade_confirmation_in_the_archive_is_refused_by_the_ingest(tmp_path):
+    """L1, for a file already on disk: nothing is written from it."""
+    from conftest import connect_migrated
+
+    from optjournal.ingest import ingest_file
+
+    path = tmp_path / "activity-20260924T111200Z.xml"
+    path.write_bytes(_TCF)
+    conn = connect_migrated(tmp_path / "j.db")
+    with pytest.raises(flex.StatementUnreadable, match="Trade Confirmation"):
+        ingest_file(conn, path)
+    assert conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("body", [b"", b"<FlexQueryResponse", _NO_STATEMENTS],
+                         ids=["empty", "malformed", "no-statements"])
+def test_loading_an_unreadable_file_raises_the_typed_error(tmp_path, body):
+    """So the CLI can print one line about it instead of a ParseError traceback."""
+    path = tmp_path / "activity-bad.xml"
+    path.write_bytes(body)
+    with pytest.raises(flex.StatementUnreadable, match="activity-bad.xml"):
+        load(path)
+
+
+def test_ingesting_a_malformed_file_raises_the_typed_error_too(tmp_path):
+    """The ingest reads the base currency first; it must not beat `load` to it."""
+    from conftest import connect_migrated
+
+    from optjournal.ingest import ingest_file
+
+    path = tmp_path / "activity-bad.xml"
+    path.write_bytes(b"<FlexQueryResponse")
+    with pytest.raises(flex.StatementUnreadable, match="activity-bad.xml"):
+        ingest_file(connect_migrated(tmp_path / "j.db"), path)
+
+
+# --------------------------------------------------------------------------
+# A busy server is not a rejected token (M7).
+# --------------------------------------------------------------------------
+
+def _answer_with_error(monkeypatch, code: str, message: str) -> None:
+    """IBKR's error envelope, raised by py_ibkr's own error table.
+
+    Through `_raise_for_error` rather than a hand-built exception, so the test
+    sees exactly what a real reply produces, class and message both.
+    """
+    from py_ibkr.flex.client import _raise_for_error
+
+    envelope = ET.fromstring(
+        f"<FlexStatementResponse><Status>Fail</Status><ErrorCode>{code}</ErrorCode>"
+        f"<ErrorMessage>{message}</ErrorMessage></FlexStatementResponse>")
+
+    def download(self, *args, **kwargs):
+        _raise_for_error(envelope)
+
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory",
+                        lambda **kw: type("C", (), {"download": download})())
+
+
+@pytest.mark.parametrize(("code", "message"), [
+    ("1009", "The server is under heavy load. Statement could not be generated "
+             "at this time. Please try again shortly."),
+    ("1008", "MTM and FIFO P/L data is not ready at this time. Please try again "
+             "shortly."),
+    ("1018", "Too many requests have been made from this token. Please try again "
+             "shortly."),
+    ("1001", "Statement could not be generated at this time. Please try again "
+             "shortly."),
+])
+def test_a_busy_server_is_a_retry_later_not_a_rejected_token(
+    tmp_path, monkeypatch, code, message,
+):
+    """1009 arrived as `FlexAuthError`, which the journal read as a dead token.
+
+    py_ibkr files 1009 beside 1012 under one class and one message template, so
+    only the CODE tells a heavy-loaded server from an expired token. The remedy
+    for one is waiting; for the other it is Client Portal, and sending someone
+    there because IBKR was busy is the bug.
+    """
+    from py_ibkr import FlexError
+
+    _answer_with_error(monkeypatch, code, message)
+    with pytest.raises(flex.FlexBusy) as caught:
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert not isinstance(caught.value, flex.TokenRejected)
+    assert isinstance(caught.value, FlexError), "existing FlexError handlers miss it"
+    assert caught.value.code == code
+    assert "try again later" in str(caught.value)
+    assert "Client Portal" not in str(caught.value)
+
+
+@pytest.mark.parametrize(("code", "message", "reads_as"), [
+    ("1012", "Token has expired.", "expired"),
+    ("1015", "Token is invalid.", "regenerated"),
+])
+def test_a_token_error_from_the_real_error_table_is_still_rejected(
+    tmp_path, monkeypatch, code, message, reads_as,
+):
+    _answer_with_error(monkeypatch, code, message)
+    with pytest.raises(flex.TokenRejected, match=reads_as):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+
+
+def test_py_ibkr_still_has_the_error_table_the_code_shim_rewrites():
+    """A pin on a private table, because the shim edits it in place.
+
+    If py_ibkr renames or reshapes `_ERROR_EXCEPTIONS`, the shim would silently
+    stop putting the code back, and 1009 would read as a token problem again.
+    """
+    from py_ibkr.flex import client
+
+    table = client._ERROR_EXCEPTIONS
+    assert {"1009", "1012"} <= set(table)
+    for code, (_cls, template) in table.items():
+        assert template.startswith(f"Flex API Error {code}: "), template
+
+
+# --------------------------------------------------------------------------
+# A keychain that never answers is a failure with a cause, not a hang (L11).
+# --------------------------------------------------------------------------
+
+def _keychain_waiting_for_an_unlock(monkeypatch) -> threading.Event:
+    """`get_password` blocks until released, like a keychain prompt nobody sees."""
+    release = threading.Event()
+
+    def blocked(service, account):
+        release.wait(30)
+        return "tok"
+
+    monkeypatch.setattr(flex.keyring, "get_password", blocked)
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.2)
+    return release
+
+
+def test_a_keychain_that_does_not_answer_raises_within_the_deadline(monkeypatch):
+    """L11: the read had no deadline, so a prompt stalled the scheduler thread,
+    and with it every job, while the fetch lock was held."""
+    import time
+
+    release = _keychain_waiting_for_an_unlock(monkeypatch)
+    started = time.monotonic()
+    try:
+        with pytest.raises(flex.TokenUnreadable, match="did not answer") as caught:
+            flex.read_token("someone")
+    finally:
+        release.set()
+    assert time.monotonic() - started < 5
+    assert isinstance(caught.value, flex.TokenMissing), (
+        "every caller that reports a missing token must report this one too"
+    )
+
+
+def test_a_keychain_that_does_not_answer_fails_the_sync_job_with_the_cause(
+    tmp_path, monkeypatch,
+):
+    """Recorded by the job as a failure that says what to do, not a silent stall."""
+    from conftest import connect_migrated
+
+    from optjournal import jobs
+
+    release = _keychain_waiting_for_an_unlock(monkeypatch)
+    ctx = jobs.Context(archive_dir=tmp_path, db_path=tmp_path / "j.db",
+                       query_id="1591754")
+    try:
+        outcome = jobs._sync(connect_migrated(tmp_path / "j.db"), ctx)
+    finally:
+        release.set()
+    assert outcome.status == "failed"
+    assert "keyring did not answer" in outcome.detail
+
+
+def test_a_keychain_error_is_still_raised_as_itself(monkeypatch):
+    """The deadline must not swallow what the backend actually said."""
+    def broken(service, account):
+        raise RuntimeError("(-25320, 'Unknown Error')")
+
+    monkeypatch.setattr(flex.keyring, "get_password", broken)
+    with pytest.raises(RuntimeError, match="-25320"):
+        flex.read_token("someone")
+
+
+# --- a reply broken off mid-way is this module's typed error (L3) -------------
+
+
+@pytest.mark.parametrize("mode", ["truncated", "hangup"])
+def test_a_reply_broken_off_mid_way_is_a_flex_error(broken_http, mode):
+    """`IncompleteRead` is an `http.client.HTTPException`, not an `OSError`.
+
+    It escaped the fetcher's own error type, so one truncated body aborted a whole
+    run instead of failing one request. `RemoteDisconnected` is here too, which
+    every fetcher must also report as its own error.
+    """
+    from optjournal.flex import FlexError, _TimeoutFlexClient
+
+    with pytest.raises(FlexError):
+        _TimeoutFlexClient(user_agent="test", timeout_s=5)._get(broken_http(mode))
+
+
+# --------------------------------------------------------------------------
+# A period override IBKR would refuse is refused here, for free (L7).
+# --------------------------------------------------------------------------
+
+def _no_request_allowed(monkeypatch) -> None:
+    def spent(account=None):
+        raise AssertionError("reached the keyring, so a request was about to be spent")
+
+    monkeypatch.setattr(flex, "read_token", spent)
+
+
+def _weekday_before(day, weekday: int):
+    from datetime import timedelta as _td
+
+    while day.weekday() != weekday:
+        day -= _td(days=1)
+    return day
+
+
+def _market_today():
+    from optjournal.clock import MARKET_TZ
+
+    return datetime.now(MARKET_TZ).date()
+
+
+@pytest.mark.parametrize(("from_date", "to_date"), [
+    ("20260105", None),
+    (None, "20260105"),
+], ids=["from-only", "to-only"])
+def test_one_end_of_a_period_is_refused_before_anything_is_spent(
+    tmp_path, monkeypatch, from_date, to_date,
+):
+    _no_request_allowed(monkeypatch)
+    with pytest.raises(ValueError, match="both"):
+        flex.fetch("1591754", archive_dir=tmp_path, from_date=from_date,
+                   to_date=to_date, force=True)
+
+
+def test_a_weekend_end_is_refused_naming_the_weekday_to_use(tmp_path, monkeypatch):
+    _no_request_allowed(monkeypatch)
+    saturday = _weekday_before(_market_today() - timedelta(days=7), 5)
+    friday = saturday - timedelta(days=1)
+    with pytest.raises(ValueError, match="Saturday") as caught:
+        flex.fetch("1591754", archive_dir=tmp_path,
+                   from_date=(friday - timedelta(days=4)).strftime("%Y%m%d"),
+                   to_date=saturday.strftime("%Y%m%d"), force=True)
+    assert friday.strftime("%Y%m%d") in str(caught.value)
+
+
+def test_a_statement_period_ending_today_or_later_is_refused(tmp_path, monkeypatch):
+    """An Activity Statement ends at the previous day; IBKR refuses a later `td`."""
+    _no_request_allowed(monkeypatch)
+    today = _market_today()
+    with pytest.raises(ValueError, match="later than"):
+        flex.fetch("1591754", archive_dir=tmp_path,
+                   from_date=(today - timedelta(days=30)).strftime("%Y%m%d"),
+                   to_date=today.strftime("%Y%m%d"), force=True)
+
+
+def test_an_inverted_period_is_refused(tmp_path, monkeypatch):
+    _no_request_allowed(monkeypatch)
+    with pytest.raises(ValueError, match="after"):
+        flex.fetch("1591754", archive_dir=tmp_path, from_date="20260109",
+                   to_date="20260105", force=True)
+
+
+def test_a_valid_period_and_a_same_day_confirm_still_go_through(tmp_path,
+                                                                 monkeypatch):
+    """The checks must not refuse what IBKR accepts: a weekday period ending
+    yesterday or earlier, and a confirm covering today (it is same-session)."""
+    friday = _weekday_before(_market_today() - timedelta(days=1), 4)
+    asked: list[dict] = []
+
+    def download(self, *args, **kwargs):
+        asked.append(kwargs)
+        return _TCF if kwargs.get("to_date") == today else STATEMENTS_FIRST.read_bytes()
+
+    today = _market_today().strftime("%Y%m%d")
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory",
+                        lambda **kw: type("C", (), {"download": download})())
+    flex.fetch("1591754", archive_dir=tmp_path, force=True,
+               from_date=(friday - timedelta(days=4)).strftime("%Y%m%d"),
+               to_date=friday.strftime("%Y-%m-%d"))
+    flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True,
+                        from_date=today, to_date=today)
+    assert [a["to_date"] for a in asked] == [friday.strftime("%Y%m%d"), today]

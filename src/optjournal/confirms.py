@@ -38,6 +38,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from py_ibkr.flex.utils import parse_date, parse_datetime
+
 from optjournal.fills import NormalisedFill, StatementMeta
 
 __all__ = [
@@ -83,6 +85,37 @@ class ConfirmParseError(RuntimeError):
 def _text(attrs: dict[str, str], name: str) -> str | None:
     value = (attrs.get(name) or "").strip()
     return value or None
+
+
+def _date(attrs: dict[str, str], name: str) -> str | None:
+    """A date in the form the Activity Statement's rows store: `2026-09-24`.
+
+    The statement's dates reach the journal through py_ibkr, which parses IBKR's
+    compact `20260924` into a `date`; a confirm is read here as text. Stored as
+    sent, the two kinds of row disagreed on one column, and every reader had been
+    written against the statement's form: replay dropped a same-session fill, a
+    month filter missed it, and the page printed the raw stamp. Parsed by the SAME
+    py_ibkr function, so the forms cannot drift apart.
+
+    A value that function cannot read is kept as IBKR sent it rather than
+    dropped: an odd date on the row is recoverable, a missing one is not.
+    """
+    raw = _text(attrs, name)
+    try:
+        parsed = parse_date(raw) if raw else None
+    except ValueError:
+        return raw
+    return str(parsed) if parsed else raw
+
+
+def _datetime(attrs: dict[str, str], name: str) -> str | None:
+    """A stamp in the statement's form, `2026-09-24 10:16:59`. See `_date`."""
+    raw = _text(attrs, name)
+    try:
+        parsed = parse_datetime(raw) if raw else None
+    except ValueError:
+        return raw
+    return str(parsed) if parsed else raw
 
 
 def _number(attrs: dict[str, str], name: str) -> float | None:
@@ -145,9 +178,9 @@ def statement_meta(path: Path, *, base_currency: str) -> list[StatementMeta]:
     return [
         StatementMeta(
             account_id=_text(stmt.attrib, "accountId"),
-            from_date=_text(stmt.attrib, "fromDate"),
-            to_date=_text(stmt.attrib, "toDate"),
-            generated_at=_text(stmt.attrib, "whenGenerated"),
+            from_date=_date(stmt.attrib, "fromDate"),
+            to_date=_date(stmt.attrib, "toDate"),
+            generated_at=_datetime(stmt.attrib, "whenGenerated"),
             base_currency=base_currency,
         )
         for stmt in _root(path).iter("FlexStatement")
@@ -203,8 +236,8 @@ def _fill(attrs: dict[str, str], account_id: str, rate_for: Any) -> NormalisedFi
         transaction_id=None,
         order_id=_text(attrs, "orderID"),
         account_id=account_id,
-        trade_date=_text(attrs, "tradeDate"),
-        date_time=_text(attrs, "dateTime"),
+        trade_date=_date(attrs, "tradeDate"),
+        date_time=_datetime(attrs, "dateTime"),
         asset_category=_text(attrs, "assetCategory"),
         symbol=_text(attrs, "symbol"),
         contract_id=_text(attrs, "conid"),
@@ -212,7 +245,7 @@ def _fill(attrs: dict[str, str], account_id: str, rate_for: Any) -> NormalisedFi
         underlying_contract_id=_text(attrs, "underlyingConid"),
         put_call=_text(attrs, "putCall"),
         strike=_number(attrs, "strike"),
-        expiry=_text(attrs, "expiry"),
+        expiry=_date(attrs, "expiry"),
         multiplier=_number(attrs, "multiplier"),
         buy_sell=_text(attrs, "buySell"),
         open_close=open_close,
