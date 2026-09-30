@@ -641,10 +641,16 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    grows with every ticker the book carries; the demo's is a short one.
    `:has()`, because on the six tabs the period does not drive it is empty, and
    an empty second row still costs its `row-gap` -- a strip of dead slab under
-   every header that has nothing to put there. */
+   every header that has nothing to put there. The row is the plain rule and
+   `:has()` only takes it AWAY: written the other way round, a browser without
+   `:has()` (Firefox before 121) kept the one-row header on the tabs that have a
+   period and ran 51px past the window at 765px. There it now costs the dead
+   strip on the other six tabs instead, which is the cheaper failure. */
 @media(max-width:1320px){
-  .brand:has(.period:not(:empty)){grid-template-columns:auto 1fr auto;
+  .brand{grid-template-columns:auto 1fr auto;
     grid-template-areas:"mark head actions" ". period period";row-gap:var(--s5)}
+  .brand:has(.period:empty){grid-template-columns:auto auto 1fr auto;
+    grid-template-areas:"mark head period actions";row-gap:normal}
   .period{justify-self:start}}
 .pstep{display:flex;align-items:center;gap:var(--s2)}
 /* The chevrons the calendar used to carry in its title, moved here with their
@@ -2113,8 +2119,10 @@ stop.gneg{stop-color:var(--bad)}
 
    THE HEADER stacks: mark and title, then the period, then the actions -- and
    with no period, just title then actions, so the tabs without one grow no empty
-   row. The `:has()` form is restated because the 1320px rule's is specificity
-   (0,3,0) and a bare `.brand` would lose to it here, source order or not.
+   row. As at 1320px the period row is the plain rule and `:has()` removes it, so
+   a browser without `:has()` still stacks the period. The `:has()` form restates
+   the columns and the gap because the 1320px one is specificity (0,3,0) and
+   would win them here, source order or not.
 
    THE CALENDAR GRIDS' CELLS get a zero minimum and clip. This was written for
    the Market strip, whose seven `1fr` tracks each refused to shrink below their
@@ -2131,9 +2139,9 @@ stop.gneg{stop-color:var(--bad)}
   .rail .tab{flex:0 0 auto}
   .wrap{padding:var(--s5)}
   .brand{grid-template-columns:auto 1fr;
+    grid-template-areas:"mark head" "period period" "actions actions";row-gap:var(--s5)}
+  .brand:has(.period:empty){grid-template-columns:auto 1fr;
     grid-template-areas:"mark head" "actions actions";row-gap:var(--s5)}
-  .brand:has(.period:not(:empty)){grid-template-columns:auto 1fr;
-    grid-template-areas:"mark head" "period period" "actions actions"}
   .period{justify-self:start;flex-wrap:wrap;row-gap:var(--s3)}
   .hdr-actions{justify-self:start}
   .cal{grid-template-columns:repeat(7,minmax(0,1fr))}

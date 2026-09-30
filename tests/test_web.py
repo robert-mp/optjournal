@@ -8641,7 +8641,28 @@ def test_the_header_figure_cannot_break_between_its_sign_and_its_number():
     assert "white-space:nowrap" in css.split(".pfig{", 1)[1].split("}", 1)[0]
     # And the header gives the period its own row when one row cannot hold it --
     # only when there IS a period, so the six tabs without one grow no dead row.
-    assert ".brand:has(.period:not(:empty)){" in css
+    assert ".brand:has(.period:empty){" in css
+
+
+@pytest.mark.parametrize("width", [1320, 760])
+def test_the_period_row_does_not_depend_on_has(width):
+    """Found while emulating finding D3: the period's own row was granted by
+    `.brand:has(.period:not(:empty))`, so a browser without `:has()` (Firefox
+    before 121) dropped the rule and kept the one-row header on the tabs that have
+    a period: 51px past the window at 765px, 14px at 320. The row is now the plain
+    `.brand` rule and `:has(.period:empty)` takes it away, which computes the same
+    layout wherever `:has()` exists (the header's geometry was compared against the
+    old page on all ten tabs at five widths in Chromium) and costs a browser without
+    it only a dead strip on the six tabs with no period.
+    """
+    rules = {sel: body.replace(" ", "") for sel, body in _media_rules(width)}
+    assert "periodperiod" in rules.get(".brand", "").replace('"', ""), (
+        f"at {width}px the period row is granted by :has(), which older browsers drop")
+    revert = rules.get(".brand:has(.period:empty)", "")
+    assert "periodperiod" not in revert.replace('"', "") and "grid-template-areas" in revert
+    assert "grid-template-columns" in revert and "row-gap" in revert, (
+        "the revert must restate what the other width's rules would otherwise win")
+    assert ".brand:has(.period:not(:empty))" not in rules
 
 
 def test_the_theme_chip_drops_under_the_wordmark_when_the_row_cannot_hold_both():
