@@ -577,8 +577,12 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
 }
 .kicker{font-size:var(--t0);letter-spacing:var(--tr-wide);text-transform:uppercase;
   color:var(--kicker);font-weight:var(--w-label);margin-bottom:var(--s0)}
+/* `flex-wrap` because on a phone the row cannot hold both: at 320px the column is
+   168px and the wordmark takes 134 of it, so the chip squeezed onto two lines and
+   still ran past the header, 4px past the window on Admiralty, whose longest word
+   is the widest. Wrapped, it sits on its own line under the wordmark. */
 .title{font-size:var(--t8);font-weight:var(--w-fig);letter-spacing:var(--tr-tight);line-height:1.1;
-  display:flex;align-items:center;gap:var(--s4)}
+  display:flex;flex-wrap:wrap;align-items:center;gap:var(--s4)}
 /* `font:inherit` and the cursor are what a <button> needs that the old <span>
    did not: a button does not inherit the page's family or size, so without it
    the chip rendered in the browser's default UI font beside a 30px title. */

@@ -8358,6 +8358,20 @@ def test_the_header_figure_cannot_break_between_its_sign_and_its_number():
     assert ".brand:has(.period:not(:empty)){" in css
 
 
+def test_the_theme_chip_drops_under_the_wordmark_when_the_row_cannot_hold_both():
+    """At 320px the title column is 168px and "Bitácora" alone takes 134px of it,
+    so the edition chip squeezed to two lines and still ran past the column: to
+    314px on Leather, 311 on Ledger, and to 324 on Admiralty, whose longest word is
+    the widest, which scrolled every tab of the page sideways by 4px. The overflow
+    was never the theme's; it was a row that could not wrap. Measured after the fix
+    at 320 and 375px in all three themes: the chip sits on its own line under the
+    wordmark and the page is exactly as wide as the window.
+    """
+    title = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}[".title"]
+    assert "display:flex" in title and "flex-wrap:wrap" in title, (
+        "the title row cannot wrap, so the chip overflows the header on a phone")
+
+
 def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state):
     """The ranking reads the lifecycles; the tiles read month_stats. Both claim to
     count decided positions' realised P&L, so over all time the decided cards must
