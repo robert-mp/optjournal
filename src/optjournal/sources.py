@@ -166,14 +166,11 @@ class IbkrSource:
         base is not EUR, and it converted every figure by a rate it did not need.
         """
         from optjournal.flex import StatementUnreadable
-        from optjournal.sections import raw_sections
+        from optjournal.sections import stated_base_currency, statement_blocks
 
-        sections = raw_sections(path)
-        for name in ("AccountInformation", "EquitySummaryInBase"):
-            for row in sections.get(name) or ():
-                code = (row.get("currency") or "").strip()
-                if code:
-                    return code
+        code = stated_base_currency(statement_blocks(path))
+        if code:
+            return code
         raise StatementUnreadable(
             f"{path.name} does not state the account's base currency: it has no "
             f"AccountInformation section. Enable Account Information in the "

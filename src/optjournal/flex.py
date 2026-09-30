@@ -43,6 +43,7 @@ from py_ibkr.flex.parser import parse_xml_file
 from optjournal.clock import MARKET_TZ
 from optjournal.confirms import CONFIRM_QUERY_TYPE
 from optjournal.locks import locked
+from optjournal.sections import stated_base_currency
 
 __all__ = [
     "FETCH_COOLDOWN_S",
@@ -825,6 +826,16 @@ def _check_payload(raw: bytes, *, expect: str, source: str) -> None:
         raise StatementUnreadable(
             f"{source} is not readable XML ({exc}); it starts {start!r}") from exc
     _check_root(root, expect=expect, source=source)
+    # Before archiving, because ingest refuses such a statement: archived, it
+    # spent a request, stamped the cooldown and left a file no ingest can read,
+    # one more on every daily sync.
+    if expect == ACTIVITY_QUERY_TYPE and not stated_base_currency(
+            root.findall(".//FlexStatement")):
+        raise StatementUnreadable(
+            f"{source} does not state the account's base currency: it has no "
+            f"AccountInformation section. Enable Account Information in the "
+            f"Activity Flex query (Client Portal, Performance & Reports, Flex "
+            f"Queries), then fetch again.")
 
 
 def _payload_to_date(raw: bytes) -> str | None:

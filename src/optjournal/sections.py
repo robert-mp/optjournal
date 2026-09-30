@@ -20,13 +20,15 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-__all__ = ["MODELLED_SECTIONS", "raw_sections", "section_tags"]
+__all__ = ["MODELLED_SECTIONS", "raw_sections", "section_tags", "stated_base_currency",
+           "statement_blocks"]
 
 #: Statement child elements py_ibkr turns into typed models.
 MODELLED_SECTIONS = frozenset({"Trades", "CashTransactions", "CashReport"})
 
 
-def _statements(path: Path) -> list[ET.Element]:
+def statement_blocks(path: Path) -> list[ET.Element]:
+    """Every FlexStatement element in the file. Raises ValueError when none."""
     root = ET.parse(str(path)).getroot()
     found = root.findall(".//FlexStatement")
     if not found:
@@ -34,10 +36,29 @@ def _statements(path: Path) -> list[ET.Element]:
     return found
 
 
+def stated_base_currency(statements: list[ET.Element]) -> str | None:
+    """The account's base currency as the statement blocks state it, or None.
+
+    AccountInformation is where IBKR states it. EquitySummaryInBase rows carry
+    the same code (every real statement agrees), so they answer when a query
+    leaves AccountInformation out. One rule for the ingest's reader and for the
+    fetch's check before a body is archived, so the two cannot disagree.
+    """
+    for name in ("AccountInformation", "EquitySummaryInBase"):
+        for stmt in statements:
+            for child in (c for c in stmt if c.tag == name):
+                rows = [child] if name == "AccountInformation" else list(child)
+                for row in rows:
+                    code = (row.get("currency") or "").strip()
+                    if code:
+                        return code
+    return None
+
+
 def section_tags(path: Path) -> list[str]:
     """Every section tag present in the file's statements, in document order."""
     tags: list[str] = []
-    for stmt in _statements(path):
+    for stmt in statement_blocks(path):
         tags += [child.tag for child in stmt if child.tag not in tags]
     return tags
 
@@ -49,7 +70,7 @@ def raw_sections(path: Path) -> dict[str, list[dict[str, str]]]:
     child rows, so each statement contributes one item to its list.
     """
     out: dict[str, list[dict[str, str]]] = {}
-    for stmt in _statements(path):
+    for stmt in statement_blocks(path):
         for child in stmt:
             if child.tag in MODELLED_SECTIONS:
                 continue

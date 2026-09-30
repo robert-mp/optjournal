@@ -751,6 +751,32 @@ def test_a_body_that_is_not_a_statement_is_neither_archived_nor_stamped(
     assert flex.cooldown_remaining(tmp_path, "1591754") == 0
 
 
+def test_a_statement_stating_no_base_currency_is_neither_archived_nor_stamped(
+    tmp_path, monkeypatch,
+):
+    """Ingest refuses a statement with no AccountInformation and no NAV rows
+    (nothing states the base currency), so archiving it spent a request, stamped
+    the cooldown and left a file no ingest can read, one more every day. It is
+    refused at the fetch now, before any of that; the same body WITH its
+    sections is archived, so the check refuses only what it names."""
+    import re
+
+    whole = sorted(RAW_DIR.glob("activity-*.xml"))[0].read_bytes()
+    bare = re.sub(rb"<AccountInformation\b[^>]*/>", b"", whole)
+    bare = re.sub(rb"<EquitySummaryInBase>.*?</EquitySummaryInBase>", b"", bare, flags=re.S)
+    assert bare != whole and b"<EquitySummaryInBase>" not in bare
+
+    _serve(monkeypatch, bare)
+    with pytest.raises(flex.StatementUnreadable, match="base currency"):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("activity-*.xml"))
+    assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+
+    _serve(monkeypatch, whole)
+    flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert len(list(tmp_path.glob("activity-*.xml"))) == 1
+
+
 def test_a_statement_that_is_not_read_is_still_an_ordinary_flex_error(tmp_path,
                                                                        monkeypatch):
     """Every caller already handles `FlexError`; the new type must reach them."""
