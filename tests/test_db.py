@@ -214,9 +214,10 @@ def test_current_positions_uses_latest_report_date(conn):
 def test_snapshot_reingest_updates_rather_than_duplicates(conn):
     """Re-ingesting the same date's snapshot updates the row, never adds one.
 
-    The conflict target names `broker` because the key does. It was
-    `(report_date, conid)` and moved when snapshot identity became per-broker --
-    a conid is IBKR's numbering, so two brokers can each hold "contract 12345".
+    The conflict target names `broker` and `account_id` because the key does. It
+    was `(report_date, conid)` and moved when snapshot identity became per-broker
+    -- a conid is IBKR's numbering, so two brokers can each hold "contract 12345"
+    -- and then per-account, because two accounts in one file can hold it too.
     """
     _statement_row(conn)
     for mark in (1.0, 5.0):
@@ -225,7 +226,7 @@ def test_snapshot_reingest_updates_rather_than_duplicates(conn):
             " asset_category, position, mark_price, currency, fx_rate_to_base, raw,"
             " source_file, ingested_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(broker, report_date, conid)"
+            " ON CONFLICT(broker, account_id, report_date, conid)"
             " DO UPDATE SET mark_price=excluded.mark_price",
             ("20260731", "C1", "U1", "TSLA P", "OPT", -3, mark, "USD", 0.9,
              "{}", "s.xml", "now"),
@@ -1472,3 +1473,118 @@ def test_the_base_commission_repair_writes_only_the_row_it_found(conn):
     assert _repair_base_commission(conn) == 1
     got = dict(conn.execute("SELECT broker, ib_commission_base FROM trades"))
     assert got == {"ibkr": -1.7, "schwab": -0.27}
+
+
+# --- a statement file holding two accounts (M4) --------------------------------
+
+
+def _two_accounts(tmp_path: Path) -> Path:
+    """The fixture with its FlexStatement block repeated for a second account.
+
+    The second block renumbers every IBKR id so nothing dedupes across accounts,
+    and keeps every CONTRACT id, so the same option held in both accounts on the
+    same day is two positions. That is the case the snapshot key collapsed.
+    """
+    import re
+
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    start = text.index("<FlexStatement ")
+    end = text.index("</FlexStatement>") + len("</FlexStatement>")
+    second = text[start:end].replace('accountId="U0000000"', 'accountId="U9999999"')
+    for attr in ("tradeID", "transactionID", "ibOrderID"):
+        second = re.sub(rf'{attr}="(\d+)"', rf'{attr}="9\1"', second)
+    second = re.sub(r'ibExecID="([^"]+)"', r'ibExecID="X\1"', second)
+    doc = text[:end] + "\n" + second + text[end:]
+    doc = doc.replace('<FlexStatements count="1">', '<FlexStatements count="2">')
+    path = tmp_path / "activity-two-accounts.xml"
+    path.write_text(doc, encoding="utf-8")
+    return path
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_every_account_in_a_file_is_read_not_only_the_first(tmp_path):
+    """`raw_sections` read the first FlexStatement only, so a second account's
+    positions, contracts and NAV were never seen."""
+    from optjournal.sections import raw_sections
+
+    single = raw_sections(STATEMENTS[0])
+    both = raw_sections(_two_accounts(tmp_path))
+    for name in ("OpenPositions", "EquitySummaryInBase", "AccountInformation"):
+        assert len(both[name]) == 2 * len(single[name]), name
+        assert {r["accountId"] for r in both[name]} == {"U0000000", "U9999999"}
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_the_same_contract_held_in_two_accounts_is_two_snapshot_rows(conn,
+                                                                     tmp_path):
+    """The snapshot key had no account, so the second account overwrote the
+    first's row for every contract both held (7 open episodes instead of 8)."""
+    single = ingest_file(conn, STATEMENTS[0])
+    conn.execute("DELETE FROM position_snapshots")
+    conn.execute("DELETE FROM equity_summaries")
+    conn.execute("DELETE FROM trades")
+    conn.execute("DELETE FROM cash_transactions")
+    conn.execute("DELETE FROM statements")
+    conn.commit()
+
+    both = ingest_file(conn, _two_accounts(tmp_path))
+
+    assert both.trades_inserted == 2 * single.trades_inserted
+    per_account = dict(conn.execute(
+        "SELECT account_id, COUNT(*) FROM position_snapshots GROUP BY account_id"))
+    assert per_account == {"U0000000": single.positions_written,
+                           "U9999999": single.positions_written}
+    navs = dict(conn.execute(
+        "SELECT account_id, COUNT(*) FROM equity_summaries GROUP BY account_id"))
+    assert navs == {"U0000000": single.equity_summaries_written,
+                    "U9999999": single.equity_summaries_written}
+    book = {r[0] for r in conn.execute(
+        "SELECT DISTINCT account_id FROM current_option_positions")}
+    assert book == {"U0000000", "U9999999"}
+
+
+def test_existing_snapshots_and_nav_are_rekeyed_by_account_losslessly(tmp_path):
+    """The v17 rebuild, run on tables with the v16 keys and real-shaped rows."""
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    _statement_row(conn)
+    for table, old_key in (
+        ("position_snapshots", "PRIMARY KEY (broker, report_date, conid)"),
+        ("equity_summaries", "PRIMARY KEY (broker, report_date)"),
+    ):
+        ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?",
+                           (table,)).fetchone()[0]
+        new_key = ddl[ddl.index("PRIMARY KEY"):ddl.rindex(")")]
+        conn.execute("DROP VIEW IF EXISTS current_option_positions")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(ddl.replace(new_key, old_key))
+    conn.execute(
+        "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
+        " asset_category, position, mark_price, currency, fx_rate_to_base, raw,"
+        " source_file, ingested_at) VALUES ('20260929', 'C1', 'U1', 'TSLA C',"
+        " 'OPT', -2, 4.5, 'USD', 0.86, '{}', 's.xml', 'then')")
+    conn.execute(
+        "INSERT INTO equity_summaries (report_date, account_id, currency,"
+        " total_base, raw, source_file, ingested_at)"
+        " VALUES ('20260929', 'U1', 'EUR', 25000.5, '{}', 's.xml', 'then')")
+    conn.commit()
+
+    migrate(conn)
+    migrate(conn)
+
+    def key(table: str) -> list[str]:
+        info = sorted((r["pk"], r["name"]) for r in conn.execute(
+            f"PRAGMA table_info({table})") if r["pk"])
+        return [name for _rank, name in info]
+
+    assert key("position_snapshots") == ["broker", "account_id", "report_date",
+                                         "conid"]
+    assert key("equity_summaries") == ["broker", "account_id", "report_date"]
+    snap = dict(conn.execute("SELECT * FROM position_snapshots").fetchone())
+    assert (snap["conid"], snap["account_id"], snap["position"],
+            snap["mark_price"], snap["ingested_at"]) == ("C1", "U1", -2, 4.5, "then")
+    nav = dict(conn.execute("SELECT * FROM equity_summaries").fetchone())
+    assert (nav["account_id"], nav["total_base"]) == ("U1", 25000.5)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM current_option_positions").fetchone()[0] == 1
+    conn.close()

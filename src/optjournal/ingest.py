@@ -601,7 +601,11 @@ def _ingest_cash(conn, cash, source_file: str, result: IngestResult,
 
 def _ingest_positions(conn, positions, source_file: str, assets, result,
                       broker: str = DEFAULT_BROKER) -> None:
-    """Write broker-neutral position snapshots, replacing the same day's row."""
+    """Write broker-neutral position snapshots, replacing the same day's row.
+
+    One row per (broker, account, day, contract): the same contract held in two
+    accounts of one file is two positions.
+    """
     for p in positions:
         cat = p.asset_category or ""
         if not _matches_filter(cat, assets):
@@ -616,7 +620,7 @@ def _ingest_positions(conn, positions, source_file: str, assets, result,
             " cost_basis_money, cost_basis_price, fifo_pnl_unrealized, side,"
             " open_date_time, currency, fx_rate_to_base, raw, source_file, ingested_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(broker, report_date, conid) DO UPDATE SET"
+            " ON CONFLICT(broker, account_id, report_date, conid) DO UPDATE SET"
             " position=excluded.position, mark_price=excluded.mark_price,"
             " position_value=excluded.position_value,"
             " position_value_base=excluded.position_value_base,"
@@ -694,7 +698,7 @@ def _ingest_equity_summaries(conn, navs, source_file: str, result,
             " currency,"
             " cash_base, stock_base, options_base, total_base, raw,"
             " source_file, ingested_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(broker, report_date) DO UPDATE SET"
+            " ON CONFLICT(broker, account_id, report_date) DO UPDATE SET"
             " cash_base=excluded.cash_base, stock_base=excluded.stock_base,"
             " options_base=excluded.options_base, total_base=excluded.total_base,"
             " raw=excluded.raw, source_file=excluded.source_file,"

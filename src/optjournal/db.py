@@ -22,8 +22,8 @@ Design notes, and the reasoning behind the non-obvious choices:
 
 * Three write semantics. trades/cash are append-only with first-write-wins,
   so `first_seen_at` stays truthful and "new since yesterday" is answerable.
-  position_snapshots replaces on (report_date, conid) so re-fetching a day
-  corrects rather than duplicates. securities upserts.
+  position_snapshots replaces on (account, report_date, conid) so re-fetching a
+  day corrects rather than duplicates. securities upserts.
 
 * position_snapshots is not optional. A position opened before the earliest
   statement has no opening trade on record, so the snapshot is the only
@@ -47,7 +47,7 @@ __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -262,8 +262,10 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
   source_file          TEXT    NOT NULL REFERENCES statements(source_file),
   ingested_at          TEXT    NOT NULL,
   -- A conid is IBKR's numbering; another broker may reuse the integer. Two
-  -- brokers holding "contract 12345" on the same date are two positions.
-  PRIMARY KEY (broker, report_date, conid)
+  -- brokers holding "contract 12345" on the same date are two positions, and so
+  -- are two ACCOUNTS: one Flex file can hold several, and without the account
+  -- in the key the second account's row replaced the first's (v17).
+  PRIMARY KEY (broker, account_id, report_date, conid)
 );
 """
 
@@ -280,11 +282,11 @@ CREATE TABLE IF NOT EXISTS equity_summaries (
   raw           TEXT NOT NULL,
   source_file   TEXT NOT NULL REFERENCES statements(source_file),
   ingested_at   TEXT NOT NULL,
-  -- Per broker: each reports the value of ITS OWN account. Keyed on the date
-  -- alone, the second broker's NAV for a day overwrites the first's, so the
-  -- "gain as % of net liquidation" denominator silently becomes one account's
-  -- value measured against both accounts' P&L.
-  PRIMARY KEY (broker, report_date)
+  -- Per broker AND account: each row is the value of ONE account. Keyed on the
+  -- date alone, the second broker's (or the second account's) NAV for a day
+  -- overwrites the first's, so the "gain as % of net liquidation" denominator
+  -- silently becomes one account's value measured against both accounts' P&L.
+  PRIMARY KEY (broker, account_id, report_date)
 );
 """
 
@@ -909,12 +911,16 @@ def _normalise_confirm_dates(conn: sqlite3.Connection) -> int:
 #: once a second broker exists. One entry per table, so the rebuild below is
 #: written once: `trades` needed it first and the other two need it for exactly
 #: the same reason, which was easy to miss because each looks fine alone.
+#:
+#: The snapshot and NAV keys also carry the account (v17): one Flex file can
+#: hold several accounts, and each holds its own positions and has its own NAV.
 _REKEYED_TABLES: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("trades", ("broker", "trade_id"), _TRADES_DDL),
     ("cash_transactions", ("broker", "transaction_id"), _CASH_DDL),
-    ("position_snapshots", ("broker", "report_date", "conid"), _POSITIONS_DDL),
+    ("position_snapshots", ("broker", "account_id", "report_date", "conid"),
+     _POSITIONS_DDL),
     ("securities", ("broker", "conid"), _SECURITIES_DDL),
-    ("equity_summaries", ("broker", "report_date"), _NAV_DDL),
+    ("equity_summaries", ("broker", "account_id", "report_date"), _NAV_DDL),
 )
 
 
