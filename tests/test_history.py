@@ -715,6 +715,100 @@ def test_prewindow_close_absent_from_snapshot_is_closed(conn):
     assert report.total_realized_base == 50.0
 
 
+# --- the pre-archive quantity, from the snapshot --------------------------------
+#
+# A pre-archive holding was only noticed when the contract's FIRST fill in the
+# archive was a close. Scaling in or out first hid it, and the episode walked from
+# zero: it went flat too early, or never. The snapshot says how much is held, so
+# the difference between it and the fills up to the snapshot's date is what was
+# held before the archive began, and the walk starts there.
+
+
+def _book_elsewhere(conn, date: str = "20260930") -> None:
+    """A snapshot row on another contract, so the book has a date and the
+    contract under test is known to be absent from it."""
+    add_snapshot(conn, "OTHER", position=1, symbol="OTHER", date=date)
+
+
+def test_a_pre_archive_position_scaled_out_and_back_in_closes_once(conn):
+    """`pnl/s_prearchive_scale.py`: long 2 from before the archive; sell 1, buy 1
+    back, sell 2. The buy-back read as a re-entry, so the walk closed a +99
+    episode and left a -1 phantom short OPEN holding the final +248."""
+    add_trade(conn, "1", open_close="C", qty=-1, price=3.0, date="2026-09-02",
+              realized=99.0)
+    add_trade(conn, "2", open_close="O", qty=1, price=2.5, date="2026-09-03")
+    add_trade(conn, "3", open_close="C", qty=-2, price=4.0, date="2026-09-20",
+              realized=248.0)
+    _book_elsewhere(conn)
+    report = build_history(conn)
+    (ep,) = [e for e in report.episodes if e.conid == "C1"]
+    assert ep.status == "CLOSED"
+    assert ep.realized_pnl == pytest.approx(347.0)
+    assert ep.entry_outside_window is True and ep.opened_at is None
+    assert ep.contracts == 2
+    from optjournal.stats import month_stats
+    september = month_stats(conn, "2026-09", report=report)
+    assert (september.net_pnl.base, september.wins, september.open_episodes) == (
+        347.0, 1, 1), "the one open episode is OTHER, the snapshot-only row"
+
+
+def test_a_pre_archive_position_added_to_then_closed_is_one_round_trip(conn):
+    """`pnl/s_prearchive_add.py`: long 1 from before the archive, buy 1, sell 2.
+    Walked from zero it never went flat: a phantom -1 short, +398 missing."""
+    add_trade(conn, "1", open_close="O", qty=1, price=2.0, date="2026-09-02")
+    add_trade(conn, "2", open_close="C", qty=-2, price=4.0, date="2026-09-20",
+              realized=398.0)
+    _book_elsewhere(conn)
+    (ep,) = [e for e in build_history(conn).episodes if e.conid == "C1"]
+    assert (ep.status, ep.net_qty, ep.realized_pnl) == ("CLOSED", 0, 398.0)
+
+
+def test_a_pre_archive_holding_still_held_matches_the_snapshot(conn):
+    """The real TSLA stock: 110 shares from before the archive and 96 bought
+    since. The episode read 96 open where the account held 206."""
+    add_trade(conn, "1", conid="T", symbol="TSLA", asset="STK", open_close="O",
+              qty=40, date="2025-08-28")
+    add_trade(conn, "2", conid="T", symbol="TSLA", asset="STK", open_close="O",
+              qty=56, date="2026-09-04")
+    add_snapshot(conn, "T", position=206, symbol="TSLA", asset="STK",
+                 date="20260929")
+    (ep,) = build_history(conn, asset_category="STK").episodes
+    assert (ep.status, ep.net_qty, ep.contracts) == ("OPEN", 206, 206)
+    assert ep.entry_outside_window is True
+    assert ep.opened_at is None, "the position was opened before the archive"
+
+
+def test_selling_a_pre_archive_holding_leaves_no_phantom(conn):
+    """`pnl/tsla_sellout.py`: sell all 206 and the next statement lists no TSLA.
+    Walked from 96 the sale left a -110 short OPEN."""
+    add_trade(conn, "1", conid="T", symbol="TSLA", asset="STK", open_close="O",
+              qty=96, date="2025-08-28")
+    add_trade(conn, "2", conid="T", symbol="TSLA", asset="STK", open_close="C",
+              qty=-206, date="2026-09-29", realized=5000.0)
+    add_snapshot(conn, "S", position=5, symbol="S", asset="STK", date="20260929")
+    report = build_history(conn, asset_category="STK")
+    (ep,) = [e for e in report.episodes if e.conid == "T"]
+    assert (ep.status, ep.net_qty, ep.realized_pnl) == ("CLOSED", 0, 5000.0)
+
+
+def test_fills_after_the_snapshot_are_not_read_as_a_pre_archive_holding(conn):
+    """Today's Trade Confirmation fills postdate the newest statement, so the
+    snapshot cannot know them. Only fills up to its date are reconciled."""
+    add_trade(conn, "1", open_close="O", qty=-2, date="2026-09-30")
+    _book_elsewhere(conn, date="20260929")
+    (ep,) = [e for e in build_history(conn).episodes if e.conid == "C1"]
+    assert (ep.status, ep.net_qty, ep.entry_outside_window) == ("OPEN", -2, False)
+
+
+def test_a_pre_archive_long_sold_through_zero_opens_the_short(conn):
+    """The two fixes meet: long 3 from before the archive, one SELL 5 (`C;O`)."""
+    add_trade(conn, "1", open_close="C;O", qty=-5, date="2026-09-10", realized=90.0)
+    add_snapshot(conn, "C1", position=-2, date="20260929")
+    closed, still_open = (lambda r: (r.closed, r.open))(build_history(conn))
+    assert [(e.realized_pnl, e.entry_outside_window) for e in closed] == [(90.0, True)]
+    assert [(e.net_qty, e.entry_outside_window) for e in still_open] == [(-2, False)]
+
+
 # ------------------------------------------------------------------------ 0DTE
 
 

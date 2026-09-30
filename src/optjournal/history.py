@@ -24,9 +24,13 @@ Three properties of IBKR's data drive the design:
 
 * A position opened before the earliest statement has no opening fill on
   record, so its episode can never balance to zero from trades alone. Those
-  are marked `entry_outside_window` and resolved against the latest position
-  snapshot: absent from the snapshot means flat, present means still open.
-  This is the second place snapshots carry information trades cannot.
+  are marked `entry_outside_window`. The newest position snapshot says how
+  much each account holds, so the difference between it and the fills up to
+  its date is the quantity held before the archive began (`_pre_archive`),
+  and the walk starts from it. Only an account with no snapshot at all falls
+  back to the old reading: a close-only run whose open/closed verdict is the
+  snapshot's. This is the second place snapshots carry information trades
+  cannot.
 
 Note codes are read through `notes.py`, which owns that rule for both readers of
 them: tokens are split and matched exactly, because substring matching would read
@@ -127,6 +131,11 @@ class Episode:
 
     status: str = STATUS_OPEN
     entry_outside_window: bool = False
+    #: What was held before the first fill on record, when the position snapshot
+    #: says: the snapshot's quantity less the fills up to its date. Non-zero only
+    #: on an `entry_outside_window` episode whose size is therefore known, so
+    #: trades decide when it goes flat. Zero on one the archive cannot size.
+    pre_archive_qty: float = 0
     #: True when the archive holds no fills for this contract at all, so
     #: everything known about it comes from a position snapshot.
     snapshot_only: bool = False
@@ -303,6 +312,15 @@ def _is_close(open_close: str | None) -> bool:
     return "C" in split_notes((open_close or "").upper())
 
 
+def _known_size(ep: Episode) -> bool:
+    """Whether the episode's quantity is known, so trades can prove it flat.
+
+    False only for an entry that predates the archive with no snapshot to say
+    how large it was: that one defers to the snapshot instead.
+    """
+    return not ep.entry_outside_window or bool(ep.pre_archive_qty)
+
+
 def _through_zero(ep: Episode | None, row: Any) -> tuple[dict, dict] | None:
     """A closing fill that takes the position past flat, split at zero.
 
@@ -313,11 +331,11 @@ def _through_zero(ep: Episode | None, row: Any) -> tuple[dict, dict] | None:
     The closing part takes all of IBKR's realised P&L, which is what it is: the
     opening part realises nothing. Commission and proceeds divide by quantity.
 
-    Only for an episode whose quantity is known. One whose entry predates the
-    archive with nothing saying how large it was (`entry_outside_window` without
-    a snapshot) has no zero to split at.
+    Only for an episode whose quantity is known (`_known_size`): one whose entry
+    predates the archive with nothing saying how large it was has no zero to
+    split at.
     """
-    if ep is None or ep.entry_outside_window or _flat(ep.net_qty):
+    if ep is None or not _known_size(ep) or _flat(ep.net_qty):
         return None
     qty = row["quantity"] or 0
     if not _is_close(row["open_close"]) or (qty > 0) == (ep.net_qty > 0):
@@ -349,7 +367,9 @@ def _absorb(ep: Episode, row: Any) -> None:
     else:
         ep.open_fills += 1
         ep.opened_qty += qty
-        if ep.opened_at is None:
+        # An entry before the archive has no opening fill on record, so a later
+        # add-on is not when the position opened.
+        if ep.opened_at is None and not ep.entry_outside_window:
             ep.opened_at = row["date_time"] or row["trade_date"]
 
     ep.net_qty += qty
@@ -372,11 +392,12 @@ def _finalise(ep: Episode, still_held: bool) -> None:
 
     `still_held` is whether the contract appears in the newest position
     snapshot. It is the deciding signal only when trades alone are
-    inconclusive, which happens when the opening fill predates the archive.
+    inconclusive, which happens when the opening fill predates the archive and
+    no snapshot said how much was held (see `_known_size`).
     """
     disposition = disposition_of(";".join(ep.notes)) if ep.close_fills else None
 
-    if ep.entry_outside_window:
+    if not _known_size(ep):
         # Trades cannot prove flatness without the entry, so defer to the
         # snapshot: absent means the position is gone.
         ep.status = STATUS_OPEN if still_held else (disposition or STATUS_CLOSED)
@@ -493,6 +514,59 @@ def _from_snapshot(row: dict[str, Any]) -> Episode:
     return ep
 
 
+def _day_key(value: Any) -> str:
+    """YYYYMMDD from either stored date shape, so the two compare as text.
+
+    Snapshot dates arrive as IBKR's compact `20260929`; fills as ISO or, from a
+    Trade Confirmation, compact with a time (`20260924;101659`).
+    """
+    return "".join(ch for ch in str(value or "")[:10] if ch.isdigit())[:8]
+
+
+def _pre_archive(
+    rows: list[Any],
+    held: dict[tuple[str, str, str], dict[str, Any]],
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str, str], float]:
+    """What each contract held before its first fill on record, per the snapshot.
+
+    Reconciles the fills against the book (`BOOK_DATE_SQL`): the snapshot's
+    quantity less the fills up to the book's date is what the account held before
+    the archive began. Only fills up to that date, because a Trade Confirmation
+    fill from today postdates the newest statement and the snapshot cannot know
+    it. Nothing for an account with no snapshot at all, since there is then no
+    book to reconcile against.
+
+    Real data: TSLA stock read 96 shares where the account held 206 (110 bought
+    before the archive), and IBKR 0.0019 where it held 0.8615. Checked over every
+    snapshot date in the archive: those two are the only disagreements, and each
+    is the same quantity on every date, as a pre-archive holding must be.
+    """
+    books = {
+        (str(r[0] or ""), str(r[1] or "")): _day_key(r[2])
+        for r in conn.execute(
+            f"SELECT DISTINCT p.broker, p.account_id, ({BOOK_DATE_SQL})"
+            " FROM position_snapshots p"
+        )
+    }
+    through: dict[tuple[str, str, str], float] = {}
+    for row in rows:
+        key = (str(row["broker"] or ""), str(row["account_id"] or ""),
+               str(row["conid"] or ""))
+        book = books.get(key[:2])
+        if book is None:
+            continue
+        through.setdefault(key, 0)
+        if _day_key(row["trade_date"] or row["date_time"]) <= book:
+            through[key] += row["quantity"] or 0
+    out: dict[tuple[str, str, str], float] = {}
+    for key, net in through.items():
+        before = (held[key]["position"] if key in held else 0) - net
+        if not _flat(before):
+            out[key] = before
+    return out
+
+
 def build_history(
     conn: sqlite3.Connection,
     *,
@@ -519,6 +593,8 @@ def build_history(
         "ORDER BY broker, account_id, conid, COALESCE(date_time, trade_date), trade_id",
         params,
     ).fetchall()
+
+    pre_archive = _pre_archive(rows, held, conn)
 
     episodes: list[Episode] = []
     current: Episode | None = None
@@ -557,9 +633,20 @@ def build_history(
 
         if current is None:
             current = _new_episode(row)
-            # No opening fill on record means the entry predates the archive.
-            current.entry_outside_window = closing
-        elif current.entry_outside_window and not closing:
+            before = pre_archive.pop(key, 0)
+            if before:
+                # The snapshot says what was held before this first fill, so the
+                # walk starts there and the fills alone decide when it is flat.
+                # Without it, scaling in or out before closing walked from zero:
+                # flat too early, or never (a phantom open episode).
+                current.entry_outside_window = True
+                current.pre_archive_qty = before
+                current.net_qty = before
+                current.peak_qty = abs(before)
+            else:
+                # No opening fill on record means the entry predates the archive.
+                current.entry_outside_window = closing
+        elif not _known_size(current) and not closing:
             # An opening fill after a close-only run is a fresh entry, so the
             # unresolvable episode ends here and a clean one begins.
             flush(closed_by_reentry=True)
@@ -578,7 +665,7 @@ def build_history(
 
         _absorb(current, row)
 
-        if not current.entry_outside_window and _flat(current.net_qty):
+        if _known_size(current) and _flat(current.net_qty):
             flush()
 
     flush()
