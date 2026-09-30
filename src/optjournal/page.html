@@ -2922,7 +2922,11 @@ function calendar(){
        an empty day has nothing to show, and making it clickable would
        promise detail that does not exist. */
     const sel=S.calday===key?' selected':'';
-    cells.push(`<div class="day ${k}${dy?' clk':''}${sel}"${dy?` data-calday="${key}"`:''}>
+    /* A button to the keyboard as well as the pointer, as the Market strip's days
+       are: without the role and the tab stop, Tab walked past every day with fills
+       and the drill-down could only be opened with a mouse. */
+    cells.push(`<div class="day ${k}${dy?' clk':''}${sel}"${dy?` data-calday="${key}"
+      role="button" tabindex="0" aria-pressed="${sel?'true':'false'}"`:''}>
       <div class="top"><span class="dnum">${d}</span>
         <span class="dct">${dy?dy.trades+(dy.trades===1?' fill':' fills'):''}</span></div>
       <div class="dpl ${dy&&!k?'dim':''}">${dy?(k?moneyOf(dy.realized):'—'):'<span class="dim2">—</span>'}</div>
@@ -3530,7 +3534,8 @@ function trades(){
       :['Realised',`<b class="${cls(lc.realized_pnl?.base)}">${
         lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—'}</b>`];
     return `<div class="card">
-      <div class="crow${rp?' rk':''}"${rp?` data-replay="${esc(lc.replay_key)}"`:''}><div><h2>${
+      <div class="crow${rp?' rk':''}"${rp?` data-replay="${esc(lc.replay_key)}"
+        role="button" tabindex="0" aria-expanded="${shown?'true':'false'}"`:''}><div><h2>${
         esc(lc.underlying||'?')}
         <span class="dim lbl">${esc(lc.label)}</span>
         <span class="pill gap"
@@ -3904,7 +3909,11 @@ function positions(){
   const row=pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
     const key=rkeyOf(pos);
     const shown=key&&S.replay===key&&owner[key]===String(pos.conid);
-    return `<tr${key?` class="rk" data-replay="${esc(key)}"`:''}><td class="mono">${
+    /* A tab stop and Enter/Space, like a Trades card's header. No button role: it
+       would take the row out of the table for a screen reader, and a row that
+       opens a panel beneath it is what `aria-expanded` on a row already says. */
+    return `<tr${key?` class="rk" data-replay="${esc(key)}" tabindex="0"
+      aria-expanded="${shown?'true':'false'}"`:''}><td class="mono">${
       esc(pos.symbol)}</td>
     <td class="side ${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
     <td class="n ${cls(pos.position)}">${pos.position}</td>
@@ -6328,22 +6337,19 @@ function draw(push){
   /* Day drill-down: pure redraw, no request -- the leg data is already in the
      payload. Clicking the selected day again clears it (toggle). */
   document.querySelectorAll('[data-calday]').forEach(el=>
-    el.onclick=()=>{const k=el.dataset.calday;
-      S.calday=S.calday===k?null:k;draw();});
+    pressable(el,()=>{const k=el.dataset.calday;
+      S.calday=S.calday===k?null:k;draw();}));
   /* Market day: pure redraw, no request -- every event is already in the
      payload. Not a toggle, unlike the calendar: the market view always shows
      SOME day, so clearing the selection would leave the panel empty with no way
-     back except reloading. role=button means Enter and Space have to work. */
-  document.querySelectorAll('[data-marketday]').forEach(el=>{
-    const pick=()=>{S.marketday=el.dataset.marketday;draw();};
-    el.onclick=pick;
-    el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();pick();}};
-  });
+     back except reloading. */
+  document.querySelectorAll('[data-marketday]').forEach(el=>
+    pressable(el,()=>{S.marketday=el.dataset.marketday;draw();}));
   /* Replay drill-down: same toggle, same pure redraw. Every bar is already in
      the payload, so opening a chart costs no request. */
   document.querySelectorAll('[data-replay]').forEach(el=>
-    el.onclick=()=>{const k=el.dataset.replay;
-      S.replay=S.replay===k?null:k;draw();});
+    pressable(el,()=>{const k=el.dataset.replay;
+      S.replay=S.replay===k?null:k;draw();}));
   bindReplayControls();
   bindJournal();
   /* Opening the 0DTE tab checks the feed at once; the timer keeps it current. */
@@ -6593,6 +6599,16 @@ function draw(push){
   else if(rem>0){b.disabled=true;
     b.title=`Cooldown: ${Math.ceil(rem/60)}m left. Prevents spending an IBKR request for data that cannot have changed.`;}
   else {b.disabled=false;b.title='Fetch from IBKR — spends one request';}
+}
+
+/* A click target that is not a <button> but carries a tab stop: the pointer and
+   the keyboard get one handler, and Enter and Space work on it as they do on a
+   button. Only when the key lands on the target itself, so a field inside one
+   keeps its own Space. */
+function pressable(el,fn){
+  el.onclick=fn;
+  el.onkeydown=ev=>{
+    if(ev.target===el&&(ev.key==='Enter'||ev.key===' ')){ev.preventDefault();fn();}};
 }
 
 /* Read every text field's value, selection and focus before a render.

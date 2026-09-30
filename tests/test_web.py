@@ -985,6 +985,28 @@ def test_calendar_day_drilldown_is_wired():
     assert "load()" not in handler, "day selection must not spend a request"
 
 
+def test_a_drill_down_opens_from_the_keyboard():
+    """M31, the handler half (test_rendered checks the tab stops): a calendar day
+    and a replay row answered a click and nothing else. They now go through
+    `pressable`, as the Market strip's days do, so Enter and Space open them and
+    a key pressed inside one does not.
+    """
+    out = _node_run([
+        *_page_fns("pressable"),
+        "const el={}; let n=0; pressable(el,()=>n++);",
+        "const key=(k,t=el)=>{let held=false;",
+        "  el.onkeydown({key:k,target:t,preventDefault(){held=true;}}); return held;};",
+        "const r=[key('Enter'),key(' '),key('a'),key('Enter',{})];",
+        "el.onclick();",
+        "console.log(JSON.stringify({n,r}));",
+    ])
+    assert out == {"n": 3, "r": [True, True, False, False]}
+    js = _code_only(_js())
+    for sel in ("[data-calday]", "[data-replay]", "[data-marketday]"):
+        binder = js.split(f"querySelectorAll('{sel}')")[1][:80]
+        assert "pressable(el," in binder, f"{sel} is not bound for the keyboard"
+
+
 def test_trades_view_renders_strategy_groups():
     """One card per strategy, member orders visible beneath -- the strangle
     sold as two same-second orders is the case order-grouping cannot show."""

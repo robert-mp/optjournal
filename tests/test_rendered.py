@@ -191,6 +191,35 @@ def test_a_themed_url_repaints_the_whole_page(served, tmp_path):
         )
 
 
+def _opening_tags(markup: str, attr: str) -> list[str]:
+    return re.findall(rf"<[a-z]+[^>]*\b{attr}=\"[^\"]*\"[^>]*>", markup)
+
+
+def test_every_drill_down_is_a_keyboard_stop(served, tmp_path):
+    """M31: a calendar day with fills and a replay row, on Trades and on Positions,
+    opened on click only. No tab stop and no role, so Tab walked past every one
+    of them and the drill-downs were out of reach without a mouse; the Market
+    strip's days were the one surface that had both. Rendered, so the check sees
+    the markup the reader's browser builds rather than a template.
+    """
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    found = {}
+    for tab, attr in (("calendar&month=all", "data-calday"),
+                      ("trades", "data-replay"), ("positions", "data-replay")):
+        dom = browser.dump_dom(f"{served}/#tab={tab}", tmp_path / f"kbd-{tab[:5]}")
+        if dom is None:
+            pytest.skip("no browser produced a DOM (environment, not the page)")
+        tags = _opening_tags(browser.markup(dom), attr)
+        found[tab] = len(tags)
+        for tag in tags:
+            assert 'tabindex="0"' in tag, f"{tab}: not a tab stop: {tag}"
+            if tab != "positions":
+                assert 'role="button"' in tag, f"{tab}: no button role: {tag}"
+    assert found["calendar&month=all"] and found["trades"], (
+        f"nothing to check, so this proved nothing: {found}")
+
+
 def test_the_dashboard_renders_the_tiles_the_reader_stored(served, tmp_path):
     """The chosen arrangement, in its order -- and the default when what is
     stored cannot be drawn.
