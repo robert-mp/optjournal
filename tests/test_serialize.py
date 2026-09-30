@@ -684,6 +684,25 @@ def test_an_option_book_gone_flat_leaves_no_options_in_the_allocation(tmp_path):
         ("TSLA", 500.0, 0.0)]
 
 
+def test_allocation_drops_an_option_book_the_nav_prices_at_zero(tmp_path):
+    """A journal ingested with `--assets OPT` holds no stock position row, so the
+    day its options go flat has no position row at all and only the NAV says the
+    book is empty. Requiring the stock figure to be zero too kept every sold
+    option in the allocation, because this account does hold stock and its NAV
+    prices it."""
+    conn = connect_migrated(tmp_path / "journal.db")
+    _alloc_fixture(conn)
+    conn.execute("DELETE FROM position_snapshots WHERE asset_category = 'STK'")
+    conn.execute(
+        "INSERT INTO equity_summaries (report_date, account_id, currency,"
+        " cash_base, stock_base, options_base, total_base, raw, source_file,"
+        " ingested_at) VALUES ('20260925','U1','EUR',80,500,0,580,'{}','t.xml','now')")
+    conn.commit()
+    al = allocation_data(conn)
+    assert al["as_of"] == "20260925"
+    assert al["rows"] == []
+
+
 def test_allocation_sums_every_accounts_net_liquidation(tmp_path):
     """Two accounts, each with its own NAV. Reading one row made the other
     account's holdings a share of a total that excluded them. Each account's

@@ -439,56 +439,101 @@ def _finalise(ep: Episode, still_held: bool) -> None:
         ep.status = STATUS_OPEN
 
 
-#: The date an account's position book is as of, for a `position_snapshots p`
-#: row in the enclosing query: the newest day that account reported a position
-#: in ANY category, or on which its NAV breakdown held no stock and no options.
-#:
-#: Any category, because IBKR's OpenPositions lists only what is held and every
-#: row of one statement carries the same reportDate (checked across the real
-#: archive). The day the option book goes flat there is no OPT row at all, so the
-#: newest date that had an option is a stale book: a sold LEAP stayed OPEN with
-#: its realised P&L missing. A Trade Confirmation carries no positions, so it
-#: never moves this date.
-#:
-#: The NAV clause is the one case no position row can speak for: everything sold,
-#: an empty OpenPositions section, no row in any category. A statement whose
-#: query lacks the section leaves no row either, but the account still holds
-#: things and its NAV says so, so that silence keeps the older book rather than
-#: reading as flat.
-#:
-#: Per `(broker, account_id)`, so an account whose statements lag is read at its
-#: own date rather than against another's. `db.current_option_positions` spells
-#: the same rule for the Positions tab; `tests/test_history.py` holds them equal.
-#: GROUPED, not one subquery per row. Spelled as a correlated scalar subquery it
-#: ran the UNION once for every snapshot row it filtered, which is quadratic in
-#: the snapshot count and reached `/api/state` three times over: measured 0.14s to
-#: 0.34s on 398 rows, and 0.2s to 21.5s on the 4,558 rows two more years of daily
-#: statements bring. As a derived table joined on `(broker, account_id)` it is one
-#: pass: 2.2s back to 1ms at that size.
-BOOK_DATES_SQL = (
-    "SELECT broker, account_id, MAX(d) AS book_date FROM ("
-    " SELECT broker, account_id, report_date AS d FROM position_snapshots"
-    " UNION ALL SELECT broker, account_id, report_date FROM equity_summaries"
-    "  WHERE stock_base = 0 AND options_base = 0)"
-    " GROUP BY broker, account_id"
-)
-
-#: The join that narrows a `position_snapshots p` to each account's current book.
-BOOK_JOIN_SQL = (
-    f" JOIN ({BOOK_DATES_SQL}) b"
-    "  ON b.broker = p.broker AND b.account_id = p.account_id"
-    "   AND b.book_date = p.report_date"
-)
+#: The equity-summary column that prices each position-bearing category, so a
+#: zero in it says the book in that category is empty. IBKR's NAV breakdown
+#: prices stock and options separately and under their own names, and nothing
+#: else a journal can hold: a fund, a bond or a future has no column here, so no
+#: NAV row ever calls one of those flat.
+NAV_VALUE_BY_CATEGORY: dict[str, str] = {
+    "STK": "stock_base",
+    "OPT": "options_base",
+}
 
 
-def book_date(conn: sqlite3.Connection) -> str | None:
+def _nav_flat_where(asset_category: str | None) -> str:
+    """The equity-summary predicate saying this scope holds nothing, or "".
+
+    Per category, because each column speaks only for its own: the option book is
+    flat when `options_base` is 0 whatever the stock figure. Reading the two
+    together left a journal ingested with `--assets OPT` on a stale option book
+    for good, since the day its options go flat has no position row at all and its
+    NAV still prices the stock that journal does not track.
+
+    A scope the NAV cannot price gets "" -- no NAV row may empty it. The mixed
+    scope takes every priced column being zero, which is as far as the NAV's own
+    columns reach: an account holding only funds or bonds still reads as flat
+    there on a day whose statement carried no positions.
+    """
+    if asset_category:
+        column = NAV_VALUE_BY_CATEGORY.get(asset_category.upper())
+        return f"{column} = 0" if column else ""
+    return " AND ".join(
+        f"{column} = 0" for column in sorted(NAV_VALUE_BY_CATEGORY.values())
+    )
+
+
+def book_dates_sql(asset_category: str | None = None) -> str:
+    """The date each account's position book is as of, as a derived table.
+
+    The newest day the account reported a position in ANY category, or on which
+    its NAV breakdown priced the scope at nothing.
+
+    Any category, because IBKR's OpenPositions lists only what is held and every
+    row of one statement carries the same reportDate (checked across the real
+    archive). The day the option book goes flat there is no OPT row at all, so the
+    newest date that had an option is a stale book: a sold LEAP stayed OPEN with
+    its realised P&L missing. A Trade Confirmation carries no positions, so it
+    never moves this date.
+
+    The NAV clause is the one case no position row can speak for: everything in
+    the scope sold, and no row for it in any category. A statement whose query
+    lacks the OpenPositions section leaves no row either, but the account still
+    holds things and its NAV says so, so that silence keeps the older book rather
+    than reading as flat. `_nav_flat_where` says which column answers.
+
+    Per `(broker, account_id)`, so an account whose statements lag is read at its
+    own date rather than against another's. `db.current_option_positions` spells
+    this again for the Positions tab, at `asset_category='OPT'`;
+    `tests/test_history.py` holds the two equal. GROUPED, not one subquery per
+    row: spelled as a correlated scalar subquery it ran the UNION once for every
+    snapshot row it filtered, which is quadratic in the snapshot count and reached
+    `/api/state` three times over (measured 0.14s to 0.34s on 398 rows, and 0.2s
+    to 21.5s on the 4,558 rows two more years of daily statements bring). As a
+    derived table joined on `(broker, account_id)` it is one pass: 2.2s back to
+    1ms at that size.
+    """
+    flat = _nav_flat_where(asset_category)
+    nav = (
+        " UNION ALL SELECT broker, account_id, report_date FROM equity_summaries"
+        f"  WHERE {flat}"
+    ) if flat else ""
+    return (
+        "SELECT broker, account_id, MAX(d) AS book_date FROM ("
+        " SELECT broker, account_id, report_date AS d FROM position_snapshots"
+        f"{nav})"
+        " GROUP BY broker, account_id"
+    )
+
+
+def book_join_sql(asset_category: str | None = None) -> str:
+    """The join narrowing a `position_snapshots p` to each account's current book."""
+    return (
+        f" JOIN ({book_dates_sql(asset_category)}) b"
+        "  ON b.broker = p.broker AND b.account_id = p.account_id"
+        "   AND b.book_date = p.report_date"
+    )
+
+
+def book_date(
+    conn: sqlite3.Connection, asset_category: str | None = None
+) -> str | None:
     """The newest account's book date, for labelling a book "as of".
 
     The newest across accounts because a label for a mixed-date book should name
     its most recent statement. Deciding what is held stays per account.
     """
     row = conn.execute(
-        f"SELECT MAX(book_date) FROM ({BOOK_DATES_SQL})"
+        f"SELECT MAX(book_date) FROM ({book_dates_sql(asset_category)})"
     ).fetchone()
     return str(row[0]) if row and row[0] else None
 
@@ -503,9 +548,10 @@ def _held(
     positions, so a conid-only key would let one account's holding answer the
     open/closed question for another's.
 
-    "Current" is `BOOK_DATES_SQL`, per account. This dict decides open versus
-    closed, so a stale book here is not cosmetic: a contract read from an older
-    date than its account's newest is judged still held after it was sold.
+    "Current" is `book_dates_sql`, for this scope and per account. This dict
+    decides open versus closed, so a stale book here is not cosmetic: a contract
+    read from an older date than its account's newest is judged still held after
+    it was sold.
 
     The date is returned even when nothing in `asset_category` is held: a flat
     book is still a book as of that day.
@@ -514,12 +560,13 @@ def _held(
     held = {
         (str(r["broker"] or ""), str(r["account_id"] or ""), str(r["conid"])): dict(r)
         for r in conn.execute(
-            f"SELECT p.* FROM position_snapshots p{BOOK_JOIN_SQL} {where}"
+            "SELECT p.* FROM position_snapshots p"
+            f"{book_join_sql(asset_category)} {where}"
             "  AND p.position != 0",
             params,
         )
     }
-    return held, book_date(conn)
+    return held, book_date(conn, asset_category)
 
 
 def _from_snapshot(row: dict[str, Any]) -> Episode:

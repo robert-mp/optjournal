@@ -51,7 +51,12 @@ from optjournal.events import (
     default_scope,
     upcoming,
 )
-from optjournal.history import BOOK_JOIN_SQL, HistoryReport, book_date, build_history
+from optjournal.history import (
+    HistoryReport,
+    book_date,
+    book_join_sql,
+    build_history,
+)
 from optjournal.journal import ADHERENCE as JOURNAL_ADHERENCE
 from optjournal.journal import FIELDS as JOURNAL_FIELDS
 from optjournal.journal import TRIGGERS as JOURNAL_TRIGGERS
@@ -258,11 +263,13 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     they are different kinds of exposure, and summed into `net` because that is
     what the name contributes to the account's value.
 
-    Read from each account's current book (`history.BOOK_DATES_SQL`), the same rows
-    the Positions tab and the episode walk treat as held. Each category from its
-    own latest snapshot kept an option sold since then: every row of one IBKR
-    statement carries the same reportDate, so options missing from the newest
-    date were sold, not reported late.
+    Read from each account's current book (`history.book_dates_sql`), the same
+    rows the Positions tab and the episode walk treat as held. Each category from
+    its own latest snapshot DATE kept an option sold since then: every row of one
+    IBKR statement carries the same reportDate, so options missing from the newest
+    date were sold, not reported late. The book date is per category all the same,
+    because the NAV declares a category flat through its own column, and "as of"
+    is the newer of the two books read here.
 
     The denominator is the broker's own net liquidation (`equity_summaries`), so
     the rows plus `cash` sum to it and a share can be read against the figure the
@@ -271,18 +278,22 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     the shares are None rather than a share of some other total.
     """
     holdings: dict[str, Row] = {}
+    dates: list[str] = []
     for cat, key in (("STK", "stock"), ("OPT", "options")):
         for r in conn.execute(
             "SELECT COALESCE(underlying_symbol, symbol) AS holding,"
             " SUM(position_value * fx_rate_to_base) AS value, COUNT(*) AS n"
-            f" FROM position_snapshots p{BOOK_JOIN_SQL}"
+            f" FROM position_snapshots p{book_join_sql(cat)}"
             " WHERE asset_category = ? GROUP BY 1", (cat,),
         ):
             row = holdings.setdefault(r["holding"], {
                 "holding": r["holding"], "stock": 0.0, "options": 0.0, "lines": 0})
             row[key] += r["value"] or 0.0
             row["lines"] += r["n"]
-    as_of = book_date(conn)
+        day = book_date(conn, cat)
+        if day:
+            dates.append(day)
+    as_of = max(dates, default=None)
     # Each account's newest NAV, summed, so a second account's holdings are a
     # share of a total that includes them. Per account, like the holdings above,
     # so an account whose statements lag still counts.
