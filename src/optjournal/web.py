@@ -2022,9 +2022,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     ctx=JobContext(
                         archive_dir=self.cfg.archive_dir,
                         db_path=self.cfg.db_path,
-                        # Per request, like the Sync button's: an id saved in
+                        # The override only, like the scheduler's: the job
+                        # resolves the stored id per run, so one saved in
                         # Settings since startup is the one this run uses.
-                        query_id=self._effective_query_id(),
+                        query_id=self.cfg.query_id,
                         assets=self.cfg.assets,
                     ),
                 )
