@@ -318,10 +318,10 @@ def link(
     # opened -- and the finished side is an outcome of its own, not cash in
     # flight inside the other. Not reachable on either journal today: no
     # campaign there holds two episodes of one contract.
-    for members in members_of_group.values():
-        if len({str(getattr(episodes[i], "conid", "") or "") for i in members}) > 1:
-            for i in members:
-                union(members[0], i)
+    for touched in members_of_group.values():
+        if len({str(getattr(episodes[i], "conid", "") or "") for i in touched}) > 1:
+            for i in touched:
+                union(touched[0], i)
 
     episode_of_order: dict[str, int] = {}
     for i, oids in orders_of_episode.items():
