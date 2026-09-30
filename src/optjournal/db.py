@@ -904,11 +904,14 @@ def _normalise_confirm_dates(conn: sqlite3.Connection) -> int:
     """
     changed = 0
     for table, column, pattern, rewrite, scope in _COMPACT_DATE_COLUMNS:
-        cur = conn.execute(
-            f"UPDATE {table} SET {column} = {rewrite}"
-            f" WHERE {column} GLOB '{pattern}' AND {scope}"
-        )
-        changed += cur.rowcount
+        where = f"{column} GLOB '{pattern}' AND {scope}"
+        # A read first, because it runs on EVERY open: an UPDATE that matches
+        # nothing still takes the write lock, so each /api/state request would
+        # wait behind any writer and fail with "database is locked" past the
+        # busy timeout. Once the rows are rewritten this finds nothing.
+        if conn.execute(f"SELECT 1 FROM {table} WHERE {where} LIMIT 1").fetchone():
+            changed += conn.execute(
+                f"UPDATE {table} SET {column} = {rewrite} WHERE {where}").rowcount
     return changed
 
 

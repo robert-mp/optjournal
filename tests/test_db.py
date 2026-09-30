@@ -1394,6 +1394,27 @@ def test_a_failed_ingest_keeps_the_callers_own_pending_writes(conn, tmp_path):
 # --- confirm rows stored before M3 are rewritten on open -----------------------
 
 
+def test_opening_a_current_journal_needs_no_write_lock(tmp_path):
+    """Every page request opens the journal, and so migrates it. The confirm date
+    repair ran its UPDATEs every time, and an UPDATE that matches nothing still
+    takes the write lock, so an open waited behind any writer and failed past
+    the busy timeout. On a journal with nothing to repair, it must not write."""
+    db = tmp_path / "j.db"
+    first = connect(db)
+    migrate(first)
+    first.close()
+    writer = sqlite3.connect(db)
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        reader = connect(db)
+        reader.execute("PRAGMA busy_timeout = 100")
+        migrate(reader)
+        reader.close()
+    finally:
+        writer.rollback()
+        writer.close()
+
+
 def test_compact_confirm_dates_already_stored_are_rewritten_on_open(tmp_path):
     """M3: the live journal holds confirm rows written as IBKR's compact text.
 
