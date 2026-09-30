@@ -719,19 +719,20 @@ SELECT * FROM trade_orders WHERE asset_category = 'OPT';
 -- held no stock and no options. Any category, because IBKR lists only what is
 -- held, so the day the option book goes flat has no OPT row and the newest OPT
 -- date is a stale book.
+-- Joined to the books GROUPED once, not one subquery per row: correlated, the
+-- UNION ran for every snapshot row and the view went quadratic in their count.
 CREATE VIEW IF NOT EXISTS current_option_positions AS
-SELECT *
+SELECT p.*
 FROM position_snapshots p
-WHERE asset_category = 'OPT'
-  AND report_date = (
-    SELECT MAX(d) FROM (
-      SELECT report_date AS d FROM position_snapshots
-      WHERE broker = p.broker AND account_id = p.account_id
-      UNION ALL SELECT report_date FROM equity_summaries
-      WHERE broker = p.broker AND account_id = p.account_id
-        AND stock_base = 0 AND options_base = 0
-    )
-  );
+JOIN (
+  SELECT broker, account_id, MAX(d) AS book_date FROM (
+    SELECT broker, account_id, report_date AS d FROM position_snapshots
+    UNION ALL SELECT broker, account_id, report_date FROM equity_summaries
+     WHERE stock_base = 0 AND options_base = 0
+  ) GROUP BY broker, account_id
+) b ON b.broker = p.broker AND b.account_id = p.account_id
+   AND b.book_date = p.report_date
+WHERE p.asset_category = 'OPT';
 """
 
 

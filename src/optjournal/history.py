@@ -435,13 +435,25 @@ def _finalise(ep: Episode, still_held: bool) -> None:
 #: Per `(broker, account_id)`, so an account whose statements lag is read at its
 #: own date rather than against another's. `db.current_option_positions` spells
 #: the same rule for the Positions tab; `tests/test_history.py` holds them equal.
-BOOK_DATE_SQL = (
-    "SELECT MAX(d) FROM ("
-    " SELECT report_date AS d FROM position_snapshots"
-    "  WHERE broker = p.broker AND account_id = p.account_id"
-    " UNION ALL SELECT report_date FROM equity_summaries"
-    "  WHERE broker = p.broker AND account_id = p.account_id"
-    "   AND stock_base = 0 AND options_base = 0)"
+#: GROUPED, not one subquery per row. Spelled as a correlated scalar subquery it
+#: ran the UNION once for every snapshot row it filtered, which is quadratic in
+#: the snapshot count and reached `/api/state` three times over: measured 0.14s to
+#: 0.34s on 398 rows, and 0.2s to 21.5s on the 4,558 rows two more years of daily
+#: statements bring. As a derived table joined on `(broker, account_id)` it is one
+#: pass: 2.2s back to 1ms at that size.
+BOOK_DATES_SQL = (
+    "SELECT broker, account_id, MAX(d) AS book_date FROM ("
+    " SELECT broker, account_id, report_date AS d FROM position_snapshots"
+    " UNION ALL SELECT broker, account_id, report_date FROM equity_summaries"
+    "  WHERE stock_base = 0 AND options_base = 0)"
+    " GROUP BY broker, account_id"
+)
+
+#: The join that narrows a `position_snapshots p` to each account's current book.
+BOOK_JOIN_SQL = (
+    f" JOIN ({BOOK_DATES_SQL}) b"
+    "  ON b.broker = p.broker AND b.account_id = p.account_id"
+    "   AND b.book_date = p.report_date"
 )
 
 
@@ -452,7 +464,7 @@ def book_date(conn: sqlite3.Connection) -> str | None:
     its most recent statement. Deciding what is held stays per account.
     """
     row = conn.execute(
-        f"SELECT MAX(({BOOK_DATE_SQL})) FROM position_snapshots p"
+        f"SELECT MAX(book_date) FROM ({BOOK_DATES_SQL})"
     ).fetchone()
     return str(row[0]) if row and row[0] else None
 
@@ -467,7 +479,7 @@ def _held(
     positions, so a conid-only key would let one account's holding answer the
     open/closed question for another's.
 
-    "Current" is `BOOK_DATE_SQL`, per account. This dict decides open versus
+    "Current" is `BOOK_DATES_SQL`, per account. This dict decides open versus
     closed, so a stale book here is not cosmetic: a contract read from an older
     date than its account's newest is judged still held after it was sold.
 
@@ -478,8 +490,8 @@ def _held(
     held = {
         (str(r["broker"] or ""), str(r["account_id"] or ""), str(r["conid"])): dict(r)
         for r in conn.execute(
-            f"SELECT p.* FROM position_snapshots p {where}"
-            f"  AND p.position != 0 AND p.report_date = ({BOOK_DATE_SQL})",
+            f"SELECT p.* FROM position_snapshots p{BOOK_JOIN_SQL} {where}"
+            "  AND p.position != 0",
             params,
         )
     }
@@ -536,7 +548,7 @@ def _pre_archive(
 ) -> dict[tuple[str, str, str], float]:
     """What each contract held before its first fill on record, per the snapshot.
 
-    Reconciles the fills against the book (`BOOK_DATE_SQL`): the snapshot's
+    Reconciles the fills against the book (`BOOK_DATES_SQL`): the snapshot's
     quantity less the fills up to the book's date is what the account held before
     the archive began. Only fills up to that date, because a Trade Confirmation
     fill from today postdates the newest statement and the snapshot cannot know
@@ -551,8 +563,7 @@ def _pre_archive(
     books = {
         (str(r[0] or ""), str(r[1] or "")): _day_key(r[2])
         for r in conn.execute(
-            f"SELECT DISTINCT p.broker, p.account_id, ({BOOK_DATE_SQL})"
-            " FROM position_snapshots p"
+            f"SELECT broker, account_id, book_date FROM ({BOOK_DATES_SQL})"
         )
     }
     through: dict[tuple[str, str, str], float] = {}

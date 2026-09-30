@@ -493,11 +493,9 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="current-book",
         module="db.py",
-        find="      SELECT report_date AS d FROM position_snapshots\n"
-             "      WHERE broker = p.broker AND account_id = p.account_id\n",
-        replace="      SELECT report_date AS d FROM position_snapshots\n"
-                "      WHERE asset_category = 'OPT' AND broker = p.broker"
-                " AND account_id = p.account_id\n",
+        find="    SELECT broker, account_id, report_date AS d FROM position_snapshots\n",
+        replace="    SELECT broker, account_id, report_date AS d FROM position_snapshots\n"
+                "     WHERE asset_category = 'OPT'\n",
         breaks="the newest date that had an option is a stale book once the option "
                "book goes flat, so a sold option stays on the Positions tab",
     ),
@@ -569,8 +567,8 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="held-scope",
         module="history.py",
-        find="    \"  WHERE broker = p.broker AND account_id = p.account_id\"",
-        replace="    \"  WHERE broker = p.broker\"",
+        find="    \"  ON b.broker = p.broker AND b.account_id = p.account_id\"",
+        replace="    \"  ON b.broker = p.broker\"",
         breaks="a lagging account's held positions would be read at another "
                "account's newer date, so a position still open reads as CLOSED",
     ),

@@ -418,8 +418,29 @@ def test_a_statement_that_reports_no_positions_is_silent_not_flat(conn):
     assert _current_option_conids(conn) == {"C1"}
 
 
+def test_the_book_is_read_in_one_pass_not_once_per_snapshot_row(conn):
+    """The book was a correlated scalar subquery, so its UNION ran once for every
+    snapshot row it filtered: quadratic, and `/api/state` went from 0.2s to 35s
+    on the rows two more years of daily statements bring. Asserted with SQLite's
+    own plan, because the cost is invisible in a small fixture: the books are
+    scanned once, into a materialised subquery the outer rows join against."""
+    from optjournal.history import BOOK_JOIN_SQL
+
+    add_snapshot(conn, "A1", position=1, date="20260901")
+    plan = [
+        str(r[3]) for r in conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT p.* FROM position_snapshots p{BOOK_JOIN_SQL}")
+    ]
+    assert not any("CORRELATED" in step.upper() for step in plan), plan
+    assert any("SCAN" in step.upper() and "position_snapshots" in step for step in plan), plan
+    for query in (f"SELECT p.* FROM position_snapshots p{BOOK_JOIN_SQL}",
+                  "SELECT * FROM current_option_positions"):
+        steps = [str(r[3]).upper() for r in conn.execute(f"EXPLAIN QUERY PLAN {query}")]
+        assert not any("CORRELATED" in s for s in steps), (query, steps)
+
+
 def test_the_positions_view_and_the_episode_walk_read_the_same_book(conn):
-    """`db.current_option_positions` spells `history.BOOK_DATE_SQL` again, since a
+    """`db.current_option_positions` spells `history.BOOK_DATES_SQL` again, since a
     view cannot import it. Every case above, in three accounts at once."""
     from optjournal.history import _held
 

@@ -51,7 +51,7 @@ from optjournal.events import (
     default_scope,
     upcoming,
 )
-from optjournal.history import BOOK_DATE_SQL, HistoryReport, book_date, build_history
+from optjournal.history import BOOK_JOIN_SQL, HistoryReport, book_date, build_history
 from optjournal.journal import ADHERENCE as JOURNAL_ADHERENCE
 from optjournal.journal import FIELDS as JOURNAL_FIELDS
 from optjournal.journal import TRIGGERS as JOURNAL_TRIGGERS
@@ -258,7 +258,7 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     they are different kinds of exposure, and summed into `net` because that is
     what the name contributes to the account's value.
 
-    Read from each account's current book (`history.BOOK_DATE_SQL`), the same rows
+    Read from each account's current book (`history.BOOK_DATES_SQL`), the same rows
     the Positions tab and the episode walk treat as held. Each category from its
     own latest snapshot kept an option sold since then: every row of one IBKR
     statement carries the same reportDate, so options missing from the newest
@@ -275,8 +275,8 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
         for r in conn.execute(
             "SELECT COALESCE(underlying_symbol, symbol) AS holding,"
             " SUM(position_value * fx_rate_to_base) AS value, COUNT(*) AS n"
-            " FROM position_snapshots p WHERE asset_category = ?"
-            f" AND report_date = ({BOOK_DATE_SQL}) GROUP BY 1", (cat,),
+            f" FROM position_snapshots p{BOOK_JOIN_SQL}"
+            " WHERE asset_category = ? GROUP BY 1", (cat,),
         ):
             row = holdings.setdefault(r["holding"], {
                 "holding": r["holding"], "stock": 0.0, "options": 0.0, "lines": 0})
