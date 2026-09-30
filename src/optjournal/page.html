@@ -165,7 +165,8 @@ import {
 import {PRICE_TIERS, alertState, bxDirection, bxStrong, earningsSoon, histBars,
   meterKnob,
   priceTier, ringArc, ringPoint, shownPrice} from '/static/watch.js';
-import {cls, dayLabel, dp, esc, level, money, monthLabel, num, pct, strike, sym}
+import {cls, compact, dayLabel, dp, esc, level, money, monthLabel, num, pct, strike,
+  sym}
   from '/static/format.js';
 import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
   from '/static/market.js';
@@ -1649,6 +1650,10 @@ const chargeOf=(nat,ccy,base)=>isNativeCharge(nat,ccy)
    closed down. Commission keeps the unsigned form it was written for, below. */
 const moneyOf=mo=>mo==null?cash(null)
   :isNativeCharge(mo.native,mo.ccy)?money(mo.native,mo.ccy):cash(mo.base);
+/** The NUMBER `moneyOf` prints, by the same rule, for a cell that has to print it
+    shorter (`compact`). */
+const amountOf=mo=>mo==null?null
+  :isNativeCharge(mo.native,mo.ccy)?mo.native:conv(mo.base);
 /** A commission: a charge, shown unsigned in the currency it was billed in. */
 const chargeMo=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);
 /** @param {Money|null} mo */
@@ -2925,11 +2930,18 @@ function calendar(){
     /* A button to the keyboard as well as the pointer, as the Market strip's days
        are: without the role and the tab stop, Tab walked past every day with fills
        and the drill-down could only be opened with a mouse. */
+    const fills=dy?dy.trades+(dy.trades===1?' fill':' fills'):'';
+    /* BOTH forms of the figure, and the stylesheet shows one: the amount where it
+       fits, `compact` on a phone, where "−€1,729.42" was clipped to "−€1,7". The
+       label is what a screen reader hears either way, and it has the exact one. */
+    const fig=k?`<span class="dplw">${moneyOf(dy.realized)}</span><span class="dpln">${
+      compact(amountOf(dy.realized))}</span>`:'—';
     cells.push(`<div class="day ${k}${dy?' clk':''}${sel}"${dy?` data-calday="${key}"
-      role="button" tabindex="0" aria-pressed="${sel?'true':'false'}"`:''}>
+      role="button" tabindex="0" aria-pressed="${sel?'true':'false'}" aria-label="${
+      esc(`${dayLabel(key)}: ${fills}${k?', '+moneyOf(dy.realized):''}`)}"`:''}>
       <div class="top"><span class="dnum">${d}</span>
-        <span class="dct">${dy?dy.trades+(dy.trades===1?' fill':' fills'):''}</span></div>
-      <div class="dpl ${dy&&!k?'dim':''}">${dy?(k?moneyOf(dy.realized):'—'):'<span class="dim2">—</span>'}</div>
+        <span class="dct">${fills}</span></div>
+      <div class="dpl ${dy&&!k?'dim':''}">${dy?fig:'<span class="dim2">—</span>'}</div>
     </div>`);
   }
   /* No chevrons of its own. The calendar used to carry prev/next beside its

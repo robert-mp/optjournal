@@ -982,8 +982,11 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
    flex item, so a long caption beside it squeezed the strip to its narrowest
    content width and every pill wrapped onto its own line -- a three-row column
    taller than the header text, which pushed down into the stats grid. The
-   caption is the part that should reflow, so it shrinks and the pills do not. */
-.pills{display:flex;gap:var(--s3);flex-wrap:wrap;flex:0 0 auto;justify-content:flex-end}
+   caption is the part that should reflow, so it shrinks and the pills do not.
+   `max-width` is the other end: once the strip has a row to itself it wraps its
+   own pills, where at 375px the Calendar's three ran 7px past the card. */
+.pills{display:flex;gap:var(--s3);flex-wrap:wrap;flex:0 0 auto;justify-content:flex-end;
+  max-width:100%}
 /* Lets the text block shrink below its content width. A flex item defaults to
    min-width:auto, which refuses to go under min-content and is the usual reason
    a neighbour gets crushed instead. */
@@ -1591,6 +1594,21 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .linkish:hover{color:var(--fg)}
 .day .dpl{font-family:var(--fig);font-variant-numeric:tabular-nums;
   font-weight:var(--w-label);font-size:var(--t3)}
+/* The day's figure is in the cell twice (page.html `calendar`): the amount, and
+   `compact` for a grid too narrow for it. Below 700px a day is under 84px wide,
+   which is where the widest four-digit amount stopped fitting and was clipped;
+   an amount wider still wraps rather than clipping. The compact form is at most
+   five glyphs, about 2.9em, so sizing it at 34% of the day's own width (`cqi`,
+   each day its own container) keeps it inside the cell on the narrowest phone
+   while `--t1` caps it everywhere else. */
+.day .dplw{overflow-wrap:anywhere}
+.day .dpln{display:none}
+@media(max-width:700px){
+  .cal{gap:var(--s1)}
+  .cal>.day{padding:var(--s1);container-type:inline-size}
+  .day .top{flex-wrap:wrap}
+  .day .dplw{display:none}
+  .day .dpln{display:inline;font-size:min(var(--t1),34cqi)}}
 .day.g .dct,.day.r .dct{color:var(--onfill)}
 
 /* ---- legs / strategy ---- */

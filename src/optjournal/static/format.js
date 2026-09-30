@@ -38,6 +38,23 @@ export function money(value, currency, digits) {
   }`;
 }
 
+/** An amount in at most five characters, for a cell too narrow for `money`: a
+ * calendar day on a phone, where "−€1,729.42" was clipped to "−€1,7". No symbol
+ * and no cents, because the month's total beside the grid carries the currency
+ * and the day's own label carries the exact figure: 716, −198, 1.1k, −3.3k, 12k.
+ * Anything that rounds to zero prints without a sign, so there is no "−0".
+ */
+export function compact(value) {
+  if (value == null) return "—";
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "—";
+  const size = Math.abs(amount);
+  const body = size < 999.5 ? num(Math.round(size), 0)
+    : size < 9950 ? `${num(size / 1000, 1)}k`
+    : `${num(Math.round(size / 1000), 0)}k`;
+  return `${amount < 0 && body !== "0" ? "−" : ""}${body}`;
+}
+
 export const cls = (value) => value == null || Number(value) === 0
   ? ""
   : Number(value) > 0 ? "pos signed" : "neg signed";

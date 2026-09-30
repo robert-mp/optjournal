@@ -7305,6 +7305,31 @@ def _media_rules(width: int) -> list[tuple[str, str]]:
     return [(sel.strip(), body) for sel, body in rules]
 
 
+def test_a_phone_calendar_prints_every_day_whole():
+    """M33: at 375px a day is 37px wide and "−€1,729.42" was clipped to "−€1,7",
+    and the pill row ran 7px past the card. Measured in a browser at 320 to 1280px
+    after the fix, on the real journal's two busiest months: nothing clipped.
+
+    The cell carries the amount and its `compact` form (node-tested in
+    format.test.mjs), and below 700px only the compact one shows, sized to the
+    day's own width so it fits the narrowest phone; the day's label keeps the
+    exact figure for a screen reader.
+    """
+    narrow = {sel: body.replace(" ", "") for sel, body in _media_rules(700)}
+    assert "display:none" in narrow.get(".day .dplw", ""), "the full amount still shows"
+    shown = narrow.get(".day .dpln", "")
+    assert "display:inline" in shown and "cqi" in shown, (
+        "the compact amount does not show, or does not scale with the day")
+    assert "container-type:inline-size" in narrow.get(".cal>.day", "")
+    wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "display:none" in wide.get(".day .dpln", ""), (
+        "the compact amount shows beside the full one on a wide screen")
+    assert "max-width:100%" in wide.get(".pills", ""), (
+        "a pill strip with a row to itself cannot wrap, so it overflows its card")
+    cal = _fn("calendar")
+    assert "compact(amountOf(dy.realized))" in cal and "aria-label=" in cal
+
+
 def test_the_content_column_can_shrink_below_its_widest_child():
     """A `1fr` track has an `auto` minimum, so one wide table widened `.wrap`
     past the viewport and the whole page scrolled sideways. `minmax(0,1fr)` is
