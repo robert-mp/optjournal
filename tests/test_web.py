@@ -7508,6 +7508,53 @@ def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, 
     assert reply["earnings_failed"] == []
 
 
+def _stale_earnings_row(db: Path) -> None:
+    """One watched symbol with a fetched date whose check is days old."""
+    with open_journal(db) as conn:
+        conn.execute(
+            "INSERT INTO watchlist (symbol, added_at, earnings_next,"
+            " earnings_confirmed, earnings_timing, earnings_checked_at)"
+            " VALUES ('AMD', '2026-01-01', '2026-10-28', 1, 'after close',"
+            " '2026-01-01T00:00:00+00:00')")
+        conn.commit()
+
+
+def _offline_quotes(monkeypatch) -> None:
+    """The quote and IV-rank halves of /api/quotes, failing without the network."""
+    from optjournal.iv import IvFetchError  # noqa: PLC0415 - local helper
+    from optjournal.marketdata import BarFetchError  # noqa: PLC0415
+
+    def no_quote(symbol, **_):
+        raise BarFetchError("no network in tests")
+
+    def no_rank(symbol, **_):
+        raise IvFetchError("no network in tests")
+
+    monkeypatch.setattr(web, "fetch_quote", no_quote)
+    monkeypatch.setattr(web, "fetch_iv_rank", no_rank)
+
+
+def test_a_nasdaq_error_reply_keeps_the_stored_earnings_date(tmp_path, monkeypatch):
+    """L8: a throttled Nasdaq reply (HTTP 200, `rCode` 429, no data) used to parse
+    as "no earnings" and wipe the stored date for a day. It is a failure now, so
+    the refresh names the symbol and the date on screen stays."""
+    from optjournal import earnings  # noqa: PLC0415 - local to this test
+
+    db = tmp_path / "j.db"
+    _stale_earnings_row(db)
+    _offline_quotes(monkeypatch)
+    monkeypatch.setattr(earnings, "fetch_earnings", lambda symbol, **_: (
+        earnings.parse_earnings({"data": None, "status": {"rCode": 429}})))
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, reply = _get(base, "/api/quotes")
+    assert (status, reply["earnings_failed"]) == (200, ["AMD"])
+    with open_journal(db) as conn:
+        row = conn.execute(
+            "SELECT earnings_next, earnings_confirmed, earnings_timing"
+            " FROM watchlist WHERE symbol = 'AMD'").fetchone()
+    assert tuple(row) == ("2026-10-28", 1, "after close")
+
+
 def test_each_job_row_says_how_many_requests_one_run_spends():
     """The confirm dialogue reads this, so it must not say "one" for five."""
     from optjournal.web import _with_request_counts

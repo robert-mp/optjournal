@@ -65,3 +65,14 @@ def test_a_reply_that_is_not_an_object_is_loud():
     different remedies."""
     with pytest.raises(EarningsFetchError):
         parse_earnings("<html>403</html>")
+
+
+@pytest.mark.parametrize("code", [429, 500, 503])
+def test_an_error_reply_is_a_failure_not_an_absence(code):
+    """L8: Nasdaq answers a throttled or failed request with HTTP 200, a non-200
+    `rCode` and no data. Read as "no earnings", that wiped a stored date, so only
+    the documented no-earnings reply (400, a fund) is an absence."""
+    payload = {"data": None, "message": None,
+               "status": {"rCode": code, "bCodeMessage": None}}
+    with pytest.raises(EarningsFetchError, match=str(code)):
+        parse_earnings(payload)
