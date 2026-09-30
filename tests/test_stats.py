@@ -461,6 +461,53 @@ def test_expirations_on_one_day_do_not_merge_unrelated_positions(conn):
     assert s.net_pnl.base == pytest.approx(-102.0), "the money never moved"
 
 
+def test_expirations_on_one_day_are_not_one_strategy_on_the_calendar(conn):
+    """The same two expirations as above, seen through the events the Calendar's
+    day detail reads. They were plain `strategy_groups`, which clustered orders
+    without knowing which ones IBKR generated, so the two unrelated expirations
+    were drawn as one 2-leg strategy after the scoreboard had kept them apart."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for
+    from optjournal.strategies import campaign_events
+
+    _leg(conn, conid="1", order_id="1001", at="2026-09-01 10:00:00", qty=-1,
+         proceeds=200.0, pnl=None, put_call="P")
+    _leg(conn, conid="2", order_id="1002", at="2026-09-20 11:00:00", qty=1,
+         proceeds=-300.0, pnl=None, put_call="C")
+    _leg(conn, conid="1", order_id="9001", at="2026-10-16 16:20:00", qty=1,
+         proceeds=0.0, pnl=199.0, put_call="P", notes="Ep")
+    _leg(conn, conid="2", order_id="9002", at="2026-10-16 16:20:00", qty=-1,
+         proceeds=0.0, pnl=-301.0, put_call="C", notes="Ep")
+    episodes = build_history(conn, asset_category="OPT").episodes
+    events = campaign_events(orders_data(conn), campaigns_for(conn, "OPT", episodes))
+    assert sorted(e["order_ids"] for e in events) == [
+        ["1001"], ["1002"], ["9001"], ["9002"]]
+
+
+def test_a_spreads_legs_expiring_together_stay_one_event(conn):
+    """The other half: a vertical opened as one decision expires as two IBKR
+    orders at 16:20:00, and those ARE one event (one campaign), so the day
+    detail still names the spread rather than two single legs."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for
+    from optjournal.strategies import campaign_events
+
+    _leg(conn, conid="1", order_id="1001", at="2026-09-01 10:00:00", qty=-1,
+         proceeds=200.0, pnl=None, put_call="P")
+    _leg(conn, conid="2", order_id="1002", at="2026-09-01 10:00:01", qty=1,
+         proceeds=-80.0, pnl=None, put_call="P")
+    _leg(conn, conid="1", order_id="9001", at="2026-10-16 16:20:00", qty=1,
+         proceeds=0.0, pnl=199.0, put_call="P", notes="Ep")
+    _leg(conn, conid="2", order_id="9002", at="2026-10-16 16:20:00", qty=-1,
+         proceeds=0.0, pnl=-81.0, put_call="P", notes="Ep")
+    episodes = build_history(conn, asset_category="OPT").episodes
+    events = campaign_events(orders_data(conn), campaigns_for(conn, "OPT", episodes))
+    assert sorted(e["order_ids"] for e in events) == [
+        ["1001", "1002"], ["9001", "9002"]]
+
+
 def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):
     """`pnl/s_scope_inflight.py`: a 0DTE short put rolled at 15:55 into the next
     day's put, which is still open.

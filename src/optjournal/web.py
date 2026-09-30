@@ -157,8 +157,8 @@ from optjournal.stats import (
     strategy_ranking,
 )
 from optjournal.strategies import (
+    campaign_events,
     position_groups,
-    strategy_groups,
 )
 from optjournal.sync import history_plan, sync_journal
 
@@ -709,8 +709,10 @@ def build_state(
             "allocation": allocation_data(conn),
             "orders": orders,
             # The same orders folded into the strategies they were placed
-            # as -- a strangle sold as two same-second orders is one group.
-            "strategies": strategy_groups(orders),
+            # as (a strangle sold as two same-second orders is one group), and
+            # never across two campaigns, so two positions expiring together
+            # are not labelled one strategy.
+            "strategies": campaign_events(orders, view_campaigns),
             # ... and further linked into position lifecycles: the open and
             # the close of one position share an episode, so they are one
             # card. The union is `campaigns.link`'s, shared with the scoreboard.

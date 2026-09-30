@@ -162,6 +162,40 @@ def _event(members: list[Row]) -> Row:
     }
 
 
+def _campaign_of_order(campaign_list: list[campaigns.Campaign]) -> dict[str, int]:
+    """Which campaign each order filled, so an event is placed by its own orders.
+
+    The campaign carries them because the leg views aggregate per contract and so
+    carry no fill id for an event to join on.
+    """
+    return {oid: index for index, camp in enumerate(campaign_list)
+            for oid in camp.order_ids}
+
+
+def campaign_events(
+    orders: list[Row], campaign_list: list[campaigns.Campaign],
+) -> list[Row]:
+    """`strategy_groups`, with no event straddling two campaigns, newest first.
+
+    The event grouping reads orders, which carry no note codes, so it puts two
+    positions' expirations in one event (IBKR stamps both 16:20:00) after the
+    campaigns have kept the positions apart. Split along campaign lines, each
+    position keeps its own expiry, while a spread's legs expiring together (one
+    campaign) stay one event. The Trades cards and the Calendar's day detail both
+    read this, so they cannot disagree about what one event was.
+    """
+    campaign_of_order = _campaign_of_order(campaign_list)
+    events: list[Row] = []
+    for event in strategy_groups(orders):
+        parts: dict[int | None, list[Row]] = {}
+        for order in event["orders"]:
+            parts.setdefault(
+                campaign_of_order.get(str(order.get("ib_order_id"))), []
+            ).append(order)
+        events.extend([event] if len(parts) == 1 else map(_event, parts.values()))
+    return events
+
+
 def position_groups(
     orders: list[Row],
     *,
@@ -191,14 +225,7 @@ def position_groups(
     Events whose orders map to no episode (nothing but snapshots, or an
     unmatched category) stay as singleton lifecycles.
     """
-    #: Which campaign each order filled, so an event is placed by its own
-    #: orders. The campaign carries them because the leg views aggregate per
-    #: contract and so carry no fill id for an event to join on.
-    campaign_of_order: dict[str, int] = {
-        oid: index
-        for index, camp in enumerate(campaign_list)
-        for oid in camp.order_ids
-    }
+    campaign_of_order = _campaign_of_order(campaign_list)
 
     def campaign_of(event: Row) -> int | None:
         for oid in event.get("order_ids", ()):
@@ -207,19 +234,7 @@ def position_groups(
                 return index
         return None
 
-    # An event is drawn on ONE card, so it may not straddle two campaigns. The
-    # event grouping here reads orders, which carry no note codes, so it still
-    # puts two positions' expirations in one event (IBKR stamps both 16:20:00)
-    # after the campaigns have kept the positions apart. Split along campaign
-    # lines, each card keeps its own expiry rather than one card holding both.
-    events: list[Row] = []
-    for event in strategy_groups(orders):
-        parts: dict[int | None, list[Row]] = {}
-        for order in event["orders"]:
-            parts.setdefault(
-                campaign_of_order.get(str(order.get("ib_order_id"))), []
-            ).append(order)
-        events.extend([event] if len(parts) == 1 else map(_event, parts.values()))
+    events = campaign_events(orders, campaign_list)
 
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own
