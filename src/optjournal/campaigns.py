@@ -46,7 +46,7 @@ order grouping, event labelling and Money aggregation, where the stats layer
 could not reach it, so the Dashboard counted a roll as two wins while the
 Trades tab drew it as one card. That is `notes.py`'s situation exactly: one
 rule, two readers that cannot see each other, the previous state being the rule
-written twice. This holds `money.py` and nothing else, so any layer may hold it
+written twice. This holds `money.py` and `notes.py`, both leaves, so any layer may hold it
 and every case below is testable against literals.
 
 Episodes are duck-typed rather than imported. Everything here reads is
@@ -63,12 +63,15 @@ from datetime import datetime
 from typing import Any
 
 from optjournal.money import Money
+from optjournal.notes import split_notes
 
 __all__ = [
+    "BROKER_CODES",
     "Campaign",
     "WINDOW_S",
     "cluster_orders",
     "link",
+    "placed_by_broker",
     "position_count",
 ]
 
@@ -79,6 +82,19 @@ __all__ = [
 #: `strategies.py` because this is now the module that owns the union rule, and
 #: the constant is the whole risk surface of it.
 WINDOW_S = 90
+
+#: IBKR note codes on fills the BROKER generated rather than the trader placed:
+#: expiry (`Ep`), assignment (`A`), exercise (`Ex`, `AEx`, `MEx`, `GEA`), a
+#: margin liquidation (`L`) and a dividend reinvestment (`R`). IBKR stamps them
+#: with its own processing time, every expiration at 16:20:00, so the window
+#: would read unrelated positions expiring together as one placement.
+BROKER_CODES = frozenset({"Ep", "A", "Ex", "AEx", "MEx", "GEA", "L", "R"})
+
+
+def placed_by_broker(notes: Any) -> bool:
+    """Whether a fill's note codes say IBKR generated it. Whole codes only, so
+    `AFx` (an auto-conversion) is not read as `A` (an assignment)."""
+    return not BROKER_CODES.isdisjoint(split_notes(notes))
 
 
 def _dt(value: Any) -> datetime | None:
@@ -178,6 +194,8 @@ class Campaign:
 
 def cluster_orders(
     items: Iterable[tuple[str, Any, Any]],
+    *,
+    standalone: Iterable[str] = (),
 ) -> list[tuple[str, ...]]:
     """Order ids grouped into the decisions they were placed as.
 
@@ -187,11 +205,17 @@ def cluster_orders(
     spanning several) or no parseable time is never merged, because the
     heuristic only trusts itself where it can see both.
 
+    `standalone` names orders that are never merged either: the ones IBKR
+    generated (`placed_by_broker`). The window infers a shared placement from a
+    shared time, and nobody placed an expiration, so two positions expiring on
+    the same afternoon share IBKR's timestamp and nothing else.
+
     Returned as tuples of ids in fill order, so a caller can map back to
     whatever it holds those ids against.
     """
+    alone = {str(oid) for oid in standalone}
     rows = [
-        (str(oid), _dt(at), str(under) if under else None)
+        (str(oid), _dt(at), str(under) if under and str(oid) not in alone else None)
         for oid, at, under in items
     ]
     rows.sort(key=lambda r: (r[2] or f"￿{r[0]}", str(r[1] or ""), r[0]))
@@ -225,7 +249,9 @@ def link(
 
     Two episodes are one campaign when one order group touched both: that is a
     roll (the group's order closed one expiry and opened the next) or a spread
-    (its legs are separate contracts filled together). `order_of_trade` maps a
+    (its legs are separate contracts filled together). A group that touched only
+    ONE contract joins nothing: that is a fill through zero, a reversal rather
+    than a continuation, and its two sides are two decisions. `order_of_trade` maps a
     fill id to its order, which is how an episode -- which knows only its trade
     ids -- reaches the group.
 
@@ -267,7 +293,7 @@ def link(
         for oid in ids:
             group_of_order[str(oid)] = index
 
-    first_in_group: dict[int, int] = {}
+    members_of_group: dict[int, list[int]] = {}
     #: Orders reached per episode, so the campaign can carry the union of them.
     orders_of_episode: dict[int, set[str]] = {}
     for i, episode in enumerate(episodes):
@@ -285,7 +311,17 @@ def link(
             orders_of_episode[i].update(
                 oid2 for oid2, g in group_of_order.items() if g == group
             )
-            union(first_in_group.setdefault(group, i), i)
+            members_of_group.setdefault(group, []).append(i)
+    # A group joins DIFFERENT contracts: a roll's two expiries, a spread's legs.
+    # A group that touched episodes of only ONE contract has reversed it -- a fill
+    # through zero (IBKR's `C;O`) belongs to the long it closed and the short it
+    # opened -- and the finished side is an outcome of its own, not cash in
+    # flight inside the other. Not reachable on either journal today: no
+    # campaign there holds two episodes of one contract.
+    for touched in members_of_group.values():
+        if len({str(getattr(episodes[i], "conid", "") or "") for i in touched}) > 1:
+            for i in touched:
+                union(touched[0], i)
 
     episode_of_order: dict[str, int] = {}
     for i, oids in orders_of_episode.items():

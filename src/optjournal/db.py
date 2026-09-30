@@ -711,21 +711,26 @@ SELECT * FROM trade_legs WHERE asset_category = 'OPT';
 CREATE VIEW IF NOT EXISTS option_orders AS
 SELECT * FROM trade_orders WHERE asset_category = 'OPT';
 
--- Current option book, from the most recent snapshot only.
+-- Current option book: the option rows of each account's current book.
 --
--- "Most recent" is per broker, via the correlated subquery. A single MAX over
--- the whole table asks one broker's statement date to decide whether ANOTHER
--- broker's positions are current -- so the broker whose statements lag drops out
--- of the book entirely, silently, and the page shows a shorter position list
--- rather than an error. `history._latest_snapshot` takes its own MAX and would
--- need the same scoping; it already keys episodes on (broker, account_id, conid).
+-- The book's date is `history.BOOK_DATE_SQL`, spelled again here because a view
+-- cannot import it (tests/test_history.py holds the two equal): per broker AND
+-- account, the newest day with a position row in ANY category, or whose NAV
+-- held no stock and no options. Any category, because IBKR lists only what is
+-- held, so the day the option book goes flat has no OPT row and the newest OPT
+-- date is a stale book.
 CREATE VIEW IF NOT EXISTS current_option_positions AS
 SELECT *
 FROM position_snapshots p
 WHERE asset_category = 'OPT'
   AND report_date = (
-    SELECT MAX(report_date) FROM position_snapshots
-    WHERE asset_category = 'OPT' AND broker = p.broker
+    SELECT MAX(d) FROM (
+      SELECT report_date AS d FROM position_snapshots
+      WHERE broker = p.broker AND account_id = p.account_id
+      UNION ALL SELECT report_date FROM equity_summaries
+      WHERE broker = p.broker AND account_id = p.account_id
+        AND stock_base = 0 AND options_base = 0
+    )
   );
 """
 

@@ -203,9 +203,12 @@ def campaigns_for(
     )
     order_of_trade: dict[str, str] = {}
     first_fill: dict[str, tuple[str, str | None]] = {}
+    #: Orders IBKR generated (an expiry, an assignment), which the window must
+    #: not merge: every expiration is stamped 16:20:00. See `cluster_orders`.
+    by_broker: set[str] = set()
     for row in conn.execute(
         "SELECT trade_id, ib_order_id, date_time, trade_date, underlying_symbol,"
-        f" symbol FROM trades {clause}", params
+        f" symbol, notes FROM trades {clause}", params
     ):
         oid = str(row["ib_order_id"])
         order_of_trade[str(row["trade_id"])] = oid
@@ -213,10 +216,13 @@ def campaigns_for(
         under = row["underlying_symbol"] or row["symbol"]
         if oid not in first_fill or at < first_fill[oid][0]:
             first_fill[oid] = (at, under)
+        if campaigns.placed_by_broker(row["notes"]):
+            by_broker.add(oid)
     return campaigns.link(
         episodes,
         order_groups=campaigns.cluster_orders(
-            (oid, at, under) for oid, (at, under) in first_fill.items()
+            ((oid, at, under) for oid, (at, under) in first_fill.items()),
+            standalone=by_broker,
         ),
         order_of_trade=order_of_trade,
         links=journal.links(conn),
@@ -519,8 +525,12 @@ class MonthStats:
         cannot see commission on other instruments at all, while the cost
         report reads the raw statement and includes it. Do not present the two
         under the same label -- they differ by the whole of stock commission.
+
+        The signed sum flipped once, not its magnitude: a period whose refunds
+        exceed its charges (September 2026 on the real account, +0.01) is a net
+        credit, and the Costs tab (`costs.build_costs`) reports it as one.
         """
-        return abs(self.fees.base)
+        return -self.fees.base
 
     @property
     def total_friction_base(self) -> float:
@@ -972,19 +982,28 @@ def _net_liq_for(
     Comparing normalised day strings works because both sides are ISO-ordered;
     the period end key is the period prefix plus '\uffff', which sorts after
     every day inside it and before the next period.
+
+    Each account's newest summary, summed: the account's value is the sum of
+    its accounts' values, and one row read from a multi-account journal measured
+    the gain against one account. Per account rather than per date so an account
+    whose statements lag still counts. The date is the newest of them.
     """
     rows = conn.execute(
-        "SELECT report_date, total_base FROM equity_summaries"
+        "SELECT broker, account_id, report_date, total_base FROM equity_summaries"
         " ORDER BY report_date"
     ).fetchall()
     end_key = (period + "\uffff") if period else "\uffff"
-    best: tuple[float | None, str | None] = (None, None)
+    newest: dict[tuple[str, str], tuple[str, float]] = {}
     for row in rows:
         day = _day_of(row["report_date"])
         if day is None or day > end_key:
             continue
-        best = (row["total_base"], day)
-    return best
+        newest[(str(row["broker"]), str(row["account_id"]))] = (
+            day, row["total_base"] or 0.0)
+    if not newest:
+        return None, None
+    return (sum(total for _, total in newest.values()),
+            max(day for day, _ in newest.values()))
 
 
 def month_stats(
@@ -1096,9 +1115,19 @@ def month_stats(
     # opened in December and closed in January is a January outcome, and so a
     # 2026 one. Attributing by entry instead would make the annual rows stop
     # summing to the monthly ones.
+    #
+    # By the SAME clock as the category's money, so an outcome lands in the month
+    # its P&L does. Options money is the episode's, on its ET close stamp. The
+    # per-fill categories book money on IBKR's trade date, so their outcomes take
+    # the closing fill's trade date: a Korean sale at 20:03 ET on 31 August is a
+    # 1 September trade, and on the ET stamp its win landed in August with its
+    # P&L in September.
+    def close_of(e: Any) -> str | None:
+        return e.closed_at if episode_pnl else (e.closed_on or e.closed_at)
+
     closed = [
         e for e in report.closed
-        if _in_period(e.closed_at, period) and scope.has_episode(e)
+        if _in_period(close_of(e), period) and scope.has_episode(e)
     ]
     stats.closed_episodes = len(closed)
     stats.open_episodes = sum(1 for e in report.open if scope.has_episode(e))
@@ -1164,11 +1193,18 @@ def month_stats(
         units = [
             [report.episodes[i] for i in c.episode_indices] for c in campaign_list
         ]
+    # Decided when the WHOLE unit is closed, and in the period its last episode
+    # closed, whatever the scope: the same test the in-flight figure below and the
+    # Trades tab's cards apply. The scope only picks which episodes' cash the
+    # outcome carries. Judging a unit by its in-scope episodes alone decided a
+    # 0DTE leg rolled into a next-day contract still open, so under the 0DTE scope
+    # the same -302 was a decided loss AND cash inside a position still running.
     decided = [
-        scoped for scoped in ([e for e in u if scope.has_episode(e)] for u in units)
+        scoped for unit, scoped in ((u, [e for e in u if scope.has_episode(e)])
+                                    for u in units)
         if scoped
-        and all(e.is_closed for e in scoped)
-        and _in_period(max(str(e.closed_at or "") for e in scoped), period)
+        and all(e.is_closed for e in unit)
+        and _in_period(max(str(close_of(e) or "") for e in unit), period)
     ]
     stats.decided_campaigns = len(decided)
     won = [c for c in decided if _campaign_pnl(c).base > 0]
@@ -1214,7 +1250,7 @@ def month_stats(
         for unit in units
         if not all(e.is_closed for e in unit)
         for e in unit
-        if e.is_closed and _in_period(e.closed_at, period) and scope.has_episode(e)
+        if e.is_closed and _in_period(close_of(e), period) and scope.has_episode(e)
     )
     stats.net_liq_base, stats.net_liq_date = _net_liq_for(conn, period)
 

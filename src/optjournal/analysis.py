@@ -273,19 +273,18 @@ class WithholdingLine:
 
     @property
     def effective_rate(self) -> Decimal | None:
-        """Withheld / (net + withheld), since IBKR reports dividends net.
+        """Withheld / gross, since IBKR's Dividends row is the gross amount.
+
+        The tax arrives as its own WHTAX row beside the gross dividend, so
+        dividing by the two together understated a 30% rate as about 23%.
 
         Returns None when there is no matching dividend. Withholding on
         credit interest, for instance, arrives as a WHTAX row with no
-        DIVIDEND counterpart, and dividing by the withholding alone would
-        report a meaningless 100%.
+        DIVIDEND counterpart, and there is no gross to divide by.
         """
         if not self.gross_base:
             return None
-        total = self.gross_base + self.withheld_base
-        if not total:
-            return None
-        return (self.withheld_base / total) * Decimal("100")
+        return (self.withheld_base / self.gross_base) * Decimal("100")
 
 
 @dataclass(slots=True)
@@ -362,7 +361,7 @@ class CostReport:
 
     @property
     def total_fees_native_by_ccy(self) -> dict[str, Decimal]:
-        """Fees as levied. Already magnitudes, so no sign flip."""
+        """Fees as levied. Already flipped to cost-positive, so no second flip."""
         return self._merge(*(f.native_by_ccy for f in self.fees))
 
     @property
@@ -590,21 +589,26 @@ def analyse(
         kind = str(c.type).upper()
         amount_base = _to_base(c.amount, c.fxRateToBase)
 
+        # Fees and withholding are SIGNED, summed with the sign, and flipped once
+        # into cost-positive. A refund is a real row (IBKR cancels a charge with
+        # a positive `CANCEL[...]` row of the same size, and reclaims withholding
+        # the same way), so a per-row abs() booked each reversal as a further
+        # charge: `activity-20260903` read 3.89 of EUR market data for 1.29 paid.
         if "FEES" in kind:
             name = categorise_fee(c.description)
             fee_category = fees.setdefault(name, FeeCategory(name=name))
             fee_category.count += 1
-            fee_category.total_base += abs(amount_base)
+            fee_category.total_base -= amount_base
             fee_ccy = str(getattr(c, "currency", None) or "") or base_currency
             if c.amount:
                 fee_category.native_by_ccy[fee_ccy] = (
-                    fee_category.native_by_ccy.get(fee_ccy, ZERO) + abs(c.amount)
+                    fee_category.native_by_ccy.get(fee_ccy, ZERO) - c.amount
                 )
             if len(fee_category.examples) < 3 and c.description:
                 fee_category.examples.append(c.description)
         elif "WHTAX" in kind:
             key = str(c.symbol or "(non-dividend)")
-            withheld[key] += abs(amount_base)
+            withheld[key] -= amount_base
             ccy_of.setdefault(key, str(c.currency or ""))
         elif "DIVIDEND" in kind:
             key = str(c.symbol or "(unknown)")
@@ -715,7 +719,7 @@ def format_report(report: CostReport) -> str:
             out.append(f"    {c.name}: {c.examples[0]}")
 
     out.append("\nDividend withholding")
-    out.append(f"  {'symbol':<16}{'ccy':>5}{'net':>10}{'withheld':>11}{'eff rate':>10}")
+    out.append(f"  {'symbol':<16}{'ccy':>5}{'gross':>10}{'withheld':>11}{'eff rate':>10}")
     for w in report.withholding:
         rate = f"{w.effective_rate:.1f}%" if w.effective_rate is not None else "-"
         out.append(

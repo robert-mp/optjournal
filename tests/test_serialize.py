@@ -642,21 +642,22 @@ def _alloc_fixture(conn):
             (day, conid, symbol, under, cat, value, rate))
 
     snap("20260924", "1", "TSLA", None, "STK", 1000.0, 0.5)
-    snap("20260923", "2", "TSLA  260918P00300000", "TSLA", "OPT", -100.0, 0.5)
-    snap("20260923", "3", "MRVL  260918P00070000", "MRVL", "OPT", -40.0, 0.5)
-    # An older option snapshot that must not be read: only each category's
-    # latest date counts.
+    snap("20260924", "2", "TSLA  260918P00300000", "TSLA", "OPT", -100.0, 0.5)
+    snap("20260924", "3", "MRVL  260918P00070000", "MRVL", "OPT", -40.0, 0.5)
+    # An older option snapshot that must not be read: only the book's newest
+    # date counts.
     snap("20260901", "4", "OLD", "OLD", "OPT", -999.0, 0.5)
     conn.execute(
         "INSERT INTO equity_summaries (report_date, account_id, currency,"
         " cash_base, stock_base, options_base, total_base, raw, source_file,"
         " ingested_at) VALUES ('20260924','U1','EUR',80,500,-70,510,'{}','t.xml','now')")
     conn.commit()
+    return snap
 
 
 def test_allocation_folds_a_stock_and_its_options_into_one_holding(tmp_path):
-    """TSLA shares and a TSLA put are one line, each category from its own
-    latest snapshot, and rows plus cash sum to the broker's net liquidation."""
+    """TSLA shares and a TSLA put are one line, read from the newest snapshot,
+    and rows plus cash sum to the broker's net liquidation."""
     conn = connect_migrated(tmp_path / "journal.db")
     _alloc_fixture(conn)
     al = allocation_data(conn)
@@ -667,6 +668,43 @@ def test_allocation_folds_a_stock_and_its_options_into_one_holding(tmp_path):
     assert by["MRVL"]["share"] == pytest.approx(-20 / 510)
     assert sum(r["net"] for r in al["rows"]) + al["cash"] == pytest.approx(al["nav"])
     assert [r["holding"] for r in al["rows"]] == ["TSLA", "MRVL"]
+
+
+def test_an_option_book_gone_flat_leaves_no_options_in_the_allocation(tmp_path):
+    """Every row of one statement carries the same reportDate, so options absent
+    from the newest date were sold, not reported late. Each category from its own
+    latest snapshot kept a sold put in the allocation (`pnl/s_empty_book.py`)."""
+    conn = connect_migrated(tmp_path / "journal.db")
+    snap = _alloc_fixture(conn)
+    snap("20260925", "1", "TSLA", None, "STK", 1000.0, 0.5)
+    conn.commit()
+    al = allocation_data(conn)
+    assert al["as_of"] == "20260925"
+    assert [(r["holding"], r["stock"], r["options"]) for r in al["rows"]] == [
+        ("TSLA", 500.0, 0.0)]
+
+
+def test_allocation_sums_every_accounts_net_liquidation(tmp_path):
+    """Two accounts, each with its own NAV. Reading one row made the other
+    account's holdings a share of a total that excluded them. Each account's
+    newest summary counts, so an account whose statements lag still does."""
+    conn = connect_migrated(tmp_path / "journal.db")
+    _alloc_fixture(conn)
+    conn.execute(
+        "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
+        " underlying_symbol, asset_category, position, position_value, currency,"
+        " fx_rate_to_base, raw, source_file, ingested_at) VALUES ('20260923','9',"
+        " 'U2','MRVL','MRVL','STK',1,400.0,'USD',0.5,'{}','t.xml','now')")
+    conn.execute(
+        "INSERT INTO equity_summaries (report_date, account_id, currency,"
+        " cash_base, stock_base, options_base, total_base, raw, source_file,"
+        " ingested_at) VALUES ('20260923','U2','EUR',20,200,0,220,'{}','t.xml','now')")
+    conn.commit()
+    al = allocation_data(conn)
+    assert (al["nav"], al["cash"], al["nav_date"]) == (730, 100, "20260924")
+    by = {r["holding"]: r for r in al["rows"]}
+    assert (by["MRVL"]["stock"], by["MRVL"]["options"]) == (200.0, -20.0)
+    assert sum(r["net"] for r in al["rows"]) + al["cash"] == pytest.approx(al["nav"])
 
 
 def test_allocation_without_a_net_liquidation_figure_has_no_shares(tmp_path):
@@ -875,3 +913,41 @@ def test_no_date_anywhere_is_a_null_source(conn):
     row = watchlist_data(conn, now=datetime(2026, 10, 1, 16, 0, tzinfo=UTC))[0]
     assert (row["earnings_date"], row["earnings_source"]) == (None, None)
     assert row["earnings_in_days"] is None
+
+
+# ------------------------------------------------------------ journal orphans
+
+
+def test_a_note_no_decision_claims_is_listed_rather_than_lost(tmp_path):
+    """`journal.orphans` had no caller, so a note whose anchor stopped naming a
+    campaign matched no card and vanished from the page without a word. The
+    payload lists it; a note on a live decision, options or equities, is not."""
+    from conftest import add_statement
+
+    from optjournal import journal
+    from optjournal.serialize import journal_data
+
+    conn = connect_migrated(tmp_path / "journal.db")
+    add_statement(conn)
+    for tid, order, cat, conid in (("1", "100", "OPT", "C1"), ("2", "200", "STK", "S1")):
+        conn.execute(
+            "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
+            " account_id, trade_date, date_time, asset_category, symbol, conid,"
+            " underlying_symbol, open_close, quantity, currency, fx_rate_to_base,"
+            " raw, source_file, first_seen_at) VALUES (?,?,?,?,'U1','2026-09-01',"
+            " '2026-09-01 10:00:00',?,?,?,'SPY','O',1,'USD',1.0,'{}','t.xml','now')",
+            (tid, tid, tid, order, cat, conid, conid),
+        )
+    for anchor in ("100", "200", "999"):
+        journal.save(conn, anchor, account_id="U1", underlying_symbol="SPY",
+                     opened_on="2026-09-01", values={"entry_note": f"note {anchor}"})
+    data = journal_data(conn)
+    assert [o["anchor"] for o in data["orphans"]] == ["999"]
+    assert data["orphans"][0]["entry_note"] == "note 999"
+    assert set(data["entries"]) == {"100", "200", "999"}, "entries are unchanged"
+
+
+def test_no_writing_means_no_orphan_check(conn):
+    from optjournal.serialize import journal_data
+
+    assert journal_data(conn)["orphans"] == []

@@ -73,13 +73,25 @@ def add_trade(
 
 def add_snapshot(conn, conid: str, *, position: int, symbol: str = "OPT1",
                  date: str = "2026-12-31", asset: str = "OPT",
-                 cost_basis: float | None = None) -> None:
+                 cost_basis: float | None = None, account_id: str = "U1",
+                 source_file: str = "t.xml") -> None:
     conn.execute(
         "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
         " asset_category, position, cost_basis_money, currency, fx_rate_to_base,"
         " raw, source_file, ingested_at)"
-        " VALUES (?,?, 'U1', ?, ?, ?, ?, 'USD', 1.0, '{}', 't.xml', 'now')",
-        (date, conid, symbol, asset, position, cost_basis),
+        " VALUES (?,?, ?, ?, ?, ?, ?, 'USD', 1.0, '{}', ?, 'now')",
+        (date, conid, account_id, symbol, asset, position, cost_basis, source_file),
+    )
+
+
+def add_nav(conn, date: str, *, stock: float, options: float,
+            account_id: str = "U1") -> None:
+    """One day of IBKR's NAV breakdown (EquitySummaryByReportDateInBase)."""
+    conn.execute(
+        "INSERT INTO equity_summaries (report_date, account_id, currency,"
+        " cash_base, stock_base, options_base, total_base, raw, source_file,"
+        " ingested_at) VALUES (?, ?, 'EUR', 1000, ?, ?, ?, '{}', 't.xml', 'now')",
+        (date, account_id, stock, options, 1000 + stock + options),
     )
 
 
@@ -133,6 +145,77 @@ def test_round_trip_closes(conn):
     assert ep.realized_pnl == 900.0
     assert ep.holding_days == 10
     assert ep.contracts == 3
+
+
+def test_contracts_is_the_largest_position_held_not_the_opens_summed(conn):
+    """Short 2, buy 1 back, sell 1 again, buy 2 back: never more than 2 held.
+
+    `contracts` summed the opening fills (2 + 1) and reported 3, so a trader who
+    scaled out and back in read as having carried a bigger position than they
+    ever did, and the 0DTE cohort's contract count inherited it.
+    """
+    add_trade(conn, "1", open_close="O", qty=-2, date="2026-03-01")
+    add_trade(conn, "2", open_close="C", qty=1, date="2026-03-02", realized=99.0)
+    add_trade(conn, "3", open_close="O", qty=-1, date="2026-03-03")
+    add_trade(conn, "4", open_close="C", qty=2, date="2026-03-04", realized=198.0)
+    (ep,) = build_history(conn).episodes
+    assert ep.status == "CLOSED"
+    assert ep.contracts == 2
+
+
+def test_contracts_of_a_position_still_open_is_what_it_reached(conn):
+    """Bought 1, then 4 more, sold 2: at its largest the position was 5."""
+    add_trade(conn, "1", open_close="O", qty=1, date="2026-03-01")
+    add_trade(conn, "2", open_close="O", qty=4, date="2026-03-02")
+    add_trade(conn, "3", open_close="C", qty=-2, date="2026-03-03", realized=10.0)
+    (ep,) = build_history(conn).episodes
+    assert ep.net_qty == 3
+    assert ep.contracts == 5
+
+
+def test_a_fill_through_zero_closes_the_position_and_opens_the_opposite(conn):
+    """Long 2, then SELL 3 in one fill: IBKR marks it `C;O` and realises the long.
+
+    Only a bare `C` counted as a close, so the fill was read as an opening sale:
+    the long never went flat, the +198 IBKR realised in September waited inside
+    one open episode, and the whole outcome later landed in October as a single
+    +347. The fill is split at zero: its closing 2 finish the long, which takes
+    all of the realised P&L, and its leftover 1 opens the short. Commission and
+    proceeds divide by quantity.
+    """
+    add_trade(conn, "1", open_close="O", qty=2, date="2026-09-01")
+    add_trade(conn, "2", open_close="C;O", qty=-3, price=2.0, date="2026-09-10",
+              realized=198.0, commission=-3.0)
+    report = build_history(conn)
+    (long_leg,), (short,) = report.closed, report.open
+    assert long_leg.status == "CLOSED"
+    assert long_leg.realized_pnl == pytest.approx(198.0)
+    assert long_leg.closed_at == "2026-09-10 10:00:00"
+    assert long_leg.contracts == 2
+    assert long_leg.commission == pytest.approx(-1.0 - 2.0)
+    assert long_leg.proceeds == pytest.approx(-200.0 + 400.0)
+    assert short.net_qty == -1
+    assert short.opened_at == "2026-09-10 10:00:00"
+    assert short.entry_outside_window is False
+    assert short.realized_pnl == 0.0
+    assert short.commission == pytest.approx(-1.0)
+    assert short.proceeds == pytest.approx(200.0)
+    assert short.trade_ids == ["2"]
+
+    add_trade(conn, "3", open_close="C", qty=1, price=0.5, date="2026-10-05",
+              realized=149.0)
+    closed = sorted(build_history(conn).closed, key=lambda e: e.closed_at)
+    assert [(e.closed_at[:10], e.realized_pnl, e.contracts) for e in closed] == [
+        ("2026-09-10", 198.0, 2), ("2026-10-05", 149.0, 1)]
+
+
+def test_a_fill_marked_close_and_open_that_stops_at_zero_is_not_split(conn):
+    """The split needs the fill to go THROUGH zero. One that only reaches it
+    closes the position and opens nothing, whatever the marker says."""
+    add_trade(conn, "1", open_close="O", qty=2, date="2026-09-01")
+    add_trade(conn, "2", open_close="C;O", qty=-2, date="2026-09-10", realized=50.0)
+    (ep,) = build_history(conn).episodes
+    assert ep.status == "CLOSED" and ep.net_qty == 0
 
 
 def test_reentry_after_close_is_a_separate_episode(conn):
@@ -272,6 +355,103 @@ def test_snapshot_only_not_duplicated_when_trades_exist(conn):
     add_trade(conn, "1", open_close="O", qty=1)
     add_snapshot(conn, "C1", position=1)
     assert len(build_history(conn).episodes) == 1
+
+
+# ------------------------------------------------------------ the book's date
+#
+# IBKR's OpenPositions lists only what is held, and every row of one statement
+# carries the same reportDate (checked across the real archive, STK and OPT
+# alike). So the day the option book goes flat there is simply no OPT row, and
+# reading "the newest date that had an option" falls back to a stale book.
+
+
+def _current_option_conids(conn) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT conid FROM current_option_positions")}
+
+
+def test_an_option_missing_from_the_newest_book_is_flat(conn):
+    """`pnl/s_empty_book.py`: a LEAP held from before the archive is sold, and
+    the next statement lists only the stock. The LEAP stayed OPEN with its
+    +1500 missing, and stayed on the Positions tab."""
+    add_snapshot(conn, "LEAP", position=1, date="20260901")
+    add_snapshot(conn, "STK1", position=10, date="20260901", asset="STK",
+                 symbol="STK1")
+    add_trade(conn, "1", conid="LEAP", open_close="C", qty=-1, date="2026-09-15",
+              realized=1500.0)
+    add_snapshot(conn, "STK1", position=10, date="20260916", asset="STK",
+                 symbol="STK1")
+    report = build_history(conn)
+    (leap,) = report.episodes
+    assert leap.status == "CLOSED"
+    assert report.total_realized_base == 1500.0
+    assert report.snapshot_date == "20260916"
+    assert _current_option_conids(conn) == set()
+
+
+def test_an_empty_book_is_flat_when_the_nav_says_nothing_is_held(conn):
+    """Everything sold: the statement's OpenPositions section is present but
+    empty, so no position row exists for that day in ANY category. IBKR's NAV
+    breakdown for the day (no stock, no options) is what says the book is empty
+    rather than unreported."""
+    add_snapshot(conn, "LEAP", position=1, date="20260901")
+    add_nav(conn, "20260901", stock=0, options=4500)
+    add_trade(conn, "1", conid="LEAP", open_close="C", qty=-1, date="2026-09-15",
+              realized=1500.0)
+    add_nav(conn, "20260916", stock=0, options=0)
+    report = build_history(conn)
+    assert [e.status for e in report.episodes] == ["CLOSED"]
+    assert report.snapshot_date == "20260916"
+    assert _current_option_conids(conn) == set()
+
+
+def test_a_statement_that_reports_no_positions_is_silent_not_flat(conn):
+    """A query without the OpenPositions section leaves no row either, but the
+    account still holds things, and its NAV says so. Reading that silence as an
+    empty book would close every position held from before the archive."""
+    add_snapshot(conn, "C1", position=-1, date="20260901")
+    add_nav(conn, "20260901", stock=0, options=-300)
+    add_trade(conn, "1", open_close="C", qty=1, date="2026-08-25", realized=20.0)
+    add_nav(conn, "20260916", stock=0, options=-280)
+    report = build_history(conn)
+    assert [e.status for e in report.episodes] == ["OPEN"]
+    assert report.snapshot_date == "20260901"
+    assert _current_option_conids(conn) == {"C1"}
+
+
+def test_the_positions_view_and_the_episode_walk_read_the_same_book(conn):
+    """`db.current_option_positions` spells `history.BOOK_DATE_SQL` again, since a
+    view cannot import it. Every case above, in three accounts at once."""
+    from optjournal.history import _held
+
+    for account in ("U2", "U3"):
+        add_statement(conn, source_file=f"{account}.xml", account_id=account)
+    # U1: options sold, the stock still held.
+    add_snapshot(conn, "A1", position=1, date="20260901")
+    add_snapshot(conn, "S1", position=5, date="20260916", asset="STK", symbol="S1")
+    # U2: its statements lag, and it still holds its option.
+    add_snapshot(conn, "B1", position=-1, date="20260901", account_id="U2",
+                 source_file="U2.xml")
+    # U3: everything sold, and its NAV says so.
+    add_snapshot(conn, "C1", position=2, date="20260901", account_id="U3",
+                 source_file="U3.xml")
+    add_nav(conn, "20260916", stock=0, options=0, account_id="U3")
+    held, _ = _held(conn, "OPT")
+    assert {conid for _, _, conid in held} == _current_option_conids(conn) == {"B1"}
+
+
+def test_each_account_is_read_at_its_own_newest_date(conn):
+    """U2's statements lag U1's. Measured against U1's newer date, U2's held
+    position vanished from the book, and its pre-archive episode read CLOSED."""
+    add_statement(conn, source_file="b.xml", account_id="U2")
+    add_snapshot(conn, "C1", position=-1, date="20260916")
+    add_snapshot(conn, "C2", position=-1, date="20260901", account_id="U2",
+                 source_file="b.xml")
+    add_trade(conn, "1", conid="C2", open_close="C", qty=1, date="2026-08-25",
+              realized=20.0, account_id="U2", source_file="b.xml")
+    report = build_history(conn)
+    u2 = next(e for e in report.episodes if e.account_id == "U2" and not e.snapshot_only)
+    assert u2.status == "OPEN"
+    assert _current_option_conids(conn) == {"C1", "C2"}
 
 
 # ----------------------------------------------------------------- exclusions
@@ -533,6 +713,100 @@ def test_prewindow_close_absent_from_snapshot_is_closed(conn):
     assert len(report.episodes) == 1
     assert report.episodes[0].is_closed
     assert report.total_realized_base == 50.0
+
+
+# --- the pre-archive quantity, from the snapshot --------------------------------
+#
+# A pre-archive holding was only noticed when the contract's FIRST fill in the
+# archive was a close. Scaling in or out first hid it, and the episode walked from
+# zero: it went flat too early, or never. The snapshot says how much is held, so
+# the difference between it and the fills up to the snapshot's date is what was
+# held before the archive began, and the walk starts there.
+
+
+def _book_elsewhere(conn, date: str = "20260930") -> None:
+    """A snapshot row on another contract, so the book has a date and the
+    contract under test is known to be absent from it."""
+    add_snapshot(conn, "OTHER", position=1, symbol="OTHER", date=date)
+
+
+def test_a_pre_archive_position_scaled_out_and_back_in_closes_once(conn):
+    """`pnl/s_prearchive_scale.py`: long 2 from before the archive; sell 1, buy 1
+    back, sell 2. The buy-back read as a re-entry, so the walk closed a +99
+    episode and left a -1 phantom short OPEN holding the final +248."""
+    add_trade(conn, "1", open_close="C", qty=-1, price=3.0, date="2026-09-02",
+              realized=99.0)
+    add_trade(conn, "2", open_close="O", qty=1, price=2.5, date="2026-09-03")
+    add_trade(conn, "3", open_close="C", qty=-2, price=4.0, date="2026-09-20",
+              realized=248.0)
+    _book_elsewhere(conn)
+    report = build_history(conn)
+    (ep,) = [e for e in report.episodes if e.conid == "C1"]
+    assert ep.status == "CLOSED"
+    assert ep.realized_pnl == pytest.approx(347.0)
+    assert ep.entry_outside_window is True and ep.opened_at is None
+    assert ep.contracts == 2
+    from optjournal.stats import month_stats
+    september = month_stats(conn, "2026-09", report=report)
+    assert (september.net_pnl.base, september.wins, september.open_episodes) == (
+        347.0, 1, 1), "the one open episode is OTHER, the snapshot-only row"
+
+
+def test_a_pre_archive_position_added_to_then_closed_is_one_round_trip(conn):
+    """`pnl/s_prearchive_add.py`: long 1 from before the archive, buy 1, sell 2.
+    Walked from zero it never went flat: a phantom -1 short, +398 missing."""
+    add_trade(conn, "1", open_close="O", qty=1, price=2.0, date="2026-09-02")
+    add_trade(conn, "2", open_close="C", qty=-2, price=4.0, date="2026-09-20",
+              realized=398.0)
+    _book_elsewhere(conn)
+    (ep,) = [e for e in build_history(conn).episodes if e.conid == "C1"]
+    assert (ep.status, ep.net_qty, ep.realized_pnl) == ("CLOSED", 0, 398.0)
+
+
+def test_a_pre_archive_holding_still_held_matches_the_snapshot(conn):
+    """The real TSLA stock: 110 shares from before the archive and 96 bought
+    since. The episode read 96 open where the account held 206."""
+    add_trade(conn, "1", conid="T", symbol="TSLA", asset="STK", open_close="O",
+              qty=40, date="2025-08-28")
+    add_trade(conn, "2", conid="T", symbol="TSLA", asset="STK", open_close="O",
+              qty=56, date="2026-09-04")
+    add_snapshot(conn, "T", position=206, symbol="TSLA", asset="STK",
+                 date="20260929")
+    (ep,) = build_history(conn, asset_category="STK").episodes
+    assert (ep.status, ep.net_qty, ep.contracts) == ("OPEN", 206, 206)
+    assert ep.entry_outside_window is True
+    assert ep.opened_at is None, "the position was opened before the archive"
+
+
+def test_selling_a_pre_archive_holding_leaves_no_phantom(conn):
+    """`pnl/tsla_sellout.py`: sell all 206 and the next statement lists no TSLA.
+    Walked from 96 the sale left a -110 short OPEN."""
+    add_trade(conn, "1", conid="T", symbol="TSLA", asset="STK", open_close="O",
+              qty=96, date="2025-08-28")
+    add_trade(conn, "2", conid="T", symbol="TSLA", asset="STK", open_close="C",
+              qty=-206, date="2026-09-29", realized=5000.0)
+    add_snapshot(conn, "S", position=5, symbol="S", asset="STK", date="20260929")
+    report = build_history(conn, asset_category="STK")
+    (ep,) = [e for e in report.episodes if e.conid == "T"]
+    assert (ep.status, ep.net_qty, ep.realized_pnl) == ("CLOSED", 0, 5000.0)
+
+
+def test_fills_after_the_snapshot_are_not_read_as_a_pre_archive_holding(conn):
+    """Today's Trade Confirmation fills postdate the newest statement, so the
+    snapshot cannot know them. Only fills up to its date are reconciled."""
+    add_trade(conn, "1", open_close="O", qty=-2, date="2026-09-30")
+    _book_elsewhere(conn, date="20260929")
+    (ep,) = [e for e in build_history(conn).episodes if e.conid == "C1"]
+    assert (ep.status, ep.net_qty, ep.entry_outside_window) == ("OPEN", -2, False)
+
+
+def test_a_pre_archive_long_sold_through_zero_opens_the_short(conn):
+    """The two fixes meet: long 3 from before the archive, one SELL 5 (`C;O`)."""
+    add_trade(conn, "1", open_close="C;O", qty=-5, date="2026-09-10", realized=90.0)
+    add_snapshot(conn, "C1", position=-2, date="20260929")
+    closed, still_open = (lambda r: (r.closed, r.open))(build_history(conn))
+    assert [(e.realized_pnl, e.entry_outside_window) for e in closed] == [(90.0, True)]
+    assert [(e.net_qty, e.entry_outside_window) for e in still_open] == [(-2, False)]
 
 
 # ------------------------------------------------------------------------ 0DTE

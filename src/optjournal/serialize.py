@@ -51,15 +51,16 @@ from optjournal.events import (
     default_scope,
     upcoming,
 )
-from optjournal.history import HistoryReport
+from optjournal.history import BOOK_DATE_SQL, HistoryReport, book_date, build_history
 from optjournal.journal import ADHERENCE as JOURNAL_ADHERENCE
 from optjournal.journal import FIELDS as JOURNAL_FIELDS
 from optjournal.journal import TRIGGERS as JOURNAL_TRIGGERS
 from optjournal.journal import entries as journal_entries
+from optjournal.journal import orphans as journal_orphans
 from optjournal.marketdata import BarFetchError, fetch_bars
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
-from optjournal.stats import first_activity
+from optjournal.stats import EQUITY_CATEGORY, campaigns_for, first_activity
 from optjournal.trend import bucket, bxtrender_short
 from optjournal.vol import (
     expected_move,
@@ -257,9 +258,11 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     they are different kinds of exposure, and summed into `net` because that is
     what the name contributes to the account's value.
 
-    Each category from its OWN latest snapshot, the rule `current_option_positions`
-    already applies, because IBKR can report the two on different days and a
-    date shared across both would drop whichever lagged.
+    Read from each account's current book (`history.BOOK_DATE_SQL`), the same rows
+    the Positions tab and the episode walk treat as held. Each category from its
+    own latest snapshot kept an option sold since then: every row of one IBKR
+    statement carries the same reportDate, so options missing from the newest
+    date were sold, not reported late.
 
     The denominator is the broker's own net liquidation (`equity_summaries`), so
     the rows plus `cash` sum to it and a share can be read against the figure the
@@ -268,30 +271,28 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     the shares are None rather than a share of some other total.
     """
     holdings: dict[str, Row] = {}
-    as_of: str | None = None
     for cat, key in (("STK", "stock"), ("OPT", "options")):
-        latest = conn.execute(
-            "SELECT MAX(report_date) FROM position_snapshots WHERE asset_category = ?",
-            (cat,),
-        ).fetchone()[0]
-        if latest is None:
-            continue
-        as_of = max(as_of or latest, latest)
         for r in conn.execute(
             "SELECT COALESCE(underlying_symbol, symbol) AS holding,"
             " SUM(position_value * fx_rate_to_base) AS value, COUNT(*) AS n"
-            " FROM position_snapshots WHERE asset_category = ? AND report_date = ?"
-            " GROUP BY 1", (cat, latest),
+            " FROM position_snapshots p WHERE asset_category = ?"
+            f" AND report_date = ({BOOK_DATE_SQL}) GROUP BY 1", (cat,),
         ):
             row = holdings.setdefault(r["holding"], {
                 "holding": r["holding"], "stock": 0.0, "options": 0.0, "lines": 0})
             row[key] += r["value"] or 0.0
             row["lines"] += r["n"]
-    nav = conn.execute(
-        "SELECT total_base, cash_base, report_date FROM equity_summaries"
-        " ORDER BY report_date DESC LIMIT 1"
-    ).fetchone()
-    total = nav["total_base"] if nav else None
+    as_of = book_date(conn)
+    # Each account's newest NAV, summed, so a second account's holdings are a
+    # share of a total that includes them. Per account, like the holdings above,
+    # so an account whose statements lag still counts.
+    navs = conn.execute(
+        "SELECT total_base, cash_base, report_date FROM equity_summaries e"
+        " WHERE report_date = (SELECT MAX(report_date) FROM equity_summaries"
+        "  WHERE broker = e.broker AND account_id = e.account_id)"
+    ).fetchall()
+    total = sum(n["total_base"] or 0.0 for n in navs) if navs else None
+    cashes = [n["cash_base"] for n in navs if n["cash_base"] is not None]
 
     def share(value: float | None) -> float | None:
         return value / total if total and value is not None else None
@@ -302,11 +303,11 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
         row["share"] = share(row["net"])
         rows.append(row)
     rows.sort(key=lambda r: (-abs(r["net"]), r["holding"]))
-    cash = nav["cash_base"] if nav else None
+    cash = sum(cashes) if cashes else None
     return {
         "as_of": as_of,
         "nav": total,
-        "nav_date": nav["report_date"] if nav else None,
+        "nav_date": max(str(n["report_date"]) for n in navs) if navs else None,
         "cash": cash,
         "cash_share": share(cash),
         "rows": rows,
@@ -1667,12 +1668,28 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     The whole map in one payload, rather than a lookup per card. The Trades tab
     asks "has this decision been written up" for every card it draws, and a
     request each would put a network round trip inside a render loop.
+
+    `orphans` are the entries no current decision claims: a campaign can change
+    membership when a fill lands inside its window, and its anchor with it, and
+    a note keyed on the old anchor then matched no card and vanished from the
+    page without a word. Listed so the reader sees the writing and what it was
+    about. Checked against the decisions the Trades tab can draw, options and
+    equities, and not computed at all when nothing has been written.
     """
+    written = journal_entries(conn)
+    live: set[str] = set()
+    if written:
+        for category in ("OPT", EQUITY_CATEGORY):
+            report = build_history(conn, asset_category=category)
+            live |= {c.anchor for c in campaigns_for(conn, category, report.episodes)
+                     if c.anchor}
     return {
         "entries": {
             anchor: entry.payload()
-            for (_broker, _account, anchor), entry in journal_entries(conn).items()
+            for (_broker, _account, anchor), entry in written.items()
         },
+        "orphans": [entry.payload() for entry in journal_orphans(conn, live)]
+        if written else [],
         "triggers": [{"key": key, "label": label}
                      for key, label in JOURNAL_TRIGGERS.items()],
         "adherence": list(JOURNAL_ADHERENCE),

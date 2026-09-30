@@ -266,6 +266,34 @@ def test_a_roll_event_chains_lifecycles_into_one_campaign():
     assert {e["label"] for e in lc["events"]} == {"Short put", "Roll"}
 
 
+def test_a_card_holds_only_its_own_campaigns_orders():
+    """Two positions expiring together: IBKR's expirations share a timestamp, so
+    the Trades tab's event grouping puts them in one event even once the
+    campaigns keep the positions apart. That event was drawn on whichever card
+    its first order led to, so one card carried the other's expiry and the
+    other card had none. An event is split along campaign lines instead."""
+    put_open = _order("1001", "2026-09-01 10:00:00", [_leg(underlying_symbol="SPY")])
+    call_open = _order("1002", "2026-09-20 11:00:00", [
+        _leg(underlying_symbol="SPY", put_call="C", buy_sell="BUY")])
+    put_exp = _order("9001", "2026-10-16 16:20:00", [
+        _leg(underlying_symbol="SPY", buy_sell="BUY", open_close="C")])
+    call_exp = _order("9002", "2026-10-16 16:20:00", [
+        _leg(underlying_symbol="SPY", put_call="C", open_close="C")])
+    orders = [put_open, call_open, put_exp, call_exp]
+    eps = [_Ep("P", ["t1", "t3"], closed=True, closed_at="2026-10-16 16:20:00",
+               pnl=199.0),
+           _Ep("C", ["t2", "t4"], closed=True, closed_at="2026-10-16 16:20:00",
+               pnl=-301.0)]
+    camps = link(eps, order_groups=[("1001",), ("1002",), ("9001",), ("9002",)],
+                 order_of_trade={"t1": "1001", "t2": "1002", "t3": "9001",
+                                 "t4": "9002"})
+    cards = position_groups(orders, episodes=eps, campaign_list=camps)
+    got = {lc["anchor"]: [e["order_ids"] for e in lc["events"]] for lc in cards}
+    assert got == {"1001": [["1001"], ["9001"]], "1002": [["1002"], ["9002"]]}
+    labels = {lc["anchor"]: [e["label"] for e in lc["events"]] for lc in cards}
+    assert labels["1001"] == ["Short put", "Short put close"]
+
+
 def test_grouping_layers_do_not_mutate_the_orders_they_receive():
     """build_state now fetches orders_data() ONCE and hands the same list to
     the flat view, strategy_groups and position_groups. That dedup is only

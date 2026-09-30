@@ -328,14 +328,15 @@ class WithholdingLine:
     def effective_rate(self) -> float | None:
         """Withheld over gross, or None when there is no matching dividend.
 
-        IBKR reports dividends net, so gross is net plus withheld. Withholding
-        on credit interest arrives with no DIVIDEND counterpart, and dividing by
-        the withholding alone would report a meaningless 100%.
+        IBKR's Dividends row IS the gross amount, with the tax withheld as a
+        separate row: 0.8609 IBKR shares at USD 0.0875 is 0.0753, reported as a
+        0.08 dividend beside 0.02 withheld. Dividing by gross plus withheld read
+        a 30% rate as about 23%. Withholding on credit interest arrives with no
+        DIVIDEND counterpart, and dividing by nothing would be meaningless.
         """
-        total = self.gross.base + self.withheld.base
-        if not self.gross.base or not total:
+        if not self.gross.base:
             return None
-        return self.withheld.base / total * 100.0
+        return self.withheld.base / self.gross.base * 100.0
 
 
 # --- the report --------------------------------------------------------------
@@ -613,7 +614,15 @@ def _read_cash(
     ):
         kind = str(row["type"] or "").upper()
         currency = str(row["currency"] or "").upper()
-        # Cost positive, like every other figure here.
+        # SIGNED, and summed with the sign. A refund is a real row: IBKR cancels
+        # a market-data charge with a positive `CANCEL[...]` row of the same
+        # size, reclaims withholding the same way, and reverses a dividend with a
+        # negative one. Taking each row's magnitude booked every reversal as a
+        # further charge (3.89 of EUR market data where the account paid 1.29).
+        # Cost positive, like every other figure here: the sign flips once, on
+        # the charge, and a period refunded more than it paid is a net credit.
+        stated = Charge.of([(row["amount_base"] or 0.0, row["amount"] or 0.0,
+                             currency)])
         charge = Charge.of([(-(row["amount_base"] or 0.0), -(row["amount"] or 0.0),
                              currency)])
 
@@ -621,18 +630,18 @@ def _read_cash(
             name = categorise_fee(row["description"])
             group = fees.setdefault(name, FeeGroup(name=name))
             group.count += 1
-            group.total += abs(charge)
+            group.total += charge
             if len(group.examples) < 3 and row["description"]:
                 group.examples.append(str(row["description"]))
         elif "WITHHOLDING" in kind or "WHTAX" in kind:
             key = str(row["symbol"] or "") or "(non-dividend)"
-            withheld[key] = withheld.get(key, Charge()) + abs(charge)
+            withheld[key] = withheld.get(key, Charge()) + charge
             ccy_of.setdefault(key, currency)
         elif "DIVIDEND" in kind:
             key = str(row["symbol"] or "") or "(unknown)"
-            # A dividend is a credit, so its magnitude is the gross figure the
+            # Income, so read as stated rather than flipped: the gross figure the
             # withholding is a fraction of.
-            dividends[key] = dividends.get(key, Charge()) + abs(charge)
+            dividends[key] = dividends.get(key, Charge()) + stated
             ccy_of.setdefault(key, currency)
 
     report.fees = sorted(fees.values(), key=lambda f: -f.total.base)

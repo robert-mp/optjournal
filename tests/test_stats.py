@@ -196,6 +196,9 @@ def _leg(
     proceeds: float,
     pnl: float | None,
     put_call: str = "P",
+    open_close: str | None = None,
+    notes: str | None = None,
+    expiry: str = "2026-04-17",
 ) -> None:
     """One OPT fill on `conid`, enough for `build_history` to fold into episodes.
 
@@ -208,16 +211,17 @@ def _leg(
         "INSERT INTO trades (broker, trade_id, ib_exec_id, transaction_id,"
         " ib_order_id, account_id, trade_date, date_time, asset_category,"
         " symbol, conid, underlying_symbol, put_call, strike, expiry,"
-        " multiplier, buy_sell, open_close, quantity, trade_price, currency,"
+        " multiplier, buy_sell, open_close, notes, quantity, trade_price, currency,"
         " fx_rate_to_base, proceeds, proceeds_base, ib_commission,"
         " ib_commission_base, fifo_pnl_realized, fifo_pnl_realized_base,"
         " raw, source_file, first_seen_at)"
-        " VALUES ('IBKR',?,?,?,?,'U1',?,?,'OPT',?,?,'SPY',?,500,'2026-04-17',"
-        "100,?,?,?,?,'USD',1.0,?,?,-1.0,-1.0,?,?,'{}','t.xml',"
+        " VALUES ('IBKR',?,?,?,?,'U1',?,?,'OPT',?,?,'SPY',?,500,?,"
+        "100,?,?,?,?,?,'USD',1.0,?,?,-1.0,-1.0,?,?,'{}','t.xml',"
         "'2026-03-02T00:00:00Z')",
         (trade_id, trade_id, trade_id, order_id, at[:10], at,
-         f"SPY  {put_call}{conid}", conid, put_call,
-         "SELL" if qty < 0 else "BUY", "O" if pnl is None else "C",
+         f"SPY  {put_call}{conid}", conid, put_call, expiry,
+         "SELL" if qty < 0 else "BUY",
+         open_close or ("O" if pnl is None else "C"), notes,
          qty, abs(proceeds) / (abs(qty) * 100),
          proceeds, proceeds, pnl, pnl),
     )
@@ -390,3 +394,146 @@ def test_one_strategy_has_no_worst_and_nothing_decided_has_neither():
     assert strategy_ranking([], None) == {"best": None, "worst": None}
     assert strategy_ranking([_lc("Strangle", 5.0, status="open")], None) == \
         {"best": None, "worst": None}
+
+
+def test_account_fees_are_signed_so_a_refund_month_agrees_with_the_costs_tab(conn):
+    """September 2026 on the real account was refunded more than it was charged.
+
+    The Dashboard took the magnitude of the signed sum, so a net CREDIT of 0.01
+    read as a 0.01 charge while the Costs tab (`costs.build_costs`) reported the
+    credit. Both now flip the sign once, on the total.
+    """
+    from optjournal.costs import build_costs
+
+    for tid, day, amount in (("f1", "2026-09-02 13:33:52", 1.30),
+                             ("f2", "2026-09-02 17:34:36", -1.29)):
+        conn.execute(
+            "INSERT INTO cash_transactions (transaction_id, account_id, date_time,"
+            " type, description, amount, currency, fx_rate_to_base, amount_base,"
+            " raw, source_file, first_seen_at)"
+            " VALUES (?, 'U1', ?, 'Other Fees', 'OPRA NP L1', ?, 'EUR', 1.0, ?,"
+            " '{}', 't.xml', 'now')",
+            (tid, day, amount, amount),
+        )
+    s = month_stats(conn, "2026-09")
+    assert s.account_friction_base == pytest.approx(-0.01)
+    assert s.account_friction_base == pytest.approx(
+        build_costs(conn, period="2026-09").unattributable.base)
+
+
+def test_a_reversal_through_zero_scores_the_long_and_the_short_apart(conn):
+    """`pnl/s_cross_zero.py`: long 2 calls, one SELL 3 (`C;O`) realising +198 in
+    September, the leftover short bought back in October for +149.
+
+    Read as one opening sale, September showed no P&L and no outcome, and
+    October one +347 win. The long finished in September, so September has its
+    money and its win; the short is its own decision, decided in October.
+    """
+    _leg(conn, conid="1", order_id="10", at="2026-09-01 10:00:00",
+         qty=2, proceeds=-200.0, pnl=None, put_call="C")
+    _leg(conn, conid="1", order_id="11", at="2026-09-10 10:00:00",
+         qty=-3, proceeds=600.0, pnl=198.0, put_call="C", open_close="C;O")
+    _leg(conn, conid="1", order_id="12", at="2026-10-05 10:00:00",
+         qty=1, proceeds=-50.0, pnl=149.0, put_call="C")
+    september, october = (month_stats(conn, m) for m in ("2026-09", "2026-10"))
+    assert (september.net_pnl.base, september.wins, september.decided_campaigns) == (
+        198.0, 1, 1)
+    assert september.inflight_realized.base == 0.0
+    assert (october.net_pnl.base, october.wins, october.decided_campaigns) == (
+        149.0, 1, 1)
+
+
+def test_expirations_on_one_day_do_not_merge_unrelated_positions(conn):
+    """`pnl/s_expiry_merge.py`: a short put opened 2026-09-01 and a long call
+    opened three weeks later expire together. IBKR books both at 16:20:00 under
+    orders of its own, inside the 90-second window, so the two decisions scored
+    as one -102 loss where they were a +199 win and a -301 loss."""
+    _leg(conn, conid="1", order_id="1001", at="2026-09-01 10:00:00", qty=-1,
+         proceeds=200.0, pnl=None, put_call="P")
+    _leg(conn, conid="2", order_id="1002", at="2026-09-20 11:00:00", qty=1,
+         proceeds=-300.0, pnl=None, put_call="C")
+    _leg(conn, conid="1", order_id="9001", at="2026-10-16 16:20:00", qty=1,
+         proceeds=0.0, pnl=199.0, put_call="P", notes="Ep")
+    _leg(conn, conid="2", order_id="9002", at="2026-10-16 16:20:00", qty=-1,
+         proceeds=0.0, pnl=-301.0, put_call="C", notes="Ep")
+    s = month_stats(conn, None)
+    assert (s.decided_campaigns, s.wins, s.losses) == (2, 1, 1)
+    assert s.net_pnl.base == pytest.approx(-102.0), "the money never moved"
+
+
+def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):
+    """`pnl/s_scope_inflight.py`: a 0DTE short put rolled at 15:55 into the next
+    day's put, which is still open.
+
+    The scoreboard decided a unit by its IN-SCOPE episodes (only the 0DTE leg,
+    closed) while the in-flight figure read the whole campaign (still running),
+    so the same -302 was shown as a decided loss AND as cash inside a position
+    still running. Both now read the campaign the Trades tab draws: open until
+    its last leg closes, and its in-scope cash in flight until then.
+    """
+    from optjournal.stats import odte_scope
+
+    _leg(conn, conid="1", order_id="1", at="2026-09-10 10:00:00", qty=-1,
+         proceeds=200.0, pnl=None, expiry="2026-09-10")
+    _leg(conn, conid="1", order_id="2", at="2026-09-10 15:55:00", qty=1,
+         proceeds=-500.0, pnl=-302.0, expiry="2026-09-10")
+    _leg(conn, conid="2", order_id="3", at="2026-09-10 15:55:00", qty=-1,
+         proceeds=600.0, pnl=None, expiry="2026-09-11")
+    scope = odte_scope(conn)
+    s = month_stats(conn, "2026-09", scope=scope)
+    assert s.net_pnl.base == -302.0
+    assert (s.decided_campaigns, s.losses) == (0, 0)
+    assert s.inflight_realized.base == -302.0
+    assert s.avg_pnl is None
+
+    # The roll's far leg closes the next day: the decision is now finished, and
+    # under the scope its outcome is the in-scope cash, counted once.
+    _leg(conn, conid="2", order_id="4", at="2026-09-11 15:00:00", qty=1,
+         proceeds=-100.0, pnl=498.0, expiry="2026-09-11")
+    s = month_stats(conn, "2026-09", scope=odte_scope(conn))
+    assert (s.decided_campaigns, s.losses, s.inflight_realized.base) == (1, 1, 0.0)
+    assert s.avg_pnl.base == -302.0
+
+
+def test_a_stock_outcome_lands_in_the_month_its_pnl_does(conn):
+    """`pnl/s_two_clocks.py`: a Korean stock sold at 20:03 ET on 31 August, which
+    is 1 September in Seoul, so IBKR's trade date is the 1st.
+
+    Stock P&L follows IBKR's per-fill realisation on the trade date, the month
+    the statement books it in, while the outcome followed the fill's ET stamp: the
+    win landed in August with no P&L and the P&L in September with no win. The
+    outcome now takes the closing fill's trade date, the same clock as its money.
+    """
+    for tid, at, day, oc, qty, pnl in (
+        ("k1", "2026-08-10 21:00:00", "2026-08-11", "O", 10, 0.0),
+        ("k2", "2026-08-31 20:03:00", "2026-09-01", "C", -10, 11.88),
+    ):
+        conn.execute(
+            "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
+            " account_id, trade_date, date_time, asset_category, symbol, conid,"
+            " underlying_symbol, open_close, quantity, trade_price, currency,"
+            " fx_rate_to_base, fifo_pnl_realized, fifo_pnl_realized_base, raw,"
+            " source_file, first_seen_at) VALUES (?,?,?,?,'U1',?,?,'STK',"
+            " '322310.KQ','K1','322310.KQ',?,?,10000,'KRW',0.0006,?,?,'{}','t.xml','now')",
+            (tid, tid, tid, tid, day, at, oc, qty, pnl / 0.0006, pnl),
+        )
+    august, september = (month_stats(conn, m, asset_category="STK")
+                         for m in ("2026-08", "2026-09"))
+    assert (august.net_pnl.base, august.decided_campaigns, august.wins) == (0.0, 0, 0)
+    assert (september.net_pnl.base, september.decided_campaigns,
+            september.wins, september.closed_episodes) == (11.88, 1, 1, 1)
+
+
+def test_net_liquidation_is_every_accounts_newest_summary_summed(conn):
+    """Two accounts' NAV, one a day behind. The panel read one row, so the gain
+    as a share of net liquidation was measured against one account's value."""
+    for day, account, total in (("20260923", "U2", 220.0), ("20260924", "U1", 510.0),
+                                ("20260922", "U1", 400.0)):
+        conn.execute(
+            "INSERT INTO equity_summaries (report_date, account_id, currency,"
+            " cash_base, total_base, raw, source_file, ingested_at)"
+            " VALUES (?, ?, 'EUR', 0, ?, '{}', 't.xml', 'now')", (day, account, total))
+    s = month_stats(conn, None)
+    assert (s.net_liq_base, s.net_liq_date) == (730.0, "2026-09-24")
+    # A period ending before every summary has none, rather than a zero.
+    assert month_stats(conn, "2026-08").net_liq_base is None

@@ -174,7 +174,14 @@ def render_positions(data: list[Row]) -> str:
         return "No option positions. Run `optjournal ingest` first."
 
     total_base = sum(r["position_value_base"] or 0.0 for r in data)
-    total_unreal = sum(r["fifo_pnl_unrealized"] or 0.0 for r in data)
+    # Unrealised P&L arrives in each row's own currency, so it totals per
+    # currency: summing USD and SEK into one "instrument ccy" line printed a
+    # number in neither. The base translation is the one figure spanning them.
+    unreal_by_ccy: dict[str, float] = {}
+    for r in data:
+        ccy = str(r["currency"] or "?")
+        unreal_by_ccy[ccy] = unreal_by_ccy.get(ccy, 0.0) + (r["fifo_pnl_unrealized"] or 0.0)
+    unreal_base = sum((r["unrealized"] or {}).get("base") or 0.0 for r in data)
     out = [f"Option book as of {data[0]['report_date']}"]
     out.append(
         table(
@@ -191,8 +198,10 @@ def render_positions(data: list[Row]) -> str:
         )
     )
     out.append("")
-    out.append(f"  unrealised (instrument ccy) {_money(total_unreal):>14}")
-    out.append(f"  position value (base ccy)   {_money(total_base):>14}")
+    for ccy, amount in sorted(unreal_by_ccy.items()):
+        out.append(f"  {f'unrealised ({ccy})':<28}{_money(amount):>14}")
+    out.append(f"  {'unrealised (base ccy)':<28}{_money(unreal_base):>14}")
+    out.append(f"  {'position value (base ccy)':<28}{_money(total_base):>14}")
     return "\n".join(out)
 
 
