@@ -3087,6 +3087,13 @@ let RGEO=null, RTIMER=null;
    same replay" was the new key compared with itself, always true, and opening a
    second chart while the first played started the second one playing too. */
 let RPKEY=null;
+/* WHERE the running loop stands, unrounded, beside the key it belongs to. The
+   scrubber is integral, so it holds the NEAREST bar, up to half a bar ahead of the
+   drawing, and the two resumes (a redraw while playing, a speed change) used to
+   carry on from it: interrupted in the half bar before a stop, playback started
+   past the stop and never raised its card; interrupted on the last bar, "play at
+   the end" restarted it from 0. Written by the frame loop, read by those resumes. */
+let RPOS=null;
 /* The events a replay can place on the timeline: those carrying a real epoch.
    ONE filter, because two readers must agree about the set -- the geometry
    decides which cards `replaySeek` reveals, and the renderer decides which cards
@@ -3434,18 +3441,17 @@ function bindReplayControls(resume){
      would be describing somewhere the chart no longer is. */
   scrub.oninput=()=>{replayStop();if(play)play.textContent='▶ play';
     replayFocus(null);replaySeek(Number(scrub.value));};
-  if(play) play.onclick=()=>{
-    if(RTIMER!==null){replayStop();play.textContent='▶ play';return;}
-    /* Restart from the beginning when the cursor is already at the end,
-       otherwise pressing play on a finished replay does nothing visible. */
-    if(Number(scrub.value)>=Number(scrub.max)) scrub.value='0';
+  /* The frame loop, from bar `from`: the scrubber's bar on a press, and the
+     loop's own unrounded position (RPOS) when it carries on after a redraw or a
+     speed change. */
+  const run=from=>{
     play.textContent='❚❚ pause';
     /* Pressing play dismisses the parked card. It is the answer to "I have read
        this, continue" -- leaving it up would have it hang over a moving chart
        and describe an instant the replay has left. */
     replayFocus(null);
     const max=Number(scrub.max);
-    let position=Number(scrub.value), last=null;
+    let position=from, last=null;
     /* Bars per millisecond from the LENGTH, so the setting means "this replay in
        REPLAY_SECONDS/speed" rather than "this many ms per bar". A fixed ms/bar
        made 1x take 6s on a strangle and nearly two minutes on the LEAP. */
@@ -3461,15 +3467,17 @@ function bindReplayControls(resume){
        this one" and got back the stop we are parked ON -- play halted instantly
        at the same bar and the replay could never be resumed past its first
        event. Caught by driving the real page, which is why this is the value the
-       test now pins. */
+       test now pins. FLOORED, because a resume starts between bars: at 8.6 the
+       bar playback stands on is 8, and a stop at 9 is still ahead of it. */
     const stops=$('#rstops');
     const halt=(stops&&stops.checked)&&RGEO
-      ?nextStop(RGEO.events||[],RGEO.points,Math.round(position)):null;
+      ?nextStop(RGEO.events||[],RGEO.points,Math.floor(position)):null;
     const tick=(now)=>{
       if(RTIMER===null) return;                    /* stopped mid-frame */
       if(last===null) last=now;
       position+=(now-last)*rate;
       last=now;
+      RPOS=position;
       /* A stop is honoured BEFORE the end check, so an event on the last bar
          parks on its card instead of being overtaken by the finish. */
       if(halt!==null&&position>=halt){
@@ -3504,10 +3512,19 @@ function bindReplayControls(resume){
       RTIMER=requestAnimationFrame(tick);
     };
     /* Armed for THIS replay, beside the timer it belongs to. */
-    RPKEY=S.replay;
+    RPKEY=S.replay; RPOS=position;
     RTIMER=requestAnimationFrame(tick);
   };
-  if(speed) speed.onchange=()=>{ if(RTIMER!==null&&play){play.onclick();play.onclick();} };
+  if(play) play.onclick=()=>{
+    if(RTIMER!==null){replayStop();play.textContent='▶ play';return;}
+    /* Restart from the beginning when the cursor is already at the end,
+       otherwise pressing play on a finished replay does nothing visible. */
+    if(Number(scrub.value)>=Number(scrub.max)) scrub.value='0';
+    run(Number(scrub.value));
+  };
+  /* A new rate from where playback stands: stop the loop and run it again from
+     its own position, which the rate is read at the start of. */
+  if(speed) speed.onchange=()=>{ if(RTIMER!==null&&play){replayStop();run(RPOS);} };
   /* Jump to either end, or to an event. Stops playback first: leaving a timer
      running would have it march away from the position just asked for. The
      annotation cards carry data-rseek too, which makes the strip a table of
@@ -3526,10 +3543,11 @@ function bindReplayControls(resume){
     if(el.getAttribute('role')==='button')
       el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();seek();}};
   });
-  /* Playing when the page redrew under it: carry on from the bar the scrubber
-     held, which `preserveInputs` has already put back. Through `play.onclick`,
-     the one entry point, so the next stop is found from here as on any press. */
-  if(resume&&play) play.onclick();
+  /* Playing when the page redrew under it: carry on from where the loop stood,
+     not from the bar the scrubber held (which `preserveInputs` put back, and which
+     can be half a bar ahead). Through `run`, the one loop, so the next stop is
+     found from here as on any press. */
+  if(resume&&play) run(RPOS);
 }
 
 function replayPanel(rp,label,valueHtml){

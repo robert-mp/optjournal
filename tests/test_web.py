@@ -2252,7 +2252,9 @@ def _bind_replay(resume: bool, key: str = "lc:a") -> dict:
     return _node_run([
         f"import {{barsPerMs, nextStop}} from '{_static('replay.js')}';",
         "let RGEO={points:Array.from({length:10},(_,i)=>[i,1]),events:[]}, RTIMER=null;",
-        "let RPKEY=null;",
+        # A resume carries on from where the loop stood, which for this panel is
+        # the bar it is parked at.
+        "let RPKEY=null, RPOS=3;",
         f"const S={{replay:{json.dumps(key)}}};",
         "let frames=0; const requestAnimationFrame=()=>++frames;",
         "const cancelAnimationFrame=()=>{};",
@@ -2300,6 +2302,82 @@ def test_a_redraw_during_playback_keeps_the_replay_playing():
         "whether it was playing has to be read before the loop is stopped")
     assert "bindReplayControls(replaying!==null&&replaying===S.replay)" in draw
     assert "el.checked=was.checked" in _fn("restoreInputs")
+
+
+def _replay_resume(start: int, bars: int, stops: list[int], stop_on: bool,
+                   interrupt: str) -> dict:
+    """Play the page's real `bindReplayControls` on a clock, interrupt it, run on.
+
+    The clock is a hand-driven `requestAnimationFrame`. Playback starts at `start`
+    and runs until the scrubber READS the bar just short of where it halts (the
+    stop, or the last bar), with the drawing still behind it; then either draw()'s
+    own resume lines run (a redraw) or the speed changes, and playback carries on
+    to wherever it halts. Reports where it halted, the card it raised, and the
+    lowest bar drawn after the interruption.
+    """
+    draw = _fn("draw")
+    capture = re.search(r"^\s*const replaying=.*?;$", draw, re.M)
+    decide = re.search(r"bindReplayControls\(([^;]*)\);", draw)
+    assert capture and decide, "draw() no longer decides whether to resume playback"
+    js = _code_only(_js())
+    consts = [_page_const("REPLAY_SECONDS")] if "const REPLAY_SECONDS=" in js else []
+    target = stops[-1] if stop_on else bars - 1
+    return _node_run([
+        f"import {{barsPerMs, nextStop, indexOfTs}} from '{_static('replay.js')}';",
+        f"let RGEO={{points:Array.from({{length:{bars}}},(_,i)=>[i*3600,1]),",
+        f"  events:{json.dumps([{'ts': s * 3600} for s in stops])}}}, RTIMER=null;",
+        "let RPKEY=null, RPOS=null;",
+        "const S={replay:'lc:a'};",
+        # A real cancel: the stopped loop's queued frame must not run again.
+        "let queue=new Map(), ids=0, now=0;",
+        "const requestAnimationFrame=cb=>{queue.set(++ids,cb);return ids;};",
+        "const cancelAnimationFrame=h=>{queue.delete(h);};",
+        "const frame=dt=>{now+=dt;const q=[...queue.values()];queue.clear();",
+        "  q.forEach(cb=>cb(now));};",
+        f"const scrub={{value:'{start}',max:'{bars - 1}'}}, play={{textContent:'▶ play'}};",
+        "const speed={value:'1'};",
+        f"const box={{'#rscrub':scrub,'#rspeed':speed,'#rstops':{{checked:{json.dumps(stop_on)}}},",
+        "  '#rloop':{checked:false}};",
+        "const $=sel=>box[sel]||null;",
+        "const document={querySelector:()=>play,querySelectorAll:()=>[]};",
+        "let drawn=[], card=null;",
+        "function replaySeek(i){drawn.push(i);} function replayFocus(e){card=e;}",
+        *consts, *_page_fns("replayStop", "bindReplayControls"),
+        "bindReplayControls(false); play.onclick(); frame(0);",
+        # Run until the scrubber reads the bar playback will halt on, while the
+        # drawing is still short of it: the half bar the rounding covers.
+        f"while(!(scrub.value==='{target}'&&drawn[drawn.length-1]<{target})) frame(10);",
+        "const before=drawn[drawn.length-1]; drawn=[];",
+        {"redraw": capture.group(0) + " replayStop(); bindReplayControls("
+                   + decide.group(1) + ");",
+         "speed": "speed.value='2'; speed.onchange();"}[interrupt],
+        "for(let i=0;i<20000&&RTIMER!==null;i++) frame(10);",
+        "console.log(JSON.stringify({before,halted:scrub.value,playing:RTIMER!==null,",
+        "  card:card?card.ts/3600:null,lowest:Math.min(...drawn)}));",
+    ])
+
+
+@pytest.mark.parametrize("interrupt", ["redraw", "speed"])
+def test_playback_resumes_from_where_it_stood_not_from_the_rounded_scrubber(interrupt):
+    """A redraw during playback (the theme chip, the currency toggle, a load()
+    landing, the update probe's answer) and a speed change both carry playback on,
+    and both resumed from the SCRUBBER, which holds the nearest bar: up to half a
+    bar ahead of the drawing. Reproduced in a browser on the real-journal copy, an
+    18-bar replay with stops at 3 and 9: interrupted while the scrubber read 9, it
+    ran to 17 and the "Short call close" card never showed (it halts at 9 when left
+    alone); on a 9-bar replay with stops off, interrupted while the scrubber read
+    the last bar, it jumped back to bar 0, because "play at the end" restarts.
+    Playback now resumes from its own unrounded position.
+    """
+    stop = _replay_resume(start=4, bars=18, stops=[3, 9], stop_on=True,
+                          interrupt=interrupt)
+    assert 8.5 <= stop["before"] < 9
+    assert (stop["halted"], stop["playing"], stop["card"]) == ("9", False, 9), (
+        f"playback ran past the stop it had not reached yet: {stop}")
+    end = _replay_resume(start=2, bars=9, stops=[], stop_on=False, interrupt=interrupt)
+    assert (end["halted"], end["playing"]) == ("8", False)
+    assert end["lowest"] >= end["before"], (
+        f"playback went back to bar {end['lowest']} instead of finishing: {end}")
 
 
 def test_a_second_replay_opened_over_a_playing_one_opens_paused():
