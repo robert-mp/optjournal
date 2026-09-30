@@ -233,8 +233,8 @@ _REPLAY_OK = (
     '<polyline class="pxline" points="1,2 3,4 5,6"/></g>'
     '</svg>' + _REPLAY_CTL
     + '<div class="evs">'
-      '<div class="evc on" data-rts="150" data-rseek="0">opened</div>'
-      '<div class="evc on now" data-rts="280" data-rseek="1">closed</div>'
+      '<div class="evc on" data-rts="150" data-rseek="1">opened</div>'
+      '<div class="evc on now" data-rts="280" data-rseek="2">closed</div>'
       '</div></div>'
 )
 #: The failure this excludes: an axis frame with no line reads as "this trade
@@ -245,11 +245,19 @@ _REPLAY_NO_LINE = _REPLAY_OK.replace(
 #: strip sits blank until the reader happens to touch the scrubber.
 _REPLAY_CARDS_HIDDEN = _REPLAY_OK.replace('class="evc on now"', 'class="evc"').replace(
     'class="evc on"', 'class="evc"')
-#: A card seeking PAST its own event: clicking it would jump the chart to a frame
-#: where the card it was clicked from is not yet revealed.
+#: A card seeking PAST the frame it lights at. A point is stamped at its bar's
+#: close, so the event at 150 is reached at the point stamped 200; seeking to 300
+#: skips the bar it happened in.
 _REPLAY_CARD_MISSEEKS = _REPLAY_OK.replace(
-    '<div class="evc on" data-rts="150" data-rseek="0">',
+    '<div class="evc on" data-rts="150" data-rseek="1">',
     '<div class="evc on" data-rts="150" data-rseek="2">')
+#: A card seeking SHORT of it, to the bar that closed at 100, before its event.
+#: That was the old rule, "the bar containing it" by the bar's open, and it
+#: landed on a frame where the card clicked was dark while the P&L beside it
+#: already counted the fill.
+_REPLAY_CARD_SEEKS_SHORT = _REPLAY_OK.replace(
+    '<div class="evc on" data-rts="150" data-rseek="1">',
+    '<div class="evc on" data-rts="150" data-rseek="0">')
 #: No eff-delta drawn at all, which is right only when no mark carries a delta.
 _REPLAY_NO_DELTA = _REPLAY_OK.replace('<polyline class="dline" points="1,2 3,4"/>', '')
 #: A delta series one bar long, which the page draws as a dot, not a line.
@@ -432,6 +440,12 @@ CASES: list[tuple[str, sweep.Check, Page, Page]] = [
      page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_OK,
           payload=_REPLAY_PAYLOAD),
      page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_CARD_MISSEEKS,
+          payload=_REPLAY_PAYLOAD)),
+    ("an annotation card seeks to a frame where it is lit",
+     sweep.check_replay_renders_from_url,
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_OK,
+          payload=_REPLAY_PAYLOAD),
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_CARD_SEEKS_SHORT,
           payload=_REPLAY_PAYLOAD)),
     ("marks that carry a delta draw an eff-delta series",
      sweep.check_replay_renders_from_url,

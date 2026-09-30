@@ -30,9 +30,12 @@ from datetime import date
 import pytest
 from conftest import connect_migrated
 
-from optjournal import browser, web
-from optjournal.demo import write_demo_statement
+from optjournal import browser, sweep, web
+from optjournal.bars import upsert_bars
+from optjournal.clock import epoch_et
+from optjournal.demo import _UNDERLYING_CONID, write_demo_statement
 from optjournal.ingest import ingest_file
+from optjournal.marketdata import Bar
 
 
 @pytest.fixture(scope="module")
@@ -282,3 +285,80 @@ def test_the_dashboard_renders_the_tiles_the_reader_stored(served, tmp_path):
         )
     finally:
         settings.update(tiles=None)
+
+
+@pytest.fixture(scope="module")
+def replayed(tmp_path_factory):
+    """The demo journal with hourly SPY closes across its same-day 0DTE trade.
+
+    The `served` journal stores no bars, so every replay panel there draws its
+    empty state and nothing about time. Two sessions are enough for the 0DTE
+    (sold 10:02, bought back 15:30 on 2026-01-16): its own, and the one before
+    it that the chart keeps as context. Stamped at each bar's open, as the
+    source stamps them.
+    """
+    root = tmp_path_factory.mktemp("replay")
+    statement = write_demo_statement(root / "demo", root / "demo.db")
+    conn = connect_migrated(root / "demo.db")
+    ingest_file(conn, statement)
+    closes = (690.0, 691.0, 692.5, 691.5, 693.0, 692.0, 692.5)
+    upsert_bars(
+        conn, conid=_UNDERLYING_CONID["SPY"], symbol="SPY", bar_size="1h",
+        source="yahoo",
+        bars=[Bar(ts=epoch_et(f"{day} {hour:02d}:30:00"), open=close, high=close,
+                  low=close, close=close, volume=1)
+              for day in ("2026-01-15", "2026-01-16")
+              for hour, close in zip(range(9, 16), closes, strict=True)],
+    )
+    conn.close()
+    with web.serve_ephemeral(
+        db_path=root / "demo.db", archive_dir=statement.parent,
+    ) as base:
+        yield base
+
+
+def test_a_replay_card_seeks_to_the_frame_that_reveals_its_fill(replayed, tmp_path):
+    """Each event card seeks to the first frame whose reveal uncovers its fill.
+
+    A point is stamped at its bar's close, the instant the bar is priced at, so
+    a fill lies between the previous point and the one its card seeks to. The
+    chart once drew each close at the bar's OPEN while the card sought to the
+    bar holding the fill: the dot sat right of that frame, hidden by the reveal
+    clip, and the card was dark, while the P&L readout already counted the fill.
+    Rendered, because the card's seek, the dot's x and the points' x come from
+    three places in the page and replay.js, and only the browser puts them on
+    one axis.
+    """
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    with urllib.request.urlopen(replayed + "/api/state") as res:
+        payload = json.load(res)
+    key = next(k for k in payload["replays"] if k.endswith("@2026-01-16"))
+    replay = payload["replays"][key]
+    assert replay["bar_size"] == "1h" and len(replay["events"]) == 2, (
+        "the fixture no longer draws the 0DTE hourly, so this proves nothing")
+    dom = browser.dump_dom(f"{replayed}/#tab=trades&replay={key}", tmp_path / "replay")
+    if dom is None:
+        pytest.skip("no browser produced a DOM (environment, not the page)")
+    markup = browser.markup(dom)
+    page = sweep.Page(tab="trades", ccy=None, kind=None, calday=None, replay=key,
+                      dom=dom, markup=markup, text=browser.rendered_text(dom),
+                      payload=payload)
+    verdict = sweep.check_replay_renders_from_url(page)
+    assert verdict.status == sweep.PASS, verdict.detail
+
+    line = re.search(r'class="pxline" points="([^"]*)"', markup)
+    assert line, "no price line drawn"
+    xs = [float(pair.split(",")[0]) for pair in line.group(1).split()]
+    dots = [float(cx) for cx in re.findall(r'<circle class="fill" cx="([\d.]+)"', markup)]
+    assert len(dots) == len(replay["fills"]), "a fill dot is missing"
+    cards = re.findall(r'data-rts="(\d+)" data-rseek="(\d+)"', markup)
+    assert len(cards) == len(replay["events"])
+    for raw_ts, raw_seek in cards:
+        seek, dot = int(raw_seek), dots[replay["fills"].index(int(raw_ts))]
+        # 0.05 of slack for the one-decimal rounding both coordinates carry.
+        assert dot <= xs[seek] + 0.05, (
+            f"the fill at {raw_ts} is right of the frame its card seeks to, so the "
+            "reveal clip still hides it there")
+        assert seek == 0 or dot > xs[seek - 1] + 0.05, (
+            f"the fill at {raw_ts} was already on screen a frame before its card")

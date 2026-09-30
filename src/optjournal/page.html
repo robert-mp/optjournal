@@ -949,7 +949,9 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string|null} label -- the strategy name, or "Open position"
  * @property {string|null} bar_size -- "1h" or "1d"; the panel states which, so a
  *   flat stretch reads as a quiet week rather than a coarser grid
- * @property {Array} points -- [ts, close] pairs of the UNDERLYING, oldest first
+ * @property {Array} points -- [ts, close] pairs of the UNDERLYING, oldest first.
+ *   `ts` is the bar's CLOSE (replay._drawn), the instant it is priced at, and the
+ *   stamp its band row and mark carry: a fill inside a bar is reached at it
  * @property {Array} strikes -- Strike rows, one per distinct contract
  * @property {string|null} opened_at -- null for a snapshot-only contract
  * @property {string|null} closed_at -- null while the position is open
@@ -3061,8 +3063,13 @@ function legRow(l,extra=''){
    is US-listed, so one zone covers it; a non-US underlying would need its own
    exchange zone rather than this constant. */
 const MKT='America/New_York';
+/* A point is stamped at its bar's CLOSE, so an hourly one reads 10:30 through
+   15:30 and then 16:00, and it carries its minutes: an hour alone labelled the
+   11:30 close "11 AM", which beside a card for an 11:10 fill reads as a frame
+   before the fill it already holds. A daily point is 16:00 of its own session,
+   so its date is the day it traded. */
 const rstamp=(ts,size)=>new Date(ts*1000).toLocaleString(undefined,
-  size==='1h'?{timeZone:MKT,month:'short',day:'numeric',hour:'numeric'}
+  size==='1h'?{timeZone:MKT,month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}
              :{timeZone:MKT,year:'2-digit',month:'short',day:'numeric'});
 /* The bar's calendar day at the exchange, for finding session boundaries.
    'en-CA' because it yields YYYY-MM-DD, so string equality is date equality. */

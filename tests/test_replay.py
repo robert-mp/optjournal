@@ -21,7 +21,7 @@ from conftest import add_statement, connect_migrated
 
 from optjournal.bars import upsert_bars
 from optjournal.blackscholes import bs_price
-from optjournal.clock import epoch_et, expiry_epoch
+from optjournal.clock import epoch_et, et_day, expiry_epoch
 from optjournal.marketdata import Bar
 from optjournal.replay import (
     ReplayLeg,
@@ -185,13 +185,14 @@ def test_a_fill_anchors_vol_where_the_source_has_no_history(conn):
     band = expected_move_band(
         conn, [sold], points, underlying_conid="U1", bar_size="1h"
     )
-    assert [row[0] for row in band] == opens[1:], (
+    # Each row is keyed by its bar's close, an hour after the bar opened.
+    assert [row[0] for row in band] == [stamp + 3600 for stamp in opens[1:]], (
         "the band should start at the bar the fill falls in and not before it: "
         "a vol held backwards would price a position that did not exist yet"
     )
     stamp, low, high = band[0]
-    # Read at that bar's close, an hour after its stamp.
-    closes = (expiry_ts - (opens[1] + 3600)) / (365.0 * 86400)
+    # Read at that bar's close, which is the row's stamp.
+    closes = (expiry_ts - stamp) / (365.0 * 86400)
     assert (high - low) / 2 == pytest.approx(spot * vol * (closes ** 0.5), abs=1e-4)
 
 
@@ -200,30 +201,32 @@ def test_delta_around_reports_none_before_a_position_existed(conn):
     "we were delta-neutral" rather than "we were not in the trade" -- and for a
     roll, whose whole point is the exposure it removed, the pair is the number.
     """
-    bars = [epoch_et(f"2026-01-05 {hour}:30:00") for hour in (9, 10, 11)]
-    marks = [[bars[0], 0.0, 0.60], [bars[1], 5.0, 0.40], [bars[2], 9.0, 0.0]]
+    # Hourly marks, each stamped at its bar's close.
+    closes = [epoch_et(f"2026-01-05 {hour}:30:00") for hour in (10, 11, 12)]
+    marks = [[closes[0], 0.0, 0.60], [closes[1], 5.0, 0.40], [closes[2], 9.0, 0.0]]
 
     def around(at: str):
-        return delta_around(marks, epoch_et(f"2026-01-05 {at}"), bar_size="1h")
+        return delta_around(marks, epoch_et(f"2026-01-05 {at}"))
 
     assert around("10:30:00") == (None, 0.60), "an event at the first bar's close"
     assert around("11:30:00") == (0.60, 0.40), "a roll mid-series"
     assert around("09:00:00") == (None, 0.60), "before every mark"
     assert around("13:00:00") == (0.0, None), "after every mark"
-    assert delta_around([], bars[0], bar_size="1h") == (None, None)
+    assert delta_around([], closes[0]) == (None, None)
 
 
 def test_delta_around_reads_a_mark_at_its_bars_close(conn):
-    """A bar's mark is read at its close, so a fill inside the bar is AFTER it.
+    """A bar's mark is stamped at its close, so a fill inside the bar is AFTER it.
 
-    The 10:30 bar closes at 11:30, already holding a 10:35 fill. Compared by its
-    stamp, that mark counted as "before" the fill it contains, and an opening
-    card read the new position's delta on both sides of its arrow.
+    The 10:30 bar closes at 11:30, already holding a 10:35 fill, and its mark is
+    the one stamped 11:30. Compared by the bar's open, that mark counted as
+    "before" the fill it contains, and an opening card read the new position's
+    delta on both sides of its arrow.
     """
-    bars = [epoch_et(f"2026-01-05 {hour}:30:00") for hour in (9, 10, 11)]
-    marks = [[bars[0], 0.0, None], [bars[1], 5.0, 0.32], [bars[2], 9.0, 0.30]]
+    closes = [epoch_et(f"2026-01-05 {hour}:30:00") for hour in (10, 11, 12)]
+    marks = [[closes[0], 0.0, None], [closes[1], 5.0, 0.32], [closes[2], 9.0, 0.30]]
     filled = epoch_et("2026-01-05 10:35:00")
-    assert delta_around(marks, filled, bar_size="1h") == (None, 0.32)
+    assert delta_around(marks, filled) == (None, 0.32)
 
 
 def test_delta_around_carries_an_absent_delta_rather_than_flattening_it(conn):
@@ -235,11 +238,11 @@ def test_delta_around_carries_an_absent_delta_rather_than_flattening_it(conn):
     which on a symmetric axis claims the position ended delta-neutral rather than
     ended.
     """
-    bars = [epoch_et(f"2026-01-05 {hour}:30:00") for hour in (9, 10, 11)]
-    marks = [[bars[0], 0.0, None], [bars[1], 5.0, 0.32], [bars[2], 9.0, None]]
+    closes = [epoch_et(f"2026-01-05 {hour}:30:00") for hour in (10, 11, 12)]
+    marks = [[closes[0], 0.0, None], [closes[1], 5.0, 0.32], [closes[2], 9.0, None]]
     closing, opening = epoch_et("2026-01-05 12:00:00"), epoch_et("2026-01-05 11:00:00")
-    assert delta_around(marks, closing, bar_size="1h") == (0.32, None), "a CLOSING event"
-    assert delta_around(marks, opening, bar_size="1h") == (None, 0.32), "an OPENING event"
+    assert delta_around(marks, closing) == (0.32, None), "a CLOSING event"
+    assert delta_around(marks, opening) == (None, 0.32), "an OPENING event"
 
 
 def test_delta_is_absent_off_position_while_pnl_keeps_reporting(conn):
@@ -288,18 +291,20 @@ def test_delta_is_absent_off_position_while_pnl_keeps_reporting(conn):
     )
     marks = modelled_marks(conn, [leg], points, underlying_conid="U1", bar_size="1d")
     by_ts = {row[0]: row for row in marks}
+    # Each mark is keyed by its bar's close, 16:00 of the session.
+    closes = [epoch_et(f"{day} 16:00:00") for day in days]
 
-    for stamp in opens[:2]:
+    for stamp in closes[:2]:
         assert by_ts[stamp][2] is None, "delta before the opening fill"
-    for stamp in opens[2:4]:
+    for stamp in closes[2:4]:
         assert by_ts[stamp][2], "delta must be reported while the position is held"
-    for stamp in opens[4:]:
+    for stamp in closes[4:]:
         assert by_ts[stamp][2] is None, "delta after the position went flat"
 
     # P&L is present on EVERY bar, including the flat ones, and frozen after the
     # close at what the trade made.
     assert all(row[1] is not None for row in marks), "P&L went missing"
-    closed = [by_ts[stamp][1] for stamp in opens[4:]]
+    closed = [by_ts[stamp][1] for stamp in closes[4:]]
     assert len(set(closed)) == 1, "the realised figure moved after the close"
     assert closed[0] == pytest.approx((3.0 - 1.0) * 100.0), (
         "the frozen figure is not the credit received less the cost to close"
@@ -504,16 +509,15 @@ def test_each_bar_is_priced_at_its_close_and_a_close_is_known_only_after_it(conn
                      closed="2026-01-06 15:50:00")
 
     half = _half(replay["band"])
-    tuesday = [epoch_et(f"2026-01-06 {h}:30:00") for h in range(9, 16)]
-    for stamp in tuesday[:-1]:
-        closes = stamp + 3600
-        assert half[stamp] == pytest.approx(
+    # Tuesday's rows by the close each is keyed at: the 09:30 bar's 10:30 on.
+    for closes in [epoch_et(f"2026-01-06 {h}:30:00") for h in range(10, 16)]:
+        assert half[closes] == pytest.approx(
             spot * 0.30 * ((expiry - closes) / _YEAR) ** 0.5, abs=1e-4
-        ), "a bar before 16:00 used Tuesday's close, or its stamp rather than its close"
+        ), "a bar before 16:00 used Tuesday's close, or its open rather than its close"
     # The 15:30 bar closes at 16:00: the first moment Tuesday's close exists.
-    assert half[tuesday[-1]] == pytest.approx(
-        spot * 0.60 * ((expiry - epoch_et("2026-01-06 16:00:00")) / _YEAR) ** 0.5,
-        abs=1e-4,
+    settles = epoch_et("2026-01-06 16:00:00")
+    assert half[settles] == pytest.approx(
+        spot * 0.60 * ((expiry - settles) / _YEAR) ** 0.5, abs=1e-4,
     )
 
 
@@ -536,13 +540,96 @@ def test_the_settlement_bar_has_a_band_of_no_width_and_a_mark_at_intrinsic(conn)
                                  "2026-01-06 09:45:00", -1, 0.50)],
                      closed="2026-01-06 16:20:00")
 
-    last = epoch_et("2026-01-06 15:30:00")
+    last = epoch_et("2026-01-06 16:00:00")      # the 15:30 bar, at its close
     band = {row[0]: row for row in replay["band"]}
     marks = {row[0]: row for row in replay["marks"]}
     assert band[last][1] == band[last][2] == spot, "a band at settlement"
     assert marks[last][1] == pytest.approx(50.0), (
         "the put expired out of the money, so the trade kept its whole credit"
     )
+
+
+def _reached(stamps: list[int], at: int) -> int:
+    """The page's rule for the frame an event lights at: the first point at or
+    after it (`indexOfTs`, `reachedEvents` in replay.js)."""
+    return next(stamp for stamp in stamps if stamp >= at)
+
+
+def test_a_point_is_stamped_at_the_close_it_is_priced_at(conn):
+    """A point, its band row and its mark carry the instant the bar was priced at.
+
+    The model reads each bar at its close, so a 10:35 sale is already in the
+    10:30 bar's P&L. The payload stamped that bar at 10:30 all the same, and the
+    page reaches an event at the first point stamped at or after it: the sale's
+    card lit, and its dot was revealed, one bar AFTER the readout had started
+    showing its P&L. Stamped at its close, the bar is drawn where its price was
+    printed, and the frame an event lights at is the first frame that holds it.
+    """
+    spot, strike, vol = 100.0, 95.0, 0.30
+    expiry = epoch_et("2026-01-16 16:00:00")
+    days = ["2026-01-05", "2026-01-06", "2026-01-07"]
+    _hourly(conn, "U1", {stamp: close for day in days
+                         for stamp, close in _session(day, [spot] * 7).items()})
+    _daily(conn, days, spot)
+    _closes(conn, "OPT1", strike, "P", expiry, vol, dict.fromkeys(days, spot))
+    sold, bought = "2026-01-06 10:35:00", "2026-01-06 13:10:00"
+
+    def price(at):
+        return bs_price(spot, strike, (expiry - epoch_et(at)) / _YEAR, vol, "P")
+
+    replay = _replay(conn, [
+        _leg("OPT1", strike, "P", "2026-01-16", sold, -1, price(sold)),
+        _leg("OPT1", strike, "P", "2026-01-16", bought, 1, price(bought), marker="C"),
+    ], closed=bought)
+
+    stamps = [stamp for stamp, _close in replay["points"]]
+    assert [stamp for stamp in stamps if et_day(stamp) == "2026-01-06"] == [
+        *(epoch_et(f"2026-01-06 {hour}:30:00") for hour in range(10, 16)),
+        epoch_et("2026-01-06 16:00:00"),
+    ], "a point is stamped at its bar's open rather than at the close it carries"
+    marks = {row[0]: row for row in replay["marks"]}
+    assert marks, "the control: the trade must be modelled at all"
+    assert set(marks) <= set(stamps), "a mark is keyed off the points it is drawn on"
+    assert {row[0] for row in replay["band"]} <= set(stamps), (
+        "a band row is keyed off the points it is drawn on")
+
+    # The frame each fill lights at is the first whose mark holds it.
+    for at, held_before, held_after in ((sold, False, True), (bought, True, False)):
+        reached = _reached(stamps, epoch_et(at))
+        earlier = stamps[stamps.index(reached) - 1]
+        assert (marks[earlier][2] is not None) == held_before, (
+            f"the frame before the {at} fill's card lights already counts it")
+        assert (marks[reached][2] is not None) == held_after, (
+            f"the frame the {at} fill's card lights at does not count it yet")
+    assert marks[_reached(stamps, epoch_et(bought))][1] == pytest.approx(
+        (price(sold) - price(bought)) * 100, abs=0.01)
+
+
+def test_a_daily_point_is_stamped_at_its_sessions_close(conn):
+    """A daily bar closes at 16:00 ET of its own session, whatever it is stamped.
+
+    So the point sits on the day it traded (which is what the axis labels it by),
+    and a fill that session is reached on that session's point rather than on the
+    next morning's.
+    """
+    spot, strike, vol = 100.0, 95.0, 0.30
+    expiry = epoch_et("2026-02-20 16:00:00")
+    days = ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09"]
+    _daily(conn, days, spot)
+    _closes(conn, "OPT1", strike, "P", expiry, vol, dict.fromkeys(days, spot))
+    sold = "2026-01-07 10:15:00"
+    price = bs_price(spot, strike, (expiry - epoch_et(sold)) / _YEAR, vol, "P")
+    replay = _replay(conn, [_leg("OPT1", strike, "P", "2026-02-20", sold, -1, price)])
+
+    assert replay["bar_size"] == "1d"
+    stamps = [stamp for stamp, _close in replay["points"]]
+    assert stamps == [epoch_et(f"{et_day(stamp)} 16:00:00") for stamp in stamps], (
+        "a daily point is not at its session's 16:00 close")
+    assert "2026-01-07" in [et_day(stamp) for stamp in stamps]
+    reached = _reached(stamps, epoch_et(sold))
+    assert et_day(reached) == "2026-01-07", "the sale was reached the next session"
+    marks = {row[0]: row for row in replay["marks"]}
+    assert marks[reached][2] is not None, "the session of the sale does not hold it"
 
 
 @pytest.mark.parametrize(("filled", "spot_then"), [
@@ -573,11 +660,12 @@ def test_a_fill_is_paired_with_the_spot_either_side_of_it(conn, filled, spot_the
     price = bs_price(spot_then, strike, (expiry - at) / _YEAR, vol, "C")
     replay = _replay(conn, [_leg("OPT1", strike, "C", "2026-01-09", filled, -1, price)])
 
-    # The first bar to close after the fill is the first one its vol reaches.
-    row = next(row for row in replay["band"] if row[0] + 3600 >= at)
+    # The first bar to close after the fill is the first one its vol reaches,
+    # and each row is keyed by that close.
+    row = next(row for row in replay["band"] if row[0] >= at)
     bar_spot = {ts: close for ts, close in replay["points"]}[row[0]]
     assert (row[2] - row[1]) / 2 == pytest.approx(
-        bar_spot * vol * ((expiry - (row[0] + 3600)) / _YEAR) ** 0.5, abs=1e-4
+        bar_spot * vol * ((expiry - row[0]) / _YEAR) ** 0.5, abs=1e-4
     ), "the fill was paired with a spot other than the one around it"
 
 
@@ -625,18 +713,21 @@ def test_the_band_measures_to_the_legs_held_at_each_bar(conn):
 
     half = _half(replay["band"])
 
+    def close(day):
+        return epoch_et(f"{day} 16:00:00")      # a daily row is keyed by its close
+
     def want(day, vol, horizon):
-        return spot * vol * ((horizon - epoch_et(f"{day} 16:00:00")) / _YEAR) ** 0.5
+        return spot * vol * ((horizon - close(day)) / _YEAR) ** 0.5
 
     # Before entry nothing is held: both legs are the basis, as they always were.
-    assert half[epoch_et("2026-01-02 09:30:00")] == pytest.approx(
+    assert half[close("2026-01-02")] == pytest.approx(
         want("2026-01-02", 0.40, near), abs=1e-4)
     for day in ("2026-01-05", "2026-01-06"):
-        assert half[epoch_et(f"{day} 09:30:00")] == pytest.approx(
+        assert half[close(day)] == pytest.approx(
             want(day, 0.30, near), abs=1e-4), f"{day}: the call alone was held"
     for day in ("2026-01-07", "2026-01-08", "2026-01-09", "2026-01-12", "2026-01-13"):
-        assert epoch_et(f"{day} 09:30:00") in half, f"{day}: the band vanished with the put held"
-        assert half[epoch_et(f"{day} 09:30:00")] == pytest.approx(
+        assert close(day) in half, f"{day}: the band vanished with the put held"
+        assert half[close(day)] == pytest.approx(
             want(day, 0.50, far), abs=1e-4), f"{day}: measured to a leg rolled away"
 
 
@@ -678,8 +769,8 @@ def test_after_the_close_the_band_measures_to_what_was_last_held(conn):
     assert after, "no context bar after the close to measure"
     for stamp in after:
         assert stamp in half, "the band vanished after the close"
-        settles = stamp + 6.5 * 3600                  # a 09:30 bar's 16:00 close
-        want = spot * 0.50 * ((far - settles) / _YEAR) ** 0.5
+        # A row is keyed by its bar's 16:00 close, which is when it is read.
+        want = spot * 0.50 * ((far - stamp) / _YEAR) ** 0.5
         assert half[stamp] == pytest.approx(want, abs=1e-4), (
             "measured to a leg closed before the position ended")
 
@@ -717,7 +808,7 @@ def test_a_held_leg_the_model_cannot_price_yet_books_neither_its_cash_nor_its_va
     ])
     marks = {row[0]: row for row in replay["marks"]}
 
-    monday = epoch_et("2026-01-05 09:30:00")
+    monday = epoch_et("2026-01-05 16:00:00")      # keyed, and read, at its close
     worth = bs_price(250.0, 270.0, (short - epoch_et("2026-01-05 16:00:00")) / _YEAR,
                      0.30, "C")
     assert marks[monday][1] == pytest.approx((credit - worth) * 100, abs=0.01), (
@@ -729,7 +820,7 @@ def test_a_held_leg_the_model_cannot_price_yet_books_neither_its_cash_nor_its_va
     at = epoch_et("2026-01-06 16:00:00")
     both = (bs_price(250.0, 150.0, (leap - at) / _YEAR, 0.30, "C") - 100.0
             + credit - bs_price(250.0, 270.0, (short - at) / _YEAR, 0.30, "C")) * 100
-    assert marks[epoch_et("2026-01-06 09:30:00")][1] == pytest.approx(both, abs=0.01)
+    assert marks[at][1] == pytest.approx(both, abs=0.01)
 
 
 def _delta(spot, strike, expiry, day, vol, right):
@@ -789,7 +880,7 @@ def test_an_expired_leg_still_held_is_valued_at_its_settlement(conn):
     ])
     marks = {row[0]: row for row in replay["marks"]}
 
-    thursday = epoch_et("2026-01-08 09:30:00")
+    thursday = epoch_et("2026-01-08 16:00:00")    # keyed, and read, at its close
     worth = bs_price(110.0, 100.0, (far - epoch_et("2026-01-08 16:00:00")) / _YEAR,
                      0.30, "C")
     assert marks[thursday][1] == pytest.approx(

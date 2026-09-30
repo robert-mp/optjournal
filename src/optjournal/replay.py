@@ -33,7 +33,10 @@ because a fill in a session's first hour happened next to the open.
 EVERY PRICE IS READ AT ITS CLOSE. A stored bar is stamped at its open and carries
 its close, so the model places it where it was printed (`_closed_at`): the vol a
 bar sees, the fills it holds and the time it has left all run from its close,
-and an option's midnight-stamped daily close is not known until 16:00.
+and an option's midnight-stamped daily close is not known until 16:00. The
+payload is stamped the same way: every point, band row and mark carries that
+close, so the chart draws a price where it was printed and an event inside a
+bar is reached at the bar whose P&L already holds it.
 
 TWO HALVES, ONE CONCERN. Below the arithmetic sits the ASSEMBLY: turning
 lifecycles and position rows into the `replays` map the panel reads -- the strike
@@ -138,6 +141,18 @@ def _closed_at(stamp: int, bar_size: str) -> int:
     an option's close as known from midnight, sixteen hours before it happened.
     """
     return min(stamp + _BAR_SECONDS[bar_size], _session_at(stamp, _SESSION_CLOSE))
+
+
+def _at_close(
+    points: list[tuple[int, float]], bar_size: str
+) -> list[tuple[int, float]]:
+    """Stored ``(stamp, close)`` points, each restamped at its `_closed_at`.
+
+    The one conversion from the source's stamps to the instants this module and
+    the chart work in. Every row the replay emits is keyed this way, so a point,
+    its band row and its mark name one instant, the one the bar was priced at.
+    """
+    return [(_closed_at(stamp, bar_size), close) for stamp, close in points]
 
 
 def _path(
@@ -375,15 +390,16 @@ def expected_move_band(
     bar_size: str,
     vols: dict[str, list[tuple[int, float]]] | None = None,
 ) -> list[list[float]]:
-    """A one-standard-deviation envelope, per underlying bar, keyed by its stamp.
+    """A one-standard-deviation envelope, per underlying bar, keyed by its close.
 
     Spot and time-to-expiry are per BAR, so the envelope moves and tapers hourly;
     the vol input steps daily, because the source serves no intraday option
     history and there is nothing finer to solve against. Each bar is read at its
     CLOSE (see `_closed_at`): its spot is the close, the vol is the latest one
-    observed by then, and the time left runs from then. So the last bar of an
-    expiry session, which closes AT the expiry, is drawn with no width: nothing
-    is left to move.
+    observed by then, and the time left runs from then. That instant is also the
+    row's stamp, the same one the chart's point carries (see `_at_close`). So
+    the last bar of an expiry session, which closes AT the expiry, is drawn with
+    no width: nothing is left to move.
 
     Each bar is measured from its `_basis`, the legs held at that bar: the vol is
     their average and the horizon the NEAREST of their expiries, which is the one
@@ -401,8 +417,7 @@ def expected_move_band(
     if not vols:
         return []
     band: list[list[float]] = []
-    for stamp, spot in points:
-        at = _closed_at(stamp, bar_size)
+    for at, spot in _at_close(points, bar_size):
         basis = _basis(legs, at)
         observed = [
             vol
@@ -416,7 +431,7 @@ def expected_move_band(
         move = 0.0 if at == horizon else expected_move(spot, average, (horizon - at) / _YEAR)
         if move is None:
             continue
-        band.append([stamp, round(spot - move, 4), round(spot + move, 4)])
+        band.append([at, round(spot - move, 4), round(spot + move, 4)])
     return band
 
 
@@ -459,7 +474,7 @@ def modelled_marks(
     bar_size: str,
     vols: dict[str, list[tuple[int, float]]] | None = None,
 ) -> list[list[float | None]]:
-    """Modelled P&L and effective delta per bar: ``[ts, pnl, delta]``.
+    """Modelled P&L and effective delta per bar: ``[close, pnl, delta]``.
 
     P&L is cash flow to date plus the mark-to-market of whatever is still open --
     the standard formulation, and the reason it behaves correctly through a
@@ -470,7 +485,9 @@ def modelled_marks(
 
     Each bar is read at its CLOSE (see `_closed_at`), the instant its price was
     printed: a fill inside the bar is already in the position, the vol is the
-    latest one observed by then, and the time to expiry runs from then.
+    latest one observed by then, and the time to expiry runs from then. The row
+    is stamped at that close too, like the point it is drawn on, so the first
+    mark holding a fill is the first one stamped at or after it.
 
     The PRICING is exact: repricing an option's own close at the vol solved from
     it returns that close to 1e-14, so nothing is approximated in the model
@@ -518,9 +535,9 @@ def modelled_marks(
         )
     if not vols:
         return []
-    closes = [(_closed_at(stamp, bar_size), spot) for stamp, spot in points]
+    closes = _at_close(points, bar_size)
     marks: list[list[float | None]] = []
-    for (stamp, spot), (at, _) in zip(points, closes, strict=True):
+    for at, spot in closes:
         if not any(
             _held_forward(vols.get(leg.conid, []), at) is not None
             for leg, _ in _basis(legs, at)
@@ -572,7 +589,7 @@ def modelled_marks(
         # left to mark IS the trade's result: it is frozen because the trade
         # finished, so the figure is true. Exposure has no such post-close value
         # -- there is nothing to be exposed by -- so it is absent instead.
-        marks.append([stamp, round(pnl, 2), round(delta, 4) if exposed else None])
+        marks.append([at, round(pnl, 2), round(delta, 4) if exposed else None])
     return marks
 
 
@@ -620,7 +637,7 @@ def replay_model(
 
 
 def delta_around(
-    marks: list[list[float | None]], stamp: int, *, bar_size: str
+    marks: list[list[float | None]], stamp: int
 ) -> tuple[float | None, float | None]:
     """Effective delta immediately before and after an event, as ``(before, after)``.
 
@@ -632,9 +649,9 @@ def delta_around(
     ``after`` the first that closed at or after it, so an opening fill correctly
     reports ``None -> 0.56``: there was no position to have a delta, and inventing
     0.0 there would read as "we were delta-neutral" rather than "we were not in
-    the trade". Compared at the close because that is when a mark is read (see
-    `modelled_marks`): the bar a 10:35 fill falls in closes at 11:30 already
-    holding it, so by its stamp it would be "before" a fill it contains.
+    the trade". A mark is stamped at its bar's close (see `modelled_marks`), so
+    the bar a 10:35 fill falls in is the one stamped 11:30, already holding it,
+    and the "after" read here is the frame the page lights the event's card at.
 
     Either side may be None at a window edge, when no bar in the window had a
     solvable vol, or because the neighbouring bar HELD nothing -- `modelled_marks`
@@ -648,7 +665,7 @@ def delta_around(
         row_stamp = row[0]
         if row_stamp is None:
             continue
-        if _closed_at(int(row_stamp), bar_size) < stamp:
+        if row_stamp < stamp:
             before = row[2]
         else:
             after = row[2]
@@ -776,7 +793,7 @@ def _snapshot_leg(row: dict[str, Any]) -> ReplayLeg:
 
 
 def _annotations(
-    lifecycle: dict[str, Any], marks: list[list[float | None]], bar_size: str | None
+    lifecycle: dict[str, Any], marks: list[list[float | None]]
 ) -> list[dict[str, Any]]:
     """One card per EVENT on the timeline: what was done, what it cost, what it changed.
 
@@ -794,8 +811,7 @@ def _annotations(
 
     Delta before and after come from the modelled marks, so a roll states the
     exposure it removed. An OPENING event reports ``None -> x``: there was no
-    position to have a delta. ``bar_size`` is the grid the marks are on, which
-    `delta_around` needs to read each at its close; None only with no marks.
+    position to have a delta.
     """
     out: list[dict[str, Any]] = []
     for event in lifecycle.get("events") or []:
@@ -813,9 +829,7 @@ def _annotations(
             else "close" if markers == {"C"}
             else "open"
         )
-        before, after = (
-            delta_around(marks, stamp, bar_size=bar_size) if bar_size else (None, None)
-        )
+        before, after = delta_around(marks, stamp)
         out.append({
             "ts": stamp,
             "at": str(event.get("first_fill_at") or "")[:16],
@@ -844,6 +858,22 @@ def _annotations(
             "delta_after": after,
         })
     return sorted(out, key=lambda row: row["ts"])
+
+
+def _drawn(points: list[tuple[int, float]], bar_size: str | None) -> list[list[float]]:
+    """The chart's points: each close at the instant it was printed.
+
+    Stamped as the band and the marks are (see `_at_close`), so the chart draws a
+    close where it happened. That is what lets the page read every event with
+    one rule: a fill inside a bar lies between the previous close and this one,
+    so its dot is revealed, its card lit and its fill counted in the P&L readout
+    on the same frame. Stamped at the bar's open, the P&L counted it one bar
+    before the card and the dot appeared. ``bar_size`` is None only when no bar
+    is stored, and then there is nothing to draw.
+    """
+    if bar_size is None:
+        return []
+    return [[at, close] for at, close in _at_close(points, bar_size)]
 
 
 def attach(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
@@ -901,7 +931,7 @@ def attach(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "underlying": lifecycle.get("underlying"),
             "label": lifecycle.get("label"),
             "bar_size": bars.bar_size,
-            "points": [[ts, close] for ts, close in bars.points],
+            "points": _drawn(bars.points, bars.bar_size),
             "strikes": _strikes_of(replay_legs),
             "opened_at": opened,
             "closed_at": closed,
@@ -918,7 +948,7 @@ def attach(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             # cannot disagree about what the market charged for a contract.
             "band": band,
             "marks": marks,
-            "events": _annotations(lifecycle, marks, bars.bar_size),
+            "events": _annotations(lifecycle, marks),
         }
         lifecycle["replay_key"] = key
 
@@ -951,7 +981,7 @@ def attach(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             "underlying": row.get("underlying_symbol"),
             "label": "Open position",
             "bar_size": bars.bar_size,
-            "points": [[ts, close] for ts, close in bars.points],
+            "points": _drawn(bars.points, bars.bar_size),
             # A snapshot row has no fills, so its side comes from the signed
             # position and its window stays unknown -- drawn full width.
             "strikes": _strikes_of(legs),

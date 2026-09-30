@@ -275,13 +275,41 @@ test("band edges pair upper with lower at the same x", () => {
   assert.ok(upper[0][1] < lower[0][1], "the upper edge is not above the lower");
 });
 
-test("an event maps to the bar that contains it, not the nearest one", () => {
-  // A fill at 1900 sits inside the bar stamped 1000 (which spans 1000-2000).
-  // Nearest-bar rounding would call it bar 1 and place it after later bars.
-  assert.equal(indexOfTs(PRICE, 1900), 0);
-  assert.equal(indexOfTs(PRICE, 2000), 1, "a fill exactly on a bar is that bar");
-  assert.equal(indexOfTs(PRICE, 500), 0, "before the first bar clamps to it");
-  assert.equal(indexOfTs(PRICE, 99999), 2, "after the last bar clamps to it");
+test("an event maps to the first bar that closes at or after it", () => {
+  // A point is stamped at its bar's CLOSE, so a fill at 1100 happened inside the
+  // bar that closed at 2000 and is in that bar's P&L. Its own bar is the first
+  // close after it, not the last one before it (that bar closed without it) and
+  // not the nearest one (1000 is nearer, and it closed first).
+  assert.equal(indexOfTs(PRICE, 1100), 1);
+  assert.equal(indexOfTs(PRICE, 1900), 1);
+  assert.equal(indexOfTs(PRICE, 2000), 1, "a fill exactly at a close is that bar's");
+  assert.equal(indexOfTs(PRICE, 2001), 2);
+  assert.equal(indexOfTs(PRICE, 500), 0, "before the first close clamps to it");
+  assert.equal(indexOfTs(PRICE, 99999), 2, "after the last close clamps to it");
+  assert.equal(indexOfTs(PRICE, null), 0);
+  assert.equal(indexOfTs([], 1500), 0);
+});
+
+test("a card seeks to the frame it lights at, and its dot is drawn by then", () => {
+  /* The three readings of one event have to land on one frame: the card the
+     strip lights (reachedEvents), the frame a click on it seeks to (indexOfTs),
+     and the dot the reveal clip uncovers. The card used to seek to the bar
+     BEFORE its close, a frame where the card was dark and the dot still hidden
+     while the P&L beside them already counted the fill. */
+  const geo = geometry();
+  const state = { points: PRICE, marks: [], xs: geo.xs };
+  for (const ts of [500, 1000, 1100, 1900, 2000, 2400, 3000]) {
+    const seek = indexOfTs(PRICE, ts);
+    const frame = frameAt(state, seek);
+    assert.deepEqual(reachedEvents([{ ts }], frame.ts), [ts],
+                     `the card for ${ts} is dark on the frame it seeks to`);
+    assert.ok(geo.at(ts).x <= frame.revealWidth,
+              `the dot for ${ts} is hidden on the frame its card seeks to`);
+    if (seek > 0) {
+      assert.deepEqual(reachedEvents([{ ts }], frameAt(state, seek - 1).ts), [],
+                       `the card for ${ts} was already lit a frame earlier`);
+    }
+  }
 });
 
 test("an event is reached only once the replay passes it", () => {
@@ -405,9 +433,23 @@ test("playback stops on the bar an event's own card seeks to", () => {
   // The pause and the annotation must agree, or the replay halts a bar away
   // from the card it is halting FOR. indexOfTs is the single source of both.
   const events = [{ ts: 1900 }, { ts: 2500 }];
-  assert.equal(nextStop(events, PRICE, -1), indexOfTs(PRICE, 1900));
-  assert.equal(nextStop(events, PRICE, 0), indexOfTs(PRICE, 2500),
+  const first = nextStop(events, PRICE, -1);
+  assert.equal(first, indexOfTs(PRICE, 1900));
+  assert.equal(nextStop(events, PRICE, first), indexOfTs(PRICE, 2500),
                "a stop already standing on was not passed");
+});
+
+test("playback halts on a frame where the event it halts for is lit", () => {
+  /* The overlay raised at a stop describes the event, and the strip below it has
+     to agree: a halt one bar short of the close that holds the fill parked the
+     chart on a frame whose card was still dark. */
+  const events = [{ ts: 1500 }, { ts: 2500 }];
+  let at = -1;
+  for (const ts of [1500, 2500]) {
+    at = nextStop(events, PRICE, at);
+    assert.ok(reachedEvents(events, PRICE[at][0]).includes(ts),
+              `halted on bar ${at}, where the event at ${ts} is not reached`);
+  }
 });
 
 test("a stop is exclusive of where playback already stands", () => {

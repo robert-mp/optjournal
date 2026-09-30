@@ -685,13 +685,21 @@ def check_replay_renders_from_url(p: Page) -> Verdict:
     for (raw_ts, raw_seek), event in zip(cards, events, strict=False):
         if int(raw_ts) != event["ts"]:
             return bad(f"card timestamp {raw_ts} does not match event {event['ts']}")
-        # A card seeks to the bar CONTAINING its event. Landing past the event
-        # would jump the chart to a frame where the card is not yet revealed.
+        # A card seeks to the frame it lights at: the first point stamped at or
+        # after its event. A point carries its bar's close, so that is the bar
+        # the event happened in, and the first whose P&L holds it. Short of it
+        # the card is dark while the readout beside it already counts the fill;
+        # past it the chart skips the bar the event happened in.
         seek = int(raw_seek)
-        if not 0 <= seek < len(replay["points"]):
-            return bad(f"card seeks to bar {seek}, outside {len(replay['points'])} bars")
-        if replay["points"][seek][0] > event["ts"]:
-            return bad(f"card for {event['at']} seeks past its own event")
+        points = replay["points"]
+        if not 0 <= seek < len(points):
+            return bad(f"card seeks to bar {seek}, outside {len(points)} bars")
+        if points[seek][0] < event["ts"]:
+            return bad(f"card for {event['at']} seeks to a bar that closed before "
+                       "its event, where the card is not lit")
+        if seek and points[seek - 1][0] >= event["ts"]:
+            return bad(f"card for {event['at']} seeks past the bar its event "
+                       "is reached at")
     # Revealed on open. The strip renders hidden and bindReplayControls syncs it,
     # so a missing sync leaves every card invisible with the scrubber at the end.
     if events and p.markup.count('class="evc on') != len(events):
