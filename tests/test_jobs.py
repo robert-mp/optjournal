@@ -1143,6 +1143,7 @@ def _due(now, **kw):
 
     kw.setdefault("claimed", {})
     kw.setdefault("last_poll", {})
+    kw.setdefault("last_try", {})
     kw.setdefault("ever_ran", {job.name for job in JOBS})
     return due_jobs(now, **kw)
 
@@ -1367,7 +1368,7 @@ def test_the_repeated_hour_at_the_dst_fall_back_cannot_fire_twice():
 
     stamps = set()
     for probe in (early, late, datetime(2026, 10, 25, 3, 0, tzinfo=dublin)):
-        found = due_jobs(probe, claimed={}, last_poll={},
+        found = due_jobs(probe, claimed={}, last_poll={}, last_try={},
                          ever_ran={"market"}, registry=(nightly,))
         stamps |= {d.fired_for for d in found}
     assert len(stamps) == 1, (
@@ -1399,7 +1400,7 @@ def test_a_schedule_in_the_missing_spring_forward_hour_still_runs():
     )
     # Mid-morning on the spring-forward day: the 01:30 slot is behind us.
     found = due_jobs(datetime(2026, 3, 29, 9, 0, tzinfo=dublin),
-                     claimed={}, last_poll={}, ever_ran={"market"},
+                     claimed={}, last_poll={}, last_try={}, ever_ran={"market"},
                      registry=(nightly,))
     assert found, (
         "a schedule inside the missing hour produced no due instant, so that day "
@@ -1911,7 +1912,7 @@ def test_replacing_the_registry_actually_reaches_due_jobs(monkeypatch):
         minute=0, hour=0, weekdays=(1, 2, 3, 4, 5, 6, 7), zone="Europe/Dublin",
     )
     monkeypatch.setattr(mod, "JOBS", (only,))
-    found = mod.due_jobs(datetime.now(UTC), claimed={}, last_poll={},
+    found = mod.due_jobs(datetime.now(UTC), claimed={}, last_poll={}, last_try={},
                          ever_ran={"market"})
     assert [d.job.hour for d in found] == [0], (
         f"due_jobs ignored the replaced registry and used the import-time one: "
@@ -2268,12 +2269,13 @@ def test_a_window_job_that_found_nothing_is_still_braked(conn):
     conn.execute("UPDATE job_runs SET finished_at = ? WHERE job = 'confirm'", (stamp,))
     conn.commit()
 
-    _claimed, last_poll, ever_ran, _failures = _ledger_snapshot(conn)
+    _claimed, last_poll, _last_try, ever_ran, _failures = _ledger_snapshot(conn)
     assert "confirm" in last_poll, (
         "a completed-but-empty run did not register as a poll, so the window brake "
         "has nothing to measure against"
     )
-    due = due_jobs(now, claimed={}, last_poll=last_poll, ever_ran=ever_ran)
+    due = due_jobs(now, claimed={}, last_poll=last_poll, last_try={},
+                   ever_ran=ever_ran)
     assert "confirm" not in [d.job.name for d in due], (
         "a window job polled three minutes ago is due again, so it fires every tick"
     )
@@ -2297,9 +2299,10 @@ def test_a_window_job_that_failed_is_not_braked(conn):
     conn.execute("UPDATE job_runs SET finished_at = ? WHERE job = 'confirm'", (stamp,))
     conn.commit()
 
-    _claimed, last_poll, ever_ran, _failures = _ledger_snapshot(conn)
+    _claimed, last_poll, _last_try, ever_ran, _failures = _ledger_snapshot(conn)
     assert "confirm" not in last_poll, "a failed run braked the window"
-    due = due_jobs(now, claimed={}, last_poll=last_poll, ever_ran=ever_ran)
+    due = due_jobs(now, claimed={}, last_poll=last_poll, last_try={},
+                   ever_ran=ever_ran)
     assert "confirm" in [d.job.name for d in due], (
         "a failed poll sits out the whole window instead of retrying"
     )
@@ -2314,7 +2317,7 @@ def test_the_history_import_is_never_due():
     start = datetime(2026, 1, 1, tzinfo=UTC)
     for hour in range(0, 24 * 14, 5):
         now = start + timedelta(hours=hour)
-        due = due_jobs(now, claimed={}, last_poll={}, ever_ran={"history"})
+        due = due_jobs(now, claimed={}, last_poll={}, last_try={}, ever_ran={"history"})
         assert "history" not in [d.job.name for d in due], f"history due at {now}"
 
 
@@ -2344,3 +2347,212 @@ def test_the_history_import_without_a_query_id_fails_with_the_cause(
     ctx = jobs.Context(archive_dir=tmp_path, db_path=tmp_path / "j.db")
     outcome = jobs._history(None, ctx)
     assert outcome.status == "failed" and "query id" in outcome.detail
+
+
+# --------------------------------------------------------------------------
+# A run that did not do its work gives its instant back (M11, M12).
+#
+# The claim-before-work rule exists so a broker request is never spent twice for
+# one instant. It was applied to every job and every outcome, so a `market` run
+# that failed on the first tick after a wake (DNS not up yet) used up the day,
+# although it spends no IBKR request and costs nothing to retry. And a sync that
+# only waited out the shared fetch lock recorded `failed` and kept the day's slot,
+# though it never asked IBKR anything.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    """Freeze `jobs`' own clock to a value the test moves.
+
+    `started_at` and `finished_at` are stamped with `datetime.now(UTC)` inside the
+    runner, and the retry delay is measured from them, so a simulated day needs the
+    runner to live in simulated time too.
+    """
+    from datetime import UTC, datetime
+
+    from optjournal import jobs as mod
+
+    now = {"t": datetime(2026, 1, 1, tzinfo=UTC)}
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return now["t"] if tz is None else now["t"].astimezone(tz)
+
+    monkeypatch.setattr(mod, "datetime", _Frozen)
+    return now
+
+
+def test_a_failed_run_of_a_job_that_spends_no_request_gives_its_instant_back(
+    conn, ctx, monkeypatch
+):
+    """M11: `market` failing does not use up its day, so a retry can claim it."""
+    from optjournal.jobs import Outcome, run_job
+
+    instant = 1786310000
+    _stub(monkeypatch, "market", lambda _c, _x: Outcome(
+        "failed", "URLError: nodename nor servname provided"))
+    run_job(conn, "market", ctx=ctx, fired_for=instant)
+    row = conn.execute("SELECT status, fired_for FROM job_runs").fetchone()
+    assert row["status"] == "failed"
+    assert row["fired_for"] is None, (
+        "a failed run of a job that spends no IBKR request kept its instant, so "
+        "the day is used up by a DNS hiccup"
+    )
+
+    _stub(monkeypatch, "market", lambda _c, _x: Outcome("ok", "fetched"))
+    run_job(conn, "market", ctx=ctx, fired_for=instant)      # the retry may claim it
+    assert conn.execute(
+        "SELECT status FROM job_runs WHERE fired_for = ?", (instant,)
+    ).fetchone()["status"] == "ok"
+
+
+def test_a_failed_sync_keeps_its_instant_because_it_may_have_spent_a_request(
+    conn, ctx, monkeypatch
+):
+    """The other side: `sync` may not be made due again by a mere failure."""
+    from optjournal.jobs import JobBusy, run_job
+
+    def keychain(_c, _x):
+        raise RuntimeError("Can't get password from keychain")
+
+    instant = 1786310000
+    _stub(monkeypatch, "sync", keychain)
+    with pytest.raises(RuntimeError):
+        run_job(conn, "sync", ctx=ctx, fired_for=instant)
+    assert conn.execute("SELECT fired_for FROM job_runs").fetchone()[0] == instant
+    with pytest.raises(JobBusy):
+        run_job(conn, "sync", ctx=ctx, fired_for=instant)
+
+
+def test_a_given_back_instant_is_retried_after_a_delay_not_on_the_next_tick():
+    """Due again, but only once `RETRY_AFTER_S` has passed since the attempt."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import RETRY_AFTER_S
+
+    # Wednesday 13:00 Dublin: `market`'s 11:00 instant is unclaimed, and a run
+    # happened after it, so that run gave the instant back.
+    now = datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    epoch = int(now.timestamp())
+    soon = _due(now, last_try={"market": epoch - 60})
+    assert "market" not in _names(soon), "a given-back instant retried on the next tick"
+    later = _due(now, last_try={"market": epoch - RETRY_AFTER_S})
+    assert "market" in _names(later), "a given-back instant was never retried"
+    reason = next(d.reason for d in later if d.job.name == "market")
+    assert "retry" in reason
+
+
+def test_the_first_tick_after_a_wake_failing_does_not_cost_the_day(
+    conn, ctx, clock, monkeypatch
+):
+    """M11 end to end, as `evidence/jobs/v3_wake_tick.py` measured it.
+
+    The laptop wakes at 13:00 Dublin, the tick runs while DNS is still down and
+    `market` fails; the network is up a minute later. Before the fix no further
+    run happened that day, which the real ledger shows for `market` (567, 576,
+    579) and `bars_daily` (560, 569, 580, 758).
+    """
+    from datetime import UTC, datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from optjournal import jobs as mod
+
+    wake = datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+
+    def market(_c, _x):
+        if clock["t"] < wake + timedelta(seconds=30):
+            return mod.Outcome("failed", "URLError: nodename nor servname provided")
+        return mod.Outcome("ok", "5 fetched, 5 stored", 5, 5)
+
+    _stub(monkeypatch, "market", market)
+    monkeypatch.setattr(mod, "JOBS", tuple(j for j in mod.JOBS if j.name == "market"))
+    mod.record_run(conn, "market", status="ok", started_at="2026-08-11T10:00:00+00:00")
+
+    for minute in range(60):
+        clock["t"] = (wake + timedelta(minutes=minute)).astimezone(UTC)
+        mod.reconcile(conn, ctx=ctx, now=clock["t"])
+
+    instant = int(wake.replace(hour=11).timestamp())
+    runs = [tuple(r) for r in conn.execute(
+        "SELECT status, fired_for FROM job_runs WHERE started_at > '2026-08-12'"
+        " ORDER BY id")]
+    assert runs == [("failed", None), ("ok", instant)], (
+        f"expected one failure and one retry that serves the 11:00 instant; got {runs}"
+    )
+    retry = conn.execute(
+        "SELECT started_at FROM job_runs WHERE fired_for = ?", (instant,)).fetchone()[0]
+    assert retry == (wake + timedelta(seconds=mod.RETRY_AFTER_S)).astimezone(
+        UTC).isoformat(timespec="seconds")
+
+
+def _hold_fetch_lock_briefly(monkeypatch):
+    """The real fetch path, with the lock wait cut from 120s to none at all.
+
+    Everything past the lock is blocked outright, so a test that got the lock by
+    mistake fails loudly instead of reaching the keyring or IBKR.
+    """
+    from optjournal import flex, locks
+
+    def blocked(*_a, **_k):
+        raise AssertionError("got past the fetch lock: keyring/IBKR must not be reached")
+
+    monkeypatch.setattr(flex, "read_token", blocked)
+    monkeypatch.setattr(flex, "_client_factory", blocked)
+    monkeypatch.setattr(flex, "locked", lambda path: locks.locked(path, timeout_s=0))
+
+
+def test_waiting_out_the_fetch_lock_is_busy_and_gives_the_sync_its_slot_back(
+    conn, ctx, monkeypatch
+):
+    """M12: a sync that never asked IBKR is not a failure and keeps no slot.
+
+    Another holder (the page's Sync button, or a history chunk mid-generation) had
+    `raw/.fetch.lock`. The scheduled sync used to record `failed`, count toward the
+    backoff, and keep the day's instant, so the noon sync was lost to contention.
+    """
+    from optjournal import flex, locks
+    from optjournal.jobs import run_job
+
+    _hold_fetch_lock_briefly(monkeypatch)
+    instant = 1786310000
+    with locks.locked(ctx.archive_dir / flex.FETCH_LOCK):
+        run_job(conn, "sync", ctx=ctx, fired_for=instant)
+    row = conn.execute("SELECT status, detail, fired_for FROM job_runs").fetchone()
+    assert row["status"] == "nothing", f"a lock wait was recorded {row['status']!r}"
+    assert row["detail"].startswith("busy:")
+    assert row["fired_for"] is None, "a sync that never asked IBKR kept the day's slot"
+    assert conn.execute(
+        "SELECT consecutive_failures FROM job_state WHERE job='sync'"
+    ).fetchone()[0] == 0, "a lock wait counted toward the backoff"
+
+
+def test_waiting_out_the_fetch_lock_is_busy_for_the_confirm_poll_too(
+    conn, ctx, monkeypatch
+):
+    from conftest import add_statement
+
+    from optjournal import flex, jobs, locks
+
+    _hold_fetch_lock_briefly(monkeypatch)
+    monkeypatch.setattr(jobs.prefs, "confirm_query_id", lambda *a, **k: "1621016")
+    add_statement(conn)
+    conn.commit()
+    with locks.locked(ctx.archive_dir / flex.FETCH_LOCK):
+        jobs.run_job(conn, "confirm", ctx=ctx)
+    row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
+    assert (row["status"], row["detail"][:5]) == ("nothing", "busy:")
+
+
+def test_a_manual_sync_that_waited_out_the_fetch_lock_reads_busy_too(conn):
+    """One mapping for the page's Sync button, the CLI and the job."""
+    from optjournal.jobs import record_manual_sync, sync_outcome
+    from optjournal.locks import LockTimeout
+
+    held = LockTimeout("another process held .fetch.lock for more than 120s.")
+    assert sync_outcome(held).status == "nothing"
+    record_manual_sync(conn, held)
+    row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
+    assert (row["status"], row["detail"][:5]) == ("nothing", "busy:")
