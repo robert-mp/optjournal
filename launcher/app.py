@@ -12,11 +12,15 @@ The loop, once per start and again after every update:
 2. `optjournal prepare`: move a journal home (see `optjournal.install`).
 3. `optjournal serve`, until it exits. Exit code `RESTART` means "an update or
    an import is waiting, start me again"; anything else ends the loop.
+
+Both run as `uv run --frozen`, so a start never rewrites `uv.lock`.
 """
 
 from __future__ import annotations
 
+import http.client
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -80,12 +84,31 @@ def apply_staged(root: Path = ROOT) -> str | None:
     return version
 
 
-def _listening(timeout_s: float = 0.3) -> bool:
+def _whats_on(port: int = PORT, timeout_s: float = 2.0) -> str | None:
+    """What answers on `port`: "optjournal", "other", or None when nothing does.
+
+    Asked of the page itself, whose title names the app, rather than taken from
+    an open port: other programs listen on 8765 too (AnkiConnect's default), and
+    a browser opened at one of them shows a stranger's page or an error.
+    `tests/test_updates.py` pins this against the real server.
+    """
     try:
-        with socket.create_connection((HOST, PORT), timeout=timeout_s):
-            return True
+        with socket.create_connection((HOST, port), timeout=0.3):
+            pass
     except OSError:
-        return False
+        return None
+    # `http.client` rather than `urlopen`, which would send a loopback request
+    # through any proxy set in the environment.
+    conn = http.client.HTTPConnection(HOST, port, timeout=timeout_s)
+    try:
+        conn.request("GET", "/")
+        head = conn.getresponse().read(8192).decode("utf-8", "replace")
+    except (OSError, http.client.HTTPException):
+        return "other"
+    finally:
+        conn.close()
+    title = re.search(r"<title>([^<]*)</title>", head)
+    return "optjournal" if title and "optjournal" in title.group(1) else "other"
 
 
 def _open_when_ready(proc: subprocess.Popen[bytes], limit_s: float = 120) -> None:
@@ -93,7 +116,7 @@ def _open_when_ready(proc: subprocess.Popen[bytes], limit_s: float = 120) -> Non
     environment and can take a minute, so this waits rather than guessing."""
     deadline = time.monotonic() + limit_s
     while time.monotonic() < deadline and proc.poll() is None:
-        if _listening():
+        if _whats_on() == "optjournal":
             webbrowser.open(URL)
             return
         time.sleep(0.5)
@@ -104,29 +127,37 @@ def main() -> int:
     if not uv:
         print("uv was not found. Start optjournal with its Start file.")
         return 1
-    if _listening():
+    on_port = _whats_on()
+    if on_port == "optjournal":
         print(f"optjournal is already running. Opening {URL}")
         webbrowser.open(URL)
         return 0
+    if on_port == "other":
+        print(f"Port {PORT} is in use by another program, not optjournal, so "
+              "optjournal cannot start. Close that program and start optjournal again.")
+        return 1
     print("Starting optjournal. Keep this window open while you use it;")
     print("close it to stop optjournal.\n")
     env = {**os.environ, "OPTJOURNAL_SUPERVISED": "1"}
+    # `--frozen` on every run: install exactly the `uv.lock` that shipped. A run
+    # that re-locked would leave a modified tracked file in a git clone, which
+    # `optjournal update` then refuses as uncommitted work.
+    app = [uv, "run", "--frozen", "--no-dev", "optjournal"]
     first = True
     while True:
-        version = apply_staged()
+        version = apply_staged(ROOT)
         if version:
             print(f"Updated to version {version}.")
-        subprocess.run([uv, "run", "--no-dev", "optjournal", "prepare"], cwd=ROOT, env=env,
-                       check=False)
-        proc = subprocess.Popen([uv, "run", "--no-dev", "optjournal", "serve",
-                                 "--port", str(PORT)],
-                                cwd=ROOT, env=env)
-        if first:
-            _open_when_ready(proc)
-            first = False
+        subprocess.run([*app, "prepare"], cwd=ROOT, env=env, check=False)
+        proc = subprocess.Popen([*app, "serve", "--port", str(PORT)], cwd=ROOT, env=env)
         try:
+            if first:
+                first = False
+                _open_when_ready(proc)
             code = proc.wait()
         except KeyboardInterrupt:
+            # Ctrl+C reaches the server too, which stops on its own: wait for it,
+            # including during the first start's wait for the page.
             code = proc.wait()
         if code != RESTART:
             return code

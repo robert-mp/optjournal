@@ -9,9 +9,15 @@ changed at all.
 
 from __future__ import annotations
 
+import http.server
 import importlib.util
 import io
+import json
+import socket
+import sys
+import threading
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -140,25 +146,49 @@ def test_an_interrupted_download_is_discarded_not_applied(tmp_path):
     assert not (root / updates.STAGING).exists()
 
 
-def test_a_failed_swap_puts_the_old_code_back(tmp_path, monkeypatch, supervised):
-    root = _install(tmp_path)
+def _code(root: Path) -> dict[str, bytes | None]:
+    """Everything in `root` but the swap's own two folders, by relative path."""
+    return {p.relative_to(root).as_posix(): p.read_bytes() if p.is_file() else None
+            for p in sorted(root.rglob("*"))
+            if not p.relative_to(root).parts[0].startswith((".update-",))}
+
+
+def test_a_swap_that_fails_at_any_step_puts_the_old_code_back(
+        tmp_path, monkeypatch, supervised):
+    """Every rename of the swap is made to fail in turn, and each time the install
+    must be exactly the old version, with nothing left stranded mid-swap."""
     monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball())
-    updates.stage(_release(), root=root)
     launcher = _launcher()
     real = launcher.os.replace
-    calls = {"n": 0}
+    steps = {"n": 0}
 
-    def flaky(src, dst):
-        calls["n"] += 1
-        if calls["n"] == 4:          # partway through the second entry
-            raise OSError("file in use")
+    def counting(src, dst):
+        steps["n"] += 1
         return real(src, dst)
 
-    monkeypatch.setattr(launcher.os, "replace", flaky)
-    assert launcher.apply_staged(root) is None
-    assert updates.current_version(root) == "0.1.0"
-    assert (root / "src" / "optjournal" / "old.py").exists()
-    assert (root / "journal.db").read_bytes() == b"my trades"
+    counted = _install(tmp_path / "counted")
+    updates.stage(_release(), root=counted)
+    monkeypatch.setattr(launcher.os, "replace", counting)
+    assert launcher.apply_staged(counted) == "0.2.0"
+    total, steps["n"] = steps["n"], 0
+    assert total >= 4
+
+    for failing in range(1, total + 1):
+        root = _install(tmp_path / f"fail-{failing}")
+        before = _code(root)
+        updates.stage(_release(), root=root)
+
+        def flaky(src, dst, failing=failing):
+            steps["n"] += 1
+            if steps["n"] == failing:
+                raise OSError("file in use")
+            return real(src, dst)
+
+        steps["n"] = 0
+        monkeypatch.setattr(launcher.os, "replace", flaky)
+        assert launcher.apply_staged(root) is None, failing
+        assert _code(root) == before, f"step {failing} of {total} left a mixed install"
+        assert not list((root / launcher.OLD).glob("*")), "old code stranded in .update-old"
 
 
 @pytest.mark.parametrize(("latest", "available"), [("0.2.0", True), ("0.1.0", False),
@@ -179,6 +209,110 @@ def test_offline_is_not_an_error_the_page_has_to_handle(tmp_path, monkeypatch):
     monkeypatch.setattr(updates, "latest_release", offline)
     reply = updates.check(root=_install(tmp_path), force=True)
     assert reply["available"] is False and "could not check" in reply["error"]
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@contextmanager
+def _other_program():
+    """Something else answering HTTP on a port, as AnkiConnect does on 8765."""
+    class Anki(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib naming
+            body = b'{"result": null, "error": "unsupported action"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Anki)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_launcher_knows_optjournal_from_anything_else_on_its_port(tmp_path):
+    """L20: anything listening on the port was taken for optjournal, and the
+    browser was opened at it. Pinned against the real server, so the page and
+    the launcher cannot drift apart on what identifies it."""
+    from optjournal import web
+
+    launcher = _launcher()
+    with web.serve_ephemeral(db_path=tmp_path / "journal.db", archive_dir=tmp_path / "raw") as base:
+        assert launcher._whats_on(int(base.rsplit(":", 1)[1].strip("/"))) == "optjournal"
+    with _other_program() as port:
+        assert launcher._whats_on(port) == "other"
+    with socket.socket() as silent:                   # accepts, never answers
+        silent.bind(("127.0.0.1", 0))
+        silent.listen()
+        assert launcher._whats_on(silent.getsockname()[1], timeout_s=0.5) == "other"
+    assert launcher._whats_on(_free_port()) is None
+
+
+def _fake_uv_for_launcher(tmp_path: Path, serve_codes: list[int]) -> Path:
+    """A `uv` that logs each call and exits `serve` with the next code given."""
+    log = tmp_path / "uv.log"
+    codes = tmp_path / "codes.json"
+    codes.write_text(json.dumps(serve_codes))
+    script = tmp_path / "uv"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        f"with open({str(log)!r}, 'a') as f:\n"
+        "    f.write(json.dumps([os.getcwd(), *sys.argv[1:]]) + '\\n')\n"
+        "if 'serve' in sys.argv:\n"
+        f"    left = json.loads(open({str(codes)!r}).read())\n"
+        f"    open({str(codes)!r}, 'w').write(json.dumps(left[1:]))\n"
+        "    sys.exit(left[0])\n"
+    )
+    script.chmod(0o755)
+    return log
+
+
+def _run_launcher(monkeypatch, tmp_path, port: int):
+    monkeypatch.setenv("OPTJOURNAL_PORT", str(port))
+    launcher = _launcher()
+    opened: list[str] = []
+    monkeypatch.setattr(launcher.webbrowser, "open", opened.append)
+    monkeypatch.setattr(launcher, "ROOT", _install(tmp_path))
+    return launcher, opened
+
+
+def test_the_launcher_refuses_a_port_another_program_holds(tmp_path, monkeypatch, capsys):
+    with _other_program() as port:
+        launcher, opened = _run_launcher(monkeypatch, tmp_path, port)
+        monkeypatch.setenv("UV", str(tmp_path / "no-such-uv"))
+        assert launcher.main() == 1
+    assert opened == [], "the browser was opened at another program"
+    assert "another program" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in uv is a script with a shebang")
+def test_the_launcher_restarts_after_an_update_and_never_relocks(tmp_path, monkeypatch):
+    """Exit code RESTART starts the app again; anything else ends the loop. And
+    every uv call is `--frozen` (M17): a start must not rewrite `uv.lock`."""
+    launcher, opened = _run_launcher(monkeypatch, tmp_path, _free_port())
+    log = _fake_uv_for_launcher(tmp_path, [launcher.RESTART, 0])
+    monkeypatch.setenv("UV", str(tmp_path / "uv"))
+
+    assert launcher.main() == 0
+
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [c[-1] if "prepare" in c else "serve" for c in calls] == [
+        "prepare", "serve", "prepare", "serve"]
+    assert all(c[0] == str(launcher.ROOT) for c in calls)
+    assert all("--frozen" in c for c in calls), calls
+    assert opened == [], "a server that never answered was opened in the browser"
 
 
 def test_the_launcher_and_the_app_agree_on_the_contract():
