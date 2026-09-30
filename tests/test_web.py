@@ -7806,6 +7806,38 @@ def test_the_demo_never_resolves_a_real_query_id(populated, tmp_path, monkeypatc
     assert attempts == [], "the demo tried to fetch from IBKR"
 
 
+def test_the_demos_settings_cannot_touch_the_real_journals_ids_or_token(
+    tmp_path, monkeypatch,
+):
+    """The demo reads the real journal's settings file and shows its ids as unset,
+    so Save beside a blank field deleted the real ids (the scheduled sync then
+    failed with "no query id") and a typed one replaced them. Refused now, and
+    the token, which is the real journal's keyring entry, too. A preference that
+    is the demo's own (the scoreboard unit) still saves, without echoing the
+    real ids back."""
+    import keyring  # noqa: PLC0415 - local to this test
+
+    from optjournal import settings  # noqa: PLC0415
+
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    monkeypatch.setenv(settings.HOME_ENV, str(tmp_path / "home"))
+    settings.update(query_id="4242424", confirm_query_id="3334445")
+    wrote: list[str] = []
+    monkeypatch.setattr(keyring, "set_password", lambda *a: wrote.append("set"))
+    with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path / "demo",
+                             demo=True) as base:
+        replies = [_post(base, "/api/settings", {"query_id": ""}),
+                   _post(base, "/api/settings", {"confirm_query_id": "999"}),
+                   _post(base, "/api/settings/token", {"token": "123456789012"})]
+        scoring = _post(base, "/api/settings", {"scoring": "contract"})
+    assert [(status, reply["kind"]) for status, reply in replies] == [(400, "demo")] * 3
+    assert (settings.query_id(), settings.confirm_query_id()) == ("4242424", "3334445")
+    assert wrote == [], "the demo wrote the real journal's keyring entry"
+    assert scoring[0] == 200
+    assert "query_id" not in scoring[1]["stored"]
+    assert "confirm_query_id" not in scoring[1]["stored"]
+
+
 @pytest.mark.parametrize(("flag", "env", "source"), [
     ("333333", None, "override"),
     (None, "444444", "override"),

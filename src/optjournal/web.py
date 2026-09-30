@@ -1563,6 +1563,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         import getpass
 
         account = getpass.getuser()
+        if self.cfg.demo:
+            # The keyring entry is the REAL journal's credential.
+            return 400, {
+                "ok": False, "kind": "demo", "present": None, "account": account,
+                "message": "the demo never fetches from IBKR, so it stores no token; "
+                           "set it from your real journal's Settings.",
+            }
         token = str(self._body().get("token") or "").strip()
         # Shape-checked only for length, and the reasoning is `write_token`'s:
         # IBKR does not document the format, so a stricter rule here could refuse
@@ -1630,6 +1637,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         /api/settings/token` does it, and carries the reasoning.
         """
         body = self._body()
+        # The demo reads the REAL journal's settings file, and shows its ids as
+        # unset, so a Save beside a blank field there deleted the real ids and a
+        # typed one replaced them. Refused, like every other way the demo could
+        # reach the real account.
+        if self.cfg.demo and {"query_id", "confirm_query_id"} & set(body):
+            return 400, {"ok": False, "kind": "demo",
+                         "message": "the demo never fetches from IBKR, and shares its "
+                                    "settings file with your real journal, so its "
+                                    "query ids are set from the real one"}
         changes: dict[str, Any] = {}
         if "query_id" in body:
             raw = str(body.get("query_id") or "").strip()
@@ -1674,6 +1690,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return 400, {"ok": False, "kind": "empty",
                          "message": "no known setting in the request"}
         stored = prefs.update(**changes)
+        if self.cfg.demo:
+            # The file is the real journal's: its ids are not the demo's to show.
+            stored = {k: v for k, v in stored.items()
+                      if k not in ("query_id", "confirm_query_id")}
         return 200, {"ok": True, "kind": "settings", "stored": stored,
                      "query_id": self._effective_query_id()}
 
