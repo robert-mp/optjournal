@@ -3399,7 +3399,7 @@ function replaySeek(i){
   });
   return fr.index;
 }
-function bindReplayControls(){
+function bindReplayControls(resume){
   const scrub=$('#rscrub'), speed=$('#rspeed'), play=document.querySelector('[data-rplay]');
   if(!scrub) return;
   /* Sync once on open. The cards render hidden and are revealed by replaySeek, so
@@ -3502,6 +3502,10 @@ function bindReplayControls(){
     if(el.getAttribute('role')==='button')
       el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();seek();}};
   });
+  /* Playing when the page redrew under it: carry on from the bar the scrubber
+     held, which `preserveInputs` has already put back. Through `play.onclick`,
+     the one entry point, so the next stop is found from here as on any press. */
+  if(resume&&play) play.onclick();
 }
 
 function replayPanel(rp,label,valueHtml){
@@ -6300,7 +6304,9 @@ function draw(push){
     }
   }
   /* A running playback drives element ids that this render is about to
-     replace, so it has to die with them. */
+     replace, so it stops here -- and resumes on the new panel below when that
+     panel is the same replay. A theme toggle used to end it. */
+  const replaying=RTIMER!==null?S.replay:null;
   replayStop();
   const fk=focusKey();
   syncHash(push);
@@ -6389,7 +6395,7 @@ function draw(push){
   document.querySelectorAll('[data-replay]').forEach(el=>
     pressable(el,()=>{const k=el.dataset.replay;
       S.replay=S.replay===k?null:k;draw();}));
-  bindReplayControls();
+  bindReplayControls(replaying!==null&&replaying===S.replay);
   bindJournal();
   /* Opening the 0DTE tab checks the feed at once; the timer keeps it current. */
   zdue();
@@ -6665,7 +6671,7 @@ function preserveInputs(){
   document.querySelectorAll('#body input,#body textarea,#body select').forEach(el=>{
     if(!el.id) return;
     keep[el.id]={value:el.value,subject:el.dataset.subject||'',
-      start:el.selectionStart,end:el.selectionEnd,
+      start:el.selectionStart,end:el.selectionEnd,checked:el.checked,
       focused:document.activeElement===el};
   });
   return keep;
@@ -6683,6 +6689,9 @@ function restoreInputs(keep){
     const was=keep[id];
     if((el.dataset.subject||'')!==was.subject) return;
     el.value=was.value;
+    /* A checkbox's state is `checked`, not its value: the replay's "stop on
+       events" came back ticked after every redraw. */
+    if(el.type==='checkbox') el.checked=was.checked;
     if(was.focused){
       el.focus();
       try{ el.setSelectionRange(was.start,was.end); }catch(e){ /* unsupported type */ }

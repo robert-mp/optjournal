@@ -2083,6 +2083,44 @@ def test_a_redraw_hands_focus_back_to_the_control_that_had_it():
         "the message banner is not announced")
 
 
+def _bind_replay(resume: bool) -> dict:
+    """The page's own `bindReplayControls` on a panel parked at bar 3 of 10."""
+    js = _code_only(_js())
+    consts = [_page_const("REPLAY_SECONDS")] if "const REPLAY_SECONDS=" in js else []
+    return _node_run([
+        f"import {{barsPerMs, nextStop}} from '{_static('replay.js')}';",
+        "let RGEO={points:Array.from({length:10},(_,i)=>[i,1]),events:[]}, RTIMER=null;",
+        "let frames=0; const requestAnimationFrame=()=>++frames;",
+        "const cancelAnimationFrame=()=>{};",
+        "const scrub={value:'3',max:'9'}, play={textContent:'▶ play'};",
+        "const box={'#rscrub':scrub,'#rspeed':{value:'1'},'#rstops':{checked:true},",
+        "  '#rloop':{checked:false}};",
+        "const $=sel=>box[sel]||null;",
+        "const document={querySelector:()=>play,querySelectorAll:()=>[]};",
+        "function replaySeek(){} function replayFocus(){}",
+        *consts, *_page_fns("replayStop", "bindReplayControls"),
+        f"bindReplayControls({json.dumps(resume)});",
+        "console.log(JSON.stringify({playing:RTIMER!==null,label:play.textContent,",
+        "  at:scrub.value}));",
+    ])
+
+
+def test_a_redraw_during_playback_keeps_the_replay_playing():
+    """L49: a redraw while a replay played (a theme toggle, a late update banner)
+    stopped it, since draw() must kill the frame loop before replacing the panel
+    it drives. It still does, and now tells the new panel to carry on; the bar
+    the scrubber held comes back through `preserveInputs`, which now also carries
+    a checkbox's `checked`, so "stop on events" no longer comes back ticked.
+    """
+    assert _bind_replay(resume=True) == {"playing": True, "label": "❚❚ pause", "at": "3"}
+    assert _bind_replay(resume=False)["playing"] is False, "a parked replay started"
+    draw = _fn("draw")
+    assert draw.index("RTIMER!==null?S.replay:null") < draw.index("replayStop()"), (
+        "whether it was playing has to be read before the loop is stopped")
+    assert "bindReplayControls(replaying!==null&&replaying===S.replay)" in draw
+    assert "el.checked=was.checked" in _fn("restoreInputs")
+
+
 def test_nothing_this_server_sends_is_cacheable():
     """A cached page is a stale page, and a cached payload is a stale account.
 
@@ -2901,8 +2939,15 @@ def _page_fns(*names: str) -> list[str]:
     also starts at `function`, so an async one gets its keyword back.
     """
     js = _code_only(_js())
-    return [("async " if f"async function {name}(" in js else "")
-            + re.split(r"\n\}(?=\n|$)", _fn(name), maxsplit=1)[0] + "\n}"
+
+    def whole(name: str) -> str:
+        src = _fn(name)
+        first = src.split("\n", 1)[0].rstrip()
+        if first.endswith("}") and first.count("{") == first.count("}"):
+            return first  # a one-line function
+        return re.split(r"\n\}(?=\n|$)", src, maxsplit=1)[0] + "\n}"
+
+    return [("async " if f"async function {name}(" in js else "") + whole(name)
             for name in names if f"function {name}(" in js]
 
 
