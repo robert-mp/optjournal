@@ -1619,8 +1619,6 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .linkish{background:none;border:none;color:var(--dim);cursor:pointer;
   font:inherit;font-size:var(--t1);text-decoration:underline;padding:0}
 .linkish:hover{color:var(--fg)}
-.day .dpl{font-family:var(--fig);font-variant-numeric:tabular-nums;
-  font-weight:var(--w-label);font-size:var(--t3)}
 /* The day's figure is in the cell twice (page.html `calendar`): the amount, and
    `compact` for a cell too narrow for it. WHICH one shows is a question about the
    CELL, not about the window, and asking the window got it wrong in between: from
@@ -1633,12 +1631,31 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    figure, because the Market strip reuses .cal/.day to hold event titles, which
    size their cells themselves. The compact form is at most five glyphs, about
    2.9em, so sizing it at 34% of the day's own width (`cqi`) keeps it inside the
-   cell on the narrowest phone while `--t1` caps it everywhere else. */
+   cell on the narrowest phone while `--t1` caps it everywhere else.
+
+   ABOVE 72px THE AMOUNT ITSELF DECIDES, because one width cannot: 72px is the
+   four-digit room, and a larger amount needs more ("€12,345.67" 73px,
+   "−€123,456.78" 88, "−€9,999,999.99" 99), so from 665 to 1030px those wrapped
+   after the minus or ran past the cell. The figure is one line tall and clips
+   below it, and the amount is a flex item that WRAPS OFF that line when it does
+   not fit. The compact form is ordered first with no width of its own: while the
+   amount fits, the amount takes all the spare room (a grow factor that leaves the
+   compact form a zero-width box) and the compact form is invisible; once the
+   amount wraps away, the compact form is alone on the line and takes it. So the
+   switch happens exactly where the amount stops fitting, for any size, currency
+   or font, and nothing is measured in script. */
 .cal>.day:has(>.dpl){container-type:inline-size}
-.day .dpln{display:none}
+.day .dpl{font-family:var(--fig);font-variant-numeric:tabular-nums;
+  font-weight:var(--w-label);font-size:var(--t3);
+  display:flex;flex-wrap:wrap;white-space:nowrap;height:1lh;overflow:hidden}
+.day .dplw{flex:1e6 0 auto}
+.day .dpln{order:-1;flex:1 0 0;min-width:0;overflow:hidden}
+/* Block again below 72px, where the compact form always shows, so it sits on the
+   figure's baseline at its smaller size exactly as it did before the flex line. */
 @container (max-width:72px){
+  .day .dpl{display:block}
   .day .dplw{display:none}
-  .day .dpln{display:inline;font-size:min(var(--t1),34cqi)}}
+  .day .dpln{font-size:min(var(--t1),34cqi)}}
 @media(max-width:700px){
   .cal{gap:var(--s1)}
   .cal>.day{padding:var(--s1)}

@@ -8492,22 +8492,53 @@ def test_a_calendar_day_prints_its_figure_whole_at_every_width():
     and broke it inside its digits: "−", "€1,729.4", "2".
 
     The question belongs to the cell, so each day that carries a figure is a
-    container and one query answers it everywhere. Measured in a browser on the real
-    journal's two busiest months, 320px to 2560px in 5px steps: no digit split, no
-    clipping, and nothing wraps at all. The day's label keeps the exact figure for a
-    screen reader at every width.
+    container, and below 72px (the four-digit room) the compact form shows.
+
+    Above 72px one width could not answer it, which is the residual ae93f60 left: a
+    larger amount needs more room ("€12,345.67" 73px, "−€123,456.78" 88,
+    "−€9,999,999.99" 99), so from 665 to 1030px those wrapped after the minus, and
+    ran past the cell (clipped by the phone rule's `overflow:hidden` at 700px). Now
+    the amount itself decides: the figure is one clipped line, the amount wraps off
+    it when it does not fit, and the compact form, ordered first with no width of
+    its own, is then alone on the line. Measured in a browser with amounts from 1.50
+    to 9,999,999.99 in both signs injected into a month, 320px to 2560px in 1px
+    steps: every day shows exactly one form, on one line, inside its cell, and its
+    label keeps the exact figure. The old rules failed that from 665 to 1030px.
     """
     narrow = {sel: body.replace(" ", "") for sel, body in _at_rules(72, "container")}
     assert "display:none" in narrow.get(".day .dplw", ""), "the full amount still shows"
-    shown = narrow.get(".day .dpln", "")
-    assert "display:inline" in shown and "cqi" in shown, (
-        "the compact amount does not show, or does not scale with the day")
+    assert "cqi" in narrow.get(".day .dpln", ""), "the compact amount does not scale with the day"
+    assert "display:block" in narrow.get(".day .dpl", ""), (
+        "below 72px the figure must sit on its baseline as a plain line again")
     wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
     assert "container-type:inline-size" in wide.get(".cal>.day:has(>.dpl)", ""), (
         "a day is not its own container, so the query above can never match; and "
         "the Market strip's cells must stay out of it, they size themselves")
-    assert "display:none" in wide.get(".day .dpln", ""), (
-        "the compact amount shows beside the full one on a wide screen")
+    # The figure: one line that clips below itself, which the amount wraps off.
+    fig = wide.get(".day .dpl", "")
+    for prop in ("display:flex", "flex-wrap:wrap", "white-space:nowrap",
+                 "height:1lh", "overflow:hidden"):
+        assert prop in fig, f".day .dpl lost {prop}, so a large amount can wrap or spill"
+    raw = {sel.strip(): body for sel, body in _toplevel_rules()}
+
+    def flex(sel: str) -> list[str]:
+        return re.search(r"flex:\s*([^;}]+)", raw[sel]).group(1).split()
+
+    # The amount takes every spare pixel while it fits, and never shrinks to fit.
+    grow, shrink, basis = flex(".day .dplw")
+    assert float(grow) >= 1e6 and (shrink, basis) == ("0", "auto"), (
+        "the amount no longer starves the compact form of room, so both show at once")
+    # The compact form: first on the line, zero width of its own, clipped.
+    assert flex(".day .dpln") == ["1", "0", "0"], (
+        "the compact form has a width of its own, so the amount's fit is tested "
+        "against less than the whole line, or it cannot grow into the line it gets")
+    compact_form = wide.get(".day .dpln", "")
+    for prop in ("order:-1", "min-width:0", "overflow:hidden"):
+        assert prop in compact_form, (
+            f".day .dpln lost {prop}; it cannot take the line when the amount leaves it")
+    assert "display:none" not in compact_form, (
+        "the compact form is hidden outright, so it cannot take over when the amount "
+        "does not fit")
     assert not any("anywhere" in body for sel, body in _css_rules()
                    if sel.strip() in (".day .dplw", ".day .dpl")), (
         "overflow-wrap:anywhere is back, which lets an amount break between digits")
