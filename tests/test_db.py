@@ -1323,3 +1323,68 @@ def test_a_superseded_row_equals_one_the_statement_wrote_from_scratch(tmp_path):
     )
     superseded.close()
     direct.close()
+
+
+# --- a statement that fails part-way leaves nothing behind (H1) ---------------
+
+
+def _positions_break_ingest(tmp_path: Path, name: str = "activity-broken.xml") -> Path:
+    """The fixture with one open position missing its symbol.
+
+    The trades and cash sections are written before the positions, so the NOT
+    NULL on `position_snapshots.symbol` raises part-way through the file, after
+    the provenance row and every fill have been written.
+    """
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    old = 'symbol="NVDA  260320P00140000"'
+    assert old in text, "fixture position changed; update this seam"
+    path = tmp_path / name
+    path.write_text(text.replace(old, 'symbol=""', 1), encoding="utf-8")
+    return path
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_a_statement_that_fails_part_way_leaves_nothing_for_the_caller_to_commit(
+    conn, tmp_path,
+):
+    """The job runner commits on the same connection after a failure.
+
+    Before, the half-written statement survived that commit, and every later
+    run skipped the file as "byte-identical, nothing to do": the live journal
+    kept three statements with zero position snapshots that way.
+    """
+    broken = _positions_break_ingest(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        ingest_file(conn, broken)
+    conn.commit()  # what `jobs._finish` does next, on this connection
+
+    for table in ("statements", "trades", "cash_transactions",
+                  "position_snapshots", "equity_summaries"):
+        n = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        assert n == 0, f"{table} kept {n} row(s) from the failed statement"
+
+    # The same bytes are not "already ingested": the retry tries again.
+    with pytest.raises(sqlite3.IntegrityError):
+        ingest_file(conn, broken)
+    conn.commit()
+
+    # And once the file reads cleanly, it is ingested in full.
+    broken.write_bytes(STATEMENTS[0].read_bytes())
+    result = ingest_file(conn, broken)
+    assert not result.already_ingested
+    assert result.trades_inserted > 0
+    assert result.positions_written > 0
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM position_snapshots").fetchone()["n"] == \
+        result.positions_written
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_a_failed_ingest_keeps_the_callers_own_pending_writes(conn, tmp_path):
+    """Undoing the statement must not undo what the caller wrote before it."""
+    add_statement(conn, source_file="caller.xml")  # uncommitted, the caller's
+    with pytest.raises(sqlite3.IntegrityError):
+        ingest_file(conn, _positions_break_ingest(tmp_path))
+    conn.commit()
+    names = [r["source_file"] for r in conn.execute("SELECT source_file FROM statements")]
+    assert names == ["caller.xml"]

@@ -339,3 +339,25 @@ def test_a_confirm_cannot_walk_a_settled_row_back(tmp_path, confirm_file):
     row = conn.execute("SELECT * FROM trades").fetchone()
     assert (row["source_kind"], row["fx_rate_estimated"]) == ("activity", 0)
     assert row["ib_commission"] == -1.5, "a confirm overwrote the settled commission"
+
+
+def test_a_confirm_that_fails_part_way_leaves_nothing_behind(tmp_path):
+    """H1, for the confirm writer: the job commits on the same connection.
+
+    A fill with no symbol violates `trades.symbol NOT NULL` after the provenance
+    row is written, so without the savepoint that row survived the caller's
+    commit and claimed a file whose fills never landed.
+    """
+    conn = connect_migrated(tmp_path / "j.db")
+    path = tmp_path / "confirm-20260924.xml"
+    path.write_text(CONFIRM_XML.replace('symbol="GOOG  261030P00310000"',
+                                        'symbol=""'), encoding="utf-8")
+    with pytest.raises(Exception, match="NOT NULL"):
+        ingest_confirms(conn, path, base_currency="EUR", rate_for=_fixed_rate())
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+
+    path.write_text(CONFIRM_XML, encoding="utf-8")
+    result = ingest_confirms(conn, path, base_currency="EUR", rate_for=_fixed_rate())
+    assert result.trades_inserted == 1

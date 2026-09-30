@@ -25,7 +25,8 @@ import hashlib
 import json
 import logging
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -161,6 +162,33 @@ def _s(value: Any) -> str | None:
     return text or None
 
 
+@contextmanager
+def _all_or_nothing(conn: sqlite3.Connection) -> Iterator[None]:
+    """Write one statement completely or not at all, then commit.
+
+    A SAVEPOINT rather than relying on the caller to roll back, because the
+    caller may not: the job runner records a failed run on the SAME connection
+    and commits it, which used to commit whatever this had written before the
+    raise. A statement row with half its sections is worse than none, because
+    the digest check then skips the file as already ingested on every retry
+    (the live journal kept three statements with no position snapshots that
+    way). Only this statement's writes are undone; anything the caller had
+    pending is theirs to keep or drop.
+    """
+    conn.execute("SAVEPOINT ingest")
+    try:
+        yield
+    except BaseException:
+        # SQLite ends the whole transaction by itself on a few errors (a full
+        # disk, for one), and then there is no savepoint left to roll back to.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO ingest")
+            conn.execute("RELEASE ingest")
+        raise
+    conn.execute("RELEASE ingest")
+    conn.commit()
+
+
 def _matches_filter(asset_category: str | None, wanted: Iterable[str]) -> bool:
     allowed = tuple(wanted)
     if not allowed:
@@ -237,46 +265,46 @@ def ingest_file(
     # StatementSource and an unchanged writer -- which is the whole claim the seam
     # makes, and which was only true of the trade path until now.
     #
-    # Provenance first: `statements.source_file` is a foreign key from every other
-    # table, so its row has to exist before theirs.
-    for meta in source.metadata(path):
-        conn.execute(
-            "INSERT INTO statements (broker, source_file, sha256, account_id,"
-            " from_date, to_date, when_generated, base_currency, asset_filter,"
-            " ingested_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(source_file) DO UPDATE SET"
-            " sha256=excluded.sha256, ingested_at=excluded.ingested_at,"
-            " asset_filter=excluded.asset_filter",
-            (
-                broker,
-                path.name,
-                digest,
-                meta.account_id,
-                meta.from_date,
-                meta.to_date,
-                meta.generated_at,
-                meta.base_currency,
-                asset_filter,
-                _now(),
-            ),
-        )
+    with _all_or_nothing(conn):
+        # Provenance first: `statements.source_file` is a foreign key from every
+        # other table, so its row has to exist before theirs.
+        for meta in source.metadata(path):
+            conn.execute(
+                "INSERT INTO statements (broker, source_file, sha256, account_id,"
+                " from_date, to_date, when_generated, base_currency, asset_filter,"
+                " ingested_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(source_file) DO UPDATE SET"
+                " sha256=excluded.sha256, ingested_at=excluded.ingested_at,"
+                " asset_filter=excluded.asset_filter",
+                (
+                    broker,
+                    path.name,
+                    digest,
+                    meta.account_id,
+                    meta.from_date,
+                    meta.to_date,
+                    meta.generated_at,
+                    meta.base_currency,
+                    asset_filter,
+                    _now(),
+                ),
+            )
 
-    base_currency = source.base_currency(path)
-    for _account_id, fills in source.statements(path):
-        _ingest_trades(conn, fills, path.name, assets, result,
-                       base_currency=base_currency, broker=broker,
-                       source_kind=source_kind)
+        base_currency = source.base_currency(path)
+        for _account_id, fills in source.statements(path):
+            _ingest_trades(conn, fills, path.name, assets, result,
+                           base_currency=base_currency, broker=broker,
+                           source_kind=source_kind)
 
-    _ingest_cash(conn, source.cash_transactions(path), path.name, result,
-                 broker=broker)
-    _ingest_positions(conn, source.positions(path), path.name, assets, result,
-                      broker=broker)
-    _ingest_securities(conn, source.securities(path), assets, result, broker=broker)
-    _ingest_equity_summaries(conn, source.equity_summaries(path), path.name, result,
-                             broker=broker)
-
-    conn.commit()
+        _ingest_cash(conn, source.cash_transactions(path), path.name, result,
+                     broker=broker)
+        _ingest_positions(conn, source.positions(path), path.name, assets, result,
+                          broker=broker)
+        _ingest_securities(conn, source.securities(path), assets, result,
+                           broker=broker)
+        _ingest_equity_summaries(conn, source.equity_summaries(path), path.name,
+                                 result, broker=broker)
     return result
 
 
@@ -314,24 +342,6 @@ def ingest_confirms(
     if rate_for is None:
         rate_for = _live_rate_for(base_currency)
 
-    # Provenance first: `statements.source_file` is a foreign key from `trades`,
-    # so the row has to exist before any fill can reference it. A confirm IS a
-    # source file, and recording it keeps every trade row's provenance answerable.
-    for meta in confirm_meta(path, base_currency=base_currency):
-        conn.execute(
-            "INSERT INTO statements (broker, source_file, sha256, account_id,"
-            " from_date, to_date, when_generated, base_currency, asset_filter,"
-            " ingested_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(source_file) DO UPDATE SET"
-            " sha256=excluded.sha256, ingested_at=excluded.ingested_at",
-            (
-                broker, path.name, digest, meta.account_id, meta.from_date,
-                meta.to_date, meta.generated_at, meta.base_currency,
-                ",".join(assets) or "ALL", _now(),
-            ),
-        )
-
     # GROUPED BY WHETHER THE RATE WAS ESTIMATED, rather than one call per fill.
     # `fx_rate_estimated` is a property of the CURRENCY, not of the fill, so a
     # session's fills fall into at most two batches -- and the writer takes a list
@@ -342,11 +352,30 @@ def ingest_confirms(
         path, rate_for=lambda ccy: rate_for(ccy)[0]
     ):
         batched.setdefault(rate_for(fill.currency)[1], []).append(fill)
-    for estimated, fills in batched.items():
-        _ingest_trades(conn, fills, path.name, assets, result,
-                       base_currency=base_currency, broker=broker,
-                       source_kind=CONFIRM_SOURCE, fx_rate_estimated=estimated)
-    conn.commit()
+
+    with _all_or_nothing(conn):
+        # Provenance first: `statements.source_file` is a foreign key from
+        # `trades`, so the row has to exist before any fill can reference it. A
+        # confirm IS a source file, and recording it keeps every trade row's
+        # provenance answerable.
+        for meta in confirm_meta(path, base_currency=base_currency):
+            conn.execute(
+                "INSERT INTO statements (broker, source_file, sha256, account_id,"
+                " from_date, to_date, when_generated, base_currency, asset_filter,"
+                " ingested_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(source_file) DO UPDATE SET"
+                " sha256=excluded.sha256, ingested_at=excluded.ingested_at",
+                (
+                    broker, path.name, digest, meta.account_id, meta.from_date,
+                    meta.to_date, meta.generated_at, meta.base_currency,
+                    ",".join(assets) or "ALL", _now(),
+                ),
+            )
+        for estimated, fills in batched.items():
+            _ingest_trades(conn, fills, path.name, assets, result,
+                           base_currency=base_currency, broker=broker,
+                           source_kind=CONFIRM_SOURCE, fx_rate_estimated=estimated)
     return result
 
 
