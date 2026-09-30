@@ -41,6 +41,7 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import re
 import signal
 import socket
@@ -55,7 +56,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from optjournal import __version__, journal, replay
+from optjournal import __version__, install, journal, replay, updates
 from optjournal import earnings as earnings_mod
 from optjournal import settings as prefs
 from optjournal.analysis import analyse
@@ -788,6 +789,13 @@ def build_state(
     # than a detail buried in a row: the caption needs one number to decide
     # whether to warn at all.
     state["provisional"] = provisional
+    # What the launcher and the updater need the page to know. `previous` is
+    # empty unless this journal is: see `install.previous_journals`.
+    state["install"] = {
+        "home": str(db_path.parent),
+        "supervised": bool(os.environ.get("OPTJOURNAL_SUPERVISED")),
+        "previous": [str(p) for p in install.previous_journals(db_path.parent)],
+    }
     state["sync"] = {
         "query_id": query_id,
         "configured": bool(query_id),
@@ -932,6 +940,9 @@ class ServeConfig:
     #: one lock per server -- not on the handler class, where it would be one
     #: lock per process.
     sync_lock: threading.Lock = field(default_factory=threading.Lock)
+    #: Set by an update or a journal import: `serve` stops and reports it, and
+    #: the launcher starts it again (see `cli.EXIT_RESTART`).
+    restart: threading.Event = field(default_factory=threading.Event)
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -1046,6 +1057,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._json(*self._quotes())
         elif path == "/api/jobs/run":
             self._json(*self._job_status(params))
+        elif path == "/api/update":
+            # A GET that may reach GitHub, once per `updates.CHECK_EVERY_S`. Its
+            # own route rather than a key on /api/state, so a slow or absent
+            # network never delays the page itself.
+            self._json(200, updates.check())
         else:
             self._json(404, {"error": "not found"})
 
@@ -1655,6 +1671,44 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return 400, {"ok": False, "kind": "link", "message": str(exc)}
         return 200, {"ok": True, "kind": "link", "pair": list(pair)}
 
+    def _restart_soon(self) -> None:
+        """Ask `serve` to stop once this reply has been sent.
+
+        Deferred, because setting the event here would race the reply: the
+        server can shut down before the page learns that it asked for this.
+        """
+        threading.Timer(0.5, self.cfg.restart.set).start()
+
+    def _update_apply(self) -> tuple[int, dict[str, Any]]:
+        """Download and stage the latest release, then restart to swap it in."""
+        try:
+            release = updates.latest_release()
+            updates.stage(release)
+        except updates.UpdateRefused as exc:
+            return 409, {"ok": False, "kind": "refused", "message": str(exc)}
+        except (OSError, ValueError, KeyError) as exc:
+            return 502, {"ok": False, "kind": "download",
+                         "message": f"could not download the update: {exc}"}
+        self._restart_soon()
+        return 202, {"ok": True, "kind": "restarting", "version": release.version}
+
+    def _import_journal(self) -> tuple[int, dict[str, Any]]:
+        """Adopt a journal another download left, then restart to move it.
+
+        The source must be one `install.previous_journals` found: `choose_import`
+        checks that, so this endpoint cannot move an arbitrary folder.
+        """
+        if not os.environ.get("OPTJOURNAL_SUPERVISED"):
+            return 409, {"ok": False, "kind": "refused",
+                         "message": "start optjournal with its Start file to do this"}
+        source = str(self._body().get("source") or "")
+        try:
+            install.choose_import(Path(source))
+        except install.RelocateRefused as exc:
+            return 400, {"ok": False, "kind": "refused", "message": str(exc)}
+        self._restart_soon()
+        return 202, {"ok": True, "kind": "restarting", "source": source}
+
     def _job_run(self) -> tuple[int, dict[str, Any]]:
         """Run one registered job now. The page's only write to the scheduler.
 
@@ -1788,6 +1842,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/settings/token":
             self._json(*self._token_write())
             return
+        if path == "/api/update":
+            self._json(*self._update_apply())
+            return
+        if path == "/api/install/import":
+            self._json(*self._import_journal())
+            return
         if path != "/api/sync":
             self._json(404, {"error": "not found"})
             return
@@ -1825,8 +1885,11 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     scheduler: bool = True,
-) -> None:
+) -> bool:
     """Serve the UI until interrupted. Loopback only, by construction.
+
+    Returns True when it stopped for a restart (an update or a journal import
+    is waiting for the launcher), False when it was asked to stop.
 
     `scheduler=True` starts the 60-second reconciler in this process, which is what
     makes `serve` the application rather than a viewer. In-process for one measured
@@ -1973,7 +2036,8 @@ def serve(
             # Waking five times a second costs nothing measurable and makes the stop
             # deterministic on every platform.
             while not stop.wait(0.2):
-                pass
+                if cfg.restart.is_set():
+                    break
         except KeyboardInterrupt:
             print("\nstopped")
         finally:
@@ -1984,6 +2048,7 @@ def serve(
             if clock is not None:
                 clock.stop()
             httpd.shutdown()
+    return cfg.restart.is_set()
 
 
 @contextmanager

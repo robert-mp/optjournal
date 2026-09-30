@@ -348,6 +348,9 @@ _UNSAMPLED = frozenset({
     # The demo account opened the day its only statement starts, so its history
     # plan is rightly empty. Exercised directly in test_sync.
     "HistoryChunk",
+    # Off the state payload, like the other replies: `/api/update` answers from
+    # GitHub, which the fixture must never reach.
+    "UpdateCheck", "UpdateReply",
     "MarketFetch", "WatchWrite", "QuoteReply", "Quote",
     # Reached only through `QuoteReply.ranks`, the `/api/quotes` reply, not the
     # state payload -- so no `/api/state` sample can carry it, exactly like
@@ -432,6 +435,7 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "Tally": state["journal"]["review"]["plan"]["held"],
         "AllocationRow": first(state["allocation"]["rows"]),
         "Order": first(orders),
+        "Install": state["install"],
         "Leg": first(orders[0]["legs"]) if orders else None,
         "LegMoney": first(orders[0]["legs"])["money"] if orders else None,
         "Episode": first(history["closed"] + history["open"]),
@@ -7427,3 +7431,36 @@ def test_each_job_row_says_how_many_requests_one_run_spends():
     plan = [("20240802", "20250801"), ("20230804", "20240802")]
     counts = {r["job"]: r["requests"] for r in _with_request_counts(scheduler, plan)["jobs"]}
     assert counts == {"sync": 1, "market": 0, "history": 2}
+
+
+def test_the_update_button_is_refused_where_it_could_not_restart(populated, monkeypatch):
+    monkeypatch.delenv("OPTJOURNAL_SUPERVISED", raising=False)
+    from optjournal import updates
+
+    monkeypatch.setattr(updates, "latest_release", lambda: updates.Release(
+        version="9.9.9", notes="", page_url="", zip_url="https://x/y.zip"))
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/update")
+    assert status == 409 and reply["kind"] == "refused"
+
+
+def test_the_update_button_stages_and_answers_before_restarting(populated, monkeypatch):
+    from optjournal import updates
+
+    staged = []
+    monkeypatch.setattr(updates, "latest_release", lambda: updates.Release(
+        version="9.9.9", notes="", page_url="", zip_url="https://x/y.zip"))
+    monkeypatch.setattr(updates, "stage", lambda release: staged.append(release.version))
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/update")
+    assert (status, reply["version"], staged) == (202, "9.9.9", ["9.9.9"])
+
+
+def test_importing_a_journal_it_did_not_find_is_refused(populated, monkeypatch, tmp_path):
+    monkeypatch.setenv("OPTJOURNAL_SUPERVISED", "1")
+    from optjournal import install
+
+    monkeypatch.setattr(install, "previous_journals", lambda *_a, **_k: [])
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/install/import", {"source": str(tmp_path)})
+    assert status == 400 and reply["kind"] == "refused"

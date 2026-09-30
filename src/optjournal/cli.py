@@ -21,7 +21,7 @@ from typing import Any
 
 from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 
-from optjournal import __version__, browser, logs, settings
+from optjournal import __version__, browser, install, logs, settings
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import newest_statement, prune_archive
 from optjournal.bars import (
@@ -32,6 +32,7 @@ from optjournal.bars import (
 from optjournal.clock import MARKET_TZ, parse_day
 from optjournal.compat import unknown_codes
 from optjournal.config import (
+    DATA_HOME,
     DEFAULT_ARCHIVE,
     DEFAULT_DB,
     DEFAULT_DEMO_DB,
@@ -101,6 +102,9 @@ EXIT_NO_DATA = 3
 #: IBKR asked us to back off. Distinct from EXIT_ERROR so the daily cron can
 #: stay silent on throttling and only alert on a genuine failure.
 EXIT_THROTTLED = 4
+#: `serve` stopped so the launcher can start it again: an update or a journal
+#: import is waiting (see `launcher/app.py`). 75 is sysexits' EX_TEMPFAIL.
+EXIT_RESTART = 75
 
 EPILOG = """\
 examples:
@@ -862,10 +866,10 @@ def cmd_serve(args) -> int:
     # agent's stdout, so a supervised `serve` would otherwise append to one file
     # forever. A one-shot `optjournal bars` needs no such thing and should not
     # leave a file behind.
-    logs.configure(ROOT)
+    logs.configure(DATA_HOME)
 
     try:
-        serve(
+        restart = serve(
             db_path=db,
             archive_dir=archive_dir,
             query_id=query_id,
@@ -883,6 +887,17 @@ def cmd_serve(args) -> int:
     except OSError as exc:
         print(f"\nCould not bind {args.host}:{args.port}: {exc}", file=sys.stderr)
         return EXIT_ERROR
+    return EXIT_RESTART if restart else EXIT_OK
+
+
+def cmd_prepare(_args) -> int:
+    """Bring the journal home before the server starts. The launcher runs this.
+
+    Reports and never fails: a journal that could not be moved still opens from
+    where it is, and the launcher starts the server either way.
+    """
+    for line in install.prepare():
+        print(line)
     return EXIT_OK
 
 
@@ -1399,6 +1414,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="report whether the last session's perishable option "
                            "bars actually landed; fetches nothing")
     p.set_defaults(func=cmd_bars)
+
+    p = sub.add_parser("prepare", parents=[common],
+                       help="move the journal to its home folder (the Start file runs this)")
+    p.set_defaults(func=cmd_prepare)
 
     p = sub.add_parser("update", parents=[common, database],
                        help="fast-forward to the latest published commit")

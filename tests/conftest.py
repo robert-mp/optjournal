@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from optjournal import settings
+from optjournal.config import data_home
 from optjournal.db import connect, migrate
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
 from optjournal.mutate import CLONE_ENV
@@ -44,7 +45,7 @@ ROOT = Path(__file__).resolve().parent.parent
 #: Optional acceptance corpus from the developer's account. Tests that make
 #: claims about specific live rows opt into this explicitly; the normal suite
 #: never changes when another statement is fetched.
-LIVE_RAW_DIR = ROOT / "raw"
+LIVE_RAW_DIR = data_home() / "raw"
 LIVE_STATEMENTS = sorted(LIVE_RAW_DIR.glob("activity-*.xml"))
 
 

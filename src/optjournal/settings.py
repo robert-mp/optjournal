@@ -38,7 +38,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from optjournal.config import ROOT
+from optjournal.config import HOME_ENV, data_home
 
 __all__ = [
     "DEV_ENV",
@@ -73,24 +73,18 @@ _KEYS = frozenset({"query_id", "confirm_query_id", "scoring", "tiles", "dev"})
 DEV_ENV = "OPTJOURNAL_DEV"
 
 
-#: Overrides the directory holding the settings file. Two callers need it and
-#: neither is a preference:
-#:
-#: * the TEST SUITE, which must never read or write the developer's own
-#:   `.optjournal.json`. Without this, any test exercising the query id's
-#:   precedence silently picks up whatever is stored on the machine running it --
-#:   which is how `test_no_query_id_anywhere_stays_none_rather_than_empty` came to
-#:   pass or fail depending on whether the developer had run `optjournal setup`;
-#: * a PACKAGED build, where the code directory is inside a signed application
-#:   bundle and is neither writable nor preserved across an update.
-HOME_ENV = "OPTJOURNAL_HOME"
-
-
 def path_for(root: Path | None = None) -> Path:
+    """The settings file: in `root` when given, else in the journal's home.
+
+    The home is `config.data_home()`, so `$OPTJOURNAL_HOME` still moves it. The
+    TEST SUITE depends on that: it must never read or write the developer's own
+    `.optjournal.json`, which is how `test_no_query_id_anywhere_stays_none_rather_
+    than_empty` once passed or failed depending on whether the developer had run
+    `optjournal setup`.
+    """
     if root is not None:
         return root / FILENAME
-    override = os.environ.get(HOME_ENV)
-    return (Path(override) if override else ROOT) / FILENAME
+    return data_home() / FILENAME
 
 
 def read(root: Path | None = None) -> dict[str, Any]:

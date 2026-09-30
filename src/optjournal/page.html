@@ -223,6 +223,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Array} watchlist -- Watch rows (serialize.watchlist_data)
  * @property {Scheduler} scheduler -- what the jobs did, and whether the loop is
  *   alive (serialize.jobs_data). Two separate questions: see the typedef
+ * @property {Install} install -- where the journal lives, whether the launcher is
+ *   supervising this server, and journals a previous download left (web.build_state)
  * @property {Array} history_plan -- HistoryChunk rows a history import would
  *   request now, newest first (sync.history_plan); empty when complete
  * @property {Audit} audit -- did the last session's perishable bars land
@@ -1343,6 +1345,31 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   symbol has no options", which would be false about the reader's own watchlist
  */
 
+/** @typedef {Object} Install -- the launcher's view of this install (web.build_state)
+ * @property {string} home -- the folder holding the journal
+ * @property {boolean} supervised -- started by the Start file, so it can restart itself
+ * @property {Array} previous -- paths of other downloads holding a journal; empty
+ *   unless this journal is (install.previous_journals)
+ */
+
+/** @typedef {Object} UpdateCheck -- GET /api/update (updates.check), off the state payload
+ * @property {string} current
+ * @property {boolean} available
+ * @property {string|null} cannot_apply -- why the button would not work here, or null
+ * @property {string} [latest]
+ * @property {string} [notes]
+ * @property {string} [url]
+ * @property {string} [error]
+ */
+
+/** @typedef {Object} UpdateReply -- POST /api/update and /api/install/import
+ * @property {boolean} ok
+ * @property {string} kind
+ * @property {string} [message]
+ * @property {string} [version]
+ * @property {string} [source]
+ */
+
 /** @typedef {Object} HistoryChunk -- one request of a history import (web.build_state)
  * @property {string} from -- YYYYMMDD, IBKR's `fd`
  * @property {string} to -- YYYYMMDD, IBKR's `td`
@@ -1382,7 +1409,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
  * @payload ivr:IvRank ir:IvRank
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
- * @payload lb:Logbook hc:HistoryChunk
+ * @payload lb:Logbook hc:HistoryChunk ins:Install upd:UpdateCheck ures:UpdateReply
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite lkres:LinkWrite
  * @payload rv:JournalReview ty:Tally tt:TriggerTally zr2:OdteRefresh
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
@@ -1394,7 +1421,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local RGEO geo edges fr xy sks dd sp dsegs seg
  * @local play scrub speed loop ev reached stops at dismiss
  * @local chosen ws opts thin px
- * @local shownByDay next picked plan
+ * @local shownByDay next picked plan u
  * @local JSON Object ages input mine qb wf was
  * @local when parts names raw err
  * @local COST_OPTIONS bits cost fees on wh
@@ -5825,6 +5852,90 @@ function provisionalBanner(){
       no realised P&L exists for these yet; tomorrow's statement settles them.`;
 }
 
+/* The two things the app itself can offer: a newer version, and a journal a
+   previous download left. Both are one button because the people this is for
+   do not use a terminal; everything the button does is on the server. */
+function appBanners(){
+  const upd=S.update, ins=(S.state&&S.state.install)||{};
+  let out='';
+  if(upd&&upd.available){
+    out+=`<div class="card banner"><b>Version ${esc(upd.latest)} is available</b>
+      <span class="dim">(you have ${esc(upd.current)})</span>
+      ${upd.cannot_apply
+        ? `<div class="note">${esc(upd.cannot_apply)}.</div>`
+        : `<button class="btn" id="updgo">Update to ${esc(upd.latest)}</button>`}
+      ${upd.notes?`<details><summary>What's new</summary>
+        <pre class="note">${esc(upd.notes)}</pre></details>`:''}
+    </div>`;
+  }
+  const found=(ins.previous||[])[0];
+  if(found&&ins.supervised){
+    out+=`<div class="card banner"><b>Found your journal</b> in
+      <span class="mono">${esc(found)}</span>.
+      <button class="btn" id="impgo" data-source="${esc(found)}">Use this journal</button>
+      <div class="note">It moves into ${esc(ins.home)}, where every future version
+      finds it.</div></div>`;
+  }
+  return out;
+}
+
+/* Ask the server whether a newer release exists. Once per page load: the server
+   caches the answer for hours, and an offline laptop just shows no banner. */
+async function checkUpdate(){
+  try{
+    const r=await fetch('/api/update');
+    S.update=await r.json();
+  }catch(e){S.update=null;}
+  /* The first load may still be in flight; it draws the banner when it lands. */
+  if(S.state) draw();
+}
+
+/* After a restart is asked for, wait for the server to come back, then reload
+   onto the new code. The first start after an update installs dependencies,
+   so the wait is generous. */
+async function awaitRestart(){
+  await new Promise(r=>setTimeout(r,3000));
+  for(let i=0;i<180;i++){
+    try{
+      const r=await fetch('/api/update',{cache:'no-store'});
+      if(r.ok){location.reload(); return;}
+    }catch(e){/* still restarting */}
+    await new Promise(r=>setTimeout(r,1000));
+  }
+  note('optjournal has not come back. Close its window and open the Start file '
+    +'again.','bad');
+}
+
+function bindAppBanners(){
+  const u=$('#updgo');
+  if(u) u.onclick=async()=>{
+    u.disabled=true; u.classList.add('busy'); u.textContent='Updating…';
+    try{
+      const r=await fetch('/api/update',{method:'POST'});
+      const ures=await r.json();
+      if(!ures.ok){note('Could not update: '+esc(ures.message||''),'bad');
+        u.disabled=false; u.classList.remove('busy');
+        u.textContent='Update to '+esc(S.update.latest); return;}
+      note(`Installing version ${esc(ures.version)}. The page reloads by itself.`,'ok');
+      await awaitRestart();
+    }catch(e){note('Could not update: '+esc(e),'bad');}
+  };
+  const m=$('#impgo');
+  if(m) m.onclick=async()=>{
+    m.disabled=true; m.classList.add('busy');
+    try{
+      const r=await fetch('/api/install/import',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({source:m.dataset.source})});
+      const ures=await r.json();
+      if(!ures.ok){note('Could not use that journal: '+esc(ures.message||''),'bad');
+        m.disabled=false; m.classList.remove('busy'); return;}
+      note('Moving your journal. The page reloads by itself.','ok');
+      await awaitRestart();
+    }catch(e){note('Could not use that journal: '+esc(e),'bad');}
+  };
+}
+
 function settingsPanel(){
   const st=S.state, se=st.settings||{};
   const src=se.query_id_source;
@@ -6173,7 +6284,7 @@ function draw(push){
    * silence, here, looks like "there is no data", which is a different claim. */
   let html;
   try{
-    html=(S.showCog?settingsPanel():'')+subnav()+(v?v():
+    html=appBanners()+(S.showCog?settingsPanel():'')+subnav()+(v?v():
       `<div class="card"><div class="empty">nothing here yet</div></div>`);
   }catch(err){
     note(`Could not render the ${esc(S.tab)} tab: ${esc(String(err&&err.message||err))}`
@@ -6439,6 +6550,7 @@ function draw(push){
      which is every render on every other tab. */
   companionPost();
   bindJobRuns();
+  bindAppBanners();
   /* First view of the Watchlist fetches quotes once, so the tab is useful without
      a click -- and NOT on any later redraw, because each quote is an HTTP request
      and a redraw happens on every toggle, filter and edit. `quotesAt` is the
@@ -6954,4 +7066,5 @@ window.onhashchange=()=>{
 
 applyHash();
 load();
+checkUpdate();
 </script></body></html>

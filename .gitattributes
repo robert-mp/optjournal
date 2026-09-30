@@ -1,0 +1,4 @@
+# The Windows Start file must keep CRLF line endings: cmd.exe misreads a .bat
+# with bare LF around labels and blocks. The macOS one must keep LF.
+*.bat text eol=crlf
+*.command text eol=lf

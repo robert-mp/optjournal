@@ -715,6 +715,11 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
 .card{margin-top:var(--s6);padding:var(--s7);border-radius:var(--r3);
   background:var(--panel);border:1px solid var(--line)}
 .card h2{font-size:var(--t6);font-weight:var(--w-fig);margin:0 0 var(--s1)}
+/* The app's own offers (a new version, a found journal): a card that names
+   itself by its edge, so it reads as the app speaking rather than as data. */
+.card.banner{border-left:3px solid var(--accent);display:flex;flex-wrap:wrap;
+  align-items:center;gap:var(--s3)}
+.card.banner .note,.card.banner details{flex-basis:100%}
 /* `h3` is styled as an ELEMENT, deliberately, and it is the one place here that
    earns an unclassed selector. This bug has been found twice: the Watchlist's
    title was a classless `<h3>` wearing the user agent's size and its 1em margins

@@ -13,7 +13,33 @@ Local tool, one journal per install: single user, loopback only, no
 authentication, and your data never leaves the machine. Several people can each
 run their own copy; an install is never shared between them.
 
-## Requirements
+## Getting started (no terminal)
+
+1. On GitHub, click **Code → Download ZIP**, and open the ZIP to unpack it.
+2. Open the unpacked folder and double-click the Start file:
+   - **Mac:** `Start optjournal.command`. The first time, macOS says it cannot
+     check the file. Open **System Settings → Privacy & Security**, scroll down,
+     click **Open Anyway**, and confirm. On older macOS, right-click the file
+     and choose **Open** instead.
+   - **Windows:** `Start optjournal.bat`. If Windows says it protected your PC,
+     click **More info → Run anyway**.
+3. A window opens and the first start installs what optjournal needs, which takes
+   a minute. Then your browser opens the journal. **Keep that window open** while
+   you use it; closing it stops optjournal.
+4. In the page, open Settings (the gear), paste your IBKR Flex token and query
+   id, and press **Sync**. The first sync fetches the last year. For older years,
+   Settings → Advanced has **Import full history**.
+
+**Updates:** when a new version is out, the page shows a banner. Click
+**Update**, and optjournal installs it and reloads by itself.
+
+**Your journal lives in your user folder**, not in the downloaded one:
+`~/Library/Application Support/optjournal` on a Mac, `%APPDATA%\optjournal` on
+Windows. Every version finds it there, so you can delete old downloads. If you
+used a download from before this existed, the page offers to bring that journal
+across: click **Use this journal**.
+
+## Requirements (for the terminal)
 
 - Windows 10/11, macOS or Linux, Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
@@ -75,7 +101,8 @@ tells you about.
 | `sync` | fetch the newest statement, ingest it, report what is new |
 | `confirms` | fetch today's fills from a Trade Confirmation query (same session, not next-day) |
 | `serve` | the dashboard, plus the in-process scheduler |
-| `update` | fast-forward this install to the latest published commit |
+| `update` | fast-forward a git clone to the latest published commit |
+| `prepare` | move the journal to its home folder (the Start file runs this) |
 | `history` | closed-position P&L, round trip by round trip |
 | `positions` | the current option book |
 | `costs` | one statement's cost report |
@@ -104,12 +131,29 @@ optjournal friction --month 2026-08       one month (or a year: 2026)
 | Flex Query ID | `.optjournal.json` | `optjournal setup`, or Settings in the page |
 | Confirms Query ID | `.optjournal.json` | Settings in the page, or `$OPTJOURNAL_CONFIRM_QUERY_ID`. Optional |
 | Scoreboard unit | `.optjournal.json` | Settings in the page |
-| Database, archive | beside the code (`journal.db`, `raw/`) | `--db` / `--archive` |
+| Database, archive, settings | the journal's home (below) | `--db` / `--archive`, `$OPTJOURNAL_HOME` |
 
 The query id also reads from `--query-id` and `$OPTJOURNAL_QUERY_ID`, in that
 order of precedence, so an existing install or a cron keeps working unchanged.
-`$OPTJOURNAL_HOME` moves the settings file, which is what lets the test suite
-and a packaged build keep out of the repo directory.
+
+The journal's home is `$OPTJOURNAL_HOME` if set. Otherwise it is the code folder
+IF that already holds a journal, which is every git clone set up before homes
+existed, so a developer's checkout and its launchd agent keep working untouched.
+Otherwise it is the per-user folder, which is where a download's journal lives.
+
+## Publishing an update
+
+Friends on a downloaded ZIP update from GitHub Releases, not from `main`, so you
+choose when they get a version:
+
+1. Bump `version` in `pyproject.toml` (the one place it is written), commit, push.
+2. Publish a release tagged with that version:
+   `gh release create v0.2.0 --title "0.2.0" --notes "What changed"`.
+
+Their page offers it on its next start (it checks at most every six hours). The
+release notes are what the banner shows under **What's new**. A release whose
+code is not the version its tag names is refused, and so is one that would
+contain any journal file.
 
 ## Wins and losses: two ways to count
 
