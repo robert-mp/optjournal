@@ -213,6 +213,16 @@ test("a level exactly between two strikes resolves AWAY from the money on both s
   assert.equal(rail("put").strike, 6920);
 });
 
+test("an in-the-money tie names the pad's strike, the one the ladder marks", () => {
+  /* A call typed below the market (or a put above it) exactly between two
+     strikes: the pad rounded by where the level sat and the ladder by the pad,
+     so the pad said 7630 while the ladder marked 7635. */
+  assert.equal(scratchRead(SPX, 7632.5, "call").strike, strikeNear(7632.5, "call"));
+  assert.equal(scratchRead(SPX, 7632.5, "call").strike, 7635);
+  assert.equal(scratchRead(SPX, 7782.5, "put").strike, 7780);
+  assert.equal(scratchRead(SPX, 7782.5).strike, 7785, "no pad: inferred as before");
+});
+
 test("a scratch level is measured from the close, and says which side it is", () => {
   const call = scratchRead(SPX, "7781");
   assert.equal(Number(call.points.toFixed(2)), 74.97);

@@ -493,8 +493,13 @@ export function ladderRows(spx, vix, options) {
  * `side` is "above", "below" or "at" rather than "call"/"put": this function is
  * told a level, not an intention, and a level typed into the call pad that sits
  * below the market is a fact the page should be able to show as one.
+ *
+ * `pad` ("call" or "put") names the pad the level was typed into. The strike is
+ * rounded by ITS side, as the ladder's line is (`scratchLines`), so an
+ * in-the-money level exactly between two strikes names the same one in both
+ * places. Without it the side is inferred from where the level sits.
  */
-export function scratchRead(spx, level) {
+export function scratchRead(spx, level, pad) {
   const close = parseNumber(spx);
   const entry = parseNumber(level);
   if (close == null || close <= 0 || entry == null || entry <= 0) return null;
@@ -503,7 +508,7 @@ export function scratchRead(spx, level) {
     level: entry,
     points,
     pct: points / close * 100,
-    strike: strikeNear(entry, entry < close ? "put" : "call"),
+    strike: strikeNear(entry, pad || (entry < close ? "put" : "call")),
     side: entry > close ? "above" : entry < close ? "below" : "at",
   };
 }

@@ -3367,7 +3367,7 @@ function replayReadout(fr,size,dp){
      real P&L. Naming the state is also the more useful readout: the figure is
      absent because there is no position, not because the exposure was zero. */
   const dl=fr.delta==null?'<span class="dim2">flat</span>':`Δ ${num(fr.delta,2)}`;
-  return `${when} · <b class="${cls(fr.pnl)}">${money(fr.pnl,'USD',2)}</b> `
+  return `${when} · <b class="${cls(fr.pnl,2)}">${money(fr.pnl,'USD',2)}</b> `
     +`<span class="dim2">est. P&L · </span>${dl}`;
 }
 
@@ -5561,8 +5561,8 @@ function odte(){
       :`<span class="dim2">Enter a closing SPX level and a VIX to draw the
         ladder.</span>`}</div>
     <div class="zpads">
-      ${pad('call',scratchRead(spx,S.zcall))}
-      ${pad('put',scratchRead(spx,S.zput))}
+      ${pad('call',scratchRead(spx,S.zcall,'call'))}
+      ${pad('put',scratchRead(spx,S.zput,'put'))}
     </div>
     ${zrows.length?`<div class="zladwrap"><table class="zlad"><thead><tr>
       <th class="n zc">Call exact</th><th class="n zc">Move %</th>

@@ -321,3 +321,20 @@ def test_the_companion_wears_the_shared_stylesheet_and_no_rules_of_its_own():
     markup = COMPANION.read_text(encoding="utf-8")
     assert '/static/app.css' in markup, "the companion must share the stylesheet"
     assert "<style" not in markup, "a stylesheet was embedded in the companion"
+
+
+def test_a_sign_class_is_judged_at_the_precision_its_figure_prints_at():
+    """`cls(value, digits)` decides zero on the figure AS PRINTED, but only when told
+    the precision: `cls(fr.pnl)` beside `money(fr.pnl,'USD',2)` coloured a -0.0028
+    P&L red while it printed "$0.00". Every sign class next to a figure printed at
+    a fixed precision must name that precision."""
+    page = PAGE.read_text(encoding="utf-8")
+    missing = []
+    for found in re.finditer(r"cls\(([^,()]+)\)", page):
+        arg = re.escape(found.group(1).strip())
+        after = page[found.end():found.end() + 160]
+        printed = re.search(rf"(?:money|num|pct)\(\s*{arg}\s*(,[^)]*)\)", after)
+        if printed and re.search(r",\s*\d\s*$", printed.group(1)):
+            missing.append(f"line {page.count(chr(10), 0, found.start()) + 1}: "
+                           f"{found.group(0)} beside {printed.group(0)}")
+    assert not missing, missing

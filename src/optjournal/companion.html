@@ -71,7 +71,7 @@ function syncHash(){
    that changes height as levels are typed moves under the pointer, and this one
    is positioned by hand over something else. */
 function pad(side){
-  const zs=scratchRead(Z.spx,side==='call'?Z.call:Z.put);
+  const zs=scratchRead(Z.spx,side==='call'?Z.call:Z.put,side);
   return `<div class="zpad ${side==='call'?'zpadcall':'zpadput'}">
     <div class="zpadh"><span class="zk">${side} sold</span>
       <span class="zv">${zs?level(zs.level):'—'}</span></div>
