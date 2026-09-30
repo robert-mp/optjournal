@@ -612,6 +612,12 @@ and no rule sets a layout property its display mode cannot use.
   work**, calls the work directly, writes the outcome, prunes to 200 rows per job
   while unconditionally keeping the newest `fired_for` row.
 
+*Revised after the 2026-09-30 QA pass (L13).* `timeout_s` is gone from the spec.
+Nothing ever read it: a job thread cannot be interrupted mid-call, the bound that
+does exist is on the socket (`flex.FETCH_SOCKET_TIMEOUT_S`), and the "stuck for 23
+min" rendering proposed under *What is not worth doing* was never built. A field a
+reader could tune without changing anything was worse than none.
+
 **The registry is code, and that is the fix for a specific failure.**
 `crons.json` holds 7 jobs and **none** is `optjournal-market` (re-verified at
 review: `grep -c optjournal-market ~/.meshclaw/crons.json` → 0). So 143 lines of
@@ -870,6 +876,16 @@ Without this rule the first reconcile after a restore spends an IBKR request and
 24 bar requests unprompted. Both losing designs stated it and Design 1 did not;
 it is the sharpest foot-gun here and it belongs in the code as a comment.
 
+*Revised after the 2026-09-30 QA pass (M13).* As built, "its next natural slot"
+never came: the code skipped any job with no recorded run, and nothing but a run
+could record one, so a fresh journal ran `sync`, `bars_daily` and `market` zero
+times in two simulated weeks. The slot now has a reference, the moment the
+`Scheduler` started: an instant after it runs, an instant before it is still never
+caught up. In the same pass (M11, M12), a run that asked IBKR nothing gives its
+instant back and is retried five minutes later: a failure of a job that spends no
+request (`market`, `bars_daily`), or any run that only waited out the fetch lock.
+A failed `sync` still keeps its claim.
+
 **Containment.** Each job's due-check is wrapped in `try/except` so one job's bad
 zone arithmetic cannot stop the tick, and the failure is recorded. The heartbeat
 is written by the tick loop itself, so a dead loop reads as a dead heartbeat.
@@ -911,6 +927,16 @@ whose every instant fails from being started once per instant forever. Five
 consecutive failures now stops the RECONCILER starting it, while leaving it
 runnable by hand from the page — a brake, not a black hole, and the count clears on
 any healthy outcome so recovery needs no restart.
+
+*Revised after the 2026-09-30 QA pass (H7).* That was a black hole after all: the
+count only clears on a run, and the reconciler no longer started one, so only a
+manual run could end the backoff. Five minutes of DNS failures parked `bars_live`
+from 09-09 to 09-24. A backed-off job now keeps its healthy cadence and loses only
+its quick retries: a window job gets one attempt per window (55 minutes for
+`bars_live`, 25 for `confirm`), a daily job one per scheduled instant. So it comes
+back on its own, and it never asks IBKR more often than a working job does
+(`tests/test_jobs.py` simulates a week offline and holds it to that). The payload
+carries `backed_off`, and the page says so beside the failure count.
 
 **`tick_failures` beside `ticks`.** A test forced this: the first version counted
 only COMPLETED ticks, so a loop that was alive and failing every tick read as dead
@@ -1196,7 +1222,7 @@ already in `build_state` and drawn.
 - **A Cancel button in v1.** You cannot kill a thread mid-`upsert_bars`, and the
   honest version (a flag checked between the 24 requests) buys little for a 1.4 s
   median. What the UI gives instead is the truth about a stuck run: a `running`
-  row older than the job's `timeout_s` renders red as "stuck for 23 min", and
+  row older than a per-job ceiling renders red as "stuck for 23 min", and
   recovery is a restart, which `KeepAlive` makes cheap and `flock` makes safe. If
   the 600 s tail later forces a cancel, build it with honest granularity — the flag
   is checked *between* windows, the button says "stopping after the current

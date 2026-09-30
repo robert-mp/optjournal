@@ -351,7 +351,7 @@ jobs.JOBS = (
         name="market",
         run=lambda conn, ctx: (time.sleep({sleep}), jobs.Outcome("ok", "slept"))[1],
         minute=0, hour=0, weekdays=(1, 2, 3, 4, 5, 6, 7), zone="UTC",
-        catchup=jobs.Catchup.WINDOW, window_s=60, timeout_s=300,
+        catchup=jobs.Catchup.WINDOW, window_s=60,
     ),
 )
 web.serve(db_path=Path({db!r}), archive_dir=Path({archive!r}),

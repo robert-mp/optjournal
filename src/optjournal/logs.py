@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 from pathlib import Path
 
 __all__ = ["LOG_DIR", "MAX_BYTES", "BACKUPS", "configure", "log_path"]
@@ -44,6 +45,39 @@ BACKUPS = 5
 
 def log_path(root: Path) -> Path:
     return root / LOG_DIR / "optjournal.log"
+
+
+class _RotatingHandler(logging.handlers.RotatingFileHandler):
+    """A `RotatingFileHandler` that keeps writing when the rename is refused.
+
+    WINDOWS WILL NOT RENAME A FILE ANOTHER PROCESS HAS OPEN, and the stdlib
+    handler does not survive that. Its `doRollover` closes the stream, shifts the
+    backups, then fails on the last rename: the record is dropped, and so is every
+    later record past `MAX_BYTES`, each attempt shifting the backups once more.
+
+    So the live file is moved aside FIRST, before any backup is touched. If that
+    is refused nothing has moved, the same file is reopened, the record is
+    written, and the next record past the cap tries again. The file runs over its
+    cap while it is held, which is the right trade for a log that exists to be
+    read after something went wrong.
+    """
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        live = self.baseFilename
+        aside = f"{live}.rotating"
+        try:
+            os.replace(live, aside)
+        except OSError:
+            self.stream = self._open()
+            return
+        for n in range(self.backupCount - 1, 0, -1):
+            if os.path.exists(f"{live}.{n}"):
+                os.replace(f"{live}.{n}", f"{live}.{n + 1}")
+        os.replace(aside, f"{live}.1")
+        self.stream = self._open()
 
 
 def configure(root: Path, *, level: int = logging.INFO) -> Path | None:
@@ -72,7 +106,7 @@ def configure(root: Path, *, level: int = logging.INFO) -> Path | None:
         return target
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.handlers.RotatingFileHandler(
+        handler = _RotatingHandler(
             target, maxBytes=MAX_BYTES, backupCount=BACKUPS, encoding="utf-8",
         )
     except OSError as exc:

@@ -224,6 +224,65 @@ def test_the_log_rotates_because_macos_will_not(tmp_path):
         handler.close()
 
 
+def test_a_log_another_process_holds_keeps_every_record(tmp_path, monkeypatch):
+    """L12: Windows refuses to rename a file another process has open.
+
+    The stdlib handler closes its stream, shifts the backups, and then fails on
+    the rename, so the record is dropped; every later record past the cap does the
+    same, and each attempt shifts the backups again. Simulated with the error
+    Windows raises (`PermissionError`, WinError 32) on the one rename that moves
+    the live file, with a tiny cap so a few records cross it.
+    """
+    import logging  # noqa: PLC0415 - local to this test
+    import os  # noqa: PLC0415 - local to this test
+
+    from optjournal import logs  # noqa: PLC0415 - local to this test
+
+    monkeypatch.setattr(logs, "MAX_BYTES", 300)
+    target = logs.configure(tmp_path)
+    assert target is not None
+    handler = next(
+        h for h in logging.getLogger().handlers
+        if isinstance(h, logging.handlers.RotatingFileHandler)
+        and Path(h.baseFilename) == target
+    )
+    held = {"now": True}
+
+    def refusing(real):
+        def rename(src, dst, *args, **kwargs):
+            if held["now"] and Path(src) == target:
+                raise PermissionError(
+                    13, "The process cannot access the file because it is being "
+                    "used by another process", str(src))
+            return real(src, dst, *args, **kwargs)
+        return rename
+
+    monkeypatch.setattr(os, "rename", refusing(os.rename))
+    monkeypatch.setattr(os, "replace", refusing(os.replace))
+    log = logging.getLogger("optjournal.test.rotation")
+    try:
+        for n in range(20):
+            log.warning("record %02d, long enough that a handful cross the cap", n)
+        handler.flush()
+        written = target.read_text(encoding="utf-8")
+        missing = [n for n in range(20) if f"record {n:02d}" not in written]
+        assert not missing, (
+            f"records {missing} were dropped while another process held the log"
+        )
+
+        # Released: the next record past the cap rotates as normal.
+        held["now"] = False
+        log.warning("after the other process let go")
+        handler.flush()
+        rotated = target.with_name(target.name + ".1")
+        assert rotated.exists(), "rotation was never retried once the file was free"
+        assert "record 19" in rotated.read_text(encoding="utf-8")
+        assert "after the other process let go" in target.read_text(encoding="utf-8")
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+
+
 def test_configuring_the_log_twice_does_not_duplicate_every_line(tmp_path):
     """`serve` is callable more than once in a process -- the suite does it
     routinely -- and stacked handlers write every line N times, which corrupts

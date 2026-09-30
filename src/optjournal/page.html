@@ -764,6 +764,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string|null} last_status
  * @property {number|null} last_fired_for -- the newest scheduled instant claimed
  * @property {number} consecutive_failures
+ * @property {boolean} backed_off -- past jobs.FAILURE_BACKOFF: the fast retries have
+ *   stopped and the job runs only at its healthy cadence until a run succeeds
  * @property {JobRun|null} last_run -- the newest job_runs row, or null
  * @property {boolean} spends_request -- running this costs one of IBKR's
  *   rate-limited Flex requests. From the REGISTRY, so the page holds no copy of
@@ -2705,8 +2707,10 @@ function collection(){
       <span class="dim jobdet">${esc(detail)}</span>
       <span class="dim2 jobwhen mono">${esc(when.slice(0,16).replace('T',' '))}</span>
       ${j.consecutive_failures>1?`<span class="pill gap neg"
-        title="Consecutive failures since the last healthy run."
-        >×${j.consecutive_failures}</span>`:''}
+        title="${j.backed_off
+          ? 'Backed off: the quick retries have stopped. It is still tried at its usual pace (once per window, or once per scheduled time) and comes back on its own when a run succeeds.'
+          : 'Consecutive failures since the last healthy run.'}"
+        >${j.backed_off?'backed off ':''}×${j.consecutive_failures}</span>`:''}
       ${j.retired
         /* No button: the job left the registry, so there is nothing to run. Its
            history stays visible and labelled rather than disappearing, because a

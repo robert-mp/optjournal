@@ -66,6 +66,7 @@ __all__ = [
     "UnknownJob",
     "due_jobs",
     "interrupted_runs",
+    "is_backed_off",
     "job_by_name",
     "prune_runs",
     "record_manual_sync",
@@ -276,9 +277,14 @@ class Context:
     `web.ServeConfig` exists: the alternative is module-level state that two
     servers in one process silently share, which the test suite creates routinely.
 
-    `query_id` may be None -- a journal serving an already-ingested archive with no
-    credentials configured is a supported state, and `sync` then reports `failed`
-    with a cause rather than raising past the ledger.
+    `query_id` is an EXPLICIT OVERRIDE only (`serve --query-id`), or None. The id a
+    run actually uses is resolved per run by `settings.query_id`, so one saved in
+    Settings while the server runs reaches the next scheduled sync and the next Run
+    press. Carrying the id `serve` resolved at start-up froze it for the life of
+    the process: a launcher install onboards through Settings, so it started with
+    no id and every scheduled sync kept recording "no Flex query id configured"
+    until a restart. With nothing configured anywhere, `sync` reports `failed` with
+    the cause rather than raising past the ledger.
     """
 
     archive_dir: Path
@@ -322,10 +328,11 @@ class Job:
     zone: str
     catchup: Catchup
     window_s: int
-    timeout_s: int
     #: Whether a run consumes one of IBKR's rate-limited Flex requests. Read by
-    #: the reconciler before retrying anything, and the reason `sync` may not be
-    #: made due again by a mere failure (see the plan's step 6).
+    #: the runner when a run fails: a job that spends none gives its instant back
+    #: and is retried after `RETRY_AFTER_S`, while one that does keeps the claim,
+    #: which is the reason `sync` may not be made due again by a mere failure (see
+    #: the plan's step 6). A failed fetch may already have reached IBKR.
     spends_broker_request: bool = False
 
     def tz(self) -> ZoneInfo:
@@ -346,6 +353,11 @@ class Outcome:
     detail: str = ""
     done: int = 0
     total: int = 0
+    #: The work never started, because another process held a lock it needed
+    #: (the shared Flex fetch lock, in practice). Recorded as `nothing`, and the
+    #: run gives its scheduled instant back: nothing was asked, so nothing was
+    #: spent and nothing was served.
+    busy: bool = False
 
 
 class UnknownJob(KeyError):
@@ -439,14 +451,15 @@ def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     OS file lock, and stamps `.fetch-state.json`; a second copy of that sequence would be
     a second thing to keep in step with the lockout budget.
     """
-    if not ctx.query_id:
+    query_id = prefs.query_id(ctx.query_id)       # per run: see `Context`
+    if not query_id:
         # A journal with no credentials configured is a supported state, not a
         # crash: `failed` with the cause is what a reader can act on.
         return Outcome("failed", "no Flex query id configured")
 
     try:
         result = sync_journal(
-            conn=conn, archive_dir=ctx.archive_dir, query_id=ctx.query_id,
+            conn=conn, archive_dir=ctx.archive_dir, query_id=query_id,
             assets=ctx.assets,
         )
     except (FetchCooldown, TokenMissing, TokenRejected) as exc:
@@ -461,11 +474,12 @@ def _history(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     that landed are real, and the refusal is named in the detail. `failed` only
     when the first chunk was refused, because then nothing happened.
     """
-    if not ctx.query_id:
+    query_id = prefs.query_id(ctx.query_id)       # per run: see `Context`
+    if not query_id:
         return Outcome("failed", "no Flex query id configured")
     try:
         result = import_history(
-            conn=conn, archive_dir=ctx.archive_dir, query_id=ctx.query_id,
+            conn=conn, archive_dir=ctx.archive_dir, query_id=query_id,
             assets=ctx.assets,
         )
     except (TokenMissing, TokenRejected) as exc:
@@ -501,7 +515,7 @@ def _confirm(conn: sqlite3.Connection, ctx: Context) -> Outcome:
 
     The id is read from settings HERE rather than carried on `Context`, so saving
     it in the page takes effect on the next tick instead of on the next restart --
-    the same reason `web._effective_query_id` resolves per request.
+    the same reason `_sync` resolves the statement's id per run.
 
     The base currency comes from the journal, because a confirm payload has no
     AccountInformation section to state it. With no statement ingested yet there is
@@ -575,10 +589,14 @@ def sync_outcome(result: dict[str, Any] | Exception) -> Outcome:
 
     `nothing` for a cooldown: the cooldown is the system working, and retrying is
     what it exists to prevent. It DOES clear a backoff, which is deliberate -- the
-    counter means "consecutive failures", and being told to wait is not one.
+    counter means "consecutive failures", and being told to wait is not one. A
+    `LockTimeout` on the fetch lock is read the same way, as `busy`: another fetch
+    was running and nothing was asked.
     """
     if isinstance(result, FetchCooldown):
         return Outcome("nothing", f"cooldown: {result}")
+    if isinstance(result, LockTimeout):
+        return _busy(result)
     if isinstance(result, TokenMissing | TokenRejected):
         return Outcome("failed", f"credentials: {result}")
     if isinstance(result, Exception):  # pragma: no cover - callers narrow first
@@ -587,6 +605,11 @@ def sync_outcome(result: dict[str, Any] | Exception) -> Outcome:
         "ok" if result["changed"] else "nothing",
         result["summary"], result["new_trades"], result["new_trades"],
     )
+
+
+def _busy(exc: LockTimeout) -> Outcome:
+    """A run that waited out a lock another process held, and so did nothing."""
+    return Outcome("nothing", f"busy: {exc}"[:400], busy=True)
 
 
 def record_manual_sync(
@@ -619,7 +642,6 @@ JOBS: tuple[Job, ...] = (
         # A missed noon is worth running at 18:00: the docstring records a
         # badly-timed sync missing Monday's fills twice.
         catchup=Catchup.LATEST, window_s=12 * 3600,
-        timeout_s=900,
         spends_broker_request=True,
     ),
     Job(
@@ -635,7 +657,6 @@ JOBS: tuple[Job, ...] = (
         # requests to re-read the morning.
         minute=35, hour=9, weekdays=(1, 2, 3, 4, 5), zone="America/New_York",
         catchup=Catchup.WINDOW, window_s=25 * 60,
-        timeout_s=300,
         spends_broker_request=True,
     ),
     Job(
@@ -643,10 +664,10 @@ JOBS: tuple[Job, ...] = (
         run=lambda conn, ctx: _bars(conn, ctx, live=False),
         # 12:30, thirty minutes behind the sync: a position opened yesterday is
         # only in the database once that sync has ingested it, and the manifest is
-        # derived from positions. The gap clears the sync's 900s worst case.
+        # derived from positions. The gap clears the sync's worst case, the
+        # 660s of `flex.POLL_WORST_CASE_S`.
         minute=30, hour=12, weekdays=(2, 3, 4, 5, 6), zone="Europe/Dublin",
         catchup=Catchup.LATEST, window_s=20 * 3600,   # re-fetchable by definition
-        timeout_s=600,
     ),
     Job(
         name="bars_live",
@@ -660,7 +681,6 @@ JOBS: tuple[Job, ...] = (
         # 10:00 collects the whole session.
         minute=5, hour=10, weekdays=(1, 2, 3, 4, 5), zone="America/New_York",
         catchup=Catchup.WINDOW, window_s=55 * 60,
-        timeout_s=300,
     ),
     Job(
         name="market",
@@ -671,7 +691,6 @@ JOBS: tuple[Job, ...] = (
         # sync means the week's releases are on screen before the fills are.
         minute=0, hour=11, weekdays=(1, 2, 3, 4, 5), zone="Europe/Dublin",
         catchup=Catchup.LATEST, window_s=24 * 3600,   # the feed serves this week
-        timeout_s=120,
     ),
     Job(
         name="history",
@@ -681,8 +700,6 @@ JOBS: tuple[Job, ...] = (
         # reader's decision, made from the page with the count in front of them.
         minute=0, hour=0, weekdays=(), zone="UTC",
         catchup=Catchup.NONE, window_s=0,
-        # Five chunks at `flex.MAX_RETRIES`' 660s ceiling, plus the pauses.
-        timeout_s=5 * 660 + 4 * 30,
         spends_broker_request=True,
     ),
 )
@@ -717,6 +734,7 @@ def run_job(
     *,
     ctx: Context,
     fired_for: int | None = None,
+    slept: bool = False,
 ) -> int:
     """Run one job under its own lock, recording before and after. Returns run id.
 
@@ -737,16 +755,18 @@ def run_job(
     and cheap to retry on the next tick, so `JobBusy` is a better answer than a
     queue behind something that spends IBKR requests.
 
-    Raises `UnknownJob` (no such name) or `JobBusy` (already running). Any other
-    exception is recorded as `failed` and re-raised, because a caller that asked
-    for a run is entitled to the traceback -- swallowing it here is what turned
-    the keychain failure into a message that reached nobody.
+    Raises `UnknownJob` (no such name) or `JobBusy` (already running). A
+    `LockTimeout` from inside the work is recorded as busy and returns normally.
+    Any other exception rolls back the run's uncommitted writes, is recorded as
+    `failed` and is re-raised, because a caller that asked for a run is entitled
+    to the traceback -- swallowing it here is what turned the keychain failure
+    into a message that reached nobody.
     """
     job = job_by_name(name)
     lock = job_lock_path(ctx.archive_dir, job.name)
     try:
         with locked(lock, timeout_s=0):
-            return _run_locked(conn, job, ctx=ctx, fired_for=fired_for)
+            return _run_locked(conn, job, ctx=ctx, fired_for=fired_for, slept=slept)
     except LockTimeout:
         # Held by another runner. The row it committed before starting is what
         # tells the caller which run to watch.
@@ -754,15 +774,22 @@ def run_job(
 
 
 def _run_locked(
-    conn: sqlite3.Connection, job: Job, *, ctx: Context, fired_for: int | None
+    conn: sqlite3.Connection, job: Job, *, ctx: Context, fired_for: int | None,
+    slept: bool,
 ) -> int:
-    """The body of `run_job`, with the lock held. See its docstring for the why."""
+    """The body of `run_job`, with the lock held. See its docstring for the why.
+
+    `slept` goes into the claim row itself, so a run that raises carries it too.
+    Stamping it after a successful return left exactly the runs that mattered at
+    0: the keychain's -25320 refusals came on the first tick after a sleep, and
+    those runs raised.
+    """
     started = datetime.now(UTC).isoformat(timespec="seconds")
     try:
         cursor = conn.execute(
-            "INSERT INTO job_runs (job, fired_for, started_at, status, detail)"
-            " VALUES (?,?,?,'running',NULL)",
-            (job.name, fired_for, started),
+            "INSERT INTO job_runs (job, fired_for, started_at, status, detail, slept)"
+            " VALUES (?,?,?,'running',NULL,?)",
+            (job.name, fired_for, started, int(slept)),
         )
         run_id = int(cursor.lastrowid or 0)
         conn.commit()          # COMMITTED before the work: see run_job's docstring
@@ -779,26 +806,65 @@ def _run_locked(
 
     try:
         outcome = job.run(conn, ctx)
+    except LockTimeout as exc:
+        # BUSY, NOT FAILED. The shared fetch lock is held by another fetch (the
+        # page's Sync button, a history chunk waiting on IBKR's generation), so
+        # this run asked IBKR nothing. Recording it `failed` counted contention
+        # toward the backoff and kept `sync`'s day; escaping from here also made
+        # `run_job` report it as `JobBusy` for the wrong lock.
+        if conn.in_transaction:
+            conn.rollback()
+        outcome = _busy(exc)
     except Exception as exc:                      # noqa: BLE001 - recorded, re-raised
-        _finish(conn, run_id, Outcome("failed", f"{type(exc).__name__}: {exc}"[:400]))
+        # ROLLED BACK BEFORE THE BOOKKEEPING, because `_finish` commits on this
+        # same connection and would otherwise commit whatever the crashed work had
+        # written so far. That is how a sync that raised half-way through an
+        # ingest left its `statements` row committed with the rest missing, and
+        # every retry then skipped the file as already ingested. The claim row
+        # itself was committed before the work began, so it survives this.
+        if conn.in_transaction:
+            conn.rollback()
+        failed = Outcome("failed", f"{type(exc).__name__}: {exc}"[:400])
+        _finish(conn, run_id, failed, release=_gives_back(job, failed))
         raise
-    _finish(conn, run_id, outcome)
+    _finish(conn, run_id, outcome, release=_gives_back(job, outcome))
     return run_id
 
 
-def _finish(conn: sqlite3.Connection, run_id: int, outcome: Outcome) -> None:
+def _gives_back(job: Job, outcome: Outcome) -> bool:
+    """Whether this run releases the instant it claimed, so it can be retried.
+
+    A busy run asked nothing. A failed run of a job that spends no IBKR request
+    (`market`, `bars_daily`) is retried at no cost to the lockout budget, and
+    keeping the claim meant a DNS failure on the first tick after a wake used up
+    the day. A failed run of a job that DOES spend one keeps its claim: the request
+    may have reached IBKR, and the plan's step 6 is explicit that a failure must
+    not make `sync` due again.
+    """
+    return outcome.busy or (
+        outcome.status == "failed" and not job.spends_broker_request)
+
+
+def _finish(
+    conn: sqlite3.Connection, run_id: int, outcome: Outcome, *, release: bool = False,
+) -> None:
     """Stamp the terminal state onto the claim row, and update the anchor.
 
     Two statements in one transaction: a run whose history says `ok` while the
     anchor still says `running` would make the job look permanently in flight.
+
+    `release` clears the row's `fired_for`, which gives the instant back: the
+    row stays as history, and the partial unique index lets a retry claim the
+    same instant. See `_gives_back` and `RETRY_AFTER_S`.
     """
     stamp = datetime.now(UTC).isoformat(timespec="seconds")
     try:
         conn.execute(
             "UPDATE job_runs SET finished_at = ?, status = ?, detail = ?,"
-            " done = ?, total = ? WHERE id = ?",
+            " done = ?, total = ?,"
+            " fired_for = CASE WHEN ? THEN NULL ELSE fired_for END WHERE id = ?",
             (stamp, outcome.status, outcome.detail or None,
-             outcome.done, outcome.total, run_id),
+             outcome.done, outcome.total, int(release), run_id),
         )
         row = conn.execute(
             "SELECT job, fired_for FROM job_runs WHERE id = ?", (run_id,)).fetchone()
@@ -966,7 +1032,10 @@ def _in_session(now: datetime) -> bool:
     return opens <= local <= closes
 
 
-def _window_due(job: Job, now: datetime, last_poll: int | None) -> Due | None:
+def _window_due(
+    job: Job, now: datetime, last_poll: int | None, *,
+    last_try: int | None = None, backed_off: bool = False,
+) -> Due | None:
     """`Catchup.WINDOW`: inside the session, and the last POLL is old enough.
 
     SEVEN CRON SLOTS COLLAPSE INTO THIS ONE PREDICATE, and it is sound only because
@@ -982,15 +1051,34 @@ def _window_due(job: Job, now: datetime, last_poll: int | None) -> Due | None:
     Claims NO `fired_for`, because there is no instant: the run is "this session, at
     whatever moment we woke". The partial unique index accepts repeats of NULL,
     which is what lets a session be polled several times.
+
+    A failed poll does not brake, so a transient failure retries on the next tick.
+    Once the job is BACKED OFF, a failed attempt brakes like a poll, which slows it
+    to one attempt per window: the cadence it keeps when healthy, so a backed-off
+    `confirm` never asks IBKR more often than a working one does.
     """
     if not _in_session(now):
         return None
-    if last_poll is not None:
-        age = int(now.timestamp()) - last_poll
-        if age < job.window_s:
+    epoch = int(now.timestamp())
+    if last_poll is not None and epoch - last_poll < job.window_s:
+        return None
+    if backed_off and last_try is not None:
+        waited = epoch - last_try
+        if waited < job.window_s:
             return None
-        return Due(job, None, f"in session, last poll {age}s ago")
+        return Due(job, None, f"in session, backed off, last attempt {waited}s ago")
+    if last_poll is not None:
+        return Due(job, None, f"in session, last poll {epoch - last_poll}s ago")
     return Due(job, None, "in session, no completed poll yet today")
+
+
+#: How long a given-back instant waits before it is tried again. A run gives its
+#: instant back when it asked IBKR nothing (busy on the fetch lock) or when its job
+#: spends no IBKR request and it failed (see `_gives_back`). The case it is sized
+#: for is the first tick after a wake, which runs before DNS is up: five minutes
+#: lets the network come back and still lands inside a typical wake (7.5 minutes
+#: on average, measured on this machine). `FAILURE_BACKOFF` bounds how many.
+RETRY_AFTER_S = 5 * 60
 
 
 def due_jobs(
@@ -998,23 +1086,34 @@ def due_jobs(
     *,
     claimed: dict[str, set[int]],
     last_poll: dict[str, int],
+    last_try: dict[str, int],
     ever_ran: set[str],
+    failures: dict[str, int],
+    since: int | None = None,
     registry: tuple[Job, ...] | None = None,
 ) -> list[Due]:
     """Which jobs should run at `now`. Pure: no clock, no database, no I/O.
 
-    The three ledger arguments are snapshots the caller reads once, so a tick makes
-    one pass over `job_runs` rather than four queries per job:
+    The ledger arguments are snapshots the caller reads once, so a tick makes one
+    pass over `job_runs` rather than four queries per job:
 
     * `claimed` -- `fired_for` instants already recorded per job. RECORDED, not
       succeeded, and that distinction is the brake. Keying on `status='ok'` would
       make a job that failed for a real reason (the locked keychain that actually
       happened) due again on the very next tick and for its whole 12-hour window --
       roughly 48 real IBKR requests in twelve hours against a lockout budget.
-      `consecutive_failures` on `job_state` is what a human reads instead.
+      `consecutive_failures` on `job_state` is what a human reads instead. A run
+      that asked IBKR nothing, or failed without being able to spend anything,
+      gave its instant back (`_gives_back`), so it is not in here.
     * `last_poll` -- newest COMPLETED (`ok` or `nothing`) epoch per job, for
       `WINDOW` jobs only. Not `ok` alone: see `_ledger_snapshot`.
+    * `last_try` -- newest epoch at which any run of the job ended (or started,
+      while it is still running), whatever its status. An unclaimed instant with a
+      run after it was given back, and waits `RETRY_AFTER_S` from that run.
     * `ever_ran` -- jobs with ANY recorded run.
+    * `failures` -- `consecutive_failures` per job. At `FAILURE_BACKOFF` a job is
+      backed off: its fast retries stop and it keeps only its healthy cadence, one
+      attempt per window or one per scheduled instant. It is never parked.
 
     EMPTY LEDGER MEANS UNKNOWN, NOT OVERDUE. `job_runs` lives in `journal.db`,
     which a `raw/` restore rebuilds from scratch, so a rebuilt journal has no runs
@@ -1022,6 +1121,14 @@ def due_jobs(
     a restore spend an IBKR request plus 24 bar requests, unprompted, on a machine
     whose owner was recovering from something. So a job with no recorded run waits
     for its next natural slot: it is scheduled, never caught up.
+
+    "Next natural slot" needs a reference, and that is `since`: the epoch at which
+    the caller started watching (the `Scheduler`'s start). An instant at or after
+    it is a slot this process saw arrive, so it runs like any other; an instant
+    before it is one a restore would be catching up on, so it is skipped. Without
+    the reference the rule read "wait for a run that never comes", and a fresh
+    journal scheduled `sync`, `bars_daily` and `market` never (two weeks of ticks,
+    no runs). `since=None` still means that, for a caller with no start to name.
 
     Returned in REGISTRY ORDER, which the caller must preserve: `sync` before
     `bars_daily`, because the latter derives its manifest from the positions the
@@ -1037,8 +1144,10 @@ def due_jobs(
     # against a stubbed one-job registry and watching zero runs happen.
     out: list[Due] = []
     for job in (JOBS if registry is None else registry):
+        backed_off = is_backed_off(failures.get(job.name, 0))
         if job.catchup is Catchup.WINDOW:
-            found = _window_due(job, now, last_poll.get(job.name))
+            found = _window_due(job, now, last_poll.get(job.name),
+                                last_try=last_try.get(job.name), backed_off=backed_off)
             if found is not None:
                 out.append(found)
             continue
@@ -1049,14 +1158,28 @@ def due_jobs(
         stamp = int(instant.timestamp())
         if stamp in claimed.get(job.name, set()):
             continue                       # already recorded, by anyone
-        if job.name not in ever_ran:
-            # See the docstring: a journal with no history is UNKNOWN, not behind.
+        if job.name not in ever_ran and (since is None or stamp < since):
+            # See the docstring: a journal with no history is UNKNOWN, not behind,
+            # so only an instant this process watched arrive may run.
             continue
         if job.catchup is Catchup.NONE:
             continue
         behind = int(now.timestamp()) - stamp
         if behind > job.window_s:
             continue                       # too old to be worth catching up
+        tried = last_try.get(job.name)
+        if tried is not None and tried >= stamp:
+            # A run since the instant, and the instant still unclaimed: that run
+            # gave it back. Retry, but not on the very next tick, and not at all
+            # while backed off: then the next instant is the retry.
+            if backed_off:
+                continue
+            waited = int(now.timestamp()) - tried
+            if waited < RETRY_AFTER_S:
+                continue
+            out.append(Due(job, stamp, f"retrying {instant.isoformat()}, "
+                                       f"last attempt {waited}s ago"))
+            continue
         out.append(Due(job, stamp, f"scheduled {instant.isoformat()}, {behind}s late"))
     return out
 
@@ -1085,11 +1208,30 @@ def due_jobs(
 #: `job_runs` per minute (measured in microseconds on a 200-row-per-job table).
 TICK_S = 60
 
-#: Above this many consecutive failures a job stops being started by the
-#: reconciler. It stays runnable BY HAND from the page, which is the point: a job
-#: failing for a real reason should stop hammering the endpoint that is failing,
-#: without becoming invisible or requiring a restart to retry.
+#: At this many consecutive failures a job is BACKED OFF: its fast retries stop,
+#: and it runs only at its own healthy cadence. A window job gets one attempt per
+#: window (55 minutes for `bars_live`, 25 for `confirm`) instead of one per tick,
+#: and a daily job one attempt per scheduled instant instead of a retry every
+#: `RETRY_AFTER_S`. So a job failing for a real reason stops hammering the endpoint
+#: that is failing, and a backed-off job never asks IBKR more often than a healthy
+#: one does. Any healthy outcome resets the count, which is how it comes back on
+#: its own; it stays runnable by hand from the page as well.
+#:
+#: It used to stop the reconciler starting the job at all, and only a manual run
+#: could reset the count, so backoff was terminal: five minutes of DNS failures
+#: parked `bars_live` from 09-09 to 09-24, and eight sessions of hourly option
+#: bars were lost.
 FAILURE_BACKOFF = 5
+
+
+def is_backed_off(consecutive_failures: int) -> bool:
+    """Whether a job with this many consecutive failures is backed off.
+
+    One definition, for `due_jobs` and for the page's payload
+    (`serialize.jobs_data`), so the pill cannot disagree with the schedule.
+    """
+    return consecutive_failures >= FAILURE_BACKOFF
+
 
 #: How far the wall clock must run ahead of `monotonic` within one tick before the
 #: run is stamped `slept`. Generous: a normal 60 s tick shows sub-millisecond drift,
@@ -1098,25 +1240,30 @@ SLEPT_THRESHOLD_S = 90
 
 
 def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
-    dict[str, set[int]], dict[str, int], set[str], dict[str, int]
+    dict[str, set[int]], dict[str, int], dict[str, int], set[str], dict[str, int]
 ]:
-    """(claimed, last_poll, ever_ran, failures) in ONE pass over the ledger.
+    """(claimed, last_poll, last_try, ever_ran, failures) in ONE pass over the ledger.
 
     One query rather than four per job, because this runs every 60 seconds against
     the same database a job may be writing. `fired_for IS NOT NULL` is the only
-    filter that matters: a NULL claim belongs to a WINDOW job, which is braked by
-    `last_poll` instead.
+    filter that matters: a NULL claim belongs to a WINDOW job (braked by
+    `last_poll`), a manual run, or a run that gave its instant back (braked by
+    `last_try`).
     """
     claimed: dict[str, set[int]] = {}
     last_poll: dict[str, int] = {}
+    last_try: dict[str, int] = {}
     ever_ran: set[str] = set()
     for row in conn.execute(
-        "SELECT job, fired_for, status, finished_at FROM job_runs"
+        "SELECT job, fired_for, status, started_at, finished_at FROM job_runs"
     ):
         job = str(row["job"])
         ever_ran.add(job)
         if row["fired_for"] is not None:
             claimed.setdefault(job, set()).add(int(row["fired_for"]))
+        tried = _epoch_of(str(row["finished_at"] or row["started_at"]))
+        if tried is not None:
+            last_try[job] = max(last_try.get(job, 0), tried)
         # `ok` OR `nothing`, and the distinction is the brake -- the same
         # distinction `claimed` above already draws for the instant-claiming jobs,
         # never applied here until a WINDOW job started spending IBKR requests.
@@ -1141,7 +1288,7 @@ def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
         str(r["job"]): int(r["consecutive_failures"] or 0)
         for r in conn.execute("SELECT job, consecutive_failures FROM job_state")
     }
-    return claimed, last_poll, ever_ran, failures
+    return claimed, last_poll, last_try, ever_ran, failures
 
 
 def _epoch_of(stamp: str) -> int | None:
@@ -1164,8 +1311,8 @@ def _last_failure(conn: sqlite3.Connection, job: str) -> str | None:
     """The detail of this job's most recent failed run, for the backoff warning.
 
     Its own query rather than a column on `_ledger_snapshot`, because it is needed
-    only on the branch that logs -- at most once per backed-off job per tick, where
-    the snapshot runs every tick for every job. Failing quietly is right here: this
+    only on the branch that logs -- once per backed-off attempt, where the snapshot
+    runs every tick for every job. Failing quietly is right here: this
     exists to enrich a log line, and a broken read of the ledger must not stop the
     reconciler from running the work.
     """
@@ -1186,6 +1333,7 @@ def reconcile(
     ctx: Context,
     now: datetime | None = None,
     slept: bool = False,
+    since: datetime | None = None,
 ) -> list[str]:
     """Run whatever is due, once. Returns the names of the jobs started.
 
@@ -1199,35 +1347,35 @@ def reconcile(
     than logged and forgotten.
 
     `now` is injectable for the same reason `due_jobs` is pure: the tick's behaviour
-    at a DST boundary is testable without waiting for October.
+    at a DST boundary is testable without waiting for October. `since` is when the
+    caller started ticking, which is what lets a job with no history run at its
+    first instant after that (see `due_jobs`).
     """
     moment = now or datetime.now(UTC)
-    claimed, last_poll, ever_ran, failures = _ledger_snapshot(conn)
+    claimed, last_poll, last_try, ever_ran, failures = _ledger_snapshot(conn)
     started: list[str] = []
     for due in due_jobs(moment, claimed=claimed, last_poll=last_poll,
-                        ever_ran=ever_ran):
-        if failures.get(due.job.name, 0) >= FAILURE_BACKOFF:
-            # Backed off, not disabled: still runnable by hand from the page, and
-            # the count resets on any healthy outcome.
+                        last_try=last_try, ever_ran=ever_ran, failures=failures,
+                        since=None if since is None else int(since.timestamp())):
+        if is_backed_off(failures.get(due.job.name, 0)):
+            # Backed off, so `due_jobs` only offers it at its healthy cadence, and
+            # this is one of those attempts.
             #
             # THE REASON IS LOGGED WITH IT, because the version that logged only
             # the count produced 344 identical lines across two weeks of a real
             # outage and named the cause in none of them -- the cause was sitting in
             # `job_runs.detail`, which takes a SQL client to read. One extra query
-            # per backed-off job per tick, on a table this loop already reads.
-            log.warning("%s: backed off after %d consecutive failures; last: %s",
-                        due.job.name, failures[due.job.name],
+            # per backed-off attempt, on a table this loop already reads.
+            log.warning("%s: retrying after %d consecutive failures (%s); last: %s",
+                        due.job.name, failures[due.job.name], due.reason,
                         _last_failure(conn, due.job.name) or "reason not recorded")
-            continue
-        log.info("%s is due (%s)", due.job.name, due.reason)
+        else:
+            log.info("%s is due (%s)", due.job.name, due.reason)
         try:
-            run_id = run_job(conn, due.job.name, ctx=ctx, fired_for=due.fired_for)
+            # `slept`: why a noon job fired at 09:14 becomes a field rather than a
+            # mystery. Both clocks are already read, so it is free.
+            run_job(conn, due.job.name, ctx=ctx, fired_for=due.fired_for, slept=slept)
             started.append(due.job.name)
-            if slept and run_id:
-                # Why a noon job fired at 09:14 becomes a field rather than a
-                # mystery. Both clocks are already read, so this is free.
-                conn.execute("UPDATE job_runs SET slept = 1 WHERE id = ?", (run_id,))
-                conn.commit()
         except JobBusy:
             # Another runner has it -- the page, or a previous tick still working.
             # Not an error: the file lock and the unique index are doing their job.
@@ -1337,6 +1485,9 @@ class Scheduler:
         # a tick means the machine was asleep.
         wall = datetime.now(UTC)
         mono = time.monotonic()
+        # The reference for "next natural slot" on a job with no history: an
+        # instant after this moment is one the loop watched arrive.
+        since = wall
         try:
             while True:
                 self.ticks += 1               # ATTEMPTED: see the attribute's note
@@ -1347,7 +1498,7 @@ class Scheduler:
                     slept = elapsed_wall - elapsed_mono > SLEPT_THRESHOLD_S
                     wall, mono = now, time.monotonic()
                     heartbeat(conn, now=now)
-                    reconcile(conn, ctx=self.ctx, now=now, slept=slept)
+                    reconcile(conn, ctx=self.ctx, now=now, slept=slept, since=since)
                 except Exception:             # noqa: BLE001 - the point of the loop
                     self.tick_failures += 1
                     # A tick that raises must not end the schedule. Design 3 named
