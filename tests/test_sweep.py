@@ -250,6 +250,17 @@ _REPLAY_CARDS_HIDDEN = _REPLAY_OK.replace('class="evc on now"', 'class="evc"').r
 _REPLAY_CARD_MISSEEKS = _REPLAY_OK.replace(
     '<div class="evc on" data-rts="150" data-rseek="0">',
     '<div class="evc on" data-rts="150" data-rseek="2">')
+#: No eff-delta drawn at all, which is right only when no mark carries a delta.
+_REPLAY_NO_DELTA = _REPLAY_OK.replace('<polyline class="dline" points="1,2 3,4"/>', '')
+#: A delta series one bar long, which the page draws as a dot, not a line.
+_REPLAY_DELTA_DOT = _REPLAY_OK.replace('<polyline class="dline" points="1,2 3,4"/>',
+                                       '<circle class="ddot" cx="1" cy="2" r="2"/>')
+
+
+def _replay_payload_with_marks(marks: list) -> dict:
+    """`_REPLAY_PAYLOAD` with its one replay's marks replaced."""
+    replay = dict(_REPLAY_PAYLOAD["replays"]["lc:C1@2026-07-24"], marks=marks)
+    return {**_REPLAY_PAYLOAD, "replays": {"lc:C1@2026-07-24": replay}}
 
 
 _SIDE_OK = '<td class="side buy">Long</td><td class="side sell">Short</td>'
@@ -422,6 +433,12 @@ CASES: list[tuple[str, sweep.Check, Page, Page]] = [
           payload=_REPLAY_PAYLOAD),
      page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_CARD_MISSEEKS,
           payload=_REPLAY_PAYLOAD)),
+    ("marks that carry a delta draw an eff-delta series",
+     sweep.check_replay_renders_from_url,
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_OK,
+          payload=_REPLAY_PAYLOAD),
+     page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_NO_DELTA,
+          payload=_REPLAY_PAYLOAD)),
     # The bug that wrote this check: a rationale one line too deep inside a
     # template literal is TEXT, and it lands inside a tag. The broken page here is
     # what that renders as -- a `<span` carrying a comment as bogus attributes.
@@ -481,6 +498,26 @@ def test_drilldown_heals_a_day_that_has_no_fills():
     lying = page(tab="calendar", calday="1999-01-01",
                  body="<h3>1999-01-01 — 3 fill(s)</h3>", payload=_DRILL_PAYLOAD)
     assert sweep.check_drilldown_renders_from_url(lying).status == FAIL
+
+
+def test_a_replay_flat_at_every_close_needs_no_eff_delta():
+    """A position opened and closed inside one bar is flat at every close, so its
+    marks carry no delta and the page rightly draws none. The check once failed
+    that correct chart on the real journal."""
+    flat = _replay_payload_with_marks([[100, 0.0, None], [200, 12.0, None],
+                                       [300, 12.0, None]])
+    shown = page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_NO_DELTA,
+                 payload=flat)
+    assert sweep.check_replay_renders_from_url(shown).status == PASS
+
+
+def test_a_one_bar_eff_delta_drawn_as_a_dot_passes():
+    """A single delta is drawn as a dot, which is a drawn series."""
+    one = _replay_payload_with_marks([[100, 0.0, None], [200, 12.0, 0.3],
+                                      [300, 12.0, None]])
+    shown = page(tab="trades", replay="lc:C1@2026-07-24", body=_REPLAY_DELTA_DOT,
+                 payload=one)
+    assert sweep.check_replay_renders_from_url(shown).status == PASS
 
 
 def test_replay_heals_a_key_that_names_no_trade():

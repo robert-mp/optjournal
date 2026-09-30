@@ -668,9 +668,13 @@ def check_replay_renders_from_url(p: Page) -> Verdict:
                 f"the {strike_row['strike']:g}{strike_row['put_call']} segment "
                 "runs to the plot edge, but it went flat before the last bar"
             )
-    # Eff delta: computed per bar and useless if it never reaches the page.
-    if replay.get("marks") and 'class="dline"' not in p.markup:
-        return bad(f"{len(replay['marks'])} marks held, no eff-delta series drawn")
+    # Eff delta: computed per bar and useless if it never reaches the page. Only
+    # a mark with a delta has one to draw: a position opened and closed inside one
+    # bar is flat at every close, so its marks carry None. A single delta draws as
+    # a dot rather than a line.
+    deltas = [m for m in replay.get("marks") or [] if m[2] is not None]
+    if deltas and not re.search(r'class="d(line|dot)"', p.markup):
+        return bad(f"{len(deltas)} marks carry a delta, no eff-delta series drawn")
     if 'class="rkey"' not in p.markup:
         return bad("no legend, so the hue and dash encodings are unexplained")
     # Event annotation cards: one per decision, each seeking to its own bar.
