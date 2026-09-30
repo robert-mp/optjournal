@@ -374,10 +374,15 @@ export function niceTicks(lo, hi, target = 4) {
   // is a figure people read fluently and a 200 or 300 step is not.
   const step = [1, 2, 2.5, 5, 10].find((m) => raw <= m * mag) * mag;
   const out = [];
+  // Both ends compared with a billionth of a step to spare, because the division
+  // and the product each carry float error: 3 * 0.1 is 0.30000000000000004, so
+  // `niceTicks(0, 0.3)` dropped its top tick, and 1.1 / 0.1 is 11.000000000000002,
+  // which `ceil` took past the bottom one.
+  const slack = 1e-9;
   // `Math.round(v / step) * step` rather than accumulating `v += step`: adding a
   // float repeatedly drifts, and a tick at 1499.9999999999998 formats as a round
   // number while sitting a hair off its own gridline.
-  for (let k = Math.ceil(lo / step); k * step <= hi; k += 1) {
+  for (let k = Math.ceil(lo / step - slack); k * step <= hi + step * slack; k += 1) {
     // `+ 0` normalises NEGATIVE ZERO. `Math.ceil(-174 / 500)` is -0, and -0 *
     // step stays -0, which `toLocaleString` renders with a minus sign: the axis
     // would have labelled break-even "−€0". Caught by the unit test, not by

@@ -130,7 +130,9 @@ const TIERS = [
   [1, new RegExp([
     "FOMC (Statement|Press Conference|Meeting Minutes|Economic Projections)",
     "Federal Funds Rate", "Interest Rate Decision",
-    "\\bCPI\\b", "\\bPCE\\b", "Non-Farm Employment", "Unemployment Rate",
+    // Anchored, because ADP's private estimate is titled "ADP Non-Farm
+    // Employment Change" and would otherwise be read as the payrolls report.
+    "\\bCPI\\b", "\\bPCE\\b", "^\\s*Non-Farm Employment", "Unemployment Rate",
     "Fed Chair(man|woman)? \\w+ Speaks", "Payrolls Revision",
   ].join("|"), "i")],
   [2, new RegExp([
@@ -157,16 +159,21 @@ function tier(title, impact) {
   return grade(impact) === 0 ? 2 : 3;
 }
 
-/* A central banker with a microphone. Matched on the feed's own verb rather than
- * on "FOMC", because the same day carries "Fed Chair Powell Speaks" and
- * "FOMC Member Barkin Speaks" and both are the same kind of event. Applied only
- * AFTER the country filter, so an MPC or SNB speaker never reaches it.
- *
- * DELIBERATELY NARROW. "FOMC Statement", "FOMC Press Conference" and a rate
- * decision do not match, and must not: those are the day's main event, and folding
- * one into a group captioned "speakers" would bury the only release that reprices
- * the whole curve. */
+/* The feed's verb for a speech, which is how a speaker's surname is found. */
 const SPEAKS = /\bspeaks\b/i;
+
+/* A central banker with a microphone: an FOMC member or the Chair, speaking.
+ * Matched on the feed's own titles, "FOMC Member Barkin Speaks" and "Fed Chair
+ * Powell Speaks", which are the same kind of event. Applied only AFTER the country
+ * filter, so an MPC or SNB speaker never reaches it.
+ *
+ * DELIBERATELY NARROW, in two directions. "FOMC Statement", "FOMC Press
+ * Conference" and a rate decision do not match, and must not: those are the day's
+ * main event, and folding one into a group captioned "speakers" would bury the
+ * only release that reprices the whole curve. And a speaker who is not at the Fed
+ * does not match either: "President Trump Speaks" merged into the group once and
+ * captioned it "Fed speakers (Trump, +3)". Those rows keep their own chip. */
+const FED_SPEAKER = /\b(FOMC Member|Fed Chair(man|woman)?)\b.*\bspeaks\b/i;
 
 /* "FOMC Member Barkin Speaks" -> "Barkin". The surname is what a reader
  * recognises, and the feed's phrasing is stable enough to take the word before
@@ -188,8 +195,8 @@ function speaker(title) {
 export function sessionEvents(events, options) {
   const { country = SESSION_COUNTRY, chips = SESSION_CHIPS } = options || {};
   const mine = (events || []).filter((event) => event.country === country);
-  const talks = mine.filter((event) => SPEAKS.test(event.title));
-  const rest = mine.filter((event) => !SPEAKS.test(event.title));
+  const talks = mine.filter((event) => FED_SPEAKER.test(event.title));
+  const rest = mine.filter((event) => !FED_SPEAKER.test(event.title));
   const chip = (event, title, count) => ({
     at: event.at,
     title: title == null ? event.title : title,
@@ -353,10 +360,21 @@ export function sanitizeLevel(text) {
     : cleaned.slice(0, dot + 1) + cleaned.slice(dot + 1).replace(/\./g, "");
 }
 
-/** The listed strike nearest a level, or null when the level is not a number. */
-export function strikeNear(level) {
+/** The listed strike nearest a level, or null when the level is not a number.
+ *
+ * A level exactly between two strikes resolves AWAY from the money: up for a
+ * "call", down for a "put", the further of the two contracts a seller could
+ * mean. `Math.round` alone sends every half up, which is away from the money for
+ * a call and toward it for a put, so the two sides of one ladder broke ties in
+ * opposite directions. Any other `side` rounds a tie up, as a call does.
+ */
+export function strikeNear(level, side) {
   const value = parseNumber(level);
-  return value == null ? null : Math.round(value / STRIKE_STEP) * STRIKE_STEP;
+  if (value == null) return null;
+  const steps = value / STRIKE_STEP;
+  const below = Math.floor(steps);
+  if (steps - below === 0.5) return (side === "put" ? below : below + 1) * STRIKE_STEP;
+  return Math.round(steps) * STRIKE_STEP;
 }
 
 /** Whether a close and a VIX can produce a ladder at all.
@@ -386,7 +404,7 @@ export function expectedMove(spx, vix) {
 }
 
 function rowAt(close, exact, base, side) {
-  const strike = strikeNear(exact);
+  const strike = strikeNear(exact, side);
   const points = Math.abs(close - strike);
   return { side, base, current: false, exact, strike, points, pct: points / close * 100 };
 }
@@ -485,7 +503,7 @@ export function scratchRead(spx, level) {
     level: entry,
     points,
     pct: points / close * 100,
-    strike: strikeNear(entry),
+    strike: strikeNear(entry, entry < close ? "put" : "call"),
     side: entry > close ? "above" : entry < close ? "below" : "at",
   };
 }
@@ -499,7 +517,10 @@ export function scratchRead(spx, level) {
  * fact is which rows it sits between: the ones above the line are still yours.
  *
  * Computed against the DISPLAY list, so it is correct under either sort without
- * knowing which one is in force.
+ * knowing which one is in force. Placed by where the level SITS in that list,
+ * whichever side's rows those are: a call typed below the market is an
+ * in-the-money call, and its line belongs below the market row, not on the
+ * nearest call.
  */
 export function scratchLines(rows, callLevel, putLevel) {
   const list = rows || [];
@@ -512,35 +533,32 @@ export function scratchLines(rows, callLevel, putLevel) {
 }
 
 function edgeFor(rows, side, level) {
-  const target = strikeNear(level);
-  if (target == null) return null;
-  const mine = rows
-    .map((row, index) => ({ row, index }))
-    .filter((held) => held.row.side === side);
-  if (!mine.length) return null;
-  const hit = mine.find((held) => held.row.strike === target);
-  if (hit) return { index: hit.index, edge: "on" };
-  let near = mine[0];
-  for (const held of mine) {
-    if (Math.abs(held.row.strike - target) < Math.abs(near.row.strike - target)) near = held;
+  const target = strikeNear(level, side);
+  if (target == null || !rows.length) return null;
+  const hit = rows.findIndex((row) => !row.current && row.strike === target);
+  if (hit !== -1) return { index: hit, edge: "on" };
+  /* The two neighbouring rows the level lies between, which may be the current
+     level and a row of either side: a put sold inside the expected move belongs
+     between the innermost put shown and the market. The line goes on whichever
+     of the two is a strike row and nearer the level, on the edge facing the
+     other. A level AT the market goes between it and the pad's own side. */
+  for (let at = 0; at + 1 < rows.length; at += 1) {
+    const pair = [rows[at], rows[at + 1]];
+    const [low, high] = [Math.min(pair[0].strike, pair[1].strike),
+      Math.max(pair[0].strike, pair[1].strike)];
+    const atMarket = pair.some((row) => row.current && row.strike === target)
+      && pair.some((row) => row.side === side);
+    if (!(low < target && target < high) && !atMarket) continue;
+    const upper = !pair[0].current && (pair[1].current
+      || Math.abs(pair[0].strike - target) <= Math.abs(pair[1].strike - target));
+    return upper ? { index: at, edge: "bottom" } : { index: at + 1, edge: "top" };
   }
-  /* The neighbour in the display list that lies TOWARD the level, if either does.
-     Either neighbour may be the current-level row or a row from the other side,
-     which is exactly right: a put sold inside the expected move belongs between
-     the innermost put shown and the market. */
-  const toward = (row) =>
-    row && Math.abs(row.strike - target) < Math.abs(near.row.strike - target);
-  if (toward(rows[near.index + 1])) return { index: near.index, edge: "bottom" };
-  if (toward(rows[near.index - 1])) return { index: near.index, edge: "top" };
-  /* Nothing shown lies between, so the level is past the end of the ladder. The
-     line goes on the far edge of the last row, away from the current level --
-     which is the direction the reader is looking when a sold strike is further
-     out than anything on screen. */
-  const at = rows.findIndex((row) => row.current);
-  const close = at >= 0 ? rows[at].strike : null;
-  const further = close == null
-    || Math.abs(target - close) > Math.abs(near.row.strike - close);
-  const away = at >= 0 && near.index < at ? "top" : "bottom";
-  const back = away === "top" ? "bottom" : "top";
-  return { index: near.index, edge: further ? away : back };
+  /* Nothing shown lies either side, so the level is past an end of the ladder:
+     the line goes on the far edge of the row at that end, which is the direction
+     the reader is looking when a sold strike is further out than anything on
+     screen. */
+  const last = rows.length - 1;
+  return Math.abs(target - rows[0].strike) < Math.abs(target - rows[last].strike)
+    ? { index: 0, edge: "top" }
+    : { index: last, edge: "bottom" };
 }

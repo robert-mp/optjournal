@@ -195,9 +195,22 @@ test("the input mask keeps digits and one decimal point", () => {
 test("a level resolves to the listed strike nearest it", () => {
   assert.equal(strikeNear(7781.5009), 7780);
   assert.equal(strikeNear(7783.09), 7785);
-  assert.equal(strikeNear(7667.5), 7670, "a tie rounds up, as the platform does");
   assert.equal(strikeNear("7630.56"), 7630);
   assert.equal(strikeNear(""), null);
+});
+
+test("a level exactly between two strikes resolves AWAY from the money on both sides", () => {
+  /* Math.round sends a half up whatever the side, which is away from the money
+     for a call and TOWARD it for a put: on a 7100 close the 2.5% rails land on
+     7277.5 and 6922.5, and the put rail named the nearer, riskier 6925. */
+  assert.equal(strikeNear(7277.5, "call"), 7280);
+  assert.equal(strikeNear(6922.5, "put"), 6920);
+  assert.equal(strikeNear(6922.4, "put"), 6920, "no tie, no preference");
+  assert.equal(strikeNear(6923.6, "put"), 6925);
+  const { rows } = ladderRows("7100", "16", { showAll: true });
+  const rail = (side) => rows.find((row) => row.side === side && row.exact % 5 === 2.5);
+  assert.equal(rail("call").strike, 7280);
+  assert.equal(rail("put").strike, 6920);
 });
 
 test("a scratch level is measured from the close, and says which side it is", () => {
@@ -243,6 +256,23 @@ test("a sold level marks the row it is, or the edge it falls past", () => {
     { index: 4, call: "", put: "on" },
     { index: 6, call: "on", put: "" },
   ]);
+});
+
+test("an in-the-money level is drawn on its own side of the market", () => {
+  /* A call typed at 7650 is BELOW a 7706.03 market: the line belongs between the
+     innermost put and the current level, where 7650 actually sits. It was drawn
+     on the top edge of the 7780 call, above the market, because only call rows
+     were searched. */
+  const up = ladderRows(SPX, VIX).rows;
+  const marked = (rows, call, put) => scratchLines(rows, call, put)
+    .map((line, index) => ({ index, strike: rows[index].strike, ...line }))
+    .filter((line) => line.call || line.put);
+  assert.deepEqual(marked(up, 7650, null), [{ index: 4, strike: 7630, call: "bottom", put: "" }]);
+  assert.deepEqual(marked(up, null, 7760), [{ index: 6, strike: 7780, call: "", put: "top" }]);
+  /* A level that IS a strike on the other side marks that strike. */
+  assert.deepEqual(marked(up, 7630, null), [{ index: 4, strike: 7630, call: "on", put: "" }]);
+  const down = ladderRows(SPX, VIX, { desc: true }).rows;
+  assert.deepEqual(marked(down, 7650, null), [{ index: 6, strike: 7630, call: "top", put: "" }]);
 });
 
 test("decorations survive a descending ladder and an empty one", () => {
@@ -343,6 +373,33 @@ test("a rate decision is never folded into the speakers", () => {
     "FOMC Statement", "Federal Funds Rate", "FOMC Press Conference",
     "Fed speakers (Barkin, +1)",
   ]);
+});
+
+test("only the Fed's speakers are merged, and nobody else's podium is", () => {
+  /* The merge matched any "Speaks", so a day with the President and two FOMC
+     members read "Fed speakers (Trump, +2)". Other speakers keep their own chip
+     and the feed's own wording. */
+  const { shown } = sessionEvents([
+    { at: "09:00", country: "USD", title: "President Trump Speaks", impact: "Medium" },
+    { at: "10:00", country: "USD", title: "FOMC Member Barkin Speaks", impact: "Low" },
+    { at: "12:00", country: "USD", title: "Treasury Secretary Bessent Speaks", impact: "Low" },
+    { at: "13:00", country: "USD", title: "Fed Chair Powell Speaks", impact: "High" },
+  ]);
+  assert.deepEqual(shown.map((row) => row.title), [
+    "Fed speakers (Barkin, +1)",
+    "President Trump Speaks",
+    "Treasury Secretary Bessent Speaks",
+  ]);
+  assert.deepEqual(shown.map((row) => row.count), [2, 1, 1]);
+});
+
+test("ADP is a second-tier print, not the payrolls report", () => {
+  /* "ADP Non-Farm Employment Change" contains the payrolls title, and the first
+     tier was tried first, so a private estimate outranked everything in the week. */
+  const tierOf = (title) =>
+    sessionEvents([{ at: "08:15", country: "USD", title, impact: "Medium" }]).shown[0].tier;
+  assert.equal(tierOf("ADP Non-Farm Employment Change"), 2);
+  assert.equal(tierOf("Non-Farm Employment Change"), 1);
 });
 
 test("an unknown grade sorts last, and an empty day is empty", () => {

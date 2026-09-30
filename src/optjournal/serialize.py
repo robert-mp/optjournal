@@ -1047,6 +1047,15 @@ def odte_scoring_data(conn: sqlite3.Connection, *, now: datetime) -> list[Row]:
 
     TODAY IS EXCLUDED. Its close is still moving, and scoring a band against a
     price that has not settled would report a hit that the afternoon can take back.
+
+    SO IS A PAIR ACROSS A HOLE. The index series is fetched over a 60-day window,
+    so a journal left unopened for longer stores June and then August, and the
+    first August session would be scored against a June close: weeks of movement
+    against a one-session band. Two stored sessions pair only when at most ONE
+    weekday lies between them, which is what an exchange holiday looks like (the
+    real series runs 2026-09-04 to 2026-09-08 across Labor Day). No US holiday
+    closes two weekdays in a row outside an emergency closure, so this needs no
+    holiday calendar.
     """
     spx = bars_close_series(conn, "^GSPC", bar_size="1d")
     vix = bars_close_series(conn, "^VIX", bar_size="1d")
@@ -1070,6 +1079,13 @@ def odte_scoring_data(conn: sqlite3.Connection, *, now: datetime) -> list[Row]:
         # session missing either is SKIPPED rather than scored, because counting an
         # absence as a broken band would make every rail read worse than it is.
         if level is None or level < 0 or opened_from <= 0 or close <= 0:
+            continue
+        start = date.fromisoformat(before)
+        skipped = sum(
+            1 for offset in range(1, (date.fromisoformat(day) - start).days)
+            if (start + timedelta(days=offset)).weekday() < 5
+        )
+        if skipped > 1:
             continue
         rows.append({
             "date": day,

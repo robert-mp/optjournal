@@ -591,6 +591,29 @@ def test_scoring_skips_a_session_whose_vix_never_landed(conn):
     assert [row["date"] for row in rows] == ["2026-08-27"]
 
 
+def test_scoring_skips_a_pair_the_stored_series_has_a_hole_between(conn):
+    """Two stored sessions are only a band and its outcome if they are ADJACENT.
+
+    `price_bars` keeps the index series from a 60-day window, so a journal left
+    unopened for longer than that stores June and then August. Pairing across the
+    hole scored an eight-week move against a one-session band and booked it as a
+    broken rail. A single weekday between two sessions is still adjacent, because
+    that is what an exchange holiday looks like: the real series runs 2026-09-04
+    to 2026-09-08 across Labor Day.
+    """
+    from optjournal.serialize import odte_scoring_data
+    for day, spx in [("2026-06-01", 7000.0), ("2026-06-02", 7010.0),
+                     ("2026-08-03", 7600.0), ("2026-08-04", 7605.0),
+                     ("2026-09-04", 7700.0), ("2026-09-08", 7710.0)]:
+        _seed_index(conn, "^GSPC", day, spx)
+        _seed_index(conn, "^VIX", day, 16.0)
+    rows = odte_scoring_data(conn, now=datetime(2026, 9, 10, 13, 0, tzinfo=UTC))
+    assert [row["date"] for row in rows] == ["2026-06-02", "2026-08-04", "2026-09-08"], (
+        "the session after the hole was scored against a close from before it, or "
+        "the holiday weekend was mistaken for a hole"
+    )
+
+
 def test_scoring_is_empty_until_both_series_have_landed(conn):
     """One index without the other scores nothing, the same as it reads nothing."""
     from optjournal.serialize import odte_scoring_data

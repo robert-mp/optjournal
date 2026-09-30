@@ -522,6 +522,15 @@ test("a tick is exactly its own round value, not a float that drifts", () => {
   assert.deepEqual(niceTicks(0, 1.2), [0, 0.5, 1]);
 });
 
+test("an end tick is kept when float error puts it a hair outside the domain", () => {
+  // 3 * 0.1 is 0.30000000000000004 and 1.1 / 0.1 is 11.000000000000002, so the
+  // ticks AT each end of these domains were dropped by the comparison that should
+  // have kept them.
+  assert.deepEqual(niceTicks(0, 0.3), [0, 0.1, 0.2, 0.3]);
+  assert.deepEqual(niceTicks(1.1, 1.5), [1.1, 1.2, 1.3, 1.4, 1.5]);
+  assert.deepEqual(niceTicks(-0.3, 0), [-0.3, -0.2, -0.1, 0]);
+});
+
 test("a degenerate domain yields no ticks rather than throwing", () => {
   // The chart pads a flat series before calling this, so these are guards rather
   // than live cases -- but an axis that throws blanks the whole card.
