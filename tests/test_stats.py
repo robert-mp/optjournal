@@ -786,6 +786,32 @@ def test_a_split_execution_is_one_fill_on_the_calendar_and_in_the_cards(conn):
     assert day == [("1002", -3, 450.0)]
 
 
+def test_a_split_execution_is_listed_under_the_position_it_closed(conn):
+    """Long 2 (order 1000), then order 1001 sells 3 as `C;O` and 1 more 20 seconds
+    later, which adds to the short. The Calendar lists 1001 whole, under the
+    position that took its first execution; the split one is taken by both, and
+    the tie goes to the long it closed. It went to the short, because the tie was
+    read off the fill count of the whole share and the short's later fill made
+    that count match the long's, so the day showed "Long put" and 1001 as two
+    unrelated events where they were one placement."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for
+    from optjournal.strategies import campaign_events
+
+    _leg(conn, conid="1", order_id="1000", at="2026-09-15 09:59:40", qty=2,
+         proceeds=-200.0, pnl=None, open_close="O")
+    _leg(conn, conid="1", order_id="1001", at="2026-09-15 10:00:00", qty=-3,
+         proceeds=300.0, pnl=95.0, open_close="C;O")
+    _leg(conn, conid="1", order_id="1001", at="2026-09-15 10:00:20", qty=-1,
+         proceeds=100.0, pnl=None, open_close="O")
+    _leg(conn, conid="1", order_id="1002", at="2026-09-20 10:00:00", qty=2,
+         proceeds=-100.0, pnl=40.0, open_close="C")
+    episodes = build_history(conn, asset_category="OPT").episodes
+    events = campaign_events(orders_data(conn), campaigns_for(conn, "OPT", episodes))
+    assert sorted(e["order_ids"] for e in events) == [["1000", "1001"], ["1002"]]
+
+
 def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):
     """`pnl/s_scope_inflight.py`: a 0DTE short put rolled at 15:55 into the next
     day's put, which is still open.

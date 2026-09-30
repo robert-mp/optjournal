@@ -314,18 +314,29 @@ def test_a_leg_two_campaigns_took_is_divided_by_the_fills_each_took():
     ]
 
 
-def test_a_share_mixing_closing_and_opening_fills_keeps_the_legs_own_marker():
-    """The edge the marker rule leaves: one campaign's share of a leg holding a
-    closing AND an opening fill has no one marker of its own, so it carries none
-    and the leg's stays."""
-    eps = [_Ep("C1", ["t1", "t3"]), _Ep("C1", ["t2"])]
-    eps[0].fill_parts = {"t1": _part(-1, "C", "2026-09-15 10:00:00", 1.0),
-                         "t3": _part(-1, "O", "2026-09-15 10:00:02", 1.0)}
+def test_a_share_reads_as_what_it_took_first():
+    """A share holding a closing AND an opening fill reads as the first, which is
+    also what orders the shares of one order: by time, and on one split execution
+    the share that took its closing half first."""
+    from optjournal.campaigns import first_taken
+
+    eps = [_Ep("C1", ["t1", "t3"]), _Ep("C1", ["t2"]), _Ep("C1", ["t4"]),
+           _Ep("C1", ["t4", "t5"])]
+    eps[0].fill_parts = {"t1": _part(-1, "C", "2026-09-15 10:00:02", 1.0),
+                         "t3": _part(-1, "O", "2026-09-15 10:00:00", 1.0)}
     eps[1].fill_parts = {"t2": _part(-1, "O", "2026-09-15 10:00:01", 1.0)}
-    camps = link(eps, order_groups=[("x",)], order_of_trade=dict.fromkeys(
-        ("t1", "t2", "t3"), "x"))
-    assert "open_close" not in camps[0].leg_parts[("x", "C1")]
-    assert camps[1].leg_parts[("x", "C1")]["open_close"] == "O"
+    # One split execution: the opening half is listed first, and still sorts last.
+    eps[2].fill_parts = {"t4": _part(1, "O", "2026-09-20 10:00:00", 1.0, fills=0)}
+    eps[3].fill_parts = {"t4": _part(-2, "C", "2026-09-20 10:00:00", 1.0),
+                         "t5": _part(-1, "C", "2026-09-18 10:00:00", 1.0)}
+    x = dict.fromkeys(("t1", "t2", "t3"), "x") | {"t4": "y", "t5": "z"}
+    shares = [dict(c.leg_parts) for c in link(
+        eps, order_groups=[("x",), ("y",), ("z",)], order_of_trade=x)]
+    assert shares[0][("x", "C1")]["open_close"] == "O", "its 10:00:00 fill opened"
+    assert shares[1][("x", "C1")]["open_close"] == "O"
+    assert first_taken(shares[2][("y", "C1")]) == ("2026-09-20 10:00:00", True)
+    assert first_taken(shares[3][("y", "C1")]) == ("2026-09-20 10:00:00", False)
+    assert first_taken(shares[3][("y", "C1")]) < first_taken(shares[2][("y", "C1")])
 
 
 def test_a_flip_placed_with_another_contract_is_still_one_decision():

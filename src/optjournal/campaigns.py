@@ -70,6 +70,7 @@ __all__ = [
     "Campaign",
     "WINDOW_S",
     "cluster_orders",
+    "first_taken",
     "link",
     "placed_by_broker",
     "position_count",
@@ -420,8 +421,9 @@ def _leg_share(parts: Sequence[Any]) -> dict[str, Any]:
     Summed from the fill parts its episodes took, so every figure is those fills'
     own, a reversal's half included, and the shares of the campaigns dividing a
     leg add back up to it. The price is `trade_legs`' average, over this share's
-    fills. The open/close marker is the parts' when they agree; a share mixing
-    closing and opening fills leaves the leg's own in place.
+    fills. The open/close marker is that of what the share took first
+    (`first_take`), which is every part's when they agree, and which says, of two
+    shares starting on one split execution, which took its closing half.
     """
     share: dict[str, Any] = {
         name: sum(getattr(part, name) for part in parts) for name in _LEG_TOTALS}
@@ -433,10 +435,19 @@ def _leg_share(parts: Sequence[Any]) -> dict[str, Any]:
     times = [str(part.date_time) for part in parts if part.date_time]
     share["first_fill_at"] = min(times, default=None)
     share["last_fill_at"] = max(times, default=None)
-    marks = {part.open_close for part in parts}
-    if len(marks) == 1:
-        share["open_close"] = marks.pop()
+    share["open_close"] = min(parts, key=lambda part: (
+        not part.date_time, str(part.date_time or ""),
+        str(part.open_close).upper() != "C")).open_close
     return share
+
+
+def first_taken(share: Mapping[str, Any]) -> tuple[str, bool]:
+    """When a share of an order leg (`_leg_share`) took its first execution, for
+    ordering the shares of one order: by time, and on a tie the share that took
+    it closing first. A split `C;O` execution is taken by both of its positions at
+    one instant, and it closed the one before it opened the next."""
+    return (str(share.get("first_fill_at") or ""),
+            str(share.get("open_close") or "").upper() != "C")
 
 
 def position_count(

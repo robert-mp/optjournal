@@ -227,14 +227,14 @@ def _first_taker(
 ) -> int:
     """Of the campaigns dividing an order, the one that took its first execution.
 
-    A reversal's one execution is taken by both, so the tie goes to the one it
-    counts in (`history.FillPart.fills`): the position it closed.
+    A reversal's one execution is taken by both, so the tie goes to the position
+    it closed (`campaigns.first_taken`).
     """
     oid = str(order.get("ib_order_id"))
 
     def first(index: int) -> tuple[str, bool]:
         return min(
-            ((str(part.get("first_fill_at") or ""), not part.get("fills"))
+            (campaigns.first_taken(part)
              for (order_id, _conid), part in campaign_list[index].leg_parts.items()
              if order_id == oid),
             default=("\uffff", True),
