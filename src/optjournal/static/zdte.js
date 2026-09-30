@@ -353,10 +353,21 @@ export function sanitizeLevel(text) {
     : cleaned.slice(0, dot + 1) + cleaned.slice(dot + 1).replace(/\./g, "");
 }
 
-/** The listed strike nearest a level, or null when the level is not a number. */
-export function strikeNear(level) {
+/** The listed strike nearest a level, or null when the level is not a number.
+ *
+ * A level exactly between two strikes resolves AWAY from the money: up for a
+ * "call", down for a "put", the further of the two contracts a seller could
+ * mean. `Math.round` alone sends every half up, which is away from the money for
+ * a call and toward it for a put, so the two sides of one ladder broke ties in
+ * opposite directions. Any other `side` rounds a tie up, as a call does.
+ */
+export function strikeNear(level, side) {
   const value = parseNumber(level);
-  return value == null ? null : Math.round(value / STRIKE_STEP) * STRIKE_STEP;
+  if (value == null) return null;
+  const steps = value / STRIKE_STEP;
+  const below = Math.floor(steps);
+  if (steps - below === 0.5) return (side === "put" ? below : below + 1) * STRIKE_STEP;
+  return Math.round(steps) * STRIKE_STEP;
 }
 
 /** Whether a close and a VIX can produce a ladder at all.
@@ -386,7 +397,7 @@ export function expectedMove(spx, vix) {
 }
 
 function rowAt(close, exact, base, side) {
-  const strike = strikeNear(exact);
+  const strike = strikeNear(exact, side);
   const points = Math.abs(close - strike);
   return { side, base, current: false, exact, strike, points, pct: points / close * 100 };
 }
@@ -485,7 +496,7 @@ export function scratchRead(spx, level) {
     level: entry,
     points,
     pct: points / close * 100,
-    strike: strikeNear(entry),
+    strike: strikeNear(entry, entry < close ? "put" : "call"),
     side: entry > close ? "above" : entry < close ? "below" : "at",
   };
 }
@@ -512,7 +523,7 @@ export function scratchLines(rows, callLevel, putLevel) {
 }
 
 function edgeFor(rows, side, level) {
-  const target = strikeNear(level);
+  const target = strikeNear(level, side);
   if (target == null) return null;
   const mine = rows
     .map((row, index) => ({ row, index }))

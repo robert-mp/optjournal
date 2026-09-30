@@ -195,9 +195,22 @@ test("the input mask keeps digits and one decimal point", () => {
 test("a level resolves to the listed strike nearest it", () => {
   assert.equal(strikeNear(7781.5009), 7780);
   assert.equal(strikeNear(7783.09), 7785);
-  assert.equal(strikeNear(7667.5), 7670, "a tie rounds up, as the platform does");
   assert.equal(strikeNear("7630.56"), 7630);
   assert.equal(strikeNear(""), null);
+});
+
+test("a level exactly between two strikes resolves AWAY from the money on both sides", () => {
+  /* Math.round sends a half up whatever the side, which is away from the money
+     for a call and TOWARD it for a put: on a 7100 close the 2.5% rails land on
+     7277.5 and 6922.5, and the put rail named the nearer, riskier 6925. */
+  assert.equal(strikeNear(7277.5, "call"), 7280);
+  assert.equal(strikeNear(6922.5, "put"), 6920);
+  assert.equal(strikeNear(6922.4, "put"), 6920, "no tie, no preference");
+  assert.equal(strikeNear(6923.6, "put"), 6925);
+  const { rows } = ladderRows("7100", "16", { showAll: true });
+  const rail = (side) => rows.find((row) => row.side === side && row.exact % 5 === 2.5);
+  assert.equal(rail("call").strike, 7280);
+  assert.equal(rail("put").strike, 6920);
 });
 
 test("a scratch level is measured from the close, and says which side it is", () => {
