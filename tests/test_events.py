@@ -464,3 +464,20 @@ def test_a_non_429_http_error_stays_a_plain_fetch_error(monkeypatch):
     with pytest.raises(EventFetchError, match="404") as caught:
         events_module.fetch_events()
     assert not isinstance(caught.value, EventRateLimited)
+
+
+# --- a reply broken off mid-way is this module's typed error (L3) -------------
+
+
+@pytest.mark.parametrize("mode", ["truncated", "hangup"])
+def test_a_reply_broken_off_mid_way_is_an_event_fetch_error(broken_http, mode):
+    """`IncompleteRead` is an `http.client.HTTPException`, not an `OSError`.
+
+    It escaped the fetcher's own error type, so one truncated body aborted a whole
+    run instead of failing one request. `RemoteDisconnected` is here too, which
+    every fetcher must also report as its own error.
+    """
+    from optjournal import events as events_module
+
+    with pytest.raises(events_module.EventFetchError):
+        events_module.fetch_events(url=broken_http(mode), timeout=5)

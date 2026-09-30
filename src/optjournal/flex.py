@@ -22,6 +22,7 @@ This module adds the three things py_ibkr deliberately leaves to callers:
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import re
@@ -244,6 +245,12 @@ class _TimeoutFlexClient(FlexClient):
             # have seen a raw traceback -- exactly the shape of the 2026-08-07
             # keychain failure this plan exists to stop.
             raise FlexError(f"timed out after {self.timeout_s}s: {exc}") from exc
+        except (http.client.HTTPException, OSError) as exc:
+            # The same gap one level over: a body cut short raises IncompleteRead,
+            # an `http.client.HTTPException` and not an `OSError`, and a server
+            # that hangs up raises RemoteDisconnected or ConnectionResetError. None
+            # is a `URLError` once the response has started.
+            raise FlexError(f"connection failed: {type(exc).__name__}: {exc}") from exc
 
 
 #: What `fetch` constructs. A module-level indirection so there is exactly ONE name

@@ -321,3 +321,18 @@ def test_an_undated_rank_is_discarded_like_an_undated_price(monkeypatch):
 
     monkeypatch.setattr(iv_module.urllib.request, "urlopen", routed)
     assert fetch_iv_rank("DELL") is None
+
+
+# --- a reply broken off mid-way is this module's typed error (L3) -------------
+
+
+@pytest.mark.parametrize("mode", ["truncated", "hangup"])
+def test_a_reply_broken_off_mid_way_is_an_iv_fetch_error(broken_http, mode):
+    """`IncompleteRead` is an `http.client.HTTPException`, not an `OSError`.
+
+    It escaped the fetcher's own error type, so one truncated body aborted a whole
+    run instead of failing one request. `RemoteDisconnected` is here too, which
+    every fetcher must also report as its own error.
+    """
+    with pytest.raises(iv_module.IvFetchError):
+        iv_module._get(broken_http(mode) + "/{symbol}", "SPY", what="iv30", timeout=5)

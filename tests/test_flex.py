@@ -959,3 +959,20 @@ def test_a_keychain_error_is_still_raised_as_itself(monkeypatch):
     monkeypatch.setattr(flex.keyring, "get_password", broken)
     with pytest.raises(RuntimeError, match="-25320"):
         flex.read_token("someone")
+
+
+# --- a reply broken off mid-way is this module's typed error (L3) -------------
+
+
+@pytest.mark.parametrize("mode", ["truncated", "hangup"])
+def test_a_reply_broken_off_mid_way_is_a_flex_error(broken_http, mode):
+    """`IncompleteRead` is an `http.client.HTTPException`, not an `OSError`.
+
+    It escaped the fetcher's own error type, so one truncated body aborted a whole
+    run instead of failing one request. `RemoteDisconnected` is here too, which
+    every fetcher must also report as its own error.
+    """
+    from optjournal.flex import FlexError, _TimeoutFlexClient
+
+    with pytest.raises(FlexError):
+        _TimeoutFlexClient(user_agent="test", timeout_s=5)._get(broken_http(mode))

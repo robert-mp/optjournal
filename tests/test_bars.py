@@ -1303,3 +1303,21 @@ def test_the_translation_is_applied_where_bars_and_quotes_share_it():
     assert "occ_symbol(symbol)" not in chart, (
         "the chart fetch bypasses the index translation"
     )
+
+
+# --- a reply broken off mid-way is this module's typed error (L3) -------------
+
+
+@pytest.mark.parametrize("mode", ["truncated", "hangup"])
+def test_a_reply_broken_off_mid_way_is_a_bar_fetch_error(broken_http, monkeypatch, mode):
+    """`IncompleteRead` is an `http.client.HTTPException`, not an `OSError`.
+
+    It escaped the fetcher's own error type, so one truncated body aborted a whole
+    run instead of failing one request. `RemoteDisconnected` is here too, which
+    every fetcher must also report as its own error.
+    """
+    monkeypatch.setattr(marketdata, "_CHART_URL", broken_http(mode) + "/{symbol}")
+    with pytest.raises(marketdata.BarFetchError):
+        marketdata.fetch_quote("SPY", timeout=5)
+    with pytest.raises(marketdata.BarFetchError):
+        marketdata.fetch_bars("SPY", bar_size="1d", start=0, end=86400)
