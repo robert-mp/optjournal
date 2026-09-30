@@ -1104,7 +1104,7 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .day.clk:hover{border-color:var(--dayhover)}
 .day.selected{outline:2px solid var(--accentlit1);outline-offset:-2px}
 /* Market strip. Reuses .cal/.day so the two calendars look like one idea; the
-   difference is what a cell holds -- a P&L figure there, event titles here.
+   difference is what a cell holds: a P&L figure there, event titles here.
    Seven EQUAL columns at every width, with a zero minimum. `.cal`'s `1fr` tracks
    have an `auto` minimum, so each day refused to shrink below its longest title:
    only the phone rule used to zero it, and from 761px, where the rail is back and
