@@ -577,8 +577,12 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
 }
 .kicker{font-size:var(--t0);letter-spacing:var(--tr-wide);text-transform:uppercase;
   color:var(--kicker);font-weight:var(--w-label);margin-bottom:var(--s0)}
+/* `flex-wrap` because on a phone the row cannot hold both: at 320px the column is
+   168px and the wordmark takes 134 of it, so the chip squeezed onto two lines and
+   still ran past the header, 4px past the window on Admiralty, whose longest word
+   is the widest. Wrapped, it sits on its own line under the wordmark. */
 .title{font-size:var(--t8);font-weight:var(--w-fig);letter-spacing:var(--tr-tight);line-height:1.1;
-  display:flex;align-items:center;gap:var(--s4)}
+  display:flex;flex-wrap:wrap;align-items:center;gap:var(--s4)}
 /* `font:inherit` and the cursor are what a <button> needs that the old <span>
    did not: a button does not inherit the page's family or size, so without it
    the chip rendered in the browser's default UI font beside a 30px title. */
@@ -637,10 +641,16 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    grows with every ticker the book carries; the demo's is a short one.
    `:has()`, because on the six tabs the period does not drive it is empty, and
    an empty second row still costs its `row-gap` -- a strip of dead slab under
-   every header that has nothing to put there. */
+   every header that has nothing to put there. The row is the plain rule and
+   `:has()` only takes it AWAY: written the other way round, a browser without
+   `:has()` (Firefox before 121) kept the one-row header on the tabs that have a
+   period and ran 51px past the window at 765px. There it now costs the dead
+   strip on the other six tabs instead, which is the cheaper failure. */
 @media(max-width:1320px){
-  .brand:has(.period:not(:empty)){grid-template-columns:auto 1fr auto;
+  .brand{grid-template-columns:auto 1fr auto;
     grid-template-areas:"mark head actions" ". period period";row-gap:var(--s5)}
+  .brand:has(.period:empty){grid-template-columns:auto auto 1fr auto;
+    grid-template-areas:"mark head period actions";row-gap:normal}
   .period{justify-self:start}}
 .pstep{display:flex;align-items:center;gap:var(--s2)}
 /* The chevrons the calendar used to carry in its title, moved here with their
@@ -1094,11 +1104,23 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .day.clk:hover{border-color:var(--dayhover)}
 .day.selected{outline:2px solid var(--accentlit1);outline-offset:-2px}
 /* Market strip. Reuses .cal/.day so the two calendars look like one idea; the
-   difference is what a cell holds -- a P&L figure there, event titles here. */
+   difference is what a cell holds: a P&L figure there, event titles here.
+   Seven EQUAL columns at every width, with a zero minimum. `.cal`'s `1fr` tracks
+   have an `auto` minimum, so each day refused to shrink below its longest title:
+   only the phone rule used to zero it, and from 761px, where the rail is back and
+   the card is narrow, the strip ran 207px past its card on the real journal and
+   drew its days 64 to 155px wide. A title is cut with an ellipsis instead; the
+   selected day's list below carries it in full. Scoped by class, so the Calendar
+   tab's grid is not touched. */
+.cal.mkweek{grid-template-columns:repeat(7,minmax(0,1fr))}
 .mktoday{border-color:var(--accentedge)}
 .mkdots{display:flex;flex-direction:column;gap:var(--s1);margin-top:var(--s2)}
 .mkdot{font-size:var(--t0);color:var(--dim);display:flex;align-items:center;gap:var(--s2);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  white-space:nowrap;overflow:hidden}
+/* The line's text, in a box of its own because `text-overflow` applies to a block
+   container and the row is a flex one: set on `.mkdot` it did nothing, and a
+   clipped title ended mid-word ("Fina") rather than with "…". */
+.mkt{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .mkdot.dim{color:var(--dim2)}
 /* Impact as a colour AND a word (the row shows the country pill and the title);
    colour alone would make High indistinguishable from Low to a reader who
@@ -1510,7 +1532,12 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .emband{fill:var(--accent2);opacity:.17}
 .emedge{fill:none;stroke:var(--accent);stroke-width:1;opacity:.5;stroke-dasharray:4 4}
 .cross{stroke:var(--dim);stroke-width:1;opacity:.5}
-.rctl{display:flex;align-items:center;gap:var(--s5);margin-top:var(--s3);padding:0 var(--s0)}
+/* WRAPS, like `.setrow`: three buttons, the scrubber, the speed, two checkboxes
+   and a readout of about 270px need some 730px, so as one unbreakable row they
+   ran past the card at every width up to 920px (456px past a phone's). Where one
+   row fits, nothing moves; where it does not, the controls flow onto further
+   lines. */
+.rctl{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s5);margin-top:var(--s3);padding:0 var(--s0)}
 .rbtn{font:inherit;font-size:var(--t1);font-weight:var(--w-label);padding:var(--s2) var(--s4);
   border-radius:var(--r2);cursor:pointer;white-space:nowrap;
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2)}
@@ -1522,7 +1549,11 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .rspeed{font:inherit;font-size:var(--t1);padding:var(--s1) var(--s2);border-radius:var(--r2);
   width:auto;flex:0 0 auto;
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2);cursor:pointer}
-.rread{font-size:var(--t1);color:var(--dim);white-space:nowrap;min-width:150px;
+/* The readout ends the row, and a wrapped one stays at the right (`margin-left:
+   auto` takes only space the scrubber has not grown into). Its text may wrap: a
+   flex item is placed at its unwrapped width, so it only ever wraps where it is
+   alone on a line narrower than itself, which is a phone. */
+.rread{font-size:var(--t1);color:var(--dim);min-width:150px;margin-left:auto;
   text-align:right;font-family:var(--fig);font-variant-numeric:tabular-nums}
 .rauto{font-size:var(--t1);color:var(--dim2);white-space:nowrap;cursor:pointer;
   display:flex;align-items:center;gap:var(--s1)}
@@ -1603,8 +1634,6 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .linkish{background:none;border:none;color:var(--dim);cursor:pointer;
   font:inherit;font-size:var(--t1);text-decoration:underline;padding:0}
 .linkish:hover{color:var(--fg)}
-.day .dpl{font-family:var(--fig);font-variant-numeric:tabular-nums;
-  font-weight:var(--w-label);font-size:var(--t3)}
 /* The day's figure is in the cell twice (page.html `calendar`): the amount, and
    `compact` for a cell too narrow for it. WHICH one shows is a question about the
    CELL, not about the window, and asking the window got it wrong in between: from
@@ -1617,12 +1646,50 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    figure, because the Market strip reuses .cal/.day to hold event titles, which
    size their cells themselves. The compact form is at most five glyphs, about
    2.9em, so sizing it at 34% of the day's own width (`cqi`) keeps it inside the
-   cell on the narrowest phone while `--t1` caps it everywhere else. */
+   cell on the narrowest phone while `--t1` caps it everywhere else.
+
+   ABOVE 72px THE AMOUNT ITSELF DECIDES, because one width cannot: 72px is the
+   four-digit room, and a larger amount needs more ("€12,345.67" 73px,
+   "−€123,456.78" 88, "−€9,999,999.99" 99), so from 665 to 1030px those wrapped
+   after the minus or ran past the cell. The figure is one line tall and clips
+   below it, and the amount is a flex item that WRAPS OFF that line when it does
+   not fit. The compact form is ordered first with no width of its own: while the
+   amount fits, the amount takes all the spare room (a grow factor that leaves the
+   compact form a zero-width box) and the compact form is invisible; once the
+   amount wraps away, the compact form is alone on the line and takes it. So the
+   switch happens exactly where the amount stops fitting, for any size, currency
+   or font, and nothing is measured in script. The one line is `1.5em` against a
+   line height of 1.5 set here, not `1lh`: Safari before 16.4 and Firefox before
+   120 drop `lh`, and without the height both lines show at once. */
 .cal>.day:has(>.dpl){container-type:inline-size}
-.day .dpln{display:none}
+.day .dpl{font-family:var(--fig);font-variant-numeric:tabular-nums;
+  font-weight:var(--w-label);font-size:var(--t3);
+  display:flex;flex-wrap:wrap;white-space:nowrap;line-height:1.5;height:1.5em;
+  overflow:hidden}
+.day .dplw{flex:1e6 0 auto}
+.day .dpln{order:-1;flex:1 0 0;min-width:0;overflow:hidden}
+/* Block again below 72px, where the compact form always shows, so it sits on the
+   figure's baseline at its smaller size exactly as it did before the flex line. */
 @container (max-width:72px){
+  .day .dpl{display:block}
   .day .dplw{display:none}
-  .day .dpln{display:inline;font-size:min(var(--t1),34cqi)}}
+  .day .dpln{font-size:min(var(--t1),34cqi)}}
+/* WITHOUT CONTAINER QUERIES OR :has() (Safari and iOS before 16, Firefox before
+   121 for :has) the rule above never applies. The wrap-off switch still does, so
+   the compact form shows wherever the amount does not fit, but at the figure's
+   13px, which a phone's cell cannot hold. Sized to the viewport instead: a day's
+   figure is at least 2.36% of the window wide from 320px up (23px at 320), and
+   the widest compact form is 3.04em, so 2.3vw fits it everywhere and reaches
+   --t1 from 478px. At that size its own line is shorter than the figure's box, so
+   it is stretched to the box, or the amount on the clipped second line would show
+   beneath it. The days are not containers there either, so a `1fr` track would
+   not shrink below its widest amount and a large one widened the grid past its
+   card from 761px: the zero minimum the phone rule gives them, at every width.
+   A browser with both features skips this block. */
+@supports not ((container-type:inline-size) and selector(:has(*))){
+  .cal{grid-template-columns:repeat(7,minmax(0,1fr))}
+  .cal>.day{min-width:0}
+  .day .dpln{font-size:min(var(--t1),2.3vw);min-height:100%}}
 @media(max-width:700px){
   .cal{gap:var(--s1)}
   .cal>.day{padding:var(--s1)}
@@ -2052,14 +2119,18 @@ stop.gneg{stop-color:var(--bad)}
 
    THE HEADER stacks: mark and title, then the period, then the actions -- and
    with no period, just title then actions, so the tabs without one grow no empty
-   row. The `:has()` form is restated because the 1320px rule's is specificity
-   (0,3,0) and a bare `.brand` would lose to it here, source order or not.
+   row. As at 1320px the period row is the plain rule and `:has()` removes it, so
+   a browser without `:has()` still stacks the period. The `:has()` form restates
+   the columns and the gap because the 1320px one is specificity (0,3,0) and
+   would win them here, source order or not.
 
-   THE WEEK STRIP'S CELLS get a zero minimum and clip, because seven `1fr` tracks
-   each refused to shrink below their longest event title -- the Market page ran
-   to 467px. The selected day's list beneath the strip carries every title in
-   full, so clipping here loses nothing. The watchlist detail's three columns go
-   to one, as its tiles cannot fit three across a phone. */
+   THE CALENDAR GRIDS' CELLS get a zero minimum and clip. This was written for
+   the Market strip, whose seven `1fr` tracks each refused to shrink below their
+   longest event title (the Market page ran to 467px); the strip now carries that
+   minimum at every width (`.cal.mkweek`), because 761px needed it as much, and
+   what is left here holds the Calendar tab's grids to a phone. The watchlist
+   detail's three columns go to one, as its tiles cannot fit three across a
+   phone. */
 @media(max-width:760px){
   .shell{grid-template-columns:minmax(0,1fr)}
   .rail{flex-direction:row;overflow-x:auto;z-index:30;background:var(--bg);
@@ -2068,9 +2139,9 @@ stop.gneg{stop-color:var(--bad)}
   .rail .tab{flex:0 0 auto}
   .wrap{padding:var(--s5)}
   .brand{grid-template-columns:auto 1fr;
+    grid-template-areas:"mark head" "period period" "actions actions";row-gap:var(--s5)}
+  .brand:has(.period:empty){grid-template-columns:auto 1fr;
     grid-template-areas:"mark head" "actions actions";row-gap:var(--s5)}
-  .brand:has(.period:not(:empty)){grid-template-columns:auto 1fr;
-    grid-template-areas:"mark head" "period period" "actions actions"}
   .period{justify-self:start;flex-wrap:wrap;row-gap:var(--s3)}
   .hdr-actions{justify-self:start}
   .cal{grid-template-columns:repeat(7,minmax(0,1fr))}

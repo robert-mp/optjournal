@@ -3087,6 +3087,13 @@ let RGEO=null, RTIMER=null;
    same replay" was the new key compared with itself, always true, and opening a
    second chart while the first played started the second one playing too. */
 let RPKEY=null;
+/* WHERE the running loop stands, unrounded, beside the key it belongs to. The
+   scrubber is integral, so it holds the NEAREST bar, up to half a bar ahead of the
+   drawing, and the two resumes (a redraw while playing, a speed change) used to
+   carry on from it: interrupted in the half bar before a stop, playback started
+   past the stop and never raised its card; interrupted on the last bar, "play at
+   the end" restarted it from 0. Written by the frame loop, read by those resumes. */
+let RPOS=null;
 /* The events a replay can place on the timeline: those carrying a real epoch.
    ONE filter, because two readers must agree about the set -- the geometry
    decides which cards `replaySeek` reveals, and the renderer decides which cards
@@ -3434,18 +3441,17 @@ function bindReplayControls(resume){
      would be describing somewhere the chart no longer is. */
   scrub.oninput=()=>{replayStop();if(play)play.textContent='▶ play';
     replayFocus(null);replaySeek(Number(scrub.value));};
-  if(play) play.onclick=()=>{
-    if(RTIMER!==null){replayStop();play.textContent='▶ play';return;}
-    /* Restart from the beginning when the cursor is already at the end,
-       otherwise pressing play on a finished replay does nothing visible. */
-    if(Number(scrub.value)>=Number(scrub.max)) scrub.value='0';
+  /* The frame loop, from bar `from`: the scrubber's bar on a press, and the
+     loop's own unrounded position (RPOS) when it carries on after a redraw or a
+     speed change. */
+  const run=from=>{
     play.textContent='❚❚ pause';
     /* Pressing play dismisses the parked card. It is the answer to "I have read
        this, continue" -- leaving it up would have it hang over a moving chart
        and describe an instant the replay has left. */
     replayFocus(null);
     const max=Number(scrub.max);
-    let position=Number(scrub.value), last=null;
+    let position=from, last=null;
     /* Bars per millisecond from the LENGTH, so the setting means "this replay in
        REPLAY_SECONDS/speed" rather than "this many ms per bar". A fixed ms/bar
        made 1x take 6s on a strangle and nearly two minutes on the LEAP. */
@@ -3461,15 +3467,17 @@ function bindReplayControls(resume){
        this one" and got back the stop we are parked ON -- play halted instantly
        at the same bar and the replay could never be resumed past its first
        event. Caught by driving the real page, which is why this is the value the
-       test now pins. */
+       test now pins. FLOORED, because a resume starts between bars: at 8.6 the
+       bar playback stands on is 8, and a stop at 9 is still ahead of it. */
     const stops=$('#rstops');
     const halt=(stops&&stops.checked)&&RGEO
-      ?nextStop(RGEO.events||[],RGEO.points,Math.round(position)):null;
+      ?nextStop(RGEO.events||[],RGEO.points,Math.floor(position)):null;
     const tick=(now)=>{
       if(RTIMER===null) return;                    /* stopped mid-frame */
       if(last===null) last=now;
       position+=(now-last)*rate;
       last=now;
+      RPOS=position;
       /* A stop is honoured BEFORE the end check, so an event on the last bar
          parks on its card instead of being overtaken by the finish. */
       if(halt!==null&&position>=halt){
@@ -3504,10 +3512,19 @@ function bindReplayControls(resume){
       RTIMER=requestAnimationFrame(tick);
     };
     /* Armed for THIS replay, beside the timer it belongs to. */
-    RPKEY=S.replay;
+    RPKEY=S.replay; RPOS=position;
     RTIMER=requestAnimationFrame(tick);
   };
-  if(speed) speed.onchange=()=>{ if(RTIMER!==null&&play){play.onclick();play.onclick();} };
+  if(play) play.onclick=()=>{
+    if(RTIMER!==null){replayStop();play.textContent='▶ play';return;}
+    /* Restart from the beginning when the cursor is already at the end,
+       otherwise pressing play on a finished replay does nothing visible. */
+    if(Number(scrub.value)>=Number(scrub.max)) scrub.value='0';
+    run(Number(scrub.value));
+  };
+  /* A new rate from where playback stands: stop the loop and run it again from
+     its own position, which the rate is read at the start of. */
+  if(speed) speed.onchange=()=>{ if(RTIMER!==null&&play){replayStop();run(RPOS);} };
   /* Jump to either end, or to an event. Stops playback first: leaving a timer
      running would have it march away from the position just asked for. The
      annotation cards carry data-rseek too, which makes the strip a table of
@@ -3526,10 +3543,11 @@ function bindReplayControls(resume){
     if(el.getAttribute('role')==='button')
       el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();seek();}};
   });
-  /* Playing when the page redrew under it: carry on from the bar the scrubber
-     held, which `preserveInputs` has already put back. Through `play.onclick`,
-     the one entry point, so the next stop is found from here as on any press. */
-  if(resume&&play) play.onclick();
+  /* Playing when the page redrew under it: carry on from where the loop stood,
+     not from the bar the scrubber held (which `preserveInputs` put back, and which
+     can be half a bar ahead). Through `run`, the one loop, so the next stop is
+     found from here as on any press. */
+  if(resume&&play) run(RPOS);
 }
 
 function replayPanel(rp,label,valueHtml){
@@ -4544,11 +4562,11 @@ function market(){
     const shown=mine.slice(0,3);
     const dots=shown.map(mev=>
       `<div class="mkdot"><span class="mkimp ${
-        mev.impact==='High'?'hi':mev.impact==='Medium'?'md':'lo'}"></span>${
-        esc(mev.title.length>22?mev.title.slice(0,21)+'…':mev.title)}</div>`).join('');
+        mev.impact==='High'?'hi':mev.impact==='Medium'?'md':'lo'}"></span><span class="mkt">${
+        esc(mev.title.length>22?mev.title.slice(0,21)+'…':mev.title)}</span></div>`).join('');
     const more=mine.length>shown.length?
-      `<div class="mkdot dim">+${mine.length-shown.length} more</div>`:'';
-    const quiet=mine.length?'':`<div class="mkdot dim">—</div>`;
+      `<div class="mkdot dim"><span class="mkt">+${mine.length-shown.length} more</span></div>`:'';
+    const quiet=mine.length?'':`<div class="mkdot dim"><span class="mkt">—</span></div>`;
     return `<div class="day${d.day===sel?' selected':''}${
       d.today?' mktoday':''}" data-marketday="${d.day}" role="button" tabindex="0">
       <div class="top"><span class="dim">${esc(d.label)}</span><b>${d.dom}</b></div>
@@ -4617,7 +4635,7 @@ function market(){
       <span class="pill">${esc(mk.from_day)} – ${esc(mk.to_day)}</span>
       <button id="mkfetch" class="btn sm">Refresh</button></div>
     ${filters}
-    <div class="cal">${cells}</div>
+    <div class="cal mkweek">${cells}</div>
     ${sel?`<div class="crow mksel"><h3>${esc(sel)}</h3>
       <span class="dim">${chosen.length} event(s)${
         hidden?` · ${hidden} hidden by the filter`:''}</span></div>${rows}`
@@ -7244,11 +7262,19 @@ function stateQuery(){
  * each payload lands rather than at the top of load(), because by then S already
  * holds the scope being asked for.
  *
- * The keys are the ones stateQuery() sends. Not `calday`: that is a selection WITHIN
- * a payload rather than part of the request, and draw() already drops a day the
- * payload holds no fills for. */
+ * The keys are the ones stateQuery() sends. Not `calday`, although with no month
+ * key it does name the month asked for: load() pins that month into `month` once
+ * its figures land, so the month is recorded here and the day stays what it is, a
+ * selection within the payload that draw() drops when the payload holds no fills
+ * for it. */
 const SCOPE_KEYS=['month','type','cost','scoring'];
 let LOADED={};
+/* The banner the last failed read raised, as it stands in #msg, so the next good
+   read can take it down. A `bad` note never dismisses itself, which is right for
+   an error nobody has seen yet and wrong for this one once the server answers:
+   it went on saying the read failed over figures that had just loaded. Compared
+   with what #msg holds, so a newer note (a Sync's refusal) is left for its reader. */
+let READ_NOTE=null;
 
 async function load(){
   const qs=stateQuery();
@@ -7263,23 +7289,52 @@ async function load(){
      "running" with nothing left to wait for. */
   if(!st){
     note('Could not read state: '+esc(why),'bad');
+    READ_NOTE=$('#msg').innerHTML;
     /* Over figures that did not move, with the controls that produced them: the
        banner says the read failed, and nothing else claims otherwise. */
     if(S.state){Object.assign(S,LOADED);draw();}
     return;
   }
+  /* Before the payload guard, whose own banner this must not take down. */
+  if(READ_NOTE!==null&&$('#msg').innerHTML===READ_NOTE) $('#msg').className='';
+  READ_NOTE=null;
   S.state=st;
   staleServerCheck(S.state);
-  /* A month outside the account's lifetime heals away (the server answers with
-     selected_month null rather than inventing one). Months WITH no fills are
-     legitimate now -- validated against month_range, not the fills-only list,
-     or picking one would revert on the very next load. */
+  /* A linked day with no month key names its own month (stateQuery), and these
+     figures are for it, so it is pinned as the month here. It lived nowhere else:
+     the day heals away when it holds no fills, and a failed read rolls back to
+     LOADED, and either one left the figures of the day's month under a URL that
+     means the current month, which a reload then opened. The current month keeps
+     its default spelling, null, as the stepper leaves it. Before the heal below,
+     so a day in a month the account never had still heals to all time. */
+  if(!S.month&&S.calday){
+    const dm=S.calday.slice(0,7);
+    if(dm!==(S.state.month_range||[])[0]) S.month=dm;
+  }
+  /* A month outside the account's lifetime heals to ALL TIME, because that is
+     what the server answered it with (selected_month null, all-time figures).
+     It healed to null, which was right while an absent month meant all time and
+     wrong once it came to mean the current month: `#month=1999-01` drew all-time
+     figures and left a URL whose reload, and whose next Sync or type switch,
+     showed the current month instead. Both entry points arrive here, a fresh load
+     and a typed hash, so they heal alike. Months WITH no fills are legitimate --
+     validated against month_range, not the fills-only list, or picking one would
+     revert on the very next load. */
   if(S.month && S.month!=='all'
      && !((S.state.month_range||S.state.months||[]).includes(S.month)))
-    S.month=null;
+    S.month='all';
   /* Server-resolved, so an unrecognised type falls back to everything here too
      instead of leaving the button set out of step with the numbers. */
   S.type=S.state.trade_type==='all'?null:S.state.trade_type;
+  /* And the scoring unit, from the unit these figures were COUNTED in. The server
+     applies the stored preference when the request names none, so a fresh page
+     with "contract" stored, or a pick saved just before a read that failed and
+     was rolled back, drew per-contract figures under a lit "Per position", and
+     `groupingMatters` then judged a contract payload by the position rule. The
+     default stays null, as the switch and the hash spell it; so does a reply
+     with no stats block, which staleServerCheck has already reported. */
+  const sco=(S.state.stats||{}).scoring;
+  S.scoring=sco&&sco!==SCORINGS[0]?sco:null;
   /* AFTER the heals, so what is remembered is the scope these figures are for
      rather than the one that was asked for. */
   LOADED=Object.fromEntries(SCOPE_KEYS.map(k=>[k,S[k]]));

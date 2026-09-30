@@ -2252,7 +2252,9 @@ def _bind_replay(resume: bool, key: str = "lc:a") -> dict:
     return _node_run([
         f"import {{barsPerMs, nextStop}} from '{_static('replay.js')}';",
         "let RGEO={points:Array.from({length:10},(_,i)=>[i,1]),events:[]}, RTIMER=null;",
-        "let RPKEY=null;",
+        # A resume carries on from where the loop stood, which for this panel is
+        # the bar it is parked at.
+        "let RPKEY=null, RPOS=3;",
         f"const S={{replay:{json.dumps(key)}}};",
         "let frames=0; const requestAnimationFrame=()=>++frames;",
         "const cancelAnimationFrame=()=>{};",
@@ -2300,6 +2302,82 @@ def test_a_redraw_during_playback_keeps_the_replay_playing():
         "whether it was playing has to be read before the loop is stopped")
     assert "bindReplayControls(replaying!==null&&replaying===S.replay)" in draw
     assert "el.checked=was.checked" in _fn("restoreInputs")
+
+
+def _replay_resume(start: int, bars: int, stops: list[int], stop_on: bool,
+                   interrupt: str) -> dict:
+    """Play the page's real `bindReplayControls` on a clock, interrupt it, run on.
+
+    The clock is a hand-driven `requestAnimationFrame`. Playback starts at `start`
+    and runs until the scrubber READS the bar just short of where it halts (the
+    stop, or the last bar), with the drawing still behind it; then either draw()'s
+    own resume lines run (a redraw) or the speed changes, and playback carries on
+    to wherever it halts. Reports where it halted, the card it raised, and the
+    lowest bar drawn after the interruption.
+    """
+    draw = _fn("draw")
+    capture = re.search(r"^\s*const replaying=.*?;$", draw, re.M)
+    decide = re.search(r"bindReplayControls\(([^;]*)\);", draw)
+    assert capture and decide, "draw() no longer decides whether to resume playback"
+    js = _code_only(_js())
+    consts = [_page_const("REPLAY_SECONDS")] if "const REPLAY_SECONDS=" in js else []
+    target = stops[-1] if stop_on else bars - 1
+    return _node_run([
+        f"import {{barsPerMs, nextStop, indexOfTs}} from '{_static('replay.js')}';",
+        f"let RGEO={{points:Array.from({{length:{bars}}},(_,i)=>[i*3600,1]),",
+        f"  events:{json.dumps([{'ts': s * 3600} for s in stops])}}}, RTIMER=null;",
+        "let RPKEY=null, RPOS=null;",
+        "const S={replay:'lc:a'};",
+        # A real cancel: the stopped loop's queued frame must not run again.
+        "let queue=new Map(), ids=0, now=0;",
+        "const requestAnimationFrame=cb=>{queue.set(++ids,cb);return ids;};",
+        "const cancelAnimationFrame=h=>{queue.delete(h);};",
+        "const frame=dt=>{now+=dt;const q=[...queue.values()];queue.clear();",
+        "  q.forEach(cb=>cb(now));};",
+        f"const scrub={{value:'{start}',max:'{bars - 1}'}}, play={{textContent:'▶ play'}};",
+        "const speed={value:'1'};",
+        f"const box={{'#rscrub':scrub,'#rspeed':speed,'#rstops':{{checked:{json.dumps(stop_on)}}},",
+        "  '#rloop':{checked:false}};",
+        "const $=sel=>box[sel]||null;",
+        "const document={querySelector:()=>play,querySelectorAll:()=>[]};",
+        "let drawn=[], card=null;",
+        "function replaySeek(i){drawn.push(i);} function replayFocus(e){card=e;}",
+        *consts, *_page_fns("replayStop", "bindReplayControls"),
+        "bindReplayControls(false); play.onclick(); frame(0);",
+        # Run until the scrubber reads the bar playback will halt on, while the
+        # drawing is still short of it: the half bar the rounding covers.
+        f"while(!(scrub.value==='{target}'&&drawn[drawn.length-1]<{target})) frame(10);",
+        "const before=drawn[drawn.length-1]; drawn=[];",
+        {"redraw": capture.group(0) + " replayStop(); bindReplayControls("
+                   + decide.group(1) + ");",
+         "speed": "speed.value='2'; speed.onchange();"}[interrupt],
+        "for(let i=0;i<20000&&RTIMER!==null;i++) frame(10);",
+        "console.log(JSON.stringify({before,halted:scrub.value,playing:RTIMER!==null,",
+        "  card:card?card.ts/3600:null,lowest:Math.min(...drawn)}));",
+    ])
+
+
+@pytest.mark.parametrize("interrupt", ["redraw", "speed"])
+def test_playback_resumes_from_where_it_stood_not_from_the_rounded_scrubber(interrupt):
+    """A redraw during playback (the theme chip, the currency toggle, a load()
+    landing, the update probe's answer) and a speed change both carry playback on,
+    and both resumed from the SCRUBBER, which holds the nearest bar: up to half a
+    bar ahead of the drawing. Reproduced in a browser on the real-journal copy, an
+    18-bar replay with stops at 3 and 9: interrupted while the scrubber read 9, it
+    ran to 17 and the "Short call close" card never showed (it halts at 9 when left
+    alone); on a 9-bar replay with stops off, interrupted while the scrubber read
+    the last bar, it jumped back to bar 0, because "play at the end" restarts.
+    Playback now resumes from its own unrounded position.
+    """
+    stop = _replay_resume(start=4, bars=18, stops=[3, 9], stop_on=True,
+                          interrupt=interrupt)
+    assert 8.5 <= stop["before"] < 9
+    assert (stop["halted"], stop["playing"], stop["card"]) == ("9", False, 9), (
+        f"playback ran past the stop it had not reached yet: {stop}")
+    end = _replay_resume(start=2, bars=9, stops=[], stop_on=False, interrupt=interrupt)
+    assert (end["halted"], end["playing"]) == ("8", False)
+    assert end["lowest"] >= end["before"], (
+        f"playback went back to bar {end['lowest']} instead of finishing: {end}")
 
 
 def test_a_second_replay_opened_over_a_playing_one_opens_paused():
@@ -3155,8 +3233,10 @@ def test_hashchange_only_refetches_when_the_server_side_keys_moved():
 def _page_const(name: str) -> str:
     """One top-level `const` declaration of the page, whole."""
     js = _code_only(_js())
-    found = (re.search(rf"^const {name}=\[.*?\n\];", js, re.S | re.M)
-             or re.search(rf"^const {name}=.*?;$", js, re.M))
+    # One line first: the multi-line form on a one-line array runs on to the next
+    # `\n];` in the file, pulling in every declaration in between.
+    found = (re.search(rf"^const {name}=.*?;$", js, re.M)
+             or re.search(rf"^const {name}=\[.*?\n\];", js, re.S | re.M))
     assert found, f"no top-level const {name} in the page"
     return found.group(0)
 
@@ -3255,6 +3335,210 @@ def test_a_hash_change_the_server_would_answer_differently_refetches():
     ])
     assert [m["call"] for m in moves] == [
         "load", "load", "load", "load", "draw", "draw", "draw"]
+
+
+def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_paths():
+    """`#month=1999-01`, loaded fresh or typed into the address bar, is answered
+    with all-time figures: `build_state` heals a month outside the account's life to
+    all-time (`test_a_month_outside_the_account_life_falls_back_to_all_time`). The
+    page drew those figures and then healed its own month to null, which since the
+    current month became the default MEANS the current month: the URL lost its
+    month, a reload of it (or the next Sync, or any type switch) showed September,
+    and the header's stepper pointed at a month it was not showing. Now the heal
+    records the scope the figures are for, `all`, so the screen, the stepper, the
+    URL and a reload of that URL all say All time.
+
+    Driven through the page's real `applyHash`, `stateQuery`, `load`, `syncHash`
+    and hashchange handler, against a stand-in server that answers the way
+    `build_state` does; only `fetch`, `draw` and `history` are stand-ins.
+    """
+    js = _code_only(_js())
+    handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
+    assert handler, "the hashchange handler moved"
+    consts = [_page_const(name) for name in
+              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS",
+               "SCOPE_KEYS")]
+    out = _node_run([
+        f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
+        "const location={hash:'',pathname:'/'}, window={};",
+        "const history={replaceState:(a,b,u)=>{location.hash=u.slice(1);},",
+        "  pushState:(a,b,u)=>{location.hash=u.slice(1);}};",
+        "let S={}, LOADED={}, READ_NOTE=null, drawn=null;",
+        "const $=()=>({innerHTML:'',className:''});",
+        "const RANGE=['2026-09','2026-08'];",
+        # The server's month rule, as build_state applies it.
+        "async function fetch(url){",
+        "  const m=new URLSearchParams(url.split('?')[1]||'').get('month');",
+        "  const month=m==='current'?RANGE[0]:m;",
+        "  const selected=RANGE.includes(month)?month:null;",
+        "  return {ok:true,json:async()=>({month_range:RANGE,months:RANGE,",
+        "    selected_month:selected,trade_type:'all',stats:{month:selected||'ALL'}})};",
+        "}",
+        "function note(){} function staleServerCheck(){}",
+        "function draw(){syncHash();drawn={shown:S.state.stats.month,",
+        "  hash:location.hash,asks:stateQuery()};}",
+        *consts, *_page_fns("applyHash", "stateQuery", "syncHash", "load"),
+        handler.group(0),
+        "const flush=()=>new Promise(r=>setTimeout(r,0));",
+        "async function fresh(hash){S={};location.hash=hash;applyHash();await load();",
+        "  return drawn;}",
+        "const out={};",
+        "out.fresh=await fresh('#month=1999-01');",
+        "await fresh('#month=2026-08');",
+        "location.hash='#month=1999-01'; window.onhashchange(); await flush(); await flush();",
+        "out.typed=drawn;",
+        "out.reloaded=await fresh(out.fresh.hash);",
+        "console.log(JSON.stringify(out));",
+    ])
+    assert out["fresh"] == out["typed"], "the two entry points disagree"
+    assert out["fresh"]["shown"] == "ALL"
+    assert out["reloaded"]["shown"] == "ALL", (
+        f"the healed URL {out['fresh']['hash']!r} reloads {out['reloaded']['shown']}, "
+        "not the all-time figures it was healed over")
+    # And what the page would ask next describes the figures on screen, so a Sync
+    # or a type switch does not silently jump to the current month.
+    assert out["fresh"]["asks"] == ""
+
+
+def _load_harness(stored: str = "position", real_note: bool = False) -> list[str]:
+    """The page's real `stateQuery` and `load()` against a stand-in server.
+
+    The server answers the month it is asked for (current = 2026-09), scores by
+    the request's unit or else the stored one, and fails with 503 while `down`.
+    `draw` and the payload guard are stand-ins, and so is `note` unless
+    `real_note`, which runs the page's own against a stand-in `#msg` (`msg`).
+    """
+    consts = [_page_const(name) for name in ("SCORINGS", "SCOPE_KEYS")]
+    banner = [
+        "const msg={innerHTML:'',className:'',addEventListener(){}};",
+        "msg.classList={contains:c=>msg.className.split(' ').includes(c),",
+        "  add:c=>{msg.className+=' '+c;}};",
+        "const $=sel=>sel==='#msg'?msg:null;",
+        *(["const setTimeout=()=>0, clearTimeout=()=>{};",
+           "let noteTimer=null;", _page_const("NOTE_MS"), *_page_fns("note")]
+          if real_note else ["function note(){}"]),
+    ]
+    return [
+        "let S={month:null,type:null,cost:null,scoring:null,calday:null}, LOADED={};",
+        "let READ_NOTE=null;",
+        f"let stored={json.dumps(stored)}, down=false;",
+        "async function fetch(url){",
+        "  if(down) return {ok:false,status:503};",
+        "  const qs=new URLSearchParams(url.split('?')[1]||'');",
+        "  const m=qs.get('month');",
+        "  return {ok:true,json:async()=>({month_range:['2026-09','2026-08','2026-01'],",
+        "    months:['2026-09'],selected_month:m==='current'?'2026-09':m,trade_type:'all',",
+        "    stats:{scoring:qs.get('scoring')||stored}})};",
+        "}",
+        *banner, "function staleServerCheck(){} function draw(){}",
+        "function esc(s){return String(s);}",
+        *consts, "const SCORING=()=>S.scoring||SCORINGS[0];",
+        *_page_fns("stateQuery", "load"),
+    ]
+
+
+def test_a_good_read_takes_down_the_banner_a_failed_read_raised():
+    """Reviewer finding D1. "Could not read state: HTTP 503" is a `bad` note, which
+    by design never dismisses itself, and nothing else took it down: after the
+    server came back and the next control read fine, the banner still said the
+    read failed, over figures that had just loaded. A good read now retires it, and
+    only it: a newer note (a Sync's refusal, say) stays for its reader.
+    """
+    out = _node_run([
+        *_load_harness(real_note=True),
+        "const shown=()=>msg.className.split(' ').includes('show')?msg.innerHTML:null;",
+        "down=true; await load(); const failed=shown();",
+        "down=false; await load(); const recovered=shown();",
+        "note('Sync failed: refused','bad'); await load(); const other=shown();",
+        "down=true; await load(); note('Sync failed: later','bad');",
+        "down=false; await load(); const newer=shown();",
+        "console.log(JSON.stringify({failed,recovered,other,newer}));",
+    ])
+    assert out["failed"] == "Could not read state: HTTP 503"
+    assert out["recovered"] is None, "the failure banner outlived a good read"
+    assert out["other"] == "Sync failed: refused", "a good read took down another note"
+    assert out["newer"] == "Sync failed: later", (
+        "a good read took down a note raised after the failure it was retiring")
+
+
+def test_a_month_named_only_by_the_linked_day_survives_the_day_and_a_failed_read():
+    """Reviewer finding C. `#tab=calendar&calday=2026-01-16` has no month key, and
+    stateQuery asks for the day's month, so January's figures load. The month
+    lived nowhere else: press Previous period against a 503 and the rollback
+    (LOADED, which recorded S.month as null) put back "the current month" over
+    January's figures, so the URL became `#tab=calendar`, a reload opened the
+    current month, and the next good control loaded it. On the real-journal copy it
+    happens with no failure at all: January 2026 holds no fills, so draw() heals
+    the day away on the first render and leaves January's figures under a URL
+    that means the current month. The month a read was asked for is now pinned as
+    S.month once its figures are in hand, so the day can go and the month stays.
+    """
+    out = _node_run([
+        *_load_harness(),
+        "S.calday='2026-01-16'; await load();",
+        "const landed=stateQuery();",
+        # The day heals away (no fills), or the reader clears it.
+        "S.calday=null; const dayGone=stateQuery();",
+        # Previous period, as its handler writes it, against a failed read.
+        "S.calday='2026-01-16'; await load();",
+        "S.calday=null; S.month='2025-12'; down=true; await load();",
+        "const rolledBack=stateQuery();",
+        # A day in the current month keeps the default spelling of that month.
+        "down=false; S={month:null,type:null,cost:null,scoring:null,calday:'2026-09-18'};",
+        "await load(); const current=S.month;",
+        "console.log(JSON.stringify({landed,dayGone,rolledBack,current}));",
+    ])
+    assert out["landed"] == "month=2026-01"
+    assert out["dayGone"] == "month=2026-01", (
+        "without the day the page asks for the current month over January's figures")
+    assert out["rolledBack"] == "month=2026-01", (
+        "a failed read rolled the page back to a month it was not showing")
+    assert out["current"] is None
+
+
+def _load_under(stored: str, steps: list[str]) -> list[dict]:
+    """The page's real `load()` against a stand-in server with a stored scoring unit.
+
+    Each step is `ok` (a good read) or `503`, optionally prefixed `pick:<unit>=`
+    to apply the scoring switch's own write first (S.scoring, as its handler sets
+    it, after a save that stored the unit). After each step: the unit the control
+    shows, the unit the figures on screen were counted in, and the month the page
+    would ask for next.
+    """
+    return _node_run([
+        *_load_harness(stored),
+        f"const steps={json.dumps(steps)}, out=[];",
+        "for(const step of steps){",
+        "  const [pick,read]=step.includes('=')?step.split('='):[null,step];",
+        "  if(pick){const unit=pick.split(':')[1];",
+        "    S.scoring=unit===SCORINGS[0]?null:unit; stored=unit;}",
+        "  down=read==='503'; await load();",
+        "  out.push({control:SCORING(),figures:S.state.stats.scoring,asks:stateQuery()});",
+        "}",
+        "console.log(JSON.stringify(out));",
+    ])
+
+
+def test_the_scoring_control_shows_the_unit_the_figures_were_counted_in():
+    """Reviewer finding B. The scoring switch saves the unit and then reads state;
+    the read restores the scope it had on a failure, so "Per contract" clicked
+    against a 503 put S.scoring back to null while the file now said contract. The
+    next good read sent no unit, the server applied the stored one, and the page
+    showed per-contract figures under a lit "Per position" chip, with
+    `groupingMatters` judging a contract payload as a position one (on the
+    reviewer's journal both buttons went disabled, and only a URL edit got out).
+    The root is older than that path: the chip never read `stats.scoring`, so a
+    fresh page with contract stored landed in the same state. Now every good read
+    sets the control from the unit the figures were counted in.
+    """
+    fresh = _load_under("contract", ["ok"])[0]
+    assert fresh["control"] == fresh["figures"] == "contract", fresh
+    picked = _load_under("position", ["ok", "pick:contract=503", "ok"])
+    assert picked[1]["control"] == picked[1]["figures"] == "position", (
+        "a failed read must leave the control on the figures still on screen")
+    assert picked[2]["control"] == picked[2]["figures"] == "contract", picked
+    back = _load_under("contract", ["ok", "pick:position=ok"])[1]
+    assert back["control"] == back["figures"] == "position", back
 
 
 def test_an_unknown_cost_key_in_the_hash_falls_back_to_the_default():
@@ -5367,7 +5651,8 @@ def test_a_state_reply_that_cannot_be_read_still_hands_the_buttons_back(reply):
         "function draw(){draws++;}",
         "function staleServerCheck(){}",
         f"let fetch; {reply}",
-        _page_const("SCOPE_KEYS"), "let LOADED={};",
+        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        "const $=()=>({innerHTML:'',className:''});",
         *_page_fns("stateQuery", "load"),
         "try{ await load(); }catch(e){ notes.push('threw'); }",
         "console.log(JSON.stringify({draws,notes}));",
@@ -5399,7 +5684,8 @@ def test_a_failed_state_read_leaves_the_controls_over_the_figures_in_hand():
         "function staleServerCheck(){}",
         f"const payload={json.dumps(payload)};",
         "let fetch=async()=>({ok:true,status:200,json:async()=>payload});",
-        _page_const("SCOPE_KEYS"), "let LOADED={};",
+        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        "const $=()=>({innerHTML:'',className:''});",
         *_page_fns("stateQuery", "load"),
         "await load();",
         # What the month stepper and the trade-type buttons do, then a read that fails.
@@ -8435,7 +8721,42 @@ def test_the_header_figure_cannot_break_between_its_sign_and_its_number():
     assert "white-space:nowrap" in css.split(".pfig{", 1)[1].split("}", 1)[0]
     # And the header gives the period its own row when one row cannot hold it --
     # only when there IS a period, so the six tabs without one grow no dead row.
-    assert ".brand:has(.period:not(:empty)){" in css
+    assert ".brand:has(.period:empty){" in css
+
+
+@pytest.mark.parametrize("width", [1320, 760])
+def test_the_period_row_does_not_depend_on_has(width):
+    """Found while emulating finding D3: the period's own row was granted by
+    `.brand:has(.period:not(:empty))`, so a browser without `:has()` (Firefox
+    before 121) dropped the rule and kept the one-row header on the tabs that have
+    a period: 51px past the window at 765px, 14px at 320. The row is now the plain
+    `.brand` rule and `:has(.period:empty)` takes it away, which computes the same
+    layout wherever `:has()` exists (the header's geometry was compared against the
+    old page on all ten tabs at five widths in Chromium) and costs a browser without
+    it only a dead strip on the six tabs with no period.
+    """
+    rules = {sel: body.replace(" ", "") for sel, body in _media_rules(width)}
+    assert "periodperiod" in rules.get(".brand", "").replace('"', ""), (
+        f"at {width}px the period row is granted by :has(), which older browsers drop")
+    revert = rules.get(".brand:has(.period:empty)", "")
+    assert "periodperiod" not in revert.replace('"', "") and "grid-template-areas" in revert
+    assert "grid-template-columns" in revert and "row-gap" in revert, (
+        "the revert must restate what the other width's rules would otherwise win")
+    assert ".brand:has(.period:not(:empty))" not in rules
+
+
+def test_the_theme_chip_drops_under_the_wordmark_when_the_row_cannot_hold_both():
+    """At 320px the title column is 168px and "Bitácora" alone takes 134px of it,
+    so the edition chip squeezed to two lines and still ran past the column: to
+    314px on Leather, 311 on Ledger, and to 324 on Admiralty, whose longest word is
+    the widest, which scrolled every tab of the page sideways by 4px. The overflow
+    was never the theme's; it was a row that could not wrap. Measured after the fix
+    at 320 and 375px in all three themes: the chip sits on its own line under the
+    wordmark and the page is exactly as wide as the window.
+    """
+    title = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}[".title"]
+    assert "display:flex" in title and "flex-wrap:wrap" in title, (
+        "the title row cannot wrap, so the chip overflows the header on a phone")
 
 
 def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state):
@@ -8496,22 +8817,53 @@ def test_a_calendar_day_prints_its_figure_whole_at_every_width():
     and broke it inside its digits: "−", "€1,729.4", "2".
 
     The question belongs to the cell, so each day that carries a figure is a
-    container and one query answers it everywhere. Measured in a browser on the real
-    journal's two busiest months, 320px to 2560px in 5px steps: no digit split, no
-    clipping, and nothing wraps at all. The day's label keeps the exact figure for a
-    screen reader at every width.
+    container, and below 72px (the four-digit room) the compact form shows.
+
+    Above 72px one width could not answer it, which is the residual ae93f60 left: a
+    larger amount needs more room ("€12,345.67" 73px, "−€123,456.78" 88,
+    "−€9,999,999.99" 99), so from 665 to 1030px those wrapped after the minus, and
+    ran past the cell (clipped by the phone rule's `overflow:hidden` at 700px). Now
+    the amount itself decides: the figure is one clipped line, the amount wraps off
+    it when it does not fit, and the compact form, ordered first with no width of
+    its own, is then alone on the line. Measured in a browser with amounts from 1.50
+    to 9,999,999.99 in both signs injected into a month, 320px to 2560px in 1px
+    steps: every day shows exactly one form, on one line, inside its cell, and its
+    label keeps the exact figure. The old rules failed that from 665 to 1030px.
     """
     narrow = {sel: body.replace(" ", "") for sel, body in _at_rules(72, "container")}
     assert "display:none" in narrow.get(".day .dplw", ""), "the full amount still shows"
-    shown = narrow.get(".day .dpln", "")
-    assert "display:inline" in shown and "cqi" in shown, (
-        "the compact amount does not show, or does not scale with the day")
+    assert "cqi" in narrow.get(".day .dpln", ""), "the compact amount does not scale with the day"
+    assert "display:block" in narrow.get(".day .dpl", ""), (
+        "below 72px the figure must sit on its baseline as a plain line again")
     wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
     assert "container-type:inline-size" in wide.get(".cal>.day:has(>.dpl)", ""), (
         "a day is not its own container, so the query above can never match; and "
         "the Market strip's cells must stay out of it, they size themselves")
-    assert "display:none" in wide.get(".day .dpln", ""), (
-        "the compact amount shows beside the full one on a wide screen")
+    # The figure: one line that clips below itself, which the amount wraps off.
+    fig = wide.get(".day .dpl", "")
+    for prop in ("display:flex", "flex-wrap:wrap", "white-space:nowrap",
+                 "height:1.5em", "overflow:hidden"):
+        assert prop in fig, f".day .dpl lost {prop}, so a large amount can wrap or spill"
+    raw = {sel.strip(): body for sel, body in _toplevel_rules()}
+
+    def flex(sel: str) -> list[str]:
+        return re.search(r"flex:\s*([^;}]+)", raw[sel]).group(1).split()
+
+    # The amount takes every spare pixel while it fits, and never shrinks to fit.
+    grow, shrink, basis = flex(".day .dplw")
+    assert float(grow) >= 1e6 and (shrink, basis) == ("0", "auto"), (
+        "the amount no longer starves the compact form of room, so both show at once")
+    # The compact form: first on the line, zero width of its own, clipped.
+    assert flex(".day .dpln") == ["1", "0", "0"], (
+        "the compact form has a width of its own, so the amount's fit is tested "
+        "against less than the whole line, or it cannot grow into the line it gets")
+    compact_form = wide.get(".day .dpln", "")
+    for prop in ("order:-1", "min-width:0", "overflow:hidden"):
+        assert prop in compact_form, (
+            f".day .dpln lost {prop}; it cannot take the line when the amount leaves it")
+    assert "display:none" not in compact_form, (
+        "the compact form is hidden outright, so it cannot take over when the amount "
+        "does not fit")
     assert not any("anywhere" in body for sel, body in _css_rules()
                    if sel.strip() in (".day .dplw", ".day .dpl")), (
         "overflow-wrap:anywhere is back, which lets an amount break between digits")
@@ -8519,6 +8871,89 @@ def test_a_calendar_day_prints_its_figure_whole_at_every_width():
         "a pill strip with a row to itself cannot wrap, so it overflows its card")
     cal = _fn("calendar")
     assert "compact(amountOf(dy.realized))" in cal and "aria-label=" in cal
+
+
+def test_a_browser_without_container_queries_still_shows_a_fitting_figure():
+    """Reviewer finding D3. The day's figure leans on three things an older browser
+    lacks: container queries and `:has()` (Safari and iOS before 16, Firefox
+    before 121 for `:has()`) for the compact form below 72px, and the `lh` unit
+    (Safari before 16.4, Firefox before 120) for the one-line box the amount wraps
+    off. Emulated in Chromium by dropping those rules: both forms showed at once and
+    a phone's cells clipped the amount. The box is sized in `em` against its own
+    line height now, so the wrap-off switch works in any browser with flexbox, and
+    a fallback gives the compact form a size a phone's cell can hold. A browser
+    with both features skips the fallback, so nothing moves there.
+    """
+    wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    fig = wide[".day .dpl"]
+    assert "lh" not in re.sub(r"line-height", "", fig), (
+        "the figure's one-line box is sized in lh, which older browsers drop")
+    assert "line-height:1.5" in fig and "height:1.5em" in fig
+    css = re.sub(r"/\*.*?\*/", "", _css(), flags=re.S).replace(" ", "")
+    fallback = re.search(
+        r"@supportsnot\(\(container-type:inline-size\)andselector\(:has\(\*\)\)\)\{(.*?)\}\}",
+        css, re.S)
+    assert fallback, "no fallback for a browser without container queries or :has()"
+    sized = r"\.day\.dpln\{font-size:min\(var\(--t1\),[\d.]+vw\);min-height:100%"
+    assert re.search(sized, fallback.group(1)), (
+        "the fallback does not size the compact form to a phone's cell")
+
+
+def test_the_market_week_strip_is_seven_equal_columns_at_every_width():
+    """The strip reuses `.cal`, whose tracks are `1fr` with an `auto` minimum, so
+    each day refused to shrink below its longest event title. Only the phone rule
+    (760px and under) gave the cells a zero minimum; from 761px the rail is back,
+    the card is narrow, and on the real journal the strip ran 207px past its card
+    and the page scrolled sideways up to 985px wide, with the seven days drawn at
+    64 to 155px each until 1285px. The zero minimum now belongs to the strip at
+    every width, so the week is seven equal columns and a long title is cut with an
+    ellipsis (its full text is in the selected day's list below). Measured from
+    320px to 2560px in 5px steps after the fix: the strip is inside its card at
+    every width.
+
+    The Calendar tab keeps its own `.cal` rules untouched: the strip is scoped by
+    its own class, so this cannot move a single day of the P&L grid.
+    """
+    wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "repeat(7,minmax(0,1fr))" in wide.get(".cal.mkweek", ""), (
+        "the week strip's tracks have an auto minimum again, so a long title widens "
+        "its day and the strip runs past its card")
+    calendar_grid = "display:grid;grid-template-columns:repeat(7,1fr);gap:var(--s3)"
+    assert wide.get(".cal", "") == calendar_grid, (
+        "the Calendar tab's grid moved; the strip's fix must stay scoped to the strip")
+    assert '<div class="cal mkweek">' in _fn("market")
+    # The ellipsis the strip always declared, now on a box it can apply to:
+    # `text-overflow` does nothing on a flex container, so `.mkdot` cut a title
+    # mid-word ("Fina") instead of ending it with "…".
+    title = wide.get(".mkt", "")
+    for prop in ("min-width:0", "overflow:hidden", "text-overflow:ellipsis"):
+        assert prop in title, f".mkt lost {prop}, so a clipped title shows no ellipsis"
+    assert "white-space:nowrap" in wide.get(".mkdot", "")
+    assert "text-overflow" not in wide.get(".mkdot", ""), (
+        "text-overflow on the flex row is inert; it belongs on the title's own box")
+    cells = _fn("market")
+    assert cells.count('<span class="mkt">') == 3, (
+        "every line of a day (a title, the '+N more' count, the quiet dash) is its "
+        "own truncating box")
+
+
+def test_the_replay_controls_wrap_inside_their_card():
+    """Reviewer finding D2. The control row is three buttons, the scrubber (80px
+    at least), the speed select, two checkboxes and the readout, one `nowrap` flex
+    row. The readout alone is about 270px on a real replay ("Sep 11, 11:30 AM · 104
+    · $396.00 est. P&L · flat"), so from 320 to 920px the row ran past its card
+    and the page scrolled sideways (456px at 320). It wraps now, as `.setrow` and
+    the Market buttons do: where one row fits, nothing moves (the scrubber still
+    takes the spare room and the readout ends the row); where it does not, the
+    controls flow onto further lines, the readout stays at the right, and on a
+    phone its own text wraps rather than widening the page.
+    """
+    rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "flex-wrap:wrap" in rules[".rctl"], "the replay controls cannot wrap"
+    readout = rules[".rread"]
+    assert "white-space:nowrap" not in readout, (
+        "a readout that cannot wrap is wider than a phone's card on its own")
+    assert "margin-left:auto" in readout, "a wrapped readout falls to the left edge"
 
 
 def test_the_content_column_can_shrink_below_its_widest_child():
