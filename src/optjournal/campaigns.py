@@ -70,6 +70,7 @@ __all__ = [
     "Campaign",
     "WINDOW_S",
     "cluster_orders",
+    "first_taken",
     "link",
     "placed_by_broker",
     "position_count",
@@ -139,7 +140,7 @@ class Campaign:
     #: campaign: the leg views aggregate per contract and carry no fill id, so an
     #: order is the only handle the Trades tab has. One order is in two campaigns
     #: when its fills ended one position and began the next; `leg_parts` says
-    #: what each took.
+    #: what each took. `orders` says which broker issued each.
     order_ids: frozenset[str]
     #: Every episode closed. A roll into a still-open position leaves this
     #: False, which is the entire behavioural change: the near leg's realised
@@ -156,6 +157,17 @@ class Campaign:
     #: campaign, as stored. Empty for a campaign the window alone built, which is
     #: how the Trades tab knows which cards it may offer to unlink.
     links: tuple[tuple[str, str], ...] = ()
+    #: The orders its anchor is chosen from, which a hand link finds it by: its
+    #: own, and every order of the window groups its fills are in. Wider than
+    #: `order_ids` on purpose, since it is what every stored entry and link was
+    #: made against: a position closed by order 100 and re-entered by 101 thirty
+    #: seconds later is two campaigns, and the re-entry's card has always
+    #: answered to 100.
+    handles: frozenset[str] = frozenset()
+    #: `order_ids` with the broker that issued each, `(broker, order id)`, which
+    #: is how the Trades tab finds an order's campaigns: an order id is the
+    #: issuing broker's own, and two brokers can both number an order 5000.
+    orders: frozenset[tuple[str, str]] = frozenset()
     #: What this campaign took of an order LEG another campaign also took, keyed
     #: by `(order id, conid)`, in the leg's own columns (`_leg_share`): quantity,
     #: fills, prices, times, money, and the open/close marker of what it took.
@@ -173,33 +185,42 @@ class Campaign:
     #: TypeError. Equality still reads it.
     leg_parts: Mapping[tuple[str, str], Mapping[str, Any]] = field(
         default_factory=dict, hash=False)
+    #: The campaign's stable handle: the lowest of its `handles`, or None if it
+    #: has no fills. What journal entries are filed under and what a hand link
+    #: names.
+    #:
+    #: `episode_indices` cannot be a handle: they are positions in the list
+    #: `link` was handed, and every ingest rebuilds that list. Nor can the
+    #: campaign's identity be its membership, which a 90-second heuristic decides
+    #: and a later fill can change. An ORDER ID is neither: IBKR issued it, it
+    #: names one placement forever, and it is already carried here because the
+    #: Trades tab reaches campaigns through orders.
+    #:
+    #: The LOWEST, so the handle is the decision's earliest placement and a roll
+    #: added tomorrow does not move it. Compared numerically, because IBKR order
+    #: ids are numbers in text and `min` on strings would rank '999' above '1000'
+    #: (true today only because the real ids are all ten digits, which is the
+    #: kind of accident that holds until it does not). Ties fall back to the
+    #: string so the answer is total either way.
+    #:
+    #: One anchor per card: where two campaigns' lowest handle is the same order,
+    #: the one that took that order's first execution keeps it and the other
+    #: takes the lowest of its own orders a link would find it by
+    #: (`shared_anchor` says which it gave up), or None if it has none.
+    #:
+    #: None for a campaign built only from position snapshots: the archive holds
+    #: no fills for it, so there is no order to name. Callers that key anything
+    #: on this have to say what they do about that; see `journal.py`.
+    anchor: str | None = None
+    #: The anchor this campaign answered to alongside another, which now owns it,
+    #: so writing filed under it may be about either (`serialize.journal_data`
+    #: lists it). None for every campaign whose lowest handle is its own alone.
+    shared_anchor: str | None = None
 
     @property
-    def anchor(self) -> str | None:
-        """The campaign's stable handle: its lowest order id, or None if it has
-        no fills.
-
-        `episode_indices` cannot be a handle -- they are positions in the list
-        `link` was handed, and every ingest rebuilds that list. Nor can the
-        campaign's identity be its membership, which a 90-second heuristic
-        decides and a later fill can change. An ORDER ID is neither: IBKR issued
-        it, it names one placement forever, and it is already carried here
-        because the Trades tab reaches campaigns through orders.
-
-        The LOWEST, so the handle is the decision's earliest placement and a roll
-        added tomorrow does not move it. Compared numerically, because IBKR order
-        ids are numbers in text and `min` on strings would rank '999' above
-        '1000' -- true today only because the real ids are all ten digits, which
-        is the kind of accident that holds until it does not. Ties fall back to
-        the string so the answer is total either way.
-
-        None for a campaign built only from position snapshots: the archive holds
-        no fills for it, so there is no order to name. Callers that key anything
-        on this have to say what they do about that -- see `journal.py`.
-        """
-        if not self.order_ids:
-            return None
-        return min(self.order_ids, key=lambda oid: (_order_sort_key(oid), oid))
+    def brokers(self) -> frozenset[str]:
+        """The brokers whose fills it holds; one, in all but a hand-made case."""
+        return frozenset(broker for broker, _oid in self.orders)
 
     @property
     def is_win(self) -> bool:
@@ -311,8 +332,14 @@ def link(
     for index, ids in enumerate(order_groups):
         for oid in ids:
             group_of_order[str(oid)] = index
+    orders_of_group: dict[int, set[str]] = {}
+    for oid, index in group_of_order.items():
+        orders_of_group.setdefault(index, set()).add(oid)
 
-    members_of_group: dict[int, list[int]] = {}
+    #: Per broker as well: a decision is placed at one broker, and an order id is
+    #: the issuing broker's own, so two brokers' order 5000 are not one order
+    #: touching two contracts, which is what a spread looks like.
+    members_of_group: dict[tuple[int, str], list[int]] = {}
     #: Orders reached per episode, so the campaign can carry the union of them.
     #: Only the orders of the episode's OWN fills. A group that joins episodes
     #: (below) makes every one of its orders some member's own anyway; one that
@@ -320,15 +347,22 @@ def link(
     #: orders seconds apart, listed each side's order under the other, and the
     #: Trades tab drew both orders whole in both cards.
     orders_of_episode: dict[int, set[str]] = {}
+    #: ... and those plus every order of their groups, which is what anchors and
+    #: hand links have always been read against (`Campaign.handles`).
+    handles_of_episode: dict[int, set[str]] = {}
+    broker_of = [str(getattr(episode, "broker", "") or "") for episode in episodes]
     for i, episode in enumerate(episodes):
         for tid in getattr(episode, "trade_ids", ()) or ():
             order_id = order_of_trade.get(str(tid))
             if order_id is None:
                 continue
             orders_of_episode.setdefault(i, set()).add(order_id)
+            handles = handles_of_episode.setdefault(i, set())
+            handles.add(order_id)
             group = group_of_order.get(order_id)
             if group is not None:
-                members_of_group.setdefault(group, []).append(i)
+                handles |= orders_of_group[group]
+                members_of_group.setdefault((group, broker_of[i]), []).append(i)
     # A group joins DIFFERENT contracts: a roll's two expiries, a spread's legs.
     # A group that touched episodes of only ONE contract has reversed it -- a fill
     # through zero (IBKR's `C;O`) belongs to the long it closed and the short it
@@ -340,8 +374,10 @@ def link(
             for i in touched:
                 union(touched[0], i)
 
+    # A link names two cards' anchors, so it finds its episodes through the
+    # handles the anchors come from: the first episode holding each.
     episode_of_order: dict[str, int] = {}
-    for i, oids in orders_of_episode.items():
+    for i, oids in handles_of_episode.items():
         for oid in oids:
             episode_of_order.setdefault(oid, i)
     applied: list[tuple[int, tuple[str, str]]] = []
@@ -361,7 +397,7 @@ def link(
     # What each campaign took of each order leg, per (order, contract), which is
     # the shape a leg has: its episodes' own fill parts. A leg more than one
     # campaign took is divided between them; see `Campaign.leg_parts`.
-    took: dict[int, dict[tuple[str, str], list[Any]]] = {}
+    took: dict[int, dict[tuple[str, str, str], list[tuple[str, Any]]]] = {}
     for root, idxs in members.items():
         for i in idxs:
             conid = str(getattr(episodes[i], "conid", "") or "")
@@ -369,23 +405,34 @@ def link(
                 order_id = order_of_trade.get(str(tid))
                 if order_id is not None:
                     took.setdefault(root, {}).setdefault(
-                        (order_id, conid), []).append(part)
-    takers: dict[tuple[str, str], int] = {}
+                        (broker_of[i], order_id, conid), []).append((str(tid), part))
+    takers: dict[tuple[str, str, str], int] = {}
     for legs in took.values():
         for key in legs:
             takers[key] = takers.get(key, 0) + 1
 
+    roots = sorted(members)
+    own = {root: frozenset((broker_of[i], oid) for i in members[root]
+                           for oid in orders_of_episode.get(i, ())) for root in roots}
+    handles_of = {root: frozenset(oid for i in members[root]
+                                  for oid in handles_of_episode.get(i, ()))
+                  for root in roots}
+    anchor_of, shared_of = _anchors(roots, own, handles_of, took, {
+        oid: find(i) for oid, i in episode_of_order.items()})
+
     out: list[Campaign] = []
-    for root in sorted(members):
+    for root in roots:
         idxs = members[root]
         eps = [episodes[i] for i in idxs]
         decided = bool(eps) and all(e.is_closed for e in eps)
         out.append(Campaign(
             episode_indices=tuple(idxs),
             conids=tuple(sorted({str(getattr(e, "conid", "") or "") for e in eps})),
-            order_ids=frozenset(
-                oid for i in idxs for oid in orders_of_episode.get(i, ())
-            ),
+            order_ids=frozenset(oid for _broker, oid in own[root]),
+            orders=own[root],
+            handles=handles_of[root],
+            anchor=anchor_of.get(root),
+            shared_anchor=shared_of.get(root),
             is_decided=decided,
             closed_at=max(
                 (str(e.closed_at) for e in eps if e.closed_at), default=None
@@ -401,30 +448,104 @@ def link(
                 (e.commission_base, e.commission, e.currency) for e in eps
             ) if decided else None,
             links=tuple(sorted(links_of_root.get(root, ()))),
-            leg_parts={key: _leg_share(parts)
-                       for key, parts in took.get(root, {}).items()
-                       if takers[key] > 1},
+            leg_parts={(order_id, conid): _leg_share(taken)
+                       for (broker, order_id, conid), taken in took.get(root, {}).items()
+                       if takers[(broker, order_id, conid)] > 1},
         ))
     return out
 
 
+def _lowest(order_ids: Iterable[str]) -> str | None:
+    """The lowest order id, numerically, or None for none (`Campaign.anchor`)."""
+    return min(order_ids, key=lambda oid: (_order_sort_key(oid), oid), default=None)
+
+
+def _taken_first(part: Any) -> tuple[bool, str, bool]:
+    """Orders the fill parts of one order by when they were taken: by time (an
+    undated part last), and on one instant the closing half of a split execution
+    before its opening half, since it closed one position before it opened the
+    next."""
+    return (not part.date_time, str(part.date_time or ""),
+            str(part.open_close).upper() != "C")
+
+
+def _anchors(
+    roots: list[int],
+    own: Mapping[int, frozenset[tuple[str, str]]],
+    handles: Mapping[int, frozenset[str]],
+    took: Mapping[int, Mapping[tuple[str, str, str], list[tuple[str, Any]]]],
+    campaign_of_order: Mapping[str, int],
+) -> tuple[dict[int, str | None], dict[int, str]]:
+    """Each campaign's anchor, one per card, and the anchor any gave up.
+
+    The anchor is the lowest handle. Two campaigns can share it (a holding from
+    before the archive closed by order 100 and re-entered by 101 inside the
+    window, or one order ending one position and beginning the next), and one
+    anchor on two cards showed one entry on both and let either rewrite it. The
+    campaign that took the anchor order's first execution keeps it
+    (`_taken_first`, then the lower root); each other takes the lowest of its
+    own orders that no campaign is anchored at and that a link naming it would
+    find it by (`campaign_of_order`), or None when it has none. Per broker: an
+    entry is filed under `(broker, account, anchor)`, so two brokers' cards
+    answering to one order id do not clash.
+    """
+    anchor_of: dict[int, str | None] = {root: _lowest(handles[root]) for root in roots}
+    claims: dict[tuple[str, str], list[int]] = {}
+    for root in roots:
+        anchor = anchor_of[root]
+        for broker in sorted({broker for broker, _oid in own[root]}):
+            if anchor is not None:
+                claims.setdefault((broker, anchor), []).append(root)
+    used = set(claims)
+    shared_of: dict[int, str] = {}
+    for broker, anchor in sorted(claims, key=lambda key: (
+            key[0], _order_sort_key(key[1]), key[1])):
+        claimants = claims[(broker, anchor)]
+        if len(claimants) < 2:
+            continue
+        taken = {root: [part for (at, order_id, _conid), pairs in took.get(root, {}).items()
+                        if (at, order_id) == (broker, anchor) for _tid, part in pairs]
+                 for root in claimants}
+        owner = min(claimants, key=lambda root: (
+            min(map(_taken_first, taken[root]), default=(True, "", True)), root))
+        for root in claimants:
+            if root == owner or root in shared_of:
+                continue
+            spare = min(((at, oid) for at, oid in own[root] if (at, oid) not in used
+                         and campaign_of_order.get(oid) == root),
+                        key=lambda pair: (_order_sort_key(pair[1]), pair), default=None)
+            anchor_of[root] = spare[1] if spare else None
+            shared_of[root] = anchor
+            if spare:
+                used.add(spare)
+    return anchor_of, shared_of
+
+
 #: The columns of a leg that are sums over its fills, named as `db.trade_legs`
 #: and `history.FillPart` both name them.
-_LEG_TOTALS = ("quantity", "fills", "proceeds", "proceeds_base", "commission",
+_LEG_TOTALS = ("quantity", "proceeds", "proceeds_base", "commission",
                "commission_base", "realized_pnl", "realized_pnl_base")
 
 
-def _leg_share(parts: Sequence[Any]) -> dict[str, Any]:
+def _leg_share(taken: Sequence[tuple[str, Any]]) -> dict[str, Any]:
     """The share of one order leg a campaign took, in the leg's own columns.
 
-    Summed from the fill parts its episodes took, so every figure is those fills'
-    own, a reversal's half included, and the shares of the campaigns dividing a
-    leg add back up to it. The price is `trade_legs`' average, over this share's
-    fills. The open/close marker is the parts' when they agree; a share mixing
-    closing and opening fills leaves the leg's own in place.
+    Summed from the fill parts its episodes took, `(trade id, part)`, so every
+    figure is those fills' own, a reversal's half included, and the shares of the
+    campaigns dividing a leg add back up to it. `fills` counts the executions it
+    drew from, a split one included, so each card counts every execution it
+    draws and a split one counts in both of its cards (once in one card holding
+    both of its halves); a total across cards counts executions from the fills
+    themselves instead (the Dashboard's, and the Calendar's, which lists an
+    order whole). The price is `trade_legs`' average, over this share's fills.
+    The open/close marker is that of what the share took first (`first_taken`),
+    which is every part's when they agree, and which says, of two shares
+    starting on one split execution, which took its closing half.
     """
+    parts = [part for _tid, part in taken]
     share: dict[str, Any] = {
         name: sum(getattr(part, name) for part in parts) for name in _LEG_TOTALS}
+    share["fills"] = len({tid for tid, _part in taken})
     size = sum(abs(part.quantity) for part in parts)
     share["avg_price"] = sum(
         abs(part.quantity) * part.trade_price
@@ -433,10 +554,17 @@ def _leg_share(parts: Sequence[Any]) -> dict[str, Any]:
     times = [str(part.date_time) for part in parts if part.date_time]
     share["first_fill_at"] = min(times, default=None)
     share["last_fill_at"] = max(times, default=None)
-    marks = {part.open_close for part in parts}
-    if len(marks) == 1:
-        share["open_close"] = marks.pop()
+    share["open_close"] = min(parts, key=_taken_first).open_close
     return share
+
+
+def first_taken(share: Mapping[str, Any]) -> tuple[str, bool]:
+    """When a share of an order leg (`_leg_share`) took its first execution, for
+    ordering the shares of one order: by time, and on a tie the share that took
+    it closing first. A split `C;O` execution is taken by both of its positions at
+    one instant, and it closed the one before it opened the next."""
+    return (str(share.get("first_fill_at") or ""),
+            str(share.get("open_close") or "").upper() != "C")
 
 
 def position_count(

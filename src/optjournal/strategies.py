@@ -131,12 +131,13 @@ def strategy_groups(orders: list[Row]) -> list[Row]:
     The window rule is `campaigns.cluster_orders`, so the Trades tab and the
     scoreboard group the same fills the same way by construction.
     """
-    by_id = {str(o.get("ib_order_id")): o for o in orders}
+    # Clustered under the order id with the broker after it, so two brokers'
+    # order 5000 are two orders and ties still break on the id.
+    by_key = {"\x1f".join(_order_key(o)[::-1]): o for o in orders}
     out = [
-        _event([by_id[oid] for oid in ids])
-        for ids in campaigns.cluster_orders(
-            (str(o.get("ib_order_id")), o.get("first_fill_at"), _underlying(o))
-            for o in orders
+        _event([by_key[key] for key in keys])
+        for keys in campaigns.cluster_orders(
+            (key, o.get("first_fill_at"), _underlying(o)) for key, o in by_key.items()
         )
     ]
     out.sort(key=lambda g: g["first_fill_at"], reverse=True)
@@ -163,9 +164,15 @@ def _event(members: list[Row]) -> Row:
     }
 
 
+def _order_key(order: Row) -> tuple[str, str]:
+    """An order's identity: `(broker, order id)`, since an order id is the
+    issuing broker's own and two brokers can both number one 5000."""
+    return str(order.get("broker") or ""), str(order.get("ib_order_id"))
+
+
 def _campaign_of_order(
     campaign_list: list[campaigns.Campaign],
-) -> dict[str, list[int]]:
+) -> dict[tuple[str, str], list[int]]:
     """Which campaigns each order filled, so an event is placed by its own orders.
 
     The campaign carries them because the leg views aggregate per contract and so
@@ -178,10 +185,10 @@ def _campaign_of_order(
     card only, and the other read its opening date and its proceeds from whatever
     event was left to it.
     """
-    out: dict[str, list[int]] = {}
+    out: dict[tuple[str, str], list[int]] = {}
     for index, camp in enumerate(campaign_list):
-        for oid in camp.order_ids:
-            out.setdefault(str(oid), []).append(index)
+        for key in camp.orders:
+            out.setdefault(key, []).append(index)
     return out
 
 
@@ -227,14 +234,14 @@ def _first_taker(
 ) -> int:
     """Of the campaigns dividing an order, the one that took its first execution.
 
-    A reversal's one execution is taken by both, so the tie goes to the one it
-    counts in (`history.FillPart.fills`): the position it closed.
+    A reversal's one execution is taken by both, so the tie goes to the position
+    it closed (`campaigns.first_taken`).
     """
     oid = str(order.get("ib_order_id"))
 
     def first(index: int) -> tuple[str, bool]:
         return min(
-            ((str(part.get("first_fill_at") or ""), not part.get("fills"))
+            (campaigns.first_taken(part)
              for (order_id, _conid), part in campaign_list[index].leg_parts.items()
              if order_id == oid),
             default=("\uffff", True),
@@ -265,7 +272,7 @@ def _campaign_events(
     for event in strategy_groups(orders):
         parts: dict[int | None, list[Row]] = {}
         for order in event["orders"]:
-            found = campaigns_of_order.get(str(order.get("ib_order_id")), [])
+            found = campaigns_of_order.get(_order_key(order), [])
             if len(found) > 1 and not divide:
                 found = [_first_taker(order, found, campaign_list)]
             if len(found) <= 1:
@@ -328,8 +335,10 @@ def position_groups(
 
     An order whose fills ended one position and began the next is drawn in both
     cards, each with its own share (`_campaign_events`), so every fill's
-    quantity and money is drawn once across the cards and a card's `fills`
-    counts its own executions.
+    quantity and money is drawn once across the cards. A card's `fills` counts
+    every execution it draws, so a split `C;O` one counts in both of its cards:
+    no total adds cards' fills up, and the ones that count executions across
+    cards (the Dashboard's, the Calendar's) count each once.
     """
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own

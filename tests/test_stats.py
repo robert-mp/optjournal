@@ -684,11 +684,17 @@ def test_every_fill_is_drawn_once_across_the_cards_and_once_on_the_calendar(conn
         for field in ("proceeds", "commission", "realized_pnl"):
             assert leg["money"][field]["base"] == pytest.approx(leg[f"{field}_base"] or 0.0)
             assert (leg["money"][field]["native"] or 0.0) == pytest.approx(leg[field] or 0.0)
-    # One execution is one fill on the page, wherever the cards divide it.
+    # A card counts every execution it draws, a split one in each card drawing a
+    # half. The totals across cards count each once: the Dashboard's fills, and
+    # the Calendar's, which lists an execution whole.
+    took = [len({t for i in c.episode_indices for t in report.episodes[i].trade_ids})
+            for c in camps]
+    assert sorted(card["fills"] for card in cards) == sorted(took)
     executions = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    assert sum(card["fills"] for card in cards) == executions
-    # And the Dashboard counts the outcomes the cards show.
+    assert sum(ev["fills"] for ev in events) == executions
     stats = month_stats(conn, None, asset_category="OPT", report=report, campaign_list=camps)
+    assert stats.total_trades == executions
+    # And the Dashboard counts the outcomes the cards show.
     decided = [card["realized_pnl"]["base"] for card in cards if card["realized_pnl"]]
     assert (stats.wins, stats.losses) == (
         sum(pnl > 0 for pnl in decided), sum(pnl < 0 for pnl in decided))
@@ -757,7 +763,7 @@ def test_one_order_filled_c_then_c_o_gives_the_long_both_its_closes(conn):
     *_, cards, _events = _meet(conn, "B: one order filled C, then C;O")
     assert _cards_read(cards) == {
         "2026-09-10 10:00:00": ("Long put", [["1001"], ["1002"]], 100.0, 95.0, 3),
-        "2026-09-15 10:00:01": ("Short put", [["1002"], ["1003"]], 50.0, 40.0, 1),
+        "2026-09-15 10:00:01": ("Short put", [["1002"], ["1003"]], 50.0, 40.0, 2),
     }
 
 
@@ -771,19 +777,173 @@ def test_a_close_only_run_and_the_opening_fill_after_it_divide_their_order(conn)
     }
 
 
-def test_a_split_execution_is_one_fill_on_the_calendar_and_in_the_cards(conn):
-    """A: one `C;O` execution divided between the long and the short. Both cards
-    counted it, so the page read four fills for three executions, and the
-    Calendar's day detail drew its two halves as two rows ("2 fill(s)"). It counts
-    once, in the card it closed (the half IBKR books its P&L on), and the
-    Calendar, a list of the day's executions, shows it whole."""
+def test_a_split_execution_is_one_row_on_the_calendar_and_counted_in_each_card(conn):
+    """A: one `C;O` execution divided between the long and the short. The
+    Calendar's day detail drew its two halves as two rows ("2 fill(s)"); it lists
+    the day's executions, so it shows it whole. Each card counts it, since each
+    draws a half of it."""
     *_, cards, events = _meet(conn, "A: one C;O fill")
     assert {card["opened_at"]: card["fills"] for card in cards} == {
-        "2026-09-10 10:00:00": 2, "2026-09-15 10:00:00": 1}
+        "2026-09-10 10:00:00": 2, "2026-09-15 10:00:00": 2}
     day = [(o["ib_order_id"], lg["quantity"], lg["proceeds"]) for ev in events
            for o in ev["orders"] for lg in o["legs"]
            if lg["first_fill_at"].startswith("2026-09-15")]
     assert day == [("1002", -3, 450.0)]
+
+
+def test_a_position_opened_by_the_far_half_of_a_split_counts_that_fill(conn):
+    """Long 2, then SELL 3 as `C;O`, and the short is still open. Counted only
+    where it closed, the execution left the short's card reading "0 fill(s)" over
+    the STO it drew."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for
+    from optjournal.strategies import position_groups
+
+    _leg(conn, conid="1", order_id="1001", at="2026-09-10 10:00:00", qty=2,
+         proceeds=-200.0, pnl=None, open_close="O")
+    _leg(conn, conid="1", order_id="1002", at="2026-09-15 10:00:00", qty=-3,
+         proceeds=450.0, pnl=95.0, open_close="C;O")
+    episodes = build_history(conn, asset_category="OPT").episodes
+    cards = position_groups(orders_data(conn), episodes=episodes,
+                            campaign_list=campaigns_for(conn, "OPT", episodes))
+    assert {(card["label"], card["status"]): card["fills"] for card in cards} == {
+        ("Long put", "closed"): 2, ("Short put", "open"): 1}
+
+
+def _at_broker(conn, broker: str, fills) -> None:
+    """Fills `(trade, account, order, at, qty, open_close, realised)` on one SPY
+    put at `broker`."""
+    for tid, account, oid, at, qty, open_close, pnl in fills:
+        conn.execute(
+            "INSERT INTO trades (broker, trade_id, ib_exec_id, transaction_id,"
+            " ib_order_id, account_id, trade_date, date_time, asset_category,"
+            " symbol, conid, underlying_symbol, put_call, strike, expiry,"
+            " multiplier, buy_sell, open_close, quantity, trade_price, currency,"
+            " fx_rate_to_base, proceeds, proceeds_base, ib_commission,"
+            " ib_commission_base, fifo_pnl_realized, fifo_pnl_realized_base,"
+            " raw, source_file, first_seen_at)"
+            " VALUES (?,?,?,?,?,?,?,?,'OPT','SPY P','1','SPY','P',500,'2026-12-18',"
+            "100,?,?,?,1.0,'USD',1.0,?,?,-1.0,-1.0,?,?,'{}','t.xml','now')",
+            (broker, tid, tid, tid, oid, account, at[:10], at,
+             "SELL" if qty < 0 else "BUY", open_close, qty, -qty * 100.0,
+             -qty * 100.0, pnl, pnl))
+    conn.commit()
+
+
+def _drawn_by_broker(conn):
+    """The cards and the Calendar, each leg as `(broker, order, quantity)`."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for
+    from optjournal.strategies import campaign_events, position_groups
+
+    episodes = build_history(conn, asset_category="OPT").episodes
+    camps = campaigns_for(conn, "OPT", episodes)
+    orders = orders_data(conn)
+    cards = position_groups(orders, episodes=episodes, campaign_list=camps)
+
+    def legs(events):
+        return sorted((o["broker"], o["ib_order_id"], lg["broker"], lg["quantity"])
+                      for ev in events for o in ev["orders"] for lg in o["legs"])
+
+    return (orders, sorted((legs(c["events"]), c["fills"], c["anchor"]) for c in cards),
+            legs(campaign_events(orders, camps)))
+
+
+def test_the_same_order_id_at_two_brokers_is_two_orders(conn):
+    """Order ids are each broker's own, so 5000 at IBKR and 5000 at another broker
+    are two placements. Each order row took both brokers' legs, since the legs
+    were read by order id alone, and the cards and the Calendar then drew each
+    broker's 5000 in both positions: 1 and 2 contracts, twice over, in each."""
+    _at_broker(conn, "ibkr", [
+        ("a1", "U1", "5000", "2026-09-01 10:00:00", 1, "O", None),
+        ("a2", "U1", "5001", "2026-09-03 10:00:00", -1, "C", 10.0)])
+    _at_broker(conn, "b2", [
+        ("b1", "X9", "5000", "2026-09-02 10:00:00", 2, "O", None),
+        ("b2", "X9", "6001", "2026-09-04 10:00:00", -2, "C", 20.0)])
+    orders, cards, calendar = _drawn_by_broker(conn)
+    assert sorted((o["broker"], o["ib_order_id"], [lg["broker"] for lg in o["legs"]],
+                   o["fills"]) for o in orders) == [
+        ("b2", "5000", ["b2"], 1), ("b2", "6001", ["b2"], 1),
+        ("ibkr", "5000", ["ibkr"], 1), ("ibkr", "5001", ["ibkr"], 1)]
+    assert cards == [
+        ([("b2", "5000", "b2", 2), ("b2", "6001", "b2", -2)], 2, "5000"),
+        ([("ibkr", "5000", "ibkr", 1), ("ibkr", "5001", "ibkr", -1)], 2, "5000")]
+    assert calendar == [("b2", "5000", "b2", 2), ("b2", "6001", "b2", -2),
+                        ("ibkr", "5000", "ibkr", 1), ("ibkr", "5001", "ibkr", -1)]
+
+
+def test_the_same_order_id_at_two_brokers_joins_no_positions(conn):
+    """The window groups orders by id, and 5000 at both brokers read as one order
+    touching two contracts, which is what a spread looks like: the two brokers'
+    positions were one decision, one card and one outcome on the scoreboard. A
+    decision is placed at one broker, so a group joins only one broker's."""
+    from optjournal.history import build_history
+    from optjournal.stats import campaigns_for
+
+    _at_broker(conn, "ibkr", [
+        ("a1", "U1", "5000", "2026-09-01 10:00:00", 1, "O", None),
+        ("a2", "U1", "5001", "2026-09-03 10:00:00", -1, "C", 10.0)])
+    _at_broker(conn, "b2", [
+        ("b1", "X9", "5000", "2026-09-02 10:00:00", 2, "O", None),
+        ("b2", "X9", "6001", "2026-09-04 10:00:00", -2, "C", 20.0)])
+    conn.execute("UPDATE trades SET conid = '2' WHERE broker = 'b2'")
+    conn.commit()
+    episodes = build_history(conn, asset_category="OPT").episodes
+    camps = campaigns_for(conn, "OPT", episodes)
+    assert sorted(sorted(c.orders) for c in camps) == [
+        [("b2", "5000"), ("b2", "6001")], [("ibkr", "5000"), ("ibkr", "5001")]]
+    assert sorted(c.realized.base for c in camps) == [10.0, 20.0]
+
+
+def test_one_journal_at_two_brokers_is_two_sets_of_cards(conn):
+    """The same statement read for two brokers: every id the same, trade ids
+    included. Each broker's positions are drawn once each, from its own fills,
+    and each keeps the anchor its own order gives it: the same id, which is no
+    clash, since an entry is filed per broker."""
+    from optjournal import journal
+    from optjournal.serialize import journal_data
+
+    fills = [("t1", "U1", "100", "2026-09-01 10:00:00", 1, "O", None),
+             ("t2", "U1", "100", "2026-09-01 10:00:05", 1, "O", None),
+             ("t3", "U1", "101", "2026-09-03 10:00:00", -2, "C", 10.0)]
+    _at_broker(conn, "ibkr", fills)
+    _at_broker(conn, "b2", fills)
+    journal.save(conn, "100", account_id="U1", broker="b2", values={"entry_note": "b2"})
+    _orders, cards, calendar = _drawn_by_broker(conn)
+    assert cards == [
+        ([("b2", "100", "b2", 2), ("b2", "101", "b2", -2)], 3, "100"),
+        ([("ibkr", "100", "ibkr", 2), ("ibkr", "101", "ibkr", -2)], 3, "100")]
+    assert calendar == [("b2", "100", "b2", 2), ("b2", "101", "b2", -2),
+                        ("ibkr", "100", "ibkr", 2), ("ibkr", "101", "ibkr", -2)]
+    assert journal_data(conn)["orphans"] == []
+
+
+def test_a_split_execution_is_listed_under_the_position_it_closed(conn):
+    """Long 2 (order 1000), then order 1001 sells 3 as `C;O` and 1 more 20 seconds
+    later, which adds to the short. The Calendar lists 1001 whole, under the
+    position that took its first execution; the split one is taken by both, and
+    the tie goes to the long it closed. It went to the short, because the tie was
+    read off the fill count of the whole share and the short's later fill made
+    that count match the long's, so the day showed "Long put" and 1001 as two
+    unrelated events where they were one placement."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for
+    from optjournal.strategies import campaign_events
+
+    _leg(conn, conid="1", order_id="1000", at="2026-09-15 09:59:40", qty=2,
+         proceeds=-200.0, pnl=None, open_close="O")
+    _leg(conn, conid="1", order_id="1001", at="2026-09-15 10:00:00", qty=-3,
+         proceeds=300.0, pnl=95.0, open_close="C;O")
+    _leg(conn, conid="1", order_id="1001", at="2026-09-15 10:00:20", qty=-1,
+         proceeds=100.0, pnl=None, open_close="O")
+    _leg(conn, conid="1", order_id="1002", at="2026-09-20 10:00:00", qty=2,
+         proceeds=-100.0, pnl=40.0, open_close="C")
+    episodes = build_history(conn, asset_category="OPT").episodes
+    events = campaign_events(orders_data(conn), campaigns_for(conn, "OPT", episodes))
+    assert sorted(e["order_ids"] for e in events) == [["1000", "1001"], ["1002"]]
 
 
 def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):

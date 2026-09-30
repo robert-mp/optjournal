@@ -190,10 +190,12 @@ def orders_data(
     for o in orders:
         if order_ids is not None and str(o["ib_order_id"]) not in order_ids:
             continue
+        # By broker as well: an order id is the issuing broker's, and read by id
+        # alone each broker's order 5000 took the other's legs too.
         legs = conn.execute(
-            "SELECT * FROM trade_legs WHERE ib_order_id = ?"
+            "SELECT * FROM trade_legs WHERE broker = ? AND ib_order_id = ?"
             " AND asset_category = ? ORDER BY expiry, strike",
-            (o["ib_order_id"], asset_category),
+            (o["broker"], o["ib_order_id"], asset_category),
         ).fetchall()
         row = dict(o)
         leg_rows = [dict(lg) for lg in legs]
@@ -1689,21 +1691,30 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     page without a word. Listed so the reader sees the writing and what it was
     about. Checked against the decisions the Trades tab can draw, options and
     equities, and not computed at all when nothing has been written.
+
+    Listed there too: an entry filed under an anchor two cards answered to
+    (`campaigns.Campaign.shared_anchor`). It shows on the card that owns the
+    anchor now, and it may have been written about the other, which showed it
+    as well, so the reader is told rather than left to find it gone.
     """
     written = journal_entries(conn)
     live: set[str] = set()
+    shared: set[tuple[str, str]] = set()
     if written:
         for category in ("OPT", EQUITY_CATEGORY):
             report = build_history(conn, asset_category=category)
-            live |= {c.anchor for c in campaigns_for(conn, category, report.episodes)
-                     if c.anchor}
+            for c in campaigns_for(conn, category, report.episodes):
+                live |= {c.anchor} if c.anchor else set()
+                shared |= {(broker, c.shared_anchor) for broker in c.brokers
+                           if c.shared_anchor}
+    orphans = journal_orphans(conn, live) if written else []
+    orphans += [entry for key, entry in written.items() if (key[0], key[2]) in shared]
     return {
         "entries": {
             anchor: entry.payload()
             for (_broker, _account, anchor), entry in written.items()
         },
-        "orphans": [entry.payload() for entry in journal_orphans(conn, live)]
-        if written else [],
+        "orphans": [entry.payload() for entry in orphans],
         "triggers": [{"key": key, "label": label}
                      for key, label in JOURNAL_TRIGGERS.items()],
         "adherence": list(JOURNAL_ADHERENCE),

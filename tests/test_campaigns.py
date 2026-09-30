@@ -258,23 +258,25 @@ def test_a_group_that_joins_nothing_lends_neither_side_its_other_order():
     """Sell a long, buy the same contract back 30 seconds later under a second
     order: one window group on one contract, so it joins nothing. Each campaign
     still listed every order of the group, and the Trades tab, which reaches a
-    campaign through its orders, drew both orders whole in both cards. The
-    re-entry's anchor was the sale's order, so its journal entry was filed under
-    a handle belonging to the other card. Each now lists the orders of its own
-    fills."""
+    campaign through its orders, drew both orders whole in both cards. Each now
+    lists the orders of its own fills.
+
+    The anchor does not follow: the re-entry's card has always answered to the
+    sale's order, 1002, and what was written or linked against it has to keep
+    finding it (`test_journal`), so it still does."""
     eps = [_Ep("C1", ["t1", "t2"], pnl=48.0), _Ep("C1", ["t3", "t4"], pnl=43.0)]
     camps = link(eps, order_groups=[("1001",), ("1002", "1003"), ("1004",)],
                  order_of_trade={"t1": "1001", "t2": "1002", "t3": "1003",
                                  "t4": "1004"})
     assert [c.order_ids for c in camps] == [
         frozenset({"1001", "1002"}), frozenset({"1003", "1004"})]
-    assert [c.anchor for c in camps] == ["1001", "1003"]
+    assert [c.anchor for c in camps] == ["1001", "1002"]
 
 
-def _part(quantity, open_close, at, price, *, fills=1, proceeds=0.0, pnl=0.0):
+def _part(quantity, open_close, at, price, *, proceeds=0.0, pnl=0.0):
     from optjournal.history import FillPart
 
-    return FillPart(quantity=quantity, open_close=open_close, fills=fills,
+    return FillPart(quantity=quantity, open_close=open_close,
                     date_time=at, trade_price=price, proceeds=proceeds,
                     proceeds_base=proceeds, commission=-1.0, commission_base=-1.0,
                     realized_pnl=pnl, realized_pnl_base=pnl)
@@ -292,7 +294,7 @@ def test_a_leg_two_campaigns_took_is_divided_by_the_fills_each_took():
         "t3": _part(-1, "C", "2026-09-15 10:00:01", 1.6, proceeds=160.0, pnl=47.0),
     }
     eps[1].fill_parts = {
-        "t3": _part(-1, "O", "2026-09-15 10:00:01", 1.6, fills=0, proceeds=160.0),
+        "t3": _part(-1, "O", "2026-09-15 10:00:01", 1.6, proceeds=160.0),
         "t4": _part(1, "C", "2026-09-20 10:00:00", 1.0, proceeds=-100.0, pnl=40.0),
     }
     camps = link(eps, order_groups=[("open",), ("flip",), ("out",)],
@@ -306,7 +308,7 @@ def test_a_leg_two_campaigns_took_is_divided_by_the_fills_each_took():
             "first_fill_at": "2026-09-15 10:00:00",
             "last_fill_at": "2026-09-15 10:00:01", "open_close": "C"}},
         {("flip", "C1"): {
-            "quantity": -1, "fills": 0, "proceeds": 160.0, "proceeds_base": 160.0,
+            "quantity": -1, "fills": 1, "proceeds": 160.0, "proceeds_base": 160.0,
             "commission": -1.0, "commission_base": -1.0, "realized_pnl": 0.0,
             "realized_pnl_base": 0.0, "avg_price": 1.6,
             "first_fill_at": "2026-09-15 10:00:01",
@@ -314,18 +316,49 @@ def test_a_leg_two_campaigns_took_is_divided_by_the_fills_each_took():
     ]
 
 
-def test_a_share_mixing_closing_and_opening_fills_keeps_the_legs_own_marker():
-    """The edge the marker rule leaves: one campaign's share of a leg holding a
-    closing AND an opening fill has no one marker of its own, so it carries none
-    and the leg's stays."""
-    eps = [_Ep("C1", ["t1", "t3"]), _Ep("C1", ["t2"])]
-    eps[0].fill_parts = {"t1": _part(-1, "C", "2026-09-15 10:00:00", 1.0),
-                         "t3": _part(-1, "O", "2026-09-15 10:00:02", 1.0)}
+def test_a_share_holding_both_halves_of_a_split_counts_that_execution_once():
+    """A card counts every execution it draws. When a hand link puts both sides
+    of a reversal in one campaign while another campaign took an earlier fill of
+    the same order, the leg is still divided, and the one execution whose two
+    halves it holds is one fill, not two."""
+    eps = [_Ep("C1", ["t1"]), _Ep("C1", ["t2", "t5"]), _Ep("C1", ["t2", "t3", "t6"])]
+    eps[0].fill_parts = {"t1": _part(-1, "C", "2026-09-15 10:00:00", 1.0)}
+    eps[1].fill_parts = {"t2": _part(-1, "C", "2026-09-15 10:00:01", 1.0),
+                         "t5": _part(1, "C", "2026-09-16 10:00:00", 1.0)}
+    eps[2].fill_parts = {"t2": _part(-1, "O", "2026-09-15 10:00:01", 1.0),
+                         "t3": _part(-1, "O", "2026-09-15 10:00:02", 1.0),
+                         "t6": _part(1, "O", "2026-09-17 10:00:00", 1.0)}
+    camps = link(eps, order_groups=[("x",), ("y",), ("z",)],
+                 order_of_trade={"t1": "x", "t2": "x", "t3": "x", "t5": "y",
+                                 "t6": "z"},
+                 links=[("y", "z")])
+    fills = sorted(c.leg_parts[("x", "C1")]["fills"] for c in camps)
+    assert fills == [1, 2], "t1 in one card; t2 (both halves) and t3 in the other"
+
+
+def test_a_share_reads_as_what_it_took_first():
+    """A share holding a closing AND an opening fill reads as the first, which is
+    also what orders the shares of one order: by time, and on one split execution
+    the share that took its closing half first."""
+    from optjournal.campaigns import first_taken
+
+    eps = [_Ep("C1", ["t1", "t3"]), _Ep("C1", ["t2"]), _Ep("C1", ["t4"]),
+           _Ep("C1", ["t4", "t5"])]
+    eps[0].fill_parts = {"t1": _part(-1, "C", "2026-09-15 10:00:02", 1.0),
+                         "t3": _part(-1, "O", "2026-09-15 10:00:00", 1.0)}
     eps[1].fill_parts = {"t2": _part(-1, "O", "2026-09-15 10:00:01", 1.0)}
-    camps = link(eps, order_groups=[("x",)], order_of_trade=dict.fromkeys(
-        ("t1", "t2", "t3"), "x"))
-    assert "open_close" not in camps[0].leg_parts[("x", "C1")]
-    assert camps[1].leg_parts[("x", "C1")]["open_close"] == "O"
+    # One split execution: the opening half is listed first, and still sorts last.
+    eps[2].fill_parts = {"t4": _part(1, "O", "2026-09-20 10:00:00", 1.0)}
+    eps[3].fill_parts = {"t4": _part(-2, "C", "2026-09-20 10:00:00", 1.0),
+                         "t5": _part(-1, "C", "2026-09-18 10:00:00", 1.0)}
+    x = dict.fromkeys(("t1", "t2", "t3"), "x") | {"t4": "y", "t5": "z"}
+    shares = [dict(c.leg_parts) for c in link(
+        eps, order_groups=[("x",), ("y",), ("z",)], order_of_trade=x)]
+    assert shares[0][("x", "C1")]["open_close"] == "O", "its 10:00:00 fill opened"
+    assert shares[1][("x", "C1")]["open_close"] == "O"
+    assert first_taken(shares[2][("y", "C1")]) == ("2026-09-20 10:00:00", True)
+    assert first_taken(shares[3][("y", "C1")]) == ("2026-09-20 10:00:00", False)
+    assert first_taken(shares[3][("y", "C1")]) < first_taken(shares[2][("y", "C1")])
 
 
 def test_a_flip_placed_with_another_contract_is_still_one_decision():
