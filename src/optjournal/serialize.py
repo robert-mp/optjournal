@@ -51,7 +51,7 @@ from optjournal.events import (
     default_scope,
     upcoming,
 )
-from optjournal.history import HistoryReport
+from optjournal.history import BOOK_DATE_SQL, HistoryReport, book_date
 from optjournal.journal import ADHERENCE as JOURNAL_ADHERENCE
 from optjournal.journal import FIELDS as JOURNAL_FIELDS
 from optjournal.journal import TRIGGERS as JOURNAL_TRIGGERS
@@ -257,9 +257,11 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     they are different kinds of exposure, and summed into `net` because that is
     what the name contributes to the account's value.
 
-    Each category from its OWN latest snapshot, the rule `current_option_positions`
-    already applies, because IBKR can report the two on different days and a
-    date shared across both would drop whichever lagged.
+    Read from each account's current book (`history.BOOK_DATE_SQL`), the same rows
+    the Positions tab and the episode walk treat as held. Each category from its
+    own latest snapshot kept an option sold since then: every row of one IBKR
+    statement carries the same reportDate, so options missing from the newest
+    date were sold, not reported late.
 
     The denominator is the broker's own net liquidation (`equity_summaries`), so
     the rows plus `cash` sum to it and a share can be read against the figure the
@@ -268,25 +270,18 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     the shares are None rather than a share of some other total.
     """
     holdings: dict[str, Row] = {}
-    as_of: str | None = None
     for cat, key in (("STK", "stock"), ("OPT", "options")):
-        latest = conn.execute(
-            "SELECT MAX(report_date) FROM position_snapshots WHERE asset_category = ?",
-            (cat,),
-        ).fetchone()[0]
-        if latest is None:
-            continue
-        as_of = max(as_of or latest, latest)
         for r in conn.execute(
             "SELECT COALESCE(underlying_symbol, symbol) AS holding,"
             " SUM(position_value * fx_rate_to_base) AS value, COUNT(*) AS n"
-            " FROM position_snapshots WHERE asset_category = ? AND report_date = ?"
-            " GROUP BY 1", (cat, latest),
+            " FROM position_snapshots p WHERE asset_category = ?"
+            f" AND report_date = ({BOOK_DATE_SQL}) GROUP BY 1", (cat,),
         ):
             row = holdings.setdefault(r["holding"], {
                 "holding": r["holding"], "stock": 0.0, "options": 0.0, "lines": 0})
             row[key] += r["value"] or 0.0
             row["lines"] += r["n"]
+    as_of = book_date(conn)
     nav = conn.execute(
         "SELECT total_base, cash_base, report_date FROM equity_summaries"
         " ORDER BY report_date DESC LIMIT 1"

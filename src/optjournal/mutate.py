@@ -493,10 +493,13 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="current-book",
         module="db.py",
-        find="    WHERE asset_category = 'OPT' AND broker = p.broker",
-        replace="    WHERE asset_category = 'OPT'",
-        breaks="whichever broker filed most recently would decide what counts as "
-               "current for all of them, so a lagging broker's book vanishes",
+        find="      SELECT report_date AS d FROM position_snapshots\n"
+             "      WHERE broker = p.broker AND account_id = p.account_id\n",
+        replace="      SELECT report_date AS d FROM position_snapshots\n"
+                "      WHERE asset_category = 'OPT' AND broker = p.broker"
+                " AND account_id = p.account_id\n",
+        breaks="the newest date that had an option is a stale book once the option "
+               "book goes flat, so a sold option stays on the Positions tab",
     ),
     # NO MUTANT for the `securities` and `equity_summaries` keys, and the reason is
     # worth recording rather than leaving as an omission.
@@ -566,10 +569,10 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="held-scope",
         module="history.py",
-        find="            \"      AND broker = p.broker)\",",
-        replace="            \"      )\",",
-        breaks="a lagging broker's held positions would be invisible to the "
-               "open/closed decision, so a position still open reads as CLOSED",
+        find="    \"  WHERE broker = p.broker AND account_id = p.account_id\"",
+        replace="    \"  WHERE broker = p.broker\"",
+        breaks="a lagging account's held positions would be read at another "
+               "account's newer date, so a position still open reads as CLOSED",
     ),
 )
 

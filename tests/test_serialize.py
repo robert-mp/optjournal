@@ -619,21 +619,22 @@ def _alloc_fixture(conn):
             (day, conid, symbol, under, cat, value, rate))
 
     snap("20260924", "1", "TSLA", None, "STK", 1000.0, 0.5)
-    snap("20260923", "2", "TSLA  260918P00300000", "TSLA", "OPT", -100.0, 0.5)
-    snap("20260923", "3", "MRVL  260918P00070000", "MRVL", "OPT", -40.0, 0.5)
-    # An older option snapshot that must not be read: only each category's
-    # latest date counts.
+    snap("20260924", "2", "TSLA  260918P00300000", "TSLA", "OPT", -100.0, 0.5)
+    snap("20260924", "3", "MRVL  260918P00070000", "MRVL", "OPT", -40.0, 0.5)
+    # An older option snapshot that must not be read: only the book's newest
+    # date counts.
     snap("20260901", "4", "OLD", "OLD", "OPT", -999.0, 0.5)
     conn.execute(
         "INSERT INTO equity_summaries (report_date, account_id, currency,"
         " cash_base, stock_base, options_base, total_base, raw, source_file,"
         " ingested_at) VALUES ('20260924','U1','EUR',80,500,-70,510,'{}','t.xml','now')")
     conn.commit()
+    return snap
 
 
 def test_allocation_folds_a_stock_and_its_options_into_one_holding(tmp_path):
-    """TSLA shares and a TSLA put are one line, each category from its own
-    latest snapshot, and rows plus cash sum to the broker's net liquidation."""
+    """TSLA shares and a TSLA put are one line, read from the newest snapshot,
+    and rows plus cash sum to the broker's net liquidation."""
     conn = connect_migrated(tmp_path / "journal.db")
     _alloc_fixture(conn)
     al = allocation_data(conn)
@@ -644,6 +645,20 @@ def test_allocation_folds_a_stock_and_its_options_into_one_holding(tmp_path):
     assert by["MRVL"]["share"] == pytest.approx(-20 / 510)
     assert sum(r["net"] for r in al["rows"]) + al["cash"] == pytest.approx(al["nav"])
     assert [r["holding"] for r in al["rows"]] == ["TSLA", "MRVL"]
+
+
+def test_an_option_book_gone_flat_leaves_no_options_in_the_allocation(tmp_path):
+    """Every row of one statement carries the same reportDate, so options absent
+    from the newest date were sold, not reported late. Each category from its own
+    latest snapshot kept a sold put in the allocation (`pnl/s_empty_book.py`)."""
+    conn = connect_migrated(tmp_path / "journal.db")
+    snap = _alloc_fixture(conn)
+    snap("20260925", "1", "TSLA", None, "STK", 1000.0, 0.5)
+    conn.commit()
+    al = allocation_data(conn)
+    assert al["as_of"] == "20260925"
+    assert [(r["holding"], r["stock"], r["options"]) for r in al["rows"]] == [
+        ("TSLA", 500.0, 0.0)]
 
 
 def test_allocation_without_a_net_liquidation_figure_has_no_shares(tmp_path):

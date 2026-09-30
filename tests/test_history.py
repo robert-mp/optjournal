@@ -73,13 +73,25 @@ def add_trade(
 
 def add_snapshot(conn, conid: str, *, position: int, symbol: str = "OPT1",
                  date: str = "2026-12-31", asset: str = "OPT",
-                 cost_basis: float | None = None) -> None:
+                 cost_basis: float | None = None, account_id: str = "U1",
+                 source_file: str = "t.xml") -> None:
     conn.execute(
         "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
         " asset_category, position, cost_basis_money, currency, fx_rate_to_base,"
         " raw, source_file, ingested_at)"
-        " VALUES (?,?, 'U1', ?, ?, ?, ?, 'USD', 1.0, '{}', 't.xml', 'now')",
-        (date, conid, symbol, asset, position, cost_basis),
+        " VALUES (?,?, ?, ?, ?, ?, ?, 'USD', 1.0, '{}', ?, 'now')",
+        (date, conid, account_id, symbol, asset, position, cost_basis, source_file),
+    )
+
+
+def add_nav(conn, date: str, *, stock: float, options: float,
+            account_id: str = "U1") -> None:
+    """One day of IBKR's NAV breakdown (EquitySummaryByReportDateInBase)."""
+    conn.execute(
+        "INSERT INTO equity_summaries (report_date, account_id, currency,"
+        " cash_base, stock_base, options_base, total_base, raw, source_file,"
+        " ingested_at) VALUES (?, ?, 'EUR', 1000, ?, ?, ?, '{}', 't.xml', 'now')",
+        (date, account_id, stock, options, 1000 + stock + options),
     )
 
 
@@ -343,6 +355,103 @@ def test_snapshot_only_not_duplicated_when_trades_exist(conn):
     add_trade(conn, "1", open_close="O", qty=1)
     add_snapshot(conn, "C1", position=1)
     assert len(build_history(conn).episodes) == 1
+
+
+# ------------------------------------------------------------ the book's date
+#
+# IBKR's OpenPositions lists only what is held, and every row of one statement
+# carries the same reportDate (checked across the real archive, STK and OPT
+# alike). So the day the option book goes flat there is simply no OPT row, and
+# reading "the newest date that had an option" falls back to a stale book.
+
+
+def _current_option_conids(conn) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT conid FROM current_option_positions")}
+
+
+def test_an_option_missing_from_the_newest_book_is_flat(conn):
+    """`pnl/s_empty_book.py`: a LEAP held from before the archive is sold, and
+    the next statement lists only the stock. The LEAP stayed OPEN with its
+    +1500 missing, and stayed on the Positions tab."""
+    add_snapshot(conn, "LEAP", position=1, date="20260901")
+    add_snapshot(conn, "STK1", position=10, date="20260901", asset="STK",
+                 symbol="STK1")
+    add_trade(conn, "1", conid="LEAP", open_close="C", qty=-1, date="2026-09-15",
+              realized=1500.0)
+    add_snapshot(conn, "STK1", position=10, date="20260916", asset="STK",
+                 symbol="STK1")
+    report = build_history(conn)
+    (leap,) = report.episodes
+    assert leap.status == "CLOSED"
+    assert report.total_realized_base == 1500.0
+    assert report.snapshot_date == "20260916"
+    assert _current_option_conids(conn) == set()
+
+
+def test_an_empty_book_is_flat_when_the_nav_says_nothing_is_held(conn):
+    """Everything sold: the statement's OpenPositions section is present but
+    empty, so no position row exists for that day in ANY category. IBKR's NAV
+    breakdown for the day (no stock, no options) is what says the book is empty
+    rather than unreported."""
+    add_snapshot(conn, "LEAP", position=1, date="20260901")
+    add_nav(conn, "20260901", stock=0, options=4500)
+    add_trade(conn, "1", conid="LEAP", open_close="C", qty=-1, date="2026-09-15",
+              realized=1500.0)
+    add_nav(conn, "20260916", stock=0, options=0)
+    report = build_history(conn)
+    assert [e.status for e in report.episodes] == ["CLOSED"]
+    assert report.snapshot_date == "20260916"
+    assert _current_option_conids(conn) == set()
+
+
+def test_a_statement_that_reports_no_positions_is_silent_not_flat(conn):
+    """A query without the OpenPositions section leaves no row either, but the
+    account still holds things, and its NAV says so. Reading that silence as an
+    empty book would close every position held from before the archive."""
+    add_snapshot(conn, "C1", position=-1, date="20260901")
+    add_nav(conn, "20260901", stock=0, options=-300)
+    add_trade(conn, "1", open_close="C", qty=1, date="2026-08-25", realized=20.0)
+    add_nav(conn, "20260916", stock=0, options=-280)
+    report = build_history(conn)
+    assert [e.status for e in report.episodes] == ["OPEN"]
+    assert report.snapshot_date == "20260901"
+    assert _current_option_conids(conn) == {"C1"}
+
+
+def test_the_positions_view_and_the_episode_walk_read_the_same_book(conn):
+    """`db.current_option_positions` spells `history.BOOK_DATE_SQL` again, since a
+    view cannot import it. Every case above, in three accounts at once."""
+    from optjournal.history import _held
+
+    for account in ("U2", "U3"):
+        add_statement(conn, source_file=f"{account}.xml", account_id=account)
+    # U1: options sold, the stock still held.
+    add_snapshot(conn, "A1", position=1, date="20260901")
+    add_snapshot(conn, "S1", position=5, date="20260916", asset="STK", symbol="S1")
+    # U2: its statements lag, and it still holds its option.
+    add_snapshot(conn, "B1", position=-1, date="20260901", account_id="U2",
+                 source_file="U2.xml")
+    # U3: everything sold, and its NAV says so.
+    add_snapshot(conn, "C1", position=2, date="20260901", account_id="U3",
+                 source_file="U3.xml")
+    add_nav(conn, "20260916", stock=0, options=0, account_id="U3")
+    held, _ = _held(conn, "OPT")
+    assert {conid for _, _, conid in held} == _current_option_conids(conn) == {"B1"}
+
+
+def test_each_account_is_read_at_its_own_newest_date(conn):
+    """U2's statements lag U1's. Measured against U1's newer date, U2's held
+    position vanished from the book, and its pre-archive episode read CLOSED."""
+    add_statement(conn, source_file="b.xml", account_id="U2")
+    add_snapshot(conn, "C1", position=-1, date="20260916")
+    add_snapshot(conn, "C2", position=-1, date="20260901", account_id="U2",
+                 source_file="b.xml")
+    add_trade(conn, "1", conid="C2", open_close="C", qty=1, date="2026-08-25",
+              realized=20.0, account_id="U2", source_file="b.xml")
+    report = build_history(conn)
+    u2 = next(e for e in report.episodes if e.account_id == "U2" and not e.snapshot_only)
+    assert u2.status == "OPEN"
+    assert _current_option_conids(conn) == {"C1", "C2"}
 
 
 # ----------------------------------------------------------------- exclusions

@@ -388,47 +388,75 @@ def _finalise(ep: Episode, still_held: bool) -> None:
         ep.status = STATUS_OPEN
 
 
+#: The date an account's position book is as of, for a `position_snapshots p`
+#: row in the enclosing query: the newest day that account reported a position
+#: in ANY category, or on which its NAV breakdown held no stock and no options.
+#:
+#: Any category, because IBKR's OpenPositions lists only what is held and every
+#: row of one statement carries the same reportDate (checked across the real
+#: archive). The day the option book goes flat there is no OPT row at all, so the
+#: newest date that had an option is a stale book: a sold LEAP stayed OPEN with
+#: its realised P&L missing. A Trade Confirmation carries no positions, so it
+#: never moves this date.
+#:
+#: The NAV clause is the one case no position row can speak for: everything sold,
+#: an empty OpenPositions section, no row in any category. A statement whose
+#: query lacks the section leaves no row either, but the account still holds
+#: things and its NAV says so, so that silence keeps the older book rather than
+#: reading as flat.
+#:
+#: Per `(broker, account_id)`, so an account whose statements lag is read at its
+#: own date rather than against another's. `db.current_option_positions` spells
+#: the same rule for the Positions tab; `tests/test_history.py` holds them equal.
+BOOK_DATE_SQL = (
+    "SELECT MAX(d) FROM ("
+    " SELECT report_date AS d FROM position_snapshots"
+    "  WHERE broker = p.broker AND account_id = p.account_id"
+    " UNION ALL SELECT report_date FROM equity_summaries"
+    "  WHERE broker = p.broker AND account_id = p.account_id"
+    "   AND stock_base = 0 AND options_base = 0)"
+)
+
+
+def book_date(conn: sqlite3.Connection) -> str | None:
+    """The newest account's book date, for labelling a book "as of".
+
+    The newest across accounts because a label for a mixed-date book should name
+    its most recent statement. Deciding what is held stays per account.
+    """
+    row = conn.execute(
+        f"SELECT MAX(({BOOK_DATE_SQL})) FROM position_snapshots p"
+    ).fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
 def _held(
     conn: sqlite3.Connection, asset_category: str | None
 ) -> tuple[dict[tuple[str, str, str], dict[str, Any]], str | None]:
-    """Open positions from each broker's newest snapshot, and the newest date.
+    """Open positions in each account's current book, and the book's date.
 
     Keyed by `(broker, account_id, conid)` -- the same identity the episode walk
     uses, and for the same reason: the same contract held in two accounts is two
     positions, so a conid-only key would let one account's holding answer the
     open/closed question for another's.
 
-    "Newest" is PER BROKER, which is the same correction `current_option_positions`
-    needed. A single MAX over the table lets whichever broker filed most recently
-    decide what counts as current for all of them, so a broker whose statements lag
-    contributes nothing to `held` -- and this dict is what decides open versus
-    closed. Its positions do not merely vanish from the book: every episode of
-    theirs is judged against an empty holding, so a position still open reads as
-    CLOSED. Verified with a lagging second broker: `_held` returned 5 rows for one
-    broker and none for the other, having been handed 10.
+    "Current" is `BOOK_DATE_SQL`, per account. This dict decides open versus
+    closed, so a stale book here is not cosmetic: a contract read from an older
+    date than its account's newest is judged still held after it was sold.
 
-    The returned date is still the newest across brokers, because it is only used
-    to label the book ("as of ..."), and the honest label for a mixed-date book is
-    its most recent statement.
+    The date is returned even when nothing in `asset_category` is held: a flat
+    book is still a book as of that day.
     """
     where, params = _position_scope_where(asset_category)
-    # One row per broker, so a lagging broker keeps its own latest date rather
-    # than being measured against another's.
     held = {
         (str(r["broker"] or ""), str(r["account_id"] or ""), str(r["conid"])): dict(r)
         for r in conn.execute(
             f"SELECT p.* FROM position_snapshots p {where}"
-            "  AND p.position != 0"
-            "  AND p.report_date = ("
-            f"    SELECT MAX(report_date) FROM position_snapshots {where}"
-            "      AND broker = p.broker)",
-            (*params, *params),
+            f"  AND p.position != 0 AND p.report_date = ({BOOK_DATE_SQL})",
+            params,
         )
     }
-    if not held:
-        return {}, None
-    latest = max(str(r["report_date"]) for r in held.values())
-    return held, latest
+    return held, book_date(conn)
 
 
 def _from_snapshot(row: dict[str, Any]) -> Episode:
