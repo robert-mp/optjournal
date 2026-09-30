@@ -8,6 +8,8 @@ friend who clicks the wrong thing must still find them.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -172,3 +174,174 @@ def test_prepare_leaves_a_git_clones_journal_where_it_is(tmp_path):
     (code / ".git").mkdir()
     install.prepare(tmp_path / "home", code_dir=code)
     assert (code / "journal.db").exists(), "a developer's journal was moved"
+
+
+# --- a move that fails partway --------------------------------------------------
+#
+# The failure a friend meets is an antivirus scan or a OneDrive sync holding one
+# file of the journal. Simulated by making every copy, move and rename of `raw`
+# fail, whichever of them the move uses: the property is that the journal ends
+# up whole in exactly one place, not how it got there.
+
+
+def _lock(monkeypatch, blocked: Path, *, copies: bool = True) -> None:
+    """Make moving `blocked` fail with PermissionError, as a held file does.
+
+    `copies=False` still lets it be copied, so only taking it out of its folder
+    fails: the case where the new home already holds a full copy.
+    """
+    def guard(real):
+        def wrapper(src, dst, *args, **kwargs):
+            if Path(src) == blocked:
+                raise PermissionError(13, "held by another program", str(src))
+            return real(src, dst, *args, **kwargs)
+        return wrapper
+
+    for module, name in ((os, "rename"), (os, "replace"), (shutil, "move")):
+        monkeypatch.setattr(module, name, guard(getattr(module, name)))
+    if copies:
+        monkeypatch.setattr(shutil, "copytree", guard(shutil.copytree))
+
+
+def _tree(directory: Path) -> dict[str, bytes]:
+    return {p.relative_to(directory).as_posix(): p.read_bytes()
+            for p in sorted(directory.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.parametrize("copies", [True, False], ids=["copying-fails", "removing-fails"])
+def test_a_move_that_fails_partway_leaves_the_whole_journal_where_it_was(
+        tmp_path, monkeypatch, copies):
+    """M19: `journal.db` moved, then `raw` failed, and the journal was split.
+
+    The data home then resolved back to the code folder, which had lost its
+    database, and every later `prepare` refused. Now the source is untouched,
+    the home is exactly as it was (its empty journal included), and `prepare`
+    reports one line instead of a traceback.
+    """
+    code = _journal(tmp_path / "code")
+    (code / ".optjournal.json").write_text('{"query_id": "1"}')
+    home = _journal(tmp_path / "home", statements=0)
+    code_before, home_before = _tree(code), _tree(home)
+    _lock(monkeypatch, code / "raw", copies=copies)
+
+    done = install.prepare(home, code_dir=code)
+
+    assert len(done) == 1 and done[0].startswith("journal left beside the code"), done
+    assert "held by another program" in done[0] and "\n" not in done[0]
+    assert _tree(code) == code_before, "the source lost part of the journal"
+    assert _tree(home) == home_before, "the home kept part of a move that was undone"
+    assert sorted(p.name for p in code.iterdir()) == [".optjournal.json", "journal.db", "raw"]
+    assert sorted(p.name for p in home.iterdir()) == ["journal.db", "raw"]
+    monkeypatch.delenv(config.HOME_ENV, raising=False)
+    monkeypatch.setattr(config, "ROOT", code)
+    assert config.data_home() == code
+
+
+def test_a_move_that_succeeds_leaves_nothing_behind_in_either_folder(tmp_path):
+    code = _journal(tmp_path / "code")
+    (code / "src").mkdir()
+    (code / "src" / "app.py").write_text("code")
+    before = _tree(code)
+    home = tmp_path / "home"
+
+    assert install.relocate(code, home) == ["journal.db", "raw"]
+
+    assert sorted(p.name for p in code.iterdir()) == ["src"], "a staging folder was left"
+    assert sorted(p.name for p in home.iterdir()) == ["journal.db", "raw"]
+    assert _tree(home) == {k: v for k, v in before.items() if not k.startswith("src/")}
+
+
+def test_an_import_sets_aside_the_replaced_journals_wal_with_it(tmp_path):
+    """M20: the empty journal's `-wal`/`-shm` stayed beside the imported one.
+
+    SQLite then applied that WAL to a database it does not belong to, and the
+    import opened as "database disk image is malformed". Built here the way a
+    killed server leaves it: a WAL still holding frames, and no connection open.
+    """
+    source = _journal(tmp_path / "old", statements=3)
+    home = tmp_path / "home"
+    home.mkdir()
+    conn = sqlite3.connect(home / "journal.db")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE statements (source_file TEXT)")
+    conn.execute("CREATE TABLE server_only (x)")
+    conn.commit()
+    left = {name: (home / name).read_bytes() for name in ("journal.db-wal", "journal.db-shm")}
+    conn.close()
+    for name, body in left.items():                   # what a SIGKILL leaves
+        (home / name).write_bytes(body)
+
+    install.relocate(source, home)
+
+    moved = sqlite3.connect(home / "journal.db")
+    try:
+        assert moved.execute("SELECT COUNT(*) FROM statements").fetchone()[0] == 3
+        assert moved.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        moved.close()
+    (aside,) = home.glob("replaced-*")
+    replaced = sqlite3.connect(aside / "journal.db")
+    try:
+        assert replaced.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'server_only'"
+        ).fetchone()[0] == 1, "the set-aside journal lost what was only in its WAL"
+    finally:
+        replaced.close()
+
+
+def test_an_import_refuses_while_the_replaced_journal_is_open(tmp_path):
+    """The journal being set aside is released first, like the one being moved."""
+    source = _journal(tmp_path / "old")
+    home = _journal(tmp_path / "home", statements=0)
+    holder = sqlite3.connect(home / "journal.db")
+    holder.execute("PRAGMA journal_mode=WAL")
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(install.RelocateRefused, match="in use"):
+            install.relocate(source, home)
+    finally:
+        holder.close()
+    assert (source / "journal.db").exists() and not list(home.glob("replaced-*"))
+
+
+def test_an_unreadable_journal_in_the_home_is_set_aside_not_refused(tmp_path):
+    """It has no statements anyone could lose, and it is kept, not deleted."""
+    source = _journal(tmp_path / "old")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "journal.db").write_bytes(b"garbage" * 1000)
+    (home / "journal.db-wal").write_bytes(b"stale")
+
+    install.relocate(source, home)
+
+    (aside,) = home.glob("replaced-*")
+    assert (aside / "journal.db").read_bytes() == b"garbage" * 1000
+    assert not (home / "journal.db-wal").exists() and not (home / "journal.db-shm").exists()
+    assert install._statement_count(home / "journal.db") == 1
+
+
+def test_a_corrupt_journal_to_import_is_reported_once_not_on_every_start(tmp_path):
+    """L21: `prepare` crashed on a corrupt source and kept `.pending-import.json`,
+    so it crashed again on every start."""
+    source = _download(tmp_path / "Downloads" / "optjournal-main")
+    (source / "journal.db").write_bytes(b"garbage" * 1000)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / install.PENDING_IMPORT).write_text(json.dumps({"source": str(source)}))
+
+    done = install.prepare(home, code_dir=tmp_path / "code")
+
+    assert done[0].startswith("import not done") and "not a readable journal" in done[0]
+    assert not (home / install.PENDING_IMPORT).exists()
+    assert (source / "journal.db").exists(), "an unreadable journal must not be moved"
+
+
+def test_a_corrupt_journal_beside_the_code_is_reported_and_left(tmp_path):
+    code = _journal(tmp_path / "code")
+    (code / "journal.db").write_bytes(b"this is not a database" * 100)
+
+    done = install.prepare(tmp_path / "home", code_dir=code)
+
+    assert done[0].startswith("journal left beside the code") and "not a readable" in done[0]
+    assert (code / "journal.db").exists() and (code / "raw").exists()

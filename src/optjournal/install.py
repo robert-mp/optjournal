@@ -25,8 +25,10 @@ fewer imports it needs the fewer ways a broken update can stop it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import shutil
 import sqlite3
 import tomllib
@@ -57,9 +59,16 @@ PENDING_IMPORT = ".pending-import.json"
 SEARCH_DIRS = ("Downloads", "Desktop", "Documents")
 SEARCH_DEPTH = 2
 
+#: One database, in the files SQLite keeps it in. Moved, or set aside, together.
+DB_FILES = ("journal.db", "journal.db-wal", "journal.db-shm")
+
 
 class RelocateRefused(RuntimeError):
     """A move would have overwritten a journal, or its source is in use."""
+
+
+class _Unreadable(RelocateRefused):
+    """A `journal.db` SQLite cannot read at all."""
 
 
 def _statement_count(db: Path, *, foreign: bool = False) -> int:
@@ -69,6 +78,7 @@ def _statement_count(db: Path, *, foreign: bool = False) -> int:
     read-only open of a WAL database still creates its `-wal` and `-shm` files,
     and a scan must leave someone else's folder exactly as it found it. Not for
     this install's own journal, whose newest rows may still sit in its WAL.
+
     """
     if not db.exists():
         return 0
@@ -91,6 +101,9 @@ def _release(directory: Path) -> None:
     WAL file also appears when anyone merely reads the journal. On success the
     `-wal` and `-shm` files are gone and the move carries one file. The app puts
     the journal back into WAL mode when it next opens it.
+
+    A file SQLite cannot read at all is refused too, and left where it is: it
+    may still be someone's only copy of something worth recovering.
     """
     db = directory / "journal.db"
     if not db.exists():
@@ -104,29 +117,86 @@ def _release(directory: Path) -> None:
     except sqlite3.OperationalError as exc:
         raise RelocateRefused(
             f"{directory} is in use: close optjournal and try again ({exc})") from exc
+    except sqlite3.DatabaseError as exc:
+        raise _Unreadable(f"{db} is not a readable journal ({exc})") from exc
+
+
+def _copy(src: Path, dst: Path) -> None:
+    if src.is_dir():
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
 
 
 def relocate(source: Path, home: Path) -> list[str]:
     """Move a journal's data from `source` into `home`. Returns what moved.
 
-    Raises `RelocateRefused` when `home` already holds statements or `source` is
-    in use. An empty journal in `home` is moved aside to `home/replaced-<stamp>/`.
+    Raises `RelocateRefused` when `home` already holds statements, when either
+    journal is in use or unreadable, or when the move fails partway. An empty
+    journal in `home` is moved aside to `home/replaced-<stamp>/`, with its
+    `-wal` and `-shm`: left beside the new database, SQLite would apply that
+    WAL to it and report the import as malformed.
+
+    ALL OR NOTHING, because half a move splits the journal: `journal.db` in the
+    new home and `raw/` still beside the code, which is where the data home then
+    resolves. So the source is COPIED into a staging folder first, the staged
+    files are renamed into place, and only then are the originals renamed away
+    into a folder that is deleted last. Every step up to that deletion is
+    undone if any of them fails (a file held by an antivirus scan, a full disk),
+    leaving both folders as they were.
     """
     if _statement_count(home / "journal.db"):
         raise RelocateRefused(f"{home} already holds a journal with statements")
     _release(source)
+    # An unreadable journal in the home has no statements to protect, and is set
+    # aside as it is, with its `-wal` and `-shm`. One in use is refused.
+    with contextlib.suppress(_Unreadable):
+        _release(home)
     home.mkdir(parents=True, exist_ok=True)
 
     present = [name for name in DATA_NAMES if (source / name).exists()]
-    clashes = [name for name in present if (home / name).exists()]
-    if clashes:
-        aside = home / f"replaced-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
-        aside.mkdir()
+    replaced = {*present, *(DB_FILES if "journal.db" in present else ())}
+    clashes = [name for name in DATA_NAMES if name in replaced and (home / name).exists()]
+    stamp = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+    staging, aside = home / f".incoming-{stamp}", home / f"replaced-{stamp}"
+    moved_away = source / f".moved-{stamp}"
+    undo: list[tuple[Path, Path]] = []      # renames done, as (from, to)
+
+    def rename(src: Path, dst: Path) -> None:
+        dst.parent.mkdir(exist_ok=True)
+        os.rename(src, dst)
+        undo.append((src, dst))
+
+    try:
+        staging.mkdir()
+        for name in present:
+            _copy(source / name, staging / name)
         for name in clashes:
-            shutil.move(str(home / name), str(aside / name))
+            rename(home / name, aside / name)
+        for name in present:
+            rename(staging / name, home / name)
+        for name in present:
+            rename(source / name, moved_away / name)
+    except OSError as exc:
+        stuck = []
+        for src, dst in reversed(undo):
+            try:
+                os.rename(dst, src)
+            except OSError as again:
+                stuck.append(f"{dst} ({again})")
+        for folder in (aside, moved_away):
+            with contextlib.suppress(OSError):
+                folder.rmdir()                  # only if empty, as it should be
+        if not stuck:
+            shutil.rmtree(staging, ignore_errors=True)
+        detail = f"; could not put back {', '.join(stuck)}" if stuck else ""
+        raise RelocateRefused(
+            f"could not move the journal from {source} to {home}, so it was "
+            f"left in {source} ({exc}){detail}") from exc
+    shutil.rmtree(staging, ignore_errors=True)
+    shutil.rmtree(moved_away, ignore_errors=True)
+    if clashes:
         log.info("moved an empty journal's files aside to %s", aside)
-    for name in present:
-        shutil.move(str(source / name), str(home / name))
     log.info("moved %s from %s to %s", ", ".join(present), source, home)
     return present
 
@@ -192,8 +262,10 @@ def prepare(home: Path | None = None, *, code_dir: Path | None = None) -> list[s
 
     First a confirmed import from another download, then this install's own
     journal if it still sits beside the code (a download's, never a clone's).
-    Each failure is reported and left for the reader rather than raised: a
-    journal that could not be moved must still open, from wherever it is.
+    Each failure is reported as one line and left for the reader rather than
+    raised: a journal that could not be moved must still open, from wherever it
+    is. A confirmed import is attempted once, whatever happens, so a journal
+    that cannot be imported cannot stop every later start too.
     """
     home = home or config.home()
     code_dir = code_dir or config.ROOT
@@ -206,7 +278,8 @@ def prepare(home: Path | None = None, *, code_dir: Path | None = None) -> list[s
             done.append(f"imported {', '.join(moved)} from {source}")
         except (RelocateRefused, OSError, ValueError, KeyError) as exc:
             done.append(f"import not done: {exc}")
-        pending.unlink(missing_ok=True)
+        finally:
+            pending.unlink(missing_ok=True)
     # A git clone is a developer's checkout, not a download: its journal stays
     # where they put it, beside the tests that read it and the launchd agent.
     if (code_dir / ".git").exists():
@@ -215,6 +288,6 @@ def prepare(home: Path | None = None, *, code_dir: Path | None = None) -> list[s
         try:
             moved = relocate(code_dir, home)
             done.append(f"moved {', '.join(moved)} from {code_dir} to {home}")
-        except RelocateRefused as exc:
+        except (RelocateRefused, OSError) as exc:
             done.append(f"journal left beside the code: {exc}")
     return done
