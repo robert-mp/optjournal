@@ -132,6 +132,32 @@ def test_a_withheld_native_renders_as_a_dash_not_a_crash():
     assert "373.74" in out
 
 
+def test_the_position_book_never_adds_unrealised_pnl_across_currencies():
+    """USD and SEK amounts cannot share a number.
+
+    The footer summed every row's `fifo_pnl_unrealized` as it was stated, in the
+    row's own currency, and labelled it "instrument ccy": -100 USD plus 1,000 SEK
+    printed 900.00, which is neither. Each currency now totals on its own line,
+    and the base translation is the one figure that spans them.
+    """
+    def row(symbol, ccy, unrealised, rate):
+        return {
+            "report_date": "20260929", "symbol": symbol, "position": -1,
+            "mark_price": 1.0, "position_value": -100.0,
+            "position_value_base": -100.0 * rate, "fifo_pnl_unrealized": unrealised,
+            "currency": ccy,
+            "unrealized": {"base": unrealised * rate, "native": unrealised, "ccy": ccy},
+        }
+
+    out = render_positions([row("SPY P", "USD", -100.0, 0.9),
+                            row("OMX C", "SEK", 1000.0, 0.08)])
+    assert "900.00" not in out
+    assert "unrealised (USD)" in out and "-100.00" in out
+    assert "unrealised (SEK)" in out and "1,000.00" in out
+    # -90 + 80 in base.
+    assert "unrealised (base ccy)" in out and "-10.00" in out
+
+
 def test_summary_renders_without_a_statement_path():
     out = render_summary({"statements": [{
         "account_id": "U1", "from_date": "2026-01-01", "to_date": "2026-12-31",
