@@ -418,6 +418,33 @@ def test_a_statement_that_reports_no_positions_is_silent_not_flat(conn):
     assert _current_option_conids(conn) == {"C1"}
 
 
+def test_an_options_only_journal_reads_its_option_book_flat_from_the_nav(conn):
+    """A journal ingested with `--assets OPT` stores no stock position row, so
+    the day its options go flat has no position row in any category and the NAV
+    still prices the stock this journal does not track. Read together, the two
+    columns left the option book on its last option date forever: a LEAP sold
+    that day stayed OPEN, the Positions tab listed it, and allocation counted it.
+    Each column speaks for its own category, so `options_base = 0` is a flat
+    option book whatever the stock figure."""
+    add_snapshot(conn, "LEAP", position=1, date="20260901")
+    add_nav(conn, "20260901", stock=83000, options=4500)
+    add_nav(conn, "20260916", stock=83000, options=0)
+    report = build_history(conn, asset_category="OPT")
+    assert report.episodes == [], "nothing held, and no fill to make an episode"
+    assert report.snapshot_date == "20260916"
+
+
+def test_a_stock_book_is_flat_when_the_nav_prices_no_stock(conn):
+    """The same rule for the other column, which is the equities Dashboard's."""
+    add_snapshot(conn, "S1", position=5, symbol="S1", asset="STK",
+                 date="20260901")
+    add_nav(conn, "20260901", stock=900, options=4500)
+    add_nav(conn, "20260916", stock=0, options=4500)
+    report = build_history(conn, asset_category="STK")
+    assert report.episodes == []
+    assert report.snapshot_date == "20260916"
+
+
 def test_the_book_is_read_in_one_pass_not_once_per_snapshot_row(conn):
     """The book was a correlated scalar subquery, so its UNION ran once for every
     snapshot row it filtered: quadratic, and `/api/state` went from 0.2s to 35s
@@ -828,6 +855,112 @@ def test_a_pre_archive_long_sold_through_zero_opens_the_short(conn):
     closed, still_open = (lambda r: (r.closed, r.open))(build_history(conn))
     assert [(e.realized_pnl, e.entry_outside_window) for e in closed] == [(90.0, True)]
     assert [(e.net_qty, e.entry_outside_window) for e in still_open] == [(-2, False)]
+
+
+def _sive(conn) -> None:
+    """The real SIVE shape, in one account with two snapshot dates: bought and
+    fully sold in the spring, re-entered afterwards and still held."""
+    for tid, date, qty, close, realized in (
+        ("1", "2026-04-20", 100, "O", 0.0),
+        ("2", "2026-05-22", -100, "C", 600.0),
+        ("3", "2026-05-26", 200, "O", 0.0),
+    ):
+        add_trade(conn, tid, conid="S", symbol="SIVE", asset="STK", date=date,
+                  qty=qty, open_close=close, realized=realized)
+    add_snapshot(conn, "S", position=200, symbol="SIVE", asset="STK",
+                 date="20260901")
+
+
+def test_a_share_split_after_a_closed_round_trip_keeps_it_closed(conn):
+    """A 3:1 split is a corporate action, never a trade row, so only the snapshot
+    sees the tripled quantity. Read as a holding from before the archive, it
+    seeded the walk with 400 shares nothing had bought: the closed April-May
+    round trip fused with the re-entry into one OPEN episode and its realised
+    P&L left the closed totals entirely."""
+    _sive(conn)
+    add_snapshot(conn, "S", position=600, symbol="SIVE", asset="STK",
+                 date="20260929")
+    report = build_history(conn, asset_category="STK")
+    assert [(e.status, e.net_qty, e.realized_pnl) for e in report.episodes] == [
+        ("CLOSED", 0, 600.0), ("OPEN", 200, 0.0)]
+    assert report.total_realized_base == 600.0
+    assert (report.wins, report.losses, report.win_rate) == (1, 0, 100.0)
+
+
+def test_shares_transferred_in_after_a_closed_round_trip_keep_it_closed(conn):
+    """The same gap the other way round: 500 shares arrive from another broker,
+    which no trade row records either."""
+    _sive(conn)
+    add_snapshot(conn, "S", position=700, symbol="SIVE", asset="STK",
+                 date="20260929")
+    report = build_history(conn, asset_category="STK")
+    assert [(e.status, e.realized_pnl) for e in report.episodes] == [
+        ("CLOSED", 600.0), ("OPEN", 0.0)]
+
+
+def test_shares_transferred_out_after_a_closed_round_trip_keep_it_closed(conn):
+    """And out, which seeded a negative quantity: a -500 short opened on the day
+    the real round trip closed, with that round trip marked entry-missing."""
+    _sive(conn)
+    add_snapshot(conn, "S", position=-300, symbol="SIVE", asset="STK",
+                 date="20260929")
+    report = build_history(conn, asset_category="STK")
+    assert [(e.status, e.net_qty, e.entry_outside_window)
+            for e in report.episodes] == [
+        ("CLOSED", 0, False), ("OPEN", 200, False)]
+    assert report.total_realized_base == 600.0
+
+
+def test_a_gap_present_on_every_snapshot_date_is_still_a_pre_archive_holding(conn):
+    """The real TSLA 110 across two dates rather than one. A holding from before
+    the archive shows the SAME gap on every date, because every later change to
+    it is a trade -- including the sale of the pre-archive shares themselves.
+    That is what separates it from a split or a transfer, which starts mid-way."""
+    add_trade(conn, "1", conid="T", symbol="TSLA", asset="STK", open_close="O",
+              qty=40, date="2026-08-28")
+    add_trade(conn, "2", conid="T", symbol="TSLA", asset="STK", open_close="O",
+              qty=56, date="2026-09-04")
+    add_snapshot(conn, "T", position=150, symbol="TSLA", asset="STK",
+                 date="20260901")
+    add_snapshot(conn, "T", position=206, symbol="TSLA", asset="STK",
+                 date="20260929")
+    (ep,) = build_history(conn, asset_category="STK").episodes
+    assert (ep.status, ep.net_qty, ep.pre_archive_qty) == ("OPEN", 206, 110)
+    assert ep.entry_outside_window is True and ep.opened_at is None
+
+
+# --- a bare close past flat -----------------------------------------------------
+
+
+def test_a_plain_close_past_flat_takes_the_position_flat(conn):
+    """`qa/s_prearchive_add.py` with no snapshot at all: held 1 before the
+    archive, buy 1, sell 2 marked `C`.
+
+    Only IBKR's `C;O` opens anything. A bare `C` closes only, so a quantity past
+    flat says the position was larger than the archive saw -- one more share held
+    before it, or transferred in -- and the position is flat. Split at zero like a
+    reversal, it left a phantom -1 short OPEN carrying 400 of premium nothing
+    sold."""
+    add_trade(conn, "1", open_close="O", qty=1, price=2.0, date="2026-09-02")
+    add_trade(conn, "2", open_close="C", qty=-2, price=4.0, date="2026-09-20",
+              realized=398.0)
+    (ep,) = build_history(conn).episodes
+    assert (ep.status, ep.net_qty, ep.realized_pnl) == ("CLOSED", 0, 398.0)
+    assert (ep.entry_outside_window, ep.pre_archive_qty) == (True, 1)
+    assert ep.contracts == 2, "it closed 2, so it held 2"
+    assert ep.proceeds == pytest.approx(800.0), "the whole fill, not half of it"
+
+
+def test_a_bare_close_past_flat_does_not_absorb_a_later_re_entry(conn):
+    """The episode the overshoot flattened is finished, so a later opening fill
+    on the same contract starts a new one."""
+    add_trade(conn, "1", open_close="O", qty=1, date="2026-09-02")
+    add_trade(conn, "2", open_close="C", qty=-2, date="2026-09-20",
+              realized=398.0)
+    add_trade(conn, "3", open_close="O", qty=4, date="2026-09-25")
+    report = build_history(conn)
+    assert [(e.status, e.net_qty) for e in report.episodes] == [
+        ("CLOSED", 0), ("OPEN", 4)]
 
 
 # ------------------------------------------------------------------------ 0DTE

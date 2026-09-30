@@ -24,13 +24,14 @@ Three properties of IBKR's data drive the design:
 
 * A position opened before the earliest statement has no opening fill on
   record, so its episode can never balance to zero from trades alone. Those
-  are marked `entry_outside_window`. The newest position snapshot says how
-  much each account holds, so the difference between it and the fills up to
-  its date is the quantity held before the archive began (`_pre_archive`),
-  and the walk starts from it. Only an account with no snapshot at all falls
-  back to the old reading: a close-only run whose open/closed verdict is the
-  snapshot's. This is the second place snapshots carry information trades
-  cannot.
+  are marked `entry_outside_window`. The position snapshots say how much each
+  account holds, so a gap between one and the fills up to its date is quantity
+  the archive cannot account for; a gap that is the SAME on every snapshot date
+  is a holding from before the archive (`_pre_archive`), and the walk starts
+  from it. A gap that appears part way through is a change no trade made (a
+  split, a transfer), and those keep the older reading: a close-only run whose
+  open/closed verdict is the snapshot's. This is the second place snapshots
+  carry information trades cannot.
 
 Note codes are read through `notes.py`, which owns that rule for both readers of
 them: tokens are split and matched exactly, because substring matching would read
@@ -543,43 +544,68 @@ def _day_key(value: Any) -> str:
 
 def _pre_archive(
     rows: list[Any],
-    held: dict[tuple[str, str, str], dict[str, Any]],
     conn: sqlite3.Connection,
 ) -> dict[tuple[str, str, str], float]:
-    """What each contract held before its first fill on record, per the snapshot.
+    """What each contract held before its first fill on record, per the snapshots.
 
-    Reconciles the fills against the book (`BOOK_DATES_SQL`): the snapshot's
-    quantity less the fills up to the book's date is what the account held before
-    the archive began. Only fills up to that date, because a Trade Confirmation
-    fill from today postdates the newest statement and the snapshot cannot know
-    it. Nothing for an account with no snapshot at all, since there is then no
-    book to reconcile against.
+    A gap between what a snapshot says an account holds and what its fills up to
+    that date add up to is quantity the archive cannot account for. It is seeded
+    as a pre-archive holding only when it is the SAME on every snapshot date the
+    account has, which is the property a real one has: every later change to a
+    pre-archive holding is a trade, the sale of the pre-archive shares included,
+    so the gap never moves. A gap that appears part way through is a quantity
+    change no trade made -- a share split, which arrives as a corporate action, or
+    a transfer between brokers -- and seeding one started the walk with shares
+    nothing had bought: the closed round trip before it fused with the position
+    after it into a single open episode, and its realised P&L left the closed
+    totals. Those keep the close-only reading.
+
+    Only fills up to each date, because a Trade Confirmation fill from today
+    postdates the newest statement and no snapshot can know it. Nothing for an
+    account with no snapshot at all, since there is then no book to reconcile
+    against.
 
     Real data: TSLA stock read 96 shares where the account held 206 (110 bought
-    before the archive), and IBKR 0.0019 where it held 0.8615. Checked over every
-    snapshot date in the archive: those two are the only disagreements, and each
-    is the same quantity on every date, as a pre-archive holding must be.
+    before the archive), and IBKR 0.0019 where it held 0.8615. Those two are the
+    only disagreements anywhere in the archive, and each is the same quantity on
+    all 28 of its snapshot dates.
     """
-    books = {
-        (str(r[0] or ""), str(r[1] or "")): _day_key(r[2])
-        for r in conn.execute(
-            f"SELECT broker, account_id, book_date FROM ({BOOK_DATES_SQL})"
-        )
-    }
-    through: dict[tuple[str, str, str], float] = {}
+    days: dict[tuple[str, str], set[str]] = {}
+    positions: dict[tuple[str, str, str], dict[str, float]] = {}
+    for row in conn.execute(
+        "SELECT broker, account_id, conid, report_date, position"
+        " FROM position_snapshots"
+    ):
+        account = (str(row["broker"] or ""), str(row["account_id"] or ""))
+        day = _day_key(row["report_date"])
+        days.setdefault(account, set()).add(day)
+        key = (*account, str(row["conid"] or ""))
+        positions.setdefault(key, {})[day] = row["position"] or 0
+    dates = {account: sorted(seen) for account, seen in days.items()}
+
+    fills: dict[tuple[str, str, str], list[tuple[str, float]]] = {}
     for row in rows:
         key = (str(row["broker"] or ""), str(row["account_id"] or ""),
                str(row["conid"] or ""))
-        book = books.get(key[:2])
-        if book is None:
-            continue
-        through.setdefault(key, 0)
-        if _day_key(row["trade_date"] or row["date_time"]) <= book:
-            through[key] += row["quantity"] or 0
+        if key[:2] in dates:
+            fills.setdefault(key, []).append(
+                (_day_key(row["trade_date"] or row["date_time"]),
+                 row["quantity"] or 0))
+
     out: dict[tuple[str, str, str], float] = {}
-    for key, net in through.items():
-        before = (held[key]["position"] if key in held else 0) - net
-        if not _flat(before):
+    for key, entries in fills.items():
+        snapshot = positions.get(key, {})
+        entries.sort()
+        gaps: list[float] = []
+        net: float = 0
+        index = 0
+        for day in dates[key[:2]]:
+            while index < len(entries) and entries[index][0] <= day:
+                net += entries[index][1]
+                index += 1
+            gaps.append((snapshot.get(day) or 0) - net)
+        before = gaps[0]
+        if not _flat(before) and all(_flat(gap - before) for gap in gaps):
             out[key] = before
     return out
 
@@ -611,7 +637,7 @@ def build_history(
         params,
     ).fetchall()
 
-    pre_archive = _pre_archive(rows, held, conn)
+    pre_archive = _pre_archive(rows, conn)
 
     episodes: list[Episode] = []
     current: Episode | None = None
