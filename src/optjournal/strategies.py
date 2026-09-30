@@ -30,6 +30,7 @@ here is naming the shape and aggregating the legs.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from optjournal import campaigns
@@ -170,11 +171,12 @@ def _campaign_of_order(
     The campaign carries them because the leg views aggregate per contract and so
     carry no fill id for an event to join on.
 
-    A LIST, because one order can fill two campaigns: a fill through zero (IBKR's
-    `C;O`) closes one position and opens the opposite one, so its order belongs to
-    the decision it ended and the one it began. Keeping a single index let the
-    last campaign win, and the order was then drawn in one card only -- the other
-    read its opening date and its proceeds from whatever event was left to it.
+    A LIST, because one order can fill two campaigns: its fills can end one
+    position and begin the next, a fill through zero (IBKR's `C;O`) most plainly,
+    so its order belongs to the decision it ended and the one it began. Keeping a
+    single index let the last campaign win, and the order was then drawn in one
+    card only -- the other read its opening date and its proceeds from whatever
+    event was left to it.
     """
     out: dict[str, list[int]] = {}
     for index, camp in enumerate(campaign_list):
@@ -183,44 +185,66 @@ def _campaign_of_order(
     return out
 
 
-def _leg_part(leg: Row, part: tuple[float, str] | None) -> Row:
-    """One campaign's half of a leg two campaigns filled, or the leg itself.
+def _leg_part(leg: Row, part: Mapping[str, Any] | None) -> Row:
+    """One campaign's share of a leg two campaigns divided, or the leg itself.
 
-    `part` is `campaigns.Campaign.leg_parts`: the quantity this campaign took and
-    that half's own open/close marker. The marker is what makes the closing half
-    read STC and the opening half STO, and it is also what divides the realised
-    P&L, which IBKR reports whole on the half that closed. Everything else
-    divides by quantity, which is `history._through_zero`'s rule.
+    `part` is `campaigns.Campaign.leg_parts`: the leg's own summed columns as this
+    campaign took them, so it overlays the leg and the rest (the contract, the
+    side, the currency) stays. Its marker is what makes a closing share read STC
+    and an opening one STO.
     """
     if part is None:
         return leg
-    quantity, open_close = part
-    whole = leg.get("quantity") or 0
-    share = quantity / whole if whole else 0.0
-    out = {**leg, "quantity": quantity, "open_close": open_close}
-    for name in ("proceeds", "proceeds_base", "commission", "commission_base"):
-        out[name] = (leg.get(name) or 0.0) * share
-    closed = open_close.upper() == "C"
-    for name in ("realized_pnl", "realized_pnl_base"):
-        out[name] = (leg.get(name) or 0.0) if closed else 0.0
+    out = {**leg, **part}
     out["money"] = {f: Money.from_rows([out], f).payload()
                     for f in FILL_MONEY_FIELDS}
     return out
 
 
 def _order_part(order: Row, camp: campaigns.Campaign) -> Row:
-    """The order as one campaign filled it, when another filled the rest."""
-    if not camp.leg_parts:
-        return order
+    """The order as one campaign filled it, when another filled the rest.
+
+    Its own totals are re-read from the legs it now carries, so the part's fill
+    count and first fill are its own and not the whole order's.
+    """
     oid = str(order.get("ib_order_id"))
-    return {**order, "legs": [
-        _leg_part(leg, camp.leg_parts.get((oid, str(leg.get("conid")))))
-        for leg in order.get("legs", ())
-    ]}
+    legs = [_leg_part(leg, camp.leg_parts.get((oid, str(leg.get("conid")))))
+            for leg in order.get("legs", ())]
+    times = [str(leg["first_fill_at"]) for leg in legs if leg.get("first_fill_at")]
+    ends = [str(leg["last_fill_at"]) for leg in legs if leg.get("last_fill_at")]
+    return {
+        **order,
+        "legs": legs,
+        "fills": sum(leg.get("fills") or 0 for leg in legs),
+        "first_fill_at": min(times, default=order.get("first_fill_at")),
+        "last_fill_at": max(ends, default=order.get("last_fill_at")),
+        **{f: Money.from_rows(legs, f).payload() for f in FILL_MONEY_FIELDS},
+    }
+
+
+def _first_taker(
+    order: Row, indices: list[int], campaign_list: list[campaigns.Campaign],
+) -> int:
+    """Of the campaigns dividing an order, the one that took its first execution.
+
+    A reversal's one execution is taken by both, so the tie goes to the one it
+    counts in (`history.FillPart.fills`): the position it closed.
+    """
+    oid = str(order.get("ib_order_id"))
+
+    def first(index: int) -> tuple[str, bool]:
+        return min(
+            ((str(part.get("first_fill_at") or ""), not part.get("fills"))
+             for (order_id, _conid), part in campaign_list[index].leg_parts.items()
+             if order_id == oid),
+            default=("\uffff", True),
+        )
+
+    return min(indices, key=lambda index: (first(index), index))
 
 
 def _campaign_events(
-    orders: list[Row], campaign_list: list[campaigns.Campaign],
+    orders: list[Row], campaign_list: list[campaigns.Campaign], *, divide: bool,
 ) -> list[tuple[int | None, Row]]:
     """Every strategy event with the campaign that filled it, newest first.
 
@@ -230,19 +254,27 @@ def _campaign_events(
     position keeps its own expiry, while a spread's legs expiring together (one
     campaign) stay one event.
 
-    An order two campaigns filled joins both, each part carrying its own half of
-    the shared leg (`_leg_part`). `None` for an event no campaign claims.
+    An order two campaigns filled joins both when `divide`, each part carrying
+    its own share of the leg (`_order_part`), which is how the cards draw it. The
+    Calendar lists a day's executions instead, so there the order stays whole, in
+    the campaign that took its first execution (`_first_taker`). `None` for an
+    event no campaign claims.
     """
-    campaign_of_order = _campaign_of_order(campaign_list)
+    campaigns_of_order = _campaign_of_order(campaign_list)
     out: list[tuple[int | None, Row]] = []
     for event in strategy_groups(orders):
         parts: dict[int | None, list[Row]] = {}
         for order in event["orders"]:
-            for index in campaign_of_order.get(str(order.get("ib_order_id")),
-                                               [None]):
-                parts.setdefault(index, []).append(
-                    order if index is None
-                    else _order_part(order, campaign_list[index]))
+            found = campaigns_of_order.get(str(order.get("ib_order_id")), [])
+            if len(found) > 1 and not divide:
+                found = [_first_taker(order, found, campaign_list)]
+            if len(found) <= 1:
+                # An order drawn in one place is drawn whole.
+                parts.setdefault(found[0] if found else None, []).append(order)
+            else:
+                for index in found:
+                    parts.setdefault(index, []).append(
+                        _order_part(order, campaign_list[index]))
         if len(parts) == 1:
             out.append((next(iter(parts)), event))
         else:
@@ -256,11 +288,13 @@ def campaign_events(
 ) -> list[Row]:
     """`strategy_groups`, with no event straddling two campaigns, newest first.
 
-    The Trades cards and the Calendar's day detail both read this, so they cannot
-    disagree about what one event was. See `_campaign_events`, which the cards use
-    for the campaign each event belongs to as well.
+    What the Calendar's day detail reads. Its events are the Trades cards' events,
+    with one difference: an order two positions divided is listed once and whole,
+    because the day detail lists the day's executions, and a reversal is one. See
+    `_campaign_events`.
     """
-    return [event for _index, event in _campaign_events(orders, campaign_list)]
+    return [event for _index, event in
+            _campaign_events(orders, campaign_list, divide=False)]
 
 
 def position_groups(
@@ -291,6 +325,11 @@ def position_groups(
 
     Events whose orders map to no episode (nothing but snapshots, or an
     unmatched category) stay as singleton lifecycles.
+
+    An order whose fills ended one position and began the next is drawn in both
+    cards, each with its own share (`_campaign_events`), so every fill's
+    quantity and money is drawn once across the cards and a card's `fills`
+    counts its own executions.
     """
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own
@@ -300,7 +339,7 @@ def position_groups(
     # apart.
     grouped: dict[tuple[bool, int], list[Row]] = {}
     for position, (index, event) in enumerate(
-        _campaign_events(orders, campaign_list)
+        _campaign_events(orders, campaign_list, divide=True)
     ):
         key = (True, index) if index is not None else (False, position)
         grouped.setdefault(key, []).append(event)

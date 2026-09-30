@@ -134,10 +134,12 @@ class Campaign:
     episode_indices: tuple[int, ...]
     #: Contracts the campaign touched, for reconciling against the open book.
     conids: tuple[str, ...]
-    #: The orders that filled it. Carried because it is how a caller holding
-    #: ORDERS rather than episodes reaches the campaign: the leg views aggregate
-    #: per contract and carry no fill id, so an order is the only handle the
-    #: Trades tab has.
+    #: The orders that filled it: those of its episodes' own fills. Carried
+    #: because it is how a caller holding ORDERS rather than episodes reaches the
+    #: campaign: the leg views aggregate per contract and carry no fill id, so an
+    #: order is the only handle the Trades tab has. One order is in two campaigns
+    #: when its fills ended one position and began the next; `leg_parts` says
+    #: what each took.
     order_ids: frozenset[str]
     #: Every episode closed. A roll into a still-open position leaves this
     #: False, which is the entire behavioural change: the near leg's realised
@@ -154,19 +156,22 @@ class Campaign:
     #: campaign, as stored. Empty for a campaign the window alone built, which is
     #: how the Trades tab knows which cards it may offer to unlink.
     links: tuple[tuple[str, str], ...] = ()
-    #: What this campaign took from an order LEG another campaign also filled:
-    #: `(quantity, open_close)` keyed by `(order id, conid)`. Only a reversal
-    #: (IBKR's `C;O`) leg is shared, by the position it closed and the one it
-    #: opened, and the Trades tab needs the halves to draw that order in both
-    #: cards rather than whichever one it happened to reach. From the episodes'
-    #: own `fill_parts`, so the division is `history._through_zero`'s and not a
-    #: second reading of it. Empty for every campaign that shares no leg, which
-    #: is all of them on either journal today.
+    #: What this campaign took of an order LEG another campaign also took, keyed
+    #: by `(order id, conid)`, in the leg's own columns (`_leg_share`): quantity,
+    #: fills, prices, times, money, and the open/close marker of what it took.
+    #: A leg is divided when one order's fills end one position and begin the
+    #: next: a reversal (IBKR's `C;O`) split at zero, or an order whose closing
+    #: fills and opening fills arrive separately. Summed from the episodes' own
+    #: `fill_parts`, so a reversal divides as `history._through_zero` divided it
+    #: and every other fill goes whole to the position that took it. A leg only
+    #: this campaign took is not here, since it is drawn as it is. Empty for
+    #: every campaign that divides no leg, which is all of them on either
+    #: journal today.
     #:
     #: `hash=False` because a mapping is not hashable and this dataclass is
     #: frozen, so including it would turn `hash(campaign)` from working into a
     #: TypeError. Equality still reads it.
-    leg_parts: Mapping[tuple[str, str], tuple[float, str]] = field(
+    leg_parts: Mapping[tuple[str, str], Mapping[str, Any]] = field(
         default_factory=dict, hash=False)
 
     @property
@@ -309,6 +314,11 @@ def link(
 
     members_of_group: dict[int, list[int]] = {}
     #: Orders reached per episode, so the campaign can carry the union of them.
+    #: Only the orders of the episode's OWN fills. A group that joins episodes
+    #: (below) makes every one of its orders some member's own anyway; one that
+    #: joins nothing, a contract closed and re-opened or flipped through two
+    #: orders seconds apart, listed each side's order under the other, and the
+    #: Trades tab drew both orders whole in both cards.
     orders_of_episode: dict[int, set[str]] = {}
     for i, episode in enumerate(episodes):
         for tid in getattr(episode, "trade_ids", ()) or ():
@@ -317,15 +327,8 @@ def link(
                 continue
             orders_of_episode.setdefault(i, set()).add(order_id)
             group = group_of_order.get(order_id)
-            if group is None:
-                continue
-            # Every order in the group, not just this fill's: a spread leg that
-            # never shared an episode with its sibling is still the same
-            # decision, and the group is what says so.
-            orders_of_episode[i].update(
-                oid2 for oid2, g in group_of_order.items() if g == group
-            )
-            members_of_group.setdefault(group, []).append(i)
+            if group is not None:
+                members_of_group.setdefault(group, []).append(i)
     # A group joins DIFFERENT contracts: a roll's two expiries, a spread's legs.
     # A group that touched episodes of only ONE contract has reversed it -- a fill
     # through zero (IBKR's `C;O`) belongs to the long it closed and the short it
@@ -355,22 +358,28 @@ def link(
     for i, pair in applied:
         links_of_root.setdefault(find(i), []).append(pair)
 
+    # What each campaign took of each order leg, per (order, contract), which is
+    # the shape a leg has: its episodes' own fill parts. A leg more than one
+    # campaign took is divided between them; see `Campaign.leg_parts`.
+    took: dict[int, dict[tuple[str, str], list[Any]]] = {}
+    for root, idxs in members.items():
+        for i in idxs:
+            conid = str(getattr(episodes[i], "conid", "") or "")
+            for tid, part in (getattr(episodes[i], "fill_parts", None) or {}).items():
+                order_id = order_of_trade.get(str(tid))
+                if order_id is not None:
+                    took.setdefault(root, {}).setdefault(
+                        (order_id, conid), []).append(part)
+    takers: dict[tuple[str, str], int] = {}
+    for legs in took.values():
+        for key in legs:
+            takers[key] = takers.get(key, 0) + 1
+
     out: list[Campaign] = []
     for root in sorted(members):
         idxs = members[root]
         eps = [episodes[i] for i in idxs]
         decided = bool(eps) and all(e.is_closed for e in eps)
-        # The halves of a shared fill, per (order, contract), which is the shape a
-        # leg has. A key BOTH halves reached is a leg this campaign filled whole
-        # (a hand link joined the two sides of the reversal), so there is nothing
-        # to divide and it is dropped.
-        halves: dict[tuple[str, str], list[tuple[float, str]]] = {}
-        for episode in eps:
-            conid = str(getattr(episode, "conid", "") or "")
-            for tid, part in (getattr(episode, "fill_parts", None) or {}).items():
-                order_id = order_of_trade.get(str(tid))
-                if order_id is not None:
-                    halves.setdefault((order_id, conid), []).append(part)
         out.append(Campaign(
             episode_indices=tuple(idxs),
             conids=tuple(sorted({str(getattr(e, "conid", "") or "") for e in eps})),
@@ -392,9 +401,42 @@ def link(
                 (e.commission_base, e.commission, e.currency) for e in eps
             ) if decided else None,
             links=tuple(sorted(links_of_root.get(root, ()))),
-            leg_parts={k: v[0] for k, v in halves.items() if len(v) == 1},
+            leg_parts={key: _leg_share(parts)
+                       for key, parts in took.get(root, {}).items()
+                       if takers[key] > 1},
         ))
     return out
+
+
+#: The columns of a leg that are sums over its fills, named as `db.trade_legs`
+#: and `history.FillPart` both name them.
+_LEG_TOTALS = ("quantity", "fills", "proceeds", "proceeds_base", "commission",
+               "commission_base", "realized_pnl", "realized_pnl_base")
+
+
+def _leg_share(parts: Sequence[Any]) -> dict[str, Any]:
+    """The share of one order leg a campaign took, in the leg's own columns.
+
+    Summed from the fill parts its episodes took, so every figure is those fills'
+    own, a reversal's half included, and the shares of the campaigns dividing a
+    leg add back up to it. The price is `trade_legs`' average, over this share's
+    fills. The open/close marker is the parts' when they agree; a share mixing
+    closing and opening fills leaves the leg's own in place.
+    """
+    share: dict[str, Any] = {
+        name: sum(getattr(part, name) for part in parts) for name in _LEG_TOTALS}
+    size = sum(abs(part.quantity) for part in parts)
+    share["avg_price"] = sum(
+        abs(part.quantity) * part.trade_price
+        for part in parts if part.trade_price is not None
+    ) / size if size else None
+    times = [str(part.date_time) for part in parts if part.date_time]
+    share["first_fill_at"] = min(times, default=None)
+    share["last_fill_at"] = max(times, default=None)
+    marks = {part.open_close for part in parts}
+    if len(marks) == 1:
+        share["open_close"] = marks.pop()
+    return share
 
 
 def position_count(

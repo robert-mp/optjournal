@@ -51,6 +51,7 @@ from optjournal.notes import split_notes
 
 __all__ = [
     "Episode",
+    "FillPart",
     "HistoryReport",
     "build_history",
     "disposition_of",
@@ -108,6 +109,34 @@ def _parse_dt(value: str | None) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class FillPart:
+    """What one episode took of one fill, in the terms an order leg is summed in.
+
+    The whole fill, or for a reversal (`C;O`) the half `_through_zero` gave this
+    episode. Named like `db.trade_legs`' columns, so a caller holding order LEGS
+    can sum these per (order, contract) into the share of a leg one position
+    took. See `campaigns.Campaign.leg_parts`.
+    """
+
+    quantity: float
+    #: IBKR's marker, or for a half of a reversal that half's own: `C` or `O`.
+    open_close: str
+    #: Executions this counts as: 1, except the opening half of a reversal. One
+    #: `C;O` execution split over two episodes is still one execution, so it
+    #: counts once, on the half it closed, which is the half IBKR books its
+    #: realised P&L on.
+    fills: int
+    date_time: str | None
+    trade_price: float | None
+    proceeds: float
+    proceeds_base: float
+    commission: float
+    commission_base: float
+    realized_pnl: float
+    realized_pnl_base: float
 
 
 @dataclass(slots=True)
@@ -176,13 +205,13 @@ class Episode:
     unrealized: float | None = None
     trade_ids: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
-    #: The half of a shared fill this episode took, keyed by trade id: its
-    #: quantity, and IBKR's own open/close marker for that half. Only a reversal
-    #: (`C;O`) is shared, and only between the two episodes `_through_zero` splits
-    #: it between, so this is empty for every other episode. Carried so a caller
-    #: holding whole order LEGS can divide one along the same zero instead of
-    #: re-deriving where it fell -- see `campaigns.Campaign.leg_parts`.
-    fill_parts: dict[str, tuple[float, str]] = field(default_factory=dict)
+    #: What this episode took of each of its fills, keyed by trade id (the keys
+    #: of `trade_ids`): the whole fill, or the half of a reversal `_through_zero`
+    #: gave it. Carried because an order LEG is per (order, contract), and one
+    #: order's fills can end one position and begin the next, so a caller holding
+    #: legs divides one by what each position actually took rather than by which
+    #: orders it lists. See `campaigns.Campaign.leg_parts`.
+    fill_parts: dict[str, FillPart] = field(default_factory=dict)
 
     @property
     def is_closed(self) -> bool:
@@ -384,8 +413,9 @@ def _through_zero(ep: Episode, row: Any) -> tuple[dict, dict]:
     return close_part, open_part
 
 
-def _absorb(ep: Episode, row: Any) -> None:
-    """Fold one fill into an episode."""
+def _absorb(ep: Episode, row: Any, *, fills: int = 1) -> None:
+    """Fold one fill into an episode. `fills` is what it counts as: see
+    `FillPart.fills`."""
     qty = row["quantity"] or 0
     closing = _is_close(row["open_close"])
 
@@ -411,7 +441,21 @@ def _absorb(ep: Episode, row: Any) -> None:
     ep.proceeds += row["proceeds"] or 0.0
     ep.proceeds_base += row["proceeds_base"] or 0.0
     if row["trade_id"]:
-        ep.trade_ids.append(str(row["trade_id"]))
+        trade_id = str(row["trade_id"])
+        ep.trade_ids.append(trade_id)
+        ep.fill_parts[trade_id] = FillPart(
+            quantity=qty,
+            open_close=str(row["open_close"] or ""),
+            fills=fills,
+            date_time=row["date_time"],
+            trade_price=row["trade_price"],
+            proceeds=row["proceeds"] or 0.0,
+            proceeds_base=row["proceeds_base"] or 0.0,
+            commission=row["ib_commission"] or 0.0,
+            commission_base=row["ib_commission_base"] or 0.0,
+            realized_pnl=row["fifo_pnl_realized"] or 0.0,
+            realized_pnl_base=row["fifo_pnl_realized_base"] or 0.0,
+        )
     for tok in split_notes(row["notes"]):
         if tok not in ep.notes:
             ep.notes.append(tok)
@@ -769,18 +813,13 @@ def build_history(
         if past_flat and _reverses(row["open_close"]):
             # The fill finished one position and began the opposite one, so it
             # belongs to both episodes: the closing part ends this one, the
-            # leftover opens the next. Each records its own half, so a consumer
-            # holding the whole order leg can divide it the same way.
+            # leftover opens the next. Each records its own half (`fill_parts`),
+            # and the execution counts once, where it closed.
             close_part, open_part = _through_zero(current, row)
-            trade_id = str(row["trade_id"] or "")
             _absorb(current, close_part)
-            current.fill_parts[trade_id] = (
-                close_part["quantity"], close_part["open_close"])
             flush()
             current = _new_episode(row)
-            _absorb(current, open_part)
-            current.fill_parts[trade_id] = (
-                open_part["quantity"], open_part["open_close"])
+            _absorb(current, open_part, fills=0)
             continue
 
         _absorb(current, row)

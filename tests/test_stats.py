@@ -568,6 +568,224 @@ def test_a_reversal_order_is_drawn_in_both_positions_it_filled(conn):
     }
 
 
+#: Two positions meeting inside one order, or inside one 90-second window, each
+#: as `(conid, order, at, qty, proceeds, pnl, open_close[, put_call])` fills.
+#: The first three are the shapes the reversal fix was written for, which must
+#: keep summing; the rest are the ones it broke. B, C and F divide one order's
+#: fills between two positions without a single split fill; G and H are two
+#: ORDERS on one contract inside the window, one per position.
+_MEETINGS = {
+    "A: one C;O fill": [
+        ("1", "1001", "2026-09-10 10:00:00", 2, -200.0, None, "O"),
+        ("1", "1002", "2026-09-15 10:00:00", -3, 450.0, 95.0, "C;O"),
+        ("1", "1003", "2026-09-20 10:00:00", 1, -100.0, 40.0, "C"),
+    ],
+    "D: one leg of a two-leg order reverses": [
+        ("1", "1001", "2026-09-10 10:00:00", 2, -200.0, None, "O"),
+        ("1", "1002", "2026-09-15 10:00:00", -3, 450.0, 95.0, "C;O"),
+        ("2", "1002", "2026-09-15 10:00:00", 1, -80.0, None, "O", "C"),
+        ("1", "1003", "2026-09-20 10:00:00", 1, -100.0, 40.0, "C"),
+    ],
+    "E: flipped twice": [
+        ("1", "1001", "2026-09-10 10:00:00", 2, -200.0, None, "O"),
+        ("1", "1002", "2026-09-15 10:00:00", -3, 450.0, 95.0, "C;O"),
+        ("1", "1003", "2026-09-20 10:00:00", 3, -300.0, 40.0, "C;O"),
+        ("1", "1004", "2026-09-25 10:00:00", -2, 260.0, 50.0, "C"),
+    ],
+    "B: one order filled C, then C;O": [
+        ("1", "1001", "2026-09-10 10:00:00", 2, -200.0, None, "O"),
+        ("1", "1002", "2026-09-15 10:00:00", -1, 150.0, 48.0, "C"),
+        ("1", "1002", "2026-09-15 10:00:01", -2, 300.0, 47.0, "C;O"),
+        ("1", "1003", "2026-09-20 10:00:00", 1, -100.0, 40.0, "C"),
+    ],
+    "C: one order filled C, C, O": [
+        ("1", "1001", "2026-09-10 10:00:00", 2, -200.0, None, "O"),
+        ("1", "1002", "2026-09-15 10:00:00", -1, 150.0, 48.0, "C"),
+        ("1", "1002", "2026-09-15 10:00:01", -1, 150.0, 47.0, "C"),
+        ("1", "1002", "2026-09-15 10:00:02", -1, 150.0, None, "O"),
+        ("1", "1003", "2026-09-20 10:00:00", 1, -100.0, 40.0, "C"),
+    ],
+    "F: a close-only run, then the same order opens": [
+        ("1", "1002", "2026-09-15 10:00:00", 2, -150.0, 48.0, "C"),
+        ("1", "1002", "2026-09-15 10:00:01", 1, -75.0, None, "O"),
+        ("1", "1003", "2026-09-20 10:00:00", -1, 100.0, 25.0, "C"),
+    ],
+    "G: closed, then re-opened by a second order 30s later": [
+        ("1", "1001", "2026-09-10 10:00:00", 1, -200.0, None, "O"),
+        ("1", "1002", "2026-09-15 10:00:00", -1, 250.0, 48.0, "C"),
+        ("1", "1003", "2026-09-15 10:00:30", 1, -255.0, None, "O"),
+        ("1", "1004", "2026-09-20 10:00:00", -1, 300.0, 43.0, "C"),
+    ],
+    "H: flipped through two orders 20s apart": [
+        ("1", "1001", "2026-09-10 10:00:00", 1, -200.0, None, "O"),
+        ("1", "1002", "2026-09-15 10:00:00", -1, 250.0, 48.0, "C"),
+        ("1", "1003", "2026-09-15 10:00:20", -1, 250.0, None, "O"),
+        ("1", "1004", "2026-09-20 10:00:00", 1, -100.0, 148.0, "C"),
+    ],
+}
+
+#: What a leg carries that the page adds up, native and base.
+_LEG_SUMS = ("quantity", "proceeds", "proceeds_base", "commission",
+             "commission_base", "realized_pnl", "realized_pnl_base")
+
+
+def _meet(conn, name: str):
+    """Ingest one `_MEETINGS` case and read it the way `/api/state` does."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for
+    from optjournal.strategies import campaign_events, position_groups
+
+    for conid, order_id, at, qty, proceeds, pnl, open_close, *right in _MEETINGS[name]:
+        _leg(conn, conid=conid, order_id=order_id, at=at, qty=qty,
+             proceeds=proceeds, pnl=pnl, open_close=open_close,
+             put_call=right[0] if right else "P")
+    report = build_history(conn, asset_category="OPT")
+    camps = campaigns_for(conn, "OPT", report.episodes)
+    orders = orders_data(conn)
+    cards = position_groups(orders, episodes=report.episodes, campaign_list=camps)
+    return report, camps, orders, cards, campaign_events(orders, camps)
+
+
+def _sums(pairs) -> dict[tuple[str, str], tuple[float, ...]]:
+    """`_LEG_SUMS` per (order, contract), over `(order, leg)` pairs."""
+    out: dict[tuple[str, str], list[float]] = {}
+    for order, leg in pairs:
+        got = out.setdefault((order["ib_order_id"], leg["conid"]), [0.0] * len(_LEG_SUMS))
+        for i, name in enumerate(_LEG_SUMS):
+            got[i] += leg[name] or 0.0
+    return {k: tuple(round(v, 6) for v in vals) for k, vals in out.items()}
+
+
+@pytest.mark.parametrize("name", list(_MEETINGS))
+def test_every_fill_is_drawn_once_across_the_cards_and_once_on_the_calendar(conn, name):
+    """Where two positions meet inside one order, or inside one 90-second window,
+    the cards between them draw each fill exactly once, and the Calendar does too.
+
+    An order joined every campaign whose `order_ids` listed it, and those list
+    every order of the window's group, so two orders on one contract 30 seconds
+    apart were each drawn whole in BOTH cards (G, H); and only a single `C;O` fill
+    was ever divided, so one order filled C, C, O drew its whole leg in both (C),
+    and one filled C then C;O gave the long only the split fill's half (B)."""
+    from optjournal.stats import month_stats
+
+    report, camps, orders, cards, events = _meet(conn, name)
+    whole = _sums((o, lg) for o in orders for lg in o["legs"])
+    drawn = [(o, lg) for card in cards for ev in card["events"]
+             for o in ev["orders"] for lg in o["legs"]]
+    assert _sums(drawn) == whole, "a fill drawn twice across the cards, or not at all"
+    assert _sums((o, lg) for ev in events for o in ev["orders"]
+                 for lg in o["legs"]) == whole
+    # Once on the Calendar means one row per leg, not a row per half.
+    assert sorted((o["ib_order_id"], lg["conid"]) for ev in events
+                  for o in ev["orders"] for lg in o["legs"]) == sorted(whole)
+    # Each drawn part reads its own money, not the whole leg's.
+    for _order, leg in drawn:
+        for field in ("proceeds", "commission", "realized_pnl"):
+            assert leg["money"][field]["base"] == pytest.approx(leg[f"{field}_base"] or 0.0)
+            assert (leg["money"][field]["native"] or 0.0) == pytest.approx(leg[field] or 0.0)
+    # One execution is one fill on the page, wherever the cards divide it.
+    executions = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+    assert sum(card["fills"] for card in cards) == executions
+    # And the Dashboard counts the outcomes the cards show.
+    stats = month_stats(conn, None, asset_category="OPT", report=report, campaign_list=camps)
+    decided = [card["realized_pnl"]["base"] for card in cards if card["realized_pnl"]]
+    assert (stats.wins, stats.losses) == (
+        sum(pnl > 0 for pnl in decided), sum(pnl < 0 for pnl in decided))
+    assert stats.net_pnl.base == pytest.approx(
+        sum(decided) + stats.inflight_realized.base)
+
+
+def _cards_read(cards) -> dict[str, tuple]:
+    """Each card as a reader sees its header: shape, events, proceeds, outcome, fills."""
+    return {
+        card["opened_at"]: (
+            card["label"],
+            [event["order_ids"] for event in card["events"]],
+            round(card["proceeds"]["base"], 6),
+            card["realized_pnl"] and card["realized_pnl"]["base"],
+            card["fills"],
+        )
+        for card in cards
+    }
+
+
+def test_a_re_entry_order_inside_the_window_is_drawn_in_its_own_card_only(conn):
+    """G: sell the long, buy it back 30 seconds later under a second order. The
+    two orders are one window group, so each campaign listed both, and each card
+    drew both: the re-entry card was labelled "Roll" and read 295 of proceeds
+    for a position that paid 255 and took 300 back."""
+    *_, cards, _events = _meet(conn, "G: closed, then re-opened by a second order 30s later")
+    assert _cards_read(cards) == {
+        "2026-09-10 10:00:00": ("Long put", [["1001"], ["1002"]], 50.0, 48.0, 2),
+        "2026-09-15 10:00:30": ("Long put", [["1003"], ["1004"]], 45.0, 43.0, 2),
+    }
+
+
+def test_a_flip_through_two_orders_draws_each_order_in_the_card_it_filled(conn):
+    """H: close the long, open a short 20 seconds later under another order."""
+    *_, cards, _events = _meet(conn, "H: flipped through two orders 20s apart")
+    assert _cards_read(cards) == {
+        "2026-09-10 10:00:00": ("Long put", [["1001"], ["1002"]], 50.0, 48.0, 2),
+        "2026-09-15 10:00:20": ("Short put", [["1003"], ["1004"]], 150.0, 148.0, 2),
+    }
+
+
+def test_one_order_filled_c_c_o_divides_along_its_fills(conn):
+    """C: no fill is `C;O`, so nothing was divided and both cards drew the whole
+    -3 for 450. The long took the two closing fills and the short the opening
+    one, each card with the money of its own fills and its own fill count."""
+    *_, cards, _events = _meet(conn, "C: one order filled C, C, O")
+    assert _cards_read(cards) == {
+        "2026-09-10 10:00:00": ("Long put", [["1001"], ["1002"]], 100.0, 95.0, 3),
+        "2026-09-15 10:00:02": ("Short put", [["1002"], ["1003"]], 50.0, 40.0, 2),
+    }
+    parts = {card["opened_at"]: [
+        (leg["quantity"], leg["open_close"], leg["proceeds"], leg["realized_pnl"],
+         leg["fills"])
+        for event in card["events"] if event["order_ids"] == ["1002"]
+        for order in event["orders"] for leg in order["legs"]] for card in cards}
+    assert parts == {
+        "2026-09-10 10:00:00": [(-2, "C", 300.0, 95.0, 2)],
+        "2026-09-15 10:00:02": [(-1, "O", 150.0, 0.0, 1)],
+    }
+
+
+def test_one_order_filled_c_then_c_o_gives_the_long_both_its_closes(conn):
+    """B: the closing card got only the split fill's half (-1, 150), dropping the
+    bare C fill before it (-1, 150, +48 realised) from every card."""
+    *_, cards, _events = _meet(conn, "B: one order filled C, then C;O")
+    assert _cards_read(cards) == {
+        "2026-09-10 10:00:00": ("Long put", [["1001"], ["1002"]], 100.0, 95.0, 3),
+        "2026-09-15 10:00:01": ("Short put", [["1002"], ["1003"]], 50.0, 40.0, 1),
+    }
+
+
+def test_a_close_only_run_and_the_opening_fill_after_it_divide_their_order(conn):
+    """F: a short from before the archive bought back (+2, C) and a long opened
+    (+1, O) in the same order. Both cards drew the whole +3 for -225."""
+    *_, cards, _events = _meet(conn, "F: a close-only run, then the same order opens")
+    assert _cards_read(cards) == {
+        "2026-09-15 10:00:00": ("Short put close", [["1002"]], -150.0, 48.0, 1),
+        "2026-09-15 10:00:01": ("Long put", [["1002"], ["1003"]], 25.0, 25.0, 2),
+    }
+
+
+def test_a_split_execution_is_one_fill_on_the_calendar_and_in_the_cards(conn):
+    """A: one `C;O` execution divided between the long and the short. Both cards
+    counted it, so the page read four fills for three executions, and the
+    Calendar's day detail drew its two halves as two rows ("2 fill(s)"). It counts
+    once, in the card it closed (the half IBKR books its P&L on), and the
+    Calendar, a list of the day's executions, shows it whole."""
+    *_, cards, events = _meet(conn, "A: one C;O fill")
+    assert {card["opened_at"]: card["fills"] for card in cards} == {
+        "2026-09-10 10:00:00": 2, "2026-09-15 10:00:00": 1}
+    day = [(o["ib_order_id"], lg["quantity"], lg["proceeds"]) for ev in events
+           for o in ev["orders"] for lg in o["legs"]
+           if lg["first_fill_at"].startswith("2026-09-15")]
+    assert day == [("1002", -3, 450.0)]
+
+
 def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):
     """`pnl/s_scope_inflight.py`: a 0DTE short put rolled at 15:55 into the next
     day's put, which is still open.

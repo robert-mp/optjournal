@@ -254,6 +254,80 @@ def test_a_fill_through_zero_is_two_decisions_not_a_roll():
     assert camps[0].realized.base == pytest.approx(198.0)
 
 
+def test_a_group_that_joins_nothing_lends_neither_side_its_other_order():
+    """Sell a long, buy the same contract back 30 seconds later under a second
+    order: one window group on one contract, so it joins nothing. Each campaign
+    still listed every order of the group, and the Trades tab, which reaches a
+    campaign through its orders, drew both orders whole in both cards. The
+    re-entry's anchor was the sale's order, so its journal entry was filed under
+    a handle belonging to the other card. Each now lists the orders of its own
+    fills."""
+    eps = [_Ep("C1", ["t1", "t2"], pnl=48.0), _Ep("C1", ["t3", "t4"], pnl=43.0)]
+    camps = link(eps, order_groups=[("1001",), ("1002", "1003"), ("1004",)],
+                 order_of_trade={"t1": "1001", "t2": "1002", "t3": "1003",
+                                 "t4": "1004"})
+    assert [c.order_ids for c in camps] == [
+        frozenset({"1001", "1002"}), frozenset({"1003", "1004"})]
+    assert [c.anchor for c in camps] == ["1001", "1003"]
+
+
+def _part(quantity, open_close, at, price, *, fills=1, proceeds=0.0, pnl=0.0):
+    from optjournal.history import FillPart
+
+    return FillPart(quantity=quantity, open_close=open_close, fills=fills,
+                    date_time=at, trade_price=price, proceeds=proceeds,
+                    proceeds_base=proceeds, commission=-1.0, commission_base=-1.0,
+                    realized_pnl=pnl, realized_pnl_base=pnl)
+
+
+def test_a_leg_two_campaigns_took_is_divided_by_the_fills_each_took():
+    """One order filled C at 1.50, then C;O at 1.60 through zero: the long took
+    the first fill and the closing half of the second, the short the opening
+    half. Each campaign carries its share of that leg in the leg's own columns,
+    summed from its own fill parts; a leg only one campaign took carries none."""
+    eps = [_Ep("C1", ["t1", "t2", "t3"], pnl=95.0), _Ep("C1", ["t3", "t4"], pnl=40.0)]
+    eps[0].fill_parts = {
+        "t1": _part(2, "O", "2026-09-10 10:00:00", 1.0, proceeds=-200.0),
+        "t2": _part(-1, "C", "2026-09-15 10:00:00", 1.5, proceeds=150.0, pnl=48.0),
+        "t3": _part(-1, "C", "2026-09-15 10:00:01", 1.6, proceeds=160.0, pnl=47.0),
+    }
+    eps[1].fill_parts = {
+        "t3": _part(-1, "O", "2026-09-15 10:00:01", 1.6, fills=0, proceeds=160.0),
+        "t4": _part(1, "C", "2026-09-20 10:00:00", 1.0, proceeds=-100.0, pnl=40.0),
+    }
+    camps = link(eps, order_groups=[("open",), ("flip",), ("out",)],
+                 order_of_trade={"t1": "open", "t2": "flip", "t3": "flip",
+                                 "t4": "out"})
+    assert [dict(c.leg_parts) for c in camps] == [
+        {("flip", "C1"): {
+            "quantity": -2, "fills": 2, "proceeds": 310.0, "proceeds_base": 310.0,
+            "commission": -2.0, "commission_base": -2.0, "realized_pnl": 95.0,
+            "realized_pnl_base": 95.0, "avg_price": pytest.approx(1.55),
+            "first_fill_at": "2026-09-15 10:00:00",
+            "last_fill_at": "2026-09-15 10:00:01", "open_close": "C"}},
+        {("flip", "C1"): {
+            "quantity": -1, "fills": 0, "proceeds": 160.0, "proceeds_base": 160.0,
+            "commission": -1.0, "commission_base": -1.0, "realized_pnl": 0.0,
+            "realized_pnl_base": 0.0, "avg_price": 1.6,
+            "first_fill_at": "2026-09-15 10:00:01",
+            "last_fill_at": "2026-09-15 10:00:01", "open_close": "O"}},
+    ]
+
+
+def test_a_share_mixing_closing_and_opening_fills_keeps_the_legs_own_marker():
+    """The edge the marker rule leaves: one campaign's share of a leg holding a
+    closing AND an opening fill has no one marker of its own, so it carries none
+    and the leg's stays."""
+    eps = [_Ep("C1", ["t1", "t3"]), _Ep("C1", ["t2"])]
+    eps[0].fill_parts = {"t1": _part(-1, "C", "2026-09-15 10:00:00", 1.0),
+                         "t3": _part(-1, "O", "2026-09-15 10:00:02", 1.0)}
+    eps[1].fill_parts = {"t2": _part(-1, "O", "2026-09-15 10:00:01", 1.0)}
+    camps = link(eps, order_groups=[("x",)], order_of_trade=dict.fromkeys(
+        ("t1", "t2", "t3"), "x"))
+    assert "open_close" not in camps[0].leg_parts[("x", "C1")]
+    assert camps[1].leg_parts[("x", "C1")]["open_close"] == "O"
+
+
 def test_a_flip_placed_with_another_contract_is_still_one_decision():
     """The same-contract exception only covers a group of ONE contract. A
     reversal filled in the same second as a leg on another contract is a
