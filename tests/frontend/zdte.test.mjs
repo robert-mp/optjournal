@@ -375,6 +375,33 @@ test("a rate decision is never folded into the speakers", () => {
   ]);
 });
 
+test("only the Fed's speakers are merged, and nobody else's podium is", () => {
+  /* The merge matched any "Speaks", so a day with the President and two FOMC
+     members read "Fed speakers (Trump, +2)". Other speakers keep their own chip
+     and the feed's own wording. */
+  const { shown } = sessionEvents([
+    { at: "09:00", country: "USD", title: "President Trump Speaks", impact: "Medium" },
+    { at: "10:00", country: "USD", title: "FOMC Member Barkin Speaks", impact: "Low" },
+    { at: "12:00", country: "USD", title: "Treasury Secretary Bessent Speaks", impact: "Low" },
+    { at: "13:00", country: "USD", title: "Fed Chair Powell Speaks", impact: "High" },
+  ]);
+  assert.deepEqual(shown.map((row) => row.title), [
+    "Fed speakers (Barkin, +1)",
+    "President Trump Speaks",
+    "Treasury Secretary Bessent Speaks",
+  ]);
+  assert.deepEqual(shown.map((row) => row.count), [2, 1, 1]);
+});
+
+test("ADP is a second-tier print, not the payrolls report", () => {
+  /* "ADP Non-Farm Employment Change" contains the payrolls title, and the first
+     tier was tried first, so a private estimate outranked everything in the week. */
+  const tierOf = (title) =>
+    sessionEvents([{ at: "08:15", country: "USD", title, impact: "Medium" }]).shown[0].tier;
+  assert.equal(tierOf("ADP Non-Farm Employment Change"), 2);
+  assert.equal(tierOf("Non-Farm Employment Change"), 1);
+});
+
 test("an unknown grade sorts last, and an empty day is empty", () => {
   const { shown } = sessionEvents([
     { at: "10:00", country: "USD", title: "Something New", impact: "Critical" },

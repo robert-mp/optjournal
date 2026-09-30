@@ -130,7 +130,9 @@ const TIERS = [
   [1, new RegExp([
     "FOMC (Statement|Press Conference|Meeting Minutes|Economic Projections)",
     "Federal Funds Rate", "Interest Rate Decision",
-    "\\bCPI\\b", "\\bPCE\\b", "Non-Farm Employment", "Unemployment Rate",
+    // Anchored, because ADP's private estimate is titled "ADP Non-Farm
+    // Employment Change" and would otherwise be read as the payrolls report.
+    "\\bCPI\\b", "\\bPCE\\b", "^\\s*Non-Farm Employment", "Unemployment Rate",
     "Fed Chair(man|woman)? \\w+ Speaks", "Payrolls Revision",
   ].join("|"), "i")],
   [2, new RegExp([
@@ -157,16 +159,21 @@ function tier(title, impact) {
   return grade(impact) === 0 ? 2 : 3;
 }
 
-/* A central banker with a microphone. Matched on the feed's own verb rather than
- * on "FOMC", because the same day carries "Fed Chair Powell Speaks" and
- * "FOMC Member Barkin Speaks" and both are the same kind of event. Applied only
- * AFTER the country filter, so an MPC or SNB speaker never reaches it.
- *
- * DELIBERATELY NARROW. "FOMC Statement", "FOMC Press Conference" and a rate
- * decision do not match, and must not: those are the day's main event, and folding
- * one into a group captioned "speakers" would bury the only release that reprices
- * the whole curve. */
+/* The feed's verb for a speech, which is how a speaker's surname is found. */
 const SPEAKS = /\bspeaks\b/i;
+
+/* A central banker with a microphone: an FOMC member or the Chair, speaking.
+ * Matched on the feed's own titles, "FOMC Member Barkin Speaks" and "Fed Chair
+ * Powell Speaks", which are the same kind of event. Applied only AFTER the country
+ * filter, so an MPC or SNB speaker never reaches it.
+ *
+ * DELIBERATELY NARROW, in two directions. "FOMC Statement", "FOMC Press
+ * Conference" and a rate decision do not match, and must not: those are the day's
+ * main event, and folding one into a group captioned "speakers" would bury the
+ * only release that reprices the whole curve. And a speaker who is not at the Fed
+ * does not match either: "President Trump Speaks" merged into the group once and
+ * captioned it "Fed speakers (Trump, +3)". Those rows keep their own chip. */
+const FED_SPEAKER = /\b(FOMC Member|Fed Chair(man|woman)?)\b.*\bspeaks\b/i;
 
 /* "FOMC Member Barkin Speaks" -> "Barkin". The surname is what a reader
  * recognises, and the feed's phrasing is stable enough to take the word before
@@ -188,8 +195,8 @@ function speaker(title) {
 export function sessionEvents(events, options) {
   const { country = SESSION_COUNTRY, chips = SESSION_CHIPS } = options || {};
   const mine = (events || []).filter((event) => event.country === country);
-  const talks = mine.filter((event) => SPEAKS.test(event.title));
-  const rest = mine.filter((event) => !SPEAKS.test(event.title));
+  const talks = mine.filter((event) => FED_SPEAKER.test(event.title));
+  const rest = mine.filter((event) => !FED_SPEAKER.test(event.title));
   const chip = (event, title, count) => ({
     at: event.at,
     title: title == null ? event.title : title,
