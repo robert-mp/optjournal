@@ -3416,6 +3416,34 @@ def test_the_wire_spelling_of_the_current_month_is_the_current_month():
             f"{path}: #month=current did not land on the current month: {out[path]}")
 
 
+def test_a_linked_days_month_is_kept_when_the_same_link_is_followed_again():
+    """Follow-up review, finding 4. load() pins the month a linked day names
+    (cdb3a43), but the hashchange handler only reloads when the query moves, and
+    following the same old-format link again (`#tab=calendar&calday=2026-08-03`
+    while it is open) asks for the same month: no read, applyHash put S.month back
+    to null, and the redraw wrote the URL without its month. Clearing the day then
+    left `#tab=calendar` over August's figures with "Aug 2026" in the header, and a
+    reload or the next control opened the current month. The redraw now applies the
+    same pin, after its own calday heal, so both paths keep the month.
+    """
+    out = _hash_harness([
+        "const out={opened:await fresh('#tab=calendar&calday=2026-08-03')};",
+        "out.again=await typed('#tab=calendar&calday=2026-08-03');",
+        "S.calday=null; draw(); out.cleared=drawn;",
+        "console.log(JSON.stringify(out));",
+    ])
+    kept = "#tab=calendar&month=2026-08&calday=2026-08-03"
+    assert out["opened"]["hash"] == out["again"]["hash"] == kept, out
+    assert out["cleared"] == {"shown": "2026-08", "hash": "#tab=calendar&month=2026-08",
+                              "asks": "month=2026-08"}, (
+        f"clearing the day left August's figures under the current month: {out}")
+    draw = _code_only(_fn("draw"))
+    assert (draw.index("if(S.calday&&S.state&&") < draw.index("pinDayMonth();")
+            < draw.index("syncHash(push);")), (
+        "the pin must follow the redraw's calday heal and precede the URL write")
+    assert "pinDayMonth();" in _code_only(_fn("load"))
+
+
 def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_paths():
     """`#month=1999-01`, loaded fresh or typed into the address bar, is answered
     with all-time figures: `build_state` heals a month outside the account's life to
@@ -3482,7 +3510,7 @@ def _load_harness(stored: str = "position", real_note: bool = False) -> list[str
         *banner, "function staleServerCheck(){} function draw(){}",
         "function esc(s){return String(s);}",
         *consts, _page_const("SCORING"),
-        *_page_fns("stateQuery", "load"),
+        *_page_fns("stateQuery", "pinDayMonth", "load"),
     ]
 
 
@@ -5733,7 +5761,7 @@ def test_a_state_reply_that_cannot_be_read_still_hands_the_buttons_back(reply):
         f"let fetch; {reply}",
         _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
         "const $=()=>({innerHTML:'',className:''});",
-        *_page_fns("stateQuery", "load"),
+        *_page_fns("stateQuery", "pinDayMonth", "load"),
         "try{ await load(); }catch(e){ notes.push('threw'); }",
         "console.log(JSON.stringify({draws,notes}));",
     ])
@@ -5766,7 +5794,7 @@ def test_a_failed_state_read_leaves_the_controls_over_the_figures_in_hand():
         "let fetch=async()=>({ok:true,status:200,json:async()=>payload});",
         _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
         "const $=()=>({innerHTML:'',className:''});",
-        *_page_fns("stateQuery", "load"),
+        *_page_fns("stateQuery", "pinDayMonth", "load"),
         "await load();",
         # What the month stepper and the trade-type buttons do, then a read that fails.
         "S.month='2026-08';S.type='equities';S.cost=['OPT','STK'];S.scoring='campaign';",
