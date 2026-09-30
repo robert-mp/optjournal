@@ -8323,11 +8323,11 @@ def test_each_stats_block_ranks_strategies_over_its_own_period():
     assert "strategy_ranking(state[\"lifecycles\"],period)" in src
 
 
-def _media_rules(width: int) -> list[tuple[str, str]]:
-    """(selector, body) for every rule inside `@media(max-width:<width>px)`."""
+def _at_rules(width: int, kind: str = "media") -> list[tuple[str, str]]:
+    """(selector, body) for every rule inside `@<kind> (max-width:<width>px)`."""
     css = re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)
     rules: list[tuple[str, str]] = []
-    for m in re.finditer(rf"@media\s*\(max-width:\s*{width}px\)\s*\{{", css):
+    for m in re.finditer(rf"@{kind}\s*\(\s*max-width:\s*{width}px\s*\)\s*\{{", css):
         depth, i = 1, m.end()
         while depth:
             depth += {"{": 1, "}": -1}.get(css[i], 0)
@@ -8336,25 +8336,40 @@ def _media_rules(width: int) -> list[tuple[str, str]]:
     return [(sel.strip(), body) for sel, body in rules]
 
 
-def test_a_phone_calendar_prints_every_day_whole():
-    """M33: at 375px a day is 37px wide and "−€1,729.42" was clipped to "−€1,7",
-    and the pill row ran 7px past the card. Measured in a browser at 320 to 1280px
-    after the fix, on the real journal's two busiest months: nothing clipped.
+def _media_rules(width: int) -> list[tuple[str, str]]:
+    return _at_rules(width)
 
-    The cell carries the amount and its `compact` form (node-tested in
-    format.test.mjs), and below 700px only the compact one shows, sized to the
-    day's own width so it fits the narrowest phone; the day's label keeps the
-    exact figure for a screen reader.
+
+def test_a_calendar_day_prints_its_figure_whole_at_every_width():
+    """M33 and L52, which are the same rule read at two widths.
+
+    M33: at 375px a day is 41px wide and "−€1,729.42" was clipped to "−€1,7", and
+    the pill row ran 7px past the card. L52: the cell carries the amount and its
+    `compact` form (node-tested in format.test.mjs) and the choice between them was
+    made by the WINDOW, so from 761px, where the rail is back but the window is
+    still narrow, a 78px day showed the full amount with `overflow-wrap:anywhere`
+    and broke it inside its digits: "−", "€1,729.4", "2".
+
+    The question belongs to the cell, so each day that carries a figure is a
+    container and one query answers it everywhere. Measured in a browser on the real
+    journal's two busiest months, 320px to 2560px in 5px steps: no digit split, no
+    clipping, and nothing wraps at all. The day's label keeps the exact figure for a
+    screen reader at every width.
     """
-    narrow = {sel: body.replace(" ", "") for sel, body in _media_rules(700)}
+    narrow = {sel: body.replace(" ", "") for sel, body in _at_rules(72, "container")}
     assert "display:none" in narrow.get(".day .dplw", ""), "the full amount still shows"
     shown = narrow.get(".day .dpln", "")
     assert "display:inline" in shown and "cqi" in shown, (
         "the compact amount does not show, or does not scale with the day")
-    assert "container-type:inline-size" in narrow.get(".cal>.day", "")
     wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "container-type:inline-size" in wide.get(".cal>.day:has(>.dpl)", ""), (
+        "a day is not its own container, so the query above can never match -- and "
+        "the Market strip's cells must stay out of it, they size themselves")
     assert "display:none" in wide.get(".day .dpln", ""), (
         "the compact amount shows beside the full one on a wide screen")
+    assert not any("anywhere" in body for sel, body in _css_rules()
+                   if sel.strip() in (".day .dplw", ".day .dpl")), (
+        "overflow-wrap:anywhere is back, which lets an amount break between digits")
     assert "max-width:100%" in wide.get(".pills", ""), (
         "a pill strip with a row to itself cannot wrap, so it overflows its card")
     cal = _fn("calendar")

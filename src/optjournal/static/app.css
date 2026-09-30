@@ -1601,20 +1601,27 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .day .dpl{font-family:var(--fig);font-variant-numeric:tabular-nums;
   font-weight:var(--w-label);font-size:var(--t3)}
 /* The day's figure is in the cell twice (page.html `calendar`): the amount, and
-   `compact` for a grid too narrow for it. Below 700px a day is under 84px wide,
-   which is where the widest four-digit amount stopped fitting and was clipped;
-   an amount wider still wraps rather than clipping. The compact form is at most
-   five glyphs, about 2.9em, so sizing it at 34% of the day's own width (`cqi`,
-   each day its own container) keeps it inside the cell on the narrowest phone
-   while `--t1` caps it everywhere else. */
-.day .dplw{overflow-wrap:anywhere}
+   `compact` for a cell too narrow for it. WHICH one shows is a question about the
+   CELL, not about the window, and asking the window got it wrong in between: from
+   761px the rail is back while the window is still narrow, so a day is 78px, and
+   `overflow-wrap:anywhere` then broke the amount inside its digits -- "−€1,729.42"
+   printed as "−", "€1,729.4", "2", which reads as a different number. The wrap rule
+   is gone and each day that carries a figure is its own container instead, so one
+   query decides it at every window width: 72px is the room the widest four-digit
+   amount needs at --t3, and below that the compact form shows. Only the days with a
+   figure, because the Market strip reuses .cal/.day to hold event titles, which
+   size their cells themselves. The compact form is at most five glyphs, about
+   2.9em, so sizing it at 34% of the day's own width (`cqi`) keeps it inside the
+   cell on the narrowest phone while `--t1` caps it everywhere else. */
+.cal>.day:has(>.dpl){container-type:inline-size}
 .day .dpln{display:none}
-@media(max-width:700px){
-  .cal{gap:var(--s1)}
-  .cal>.day{padding:var(--s1);container-type:inline-size}
-  .day .top{flex-wrap:wrap}
+@container (max-width:72px){
   .day .dplw{display:none}
   .day .dpln{display:inline;font-size:min(var(--t1),34cqi)}}
+@media(max-width:700px){
+  .cal{gap:var(--s1)}
+  .cal>.day{padding:var(--s1)}
+  .day .top{flex-wrap:wrap}}
 .day.g .dct,.day.r .dct{color:var(--onfill)}
 
 /* ---- legs / strategy ---- */
