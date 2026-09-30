@@ -142,7 +142,10 @@ mirrored rather than imported for that reason, and a test holds the copies to
   (`marketdata.SOURCE_RANK`), so a genuine fetch always displaces one and never
   the reverse.
 * The server binds loopback only and refuses anything else: no
-  authentication, and the UI exposes an entire brokerage account.
+  authentication, and the UI exposes an entire brokerage account. Binding is
+  not enough against your own browser, so every request must also name this
+  server in `Host` (against DNS rebinding), and every POST must carry this
+  server's `Origin` or none (see `web.py`).
 
 ## Development
 

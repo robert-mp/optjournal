@@ -38,6 +38,7 @@ from optjournal.db import connect, migrate, open_journal
 from optjournal.history import build_history
 from optjournal.stats import campaigns_for
 from optjournal.web import (
+    _host_is_self,
     _origin_is_same,
     build_state,
     companion_html,
@@ -1709,6 +1710,12 @@ def test_serve_refuses_non_loopback(host, tmp_path, monkeypatch):
     "http://127.0.0.1:8799",
     "http://localhost:8799",
     "http://127.0.0.1",           # port 80: a different origin from 8765
+    # L26: OTHER LOOPBACK ADDRESSES on the same port. This server binds IPv4
+    # 127.0.0.1, so a page from `[::1]:8765` or `127.0.0.2:8765` was served by a
+    # different process that bound the same port number there.
+    "http://[::1]:8765",
+    "http://127.0.0.2:8765",
+    "https://127.0.0.1:8765",     # this server speaks http only
 ])
 def test_a_cross_origin_post_is_refused(origin):
     """Binding loopback stops the network, not your own browser.
@@ -1740,11 +1747,11 @@ def test_a_cross_origin_post_is_refused(origin):
 
 @pytest.mark.parametrize("origin", [
     "http://127.0.0.1:8765",
-    # The SAME server under its other names. A browser sends whichever was typed,
-    # so string equality against the bound host would refuse the page its own
-    # journal served -- which is why both sides go through `_is_loopback`.
+    # The SAME server under the name a reader may type instead. A browser sends
+    # whichever was typed, so equality against the bound host alone would refuse
+    # the page its own journal served.
     "http://localhost:8765",
-    "http://[::1]:8765",
+    "HTTP://LOCALHOST:8765",
     None,        # curl, the CLI: not a browser, so not the threat model
 ])
 def test_the_pages_own_origin_may_write(origin):
@@ -1759,6 +1766,79 @@ def test_the_pages_own_origin_may_write(origin):
     returned 400 (no query id configured), not 403, so it passed the guard.
     """
     assert _origin_is_same(origin, host="127.0.0.1", port=8765)
+
+
+def test_a_journal_bound_elsewhere_on_loopback_accepts_its_own_origin():
+    """`serve --host 127.0.0.2` serves pages whose origin is that address."""
+    assert _origin_is_same("http://127.0.0.2:8765", host="127.0.0.2", port=8765)
+    assert not _origin_is_same("http://127.0.0.1:8765", host="127.0.0.2", port=8765)
+
+
+# --- the Host header (DNS rebinding) ----------------------------------------
+
+
+@pytest.mark.parametrize("host", [
+    "127.0.0.1:8765", "localhost:8765", "LOCALHOST:8765", "[::1]:8765",
+])
+def test_a_request_naming_this_server_is_served(host):
+    assert _host_is_self(host, host="127.0.0.1", port=8765)
+
+
+@pytest.mark.parametrize("host", [
+    # DNS REBINDING: a name the attacker controls, re-pointed at 127.0.0.1 after
+    # the page loaded. Same origin to the browser, so it reads every reply.
+    "attacker.example:8765",
+    "127.0.0.1.evil.com:8765",
+    "localhost.evil.com:8765",
+    "127.0.0.1:8799",
+    "127.0.0.1",                  # port 80
+    "evil@127.0.0.1:8765",
+    "",
+    None,
+])
+def test_a_request_naming_another_host_is_refused(host):
+    """H5: the Origin guard covered POSTs, and nothing covered the Host, so a
+    rebinding page read /api/state (the whole account) with a plain GET."""
+    assert not _host_is_self(host, host="127.0.0.1", port=8765)
+
+
+def test_a_journal_bound_elsewhere_on_loopback_answers_to_that_address():
+    """`serve --host 127.0.0.2` is reached as 127.0.0.2, so that name is served."""
+    assert _host_is_self("127.0.0.2:8765", host="127.0.0.2", port=8765)
+
+
+def _raw(base: str, request: bytes) -> tuple[int, dict]:
+    """Send one hand-written request, so the Host header is ours to choose."""
+    import urllib.parse  # noqa: PLC0415 - local to this helper
+
+    parts = urllib.parse.urlsplit(base)
+    with socket.create_connection((parts.hostname, parts.port), timeout=10) as sock:
+        sock.sendall(request)
+        data = b""
+        while chunk := sock.recv(65536):
+            data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    return int(head.split()[1]), json.loads(body)
+
+
+def test_a_rebinding_page_can_neither_read_nor_write(tmp_path):
+    """H5 end to end: the Host is checked before any route, GET or POST."""
+    db = tmp_path / "j.db"
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        for request in (
+            b"GET /api/state HTTP/1.1\r\nHost: attacker.example:8765\r\n"
+            b"Connection: close\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n",
+            b"POST /api/settings HTTP/1.1\r\nHost: attacker.example\r\n"
+            b"Content-Type: application/json\r\nContent-Length: 22\r\n"
+            b"Connection: close\r\n\r\n{\"scoring\":\"contract\"}",
+        ):
+            status, reply = _raw(base, request)
+            assert (status, reply["kind"]) == (403, "host"), request
+        # The client every other test uses sends `Host: 127.0.0.1:<port>`.
+        status, _state = _get(base, "/api/state")
+    assert status == 200
+    assert web.prefs.read().get("scoring") is None, "a refused POST was stored"
 
 
 def test_the_origin_guard_runs_before_every_route_so_new_endpoints_inherit_it():

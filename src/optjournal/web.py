@@ -28,6 +28,12 @@ browser, which is the only place it was visible. "Loopback" is not one origin;
 every local port is its own, so anything that can serve a single file locally
 would otherwise have write access.
 
+The Origin check does nothing about READS, and a third attacker reads. A page
+on a domain it controls can re-point that name at 127.0.0.1 (DNS rebinding), and
+its requests are then same-origin to the browser, so every reply is readable.
+What such a request cannot change is its `Host` header, so every route checks
+that `Host` names this server before anything else. See `_host_is_self`.
+
 The page reads a single /api/state payload rather than one endpoint per panel.
 At this data volume the whole journal is a few KB of JSON, so one round trip is
 simpler than five and the panels can never disagree with each other.
@@ -413,21 +419,57 @@ def _origin_is_same(origin: str | None, *, host: str, port: int) -> bool:
     browser. curl and a future CLI are not the threat model; a page in a tab is.
     Refusing `None` would break the former and stop nothing.
 
-    The bound host is compared through `_is_loopback` on BOTH sides rather than by
-    string, so a journal served on `127.0.0.1` accepts its own page loaded as
-    `localhost` -- the same server, and a browser sends whichever name was typed.
-    `http://127.0.0.1.evil.com` still fails, because its hostname is not loopback.
+    THE BOUND ADDRESS OR `localhost`, and nothing else on loopback. A journal
+    served on `127.0.0.1` accepts its own page loaded as `localhost`, the same
+    server under the name a reader may type. It no longer accepts any loopback
+    host, which it used to: the listener is IPv4 on one address, so a page from
+    `http://[::1]:8765` or `http://127.0.0.2:8765` came from a DIFFERENT process
+    that bound the same port number on another address, which is the same hole
+    the port check above closed. Compared as exact strings, so
+    `http://127.0.0.1.evil.com` and a trailing path both fail.
     """
     if origin is None:
         return True
-    parts = urllib.parse.urlsplit(origin)
-    if not parts.hostname or parts.port != port:
+    return origin.strip().lower() in {
+        f"http://{authority}" for authority in _authorities(host, port, "localhost")
+    }
+
+
+#: The names a client may put in `Host` for this server, beside the bound
+#: address itself: every spelling of loopback a reader or a tool could type.
+_HOST_NAMES = ("127.0.0.1", "localhost", "[::1]")
+
+
+def _authorities(host: str, port: int, *names: str) -> set[str]:
+    """`name:port` for the bound host and each of `names`, lower-cased.
+
+    The bare name is included only on port 80, the one port a browser leaves
+    out of a URL's authority.
+    """
+    bound = f"[{host}]" if ":" in host else host
+    every = {bound.lower(), *names}
+    return {f"{name}:{port}" for name in every} | (every if port == 80 else set())
+
+
+def _host_is_self(header: str | None, *, host: str, port: int) -> bool:
+    """Whether a request's `Host` names THIS server, port included.
+
+    DNS REBINDING is what this stops. A page on `attacker.example` re-points
+    that name at 127.0.0.1 once it has loaded, and its script then fetches
+    `http://attacker.example:8765/api/state`: to the browser that is the page's
+    own origin, so the Origin guard never sees it and the reply, the whole
+    account, is readable. Measured before the fix: 200 and 231 KB. The one
+    thing such a request cannot fake is `Host`, which names the attacker's
+    domain, so every route, GET or POST, refuses a Host that is not this
+    server's address or a loopback name on the bound port.
+
+    A missing header is refused too. Unlike `Origin`, every client sends
+    `Host` (HTTP/1.1 requires it, and urllib and curl always do), so its absence
+    is not a way to tell a tool from a browser.
+    """
+    if header is None:
         return False
-    # Loopback-to-loopback rather than equality: 127.0.0.1, localhost and ::1 all
-    # name this server, and which one appears depends on what was typed.
-    if _is_loopback(host):
-        return _is_loopback(parts.hostname)
-    return parts.hostname == host
+    return header.strip().lower() in _authorities(host, port, *_HOST_NAMES)
 
 
 def _now() -> str:
@@ -1055,6 +1097,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._send(code, json.dumps(payload, default=str).encode(), "application/json")
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+        if not self._addressed_here():
+            return
         path, _, query = self.path.partition("?")
         params = urllib.parse.parse_qs(query)
         if path in ("/", "/index.html"):
@@ -1196,19 +1240,40 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             "asked_at": int(datetime.now(UTC).timestamp()),
         }
 
-    def _same_origin(self) -> bool:
-        """`Origin` against the socket this server actually bound.
+    def _bound(self) -> tuple[str, int]:
+        """The address and port the listening socket really bound.
 
         From `server_address`, not the `Host` header: the socket is what the
         process is really listening on, while `Host` is client-supplied and so
         cannot be trusted to decide whether a client is trusted.
         """
         address = self.server.server_address
-        bound_host = str(address[0]) if isinstance(address, tuple) else ""
-        bound_port = int(address[1]) if isinstance(address, tuple) else 0
-        return _origin_is_same(
-            self.headers.get("Origin"), host=bound_host, port=bound_port
-        )
+        if not isinstance(address, tuple):
+            return "", 0
+        return str(address[0]), int(address[1])
+
+    def _same_origin(self) -> bool:
+        """`Origin` against the socket this server actually bound."""
+        host, port = self._bound()
+        return _origin_is_same(self.headers.get("Origin"), host=host, port=port)
+
+    def _addressed_here(self) -> bool:
+        """Whether this request's `Host` names this server. See `_host_is_self`.
+
+        Answers the refusal itself when it does not, so each verb's first line
+        can be `if not self._addressed_here(): return`.
+        """
+        host, port = self._bound()
+        if _host_is_self(self.headers.get("Host"), host=host, port=port):
+            return True
+        self._json(403, {
+            "ok": False, "kind": "host",
+            "message": f"this journal answers only to its own address on port "
+                       f"{port} (127.0.0.1 or localhost). A request naming another "
+                       f"host is how a web page reads a local server, so it is "
+                       f"refused.",
+        })
+        return False
 
     def _body(self, limit: int = 8192) -> dict[str, Any]:
         """The request's JSON object, or {}.
@@ -1843,6 +1908,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # BEFORE the route check, so every write endpoint added later is covered
         # by default rather than by remembering. A 403 here costs a foreign page
         # nothing; letting it through costs an IBKR request.
+        if not self._addressed_here():
+            return
         if not self._same_origin():
             self._json(403, {
                 "ok": False, "kind": "origin",
