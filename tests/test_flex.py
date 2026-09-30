@@ -743,3 +743,85 @@ def test_ingesting_a_malformed_file_raises_the_typed_error_too(tmp_path):
     path.write_bytes(b"<FlexQueryResponse")
     with pytest.raises(flex.StatementUnreadable, match="activity-bad.xml"):
         ingest_file(connect_migrated(tmp_path / "j.db"), path)
+
+
+# --------------------------------------------------------------------------
+# A busy server is not a rejected token (M7).
+# --------------------------------------------------------------------------
+
+def _answer_with_error(monkeypatch, code: str, message: str) -> None:
+    """IBKR's error envelope, raised by py_ibkr's own error table.
+
+    Through `_raise_for_error` rather than a hand-built exception, so the test
+    sees exactly what a real reply produces, class and message both.
+    """
+    from py_ibkr.flex.client import _raise_for_error
+
+    envelope = ET.fromstring(
+        f"<FlexStatementResponse><Status>Fail</Status><ErrorCode>{code}</ErrorCode>"
+        f"<ErrorMessage>{message}</ErrorMessage></FlexStatementResponse>")
+
+    def download(self, *args, **kwargs):
+        _raise_for_error(envelope)
+
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory",
+                        lambda **kw: type("C", (), {"download": download})())
+
+
+@pytest.mark.parametrize(("code", "message"), [
+    ("1009", "The server is under heavy load. Statement could not be generated "
+             "at this time. Please try again shortly."),
+    ("1008", "MTM and FIFO P/L data is not ready at this time. Please try again "
+             "shortly."),
+    ("1018", "Too many requests have been made from this token. Please try again "
+             "shortly."),
+    ("1001", "Statement could not be generated at this time. Please try again "
+             "shortly."),
+])
+def test_a_busy_server_is_a_retry_later_not_a_rejected_token(
+    tmp_path, monkeypatch, code, message,
+):
+    """1009 arrived as `FlexAuthError`, which the journal read as a dead token.
+
+    py_ibkr files 1009 beside 1012 under one class and one message template, so
+    only the CODE tells a heavy-loaded server from an expired token. The remedy
+    for one is waiting; for the other it is Client Portal, and sending someone
+    there because IBKR was busy is the bug.
+    """
+    from py_ibkr import FlexError
+
+    _answer_with_error(monkeypatch, code, message)
+    with pytest.raises(flex.FlexBusy) as caught:
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert not isinstance(caught.value, flex.TokenRejected)
+    assert isinstance(caught.value, FlexError), "existing FlexError handlers miss it"
+    assert caught.value.code == code
+    assert "try again later" in str(caught.value)
+    assert "Client Portal" not in str(caught.value)
+
+
+@pytest.mark.parametrize(("code", "message", "reads_as"), [
+    ("1012", "Token has expired.", "expired"),
+    ("1015", "Token is invalid.", "regenerated"),
+])
+def test_a_token_error_from_the_real_error_table_is_still_rejected(
+    tmp_path, monkeypatch, code, message, reads_as,
+):
+    _answer_with_error(monkeypatch, code, message)
+    with pytest.raises(flex.TokenRejected, match=reads_as):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+
+
+def test_py_ibkr_still_has_the_error_table_the_code_shim_rewrites():
+    """A pin on a private table, because the shim edits it in place.
+
+    If py_ibkr renames or reshapes `_ERROR_EXCEPTIONS`, the shim would silently
+    stop putting the code back, and 1009 would read as a token problem again.
+    """
+    from py_ibkr.flex import client
+
+    table = client._ERROR_EXCEPTIONS
+    assert {"1009", "1012"} <= set(table)
+    for code, (_cls, template) in table.items():
+        assert template.startswith(f"Flex API Error {code}: "), template

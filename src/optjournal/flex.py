@@ -33,7 +33,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import keyring
-from py_ibkr import FlexClient, FlexError, FlexQueryResponse
+from py_ibkr import FlexClient, FlexError, FlexQueryResponse, FlexRateLimitError
 from py_ibkr.flex.client import FlexAuthError
 from py_ibkr.flex.parser import parse_xml_file
 
@@ -47,6 +47,7 @@ __all__ = [
     "FetchCooldown",
     "ConfirmFetch",
     "FetchResult",
+    "FlexBusy",
     "StatementUnreadable",
     "TokenMissing",
     "TokenRejected",
@@ -215,6 +216,24 @@ class _TimeoutFlexClient(FlexClient):
 _client_factory = _TimeoutFlexClient
 
 
+class FlexBusy(FlexRateLimitError):
+    """IBKR could not answer now, for a reason that clears by itself.
+
+    IBKR documents these codes with "Please try again shortly": a server under
+    heavy load (1009), P&L data not ready (1008 and its siblings), too many
+    requests (1018), generation still in progress (1019). Nothing about the
+    token, the query or the journal is wrong, and the remedy is to wait.
+
+    A `FlexRateLimitError`, and so a `FlexError`: every existing handler of a
+    failed Flex request keeps catching it, and the CLI's exit code for
+    throttling ("try again later") already applies. `code` is IBKR's number.
+    """
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class StatementUnreadable(FlexError):
     """A response body or an archived file that is not a statement we can read.
 
@@ -346,37 +365,50 @@ def write_token(token: str, account: str | None = None) -> str:
 #: actually telling you. Measured against the live endpoint on 2026-09-24: a token
 #: past its lifetime answered 1012, and the same token after being regenerated in
 #: Client Portal answered 1015 -- so the pair is how you tell "it aged out" from
-#: "it was replaced", which is worth keeping distinct in the message.
+#: "it was replaced", which is worth keeping distinct in the message. These are
+#: the only two codes IBKR's error table describes as a token problem.
 _TOKEN_CODES = {
     "1012": "expired",
     "1015": "invalid, which is also what a token reads as once it has been "
             "regenerated in Client Portal",
-    "1009": "not accepted",
 }
 
-#: How py_ibkr renders an IBKR error code it has no specific class for:
-#: `f"Flex API Error {code}: {msg}"`. Parsed rather than read off an attribute
-#: because `FlexError` carries no code -- checked in the installed source, and
-#: pinned by a test, so an upstream wording change fails loudly here instead of
-#: quietly losing the remedy.
+#: IBKR error codes whose documented message ends "Please try again shortly".
+#: 1009 was in `_TOKEN_CODES`, because py_ibkr files it beside 1012 as an
+#: authentication error; IBKR's own text for it is "The server is under heavy
+#: load", and treating it as a dead token sent the reader to Client Portal to
+#: replace one that worked. See `FlexBusy`.
+_TRANSIENT_CODES = frozenset({
+    "1001", "1004", "1005", "1006", "1007", "1008", "1009", "1018", "1019", "1021",
+})
+
+#: How py_ibkr renders an IBKR error code: `f"Flex API Error {code}: {msg}"`, and,
+#: through `compat._keep_error_codes`, the same prefix on the codes it maps to a
+#: class. Parsed rather than read off an attribute because `FlexError` carries
+#: no code -- checked in the installed source, and pinned by a test, so an
+#: upstream wording change fails loudly here instead of quietly losing the remedy.
 _FLEX_CODE = re.compile(r"Flex API Error (\d+)")
 
 
 def _reraise_if_token_rejected(exc: FlexError) -> None:
-    """Raise `TokenRejected` if IBKR's complaint is about the token. Else return.
+    """Raise `TokenRejected` or `FlexBusy` when the code says which. Else return.
 
-    TWO DETECTIONS, because py_ibkr reports the same class of problem two ways:
-    1009 and 1012 arrive as `FlexAuthError` with the code stripped out of the
-    message, while 1015 falls through to a bare `FlexError` whose text still
-    carries "Flex API Error 1015". Matching on the class alone missed 1015 -- the
-    code this journal actually hit -- and matching on the text alone would miss
-    1012.
+    The code comes from the message, where py_ibkr (with the compat shim) always
+    puts it. A `FlexAuthError` WITHOUT one did not come from py_ibkr's error
+    table, so it keeps the meaning its class gives it: the token.
     """
     code = None
     found = _FLEX_CODE.search(str(exc))
     if found:
         code = found.group(1)
-    if code not in _TOKEN_CODES and not isinstance(exc, FlexAuthError):
+    if code in _TRANSIENT_CODES:
+        raise FlexBusy(
+            f"IBKR could not answer just now (error {code}); nothing is wrong "
+            f"with the token or the query, try again later.\n  IBKR said: {exc}",
+            code,
+        ) from exc
+    if code not in _TOKEN_CODES and not (code is None
+                                         and isinstance(exc, FlexAuthError)):
         return
     reads_as = _TOKEN_CODES.get(code or "", "not accepted")
     raise TokenRejected(

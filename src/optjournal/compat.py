@@ -16,6 +16,13 @@ value and records it, so parsing continues and the value is preserved rather
 than guessed at or dropped. Pydantic consults `_missing_` when it validates an
 enum field, so the one hook covers both paths.
 
+The same call also puts IBKR's error CODE back into every Flex error py_ibkr
+raises. py_ibkr maps six codes to classes with message templates that drop the
+number, and it files 1009 ("the server is under heavy load") beside 1012 ("token
+has expired") under one class and one template. Only the code tells a busy
+server from a dead token, and `flex` needs that to send the reader to the right
+remedy.
+
 This is a shim, not a fix. The real fix is upstream; see README.
 """
 
@@ -25,7 +32,7 @@ import enum
 import logging
 from typing import Any
 
-from py_ibkr.flex import enums
+from py_ibkr.flex import client, enums
 from py_ibkr.flex.enums import Code
 
 __all__ = ["install_code_fallback", "unknown_codes", "unknown_values"]
@@ -81,11 +88,29 @@ def _missing_(cls: type[enum.Enum], value: Any) -> enum.Enum | None:
     return member
 
 
+def _keep_error_codes() -> None:
+    """Prefix each of py_ibkr's error templates with the code it stands for.
+
+    The prefix is the one py_ibkr already writes for a code it does NOT map,
+    `Flex API Error {code}: `, so `flex._FLEX_CODE` reads every error the same
+    way. The class is unchanged, so py_ibkr's own retry of 1003 and 1019 is too.
+    """
+    for code, (cls, template) in list(client._ERROR_EXCEPTIONS.items()):
+        prefix = f"Flex API Error {code}: "
+        if not template.startswith(prefix):
+            client._ERROR_EXCEPTIONS[code] = (cls, prefix + template)
+
+
 def install_code_fallback() -> None:
-    """Make every py_ibkr enum tolerate values it does not declare. Idempotent."""
+    """Install both py_ibkr shims. Idempotent.
+
+    Every py_ibkr enum tolerates values it does not declare, and every Flex
+    error py_ibkr raises carries IBKR's error code in its message.
+    """
     global _INSTALLED
     if _INSTALLED:
         return
     for cls in _py_ibkr_enums():
         cls._missing_ = classmethod(_missing_)  # type: ignore[assignment,method-assign]
+    _keep_error_codes()
     _INSTALLED = True
