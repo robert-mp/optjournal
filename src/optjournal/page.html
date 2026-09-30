@@ -5869,9 +5869,12 @@ function appBanners(){
     </div>`;
   }
   const found=(ins.previous||[])[0];
+  /* The sentence is ONE span: the banner is a flex row, so every bare text run in
+     it was a flex item of its own, and the full stop after the path wrapped onto a
+     line by itself. */
   if(found&&ins.supervised){
-    out+=`<div class="card banner"><b>Found your journal</b> in
-      <span class="mono">${esc(found)}</span>.
+    out+=`<div class="card banner"><span><b>Found your journal</b> in
+      <span class="mono">${esc(found)}</span>.</span>
       <button class="btn" id="impgo" data-source="${esc(found)}">Use this journal</button>
       <div class="note">It moves into ${esc(ins.home)}, where every future version
       finds it.</div></div>`;
@@ -5906,34 +5909,34 @@ async function awaitRestart(){
     +'again.','bad');
 }
 
+/* One press of a banner button: POST, then wait for the restart. EVERY way this
+   can end short of a reload hands the button back with its own label -- a refusal,
+   a network error, a reply that is not JSON, or a server that never came back.
+   Only the refusal did before, so any other failure left "Updating…" disabled
+   with nothing to press. `textContent`, so the label is not escaped a second time
+   (a refused update read "Update to 0.2.0&lt;img…"). */
+async function bannerPost(b,path,body,failed,started){
+  const label=b.textContent;
+  b.disabled=true; b.classList.add('busy');
+  if(b.id==='updgo') b.textContent='Updating…';
+  let ures=null, why='';
+  try{
+    const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)}:{method:'POST'});
+    ures=await r.json();
+    if(!ures.ok) why=ures.message||'';
+  }catch(e){why=String(e);}
+  if(ures&&ures.ok){note(started(ures),'ok'); await awaitRestart();}
+  else note(failed+esc(why),'bad');
+  b.disabled=false; b.classList.remove('busy'); b.textContent=label;
+}
 function bindAppBanners(){
   const u=$('#updgo');
-  if(u) u.onclick=async()=>{
-    u.disabled=true; u.classList.add('busy'); u.textContent='Updating…';
-    try{
-      const r=await fetch('/api/update',{method:'POST'});
-      const ures=await r.json();
-      if(!ures.ok){note('Could not update: '+esc(ures.message||''),'bad');
-        u.disabled=false; u.classList.remove('busy');
-        u.textContent='Update to '+esc(S.update.latest); return;}
-      note(`Installing version ${esc(ures.version)}. The page reloads by itself.`,'ok');
-      await awaitRestart();
-    }catch(e){note('Could not update: '+esc(e),'bad');}
-  };
+  if(u) u.onclick=()=>bannerPost(u,'/api/update',null,'Could not update: ',
+    ures=>`Installing version ${esc(ures.version)}. The page reloads by itself.`);
   const m=$('#impgo');
-  if(m) m.onclick=async()=>{
-    m.disabled=true; m.classList.add('busy');
-    try{
-      const r=await fetch('/api/install/import',{method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({source:m.dataset.source})});
-      const ures=await r.json();
-      if(!ures.ok){note('Could not use that journal: '+esc(ures.message||''),'bad');
-        m.disabled=false; m.classList.remove('busy'); return;}
-      note('Moving your journal. The page reloads by itself.','ok');
-      await awaitRestart();
-    }catch(e){note('Could not use that journal: '+esc(e),'bad');}
-  };
+  if(m) m.onclick=()=>bannerPost(m,'/api/install/import',{source:m.dataset.source},
+    'Could not use that journal: ',()=>'Moving your journal. The page reloads by itself.');
 }
 
 function settingsPanel(){

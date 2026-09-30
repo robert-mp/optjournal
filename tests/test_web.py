@@ -23,6 +23,7 @@ import socket
 import sqlite3
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import RAW_DIR, ROOT, code_only
@@ -2842,6 +2843,42 @@ def _page_const(name: str) -> str:
     return found.group(0)
 
 
+def _page_fns(*names: str) -> list[str]:
+    """The page's own functions by name, skipping any this version lacks.
+
+    `_fn` runs to the next plain `function`, so an `async function` after one is
+    cut off here: a harness declares its own stand-ins, and a second copy of one
+    would be a redeclaration. `_fn` also starts at `function`, so an async one
+    gets its keyword back.
+    """
+    js = _code_only(_js())
+    return [("async " if f"async function {name}(" in js else "")
+            + _fn(name).split("\nasync function ")[0]
+            for name in names if f"function {name}(" in js]
+
+
+def _static(name: str) -> str:
+    return (ROOT / "src" / "optjournal" / "static" / name).as_uri()
+
+
+def _node_run(lines: list[str]) -> Any:
+    """Run page code under node as a module, and return what it printed as JSON.
+
+    For the page's handlers, which read and write plain state and a handful of
+    DOM nodes: the caller declares stand-ins for those, and every line of
+    behaviour under test is the page's own source.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("no node runtime")
+    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [node, "--input-type=module", "-e", "\n".join(lines)],
+        capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+    return json.loads(result.stdout)
+
+
 def _run_hash_handler(steps: list[tuple[str, str]]) -> list[dict]:
     """Drive the page's real `applyHash` and `onhashchange` under node.
 
@@ -2850,26 +2887,18 @@ def _run_hash_handler(steps: list[tuple[str, str]]) -> list[dict]:
     which cost scope it parsed. Everything the two read is the page's own code;
     only `load`, `draw` and `location` are stand-ins.
     """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("no node runtime")
     js = _code_only(_js())
     handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
     assert handler, "the hashchange handler moved"
-    # `_fn` runs to the next plain `function`, so an `async function` after one is
-    # cut off here: `load` is a stand-in below and must not be declared twice.
-    fns = [_fn(name).split("\nasync function ")[0]
-           for name in ("applyHash", "stateQuery") if f"function {name}(" in js]
     consts = [_page_const(name) for name in
               ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS")]
-    zdte = (ROOT / "src" / "optjournal" / "static" / "zdte.js").as_uri()
-    script = "\n".join([
-        f"import {{sanitizeLevel}} from '{zdte}';",
+    return _node_run([
+        f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
         "const location={hash:''}, window={}, calls=[];",
         "const S={};",
         "function load(){calls.push('load');}",
         "function draw(){calls.push('draw');}",
-        *consts, *fns, handler.group(0),
+        *consts, *_page_fns("applyHash", "stateQuery"), handler.group(0),
         f"const steps={json.dumps(steps)};",
         "const out=[];",
         "for(const [from,to] of steps){",
@@ -2879,12 +2908,6 @@ def _run_hash_handler(steps: list[tuple[str, str]]) -> list[dict]:
         "}",
         "console.log(JSON.stringify(out));",
     ])
-    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [node, "--input-type=module", "-e", script],
-        capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
-    )
-    assert result.returncode == 0, result.stderr[-3000:]
-    return json.loads(result.stdout)
 
 
 def test_a_hash_change_the_server_would_answer_differently_refetches():
@@ -7555,3 +7578,64 @@ def test_importing_a_journal_it_did_not_find_is_refused(populated, monkeypatch, 
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         status, reply = _post(base, "/api/install/import", {"source": str(tmp_path)})
     assert status == 400 and reply["kind"] == "refused"
+
+
+#: How a banner POST can fail, as the fetch stand-in the harness answers with.
+_BANNER_FAILURES = {
+    "refused": "fetch=async()=>({json:async()=>({ok:false,message:'no <b>way</b>'})});",
+    "offline": "fetch=async()=>{throw new TypeError('Failed to fetch');};",
+    "not json": "fetch=async()=>({json:async()=>{throw new SyntaxError('Unexpected <');}});",
+    # Accepted, then the server never came back: awaitRestart gives up and returns.
+    "never back": "fetch=async()=>({json:async()=>({ok:true,version:'0.2.0'})});",
+}
+
+
+@pytest.mark.parametrize("failure", sorted(_BANNER_FAILURES))
+@pytest.mark.parametrize(("button", "label"), [
+    ("updgo", "Update to 0.2.0<img src=x>"), ("impgo", "Use this journal")])
+def test_a_banner_button_is_handed_back_after_any_failure(button, label, failure):
+    """M29: the Update button stayed disabled on "Updating…" after a network error
+    or a reply that was not JSON, and so did Use this journal; only a refusal
+    handed it back. L39: that refusal restored the label through `esc` into
+    `textContent`, so it read "Update to 0.2.0&lt;img…". Pressed here through the
+    page's own `bindAppBanners`, against every way the POST can end short of a
+    reload.
+    """
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const notes=[];",
+        "const btn=(id,text)=>({id,textContent:text,disabled:false,dataset:{source:'/x'},",
+        "  cls:new Set(),get classList(){const c=this.cls;",
+        "    return {add:k=>c.add(k),remove:k=>c.delete(k)};}});",
+        f"const b=btn({json.dumps(button)},{json.dumps(label)});",
+        "const $=sel=>sel==='#'+b.id?b:null;",
+        "const S={update:{latest:'0.2.0<img src=x>'}};",
+        "function note(text,kind){notes.push(kind);}",
+        "async function awaitRestart(){}",
+        f"let fetch; {_BANNER_FAILURES[failure]}",
+        *_page_fns("bannerPost", "bindAppBanners"),
+        "bindAppBanners();",
+        "await b.onclick();",
+        "console.log(JSON.stringify({disabled:b.disabled,busy:b.cls.has('busy'),",
+        "  text:b.textContent,notes}));",
+    ])
+    assert (out["disabled"], out["busy"], out["text"]) == (False, False, label)
+    if failure != "never back":
+        assert out["notes"] == ["bad"], "the failure was not reported"
+
+
+def test_the_app_banners_wrap_on_a_phone():
+    """L37: the "What's new" notes are a `<pre>`, which does not wrap, so at 375px
+    the page scrolled sideways to 942px. L39: the banner is a flex row, so every
+    bare text run was a flex item of its own and the full stop after a found
+    journal's path wrapped onto a line by itself.
+    """
+    rules = [(sel, body.replace(" ", "")) for sel, body in _css_rules()]
+    pre = [body for sel, body in rules if re.search(r"\.card\.banner\s+pre\b", sel)]
+    assert pre and "white-space:pre-wrap" in pre[0], "the release notes do not wrap"
+    path = [body for sel, body in rules if re.search(r"\.card\.banner\s+\.mono\b", sel)]
+    assert path and "overflow-wrap:anywhere" in path[0], "a long path cannot wrap"
+    assert re.search(r"<span><b>Found your journal</b>.*?</span>\.</span>",
+                     _fn("appBanners"), re.S), (
+        "the found-journal sentence is not one span, so its full stop is a flex "
+        "item that wraps alone")

@@ -720,6 +720,12 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
 .card.banner{border-left:3px solid var(--accent);display:flex;flex-wrap:wrap;
   align-items:center;gap:var(--s3)}
 .card.banner .note,.card.banner details{flex-basis:100%}
+/* A release note is preformatted and a found journal is a path, and neither has
+   to fit a phone: unwrapped, the notes scrolled a 375px page out to 942px. The
+   `min-width` lets the flex item shrink below its longest line at all. */
+.card.banner pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.card.banner .mono{overflow-wrap:anywhere}
+.card.banner>span,.card.banner details{min-width:0}
 /* `h3` is styled as an ELEMENT, deliberately, and it is the one place here that
    earns an unclassed selector. This bug has been found twice: the Watchlist's
    title was a classless `<h3>` wearing the user agent's size and its 1em margins
