@@ -216,8 +216,8 @@ def test_snapshot_reingest_updates_rather_than_duplicates(conn):
 
     The conflict target names `broker` and `account_id` because the key does. It
     was `(report_date, conid)` and moved when snapshot identity became per-broker
-    -- a conid is IBKR's numbering, so two brokers can each hold "contract 12345"
-    -- and then per-account, because two accounts in one file can hold it too.
+    (a conid is IBKR's numbering, so two brokers can each hold "contract 12345"),
+    and then per-account, because two accounts in one file can hold it too.
     """
     _statement_row(conn)
     for mark in (1.0, 5.0):

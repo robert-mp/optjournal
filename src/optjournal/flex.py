@@ -476,7 +476,7 @@ _TRANSIENT_CODES = frozenset({
 #: How py_ibkr renders an IBKR error code: `f"Flex API Error {code}: {msg}"`, and,
 #: through `compat._keep_error_codes`, the same prefix on the codes it maps to a
 #: class. Parsed rather than read off an attribute because `FlexError` carries
-#: no code -- checked in the installed source, and pinned by a test, so an
+#: no code (checked in the installed source, and pinned by a test), so an
 #: upstream wording change fails loudly here instead of quietly losing the remedy.
 _FLEX_CODE = re.compile(r"Flex API Error (\d+)")
 

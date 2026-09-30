@@ -19,7 +19,7 @@ Two kinds of redundancy, treated very differently:
 Provenance is preserved rather than broken. Rows in `trades`,
 `cash_transactions`, `position_snapshots` and `equity_summaries` carry the
 `source_file` they came from, and the tables disagree about which duplicate that
-is -- trades and cash are first-write-wins so they point at the oldest copy, while
+is: trades and cash are first-write-wins so they point at the oldest copy, while
 the snapshots and NAV replace on conflict so they point at the newest. Deleting
 files without fixing that would dangle a foreign key and leave rows claiming
 to originate from a file that no longer exists. Because the duplicates are
