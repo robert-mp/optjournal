@@ -984,7 +984,11 @@ def write_demo_bars(conn) -> int:
                 # not a model output at all.
                 close = round(abs(float(anchor_price)), 2)
             else:
-                years = (expiry - stamp) / (365.0 * 86400)
+                # Priced at the session's 16:00 close, which is when the replay
+                # model reads a daily option close as known, so the demo's vols
+                # solve back to the ones it was built from.
+                settled = expiry_epoch(day) or stamp
+                years = max(0.0, (expiry - settled) / (365.0 * 86400))
                 price = bs_price(
                     spot, float(strike), years, _session_vol(base_vol, day), right
                 )

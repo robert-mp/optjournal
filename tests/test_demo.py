@@ -1110,6 +1110,27 @@ def test_the_generated_vol_steps_between_sessions(conn):
     assert not falling, "the vol input never changed between sessions"
 
 
+def test_a_synthetic_close_on_expiry_day_is_intrinsic(conn):
+    """A daily option close is the 16:00 price, which is how the replay model
+    reads it, so on its own expiry session it has no time left and is worth its
+    intrinsic value. Priced from the session's opening stamp instead, it carried
+    hours of time value the model then solved into a wrong vol."""
+    from optjournal.bars import close_series
+    from optjournal.clock import et_day
+    from optjournal.demo import write_demo_bars
+
+    # High enough at the 2026-01-08 anchor for its 7.20 premium to solve, then
+    # 10 dollars under the strike by the 2026-04-17 expiry (offset 102).
+    _with_underlying(conn, "SPY", [(n, 690.0 if n < 60 else 580.0) for n in range(110)])
+    write_demo_bars(conn)
+    conid = conn.execute(
+        "SELECT conid FROM trade_legs WHERE symbol = 'SPY   260417P00590000' LIMIT 1"
+    ).fetchone()["conid"]
+    closes = {et_day(stamp): close
+              for stamp, close in close_series(conn, str(conid), bar_size="1d")}
+    assert closes["2026-04-17"] == pytest.approx(10.0, abs=0.005)
+
+
 def test_synthetic_bars_are_stamped_where_the_source_stamps_them(conn):
     """Midnight ET, which is where the price source puts an option's daily bar --
     and NOT the session open, where it puts the underlying's. The two series are
