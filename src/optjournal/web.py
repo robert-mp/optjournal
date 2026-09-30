@@ -65,6 +65,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
+
 from optjournal import __version__, install, journal, replay, updates
 from optjournal import earnings as earnings_mod
 from optjournal import settings as prefs
@@ -114,6 +116,7 @@ from optjournal.jobs import (
 from optjournal.jobs import (
     Context as JobContext,
 )
+from optjournal.locks import LockTimeout
 from optjournal.marketdata import BarFetchError, fetch_quote
 from optjournal.serialize import (
     allocation_data,
@@ -959,32 +962,68 @@ def _do_sync(
 ) -> dict[str, Any]:
     """The `POST /api/sync` reply: `sync_journal` plus this endpoint's own shapes.
 
-    Thin by design. The two `except` clauses are the whole reason it exists: the
+    Thin by design. The `except` clauses are the whole reason it exists: the
     page needs `retry_after_s` as a number to render a countdown, and a cooldown
     is not an error the way a missing token is. `sync_journal` raises so that each
     caller can make that distinction in its own vocabulary.
+
+    EVERY FAILURE ANSWERS AND IS RECORDED. Only the cooldown and the two token
+    errors used to be caught, so any other FlexError (no network, IBKR's rate
+    limit, a lockout) left the page with an empty reply and the ledger with no
+    row. `kind` is `throttled` when IBKR asked for a pause, `flex` for any other
+    refused request, `busy` when another process held the fetch lock past its
+    timeout (the route answers that 409), and `internal` for anything else (500).
+    A failure is ROLLED BACK before its ledger row is committed on the same
+    connection, so a sync that raised mid-ingest cannot commit half a statement.
+    A locked or unwritable journal is re-raised for `do_POST` to answer, since
+    the ledger write would fail the same way.
     """
     with open_journal(db_path) as conn:
         try:
             reply = sync_journal(
                 conn=conn, archive_dir=archive_dir, query_id=query_id, assets=assets,
             )
-        except FetchCooldown as exc:
+        except sqlite3.OperationalError:
+            conn.rollback()
+            raise
+        except Exception as exc:  # noqa: BLE001 - every failure is answered below
+            conn.rollback()
             # RECORDED, not just reported. Until this call existed, a sync from the
             # page wrote no ledger row, so pressing Sync could fix the journal and
             # leave the scheduler's backoff counter exactly where it was.
             record_manual_sync(conn, exc)
-            return {
-                "ok": False,
-                "kind": "cooldown",
-                "retry_after_s": exc.retry_after_s,
-                "message": str(exc),
-            }
-        except (TokenMissing, TokenRejected) as exc:
-            record_manual_sync(conn, exc)
-            return {"ok": False, "kind": "config", "message": str(exc)}
+            return _sync_refusal(exc)
         record_manual_sync(conn, reply)
         return reply
+
+
+def _sync_refusal(exc: Exception) -> dict[str, Any]:
+    """The page's reply for a sync that raised `exc`. See `_do_sync`."""
+    if isinstance(exc, FetchCooldown):
+        return {
+            "ok": False,
+            "kind": "cooldown",
+            "retry_after_s": exc.retry_after_s,
+            "message": str(exc),
+        }
+    if isinstance(exc, TokenMissing | TokenRejected):
+        return {"ok": False, "kind": "config", "message": str(exc)}
+    if isinstance(exc, FlexRateLimitError | FlexLockoutError):
+        return {"ok": False, "kind": "throttled",
+                "message": f"IBKR asked for a pause: {exc}"}
+    if isinstance(exc, FlexError):
+        return {"ok": False, "kind": "flex",
+                "message": f"the Flex request failed: {exc}"}
+    if isinstance(exc, LockTimeout):
+        return {"ok": False, "kind": "busy", "message": str(exc)}
+    log.exception("sync failed")
+    return {"ok": False, "kind": "internal",
+            "message": f"the sync failed: {type(exc).__name__}: {exc}"}
+
+
+#: The HTTP status of a `_do_sync` reply, by kind. The rest answer 200 with
+#: `ok: false`, which is what the page has always read.
+_SYNC_STATUS = {"busy": 409, "internal": 500}
 
 
 def _keyring_call(
@@ -2107,12 +2146,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                              "message": "A sync is already running."})
             return
         try:
-            self._json(200, _do_sync(
+            reply = _do_sync(
                 db_path=self.cfg.db_path,
                 archive_dir=self.cfg.archive_dir,
                 query_id=query_id,
                 assets=self.cfg.assets,
-            ))
+            )
+            self._json(_SYNC_STATUS.get(str(reply.get("kind")), 200), reply)
         finally:
             self.cfg.sync_lock.release()
 

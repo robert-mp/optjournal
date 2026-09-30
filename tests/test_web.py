@@ -1119,23 +1119,24 @@ def test_sync_response_shape_matches_what_the_page_reads():
 
     Reads BOTH functions on the path, because the reply is assembled by two: the
     success keys come from `sync_journal` (the one sync path, shared with
-    `optjournal sync` and the `sync` job) and the refusal shapes from `_do_sync`,
-    which exists precisely to turn its two typed exceptions into an HTTP body.
-    Reading only the endpoint stopped covering the success keys the moment they
-    moved -- caught here, which is the whole reason both are named.
+    `optjournal sync` and the `sync` job) and the refusal shapes from `_do_sync`
+    and `_sync_refusal`, which exist precisely to turn its typed exceptions into
+    an HTTP body. Reading only the endpoint stopped covering the success keys the
+    moment they moved -- caught here, which is the whole reason all are named.
     """
     import inspect
 
     from optjournal.web import (  # noqa: PLC0415 - private by design
         _do_sync,
+        _sync_refusal,
         sync_journal,
     )
-    src = inspect.getsource(sync_journal) + inspect.getsource(_do_sync)
+    endpoint = inspect.getsource(_do_sync) + inspect.getsource(_sync_refusal)
+    src = inspect.getsource(sync_journal) + endpoint
     for key in ("new_trades", "new_cash", "reused_archive", "warnings", "kind", "ok"):
         assert f'"{key}"' in src, f"/api/sync no longer returns {key!r}"
     # The refusal shapes are the endpoint's own, and the page renders a countdown
     # off `retry_after_s` as a number.
-    endpoint = inspect.getsource(_do_sync)
     for key in ("cooldown", "retry_after_s", "config"):
         assert f'"{key}"' in endpoint, (
             f"/api/sync no longer distinguishes {key!r}, so the page cannot tell a "
@@ -6952,6 +6953,68 @@ def test_a_refused_sync_from_the_page_is_recorded_too(tmp_path, monkeypatch):
         "SELECT status, detail FROM job_runs ORDER BY id DESC LIMIT 1").fetchone()
     assert row["status"] == "failed"
     assert "credentials:" in row["detail"]
+
+
+def _sync_failures() -> list:
+    from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError  # noqa: PLC0415
+
+    from optjournal.locks import LockTimeout  # noqa: PLC0415
+
+    return [
+        (FlexError("URL Error: [Errno 8] nodename nor servname provided"), 200, "flex"),
+        (FlexRateLimitError("1018: too many requests"), 200, "throttled"),
+        (FlexLockoutError("1019: locked out"), 200, "throttled"),
+        (LockTimeout("another process held .fetch.lock for more than 120s"), 409, "busy"),
+        (RuntimeError("the statement could not be read"), 500, "internal"),
+    ]
+
+
+@pytest.mark.parametrize(("raised", "code", "kind"), _sync_failures(),
+                         ids=["flex", "rate-limit", "lockout", "lock-timeout", "other"])
+def test_every_sync_failure_answers_the_page_and_writes_the_ledger(
+    tmp_path, monkeypatch, raised, code, kind,
+):
+    """M14: `_do_sync` caught a cooldown and the two token errors, so any other
+    FlexError (no network, IBKR rate limit, a lockout) escaped: the page got an
+    empty reply ("TypeError: Failed to fetch") and the ledger got no row. Each
+    now answers in JSON and is recorded, and anything unforeseen is still both."""
+    from conftest import connect_migrated  # noqa: PLC0415
+
+    db = tmp_path / "j.db"
+    connect_migrated(db).close()
+
+    def fail(**_kwargs):
+        raise raised
+
+    monkeypatch.setattr(web, "sync_journal", fail)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path,
+                             query_id="1591754") as base:
+        status, reply = _post(base, "/api/sync")
+    assert (status, reply["ok"], reply["kind"]) == (code, False, kind)
+    assert str(raised) in reply["message"]
+    row = connect_migrated(db).execute(
+        "SELECT job FROM job_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None and row["job"] == "sync", "the failure left no ledger row"
+
+
+def test_a_failed_sync_commits_nothing_it_had_half_written(tmp_path, monkeypatch):
+    """The ledger row is committed on the same connection, so a sync that raised
+    mid-ingest must be rolled back first or the half-written rows land with it."""
+    from conftest import connect_migrated  # noqa: PLC0415
+
+    db = tmp_path / "j.db"
+    connect_migrated(db).close()
+
+    def half(*, conn, **_kwargs):
+        conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('HALF', 'x')")
+        raise RuntimeError("the statement could not be read")
+
+    monkeypatch.setattr(web, "sync_journal", half)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path,
+                             query_id="1591754") as base:
+        _post(base, "/api/sync")
+    assert connect_migrated(db).execute(
+        "SELECT COUNT(*) FROM watchlist WHERE symbol = 'HALF'").fetchone()[0] == 0
 
 
 def test_both_hand_run_sync_paths_record_what_they_did():
