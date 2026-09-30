@@ -3233,8 +3233,10 @@ def test_hashchange_only_refetches_when_the_server_side_keys_moved():
 def _page_const(name: str) -> str:
     """One top-level `const` declaration of the page, whole."""
     js = _code_only(_js())
-    found = (re.search(rf"^const {name}=\[.*?\n\];", js, re.S | re.M)
-             or re.search(rf"^const {name}=.*?;$", js, re.M))
+    # One line first: the multi-line form on a one-line array runs on to the next
+    # `\n];` in the file, pulling in every declaration in between.
+    found = (re.search(rf"^const {name}=.*?;$", js, re.M)
+             or re.search(rf"^const {name}=\[.*?\n\];", js, re.S | re.M))
     assert found, f"no top-level const {name} in the page"
     return found.group(0)
 
@@ -3395,6 +3397,65 @@ def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_path
     # And what the page would ask next describes the figures on screen, so a Sync
     # or a type switch does not silently jump to the current month.
     assert out["fresh"]["asks"] == ""
+
+
+def _load_under(stored: str, steps: list[str]) -> list[dict]:
+    """The page's real `load()` against a stand-in server with a stored scoring unit.
+
+    Each step is `ok` (a good read) or `503`, optionally prefixed `pick:<unit>=`
+    to apply the scoring switch's own write first (S.scoring, as its handler sets
+    it, after a save that stored the unit). After each step: the unit the control
+    shows, the unit the figures on screen were counted in, and the month the page
+    would ask for next.
+    """
+    consts = [_page_const(name) for name in ("SCORINGS", "SCOPE_KEYS")]
+    return _node_run([
+        "let S={month:null,type:null,cost:null,scoring:null,calday:null}, LOADED={};",
+        f"let stored={json.dumps(stored)}, down=false;",
+        "async function fetch(url){",
+        "  if(down) return {ok:false,status:503};",
+        "  const qs=new URLSearchParams(url.split('?')[1]||'');",
+        "  const m=qs.get('month');",
+        "  return {ok:true,json:async()=>({month_range:['2026-09','2026-08','2026-01'],",
+        "    months:['2026-09'],selected_month:m==='current'?'2026-09':m,trade_type:'all',",
+        "    stats:{scoring:qs.get('scoring')||stored}})};",
+        "}",
+        "function note(){} function staleServerCheck(){} function draw(){}",
+        "function esc(s){return String(s);}",
+        *consts, "const SCORING=()=>S.scoring||SCORINGS[0];",
+        *_page_fns("stateQuery", "load"),
+        f"const steps={json.dumps(steps)}, out=[];",
+        "for(const step of steps){",
+        "  const [pick,read]=step.includes('=')?step.split('='):[null,step];",
+        "  if(pick){const unit=pick.split(':')[1];",
+        "    S.scoring=unit===SCORINGS[0]?null:unit; stored=unit;}",
+        "  down=read==='503'; await load();",
+        "  out.push({control:SCORING(),figures:S.state.stats.scoring,asks:stateQuery()});",
+        "}",
+        "console.log(JSON.stringify(out));",
+    ])
+
+
+def test_the_scoring_control_shows_the_unit_the_figures_were_counted_in():
+    """Reviewer finding B. The scoring switch saves the unit and then reads state;
+    the read restores the scope it had on a failure, so "Per contract" clicked
+    against a 503 put S.scoring back to null while the file now said contract. The
+    next good read sent no unit, the server applied the stored one, and the page
+    showed per-contract figures under a lit "Per position" chip, with
+    `groupingMatters` judging a contract payload as a position one (on the
+    reviewer's journal both buttons went disabled, and only a URL edit got out).
+    The root is older than that path: the chip never read `stats.scoring`, so a
+    fresh page with contract stored landed in the same state. Now every good read
+    sets the control from the unit the figures were counted in.
+    """
+    fresh = _load_under("contract", ["ok"])[0]
+    assert fresh["control"] == fresh["figures"] == "contract", fresh
+    picked = _load_under("position", ["ok", "pick:contract=503", "ok"])
+    assert picked[1]["control"] == picked[1]["figures"] == "position", (
+        "a failed read must leave the control on the figures still on screen")
+    assert picked[2]["control"] == picked[2]["figures"] == "contract", picked
+    back = _load_under("contract", ["ok", "pick:position=ok"])[1]
+    assert back["control"] == back["figures"] == "position", back
 
 
 def test_an_unknown_cost_key_in_the_hash_falls_back_to_the_default():

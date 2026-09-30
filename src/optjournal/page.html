@@ -7303,6 +7303,15 @@ async function load(){
   /* Server-resolved, so an unrecognised type falls back to everything here too
      instead of leaving the button set out of step with the numbers. */
   S.type=S.state.trade_type==='all'?null:S.state.trade_type;
+  /* And the scoring unit, from the unit these figures were COUNTED in. The server
+     applies the stored preference when the request names none, so a fresh page
+     with "contract" stored, or a pick saved just before a read that failed and
+     was rolled back, drew per-contract figures under a lit "Per position", and
+     `groupingMatters` then judged a contract payload by the position rule. The
+     default stays null, as the switch and the hash spell it; so does a reply
+     with no stats block, which staleServerCheck has already reported. */
+  const sco=(S.state.stats||{}).scoring;
+  S.scoring=sco&&sco!==SCORINGS[0]?sco:null;
   /* AFTER the heals, so what is remembered is the scope these figures are for
      rather than the one that was asked for. */
   LOADED=Object.fromEntries(SCOPE_KEYS.map(k=>[k,S[k]]));
