@@ -87,12 +87,16 @@ export const level = (value, digits = 2) => value == null
   ? "—"
   : signed(value, digits, false);
 
+/** A listed strike wherever a contract is named: as `level` prints it, UNGROUPED,
+ * and only to the places it was listed at (267.5, 7755, never 7,755). Every tab
+ * names contracts through this, so a strike reads the same on the Trades tab, the
+ * replay chart, the Watchlist and the 0DTE ladder. */
 export function strike(value) {
   if (value == null) return "";
   const amount = Number(value);
-  if (Number.isInteger(amount)) return num(amount, 0);
+  if (Number.isInteger(amount)) return level(amount, 0);
   const decimals = String(value).split(".")[1]?.length || 0;
-  return num(amount, decimals > 2 ? 2 : decimals);
+  return level(amount, decimals > 2 ? 2 : decimals);
 }
 
 export const pct = (value, digits = 1) => value == null

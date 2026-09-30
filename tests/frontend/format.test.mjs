@@ -34,6 +34,17 @@ test("strikes keep meaningful fractional precision", () => {
   assert.equal(strike(268), "268");
 });
 
+test("a strike is ungrouped on every tab, as the 0DTE ladder prints it", () => {
+  /* The ladder prints a listed strike through `level` (7755), and the Trades
+     tab, the replay chart and the Watchlist printed the same contract through
+     `num` (7,755). `level`'s own rule is that a strike carries no grouping. */
+  assert.equal(strike(7755), "7755");
+  assert.equal(strike(7755), level(7755, 0));
+  assert.equal(strike(7250.125), "7250.13");
+  assert.equal(strike("12500"), "12500");
+  assert.equal(strike(null), "");
+});
+
 test("sign classes distinguish gain, loss, and measured zero", () => {
   assert.equal(cls(1), "pos signed");
   assert.equal(cls(-1), "neg signed");
