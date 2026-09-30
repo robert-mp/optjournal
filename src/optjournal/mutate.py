@@ -386,7 +386,7 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="withholding-sign",
         module="analysis.py",
-        find="            withheld[key] += abs(amount_base)",
+        find="            withheld[key] -= amount_base",
         replace="            withheld[key] += amount_base",
         breaks="withholding arrives negative, so the effective tax rate would invert",
     ),
