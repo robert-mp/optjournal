@@ -7270,13 +7270,18 @@ async function load(){
   }
   S.state=st;
   staleServerCheck(S.state);
-  /* A month outside the account's lifetime heals away (the server answers with
-     selected_month null rather than inventing one). Months WITH no fills are
-     legitimate now -- validated against month_range, not the fills-only list,
-     or picking one would revert on the very next load. */
+  /* A month outside the account's lifetime heals to ALL TIME, because that is
+     what the server answered it with (selected_month null, all-time figures).
+     It healed to null, which was right while an absent month meant all time and
+     wrong once it came to mean the current month: `#month=1999-01` drew all-time
+     figures and left a URL whose reload, and whose next Sync or type switch,
+     showed the current month instead. Both entry points arrive here, a fresh load
+     and a typed hash, so they heal alike. Months WITH no fills are legitimate --
+     validated against month_range, not the fills-only list, or picking one would
+     revert on the very next load. */
   if(S.month && S.month!=='all'
      && !((S.state.month_range||S.state.months||[]).includes(S.month)))
-    S.month=null;
+    S.month='all';
   /* Server-resolved, so an unrecognised type falls back to everything here too
      instead of leaving the button set out of step with the numbers. */
   S.type=S.state.trade_type==='all'?null:S.state.trade_type;

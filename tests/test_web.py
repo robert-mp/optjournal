@@ -3257,6 +3257,68 @@ def test_a_hash_change_the_server_would_answer_differently_refetches():
         "load", "load", "load", "load", "draw", "draw", "draw"]
 
 
+def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_paths():
+    """`#month=1999-01`, loaded fresh or typed into the address bar, is answered
+    with all-time figures: `build_state` heals a month outside the account's life to
+    all-time (`test_a_month_outside_the_account_life_falls_back_to_all_time`). The
+    page drew those figures and then healed its own month to null, which since the
+    current month became the default MEANS the current month: the URL lost its
+    month, a reload of it (or the next Sync, or any type switch) showed September,
+    and the header's stepper pointed at a month it was not showing. Now the heal
+    records the scope the figures are for, `all`, so the screen, the stepper, the
+    URL and a reload of that URL all say All time.
+
+    Driven through the page's real `applyHash`, `stateQuery`, `load`, `syncHash`
+    and hashchange handler, against a stand-in server that answers the way
+    `build_state` does; only `fetch`, `draw` and `history` are stand-ins.
+    """
+    js = _code_only(_js())
+    handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
+    assert handler, "the hashchange handler moved"
+    consts = [_page_const(name) for name in
+              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS",
+               "SCOPE_KEYS")]
+    out = _node_run([
+        f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
+        "const location={hash:'',pathname:'/'}, window={};",
+        "const history={replaceState:(a,b,u)=>{location.hash=u.slice(1);},",
+        "  pushState:(a,b,u)=>{location.hash=u.slice(1);}};",
+        "let S={}, LOADED={}, drawn=null;",
+        "const RANGE=['2026-09','2026-08'];",
+        # The server's month rule, as build_state applies it.
+        "async function fetch(url){",
+        "  const m=new URLSearchParams(url.split('?')[1]||'').get('month');",
+        "  const month=m==='current'?RANGE[0]:m;",
+        "  const selected=RANGE.includes(month)?month:null;",
+        "  return {ok:true,json:async()=>({month_range:RANGE,months:RANGE,",
+        "    selected_month:selected,trade_type:'all',stats:{month:selected||'ALL'}})};",
+        "}",
+        "function note(){} function staleServerCheck(){}",
+        "function draw(){syncHash();drawn={shown:S.state.stats.month,",
+        "  hash:location.hash,asks:stateQuery()};}",
+        *consts, *_page_fns("applyHash", "stateQuery", "syncHash", "load"),
+        handler.group(0),
+        "const flush=()=>new Promise(r=>setTimeout(r,0));",
+        "async function fresh(hash){S={};location.hash=hash;applyHash();await load();",
+        "  return drawn;}",
+        "const out={};",
+        "out.fresh=await fresh('#month=1999-01');",
+        "await fresh('#month=2026-08');",
+        "location.hash='#month=1999-01'; window.onhashchange(); await flush(); await flush();",
+        "out.typed=drawn;",
+        "out.reloaded=await fresh(out.fresh.hash);",
+        "console.log(JSON.stringify(out));",
+    ])
+    assert out["fresh"] == out["typed"], "the two entry points disagree"
+    assert out["fresh"]["shown"] == "ALL"
+    assert out["reloaded"]["shown"] == "ALL", (
+        f"the healed URL {out['fresh']['hash']!r} reloads {out['reloaded']['shown']}, "
+        "not the all-time figures it was healed over")
+    # And what the page would ask next describes the figures on screen, so a Sync
+    # or a type switch does not silently jump to the current month.
+    assert out["fresh"]["asks"] == ""
+
+
 def test_an_unknown_cost_key_in_the_hash_falls_back_to_the_default():
     """L42: `#cost=BOGUS` reached the server and rendered a scope with no chip lit.
     Validated like the tab, the theme and the scoring unit: an unknown key is
