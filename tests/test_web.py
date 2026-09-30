@@ -7171,6 +7171,80 @@ def test_the_settings_endpoint_stores_and_clears_the_confirm_query(populated):
         )
 
 
+def _capture_sync_job(monkeypatch) -> list:
+    """Replace the `sync` job's work with a stub that records its Context."""
+    import dataclasses  # noqa: PLC0415 - local helper
+
+    from optjournal import jobs as mod  # noqa: PLC0415
+
+    seen: list = []
+
+    def run(_conn, ctx):
+        seen.append(ctx)
+        return mod.Outcome("nothing", "stubbed")
+
+    monkeypatch.setattr(mod, "JOBS", tuple(
+        dataclasses.replace(job, run=run) if job.name == "sync" else job
+        for job in mod.JOBS
+    ))
+    return seen
+
+
+def test_a_query_id_saved_while_serving_is_the_one_in_force(
+    tmp_path, monkeypatch,
+):
+    """M10: the stored id was frozen into the server at startup, so after a new
+    one was saved in Settings the Run button still used the old one and the page
+    labelled it an override. Now the payload, the Sync button's id and a hand-run
+    job all resolve the stored step per request."""
+    from optjournal import settings  # noqa: PLC0415 - local to this test
+
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    monkeypatch.setenv(settings.HOME_ENV, str(tmp_path / "home"))
+    settings.update(query_id="111111")
+    seen = _capture_sync_job(monkeypatch)
+    db = tmp_path / "j.db"
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, saved = _post(base, "/api/settings", {"query_id": "222222"})
+        assert (status, saved["query_id"]) == (200, "222222")
+        _, state = _get(base, "/api/state")
+        status, _run = _post(base, "/api/jobs/run", {"job": "sync"})
+    assert (state["settings"]["query_id"], state["settings"]["query_id_source"],
+            state["sync"]["query_id"]) == ("222222", "stored", "222222")
+    assert status == 202
+    assert [ctx.query_id for ctx in seen] == ["222222"]
+
+
+@pytest.mark.parametrize(("flag", "env", "source"), [
+    ("333333", None, "override"),
+    (None, "444444", "override"),
+    # The SAME value as the file is still an override: saving another id in
+    # the page would not take effect, which is what the source is for.
+    ("111111", None, "override"),
+    (None, "111111", "override"),
+    (None, None, "stored"),
+])
+def test_the_page_is_told_which_step_supplied_the_query_id(
+    tmp_path, monkeypatch, flag, env, source,
+):
+    """The source decides whether the Settings field is editable, so it must
+    follow `settings.query_id`'s precedence: a flag or the environment outranks
+    the file, whatever either holds."""
+    from optjournal import settings  # noqa: PLC0415 - local to this test
+
+    monkeypatch.setenv(settings.HOME_ENV, str(tmp_path / "home"))
+    if env is None:
+        monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    else:
+        monkeypatch.setenv("OPTJOURNAL_QUERY_ID", env)
+    settings.update(query_id="111111")
+    with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path,
+                             query_id=flag) as base:
+        _, state = _get(base, "/api/state")
+    assert (state["settings"]["query_id"], state["settings"]["query_id_source"]) == (
+        flag or env or "111111", source)
+
+
 @pytest.mark.parametrize("field", ["query_id", "confirm_query_id"])
 @pytest.mark.parametrize("typed", ["²³", "١٢٣", "１２３", "12³"])
 def test_a_query_id_is_ascii_digits_only(populated, field, typed):

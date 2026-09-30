@@ -135,6 +135,9 @@ optjournal friction --month 2026-08       one month (or a year: 2026)
 
 The query id also reads from `--query-id` and `$OPTJOURNAL_QUERY_ID`, in that
 order of precedence, so an existing install or a cron keeps working unchanged.
+A running `serve` reads the saved id per request and per job run, so a new one
+saved in Settings is used by the next sync without a restart (unless a flag or
+the variable outranks it, which Settings then says).
 
 The journal's home is `$OPTJOURNAL_HOME` if set. Otherwise it is the code folder
 IF that already holds a journal, which is every git clone set up before homes

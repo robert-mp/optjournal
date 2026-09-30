@@ -564,8 +564,14 @@ def build_state(
     trade_type: str | None = None,
     cost_scope: list[str] | None = None,
     scoring: str | None = None,
+    query_id_source: str | None = None,
 ) -> dict[str, Any]:
     """Everything the page renders, in one JSON-safe payload.
+
+    `query_id` is the id in force and `query_id_source` which step of
+    `settings.query_id`'s precedence supplied it (`settings.query_id_source`).
+    A caller that passes an id without a source resolved it itself, which by
+    that precedence is an argument, so the source defaults to "override".
 
     Opens its own connection: sqlite3 objects cannot cross threads and the
     server is threaded, so a shared handle would fail intermittently under the
@@ -859,16 +865,10 @@ def build_state(
     # exported variable outranks the stored setting (see `settings.query_id`), and
     # a form that saved into a value something else overrides is a form that lies
     # about having worked.
-    stored_qid = prefs.read().get("query_id")
-    if query_id and query_id != (str(stored_qid).strip() if stored_qid else None):
-        source = "override"
-    elif query_id:
-        source = "stored"
-    else:
-        source = "unset"
     state["settings"] = {
         "query_id": query_id,
-        "query_id_source": source,
+        "query_id_source": (query_id_source
+                            or ("override" if query_id else "unset")),
         # The intraday query. No `_source` twin: it has no `--confirm-query-id`
         # flag, so the stored value is the only thing that can be in force and a
         # form offering to edit it can never be lying about taking effect.
@@ -1088,6 +1088,10 @@ class ServeConfig:
 
     db_path: Path
     archive_dir: Path
+    #: ONLY an explicit override: `--query-id` or `$OPTJOURNAL_QUERY_ID`
+    #: (`settings.query_id_override`). Never the stored id, which the settings
+    #: page can change while this runs; `_effective_query_id` resolves that per
+    #: request.
     query_id: str | None
     assets: tuple[str, ...]
     #: Serialised because two concurrent syncs would each spend an IBKR
@@ -1248,6 +1252,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     # reading `cfg.query_id` here left the page showing "no query
                     # id" immediately after a save that had genuinely worked.
                     query_id=self._effective_query_id(),
+                    query_id_source=prefs.query_id_source(self.cfg.query_id),
                     month=month[0] if month else None,
                     trade_type=trade_type[0] if trade_type else None,
                     # Repeatable, so `?cost=OPT&cost=CASH` is a multi-select
@@ -1995,7 +2000,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     ctx=JobContext(
                         archive_dir=self.cfg.archive_dir,
                         db_path=self.cfg.db_path,
-                        query_id=self.cfg.query_id,
+                        # Per request, like the Sync button's: an id saved in
+                        # Settings since startup is the one this run uses.
+                        query_id=self._effective_query_id(),
                         assets=self.cfg.assets,
                     ),
                 )
@@ -2216,6 +2223,10 @@ def serve(
     # ThreadingHTTPServer instantiates its handler class per request; partial
     # prepends the config, which is the stdlib-sanctioned way to inject
     # dependencies into a BaseHTTPRequestHandler.
+    #
+    # `query_id` is the explicit override only, for the reason `ServeConfig`
+    # gives: each run resolves the stored id through `settings.query_id`, so
+    # one saved from the page reaches the next scheduled sync.
     clock = Scheduler(ctx=JobContext(
         archive_dir=archive_dir, db_path=db_path, query_id=query_id,
         assets=tuple(assets),
@@ -2253,17 +2264,17 @@ def serve(
         actual = httpd.socket.getsockname()[1]
         print(f"optjournal UI on http://{host}:{actual}")
         print("  loopback only, no authentication -- do not expose this port")
-        if not query_id:
+        if not prefs.query_id(query_id):
             # NAMES THE SCHEDULER, not just the button. The button being disabled is
             # visible in the page; the sync JOB failing on every due tick is only
             # visible to someone who opens the ledger, and that is the shape this
             # went wrong in -- a supervised serve logged `failed -- no Flex query id
             # configured` for as long as it ran while `optjournal sync` in a shell
             # worked, because only the CLI read $OPTJOURNAL_QUERY_ID.
-            print("  no query id (--query-id or $OPTJOURNAL_QUERY_ID):"
-                  " Sync now is disabled")
+            print("  no query id (Settings, --query-id or $OPTJOURNAL_QUERY_ID):"
+                  " Sync now is disabled until one is set")
             if scheduler:
-                print("  and the scheduled sync job will fail on every tick")
+                print("  and the scheduled sync job fails until then")
         if clock is None:
             print("  scheduler OFF (--no-scheduler): nothing runs unless you press it")
         else:

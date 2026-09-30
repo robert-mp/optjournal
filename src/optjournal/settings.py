@@ -55,6 +55,8 @@ __all__ = [
     "path_for",
     "read",
     "query_id",
+    "query_id_override",
+    "query_id_source",
     "scoring",
     "update",
 ]
@@ -193,15 +195,39 @@ def query_id(
     An empty string at any level is absence, not a choice: `--query-id ''` and
     an exported-but-empty variable both mean "not set", and treating either as a
     real id would send IBKR a request for a query that cannot exist.
+
+    Read at CALL time, every step. A long-lived process (`serve`, its scheduler)
+    keeps only `query_id_override` and asks this per request and per run, so an
+    id saved from the settings page takes effect without a restart.
     """
-    for candidate in (
-        explicit,
-        os.environ.get("OPTJOURNAL_QUERY_ID"),
-        read(root).get("query_id"),
-    ):
+    stored = read(root).get("query_id")
+    return query_id_override(explicit) or (
+        str(stored).strip() if stored and str(stored).strip() else None)
+
+
+def query_id_override(explicit: str | None = None) -> str | None:
+    """The argument or environment step of `query_id`, without the stored one.
+
+    What `serve` hands its handlers and its scheduler: the steps that are fixed
+    for the life of the process. The stored step is deliberately not frozen with
+    them, because the settings page changes it while the process runs.
+    """
+    for candidate in (explicit, os.environ.get("OPTJOURNAL_QUERY_ID")):
         if candidate and str(candidate).strip():
             return str(candidate).strip()
     return None
+
+
+def query_id_source(explicit: str | None = None, *, root: Path | None = None) -> str:
+    """Which step of `query_id` answers: "override", "stored" or "unset".
+
+    "override" is the argument or the environment, even when it holds the same
+    value as the file: saving a different id would not take effect, which is
+    what the settings page needs to know before it offers the field.
+    """
+    if query_id_override(explicit):
+        return "override"
+    return "stored" if query_id(root=root) else "unset"
 
 
 def confirm_query_id(

@@ -115,6 +115,25 @@ def test_the_query_id_precedence_is_argument_then_environment_then_stored(
     assert settings.query_id("typed", root=tmp_path) == "typed", "argument wins"
 
 
+def test_the_override_is_the_argument_or_the_environment_never_the_file(
+    tmp_path, monkeypatch,
+):
+    """M10: what `serve` freezes for its lifetime must leave out the stored id,
+    which the settings page changes while it runs. `query_id_source` names the
+    step that answers, and an override holding the file's own value is still an
+    override: saving a different id would not take effect."""
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    assert settings.query_id_source(root=tmp_path) == "unset"
+    settings.update(tmp_path, query_id="stored")
+    assert settings.query_id_override() is None
+    assert settings.query_id_source(root=tmp_path) == "stored"
+    assert settings.query_id_override("typed") == "typed"
+    assert settings.query_id_source("stored", root=tmp_path) == "override"
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", " stored ")
+    assert settings.query_id_override() == "stored"
+    assert settings.query_id_source(root=tmp_path) == "override"
+
+
 def test_a_blank_value_is_absence_at_every_level(tmp_path, monkeypatch):
     """`--query-id ''` is not a query id, and neither is an exported empty var.
 
