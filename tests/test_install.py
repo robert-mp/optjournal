@@ -263,6 +263,25 @@ def test_a_failed_move_leaves_no_copy_behind_and_the_next_start_finishes_it(tmp_
     assert sorted(p.name for p in code.iterdir()) == []
 
 
+def test_an_original_an_earlier_rollback_could_not_put_back_blocks_the_move(tmp_path):
+    """Two failures in a row (the move, then its own undo) can leave an ORIGINAL
+    inside `.moved-<stamp>`. Moving what is still beside the code would then
+    complete a split journal, with the only real `journal.db` hidden where
+    nothing reads it. So the move is refused and the folder is named."""
+    code = _journal(tmp_path / "code", statements=3)
+    hidden = code / ".moved-20260930T000000Z"
+    hidden.mkdir()
+    (code / "journal.db").rename(hidden / "journal.db")
+    before = _tree(code)
+    home = tmp_path / "home"
+
+    with pytest.raises(install.RelocateRefused, match=r"\.moved-20260930T000000Z"):
+        install.relocate(code, home)
+
+    assert _tree(code) == before, "the move touched the code folder"
+    assert not home.exists() or not any(home.iterdir()), "the move wrote into the home"
+
+
 def test_a_staging_folder_an_earlier_attempt_left_is_cleared(tmp_path):
     """It only ever holds copies, so it is nobody's only copy of anything."""
     home = tmp_path / "home"

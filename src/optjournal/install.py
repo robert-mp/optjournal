@@ -172,6 +172,14 @@ def relocate(source: Path, home: Path) -> list[str]:
     """
     if _statement_count(home / "journal.db"):
         raise RelocateRefused(f"{home} already holds a journal with statements")
+    # A move whose own undo also failed can leave an ORIGINAL in `.moved-*`.
+    # Moving what is still beside the code would then finish a split journal,
+    # with the real `journal.db` (or `raw/`) hidden where nothing reads it.
+    for hidden in sorted(source.glob(".moved-*")):
+        if any((hidden / name).exists() for name in DATA_NAMES):
+            raise RelocateRefused(
+                f"an earlier move left part of the journal in {hidden}: move what "
+                f"it holds back into {source}, then start again")
     _release(source)
     # An unreadable journal in the home has no statements to protect, and is set
     # aside as it is, with its `-wal` and `-shm`. One in use is refused.
