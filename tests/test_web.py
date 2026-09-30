@@ -7701,17 +7701,23 @@ def test_a_keyring_that_will_not_answer_reports_it_rather_than_hanging(
     The deadline is shortened here rather than the sleep lengthened: the point is
     that the handler gives up, not how long four seconds takes.
     """
-    import time  # noqa: PLC0415 - local to this test
+    import threading  # noqa: PLC0415 - local to this test
 
     import keyring  # noqa: PLC0415
 
+    # Gated rather than a sleep: a write still running after the test would
+    # finish inside a later one, and a finished write moves what reads do.
+    release = threading.Event()
     monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.05)
     monkeypatch.setattr(
         keyring, "set_password",
-        lambda service, account, token: time.sleep(5),
+        lambda service, account, token: release.wait(5),
     )
-    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
-        status, payload = _post(base, "/api/settings/token", {"token": "12345"})
+    try:
+        with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+            status, payload = _post(base, "/api/settings/token", {"token": "12345"})
+    finally:
+        _drain_keyring(release)
     assert status == 503
     assert payload["ok"] is False
     assert payload["kind"] == "keyring"
@@ -7806,22 +7812,28 @@ def test_a_stuck_keyring_holds_one_thread_however_often_it_is_asked(
                     break
     finally:
         _drain_keyring(release)
-    assert (status, reply["present"]) == (200, True), (
-        "once the stuck call returned, the next check still could not read")
-    assert len(calls) <= 2, "the checks after it asked the keychain again each time"
+    assert (status, reply["present"], len(calls)) == (200, True, 2), (
+        "once the stuck call returned, the next check did not ask again"
+    )
 
 
 def _drain_keyring(release) -> None:
-    """Answer every stuck keyring call and wait for it to return, so a call still
-    pending cannot hand the next test this test's answer (they are shared)."""
+    """Answer every stuck keyring call, read or write, and wait for it to return.
+
+    Reads are shared by the process, so one still pending could hand the next
+    test this test's answer, and a write finishing late counts as a save made
+    during it. So no keyring thread may outlive the test that started it.
+    """
     import threading  # noqa: PLC0415 - local to this helper
     import time  # noqa: PLC0415
 
     release.set()
     deadline = time.monotonic() + 5
-    while (any(t.name == "keyring-read" for t in threading.enumerate())
+    while (any(t.name.startswith("keyring-") for t in threading.enumerate())
            and time.monotonic() < deadline):
         time.sleep(0.01)
+    assert not any(t.name.startswith("keyring-") for t in threading.enumerate()), (
+        "a keyring call outlived its test")
 
 
 def test_token_checks_against_a_keychain_that_never_answers_stay_bounded(
@@ -7902,6 +7914,50 @@ def test_a_save_straight_after_a_check_is_not_refused(tmp_path, monkeypatch):
         with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
             status, checked = _get(base, "/api/settings/token")
             assert (status, checked["present"]) == (200, None)
+            status, saved = _post(base, "/api/settings/token", {"token": "123456789012"})
+            assert (status, saved["ok"]) == (200, True), saved
+            status, checked = _get(base, "/api/settings/token")
+            assert (status, checked["present"]) == (200, True), checked
+    finally:
+        _drain_keyring(release)
+
+
+def test_a_save_at_the_cap_of_stuck_reads_is_read_by_the_next_check(
+    tmp_path, monkeypatch,
+):
+    """Checks until every keyring call allowed is stuck, then a Save that works,
+    as it does once the keychain is unlocked: the next Check reads it. The cap
+    used to win, so the Save said "press Sync" and the Check said restart."""
+    import threading  # noqa: PLC0415 - local to this test
+    import time  # noqa: PLC0415
+
+    import keyring  # noqa: PLC0415
+
+    from optjournal import flex  # noqa: PLC0415
+
+    release = threading.Event()
+    store: dict[str, str] = {}
+    calls: list[int] = []
+
+    def get_password(service, account):
+        calls.append(1)
+        if len(calls) <= flex.KEYRING_MAX_PENDING:
+            release.wait(30)
+        return store.get(account)
+
+    monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(keyring, "get_password", get_password)
+    monkeypatch.setattr(keyring, "set_password",
+                        lambda service, account, token: store.__setitem__(account, token))
+    try:
+        with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
+            for _ in range(100):
+                _status, checked = _get(base, "/api/settings/token")
+                if "no more" in checked["message"]:
+                    break
+                time.sleep(0.02)
+            assert len(calls) == flex.KEYRING_MAX_PENDING, "the cap was not reached"
             status, saved = _post(base, "/api/settings/token", {"token": "123456789012"})
             assert (status, saved["ok"]) == (200, True), saved
             status, checked = _get(base, "/api/settings/token")
