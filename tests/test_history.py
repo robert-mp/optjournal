@@ -135,6 +135,32 @@ def test_round_trip_closes(conn):
     assert ep.contracts == 3
 
 
+def test_contracts_is_the_largest_position_held_not_the_opens_summed(conn):
+    """Short 2, buy 1 back, sell 1 again, buy 2 back: never more than 2 held.
+
+    `contracts` summed the opening fills (2 + 1) and reported 3, so a trader who
+    scaled out and back in read as having carried a bigger position than they
+    ever did, and the 0DTE cohort's contract count inherited it.
+    """
+    add_trade(conn, "1", open_close="O", qty=-2, date="2026-03-01")
+    add_trade(conn, "2", open_close="C", qty=1, date="2026-03-02", realized=99.0)
+    add_trade(conn, "3", open_close="O", qty=-1, date="2026-03-03")
+    add_trade(conn, "4", open_close="C", qty=2, date="2026-03-04", realized=198.0)
+    (ep,) = build_history(conn).episodes
+    assert ep.status == "CLOSED"
+    assert ep.contracts == 2
+
+
+def test_contracts_of_a_position_still_open_is_what_it_reached(conn):
+    """Bought 1, then 4 more, sold 2: at its largest the position was 5."""
+    add_trade(conn, "1", open_close="O", qty=1, date="2026-03-01")
+    add_trade(conn, "2", open_close="O", qty=4, date="2026-03-02")
+    add_trade(conn, "3", open_close="C", qty=-2, date="2026-03-03", realized=10.0)
+    (ep,) = build_history(conn).episodes
+    assert ep.net_qty == 3
+    assert ep.contracts == 5
+
+
 def test_reentry_after_close_is_a_separate_episode(conn):
     """The SIVE shape: open, fully close, then re-open the same contract."""
     add_trade(conn, "1", open_close="O", qty=2, date="2026-03-01")

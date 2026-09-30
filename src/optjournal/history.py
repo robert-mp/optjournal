@@ -139,6 +139,11 @@ class Episode:
     opened_qty: float = 0    #: int in practice for options; stock can fract
     closed_qty: float = 0
     net_qty: float = 0
+    #: The largest absolute net quantity the position reached. What `contracts`
+    #: reports, and not derivable from the two sums above: short 2, buy 1 back,
+    #: sell 1 again, buy 2 back opens 3 and closes 3 while never holding more
+    #: than 2.
+    peak_qty: float = 0
 
     #: IBKR's realized P&L, already net of opening and closing commission.
     realized_pnl: float = 0.0
@@ -201,7 +206,7 @@ class Episode:
     @property
     def contracts(self) -> int | float:
         """Position size at its largest, in contracts or shares."""
-        size = max(abs(self.opened_qty), abs(self.closed_qty))
+        size = self.peak_qty
         return int(size) if float(size).is_integer() else size
 
 
@@ -306,6 +311,7 @@ def _absorb(ep: Episode, row: Any) -> None:
             ep.opened_at = row["date_time"] or row["trade_date"]
 
     ep.net_qty += qty
+    ep.peak_qty = max(ep.peak_qty, abs(ep.net_qty))
     ep.realized_pnl += row["fifo_pnl_realized"] or 0.0
     ep.realized_pnl_base += row["fifo_pnl_realized_base"] or 0.0
     ep.commission += row["ib_commission"] or 0.0
@@ -411,6 +417,7 @@ def _from_snapshot(row: dict[str, Any]) -> Episode:
     ep.opened_at = row.get("open_date_time") or None
     ep.net_qty = row.get("position") or 0
     ep.opened_qty = ep.net_qty
+    ep.peak_qty = abs(ep.net_qty)
     ep.cost_basis = row.get("cost_basis_money")
     ep.unrealized = row.get("fifo_pnl_unrealized")
     return ep
