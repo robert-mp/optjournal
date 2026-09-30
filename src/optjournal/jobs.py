@@ -276,9 +276,14 @@ class Context:
     `web.ServeConfig` exists: the alternative is module-level state that two
     servers in one process silently share, which the test suite creates routinely.
 
-    `query_id` may be None -- a journal serving an already-ingested archive with no
-    credentials configured is a supported state, and `sync` then reports `failed`
-    with a cause rather than raising past the ledger.
+    `query_id` is an EXPLICIT OVERRIDE only (`serve --query-id`), or None. The id a
+    run actually uses is resolved per run by `settings.query_id`, so one saved in
+    Settings while the server runs reaches the next scheduled sync and the next Run
+    press. Carrying the id `serve` resolved at start-up froze it for the life of
+    the process: a launcher install onboards through Settings, so it started with
+    no id and every scheduled sync kept recording "no Flex query id configured"
+    until a restart. With nothing configured anywhere, `sync` reports `failed` with
+    the cause rather than raising past the ledger.
     """
 
     archive_dir: Path
@@ -439,14 +444,15 @@ def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     OS file lock, and stamps `.fetch-state.json`; a second copy of that sequence would be
     a second thing to keep in step with the lockout budget.
     """
-    if not ctx.query_id:
+    query_id = prefs.query_id(ctx.query_id)       # per run: see `Context`
+    if not query_id:
         # A journal with no credentials configured is a supported state, not a
         # crash: `failed` with the cause is what a reader can act on.
         return Outcome("failed", "no Flex query id configured")
 
     try:
         result = sync_journal(
-            conn=conn, archive_dir=ctx.archive_dir, query_id=ctx.query_id,
+            conn=conn, archive_dir=ctx.archive_dir, query_id=query_id,
             assets=ctx.assets,
         )
     except (FetchCooldown, TokenMissing, TokenRejected) as exc:
@@ -461,11 +467,12 @@ def _history(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     that landed are real, and the refusal is named in the detail. `failed` only
     when the first chunk was refused, because then nothing happened.
     """
-    if not ctx.query_id:
+    query_id = prefs.query_id(ctx.query_id)       # per run: see `Context`
+    if not query_id:
         return Outcome("failed", "no Flex query id configured")
     try:
         result = import_history(
-            conn=conn, archive_dir=ctx.archive_dir, query_id=ctx.query_id,
+            conn=conn, archive_dir=ctx.archive_dir, query_id=query_id,
             assets=ctx.assets,
         )
     except (TokenMissing, TokenRejected) as exc:
@@ -501,7 +508,7 @@ def _confirm(conn: sqlite3.Connection, ctx: Context) -> Outcome:
 
     The id is read from settings HERE rather than carried on `Context`, so saving
     it in the page takes effect on the next tick instead of on the next restart --
-    the same reason `web._effective_query_id` resolves per request.
+    the same reason `_sync` resolves the statement's id per run.
 
     The base currency comes from the journal, because a confirm payload has no
     AccountInformation section to state it. With no statement ingested yet there is

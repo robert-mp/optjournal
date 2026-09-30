@@ -954,7 +954,25 @@ def test_the_sync_job_calls_the_shared_path_rather_than_reimplementing_it(ctx):
         )
 
 
-def test_a_sync_with_no_credentials_reports_rather_than_raising(conn, tmp_path):
+@pytest.fixture()
+def no_stored_query_id(tmp_path, monkeypatch):
+    """A settings home with no query id in it, and no id in the environment.
+
+    The jobs resolve the id per run, so without this a developer who exported
+    `$OPTJOURNAL_QUERY_ID` would turn the "nothing configured" tests into a real
+    sync against the keyring and IBKR.
+    """
+    from optjournal import settings
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    monkeypatch.setenv(settings.HOME_ENV, str(home))
+
+
+def test_a_sync_with_no_credentials_reports_rather_than_raising(
+    conn, tmp_path, no_stored_query_id
+):
     """A journal serving an ingested archive with no query id is a supported state.
 
     It must record `failed` with a cause the page can show, not raise past the
@@ -969,6 +987,50 @@ def test_a_sync_with_no_credentials_reports_rather_than_raising(conn, tmp_path):
     row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
     assert row["status"] == "failed"
     assert "query id" in row["detail"]
+
+
+@pytest.mark.parametrize("job", ["sync", "history"])
+def test_a_query_id_saved_while_serving_reaches_the_next_run(
+    conn, tmp_path, no_stored_query_id, monkeypatch, job
+):
+    """M10: the id is resolved per RUN, so saving it in Settings takes effect.
+
+    `Context.query_id` used to be the id `serve` resolved at start-up, frozen for
+    the life of the process. A launcher install that onboards through Settings
+    starts with no id, so every scheduled sync and every Run press after saving
+    one still recorded "no Flex query id configured" until a restart. Only the
+    Sync button, which resolves per request, saw it.
+    """
+    from optjournal import jobs, settings
+
+    handed: list[str] = []
+
+    def shared_path(*, query_id, **_kwargs):
+        handed.append(query_id)
+        if job == "sync":
+            return {"changed": False, "summary": "stub", "new_trades": 0}
+        return {"fetched": [], "planned": 0, "stopped": None, "summary": "stub"}
+
+    monkeypatch.setattr(jobs, "sync_journal", shared_path)
+    monkeypatch.setattr(jobs, "import_history", shared_path)
+    ctx = jobs.Context(archive_dir=tmp_path / "raw", db_path=tmp_path / "j.db")
+
+    jobs.run_job(conn, job, ctx=ctx)
+    assert handed == [], "premise: nothing is configured yet, so nothing is fetched"
+
+    settings.update(query_id="1591754")          # what POST /api/settings does
+    jobs.run_job(conn, job, ctx=ctx)
+    settings.update(query_id="1600000")
+    jobs.run_job(conn, job, ctx=ctx)
+    assert handed == ["1591754", "1600000"], (
+        "the job used the id it was started with rather than the one saved since"
+    )
+
+    # An explicit override (`serve --query-id`) still wins over the stored one.
+    explicit = jobs.Context(archive_dir=tmp_path / "raw", db_path=tmp_path / "j.db",
+                            query_id="1234567")
+    jobs.run_job(conn, job, ctx=explicit)
+    assert handed[-1] == "1234567"
 
 
 def test_every_registered_job_is_in_the_payload_even_if_it_never_ran(conn):
@@ -2274,7 +2336,9 @@ def test_the_history_outcome_names_what_happened(reply, status, monkeypatch, tmp
     assert (outcome.done, outcome.total) == (len(reply["fetched"]), reply["planned"])
 
 
-def test_the_history_import_without_a_query_id_fails_with_the_cause(tmp_path):
+def test_the_history_import_without_a_query_id_fails_with_the_cause(
+    tmp_path, no_stored_query_id
+):
     from optjournal import jobs
 
     ctx = jobs.Context(archive_dir=tmp_path, db_path=tmp_path / "j.db")
