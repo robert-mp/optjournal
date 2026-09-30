@@ -31,6 +31,8 @@ import logging
 import os
 import shutil
 import sqlite3
+import stat
+import tempfile
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,6 +63,8 @@ SEARCH_DEPTH = 2
 
 #: One database, in the files SQLite keeps it in. Moved, or set aside, together.
 DB_FILES = ("journal.db", "journal.db-wal", "journal.db-shm")
+#: The folder in the home a move copies into before anything is renamed.
+STAGING_PREFIX = ".incoming-"
 
 
 class RelocateRefused(RuntimeError):
@@ -131,6 +135,24 @@ def _copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _remove(folder: Path) -> None:
+    """Delete a folder the move made, read-only entries included.
+
+    `copy2` keeps a file's mode, and neither a read-only file on Windows nor
+    the contents of a read-only folder can be deleted as they are. Best effort:
+    what another program holds stays, in a folder no journal lookup reads.
+    """
+    def writable(func, path, _exc):
+        parent = Path(path).parent
+        if parent.is_relative_to(folder):
+            os.chmod(parent, stat.S_IRWXU)
+        os.chmod(path, stat.S_IRWXU)
+        func(path)
+
+    with contextlib.suppress(OSError):
+        shutil.rmtree(folder, onexc=writable)
+
+
 def relocate(source: Path, home: Path) -> list[str]:
     """Move a journal's data from `source` into `home`. Returns what moved.
 
@@ -156,28 +178,33 @@ def relocate(source: Path, home: Path) -> list[str]:
     with contextlib.suppress(_Unreadable):
         _release(home)
     home.mkdir(parents=True, exist_ok=True)
+    # What an earlier attempt could not delete. A staging folder only ever
+    # holds copies, so nothing in it is anyone's only copy.
+    for leftover in home.glob(f"{STAGING_PREFIX}*"):
+        _remove(leftover)
 
     present = [name for name in DATA_NAMES if (source / name).exists()]
     replaced = {*present, *(DB_FILES if "journal.db" in present else ())}
     clashes = [name for name in DATA_NAMES if name in replaced and (home / name).exists()]
     stamp = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
-    staging, aside = home / f".incoming-{stamp}", home / f"replaced-{stamp}"
-    moved_away = source / f".moved-{stamp}"
+    aside, moved_away = home / f"replaced-{stamp}", source / f".moved-{stamp}"
+    staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=home))
     undo: list[tuple[Path, Path]] = []      # renames done, as (from, to)
 
     def rename(src: Path, dst: Path) -> None:
-        dst.parent.mkdir(exist_ok=True)
         os.rename(src, dst)
         undo.append((src, dst))
 
     try:
-        staging.mkdir()
         for name in present:
             _copy(source / name, staging / name)
+        if clashes:
+            aside.mkdir()
         for name in clashes:
             rename(home / name, aside / name)
         for name in present:
             rename(staging / name, home / name)
+        moved_away.mkdir()
         for name in present:
             rename(source / name, moved_away / name)
     except OSError as exc:
@@ -191,13 +218,13 @@ def relocate(source: Path, home: Path) -> list[str]:
             with contextlib.suppress(OSError):
                 folder.rmdir()                  # only if empty, as it should be
         if not stuck:
-            shutil.rmtree(staging, ignore_errors=True)
+            _remove(staging)
         detail = f"; could not put back {', '.join(stuck)}" if stuck else ""
         raise RelocateRefused(
             f"could not move the journal from {source} to {home}, so it was "
             f"left in {source} ({exc}){detail}") from exc
-    shutil.rmtree(staging, ignore_errors=True)
-    shutil.rmtree(moved_away, ignore_errors=True)
+    _remove(staging)
+    _remove(moved_away)
     if clashes:
         log.info("moved an empty journal's files aside to %s", aside)
     log.info("moved %s from %s to %s", ", ".join(present), source, home)

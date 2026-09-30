@@ -238,6 +238,41 @@ def test_a_move_that_fails_partway_leaves_the_whole_journal_where_it_was(
     assert config.data_home() == code
 
 
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0,
+                    reason="a read-only folder is a POSIX permission, and root ignores it")
+def test_a_failed_move_leaves_no_copy_behind_and_the_next_start_finishes_it(tmp_path):
+    """A real failure, not a simulated one: a read-only `raw` copies fine but
+    its copy cannot be renamed into place. The copy must not stay in the home
+    (a failure that repeats at every start would leave a journal's worth each
+    time), and the next start, even within the same second, must move it all."""
+    code = _journal(tmp_path / "code")
+    home = tmp_path / "home"
+    (code / "raw").chmod(0o555)
+    try:
+        done = install.prepare(home, code_dir=code)
+        assert done[0].startswith("journal left beside the code"), done
+        assert sorted(p.name for p in home.iterdir()) == [], "the failed move left files"
+        assert sorted(p.name for p in code.iterdir()) == ["journal.db", "raw"]
+    finally:
+        (code / "raw").chmod(0o755)
+
+    done = install.prepare(home, code_dir=code)
+
+    assert done[0].startswith("moved journal.db, raw"), done
+    assert sorted(p.name for p in home.iterdir()) == ["journal.db", "raw"]
+    assert sorted(p.name for p in code.iterdir()) == []
+
+
+def test_a_staging_folder_an_earlier_attempt_left_is_cleared(tmp_path):
+    """It only ever holds copies, so it is nobody's only copy of anything."""
+    home = tmp_path / "home"
+    leftover = home / f"{install.STAGING_PREFIX}old" / "raw"
+    leftover.mkdir(parents=True)
+    (leftover / "activity-x.xml").write_text("<x/>")
+    install.relocate(_journal(tmp_path / "old"), home)
+    assert sorted(p.name for p in home.iterdir()) == ["journal.db", "raw"]
+
+
 def test_a_move_that_succeeds_leaves_nothing_behind_in_either_folder(tmp_path):
     code = _journal(tmp_path / "code")
     (code / "src").mkdir()
