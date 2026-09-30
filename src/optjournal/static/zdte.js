@@ -510,7 +510,10 @@ export function scratchRead(spx, level) {
  * fact is which rows it sits between: the ones above the line are still yours.
  *
  * Computed against the DISPLAY list, so it is correct under either sort without
- * knowing which one is in force.
+ * knowing which one is in force. Placed by where the level SITS in that list,
+ * whichever side's rows those are: a call typed below the market is an
+ * in-the-money call, and its line belongs below the market row, not on the
+ * nearest call.
  */
 export function scratchLines(rows, callLevel, putLevel) {
   const list = rows || [];
@@ -524,34 +527,31 @@ export function scratchLines(rows, callLevel, putLevel) {
 
 function edgeFor(rows, side, level) {
   const target = strikeNear(level, side);
-  if (target == null) return null;
-  const mine = rows
-    .map((row, index) => ({ row, index }))
-    .filter((held) => held.row.side === side);
-  if (!mine.length) return null;
-  const hit = mine.find((held) => held.row.strike === target);
-  if (hit) return { index: hit.index, edge: "on" };
-  let near = mine[0];
-  for (const held of mine) {
-    if (Math.abs(held.row.strike - target) < Math.abs(near.row.strike - target)) near = held;
+  if (target == null || !rows.length) return null;
+  const hit = rows.findIndex((row) => !row.current && row.strike === target);
+  if (hit !== -1) return { index: hit, edge: "on" };
+  /* The two neighbouring rows the level lies between, which may be the current
+     level and a row of either side: a put sold inside the expected move belongs
+     between the innermost put shown and the market. The line goes on whichever
+     of the two is a strike row and nearer the level, on the edge facing the
+     other. A level AT the market goes between it and the pad's own side. */
+  for (let at = 0; at + 1 < rows.length; at += 1) {
+    const pair = [rows[at], rows[at + 1]];
+    const [low, high] = [Math.min(pair[0].strike, pair[1].strike),
+      Math.max(pair[0].strike, pair[1].strike)];
+    const atMarket = pair.some((row) => row.current && row.strike === target)
+      && pair.some((row) => row.side === side);
+    if (!(low < target && target < high) && !atMarket) continue;
+    const upper = !pair[0].current && (pair[1].current
+      || Math.abs(pair[0].strike - target) <= Math.abs(pair[1].strike - target));
+    return upper ? { index: at, edge: "bottom" } : { index: at + 1, edge: "top" };
   }
-  /* The neighbour in the display list that lies TOWARD the level, if either does.
-     Either neighbour may be the current-level row or a row from the other side,
-     which is exactly right: a put sold inside the expected move belongs between
-     the innermost put shown and the market. */
-  const toward = (row) =>
-    row && Math.abs(row.strike - target) < Math.abs(near.row.strike - target);
-  if (toward(rows[near.index + 1])) return { index: near.index, edge: "bottom" };
-  if (toward(rows[near.index - 1])) return { index: near.index, edge: "top" };
-  /* Nothing shown lies between, so the level is past the end of the ladder. The
-     line goes on the far edge of the last row, away from the current level --
-     which is the direction the reader is looking when a sold strike is further
-     out than anything on screen. */
-  const at = rows.findIndex((row) => row.current);
-  const close = at >= 0 ? rows[at].strike : null;
-  const further = close == null
-    || Math.abs(target - close) > Math.abs(near.row.strike - close);
-  const away = at >= 0 && near.index < at ? "top" : "bottom";
-  const back = away === "top" ? "bottom" : "top";
-  return { index: near.index, edge: further ? away : back };
+  /* Nothing shown lies either side, so the level is past an end of the ladder:
+     the line goes on the far edge of the row at that end, which is the direction
+     the reader is looking when a sold strike is further out than anything on
+     screen. */
+  const last = rows.length - 1;
+  return Math.abs(target - rows[0].strike) < Math.abs(target - rows[last].strike)
+    ? { index: 0, edge: "top" }
+    : { index: last, edge: "bottom" };
 }

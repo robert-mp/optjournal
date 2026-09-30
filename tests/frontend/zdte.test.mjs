@@ -258,6 +258,23 @@ test("a sold level marks the row it is, or the edge it falls past", () => {
   ]);
 });
 
+test("an in-the-money level is drawn on its own side of the market", () => {
+  /* A call typed at 7650 is BELOW a 7706.03 market: the line belongs between the
+     innermost put and the current level, where 7650 actually sits. It was drawn
+     on the top edge of the 7780 call, above the market, because only call rows
+     were searched. */
+  const up = ladderRows(SPX, VIX).rows;
+  const marked = (rows, call, put) => scratchLines(rows, call, put)
+    .map((line, index) => ({ index, strike: rows[index].strike, ...line }))
+    .filter((line) => line.call || line.put);
+  assert.deepEqual(marked(up, 7650, null), [{ index: 4, strike: 7630, call: "bottom", put: "" }]);
+  assert.deepEqual(marked(up, null, 7760), [{ index: 6, strike: 7780, call: "", put: "top" }]);
+  /* A level that IS a strike on the other side marks that strike. */
+  assert.deepEqual(marked(up, 7630, null), [{ index: 4, strike: 7630, call: "on", put: "" }]);
+  const down = ladderRows(SPX, VIX, { desc: true }).rows;
+  assert.deepEqual(marked(down, 7650, null), [{ index: 6, strike: 7630, call: "top", put: "" }]);
+});
+
 test("decorations survive a descending ladder and an empty one", () => {
   const down = ladderRows(SPX, VIX, { desc: true }).rows;
   const lines = scratchLines(down, 7800, null);
