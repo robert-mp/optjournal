@@ -7269,6 +7269,12 @@ function stateQuery(){
  * for it. */
 const SCOPE_KEYS=['month','type','cost','scoring'];
 let LOADED={};
+/* The banner the last failed read raised, as it stands in #msg, so the next good
+   read can take it down. A `bad` note never dismisses itself, which is right for
+   an error nobody has seen yet and wrong for this one once the server answers:
+   it went on saying the read failed over figures that had just loaded. Compared
+   with what #msg holds, so a newer note (a Sync's refusal) is left for its reader. */
+let READ_NOTE=null;
 
 async function load(){
   const qs=stateQuery();
@@ -7283,11 +7289,15 @@ async function load(){
      "running" with nothing left to wait for. */
   if(!st){
     note('Could not read state: '+esc(why),'bad');
+    READ_NOTE=$('#msg').innerHTML;
     /* Over figures that did not move, with the controls that produced them: the
        banner says the read failed, and nothing else claims otherwise. */
     if(S.state){Object.assign(S,LOADED);draw();}
     return;
   }
+  /* Before the payload guard, whose own banner this must not take down. */
+  if(READ_NOTE!==null&&$('#msg').innerHTML===READ_NOTE) $('#msg').className='';
+  READ_NOTE=null;
   S.state=st;
   staleServerCheck(S.state);
   /* A linked day with no month key names its own month (stateQuery), and these

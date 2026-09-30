@@ -3363,7 +3363,8 @@ def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_path
         "const location={hash:'',pathname:'/'}, window={};",
         "const history={replaceState:(a,b,u)=>{location.hash=u.slice(1);},",
         "  pushState:(a,b,u)=>{location.hash=u.slice(1);}};",
-        "let S={}, LOADED={}, drawn=null;",
+        "let S={}, LOADED={}, READ_NOTE=null, drawn=null;",
+        "const $=()=>({innerHTML:'',className:''});",
         "const RANGE=['2026-09','2026-08'];",
         # The server's month rule, as build_state applies it.
         "async function fetch(url){",
@@ -3399,16 +3400,27 @@ def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_path
     assert out["fresh"]["asks"] == ""
 
 
-def _load_harness(stored: str = "position") -> list[str]:
+def _load_harness(stored: str = "position", real_note: bool = False) -> list[str]:
     """The page's real `stateQuery` and `load()` against a stand-in server.
 
     The server answers the month it is asked for (current = 2026-09), scores by
     the request's unit or else the stored one, and fails with 503 while `down`.
-    `draw`, `note` and the payload guard are stand-ins.
+    `draw` and the payload guard are stand-ins, and so is `note` unless
+    `real_note`, which runs the page's own against a stand-in `#msg` (`msg`).
     """
     consts = [_page_const(name) for name in ("SCORINGS", "SCOPE_KEYS")]
+    banner = [
+        "const msg={innerHTML:'',className:'',addEventListener(){}};",
+        "msg.classList={contains:c=>msg.className.split(' ').includes(c),",
+        "  add:c=>{msg.className+=' '+c;}};",
+        "const $=sel=>sel==='#msg'?msg:null;",
+        *(["const setTimeout=()=>0, clearTimeout=()=>{};",
+           "let noteTimer=null;", _page_const("NOTE_MS"), *_page_fns("note")]
+          if real_note else ["function note(){}"]),
+    ]
     return [
         "let S={month:null,type:null,cost:null,scoring:null,calday:null}, LOADED={};",
+        "let READ_NOTE=null;",
         f"let stored={json.dumps(stored)}, down=false;",
         "async function fetch(url){",
         "  if(down) return {ok:false,status:503};",
@@ -3418,11 +3430,35 @@ def _load_harness(stored: str = "position") -> list[str]:
         "    months:['2026-09'],selected_month:m==='current'?'2026-09':m,trade_type:'all',",
         "    stats:{scoring:qs.get('scoring')||stored}})};",
         "}",
-        "function note(){} function staleServerCheck(){} function draw(){}",
+        *banner, "function staleServerCheck(){} function draw(){}",
         "function esc(s){return String(s);}",
         *consts, "const SCORING=()=>S.scoring||SCORINGS[0];",
         *_page_fns("stateQuery", "load"),
     ]
+
+
+def test_a_good_read_takes_down_the_banner_a_failed_read_raised():
+    """Reviewer finding D1. "Could not read state: HTTP 503" is a `bad` note, which
+    by design never dismisses itself, and nothing else took it down: after the
+    server came back and the next control read fine, the banner still said the
+    read failed, over figures that had just loaded. A good read now retires it, and
+    only it: a newer note (a Sync's refusal, say) stays for its reader.
+    """
+    out = _node_run([
+        *_load_harness(real_note=True),
+        "const shown=()=>msg.className.split(' ').includes('show')?msg.innerHTML:null;",
+        "down=true; await load(); const failed=shown();",
+        "down=false; await load(); const recovered=shown();",
+        "note('Sync failed: refused','bad'); await load(); const other=shown();",
+        "down=true; await load(); note('Sync failed: later','bad');",
+        "down=false; await load(); const newer=shown();",
+        "console.log(JSON.stringify({failed,recovered,other,newer}));",
+    ])
+    assert out["failed"] == "Could not read state: HTTP 503"
+    assert out["recovered"] is None, "the failure banner outlived a good read"
+    assert out["other"] == "Sync failed: refused", "a good read took down another note"
+    assert out["newer"] == "Sync failed: later", (
+        "a good read took down a note raised after the failure it was retiring")
 
 
 def test_a_month_named_only_by_the_linked_day_survives_the_day_and_a_failed_read():
@@ -5615,7 +5651,8 @@ def test_a_state_reply_that_cannot_be_read_still_hands_the_buttons_back(reply):
         "function draw(){draws++;}",
         "function staleServerCheck(){}",
         f"let fetch; {reply}",
-        _page_const("SCOPE_KEYS"), "let LOADED={};",
+        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        "const $=()=>({innerHTML:'',className:''});",
         *_page_fns("stateQuery", "load"),
         "try{ await load(); }catch(e){ notes.push('threw'); }",
         "console.log(JSON.stringify({draws,notes}));",
@@ -5647,7 +5684,8 @@ def test_a_failed_state_read_leaves_the_controls_over_the_figures_in_hand():
         "function staleServerCheck(){}",
         f"const payload={json.dumps(payload)};",
         "let fetch=async()=>({ok:true,status:200,json:async()=>payload});",
-        _page_const("SCOPE_KEYS"), "let LOADED={};",
+        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        "const $=()=>({innerHTML:'',className:''});",
         *_page_fns("stateQuery", "load"),
         "await load();",
         # What the month stepper and the trade-type buttons do, then a read that fails.
