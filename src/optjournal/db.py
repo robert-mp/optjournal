@@ -789,7 +789,7 @@ def _backfill_commission_currency(conn: sqlite3.Connection) -> int:
     Returns the number of rows filled, so a caller can log or test it.
     """
     pending = conn.execute(
-        "SELECT trade_id, raw FROM trades"
+        "SELECT broker, trade_id, raw FROM trades"
         " WHERE ib_commission_currency IS NULL"
         "   AND raw LIKE '%ibCommissionCurrency%'"
     ).fetchall()
@@ -802,9 +802,12 @@ def _backfill_commission_currency(conn: sqlite3.Connection) -> int:
         ccy = payload.get("ibCommissionCurrency")
         if not ccy:
             continue
+        # Keyed like the table, (broker, trade_id): another broker may number a
+        # fill the same, and its row must not take this one's currency.
         conn.execute(
-            "UPDATE trades SET ib_commission_currency = ? WHERE trade_id = ?",
-            (str(ccy), row["trade_id"]),
+            "UPDATE trades SET ib_commission_currency = ?"
+            " WHERE broker = ? AND trade_id = ?",
+            (str(ccy), row["broker"], row["trade_id"]),
         )
         filled += 1
     return filled
@@ -829,7 +832,7 @@ def _repair_base_commission(conn: sqlite3.Connection) -> int:
     matches the WHERE, so this costs one count per open. Returns rows repaired.
     """
     rows = conn.execute(
-        "SELECT t.trade_id, t.ib_commission, s.base_currency"
+        "SELECT t.broker, t.trade_id, t.ib_commission, s.base_currency"
         " FROM trades t JOIN statements s ON s.source_file = t.source_file"
         " WHERE t.ib_commission IS NOT NULL AND t.ib_commission <> 0"
         "   AND t.ib_commission_currency IS NOT NULL"
@@ -839,8 +842,9 @@ def _repair_base_commission(conn: sqlite3.Connection) -> int:
     ).fetchall()
     for row in rows:
         conn.execute(
-            "UPDATE trades SET ib_commission_base = ib_commission WHERE trade_id = ?",
-            (row["trade_id"],),
+            "UPDATE trades SET ib_commission_base = ib_commission"
+            " WHERE broker = ? AND trade_id = ?",
+            (row["broker"], row["trade_id"]),
         )
     return len(rows)
 

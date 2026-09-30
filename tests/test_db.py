@@ -1433,3 +1433,42 @@ def test_compact_confirm_dates_already_stored_are_rewritten_on_open(tmp_path):
     assert conn.execute(
         "SELECT opened_on FROM journal_entries").fetchone()[0] == "2026-09-24"
     conn.close()
+
+
+# --- the commission repairs stay inside the row's own broker (L6) -------------
+
+
+def test_the_commission_backfill_writes_only_the_row_whose_raw_it_read(conn):
+    """L6: the UPDATE matched on `trade_id` alone, so another broker's fill with
+    the same id took this one's commission currency."""
+    from optjournal.db import _backfill_commission_currency
+
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="ibkr",
+                  raw='{"ibCommissionCurrency": "USD"}')
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="schwab", raw="{}")
+    conn.execute("UPDATE trades SET ib_commission_currency = NULL")
+
+    assert _backfill_commission_currency(conn) == 1
+    got = dict(conn.execute("SELECT broker, ib_commission_currency FROM trades"))
+    assert got == {"ibkr": "USD", "schwab": None}
+
+
+def test_the_base_commission_repair_writes_only_the_row_it_found(conn):
+    """L6, the same key in the repair: only the mis-converted row is rewritten."""
+    from optjournal.db import _repair_base_commission
+
+    conn.execute(
+        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
+        " to_date, base_currency, asset_filter, ingested_at)"
+        " VALUES ('s.xml', 'x', 'U1', '2026-07-01', '2026-07-31', 'EUR', 'ALL', 'now')")
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="ibkr",
+                  currency="SEK", ib_commission=-1.7,
+                  ib_commission_currency="EUR", ib_commission_base=-0.15)
+    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="schwab",
+                  currency="SEK", ib_commission=-3.0,
+                  ib_commission_currency="SEK", ib_commission_base=-0.27)
+
+    assert _repair_base_commission(conn) == 1
+    got = dict(conn.execute("SELECT broker, ib_commission_base FROM trades"))
+    assert got == {"ibkr": -1.7, "schwab": -0.27}
