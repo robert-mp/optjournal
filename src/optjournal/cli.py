@@ -1068,19 +1068,29 @@ def cmd_setup(args) -> int:
     else:
         token = _prompt_token(bool(stored_token))
 
+    query_id = args.query_id
+    if not query_id and sys.stdin.isatty():
+        shown = f" [{stored_qid}]" if stored_qid else ""
+        query_id = input(f"Flex Query ID{shown}: ").strip() or None
+    # The query id is SAVED FIRST. A settings file that cannot be written (a
+    # folder that could not be made, a read-only home) then stops the run
+    # before the token is stored, rather than after, which would leave a
+    # journal holding a token and no query id while this run exits as failed.
+    if query_id:
+        try:
+            settings.update(query_id=query_id)
+        except OSError as exc:
+            print(f"Could not save the query id to {settings.path_for()}: {exc}\n"
+                  "Nothing was stored. Fix that and run `optjournal setup` again.",
+                  file=sys.stderr)
+            return EXIT_ERROR
+
     if token:
         # Through `flex.write_token`, not `keyring` directly: the settings page
         # writes the same entry, and two callers spelling the service name for
         # themselves is how one of them ends up storing a token the other cannot
         # find. It also strips the newline a pasted token arrives with.
         write_token(token, account)
-
-    query_id = args.query_id
-    if not query_id and sys.stdin.isatty():
-        shown = f" [{stored_qid}]" if stored_qid else ""
-        query_id = input(f"Flex Query ID{shown}: ").strip() or None
-    if query_id:
-        settings.update(query_id=query_id)
 
     effective_qid = settings.query_id(query_id)
     have_token = bool(token or stored_token)
