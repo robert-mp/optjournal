@@ -220,6 +220,33 @@ def test_every_drill_down_is_a_keyboard_stop(served, tmp_path):
         f"nothing to check, so this proved nothing: {found}")
 
 
+def test_the_0dte_tab_works_on_typed_readings_before_any_index_bar(
+        served, tmp_path, monkeypatch):
+    """L45: with no S&P or VIX bars stored (this demo journal has none), the tab
+    replaced the whole calculator with a note, so there were no fields to type
+    into and a `#spx=…&vix=…` link drew nothing. It now draws the fields, holds
+    the linked readings and builds the ladder from them, with the note above.
+
+    Opening the tab asks the server to refresh the index bars, which is a Yahoo
+    request: `serialize` holds its own `fetch_bars`, so the suite's autouse patch
+    on `bars` does not reach it, and it is patched here.
+    """
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    from optjournal import serialize  # noqa: PLC0415 - the server's own binding
+    monkeypatch.setattr(serialize, "fetch_bars", lambda *a, **k: [])
+    with urllib.request.urlopen(served + "/api/state") as res:
+        assert json.load(res)["odte"]["context"] is None, "the fixture now has index bars"
+    dom = browser.dump_dom(f"{served}/#tab=odte&spx=7000&vix=20", tmp_path / "odte")
+    if dom is None:
+        pytest.skip("no browser produced a DOM (environment, not the page)")
+    markup = browser.markup(dom)
+    assert re.search(r'<input id="zspx"[^>]*value="7000"', markup), "no S&P field"
+    assert re.search(r'<input id="zvix"[^>]*value="20"', markup), "no VIX field"
+    assert '<table class="zlad">' in markup, "the typed readings drew no ladder"
+    assert "Not available yet" in browser.rendered_text(dom), "the note went missing"
+
+
 def test_the_dashboard_renders_the_tiles_the_reader_stored(served, tmp_path):
     """The chosen arrangement, in its order -- and the default when what is
     stored cannot be drawn.

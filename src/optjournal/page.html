@@ -5350,17 +5350,12 @@ const ZTIER=['the session is about this','moves the open, or the range','backgro
 function odte(){
   const od=S.state.odte;
   if(!od) return `<div class="card"><div class="empty">no data</div></div>`;
-  const oc=od.context;
   /* A null context is a real state -- no `bars` fetch has landed the index closes
-     yet -- and it says how to fix it rather than drawing an empty ladder. */
-  if(!oc) return `<div class="card">
-    <div class="crow"><div><h2>0DTE calculator</h2>
-      <div class="sub">Strike by strike, from the S&amp;P 500 close and the
-      VIX.</div></div></div>
-    <div class="note"><b>Not available yet.</b> The calculator opens on the S&amp;P
-      and VIX daily closes, which arrive with the price bars — run
-      <code>optjournal bars</code> (the daily job fetches them too) and it fills in
-      from the next session.</div></div>`;
+     yet -- and it says how to fix it. It used to say so INSTEAD of the calculator,
+     which then had no fields and ignored a `#spx=…&vix=…` link; both readings can
+     be typed, so the tab is drawn with empty fields and the note in the status
+     line, and `oc` is an empty context rather than a branch per read. */
+  const none=!od.context, oc=od.context||{};
 
   /* What the fields hold: what was typed, or the feed's reading where nothing has
      been. `zread` owns that rule for the handlers too -- see its own comment. */
@@ -5385,6 +5380,7 @@ function odte(){
       aria-describedby="${id}from" value="${esc(zread(key))}">
     <div class="wcap" id="${id}from">${typed==null
       ?(oc.fresh?`the feed's reading, ${esc(day)}`:'no current reading: type one')
+      :feed==null?'typed; there is no feed reading to go back to yet'
       :`typed — the feed read <b>${level(feed)}</b> on ${esc(day)}
         <button class="zlink" data-zreset="${key}">use it</button>`}</div>
   </div>`;
@@ -5469,9 +5465,10 @@ function odte(){
       is where that level falls. Round-trip history for trades opened on their
       expiry date is under <b>Trades</b> with the <b>0DTE</b> filter, and the cohort
       comparison is on the <b>Dashboard</b>.</span>i</span></h2>
-      <div class="sub">Where a same-day move lands for <b>${esc(oc.today)}</b>,
-      strike by strike. Index levels, not ${esc(BASE())}.</div></div></div>
-    ${events.length?`<div class="zevents">${events.map(oe=>`<span
+      <div class="sub">Where a same-day move lands${oc.today?` for <b>${
+      esc(oc.today)}</b>`:''}, strike by strike. Index levels, not ${
+      esc(BASE())}.</div></div></div>
+    ${none?'':events.length?`<div class="zevents">${events.map(oe=>`<span
       class="zevent" title="${ZTIER[oe.tier-1]} — the journal's ranking; the feed grades it
         ${esc(oe.impact)}${oe.count>1?`, the highest of the ${oe.count} releases
         this chip merges`:''}. ${oe.count>1?'First at':'At'} ${esc(oe.at)} in the
@@ -5487,7 +5484,11 @@ function odte(){
        checked" rather than as "nothing scheduled". */
     :`<div class="wcap zevents">No US release on the calendar today — a lighter
       tape than a print day, though nothing rules out an intraday headline.</div>`}
-    ${!S.zat?`<div class="wcap zstat">Checking the feed…</div>`
+    ${none?`<div class="note zstat"><b>Not available yet.</b> The calculator opens on
+      the S&amp;P and VIX daily closes, which arrive with the price bars: run
+      <code>optjournal bars</code> (the daily job fetches them too) and it fills in
+      from the next session. Until then, type both readings below.</div>`
+    :!S.zat?`<div class="wcap zstat">Checking the feed…</div>`
     :!oc.fresh?`<div class="note zwarn zstat"><b>Not current, so not
       shown.</b> ${esc(oc.stale_reason||'')}.${S.zerr?` The refresh failed:
       ${esc(S.zerr)}.`:''} Type a live reading into either field, or
