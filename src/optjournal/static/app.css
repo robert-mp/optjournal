@@ -1652,11 +1652,14 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    compact form a zero-width box) and the compact form is invisible; once the
    amount wraps away, the compact form is alone on the line and takes it. So the
    switch happens exactly where the amount stops fitting, for any size, currency
-   or font, and nothing is measured in script. */
+   or font, and nothing is measured in script. The one line is `1.5em` against a
+   line height of 1.5 set here, not `1lh`: Safari before 16.4 and Firefox before
+   120 drop `lh`, and without the height both lines show at once. */
 .cal>.day:has(>.dpl){container-type:inline-size}
 .day .dpl{font-family:var(--fig);font-variant-numeric:tabular-nums;
   font-weight:var(--w-label);font-size:var(--t3);
-  display:flex;flex-wrap:wrap;white-space:nowrap;height:1lh;overflow:hidden}
+  display:flex;flex-wrap:wrap;white-space:nowrap;line-height:1.5;height:1.5em;
+  overflow:hidden}
 .day .dplw{flex:1e6 0 auto}
 .day .dpln{order:-1;flex:1 0 0;min-width:0;overflow:hidden}
 /* Block again below 72px, where the compact form always shows, so it sits on the
@@ -1665,6 +1668,22 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
   .day .dpl{display:block}
   .day .dplw{display:none}
   .day .dpln{font-size:min(var(--t1),34cqi)}}
+/* WITHOUT CONTAINER QUERIES OR :has() (Safari and iOS before 16, Firefox before
+   121 for :has) the rule above never applies. The wrap-off switch still does, so
+   the compact form shows wherever the amount does not fit, but at the figure's
+   13px, which a phone's cell cannot hold. Sized to the viewport instead: a day's
+   figure is at least 2.36% of the window wide from 320px up (23px at 320), and
+   the widest compact form is 3.04em, so 2.3vw fits it everywhere and reaches
+   --t1 from 478px. At that size its own line is shorter than the figure's box, so
+   it is stretched to the box, or the amount on the clipped second line would show
+   beneath it. The days are not containers there either, so a `1fr` track would
+   not shrink below its widest amount and a large one widened the grid past its
+   card from 761px: the zero minimum the phone rule gives them, at every width.
+   A browser with both features skips this block. */
+@supports not ((container-type:inline-size) and selector(:has(*))){
+  .cal{grid-template-columns:repeat(7,minmax(0,1fr))}
+  .cal>.day{min-width:0}
+  .day .dpln{font-size:min(var(--t1),2.3vw);min-height:100%}}
 @media(max-width:700px){
   .cal{gap:var(--s1)}
   .cal>.day{padding:var(--s1)}

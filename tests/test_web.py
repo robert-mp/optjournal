@@ -8741,7 +8741,7 @@ def test_a_calendar_day_prints_its_figure_whole_at_every_width():
     # The figure: one line that clips below itself, which the amount wraps off.
     fig = wide.get(".day .dpl", "")
     for prop in ("display:flex", "flex-wrap:wrap", "white-space:nowrap",
-                 "height:1lh", "overflow:hidden"):
+                 "height:1.5em", "overflow:hidden"):
         assert prop in fig, f".day .dpl lost {prop}, so a large amount can wrap or spill"
     raw = {sel.strip(): body for sel, body in _toplevel_rules()}
 
@@ -8770,6 +8770,31 @@ def test_a_calendar_day_prints_its_figure_whole_at_every_width():
         "a pill strip with a row to itself cannot wrap, so it overflows its card")
     cal = _fn("calendar")
     assert "compact(amountOf(dy.realized))" in cal and "aria-label=" in cal
+
+
+def test_a_browser_without_container_queries_still_shows_a_fitting_figure():
+    """Reviewer finding D3. The day's figure leans on three things an older browser
+    lacks: container queries and `:has()` (Safari and iOS before 16, Firefox
+    before 121 for `:has()`) for the compact form below 72px, and the `lh` unit
+    (Safari before 16.4, Firefox before 120) for the one-line box the amount wraps
+    off. Emulated in Chromium by dropping those rules: both forms showed at once and
+    a phone's cells clipped the amount. The box is sized in `em` against its own
+    line height now, so the wrap-off switch works in any browser with flexbox, and
+    a fallback gives the compact form a size a phone's cell can hold. A browser
+    with both features skips the fallback, so nothing moves there.
+    """
+    wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    fig = wide[".day .dpl"]
+    assert "lh" not in re.sub(r"line-height", "", fig), (
+        "the figure's one-line box is sized in lh, which older browsers drop")
+    assert "line-height:1.5" in fig and "height:1.5em" in fig
+    css = re.sub(r"/\*.*?\*/", "", _css(), flags=re.S).replace(" ", "")
+    fallback = re.search(
+        r"@supportsnot\(\(container-type:inline-size\)andselector\(:has\(\*\)\)\)\{(.*?)\}\}",
+        css, re.S)
+    assert fallback, "no fallback for a browser without container queries or :has()"
+    assert re.search(r"\.day\.dpln\{font-size:min\(var\(--t1\),[\d.]+vw\);min-height:100%", fallback.group(1)), (
+        "the fallback does not size the compact form to a phone's cell")
 
 
 def test_the_market_week_strip_is_seven_equal_columns_at_every_width():
