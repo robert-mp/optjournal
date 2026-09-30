@@ -328,7 +328,6 @@ class Job:
     zone: str
     catchup: Catchup
     window_s: int
-    timeout_s: int
     #: Whether a run consumes one of IBKR's rate-limited Flex requests. Read by
     #: the runner when a run fails: a job that spends none gives its instant back
     #: and is retried after `RETRY_AFTER_S`, while one that does keeps the claim,
@@ -643,7 +642,6 @@ JOBS: tuple[Job, ...] = (
         # A missed noon is worth running at 18:00: the docstring records a
         # badly-timed sync missing Monday's fills twice.
         catchup=Catchup.LATEST, window_s=12 * 3600,
-        timeout_s=900,
         spends_broker_request=True,
     ),
     Job(
@@ -659,7 +657,6 @@ JOBS: tuple[Job, ...] = (
         # requests to re-read the morning.
         minute=35, hour=9, weekdays=(1, 2, 3, 4, 5), zone="America/New_York",
         catchup=Catchup.WINDOW, window_s=25 * 60,
-        timeout_s=300,
         spends_broker_request=True,
     ),
     Job(
@@ -667,10 +664,10 @@ JOBS: tuple[Job, ...] = (
         run=lambda conn, ctx: _bars(conn, ctx, live=False),
         # 12:30, thirty minutes behind the sync: a position opened yesterday is
         # only in the database once that sync has ingested it, and the manifest is
-        # derived from positions. The gap clears the sync's 900s worst case.
+        # derived from positions. The gap clears the sync's worst case, the
+        # 660s of `flex.POLL_WORST_CASE_S`.
         minute=30, hour=12, weekdays=(2, 3, 4, 5, 6), zone="Europe/Dublin",
         catchup=Catchup.LATEST, window_s=20 * 3600,   # re-fetchable by definition
-        timeout_s=600,
     ),
     Job(
         name="bars_live",
@@ -684,7 +681,6 @@ JOBS: tuple[Job, ...] = (
         # 10:00 collects the whole session.
         minute=5, hour=10, weekdays=(1, 2, 3, 4, 5), zone="America/New_York",
         catchup=Catchup.WINDOW, window_s=55 * 60,
-        timeout_s=300,
     ),
     Job(
         name="market",
@@ -695,7 +691,6 @@ JOBS: tuple[Job, ...] = (
         # sync means the week's releases are on screen before the fills are.
         minute=0, hour=11, weekdays=(1, 2, 3, 4, 5), zone="Europe/Dublin",
         catchup=Catchup.LATEST, window_s=24 * 3600,   # the feed serves this week
-        timeout_s=120,
     ),
     Job(
         name="history",
@@ -705,8 +700,6 @@ JOBS: tuple[Job, ...] = (
         # reader's decision, made from the page with the count in front of them.
         minute=0, hour=0, weekdays=(), zone="UTC",
         catchup=Catchup.NONE, window_s=0,
-        # Five chunks at `flex.MAX_RETRIES`' 660s ceiling, plus the pauses.
-        timeout_s=5 * 660 + 4 * 30,
         spends_broker_request=True,
     ),
 )

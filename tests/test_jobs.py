@@ -519,7 +519,29 @@ def test_every_schedule_names_a_real_zone_and_a_real_time():
         assert set(job.weekdays) <= set(range(1, 8)), (
             f"{job.name}: {job.weekdays} is not ISO weekdays (Monday=1)"
         )
-        assert job.timeout_s > 0
+
+
+def test_every_field_on_a_job_is_read_by_something():
+    """L13: a field on the spec that nothing reads is a promise nothing keeps.
+
+    `Job.timeout_s` was declared on every job, documented as a per-job ceiling,
+    and never enforced anywhere: a reader could tune it and change nothing. Read
+    with `ast` over the modules that consume the registry, so a field that only
+    appears in its own declaration and in the tuple fails here.
+    """
+    import ast
+    import dataclasses
+
+    from conftest import ROOT
+
+    from optjournal.jobs import Job
+
+    read: set[str] = set()
+    for name in ("jobs", "serialize", "web", "cli"):
+        tree = ast.parse((ROOT / "src" / "optjournal" / f"{name}.py").read_text())
+        read |= {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    unread = [f.name for f in dataclasses.fields(Job) if f.name not in read]
+    assert not unread, f"Job fields nothing reads: {unread}"
 
 
 def test_the_market_hours_poll_is_scheduled_in_market_time():
@@ -652,8 +674,8 @@ def test_a_second_runner_is_refused_rather_than_queued(conn, ctx, monkeypatch):
     version of this test could not see the difference. `timeout_s=1` instead of 0
     still raises `JobBusy` -- one second later -- so the ablation passed while the
     behaviour was wrong. A refusal that takes a second is not a refusal, it is a
-    queue with a short patience: the browser holds a connection, and the `sync`
-    job's timeout is 900s.
+    queue with a short patience: the browser holds a connection, and a `sync`
+    can take 660s (`flex.POLL_WORST_CASE_S`).
     """
     import time
 

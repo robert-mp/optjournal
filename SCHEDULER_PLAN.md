@@ -612,6 +612,12 @@ and no rule sets a layout property its display mode cannot use.
   work**, calls the work directly, writes the outcome, prunes to 200 rows per job
   while unconditionally keeping the newest `fired_for` row.
 
+*Revised after the 2026-09-30 QA pass (L13).* `timeout_s` is gone from the spec.
+Nothing ever read it: a job thread cannot be interrupted mid-call, the bound that
+does exist is on the socket (`flex.FETCH_SOCKET_TIMEOUT_S`), and the "stuck for 23
+min" rendering proposed under *What is not worth doing* was never built. A field a
+reader could tune without changing anything was worse than none.
+
 **The registry is code, and that is the fix for a specific failure.**
 `crons.json` holds 7 jobs and **none** is `optjournal-market` (re-verified at
 review: `grep -c optjournal-market ~/.meshclaw/crons.json` → 0). So 143 lines of
@@ -1216,7 +1222,7 @@ already in `build_state` and drawn.
 - **A Cancel button in v1.** You cannot kill a thread mid-`upsert_bars`, and the
   honest version (a flag checked between the 24 requests) buys little for a 1.4 s
   median. What the UI gives instead is the truth about a stuck run: a `running`
-  row older than the job's `timeout_s` renders red as "stuck for 23 min", and
+  row older than a per-job ceiling renders red as "stuck for 23 min", and
   recovery is a restart, which `KeepAlive` makes cheap and `flock` makes safe. If
   the 600 s tail later forces a cancel, build it with honest granularity — the flag
   is checked *between* windows, the button says "stopping after the current
