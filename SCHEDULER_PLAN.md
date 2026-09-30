@@ -870,6 +870,16 @@ Without this rule the first reconcile after a restore spends an IBKR request and
 24 bar requests unprompted. Both losing designs stated it and Design 1 did not;
 it is the sharpest foot-gun here and it belongs in the code as a comment.
 
+*Revised after the 2026-09-30 QA pass (M13).* As built, "its next natural slot"
+never came: the code skipped any job with no recorded run, and nothing but a run
+could record one, so a fresh journal ran `sync`, `bars_daily` and `market` zero
+times in two simulated weeks. The slot now has a reference, the moment the
+`Scheduler` started: an instant after it runs, an instant before it is still never
+caught up. In the same pass (M11, M12), a run that asked IBKR nothing gives its
+instant back and is retried five minutes later: a failure of a job that spends no
+request (`market`, `bars_daily`), or any run that only waited out the fetch lock.
+A failed `sync` still keeps its claim.
+
 **Containment.** Each job's due-check is wrapped in `try/except` so one job's bad
 zone arithmetic cannot stop the tick, and the failure is recorded. The heartbeat
 is written by the tick loop itself, so a dead loop reads as a dead heartbeat.

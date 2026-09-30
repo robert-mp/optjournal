@@ -1095,6 +1095,7 @@ def due_jobs(
     last_try: dict[str, int],
     ever_ran: set[str],
     failures: dict[str, int],
+    since: int | None = None,
     registry: tuple[Job, ...] | None = None,
 ) -> list[Due]:
     """Which jobs should run at `now`. Pure: no clock, no database, no I/O.
@@ -1127,6 +1128,14 @@ def due_jobs(
     whose owner was recovering from something. So a job with no recorded run waits
     for its next natural slot: it is scheduled, never caught up.
 
+    "Next natural slot" needs a reference, and that is `since`: the epoch at which
+    the caller started watching (the `Scheduler`'s start). An instant at or after
+    it is a slot this process saw arrive, so it runs like any other; an instant
+    before it is one a restore would be catching up on, so it is skipped. Without
+    the reference the rule read "wait for a run that never comes", and a fresh
+    journal scheduled `sync`, `bars_daily` and `market` never (two weeks of ticks,
+    no runs). `since=None` still means that, for a caller with no start to name.
+
     Returned in REGISTRY ORDER, which the caller must preserve: `sync` before
     `bars_daily`, because the latter derives its manifest from the positions the
     former ingests. That ordering is a real happens-before edge here, where today it
@@ -1155,8 +1164,9 @@ def due_jobs(
         stamp = int(instant.timestamp())
         if stamp in claimed.get(job.name, set()):
             continue                       # already recorded, by anyone
-        if job.name not in ever_ran:
-            # See the docstring: a journal with no history is UNKNOWN, not behind.
+        if job.name not in ever_ran and (since is None or stamp < since):
+            # See the docstring: a journal with no history is UNKNOWN, not behind,
+            # so only an instant this process watched arrive may run.
             continue
         if job.catchup is Catchup.NONE:
             continue
@@ -1328,6 +1338,7 @@ def reconcile(
     ctx: Context,
     now: datetime | None = None,
     slept: bool = False,
+    since: datetime | None = None,
 ) -> list[str]:
     """Run whatever is due, once. Returns the names of the jobs started.
 
@@ -1341,13 +1352,16 @@ def reconcile(
     than logged and forgotten.
 
     `now` is injectable for the same reason `due_jobs` is pure: the tick's behaviour
-    at a DST boundary is testable without waiting for October.
+    at a DST boundary is testable without waiting for October. `since` is when the
+    caller started ticking, which is what lets a job with no history run at its
+    first instant after that (see `due_jobs`).
     """
     moment = now or datetime.now(UTC)
     claimed, last_poll, last_try, ever_ran, failures = _ledger_snapshot(conn)
     started: list[str] = []
     for due in due_jobs(moment, claimed=claimed, last_poll=last_poll,
-                        last_try=last_try, ever_ran=ever_ran, failures=failures):
+                        last_try=last_try, ever_ran=ever_ran, failures=failures,
+                        since=None if since is None else int(since.timestamp())):
         if is_backed_off(failures.get(due.job.name, 0)):
             # Backed off, so `due_jobs` only offers it at its healthy cadence, and
             # this is one of those attempts.
@@ -1476,6 +1490,9 @@ class Scheduler:
         # a tick means the machine was asleep.
         wall = datetime.now(UTC)
         mono = time.monotonic()
+        # The reference for "next natural slot" on a job with no history: an
+        # instant after this moment is one the loop watched arrive.
+        since = wall
         try:
             while True:
                 self.ticks += 1               # ATTEMPTED: see the attribute's note
@@ -1486,7 +1503,7 @@ class Scheduler:
                     slept = elapsed_wall - elapsed_mono > SLEPT_THRESHOLD_S
                     wall, mono = now, time.monotonic()
                     heartbeat(conn, now=now)
-                    reconcile(conn, ctx=self.ctx, now=now, slept=slept)
+                    reconcile(conn, ctx=self.ctx, now=now, slept=slept, since=since)
                 except Exception:             # noqa: BLE001 - the point of the loop
                     self.tick_failures += 1
                     # A tick that raises must not end the schedule. Design 3 named

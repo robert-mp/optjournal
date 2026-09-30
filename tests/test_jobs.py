@@ -1180,11 +1180,92 @@ def test_an_empty_ledger_means_unknown_not_overdue():
         "a journal with no recorded runs treated every job as overdue -- a restore "
         "would spend an IBKR request and 24 bar requests unprompted"
     )
+    # Started after every one of today's instants: still nothing to catch up on.
+    started = int(now.replace(hour=21).timestamp())
+    assert _names(_due(now, ever_ran=set(), since=started)) == []
     # And the control: with history, the same clock IS due. Without this the test
     # above passes against a function that returns nothing for every input.
     assert "sync" in _names(_due(now)), (
         "the fixture cannot distinguish the empty-ledger rule from a dead function"
     )
+
+
+def test_a_fresh_journal_runs_each_job_at_its_first_instant_after_start():
+    """M13: "waits for its next natural slot" has to END, at that slot.
+
+    Measured by `evidence/jobs/v6_empty_ledger.py`: a fresh journal ticked every
+    minute for two weeks ran `sync`, `bars_daily` and `market` zero times, because
+    a job with no history waited for a run only the reconciler could start. The
+    reference is when the process started watching: an instant after that is a
+    slot it saw arrive, and one before it is a catch-up, which a restore must not
+    do.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    dublin = ZoneInfo("Europe/Dublin")
+    # Started Wednesday 10:00 Dublin, before market (11:00), sync (12:00) and
+    # bars_daily (12:30); asked at 13:00, after all three.
+    started = int(datetime(2026, 8, 12, 10, 0, tzinfo=dublin).timestamp())
+    now = datetime(2026, 8, 12, 13, 0, tzinfo=dublin)
+    assert _names(_due(now, ever_ran=set(), since=started)) == [
+        "bars_daily", "market", "sync"], (
+        "a fresh journal did not run the slots it watched arrive"
+    )
+    # Started at 12:15: market and sync were before it, bars_daily after it.
+    started = int(datetime(2026, 8, 12, 12, 15, tzinfo=dublin).timestamp())
+    assert _names(_due(now, ever_ran=set(), since=started)) == ["bars_daily"]
+
+
+def test_a_fresh_journal_gets_its_schedule_over_two_weeks(conn, ctx, clock, monkeypatch):
+    """M13 end to end: the v6 measurement, through `reconcile` and the ledger."""
+    from datetime import UTC, datetime, timedelta
+
+    from optjournal import jobs as mod
+
+    _registry(monkeypatch, "sync", "bars_daily", "market")
+    start = datetime(2026, 10, 5, tzinfo=UTC)                  # Monday 00:00 UTC
+    for minute in range(0, 14 * 24 * 60):
+        clock["t"] = start + timedelta(minutes=minute)
+        mod.reconcile(conn, ctx=ctx, now=clock["t"], since=start)
+
+    fires = dict(conn.execute(
+        "SELECT job, COUNT(*) FROM job_runs WHERE fired_for IS NOT NULL GROUP BY job"))
+    # Tuesday to Saturday for sync and bars_daily, Monday to Friday for market.
+    assert fires == {"sync": 10, "bars_daily": 10, "market": 10}, fires
+
+
+def test_the_loop_names_its_own_start_to_the_reconciler(tmp_path, monkeypatch):
+    """The wiring for M13: one `since`, the loop's start, on every tick."""
+    import time
+    from datetime import UTC, datetime
+
+    from optjournal import jobs as mod
+    from optjournal.db import connect, migrate
+
+    db = tmp_path / "loop.db"
+    migrate(connect(db))
+    monkeypatch.setattr(mod, "JOBS", ())
+    seen: list[datetime | None] = []
+    real = mod.reconcile
+
+    def watching(conn, **kwargs):
+        seen.append(kwargs.get("since"))
+        return real(conn, **kwargs)
+
+    monkeypatch.setattr(mod, "reconcile", watching)
+    before = datetime.now(UTC)
+    loop = mod.Scheduler(ctx=mod.Context(archive_dir=tmp_path / "raw", db_path=db),
+                         tick_s=0.1)
+    loop.start()
+    try:
+        deadline = time.monotonic() + 10
+        while len(seen) < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        loop.stop()
+    assert len(seen) >= 3 and len(set(seen)) == 1, f"since changed per tick: {seen}"
+    assert seen[0] is not None and before <= seen[0] <= datetime.now(UTC)
 
 
 def test_a_claimed_instant_is_not_due_again():
