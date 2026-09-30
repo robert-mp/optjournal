@@ -1388,3 +1388,48 @@ def test_a_failed_ingest_keeps_the_callers_own_pending_writes(conn, tmp_path):
     conn.commit()
     names = [r["source_file"] for r in conn.execute("SELECT source_file FROM statements")]
     assert names == ["caller.xml"]
+
+
+# --- confirm rows stored before M3 are rewritten on open -----------------------
+
+
+def test_compact_confirm_dates_already_stored_are_rewritten_on_open(tmp_path):
+    """M3: the live journal holds confirm rows written as IBKR's compact text.
+
+    Opening the journal rewrites them into the forms an Activity Statement row
+    has, and leaves everything else alone: an activity row, and a confirm row
+    whose date is already ISO. Run twice to show it settles.
+    """
+    conn = connect(tmp_path / "j.db")
+    migrate(conn)
+    add_statement(conn, source_file="confirm-20260924.xml",
+                  from_date="20260924", to_date="20260924")
+    conn.execute("UPDATE statements SET when_generated = '20260924;114524'")
+    _statement_row(conn)
+    _insert_trade(conn, trade_id="C1", ib_exec_id="EC1", source_kind=CONFIRM_SOURCE,
+                  source_file="confirm-20260924.xml", trade_date="20260924",
+                  date_time="20260924;101659", expiry="20261016")
+    _insert_trade(conn, trade_id="A1", ib_exec_id="EA1", expiry="2026-09-04")
+    conn.execute(
+        "INSERT INTO journal_entries (account_id, anchor_order_id, opened_on,"
+        " created_at, updated_at) VALUES ('U1', 'O1', '20260924', 'now', 'now')")
+    conn.commit()
+
+    migrate(conn)
+    migrate(conn)
+
+    confirm = conn.execute(
+        "SELECT trade_date, date_time, expiry FROM trades WHERE trade_id = 'C1'"
+    ).fetchone()
+    assert tuple(confirm) == ("2026-09-24", "2026-09-24 10:16:59", "2026-10-16")
+    activity = conn.execute(
+        "SELECT trade_date, date_time, expiry FROM trades WHERE trade_id = 'A1'"
+    ).fetchone()
+    assert tuple(activity) == ("2026-07-24", "2026-07-24 10:00:00", "2026-09-04")
+    stmt = conn.execute(
+        "SELECT from_date, to_date, when_generated FROM statements"
+        " WHERE source_file = 'confirm-20260924.xml'").fetchone()
+    assert tuple(stmt) == ("2026-09-24", "2026-09-24", "2026-09-24 11:45:24")
+    assert conn.execute(
+        "SELECT opened_on FROM journal_entries").fetchone()[0] == "2026-09-24"
+    conn.close()

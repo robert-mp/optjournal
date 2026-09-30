@@ -95,6 +95,13 @@ Open/close comes through `code` (`O`, `C`, `P`, semicolon-delimited), not throug
 from the confirm's field list. `orderTime` carries a date AND a time despite the
 name. `dateTime` is the execution stamp; there is no separate `tradeTime`.
 
+Dates arrive in IBKR's compact form (`20260924`, `20260924;101659`). They are
+stored in the forms py_ibkr gives Activity rows (`2026-09-24`,
+`2026-09-24 10:16:59`), parsed by the same py_ibkr functions, because every
+reader (replay, bars, the month filters, the page) was written against those.
+Rows written in the compact form before that was fixed are rewritten when the
+journal is opened (`db._normalise_confirm_dates`).
+
 ## No realised P&L, which is the design already assumed
 
 IBKR's Trade Confirmation configuration page lists every selectable field and

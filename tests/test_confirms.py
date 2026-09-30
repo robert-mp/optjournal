@@ -195,9 +195,9 @@ def test_the_statement_metadata_takes_the_base_currency_from_the_caller(confirm_
     """
     meta = statement_meta(confirm_file, base_currency="EUR")
     assert len(meta) == 1
-    assert meta[0].from_date == "20260924"
+    assert meta[0].from_date == "2026-09-24"
     assert meta[0].base_currency == "EUR"
-    assert meta[0].generated_at == "20260924;111200"
+    assert meta[0].generated_at == "2026-09-24 11:12:00"
 
 
 def test_a_base_currency_fill_is_not_an_estimate(monkeypatch):
@@ -361,3 +361,53 @@ def test_a_confirm_that_fails_part_way_leaves_nothing_behind(tmp_path):
     path.write_text(CONFIRM_XML, encoding="utf-8")
     result = ingest_confirms(conn, path, base_currency="EUR", rate_for=_fixed_rate())
     assert result.trades_inserted == 1
+
+
+def test_a_confirm_stores_its_dates_in_the_forms_the_statement_does(
+    tmp_path, confirm_file,
+):
+    """M3: every reader of these columns was written against the statement's forms.
+
+    py_ibkr turns the statement's `20260924;101659` into `2026-09-24 10:16:59`, and
+    a confirm stored IBKR's compact text as it came. So replay's `epoch_et` read a
+    same-session fill as no time at all, a month filter's `LIKE '2026-09%'` missed
+    it, and the page showed the raw stamp. Compared against the activity row for
+    the SAME execution, so the two forms cannot drift apart again.
+    """
+    from optjournal.clock import epoch_et
+
+    columns = "trade_date, date_time, expiry"
+    confirm_db = connect_migrated(tmp_path / "c.db")
+    ingest_confirms(confirm_db, confirm_file, base_currency="EUR",
+                    rate_for=_fixed_rate())
+    from_confirm = tuple(confirm_db.execute(f"SELECT {columns} FROM trades").fetchone())
+
+    activity = tmp_path / "activity-20260925T050000Z.xml"
+    activity.write_text(ACTIVITY_XML, encoding="utf-8")
+    activity_db = connect_migrated(tmp_path / "a.db")
+    ingest_file(activity_db, activity)
+    from_activity = tuple(
+        activity_db.execute(f"SELECT {columns} FROM trades").fetchone())
+
+    assert from_confirm == from_activity == (
+        "2026-09-24", "2026-09-24 10:16:59", "2026-10-30")
+    assert epoch_et(from_confirm[1]) is not None
+
+    stored = confirm_db.execute(
+        "SELECT from_date, to_date, when_generated FROM statements").fetchone()
+    assert tuple(stored) == ("2026-09-24", "2026-09-24", "2026-09-24 11:12:00")
+    statement = activity_db.execute(
+        "SELECT from_date, when_generated FROM statements").fetchone()
+    assert tuple(statement) == ("2026-09-24", "2026-09-25 05:00:00"), (
+        "the statement's own forms moved; the confirm must follow them"
+    )
+
+
+def test_a_date_the_parser_cannot_read_is_kept_as_sent(tmp_path):
+    """Normalising must not lose a value: an unreadable one stays as IBKR wrote it."""
+    path = tmp_path / "confirm-odd.xml"
+    path.write_text(CONFIRM_XML.replace('expiry="20261030"', 'expiry="2026-10"'),
+                    encoding="utf-8")
+    _account, fill = parse_confirms(path, rate_for=lambda c: 1.0)[0]
+    assert fill.expiry == "2026-10"
+    assert fill.trade_date == "2026-09-24"

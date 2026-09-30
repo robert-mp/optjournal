@@ -845,6 +845,62 @@ def _repair_base_commission(conn: sqlite3.Connection) -> int:
     return len(rows)
 
 
+#: IBKR's compact forms, as SQLite GLOB patterns: `20260924` and `20260924;101659`.
+_COMPACT_DAY = "[0-9]" * 8
+_COMPACT_STAMP = _COMPACT_DAY + ";" + "[0-9]" * 6
+
+
+def _iso_day_sql(column: str) -> str:
+    return (f"substr({column}, 1, 4) || '-' || substr({column}, 5, 2) || '-' ||"
+            f" substr({column}, 7, 2)")
+
+
+def _iso_stamp_sql(column: str) -> str:
+    return (f"{_iso_day_sql(column)} || ' ' || substr({column}, 10, 2) || ':' ||"
+            f" substr({column}, 12, 2) || ':' || substr({column}, 14, 2)")
+
+
+#: Every column a Trade Confirmation wrote in IBKR's compact form before
+#: `confirms._date` existed: (table, column, pattern, rewrite, scope).
+_COMPACT_DATE_COLUMNS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("trades", "trade_date", _COMPACT_DAY, _iso_day_sql("trade_date"),
+     f"source_kind = '{CONFIRM_SOURCE}'"),
+    ("trades", "date_time", _COMPACT_STAMP, _iso_stamp_sql("date_time"),
+     f"source_kind = '{CONFIRM_SOURCE}'"),
+    ("trades", "expiry", _COMPACT_DAY, _iso_day_sql("expiry"),
+     f"source_kind = '{CONFIRM_SOURCE}'"),
+    ("statements", "from_date", _COMPACT_DAY, _iso_day_sql("from_date"), "1"),
+    ("statements", "to_date", _COMPACT_DAY, _iso_day_sql("to_date"), "1"),
+    ("statements", "when_generated", _COMPACT_STAMP,
+     _iso_stamp_sql("when_generated"), "1"),
+    ("journal_entries", "opened_on", _COMPACT_DAY, _iso_day_sql("opened_on"), "1"),
+)
+
+
+def _normalise_confirm_dates(conn: sqlite3.Connection) -> int:
+    """Rewrite confirm dates stored as `20260924` into the statement's `2026-09-24`.
+
+    A confirm used to be stored with IBKR's compact text while every Activity
+    Statement row, parsed by py_ibkr, is ISO. Every reader was written against
+    the ISO form, so the compact rows were dropped by replay, missed by a
+    month filter and printed raw. `confirms._date` fixes new rows; this fixes
+    the ones already written, including the statements rows the confirms
+    opened and the journal entries that took their `opened_on` from a confirm.
+
+    Self-terminating like the backfills: it touches only values still in the
+    compact form, which no parsed row is. Trades are scoped to confirm rows so a
+    hand-built activity row is never rewritten. Returns rows changed.
+    """
+    changed = 0
+    for table, column, pattern, rewrite, scope in _COMPACT_DATE_COLUMNS:
+        cur = conn.execute(
+            f"UPDATE {table} SET {column} = {rewrite}"
+            f" WHERE {column} GLOB '{pattern}' AND {scope}"
+        )
+        changed += cur.rowcount
+    return changed
+
+
 #: The tables whose identity was IBKR's own numbering, and the key each needs
 #: once a second broker exists. One entry per table, so the rebuild below is
 #: written once: `trades` needed it first and the other two need it for exactly
@@ -1201,6 +1257,7 @@ def _migrate_unlocked(conn: sqlite3.Connection) -> int:
     # repair's WHERE compares ib_commission_currency, so on a journal that has
     # not been backfilled yet there is nothing for it to find.
     _repair_base_commission(conn)
+    _normalise_confirm_dates(conn)
     row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
     current = row["v"] if row and row["v"] is not None else 0
     if current < SCHEMA_VERSION:
