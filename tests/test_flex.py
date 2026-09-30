@@ -966,15 +966,18 @@ def _drain(release: threading.Event) -> None:
     """Answer every stuck keyring call and wait for it to return.
 
     The calls are shared by every reader in the process, so one still pending
-    when the next test starts would hand that test this test's answer.
+    when the next test starts would hand that test this test's answer, and a
+    write finishing late would count as a save made during it.
     """
     import time
 
     release.set()
     deadline = time.monotonic() + 5
-    while (any(t.name == "keyring-read" for t in threading.enumerate())
+    while (any(t.name.startswith("keyring-") for t in threading.enumerate())
            and time.monotonic() < deadline):
         time.sleep(0.01)
+    assert not any(t.name.startswith("keyring-") for t in threading.enumerate()), (
+        "a keyring call outlived its test")
 
 
 def test_a_keychain_that_does_not_answer_raises_within_the_deadline(monkeypatch):
