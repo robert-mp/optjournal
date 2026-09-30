@@ -162,8 +162,12 @@ class Campaign:
     #: own `fill_parts`, so the division is `history._through_zero`'s and not a
     #: second reading of it. Empty for every campaign that shares no leg, which
     #: is all of them on either journal today.
+    #:
+    #: `hash=False` because a mapping is not hashable and this dataclass is
+    #: frozen, so including it would turn `hash(campaign)` from working into a
+    #: TypeError. Equality still reads it.
     leg_parts: Mapping[tuple[str, str], tuple[float, str]] = field(
-        default_factory=dict)
+        default_factory=dict, hash=False)
 
     @property
     def anchor(self) -> str | None:
