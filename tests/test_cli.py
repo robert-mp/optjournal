@@ -639,3 +639,50 @@ def test_watch_refuses_setting_and_clearing_a_note_at_once(tmp_path):
     db = tmp_path / "watch.db"
     with pytest.raises(SystemExit):
         main(["watch", "DELL", "--note", "x", "--clear-note", "--db", str(db)])
+
+
+def _fake_keyring(monkeypatch) -> list[str]:
+    """No token stored, and writes captured: the suite never touches the real one."""
+    import keyring  # noqa: PLC0415 - local to the setup tests
+
+    wrote: list[str] = []
+    monkeypatch.setattr(keyring, "get_password", lambda service, account: None)
+    monkeypatch.setattr(keyring, "set_password",
+                        lambda service, account, token: wrote.append(token))
+    return wrote
+
+
+def _setup(monkeypatch, home) -> int:
+    import io  # noqa: PLC0415 - local to the setup tests
+
+    monkeypatch.setenv("OPTJOURNAL_HOME", str(home))
+    monkeypatch.setattr("sys.stdin", io.StringIO("123456789012345\n"))
+    return main(["setup", "--query-id", "1591754", "--token-stdin", "--no-verify"])
+
+
+def test_setup_on_a_fresh_machine_stores_the_token_and_the_query_id(
+    tmp_path, monkeypatch,
+):
+    """H8: the README's first step, on a machine whose journal folder does not
+    exist yet. Both halves must land."""
+    from optjournal import settings  # noqa: PLC0415 - local to this test
+
+    wrote = _fake_keyring(monkeypatch)
+    home = tmp_path / "Application Support" / "optjournal"
+    assert _setup(monkeypatch, home) == 0
+    assert wrote == ["123456789012345"]
+    assert settings.query_id(root=home) == "1591754"
+
+
+def test_setup_stores_no_token_when_the_query_id_cannot_be_saved(
+    tmp_path, monkeypatch, capsys,
+):
+    """H8: a settings write that fails must not leave the token stored and the
+    query id lost, which is a half-configured journal that says it is set up.
+    The query id is saved first, so a failure there stores nothing."""
+    wrote = _fake_keyring(monkeypatch)
+    blocker = tmp_path / "a-file"
+    blocker.write_text("", encoding="utf-8")
+    assert _setup(monkeypatch, blocker / "optjournal") == 1
+    assert wrote == [], "the token was stored although the query id was not"
+    assert "Nothing was stored" in capsys.readouterr().err

@@ -873,7 +873,13 @@ def cmd_serve(args) -> int:
     # file) so `serve`, `sync` and the cron cannot each carry their own version
     # of it -- and the STORED step is the one a launchd agent can actually see,
     # which the environment channel above never was.
-    query_id = None if args.demo else settings.query_id(args.query_id)
+    #
+    # ONLY THE OVERRIDE is handed over, never the stored step. Resolving the whole
+    # precedence here froze the stored id into the server and the scheduler for
+    # the life of the process: an id saved in Settings later never reached the Run
+    # button or the scheduled sync, and the page called the startup id an
+    # override. The server and each job run read the stored step themselves.
+    query_id = None if args.demo else settings.query_id_override(args.query_id)
     # A ROTATING LOG, FOR SERVE ONLY. This is the long-lived process -- the one
     # whose reconciler logs every tick -- and macOS rotates nothing for a launchd
     # agent's stdout, so a supervised `serve` would otherwise append to one file
@@ -893,6 +899,10 @@ def cmd_serve(args) -> int:
             # demo journal must never fetch anything, and a scheduler pointed at a
             # synthetic archive would spend a real IBKR request to fill it.
             scheduler=bool(args.scheduler) and not args.demo,
+            # And told, because the server resolves the stored query id per
+            # request: `query_id=None` above did not stop a Sync click from
+            # fetching the real statement into the demo.
+            demo=bool(args.demo),
         )
     except ValueError as exc:
         print(f"\n{exc}", file=sys.stderr)
@@ -1150,19 +1160,29 @@ def cmd_setup(args) -> int:
     else:
         token = _prompt_token(bool(stored_token))
 
+    query_id = args.query_id
+    if not query_id and sys.stdin.isatty():
+        shown = f" [{stored_qid}]" if stored_qid else ""
+        query_id = input(f"Flex Query ID{shown}: ").strip() or None
+    # The query id is SAVED FIRST. A settings file that cannot be written (a
+    # folder that could not be made, a read-only home) then stops the run
+    # before the token is stored, rather than after, which would leave a
+    # journal holding a token and no query id while this run exits as failed.
+    if query_id:
+        try:
+            settings.update(query_id=query_id)
+        except OSError as exc:
+            print(f"Could not save the query id to {settings.path_for()}: {exc}\n"
+                  "Nothing was stored. Fix that and run `optjournal setup` again.",
+                  file=sys.stderr)
+            return EXIT_ERROR
+
     if token:
         # Through `flex.write_token`, not `keyring` directly: the settings page
         # writes the same entry, and two callers spelling the service name for
         # themselves is how one of them ends up storing a token the other cannot
         # find. It also strips the newline a pasted token arrives with.
         write_token(token, account)
-
-    query_id = args.query_id
-    if not query_id and sys.stdin.isatty():
-        shown = f" [{stored_qid}]" if stored_qid else ""
-        query_id = input(f"Flex Query ID{shown}: ").strip() or None
-    if query_id:
-        settings.update(query_id=query_id)
 
     effective_qid = settings.query_id(query_id)
     have_token = bool(token or stored_token)
@@ -1551,8 +1571,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("serve", parents=[common],
                        help="local web UI (loopback only, no auth)")
     p.add_argument("--query-id", dest="query_id",
-                   help="Flex Query ID; falls back to $OPTJOURNAL_QUERY_ID. "
-                        "Without either, the Sync button is disabled and the "
+                   help="Flex Query ID; falls back to $OPTJOURNAL_QUERY_ID, "
+                        "then to the one saved in Settings, read per request. "
+                        "With none, the Sync button is disabled and the "
                         "scheduled sync job fails")
     p.add_argument("--port", type=int, default=8765, help="default: 8765")
     p.add_argument("--host", default="127.0.0.1",

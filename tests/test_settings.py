@@ -8,10 +8,12 @@ whose entire job is a file beside the code.
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
 from optjournal import settings
+from optjournal.locks import locked
 
 
 def test_an_absent_file_reads_as_no_preferences(tmp_path):
@@ -84,7 +86,7 @@ def test_an_unknown_key_is_refused_at_the_call_site(tmp_path):
 def test_a_write_leaves_no_temporary_file_behind(tmp_path):
     """The atomic write renames its staging file, it does not leave it.
 
-    A stray `.optjournal.tmp` is gitignored, but a leftover would also mean the
+    A stray `.optjournal.*.tmp` is gitignored, but a leftover would also mean the
     rename never happened -- which is the case where a crash could have left
     truncated JSON where valid settings were, and `read` would fail OPEN on the
     wreckage and silently reset every preference.
@@ -111,6 +113,25 @@ def test_the_query_id_precedence_is_argument_then_environment_then_stored(
     monkeypatch.setenv("OPTJOURNAL_QUERY_ID", "from-env")
     assert settings.query_id(root=tmp_path) == "from-env", "env beats the file"
     assert settings.query_id("typed", root=tmp_path) == "typed", "argument wins"
+
+
+def test_the_override_is_the_argument_or_the_environment_never_the_file(
+    tmp_path, monkeypatch,
+):
+    """M10: what `serve` freezes for its lifetime must leave out the stored id,
+    which the settings page changes while it runs. `query_id_source` names the
+    step that answers, and an override holding the file's own value is still an
+    override: saving a different id would not take effect."""
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    assert settings.query_id_source(root=tmp_path) == "unset"
+    settings.update(tmp_path, query_id="stored")
+    assert settings.query_id_override() is None
+    assert settings.query_id_source(root=tmp_path) == "stored"
+    assert settings.query_id_override("typed") == "typed"
+    assert settings.query_id_source("stored", root=tmp_path) == "override"
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", " stored ")
+    assert settings.query_id_override() == "stored"
+    assert settings.query_id_source(root=tmp_path) == "override"
 
 
 def test_a_blank_value_is_absence_at_every_level(tmp_path, monkeypatch):
@@ -219,3 +240,65 @@ def test_dev_is_a_writable_key_so_update_does_not_refuse_it(tmp_path):
     not be is writable over HTTP -- that is `web`'s concern, tested there."""
     settings.update(root=tmp_path, dev=True)
     assert settings.read(root=tmp_path).get("dev") is True
+
+
+def test_the_first_save_on_a_fresh_machine_creates_the_folder(tmp_path):
+    """H8: `optjournal setup` is the README's first step, and on a fresh machine
+    the per-user folder does not exist yet. The save must create it rather than
+    fail on the staging file inside a directory nobody made."""
+    home = tmp_path / "Library" / "Application Support" / "optjournal"
+    settings.update(home, query_id="1591754")
+    assert settings.query_id(root=home) == "1591754"
+
+
+def test_concurrent_saves_keep_every_value(tmp_path):
+    """M23: the settings page saves each field on its own request, so two saves
+    can overlap. Each read-merge-write must see the other's result, and neither
+    may fail on a staging file the other already renamed away."""
+    values = {"query_id": "111111", "confirm_query_id": "222222",
+              "scoring": "contract", "tiles": ["net_pnl"]}
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(len(values))
+
+    def save(key: str) -> None:
+        barrier.wait()
+        try:
+            for _ in range(25):
+                settings.update(tmp_path, **{key: values[key]})
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save, args=(k,)) for k in values]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert settings.read(tmp_path) == values
+    assert not list(tmp_path.glob("*.tmp")), "a staging file was left behind"
+
+
+def test_a_save_waits_for_another_process_holding_the_settings_lock(tmp_path):
+    """M23, the cross-process half: the lock is an OS file lock, so a second
+    process (a `setup` run while `serve` saves) waits instead of interleaving.
+    Two opens of one file conflict even inside one process, which is what lets
+    a thread stand in for the other process here."""
+    with locked(settings.lock_path(tmp_path)):
+        writer = threading.Thread(
+            target=lambda: settings.update(tmp_path, scoring="contract"))
+        writer.start()
+        writer.join(0.3)
+        assert writer.is_alive(), "the save did not wait for the lock holder"
+        assert settings.read(tmp_path) == {}
+    writer.join(5)
+    assert settings.read(tmp_path) == {"scoring": "contract"}
+
+
+def test_a_byte_order_mark_does_not_hide_the_settings(tmp_path):
+    """L23: Windows Notepad saves UTF-8 with a BOM. Reading that as damage would
+    show every setting as unset, and the next save would then wipe them."""
+    settings.path_for(tmp_path).write_text(
+        '﻿{"query_id": "1591754", "scoring": "contract"}', encoding="utf-8")
+    assert settings.read(tmp_path) == {"query_id": "1591754", "scoring": "contract"}
+    settings.update(tmp_path, tiles=["net_pnl"])
+    assert settings.read(tmp_path)["query_id"] == "1591754"

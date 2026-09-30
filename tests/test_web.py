@@ -38,6 +38,7 @@ from optjournal.db import connect, migrate, open_journal
 from optjournal.history import build_history
 from optjournal.stats import campaigns_for
 from optjournal.web import (
+    _host_is_self,
     _origin_is_same,
     build_state,
     companion_html,
@@ -1118,23 +1119,24 @@ def test_sync_response_shape_matches_what_the_page_reads():
 
     Reads BOTH functions on the path, because the reply is assembled by two: the
     success keys come from `sync_journal` (the one sync path, shared with
-    `optjournal sync` and the `sync` job) and the refusal shapes from `_do_sync`,
-    which exists precisely to turn its two typed exceptions into an HTTP body.
-    Reading only the endpoint stopped covering the success keys the moment they
-    moved -- caught here, which is the whole reason both are named.
+    `optjournal sync` and the `sync` job) and the refusal shapes from `_do_sync`
+    and `_sync_refusal`, which exist precisely to turn its typed exceptions into
+    an HTTP body. Reading only the endpoint stopped covering the success keys the
+    moment they moved (caught here), which is the whole reason all are named.
     """
     import inspect
 
     from optjournal.web import (  # noqa: PLC0415 - private by design
         _do_sync,
+        _sync_refusal,
         sync_journal,
     )
-    src = inspect.getsource(sync_journal) + inspect.getsource(_do_sync)
+    endpoint = inspect.getsource(_do_sync) + inspect.getsource(_sync_refusal)
+    src = inspect.getsource(sync_journal) + endpoint
     for key in ("new_trades", "new_cash", "reused_archive", "warnings", "kind", "ok"):
         assert f'"{key}"' in src, f"/api/sync no longer returns {key!r}"
     # The refusal shapes are the endpoint's own, and the page renders a countdown
     # off `retry_after_s` as a number.
-    endpoint = inspect.getsource(_do_sync)
     for key in ("cooldown", "retry_after_s", "config"):
         assert f'"{key}"' in endpoint, (
             f"/api/sync no longer distinguishes {key!r}, so the page cannot tell a "
@@ -1709,6 +1711,12 @@ def test_serve_refuses_non_loopback(host, tmp_path, monkeypatch):
     "http://127.0.0.1:8799",
     "http://localhost:8799",
     "http://127.0.0.1",           # port 80: a different origin from 8765
+    # L26: OTHER LOOPBACK ADDRESSES on the same port. This server binds IPv4
+    # 127.0.0.1, so a page from `[::1]:8765` or `127.0.0.2:8765` was served by a
+    # different process that bound the same port number there.
+    "http://[::1]:8765",
+    "http://127.0.0.2:8765",
+    "https://127.0.0.1:8765",     # this server speaks http only
 ])
 def test_a_cross_origin_post_is_refused(origin):
     """Binding loopback stops the network, not your own browser.
@@ -1740,11 +1748,11 @@ def test_a_cross_origin_post_is_refused(origin):
 
 @pytest.mark.parametrize("origin", [
     "http://127.0.0.1:8765",
-    # The SAME server under its other names. A browser sends whichever was typed,
-    # so string equality against the bound host would refuse the page its own
-    # journal served -- which is why both sides go through `_is_loopback`.
+    # The SAME server under the name a reader may type instead. A browser sends
+    # whichever was typed, so equality against the bound host alone would refuse
+    # the page its own journal served.
     "http://localhost:8765",
-    "http://[::1]:8765",
+    "HTTP://LOCALHOST:8765",
     None,        # curl, the CLI: not a browser, so not the threat model
 ])
 def test_the_pages_own_origin_may_write(origin):
@@ -1759,6 +1767,79 @@ def test_the_pages_own_origin_may_write(origin):
     returned 400 (no query id configured), not 403, so it passed the guard.
     """
     assert _origin_is_same(origin, host="127.0.0.1", port=8765)
+
+
+def test_a_journal_bound_elsewhere_on_loopback_accepts_its_own_origin():
+    """`serve --host 127.0.0.2` serves pages whose origin is that address."""
+    assert _origin_is_same("http://127.0.0.2:8765", host="127.0.0.2", port=8765)
+    assert not _origin_is_same("http://127.0.0.1:8765", host="127.0.0.2", port=8765)
+
+
+# --- the Host header (DNS rebinding) ----------------------------------------
+
+
+@pytest.mark.parametrize("host", [
+    "127.0.0.1:8765", "localhost:8765", "LOCALHOST:8765", "[::1]:8765",
+])
+def test_a_request_naming_this_server_is_served(host):
+    assert _host_is_self(host, host="127.0.0.1", port=8765)
+
+
+@pytest.mark.parametrize("host", [
+    # DNS REBINDING: a name the attacker controls, re-pointed at 127.0.0.1 after
+    # the page loaded. Same origin to the browser, so it reads every reply.
+    "attacker.example:8765",
+    "127.0.0.1.evil.com:8765",
+    "localhost.evil.com:8765",
+    "127.0.0.1:8799",
+    "127.0.0.1",                  # port 80
+    "evil@127.0.0.1:8765",
+    "",
+    None,
+])
+def test_a_request_naming_another_host_is_refused(host):
+    """H5: the Origin guard covered POSTs, and nothing covered the Host, so a
+    rebinding page read /api/state (the whole account) with a plain GET."""
+    assert not _host_is_self(host, host="127.0.0.1", port=8765)
+
+
+def test_a_journal_bound_elsewhere_on_loopback_answers_to_that_address():
+    """`serve --host 127.0.0.2` is reached as 127.0.0.2, so that name is served."""
+    assert _host_is_self("127.0.0.2:8765", host="127.0.0.2", port=8765)
+
+
+def _raw(base: str, request: bytes) -> tuple[int, dict]:
+    """Send one hand-written request, so the Host header is ours to choose."""
+    import urllib.parse  # noqa: PLC0415 - local to this helper
+
+    parts = urllib.parse.urlsplit(base)
+    with socket.create_connection((parts.hostname, parts.port), timeout=10) as sock:
+        sock.sendall(request)
+        data = b""
+        while chunk := sock.recv(65536):
+            data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    return int(head.split()[1]), json.loads(body)
+
+
+def test_a_rebinding_page_can_neither_read_nor_write(tmp_path):
+    """H5 end to end: the Host is checked before any route, GET or POST."""
+    db = tmp_path / "j.db"
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        for request in (
+            b"GET /api/state HTTP/1.1\r\nHost: attacker.example:8765\r\n"
+            b"Connection: close\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n",
+            b"POST /api/settings HTTP/1.1\r\nHost: attacker.example\r\n"
+            b"Content-Type: application/json\r\nContent-Length: 22\r\n"
+            b"Connection: close\r\n\r\n{\"scoring\":\"contract\"}",
+        ):
+            status, reply = _raw(base, request)
+            assert (status, reply["kind"]) == (403, "host"), request
+        # The client every other test uses sends `Host: 127.0.0.1:<port>`.
+        status, _state = _get(base, "/api/state")
+    assert status == 200
+    assert web.prefs.read().get("scoring") is None, "a refused POST was stored"
 
 
 def test_the_origin_guard_runs_before_every_route_so_new_endpoints_inherit_it():
@@ -1981,6 +2062,83 @@ def test_a_refused_date_writes_nothing_at_all(tmp_path):
     assert _watch_row(db) == {"note": "keep me", "earnings_on": None}
 
 
+def _alerts(db: Path, symbol: str = "AMD") -> tuple:
+    """The stored alert levels and their SQLite storage classes."""
+    conn = connect(db)
+    try:
+        return tuple(conn.execute(
+            "SELECT alert_above, typeof(alert_above), alert_below,"
+            " typeof(alert_below) FROM watchlist WHERE symbol = ?", (symbol,)
+        ).fetchone())
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("typed", ["1_000", "١٢٣", "１２３", "8٠0"])
+def test_an_alert_level_is_refused_unless_it_is_ascii(tmp_path, typed):
+    """L29: `float()` reads "1_000" and other scripts' digits, SQLite does not, so
+    the level was stored as TEXT and the alert could never fire."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, reply = _post(base, "/api/watchlist",
+                              {"symbol": "AMD", "alert_above": typed})
+    assert (status, reply["kind"]) == (400, "alert")
+    assert _watch_row(db) == {}, "a refused level was stored anyway"
+
+
+def test_an_alert_level_is_stored_as_a_number(tmp_path):
+    """L29: what is stored is the parsed level, never the typed text."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, _ = _post(base, "/api/watchlist",
+                          {"symbol": "AMD", "alert_above": "1e3", "alert_below": "650.5"})
+    assert status == 200
+    assert _alerts(db) == (1000.0, "real", 650.5, "real")
+
+
+@pytest.mark.parametrize(("first", "second"), [
+    # Both sides in one request.
+    ({}, {"alert_above": "100", "alert_below": "900"}),
+    ({}, {"alert_above": "500", "alert_below": "500"}),
+    # One side against the level already stored for the other.
+    ({"alert_below": "900"}, {"alert_above": "100"}),
+    ({"alert_above": "100"}, {"alert_below": "900"}),
+])
+def test_an_inverted_alert_pair_is_refused(tmp_path, first, second):
+    """L30: above 100 and below 900 is crossed at every price, so the bell would
+    ring forever. The pair is judged with whatever the other side already
+    holds, because the page saves one row's two boxes together but a request
+    may carry only one."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        if first:
+            assert _post(base, "/api/watchlist", {"symbol": "AMD", **first})[0] == 200
+        before = _alerts(db) if first else None
+        status, reply = _post(base, "/api/watchlist", {"symbol": "AMD", **second})
+    assert (status, reply["kind"]) == (400, "alert")
+    assert (_alerts(db) if first else _watch_row(db)) == (before if first else {})
+
+
+def test_clearing_one_alert_side_is_never_refused_as_inverted(tmp_path):
+    """The other direction: an empty box clears its side whatever the other
+    holds, so an old inverted pair can always be undone."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        _post(base, "/api/watchlist",
+              {"symbol": "AMD", "alert_above": "900", "alert_below": "100"})
+        status, _ = _post(base, "/api/watchlist", {"symbol": "AMD", "alert_above": ""})
+    assert status == 200
+    assert _alerts(db) == (None, "null", 100.0, "real")
+
+
 def test_an_oversized_body_is_refused_rather_than_read(populated):
     """`rfile.read` on a client-chosen Content-Length is an unbounded allocation.
 
@@ -2051,6 +2209,34 @@ def test_nothing_this_server_sends_is_cacheable():
     src = inspect.getsource(_Handler._send)
     assert "Cache-Control" in src, "responses no longer forbid caching"
     assert "no-store" in src
+
+
+def test_no_response_of_this_server_can_be_framed(tmp_path):
+    """M22: a page in another tab could load the journal in an invisible frame
+    and click Update or "Use this journal" for you; the framed page's own POSTs
+    carry its own Origin, so the Origin guard passes them. Refused by both the
+    CSP directive and the older header, on every response."""
+    import urllib.error  # noqa: PLC0415 - local to this test
+    import urllib.request  # noqa: PLC0415
+
+    db = tmp_path / "j.db"
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        for path in ("/", "/companion", "/static/app.css", "/api/missing"):
+            try:
+                with urllib.request.urlopen(f"{base}{path}", timeout=10) as response:  # noqa: S310
+                    headers = response.headers
+            except urllib.error.HTTPError as exc:
+                headers = exc.headers
+            assert headers["X-Frame-Options"] == "DENY", path
+            assert "frame-ancestors 'none'" in headers["Content-Security-Policy"], path
+
+
+def test_the_companion_is_a_window_not_a_frame():
+    """The other side of M22: `frame-ancestors 'none'` also refuses a frame of
+    the journal's own, so the Broker Companion must stay a real window."""
+    assert "window.open(companionUrl()" in _js().replace(" ", "")
+    for doc in (page_html(), companion_html()):
+        assert "<iframe" not in doc and "<frame" not in doc
 
 
 def test_dashboard_friction_is_split_by_scope(state):
@@ -5861,6 +6047,112 @@ def test_the_locked_database_guard_covers_every_post_route_not_just_one():
     ), "the guard is duplicated inside the router as well as around it"
 
 
+def test_only_a_busy_database_is_reported_as_locked(tmp_path):
+    """L28: every OperationalError used to answer 503 "locked, try again", so a
+    journal on a read-only volume told the reader to wait for something that
+    would never change. Only SQLITE_BUSY and SQLITE_LOCKED are "locked"; the
+    rest are a 500 that carries SQLite's own words."""
+    import os  # noqa: PLC0415 - local to this test
+
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    files = [db, *tmp_path.glob("j.db-*")]
+    for path in files:
+        os.chmod(path, 0o444)
+    try:
+        with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+            status, reply = _post(base, "/api/watchlist", {"symbol": "SPY", "note": "x"})
+    finally:
+        for path in files:
+            os.chmod(path, 0o644)
+    assert (status, reply["kind"]) == (500, "database")
+    assert "readonly" in reply["message"]
+
+
+def _raw_for(base: str, head: bytes, body: bytes = b"") -> tuple[int, dict]:
+    """`_raw` with this server's own Host, for a request urllib will not send."""
+    port = base.rsplit(":", 1)[1].encode()
+    length = f"Content-Length: {len(body)}\r\n".encode() if body else b""
+    return _raw(base, head + b"\r\nHost: 127.0.0.1:" + port + b"\r\n" + length
+                + b"Connection: close\r\n\r\n" + body)
+
+
+def _post_bytes(base: str, path: str, body: bytes) -> tuple[int, dict]:
+    """A POST whose body is not JSON we built, so it can be malformed on purpose."""
+    import urllib.error  # noqa: PLC0415 - local to this helper
+    import urllib.request  # noqa: PLC0415
+
+    request = urllib.request.Request(f"{base}{path}", method="POST", data=body,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_no_malformed_request_ends_with_an_empty_reply(tmp_path):
+    """L27: each of these escaped its handler, and `BaseHTTPRequestHandler`
+    then closes the connection with no reply at all."""
+    db = tmp_path / "j.db"
+    with open_journal(db):
+        pass
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        # 60,000 `[` fits the journal endpoint's larger cap, and json.loads
+        # raises RecursionError on it, which is not a ValueError.
+        status, reply = _post_bytes(base, "/api/journal", b"[" * 60000)
+        assert (status, reply["kind"]) == (400, "anchor")
+        # An integer SQLite cannot bind raises OverflowError, not ValueError.
+        status, reply = _get(base, "/api/jobs/run?id=99999999999999999999")
+        assert (status, reply["kind"]) == (404, "missing")
+        # A NUL byte makes `Path.resolve` raise.
+        status, reply = _raw_for(base, b"GET /static/app.css\x00.js HTTP/1.1")
+        assert (status, reply["error"]) == (404, "not found")
+
+
+@pytest.mark.parametrize("download", ["html", "truncated"])
+def test_a_download_that_is_not_a_release_is_a_502(populated, monkeypatch, download):
+    """L27: a non-zip body raises BadZipFile and a cut-off one IncompleteRead,
+    neither an OSError, so the Update button got no reply."""
+    import http.client  # noqa: PLC0415 - local to this test
+
+    from optjournal import updates  # noqa: PLC0415
+
+    def get(url, *, limit):
+        if download == "truncated":
+            raise http.client.IncompleteRead(b"PK\x03\x04")
+        return b"<html>GitHub is having a bad day</html>"
+
+    monkeypatch.setattr(updates, "latest_release", lambda: updates.Release(
+        version="9.9.9", notes="", page_url="", zip_url="https://x/y.zip"))
+    monkeypatch.setattr(updates, "cannot_apply", lambda root=None: None)
+    monkeypatch.setattr(updates, "_get", get)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/update")
+    assert (status, reply["kind"]) == (502, "download")
+
+
+def test_an_unexpected_error_is_a_json_500_on_both_verbs(tmp_path, monkeypatch):
+    """L27, the last resort: whatever a handler did not foresee still answers,
+    so the page shows the cause instead of "Failed to fetch"."""
+    def boom(*_a, **_k):
+        raise RuntimeError("something nobody planned for")
+
+    monkeypatch.setattr(web, "fetch_quote", boom)
+    monkeypatch.setattr(web, "fetch_iv_rank", boom)
+    monkeypatch.setattr(web, "fetch_events", boom)
+    db = tmp_path / "j.db"
+    with open_journal(db) as conn:
+        conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('AMD', 'x')")
+        conn.commit()
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        for status, reply in (_get(base, "/api/quotes"),
+                              _post(base, "/api/market/fetch")):
+            assert (status, reply["ok"], reply["kind"]) == (500, False, "internal")
+            assert "something nobody planned for" in reply["message"]
+
+
 def test_serve_ephemeral_never_starts_a_scheduler():
     """A SAFETY PROPERTY, not a preference, and it is about this test suite.
 
@@ -6455,6 +6747,98 @@ def test_a_keyring_that_will_not_answer_reports_it_rather_than_hanging(
     assert "Nothing was stored" in payload["message"]
 
 
+def _get_as(base: str, path: str, **headers: str) -> tuple[int, dict]:
+    """`_get` with request headers of our choosing, such as `Sec-Fetch-Site`."""
+    import urllib.error  # noqa: PLC0415 - local to this helper
+    import urllib.request  # noqa: PLC0415
+
+    request = urllib.request.Request(f"{base}{path}", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+def test_a_get_from_another_site_is_refused_before_it_does_any_work(
+    tmp_path, monkeypatch, site,
+):
+    """M21: `/api/quotes` spends Yahoo, CBOE and Nasdaq requests and writes the
+    journal, and `/api/settings/token` wakes the keyring, so an `<img src>` on
+    any page could trigger them. The browser labels such a request with
+    `Sec-Fetch-Site`, and only this server's own pages (`same-origin`) and a
+    typed URL (`none`) may use the API. `same-site` is refused too: another
+    port on 127.0.0.1 is the same site and a different origin."""
+    import keyring  # noqa: PLC0415 - local to this test
+
+    touched: list[str] = []
+    monkeypatch.setattr(keyring, "get_password",
+                        lambda service, account: touched.append("keyring"))
+    monkeypatch.setattr(web, "fetch_quote",
+                        lambda symbol, **_: touched.append("quote"))
+    db = tmp_path / "j.db"
+    with open_journal(db) as conn:
+        conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('AMD', 'x')")
+        conn.commit()
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        for path in ("/api/quotes", "/api/settings/token", "/api/state",
+                     "/api/update", "/api/jobs/run?id=1"):
+            status, reply = _get_as(base, path, **{"Sec-Fetch-Site": site})
+            assert (status, reply["kind"]) == (403, "origin"), path
+    assert touched == [], f"a refused request still did its work: {touched}"
+
+
+@pytest.mark.parametrize("site", ["same-origin", "none", None])
+def test_the_pages_own_gets_and_non_browsers_are_served(tmp_path, monkeypatch, site):
+    """The other direction: the page's fetches, a typed URL, and curl."""
+    import keyring  # noqa: PLC0415 - local to this test
+
+    monkeypatch.setattr(keyring, "get_password", lambda service, account: "tok")
+    headers = {} if site is None else {"Sec-Fetch-Site": site}
+    with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
+        status, reply = _get_as(base, "/api/settings/token", **headers)
+    assert (status, reply["present"]) == (200, True)
+
+
+def test_a_stuck_keyring_holds_one_thread_however_often_it_is_asked(
+    tmp_path, monkeypatch,
+):
+    """M21: each token check started a new worker thread, and a keychain waiting
+    on an unlock never lets one finish, so 50 checks left 50 threads stuck for
+    the life of the process. A new call now waits on the one still pending
+    instead of starting another, and reports the same "did not answer"."""
+    import threading  # noqa: PLC0415 - local to this test
+
+    import keyring  # noqa: PLC0415
+
+    release = threading.Event()
+    calls: list[int] = []
+
+    def locked_keychain(service, account):
+        calls.append(1)
+        release.wait(10)
+        return "tok"
+
+    monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(keyring, "get_password", locked_keychain)
+    try:
+        with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
+            replies = [_get(base, "/api/settings/token") for _ in range(20)]
+            assert len(calls) == 1, f"{len(calls)} keyring threads were started"
+            assert {(s, r["present"]) for s, r in replies} == {(200, None)}
+            release.set()
+            for _ in range(100):
+                status, reply = _get(base, "/api/settings/token")
+                if reply["present"] is not None:
+                    break
+    finally:
+        release.set()
+    assert (status, reply["present"], len(calls)) == (200, True, 2), (
+        "once the stuck call returned, the next check did not ask again"
+    )
+
+
 def test_the_settings_panel_offers_a_token_field_that_does_not_render_a_value():
     """The page half, pinned where the copy cannot quietly diverge from it.
 
@@ -6569,6 +6953,68 @@ def test_a_refused_sync_from_the_page_is_recorded_too(tmp_path, monkeypatch):
         "SELECT status, detail FROM job_runs ORDER BY id DESC LIMIT 1").fetchone()
     assert row["status"] == "failed"
     assert "credentials:" in row["detail"]
+
+
+def _sync_failures() -> list:
+    from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError  # noqa: PLC0415
+
+    from optjournal.locks import LockTimeout  # noqa: PLC0415
+
+    return [
+        (FlexError("URL Error: [Errno 8] nodename nor servname provided"), 200, "flex"),
+        (FlexRateLimitError("1018: too many requests"), 200, "throttled"),
+        (FlexLockoutError("1019: locked out"), 200, "throttled"),
+        (LockTimeout("another process held .fetch.lock for more than 120s"), 409, "busy"),
+        (RuntimeError("the statement could not be read"), 500, "internal"),
+    ]
+
+
+@pytest.mark.parametrize(("raised", "code", "kind"), _sync_failures(),
+                         ids=["flex", "rate-limit", "lockout", "lock-timeout", "other"])
+def test_every_sync_failure_answers_the_page_and_writes_the_ledger(
+    tmp_path, monkeypatch, raised, code, kind,
+):
+    """M14: `_do_sync` caught a cooldown and the two token errors, so any other
+    FlexError (no network, IBKR rate limit, a lockout) escaped: the page got an
+    empty reply ("TypeError: Failed to fetch") and the ledger got no row. Each
+    now answers in JSON and is recorded, and anything unforeseen is still both."""
+    from conftest import connect_migrated  # noqa: PLC0415
+
+    db = tmp_path / "j.db"
+    connect_migrated(db).close()
+
+    def fail(**_kwargs):
+        raise raised
+
+    monkeypatch.setattr(web, "sync_journal", fail)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path,
+                             query_id="1591754") as base:
+        status, reply = _post(base, "/api/sync")
+    assert (status, reply["ok"], reply["kind"]) == (code, False, kind)
+    assert str(raised) in reply["message"]
+    row = connect_migrated(db).execute(
+        "SELECT job FROM job_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None and row["job"] == "sync", "the failure left no ledger row"
+
+
+def test_a_failed_sync_commits_nothing_it_had_half_written(tmp_path, monkeypatch):
+    """The ledger row is committed on the same connection, so a sync that raised
+    mid-ingest must be rolled back first or the half-written rows land with it."""
+    from conftest import connect_migrated  # noqa: PLC0415
+
+    db = tmp_path / "j.db"
+    connect_migrated(db).close()
+
+    def half(*, conn, **_kwargs):
+        conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('HALF', 'x')")
+        raise RuntimeError("the statement could not be read")
+
+    monkeypatch.setattr(web, "sync_journal", half)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path,
+                             query_id="1591754") as base:
+        _post(base, "/api/sync")
+    assert connect_migrated(db).execute(
+        "SELECT COUNT(*) FROM watchlist WHERE symbol = 'HALF'").fetchone()[0] == 0
 
 
 def test_both_hand_run_sync_paths_record_what_they_did():
@@ -6723,6 +7169,124 @@ def test_the_settings_endpoint_stores_and_clears_the_confirm_query(populated):
             "an empty confirm query id was not stored as absent, so the poll "
             "cannot be turned off from the page"
         )
+
+
+def _capture_sync_job(monkeypatch) -> list:
+    """Replace the `sync` job's work with a stub that records its Context."""
+    import dataclasses  # noqa: PLC0415 - local helper
+
+    from optjournal import jobs as mod  # noqa: PLC0415
+
+    seen: list = []
+
+    def run(_conn, ctx):
+        seen.append(ctx)
+        return mod.Outcome("nothing", "stubbed")
+
+    monkeypatch.setattr(mod, "JOBS", tuple(
+        dataclasses.replace(job, run=run) if job.name == "sync" else job
+        for job in mod.JOBS
+    ))
+    return seen
+
+
+def test_a_query_id_saved_while_serving_is_the_one_in_force(
+    tmp_path, monkeypatch,
+):
+    """M10: the stored id was frozen into the server at startup, so after a new
+    one was saved in Settings the Run button still used the old one and the page
+    labelled it an override. Now the payload, the Sync button's id and a hand-run
+    job all resolve the stored step per request."""
+    from optjournal import settings  # noqa: PLC0415 - local to this test
+
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    monkeypatch.setenv(settings.HOME_ENV, str(tmp_path / "home"))
+    settings.update(query_id="111111")
+    seen = _capture_sync_job(monkeypatch)
+    db = tmp_path / "j.db"
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, saved = _post(base, "/api/settings", {"query_id": "222222"})
+        assert (status, saved["query_id"]) == (200, "222222")
+        _, state = _get(base, "/api/state")
+        status, _run = _post(base, "/api/jobs/run", {"job": "sync"})
+    assert (state["settings"]["query_id"], state["settings"]["query_id_source"],
+            state["sync"]["query_id"]) == ("222222", "stored", "222222")
+    assert status == 202
+    assert [ctx.query_id for ctx in seen] == ["222222"]
+
+
+def test_the_demo_never_resolves_a_real_query_id(tmp_path, monkeypatch):
+    """H6: `serve --demo` passed `query_id=None`, but `_effective_query_id` fell
+    back to the stored id, so the demo page showed the real id with Sync
+    enabled, and Sync fetched the real statement into `demo/` and the demo
+    database. Under the demo flag no path resolves one: the payload, the Sync
+    button, and every job that spends an IBKR request."""
+    from optjournal import settings  # noqa: PLC0415 - local to this test
+    from optjournal.jobs import JOBS  # noqa: PLC0415
+
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    monkeypatch.setenv(settings.HOME_ENV, str(tmp_path / "home"))
+    settings.update(query_id="1591754", confirm_query_id="1621016")
+    seen = _capture_sync_job(monkeypatch)
+    monkeypatch.setattr(web, "sync_journal", lambda **kw: pytest.fail(
+        f"the demo reached IBKR with {kw.get('query_id')}"))
+    spending = [job.name for job in JOBS if job.spends_broker_request]
+    assert "sync" in spending and "confirm" in spending
+    with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path,
+                             demo=True) as base:
+        _, state = _get(base, "/api/state")
+        sync_status, sync_reply = _post(base, "/api/sync")
+        runs = {name: _post(base, "/api/jobs/run", {"job": name})
+                for name in spending}
+    assert (state["settings"]["query_id"], state["settings"]["query_id_source"],
+            state["settings"]["confirm_query_id"]) == (None, "unset", None)
+    assert (state["sync"]["query_id"], state["sync"]["configured"]) == (None, False)
+    assert (sync_status, sync_reply["kind"]) == (400, "demo")
+    assert {name: (status, reply["kind"]) for name, (status, reply) in runs.items()} == {
+        name: (400, "demo") for name in spending}
+    assert seen == [], "a job that spends a request ran in the demo"
+
+
+@pytest.mark.parametrize(("flag", "env", "source"), [
+    ("333333", None, "override"),
+    (None, "444444", "override"),
+    # The SAME value as the file is still an override: saving another id in
+    # the page would not take effect, which is what the source is for.
+    ("111111", None, "override"),
+    (None, "111111", "override"),
+    (None, None, "stored"),
+])
+def test_the_page_is_told_which_step_supplied_the_query_id(
+    tmp_path, monkeypatch, flag, env, source,
+):
+    """The source decides whether the Settings field is editable, so it must
+    follow `settings.query_id`'s precedence: a flag or the environment outranks
+    the file, whatever either holds."""
+    from optjournal import settings  # noqa: PLC0415 - local to this test
+
+    monkeypatch.setenv(settings.HOME_ENV, str(tmp_path / "home"))
+    if env is None:
+        monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    else:
+        monkeypatch.setenv("OPTJOURNAL_QUERY_ID", env)
+    settings.update(query_id="111111")
+    with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path,
+                             query_id=flag) as base:
+        _, state = _get(base, "/api/state")
+    assert (state["settings"]["query_id"], state["settings"]["query_id_source"]) == (
+        flag or env or "111111", source)
+
+
+@pytest.mark.parametrize("field", ["query_id", "confirm_query_id"])
+@pytest.mark.parametrize("typed", ["²³", "١٢٣", "１２３", "12³"])
+def test_a_query_id_is_ascii_digits_only(populated, field, typed):
+    """M24: `str.isdigit()` is true for superscripts and other scripts' digits,
+    so "²³" was stored as a query id and enabled Sync, and IBKR can only refuse
+    it. Client Portal shows the id as ASCII digits, and that is the rule."""
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/settings", {field: typed})
+    assert (status, reply["kind"]) == (400, field)
+    assert web.prefs.read().get(field) is None, "a refused id was stored anyway"
 
 
 def test_the_server_and_the_page_agree_on_the_dashboard_tiles():
@@ -7417,6 +7981,92 @@ def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, 
         _, reply = _get(base, "/api/quotes")
     assert calls == ["ZZZQ"], "a failure is stamped, so the day's budget is spent"
     assert reply["earnings_failed"] == []
+
+
+def _stale_earnings_row(db: Path) -> None:
+    """One watched symbol with a fetched date whose check is days old."""
+    with open_journal(db) as conn:
+        conn.execute(
+            "INSERT INTO watchlist (symbol, added_at, earnings_next,"
+            " earnings_confirmed, earnings_timing, earnings_checked_at)"
+            " VALUES ('AMD', '2026-01-01', '2026-10-28', 1, 'after close',"
+            " '2026-01-01T00:00:00+00:00')")
+        conn.commit()
+
+
+def _offline_quotes(monkeypatch) -> None:
+    """The quote and IV-rank halves of /api/quotes, failing without the network."""
+    from optjournal.iv import IvFetchError  # noqa: PLC0415 - local helper
+    from optjournal.marketdata import BarFetchError  # noqa: PLC0415
+
+    def no_quote(symbol, **_):
+        raise BarFetchError("no network in tests")
+
+    def no_rank(symbol, **_):
+        raise IvFetchError("no network in tests")
+
+    monkeypatch.setattr(web, "fetch_quote", no_quote)
+    monkeypatch.setattr(web, "fetch_iv_rank", no_rank)
+
+
+def test_a_nasdaq_error_reply_keeps_the_stored_earnings_date(tmp_path, monkeypatch):
+    """L8: a throttled Nasdaq reply (HTTP 200, `rCode` 429, no data) used to parse
+    as "no earnings" and wipe the stored date for a day. It is a failure now, so
+    the refresh names the symbol and the date on screen stays."""
+    from optjournal import earnings  # noqa: PLC0415 - local to this test
+
+    db = tmp_path / "j.db"
+    _stale_earnings_row(db)
+    _offline_quotes(monkeypatch)
+    monkeypatch.setattr(earnings, "fetch_earnings", lambda symbol, **_: (
+        earnings.parse_earnings({"data": None, "status": {"rCode": 429}})))
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, reply = _get(base, "/api/quotes")
+    assert (status, reply["earnings_failed"]) == (200, ["AMD"])
+    with open_journal(db) as conn:
+        row = conn.execute(
+            "SELECT earnings_next, earnings_confirmed, earnings_timing"
+            " FROM watchlist WHERE symbol = 'AMD'").fetchone()
+    assert tuple(row) == ("2026-10-28", 1, "after close")
+
+
+def test_the_earnings_refresh_holds_no_write_lock_while_it_asks_nasdaq(tmp_path, monkeypatch):
+    """L25: each fetch can take up to 15 s, and the refresh used to UPDATE after
+    the first symbol and commit after the last, so every later fetch ran inside
+    an open write transaction and a watchlist save meanwhile got 503. Probed
+    from inside the fetch: another connection must be able to start a write."""
+    from optjournal import earnings  # noqa: PLC0415 - local to this test
+
+    db = tmp_path / "j.db"
+    with open_journal(db) as conn:
+        for symbol in ("AAA", "BBB", "CCC"):
+            conn.execute("INSERT INTO watchlist (symbol, added_at)"
+                         " VALUES (?, '2026-01-01')", (symbol,))
+        conn.commit()
+    blocked: list[str] = []
+
+    def fetch(symbol, **_):
+        probe = sqlite3.connect(db, timeout=0)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+            probe.rollback()
+        except sqlite3.OperationalError:
+            blocked.append(symbol)
+        finally:
+            probe.close()
+        if symbol == "BBB":
+            raise earnings.EarningsFetchError("BBB earnings: URLError")
+        return earnings.Earnings(day="2026-10-28", confirmed=True, timing=None)
+
+    monkeypatch.setattr(earnings, "fetch_earnings", fetch)
+    with open_journal(db) as conn:
+        failed, asked = web._refresh_earnings(conn, ["AAA", "BBB", "CCC"])
+        rows = {r["symbol"]: (r["earnings_next"], bool(r["earnings_checked_at"]))
+                for r in conn.execute("SELECT * FROM watchlist")}
+    assert blocked == [], f"a fetch ran while the journal was write-locked: {blocked}"
+    assert (failed, asked) == (["BBB"], 3)
+    assert rows == {"AAA": ("2026-10-28", True), "BBB": (None, True),
+                    "CCC": ("2026-10-28", True)}
 
 
 def test_each_job_row_says_how_many_requests_one_run_spends():

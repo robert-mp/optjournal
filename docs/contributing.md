@@ -131,7 +131,9 @@ mirrored rather than imported for that reason, and a test holds the copies to
   cannot have changed. `--force` overrides.
 * `optjournal demo` refuses to write into the real archive or database,
   and `serve --demo --query-id` is refused outright: one Sync click would
-  ingest real trades into the synthetic database.
+  ingest real trades into the synthetic database. A demo server also ignores
+  the stored query ids: Sync, and every job that spends an IBKR request, are
+  refused there.
 * `demo.write_demo_bars` refuses a database holding any statement that is not
   a demo one. Every row in `price_bars` is supposed to be something a source
   really served, so a **computed** bar in the real journal would break the
@@ -142,7 +144,10 @@ mirrored rather than imported for that reason, and a test holds the copies to
   (`marketdata.SOURCE_RANK`), so a genuine fetch always displaces one and never
   the reverse.
 * The server binds loopback only and refuses anything else: no
-  authentication, and the UI exposes an entire brokerage account.
+  authentication, and the UI exposes an entire brokerage account. Binding is
+  not enough against your own browser, so every request must also name this
+  server in `Host` (against DNS rebinding), and every POST must carry this
+  server's `Origin` or none (see `web.py`).
 
 ## Development
 

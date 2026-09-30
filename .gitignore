@@ -37,10 +37,12 @@ raw
 
 # Stored preferences: one person's Flex query id and scoreboard unit. A clone is
 # someone else's journal, and `optjournal setup` writes this in seconds -- see
-# settings.py. The `.tmp` sibling is the atomic-write staging file, which only
-# exists mid-write but would be committable if a write were interrupted.
+# settings.py. The `.tmp` siblings are the atomic-write staging files, which only
+# exist mid-write but would be committable if a write were interrupted, and the
+# `.lock` is the empty sidecar a save locks (see locks.py).
 .optjournal.json
-.optjournal.tmp
+.optjournal*.tmp
+.optjournal.lock
 
 # Derived database. Rebuildable at any time with `optjournal ingest`, and a
 # WAL-mode SQLite file is a poor fit for git regardless -- binary, no useful

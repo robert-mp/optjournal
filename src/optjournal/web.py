@@ -28,6 +28,12 @@ browser, which is the only place it was visible. "Loopback" is not one origin;
 every local port is its own, so anything that can serve a single file locally
 would otherwise have write access.
 
+The Origin check does nothing about READS, and a third attacker reads. A page
+on a domain it controls can re-point that name at 127.0.0.1 (DNS rebinding), and
+its requests are then same-origin to the browser, so every reply is readable.
+What such a request cannot change is its `Host` header, so every route checks
+that `Host` names this server before anything else. See `_host_is_self`.
+
 The page reads a single /api/state payload rather than one endpoint per panel.
 At this data volume the whole journal is a few KB of JSON, so one round trip is
 simpler than five and the panels can never disagree with each other.
@@ -36,6 +42,7 @@ simpler than five and the panels can never disagree with each other.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import http.server
 import ipaddress
 import json
@@ -47,7 +54,9 @@ import signal
 import socket
 import sqlite3
 import threading
+import time
 import urllib.parse
+import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -55,6 +64,8 @@ from datetime import UTC, date, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 
 from optjournal import __version__, install, journal, replay, updates
 from optjournal import earnings as earnings_mod
@@ -105,6 +116,7 @@ from optjournal.jobs import (
 from optjournal.jobs import (
     Context as JobContext,
 )
+from optjournal.locks import LockTimeout
 from optjournal.marketdata import BarFetchError, fetch_quote
 from optjournal.serialize import (
     allocation_data,
@@ -168,6 +180,12 @@ def _is_loopback(host: str) -> bool:
 #: listings, and not enough for a path or a quote. Not a ticker universe:
 #: see `_watchlist_write` on why this journal has no such list.
 _SYMBOL_OK = re.compile(r"^[A-Za-z0-9.\-]+$")
+
+#: A Flex query id as Client Portal shows it: ASCII digits, and not many.
+#: Spelled `[0-9]` rather than `\d` or `str.isdigit()`, both of which also
+#: accept superscripts and other scripts' digits ("²³", "١٢٣") that IBKR can
+#: only refuse.
+_QUERY_ID_OK = re.compile(r"[0-9]{1,32}")
 
 #: How long `/api/settings/token` waits for the OS credential store before
 #: answering "unreadable". Not a guess: `keyring.get_password` was measured on
@@ -251,13 +269,19 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
 
     Returns the symbols whose fetch FAILED, so the reply can say so, and how
     many were asked, so the page knows whether its payload is now stale; a symbol
-    with no earnings (a fund) is an answer and is stored as none. Every asked
-    symbol is stamped, success or not, so a dead endpoint costs one request per
-    symbol per day rather than one per refresh.
+    with no earnings (a fund) is an answer and is stored as none, while a failed
+    fetch keeps the stored date. Every asked symbol is stamped, success or not,
+    so a dead endpoint costs one request per symbol per day rather than one per
+    refresh.
+
+    EVERY FETCH FIRST, THEN EVERY WRITE in one short transaction. A fetch can
+    take up to `earnings._TIMEOUT_S`, and writing after each one held the
+    journal's write lock across the next, so a watchlist save made meanwhile
+    waited out the busy timeout and got a 503.
     """
     now = datetime.now(UTC)
-    failed: list[str] = []
-    asked = 0
+    stamp = now.isoformat(timespec="seconds")
+    due: list[str] = []
     for symbol in symbols:
         row = conn.execute(
             "SELECT earnings_checked_at FROM watchlist WHERE symbol = ?", (symbol,)
@@ -272,25 +296,58 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
                 age = EARNINGS_MAX_AGE_S
             if age < EARNINGS_MAX_AGE_S:
                 continue
-        asked += 1
+        due.append(symbol)
+    failed: list[str] = []
+    found: dict[str, earnings_mod.Earnings | None] = {}
+    for symbol in due:
         try:
-            found = earnings_mod.fetch_earnings(symbol)
+            found[symbol] = earnings_mod.fetch_earnings(symbol)
         except earnings_mod.EarningsFetchError as exc:
             log.debug("earnings %s failed: %s", symbol, exc)
             failed.append(symbol)
+    for symbol in due:
+        if symbol not in found:
             conn.execute("UPDATE watchlist SET earnings_checked_at = ? WHERE symbol = ?",
-                         (now.isoformat(timespec="seconds"), symbol))
+                         (stamp, symbol))
             continue
+        answer = found[symbol]
         conn.execute(
             "UPDATE watchlist SET earnings_next = ?, earnings_confirmed = ?,"
             " earnings_timing = ?, earnings_checked_at = ? WHERE symbol = ?",
-            (found.day if found else None,
-             (1 if found.confirmed else 0) if found else None,
-             found.timing if found else None,
-             now.isoformat(timespec="seconds"), symbol),
+            (answer.day if answer else None,
+             (1 if answer.confirmed else 0) if answer else None,
+             answer.timing if answer else None,
+             stamp, symbol),
         )
     conn.commit()
-    return failed, asked
+    return failed, len(due)
+
+
+def _inverted_alert(conn: sqlite3.Connection, symbol: str,
+                    fields: dict[str, Any]) -> str | None:
+    """Why this alert pair can never be quiet, or None when it can.
+
+    Above 100 and below 900 is crossed at every price, so the bell would ring
+    for ever. Judged with the level already stored for a side the request does
+    not carry, because a request may set one side only. Clearing a side is
+    never refused, so an old inverted pair can always be undone.
+    """
+    stored = conn.execute(
+        "SELECT alert_above, alert_below FROM watchlist WHERE symbol = ?", (symbol,)
+    ).fetchone()
+    pair = []
+    for column in ("alert_above", "alert_below"):
+        value = fields[column] if column in fields else (
+            stored[column] if stored else None)
+        try:
+            pair.append(float(value) if value is not None else None)
+        except (TypeError, ValueError):
+            pair.append(None)
+    above, below = pair
+    if above is None or below is None or above > below:
+        return None
+    return (f"an alert above {above:g} and below {below:g} is crossed at every "
+            f"price: the level above has to be higher than the level below.")
 
 
 def _iv_ranks(symbols: list[str]) -> dict[str, Any]:
@@ -368,21 +425,69 @@ def _origin_is_same(origin: str | None, *, host: str, port: int) -> bool:
     browser. curl and a future CLI are not the threat model; a page in a tab is.
     Refusing `None` would break the former and stop nothing.
 
-    The bound host is compared through `_is_loopback` on BOTH sides rather than by
-    string, so a journal served on `127.0.0.1` accepts its own page loaded as
-    `localhost` -- the same server, and a browser sends whichever name was typed.
-    `http://127.0.0.1.evil.com` still fails, because its hostname is not loopback.
+    THE BOUND ADDRESS OR `localhost`, and nothing else on loopback. A journal
+    served on `127.0.0.1` accepts its own page loaded as `localhost`, the same
+    server under the name a reader may type. It no longer accepts any loopback
+    host, which it used to: the listener is IPv4 on one address, so a page from
+    `http://[::1]:8765` or `http://127.0.0.2:8765` came from a DIFFERENT process
+    that bound the same port number on another address, which is the same hole
+    the port check above closed. Compared as exact strings, so
+    `http://127.0.0.1.evil.com` and a trailing path both fail.
     """
     if origin is None:
         return True
-    parts = urllib.parse.urlsplit(origin)
-    if not parts.hostname or parts.port != port:
+    return origin.strip().lower() in {
+        f"http://{authority}" for authority in _authorities(host, port, "localhost")
+    }
+
+
+#: The names a client may put in `Host` for this server, beside the bound
+#: address itself: every spelling of loopback a reader or a tool could type.
+_HOST_NAMES = ("127.0.0.1", "localhost", "[::1]")
+
+
+def _authorities(host: str, port: int, *names: str) -> set[str]:
+    """`name:port` for the bound host and each of `names`, lower-cased.
+
+    The bare name is included only on port 80, the one port a browser leaves
+    out of a URL's authority.
+    """
+    bound = f"[{host}]" if ":" in host else host
+    every = {bound.lower(), *names}
+    return {f"{name}:{port}" for name in every} | (every if port == 80 else set())
+
+
+def _host_is_self(header: str | None, *, host: str, port: int) -> bool:
+    """Whether a request's `Host` names THIS server, port included.
+
+    DNS REBINDING is what this stops. A page on `attacker.example` re-points
+    that name at 127.0.0.1 once it has loaded, and its script then fetches
+    `http://attacker.example:8765/api/state`: to the browser that is the page's
+    own origin, so the Origin guard never sees it and the reply, the whole
+    account, is readable. Measured before the fix: 200 and 231 KB. The one
+    thing such a request cannot fake is `Host`, which names the attacker's
+    domain, so every route, GET or POST, refuses a Host that is not this
+    server's address or a loopback name on the bound port.
+
+    A missing header is refused too. Unlike `Origin`, every client sends
+    `Host` (HTTP/1.1 requires it, and urllib and curl always do), so its absence
+    is not a way to tell a tool from a browser.
+    """
+    if header is None:
         return False
-    # Loopback-to-loopback rather than equality: 127.0.0.1, localhost and ::1 all
-    # name this server, and which one appears depends on what was typed.
-    if _is_loopback(host):
-        return _is_loopback(parts.hostname)
-    return parts.hostname == host
+    return header.strip().lower() in _authorities(host, port, *_HOST_NAMES)
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    """Whether SQLite raised because another connection holds the journal.
+
+    By the primary result code (the low byte of the extended one), because the
+    wording is SQLite's to change, and BUSY and LOCKED are its only two
+    "someone else has it" answers.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) in (sqlite3.SQLITE_BUSY,
+                                                  sqlite3.SQLITE_LOCKED)
 
 
 def _now() -> str:
@@ -459,8 +564,17 @@ def build_state(
     trade_type: str | None = None,
     cost_scope: list[str] | None = None,
     scoring: str | None = None,
+    query_id_source: str | None = None,
+    demo: bool = False,
 ) -> dict[str, Any]:
     """Everything the page renders, in one JSON-safe payload.
+
+    `query_id` is the id in force and `query_id_source` which step of
+    `settings.query_id`'s precedence supplied it (`settings.query_id_source`).
+    A caller that passes an id without a source resolved it itself, which by
+    that precedence is an argument, so the source defaults to "override".
+    `demo` blanks the confirm query id the same way the handler blanks the
+    statement's: the demo journal shows no real id and fetches with none.
 
     Opens its own connection: sqlite3 objects cannot cross threads and the
     server is threaded, so a shared handle would fail intermittently under the
@@ -754,20 +868,14 @@ def build_state(
     # exported variable outranks the stored setting (see `settings.query_id`), and
     # a form that saved into a value something else overrides is a form that lies
     # about having worked.
-    stored_qid = prefs.read().get("query_id")
-    if query_id and query_id != (str(stored_qid).strip() if stored_qid else None):
-        source = "override"
-    elif query_id:
-        source = "stored"
-    else:
-        source = "unset"
     state["settings"] = {
         "query_id": query_id,
-        "query_id_source": source,
+        "query_id_source": (query_id_source
+                            or ("override" if query_id else "unset")),
         # The intraday query. No `_source` twin: it has no `--confirm-query-id`
         # flag, so the stored value is the only thing that can be in force and a
         # form offering to edit it can never be lying about taking effect.
-        "confirm_query_id": prefs.confirm_query_id(),
+        "confirm_query_id": None if demo else prefs.confirm_query_id(),
         "scoring": state["stats"]["scoring"],
         # The reader's dashboard tiles, or null for the default arrangement.
         "tiles": prefs.tiles(),
@@ -857,36 +965,72 @@ def _do_sync(
 ) -> dict[str, Any]:
     """The `POST /api/sync` reply: `sync_journal` plus this endpoint's own shapes.
 
-    Thin by design. The two `except` clauses are the whole reason it exists: the
+    Thin by design. The `except` clauses are the whole reason it exists: the
     page needs `retry_after_s` as a number to render a countdown, and a cooldown
     is not an error the way a missing token is. `sync_journal` raises so that each
     caller can make that distinction in its own vocabulary.
+
+    EVERY FAILURE ANSWERS AND IS RECORDED. Only the cooldown and the two token
+    errors used to be caught, so any other FlexError (no network, IBKR's rate
+    limit, a lockout) left the page with an empty reply and the ledger with no
+    row. `kind` is `throttled` when IBKR asked for a pause, `flex` for any other
+    refused request, `busy` when another process held the fetch lock past its
+    timeout (the route answers that 409), and `internal` for anything else (500).
+    A failure is ROLLED BACK before its ledger row is committed on the same
+    connection, so a sync that raised mid-ingest cannot commit half a statement.
+    A locked or unwritable journal is re-raised for `do_POST` to answer, since
+    the ledger write would fail the same way.
     """
     with open_journal(db_path) as conn:
         try:
             reply = sync_journal(
                 conn=conn, archive_dir=archive_dir, query_id=query_id, assets=assets,
             )
-        except FetchCooldown as exc:
+        except sqlite3.OperationalError:
+            conn.rollback()
+            raise
+        except Exception as exc:  # noqa: BLE001 - every failure is answered below
+            conn.rollback()
             # RECORDED, not just reported. Until this call existed, a sync from the
             # page wrote no ledger row, so pressing Sync could fix the journal and
             # leave the scheduler's backoff counter exactly where it was.
             record_manual_sync(conn, exc)
-            return {
-                "ok": False,
-                "kind": "cooldown",
-                "retry_after_s": exc.retry_after_s,
-                "message": str(exc),
-            }
-        except (TokenMissing, TokenRejected) as exc:
-            record_manual_sync(conn, exc)
-            return {"ok": False, "kind": "config", "message": str(exc)}
+            return _sync_refusal(exc)
         record_manual_sync(conn, reply)
         return reply
 
 
+def _sync_refusal(exc: Exception) -> dict[str, Any]:
+    """The page's reply for a sync that raised `exc`. See `_do_sync`."""
+    if isinstance(exc, FetchCooldown):
+        return {
+            "ok": False,
+            "kind": "cooldown",
+            "retry_after_s": exc.retry_after_s,
+            "message": str(exc),
+        }
+    if isinstance(exc, TokenMissing | TokenRejected):
+        return {"ok": False, "kind": "config", "message": str(exc)}
+    if isinstance(exc, FlexRateLimitError | FlexLockoutError):
+        return {"ok": False, "kind": "throttled",
+                "message": f"IBKR asked for a pause: {exc}"}
+    if isinstance(exc, FlexError):
+        return {"ok": False, "kind": "flex",
+                "message": f"the Flex request failed: {exc}"}
+    if isinstance(exc, LockTimeout):
+        return {"ok": False, "kind": "busy", "message": str(exc)}
+    log.exception("sync failed")
+    return {"ok": False, "kind": "internal",
+            "message": f"the sync failed: {type(exc).__name__}: {exc}"}
+
+
+#: The HTTP status of a `_do_sync` reply, by kind. The rest answer 200 with
+#: `ok: false`, which is what the page has always read.
+_SYNC_STATUS = {"busy": 409, "internal": 500}
+
+
 def _keyring_call(
-    work: Callable[[], tuple[str, str]],
+    work: Callable[[], tuple[str, str]], busy: threading.Lock,
 ) -> tuple[str, str] | None:
     """Run one keyring operation with a deadline. `None` means it never answered.
 
@@ -903,8 +1047,20 @@ def _keyring_call(
     write that lands after the deadline is reported as a timeout and is still
     stored -- the page's advice, try again, costs nothing in that case.
 
+    ONE WORKER AT A TIME, per server, and that bound is the other half of the
+    daemon choice. A keychain waiting on an unlock never lets its worker
+    finish, so a thread per call leaked one stuck thread per click, or per
+    `<img src>` on a page elsewhere: 50 checks, 50 threads for the life of the
+    process. `busy` is held by the worker until its call returns, so a new
+    call first waits, inside the same deadline, for the one still pending, and
+    answers `None` like any other timeout if it never frees up. The keyring
+    answers one question at a time anyway.
+
     `work` returns its own (kind, message); any exception becomes ('error', str).
     """
+    deadline = time.monotonic() + KEYRING_TIMEOUT_S
+    if not busy.acquire(timeout=KEYRING_TIMEOUT_S):
+        return None
     outcome: list[tuple[str, str]] = []
 
     def run() -> None:
@@ -912,10 +1068,12 @@ def _keyring_call(
             outcome.append(work())
         except Exception as exc:  # pragma: no cover - backend failures
             outcome.append(("error", str(exc)))
+        finally:
+            busy.release()
 
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
-    worker.join(KEYRING_TIMEOUT_S)
+    worker.join(max(0.0, deadline - time.monotonic()))
     return outcome[0] if outcome else None
 
 
@@ -933,13 +1091,24 @@ class ServeConfig:
 
     db_path: Path
     archive_dir: Path
+    #: ONLY an explicit override: `--query-id` or `$OPTJOURNAL_QUERY_ID`
+    #: (`settings.query_id_override`). Never the stored id, which the settings
+    #: page can change while this runs; `_effective_query_id` resolves that per
+    #: request.
     query_id: str | None
     assets: tuple[str, ...]
+    #: Serving the synthetic journal from `optjournal demo`. Nothing may then
+    #: resolve a real query id: not the payload, not Sync, not a job that spends
+    #: an IBKR request. `query_id=None` alone did not do it, because the stored
+    #: id is resolved per request.
+    demo: bool = False
     #: Serialised because two concurrent syncs would each spend an IBKR
     #: request and race on the same archive directory. Lives on the config --
     #: one lock per server -- not on the handler class, where it would be one
     #: lock per process.
     sync_lock: threading.Lock = field(default_factory=threading.Lock)
+    #: Held by the one keyring worker allowed at a time. See `_keyring_call`.
+    keyring_busy: threading.Lock = field(default_factory=threading.Lock)
     #: Set by an update or a journal import: `serve` stops and reports it, and
     #: the launcher starts it again (see `cli.EXIT_RESTART`).
     restart: threading.Event = field(default_factory=threading.Event)
@@ -952,12 +1121,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # Assigned before super().__init__, which handles the request inside
         # the constructor -- stdlib quirk, not a style choice.
         self.cfg = cfg
+        #: Whether a status line has gone out, so `_failed` never sends a
+        #: second response into one that is already half written.
+        self._replied = False
         super().__init__(*args, **kwargs)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         log.debug("%s - %s", self.address_string(), fmt % args)
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self._replied = True
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -982,10 +1155,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # served is not a degraded page but a completely blank one. On a
         # loopback-only, single-user server that is a bad trade. Revisit it if this
         # ever listens on anything but 127.0.0.1.
+        #
+        # NOTHING HERE MAY BE FRAMED, not even by this server's own pages: a page
+        # in another tab could load the journal in an invisible frame and have
+        # you click Update or "Use this journal", and the framed page's POSTs
+        # carry its own Origin, so the Origin guard lets them through.
+        # `frame-ancestors` is the CSP spelling and `X-Frame-Options` the older
+        # one. The Broker Companion is a `window.open` window, not a frame.
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self' 'unsafe-inline'",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
         )
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-Content-Type-Options", "nosniff")
         # NOTHING HERE IS CACHEABLE. The page is read from disk per request and the
         # payload is a live brokerage account, so a cached copy is a stale copy in
@@ -1001,9 +1182,47 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, code: int, payload: Any) -> None:
         self._send(code, json.dumps(payload, default=str).encode(), "application/json")
 
+    def _failed(self, exc: Exception) -> None:
+        """The last resort: an exception no route caught still gets a JSON 500.
+
+        `BaseHTTPRequestHandler` has no error handler of its own. An exception
+        that escapes a handler closes the connection with no reply at all, which
+        the page can only show as "Failed to fetch", naming neither the route nor
+        the cause. Found on several shapes (a huge run id, a NUL in a static path,
+        deeply nested JSON, a download that was not a zip), each fixed where it
+        happens; this is for the next one. Called from an `except` block, so the
+        log line carries the traceback.
+        """
+        log.exception("%s %s failed", self.command, self.path.partition("?")[0])
+        if not self._replied:
+            self._json(500, {"ok": False, "kind": "internal",
+                             "message": f"{type(exc).__name__}: {exc}"})
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+        if not self._addressed_here():
+            return
         path, _, query = self.path.partition("?")
-        params = urllib.parse.parse_qs(query)
+        # EVERY API GET, not a list of the ones that do work today, for the
+        # reason the POST guard sits ahead of its router: a route added later is
+        # covered by default. Several do work a page elsewhere could trigger with
+        # an `<img src>`: /api/quotes spends Yahoo, CBOE and Nasdaq requests and
+        # writes the journal, /api/settings/token wakes the keyring, /api/update
+        # reaches GitHub. The page, its assets and the companion are not under
+        # /api/ and stay reachable from a link.
+        if path.startswith("/api/") and self._from_another_site():
+            self._json(403, {
+                "ok": False, "kind": "origin",
+                "message": "requests from another site's page are refused: this "
+                           "journal has no authentication.",
+            })
+            return
+        try:
+            self._route_get(path, urllib.parse.parse_qs(query))
+        except Exception as exc:  # noqa: BLE001 - the last resort, see `_failed`
+            self._failed(exc)
+
+    def _route_get(self, path: str, params: dict[str, list[str]]) -> None:
+        """The GET routing, so `do_GET` can wrap all of it in one guard."""
         if path in ("/", "/index.html"):
             self._send(200, page_html().encode(), "text/html; charset=utf-8")
         elif path == "/companion":
@@ -1017,6 +1236,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # CSP is `default-src 'self'`, and a path that could escape this
             # directory would turn a local journal viewer into a file server.
             name = path[len("/static/"):]
+            if "\0" in name:
+                # `Path.resolve` raises on a NUL rather than answering False.
+                self._json(404, {"error": "not found"})
+                return
             asset = (Path(__file__).parent / "static" / name).resolve()
             root = (Path(__file__).parent / "static").resolve()
             ctype = STATIC_TYPES.get(asset.suffix)
@@ -1037,6 +1260,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     # reading `cfg.query_id` here left the page showing "no query
                     # id" immediately after a save that had genuinely worked.
                     query_id=self._effective_query_id(),
+                    query_id_source=("unset" if self.cfg.demo
+                                     else prefs.query_id_source(self.cfg.query_id)),
+                    demo=self.cfg.demo,
                     month=month[0] if month else None,
                     trade_type=trade_type[0] if trade_type else None,
                     # Repeatable, so `?cost=OPT&cost=CASH` is a multi-select
@@ -1143,19 +1369,53 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             "asked_at": int(datetime.now(UTC).timestamp()),
         }
 
-    def _same_origin(self) -> bool:
-        """`Origin` against the socket this server actually bound.
+    def _bound(self) -> tuple[str, int]:
+        """The address and port the listening socket really bound.
 
         From `server_address`, not the `Host` header: the socket is what the
         process is really listening on, while `Host` is client-supplied and so
         cannot be trusted to decide whether a client is trusted.
         """
         address = self.server.server_address
-        bound_host = str(address[0]) if isinstance(address, tuple) else ""
-        bound_port = int(address[1]) if isinstance(address, tuple) else 0
-        return _origin_is_same(
-            self.headers.get("Origin"), host=bound_host, port=bound_port
-        )
+        if not isinstance(address, tuple):
+            return "", 0
+        return str(address[0]), int(address[1])
+
+    def _same_origin(self) -> bool:
+        """`Origin` against the socket this server actually bound."""
+        host, port = self._bound()
+        return _origin_is_same(self.headers.get("Origin"), host=host, port=port)
+
+    def _from_another_site(self) -> bool:
+        """Whether the browser says another site's page made this request.
+
+        `Sec-Fetch-Site` is set by the browser and cannot be changed by a page's
+        script. `same-origin` is this server's own page and `none` a typed URL
+        or a bookmark; `same-site` and `cross-site` are someone else's page,
+        and `same-site` includes another port on 127.0.0.1. A missing header is
+        a client that is not a browser (curl, urllib, the CLI), the same
+        reading `_origin_is_same` gives a missing `Origin`.
+        """
+        site = (self.headers.get("Sec-Fetch-Site") or "none").strip().lower()
+        return site not in ("same-origin", "none")
+
+    def _addressed_here(self) -> bool:
+        """Whether this request's `Host` names this server. See `_host_is_self`.
+
+        Answers the refusal itself when it does not, so each verb's first line
+        can be `if not self._addressed_here(): return`.
+        """
+        host, port = self._bound()
+        if _host_is_self(self.headers.get("Host"), host=host, port=port):
+            return True
+        self._json(403, {
+            "ok": False, "kind": "host",
+            "message": f"this journal answers only to its own address on port "
+                       f"{port} (127.0.0.1 or localhost). A request naming another "
+                       f"host is how a web page reads a local server, so it is "
+                       f"refused.",
+        })
+        return False
 
     def _body(self, limit: int = 8192) -> dict[str, Any]:
         """The request's JSON object, or {}.
@@ -1172,7 +1432,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return {}
         try:
             parsed = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, OSError):
+        except (ValueError, OSError, RecursionError):
+            # RecursionError is what deeply nested JSON raises ("[" repeated
+            # 60,000 times fits the journal endpoint's cap), and it is not a
+            # ValueError.
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
@@ -1203,7 +1466,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         can change it while this process runs and `ServeConfig` is frozen. The
         alternative was telling the reader to restart the server after saving,
         which for a setting this basic is not a workable answer.
+
+        None for the demo, whatever is stored: one Sync there fetched the real
+        statement into `demo/` and the synthetic database.
         """
+        if self.cfg.demo:
+            return None
         return prefs.query_id(self.cfg.query_id)
 
     def _token_status(self) -> tuple[int, dict[str, Any]]:
@@ -1234,7 +1502,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return "absent", str(exc)
             return "present", "a token is stored for this account"
 
-        answer = _keyring_call(probe)
+        answer = _keyring_call(probe, self.cfg.keyring_busy)
         if answer is None:
             log.warning("keyring did not answer within %ss", KEYRING_TIMEOUT_S)
             return 200, {
@@ -1315,7 +1583,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # Bounded like the read, and for the same measurement: a keychain waiting
         # on an unlock dialog blocks the call, and an unbounded write would hold
         # this request open with the Save button spinning forever.
-        answer = _keyring_call(store)
+        answer = _keyring_call(store, self.cfg.keyring_busy)
         if answer is None:
             log.warning("keyring did not accept a write within %ss",
                         KEYRING_TIMEOUT_S)
@@ -1362,7 +1630,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # Length- and shape-checked, not verified: only IBKR can say whether
             # a well-formed id exists, and an id that does not simply fails the
             # next fetch with a message that says so.
-            if raw and (len(raw) > 32 or not raw.isdigit()):
+            if raw and not _QUERY_ID_OK.fullmatch(raw):
                 return 400, {"ok": False, "kind": "query_id",
                              "message": f"{raw!r} is not a Flex query id: "
                                         "Client Portal shows it as digits."}
@@ -1373,7 +1641,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # can say whether a well-formed id exists. Absence is a real choice here
             # rather than an error -- clearing the field turns the intraday poll off,
             # which is the supported way to stop it.
-            if raw and (len(raw) > 32 or not raw.isdigit()):
+            if raw and not _QUERY_ID_OK.fullmatch(raw):
                 return 400, {"ok": False, "kind": "confirm_query_id",
                              "message": f"{raw!r} is not a Flex query id: "
                                         "Client Portal shows it as digits."}
@@ -1446,7 +1714,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # The typed fields, from a LITERAL tuple rather than from the body's own
         # keys: the column names are interpolated into SQL below, so what may be
         # written is decided here and not by the caller.
-        fields: dict[str, str | None] = {}
+        fields: dict[str, str | float | None] = {}
         for column in _WATCH_FIELDS:
             if column not in body:
                 continue
@@ -1463,8 +1731,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # textarea clears rather than storing whitespace that renders as a
             # value the reader cannot see or delete.
             if column.startswith("alert_") and typed:
+                # ASCII only, and no digit separators: `float` reads "1_000"
+                # and other scripts' digits, SQLite does not, and the level
+                # used to be stored as the typed TEXT, which never fires.
                 try:
-                    level = float(typed)
+                    level = (float(typed) if typed.isascii() and "_" not in typed
+                             else -1.0)
                 except ValueError:
                     level = -1.0
                 if not (level > 0 and math.isfinite(level)):
@@ -1473,8 +1745,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                         "message": f"{typed} is not a price. An alert is a level "
                                    f"above zero, or empty to clear it.",
                     }
+                fields[column] = level
+                continue
             fields[column] = typed or None
         with open_journal(self.cfg.db_path) as conn:
+            if action == "add" and ("alert_above" in fields or "alert_below" in fields):
+                problem = _inverted_alert(conn, symbol, fields)
+                if problem:
+                    return 400, {"ok": False, "kind": "alert", "message": problem}
             if action == "remove":
                 cursor = conn.execute(
                     "DELETE FROM watchlist WHERE symbol = ?", (symbol,))
@@ -1686,7 +1964,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             updates.stage(release)
         except updates.UpdateRefused as exc:
             return 409, {"ok": False, "kind": "refused", "message": str(exc)}
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile,
+                http.client.HTTPException) as exc:
+            # BadZipFile for a body that is not a zip (an error page), and
+            # HTTPException for one cut off mid-download (IncompleteRead):
+            # neither is an OSError.
             return 502, {"ok": False, "kind": "download",
                          "message": f"could not download the update: {exc}"}
         self._restart_soon()
@@ -1726,6 +2008,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """
         body = self._body()
         name = str(body.get("job") or "").strip()
+        if self.cfg.demo and any(job.name == name and job.spends_broker_request
+                                 for job in JOBS):
+            # The jobs resolve the stored query id themselves, so the demo's
+            # refusal has to be here rather than in an id it hands them.
+            return 400, {"ok": False, "kind": "demo",
+                         "message": f"{name} fetches from IBKR, and the demo journal "
+                                    f"never does."}
         try:
             with open_journal(self.cfg.db_path) as conn:
                 run_id = run_job(
@@ -1733,7 +2022,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     ctx=JobContext(
                         archive_dir=self.cfg.archive_dir,
                         db_path=self.cfg.db_path,
-                        query_id=self.cfg.query_id,
+                        # Per request, like the Sync button's: an id saved in
+                        # Settings since startup is the one this run uses.
+                        query_id=self._effective_query_id(),
                         assets=self.cfg.assets,
                     ),
                 )
@@ -1762,6 +2053,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             run_id = int((params.get("id") or ["0"])[0])
         except ValueError:
             return 400, {"ok": False, "kind": "id", "message": "id must be an integer"}
+        if not 0 < run_id < 2**63:
+            # No run has it, and SQLite cannot bind an integer past 64 bits
+            # (OverflowError), so this is answered before asking.
+            return 404, {"ok": False, "kind": "missing",
+                         "message": f"no run {run_id}"}
         conn = connect(self.cfg.db_path)
         try:
             row = conn.execute(
@@ -1780,6 +2076,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # BEFORE the route check, so every write endpoint added later is covered
         # by default rather than by remembering. A 403 here costs a foreign page
         # nothing; letting it through costs an IBKR request.
+        if not self._addressed_here():
+            return
         if not self._same_origin():
             self._json(403, {
                 "ok": False, "kind": "origin",
@@ -1791,6 +2089,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             self._route_post(path)
         except sqlite3.OperationalError as exc:
+            if not _is_busy(exc):
+                # Only a busy journal is "locked, try again". A read-only file,
+                # a full disk or a damaged database will not change by waiting,
+                # so the reply carries SQLite's own words instead.
+                log.warning("POST %s hit a database error: %s", path, exc)
+                self._json(500, {"ok": False, "kind": "database",
+                                 "message": f"the journal could not be written: "
+                                            f"{exc}"})
+                return
             # A LOCKED DATABASE OTHERWISE ANSWERS NOTHING AT ALL, and that was
             # measured rather than assumed: `do_POST` caught nothing, and
             # `BaseHTTPRequestHandler` has no error handler, so the exception
@@ -1811,6 +2118,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                            "a moment.",
             })
             return
+        except Exception as exc:  # noqa: BLE001 - the last resort, see `_failed`
+            self._failed(exc)
 
     def _route_post(self, path: str) -> None:
         """The routing itself, so `do_POST` can wrap all of it in one guard."""
@@ -1851,6 +2160,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path != "/api/sync":
             self._json(404, {"error": "not found"})
             return
+        if self.cfg.demo:
+            self._json(400, {"ok": False, "kind": "demo",
+                             "message": "this is the demo journal, which never "
+                                        "fetches from IBKR."})
+            return
         query_id = self._effective_query_id()
         if not query_id:
             self._json(400, {
@@ -1866,12 +2180,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                              "message": "A sync is already running."})
             return
         try:
-            self._json(200, _do_sync(
+            reply = _do_sync(
                 db_path=self.cfg.db_path,
                 archive_dir=self.cfg.archive_dir,
                 query_id=query_id,
                 assets=self.cfg.assets,
-            ))
+            )
+            self._json(_SYNC_STATUS.get(str(reply.get("kind")), 200), reply)
         finally:
             self.cfg.sync_lock.release()
 
@@ -1885,6 +2200,7 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     scheduler: bool = True,
+    demo: bool = False,
 ) -> bool:
     """Serve the UI until interrupted. Loopback only, by construction.
 
@@ -1914,6 +2230,7 @@ def serve(
         archive_dir=archive_dir,
         query_id=query_id,
         assets=tuple(assets),
+        demo=demo,
     )
 
     # `ThreadingHTTPServer(...)` binds and starts listening in its constructor,
@@ -1935,6 +2252,10 @@ def serve(
     # ThreadingHTTPServer instantiates its handler class per request; partial
     # prepends the config, which is the stdlib-sanctioned way to inject
     # dependencies into a BaseHTTPRequestHandler.
+    #
+    # `query_id` is the explicit override only, for the reason `ServeConfig`
+    # gives: each run resolves the stored id through `settings.query_id`, so
+    # one saved from the page reaches the next scheduled sync.
     clock = Scheduler(ctx=JobContext(
         archive_dir=archive_dir, db_path=db_path, query_id=query_id,
         assets=tuple(assets),
@@ -1944,11 +2265,18 @@ def serve(
     # observe the bound socket immediately, and the shutdown tests do exactly
     # that; installing below `_Server(...)` left a real interval where SIGINT,
     # SIGTERM or Windows Ctrl+Break took its default action or was missed.
-    stop = threading.Event()
+    #
+    # A LIST THE HANDLER APPENDS TO, not an Event it sets, and not a print.
+    # CPython runs the handler on the main thread between two bytecodes, and that
+    # can be inside `Event.wait` just as it re-acquires the event's lock: `set()`
+    # then waits for a lock its own thread holds, for ever, and every later
+    # signal lands in the same wait. Observed once on a real `serve` after
+    # SIGTERM. `print` has the same shape through the stdout buffer's lock. An
+    # append takes no lock, and the main loop below polls for it.
+    stopped: list[int] = []
 
     def _bye(signum: int, _frame: Any) -> None:
-        print(f"\nsignal {signum}, stopping")
-        stop.set()
+        stopped.append(signum)
 
     # Installed only when this is the main thread. `signal.signal` raises
     # ValueError elsewhere, and `serve` is importable and callable from a test.
@@ -1965,17 +2293,17 @@ def serve(
         actual = httpd.socket.getsockname()[1]
         print(f"optjournal UI on http://{host}:{actual}")
         print("  loopback only, no authentication -- do not expose this port")
-        if not query_id:
+        if not demo and not prefs.query_id(query_id):
             # NAMES THE SCHEDULER, not just the button. The button being disabled is
             # visible in the page; the sync JOB failing on every due tick is only
             # visible to someone who opens the ledger, and that is the shape this
             # went wrong in -- a supervised serve logged `failed -- no Flex query id
             # configured` for as long as it ran while `optjournal sync` in a shell
             # worked, because only the CLI read $OPTJOURNAL_QUERY_ID.
-            print("  no query id (--query-id or $OPTJOURNAL_QUERY_ID):"
-                  " Sync now is disabled")
+            print("  no query id (Settings, --query-id or $OPTJOURNAL_QUERY_ID):"
+                  " Sync now is disabled until one is set")
             if scheduler:
-                print("  and the scheduled sync job will fail on every tick")
+                print("  and the scheduled sync job fails until then")
         if clock is None:
             print("  scheduler OFF (--no-scheduler): nothing runs unless you press it")
         else:
@@ -2020,24 +2348,25 @@ def serve(
             if not server_thread.is_alive():
                 raise RuntimeError("HTTP serving thread exited during startup")
         try:
-            # LOOPED WITH A TIMEOUT, for the same reason the `serving` barrier above
-            # is, and this asymmetry was a real bug: a bare `Event.wait()` parks the
-            # main thread in a lock acquire that Windows does not interrupt, so
-            # CPython -- which runs signal and console-control handlers on the main
-            # thread only -- could not run `_bye` until the wait returned. Nothing
-            # returns it but `_bye`. Whether that deadlocked depended purely on
-            # whether Ctrl+Break arrived before or after the main thread entered the
-            # wait, which is why it presented as flakiness: three consecutive
+            # POLLED ON A SHORT SLEEP, for the same reason the `serving` barrier
+            # above is, and this asymmetry was a real bug: a bare `Event.wait()`
+            # parks the main thread in a lock acquire that Windows does not
+            # interrupt, so CPython (which runs signal and console-control
+            # handlers on the main thread only) could not run `_bye` until the
+            # wait returned. Whether that deadlocked depended purely on whether
+            # Ctrl+Break arrived before or after the main thread entered the wait,
+            # which is why it presented as flakiness: three consecutive
             # windows-latest runs failed `tests/test_shutdown.py`, each on a
             # different test in the file, while the same suite passed on ubuntu and
-            # on the commit before. Adding imports to the startup path was enough to
-            # move the window.
+            # on the commit before. A sleep holds no lock the handler could want,
+            # and ends in at most 0.2 s on every platform.
             #
             # Waking five times a second costs nothing measurable and makes the stop
             # deterministic on every platform.
-            while not stop.wait(0.2):
-                if cfg.restart.is_set():
-                    break
+            while not stopped and not cfg.restart.is_set():
+                time.sleep(0.2)
+            if stopped:
+                print(f"\nsignal {stopped[0]}, stopping")
         except KeyboardInterrupt:
             print("\nstopped")
         finally:
@@ -2058,6 +2387,7 @@ def serve_ephemeral(
     archive_dir: Path,
     query_id: str | None = None,
     assets: tuple[str, ...] = DEFAULT_ASSET_FILTER,
+    demo: bool = False,
 ) -> Iterator[str]:
     """A real server on an OS-picked port, for the duration of the block.
 
@@ -2091,6 +2421,7 @@ def serve_ephemeral(
         archive_dir=archive_dir,
         query_id=query_id,
         assets=tuple(assets),
+        demo=demo,
     )
 
     class _Ephemeral(http.server.ThreadingHTTPServer):

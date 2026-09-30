@@ -68,3 +68,24 @@ def test_demo_refuses_a_query_id(monkeypatch, capsys):
     monkeypatch.setattr(web, "serve", lambda **kw: pytest.fail("must not serve"))
     assert main(["serve", "--demo", "--query-id", "1591754"]) == 2
     assert "Refused" in capsys.readouterr().err
+
+
+def test_the_server_is_told_when_it_serves_the_demo(monkeypatch):
+    """H6: `query_id=None` alone did not keep the demo off IBKR, because the
+    server resolves the stored id per request. The flag is what it checks."""
+    assert _serve_kwargs(monkeypatch, ["serve", "--demo"])["demo"] is True
+    assert _serve_kwargs(monkeypatch, ["serve"])["demo"] is False
+
+
+def test_the_stored_query_id_is_not_frozen_into_the_server(monkeypatch, tmp_path):
+    """M10: `serve` resolved the stored id once at startup and handed it to the
+    server and the scheduler as if it had been typed, so an id saved in Settings
+    later never reached the Run button or the scheduled sync, and the page called
+    the startup id an "override". Only an explicit flag or the environment is
+    handed over; the stored step is read per request and per run."""
+    from optjournal import settings  # noqa: PLC0415 - local to this test
+
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    settings.update(tmp_path, query_id="111111")
+    monkeypatch.setenv(settings.HOME_ENV, str(tmp_path))
+    assert _serve_kwargs(monkeypatch, ["serve"])["query_id"] is None

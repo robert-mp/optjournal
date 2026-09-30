@@ -15,7 +15,8 @@ it is, in words. Two shapes, both measured against the live endpoint:
   announces. The page marks it as an estimate rather than printing it as a date.
 
 A fund has no earnings: SPY answers ``rCode`` 400 with no data, which is an answer
-(``None``) rather than a failure.
+(``None``) rather than a failure. Every other ``rCode`` but 200 (a 429 when
+throttled, a 500) is a failure, raised so the caller keeps the date it has.
 
 Chosen after the Yahoo endpoints this journal already reaches were probed and found
 to carry no earnings date at all (see ``db.py``'s comment on ``earnings_on``). The
@@ -65,9 +66,22 @@ class Earnings:
 
 
 def parse_earnings(payload: Any) -> Earnings | None:
-    """Read one reply. None for a symbol with no earnings (a fund), or no date."""
+    """Read one reply. None for a symbol with no earnings (a fund), or no date.
+
+    The reply's own ``status.rCode`` decides between an answer and a failure,
+    because Nasdaq sends HTTP 200 either way. 400 is the documented "no
+    earnings" answer (SPY). Any other code but 200, a 429 when throttled or a
+    500, raises: read as "no earnings", it would wipe a stored date that is
+    still right.
+    """
     if not isinstance(payload, dict):
         raise EarningsFetchError("response was not an object")
+    status = payload.get("status")
+    code = str(status.get("rCode")) if isinstance(status, dict) else None
+    if code == "400":
+        return None
+    if code not in (None, "None", "200"):
+        raise EarningsFetchError(f"Nasdaq answered rCode {code}")
     data = payload.get("data")
     if not isinstance(data, dict):
         return None
