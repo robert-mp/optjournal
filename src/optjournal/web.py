@@ -686,6 +686,10 @@ def build_state(
             # sent -- so a page in another tab cannot turn it on over this
             # unauthenticated server. Off for every friend who never set it.
             "dev": prefs.dev(),
+            # The demo journal never reaches IBKR, and the server refuses a sync or
+            # a request-spending job under it; the page reads this to disable
+            # those controls rather than offer a click the server will refuse.
+            "demo": demo,
             "asset_category": asset_category,
             "asset_counts": asset_counts,
             "db": str(db_path),
@@ -1825,7 +1829,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "ok": False, "kind": "too-long",
                 "message": f"that entry is {length:,} bytes, over the "
                            f"{JOURNAL_BODY_LIMIT:,} this endpoint accepts. Nothing "
-                           f"was saved and nothing was changed -- shorten it and "
+                           f"was saved and nothing was changed: shorten it and "
                            f"save again, or the text would have been lost.",
             }
         body = self._body(limit=JOURNAL_BODY_LIMIT)

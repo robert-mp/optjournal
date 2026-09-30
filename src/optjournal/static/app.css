@@ -720,6 +720,12 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
 .card.banner{border-left:3px solid var(--accent);display:flex;flex-wrap:wrap;
   align-items:center;gap:var(--s3)}
 .card.banner .note,.card.banner details{flex-basis:100%}
+/* A release note is preformatted and a found journal is a path, and neither has
+   to fit a phone: unwrapped, the notes scrolled a 375px page out to 942px. The
+   `min-width` lets the flex item shrink below its longest line at all. */
+.card.banner pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.card.banner .mono{overflow-wrap:anywhere}
+.card.banner>span,.card.banner details{min-width:0}
 /* `h3` is styled as an ELEMENT, deliberately, and it is the one place here that
    earns an unclassed selector. This bug has been found twice: the Watchlist's
    title was a classless `<h3>` wearing the user agent's size and its 1em margins
@@ -976,8 +982,11 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
    flex item, so a long caption beside it squeezed the strip to its narrowest
    content width and every pill wrapped onto its own line -- a three-row column
    taller than the header text, which pushed down into the stats grid. The
-   caption is the part that should reflow, so it shrinks and the pills do not. */
-.pills{display:flex;gap:var(--s3);flex-wrap:wrap;flex:0 0 auto;justify-content:flex-end}
+   caption is the part that should reflow, so it shrinks and the pills do not.
+   `max-width` is the other end: once the strip has a row to itself it wraps its
+   own pills, where at 375px the Calendar's three ran 7px past the card. */
+.pills{display:flex;gap:var(--s3);flex-wrap:wrap;flex:0 0 auto;justify-content:flex-end;
+  max-width:100%}
 /* Lets the text block shrink below its content width. A flex item defaults to
    min-width:auto, which refuses to go under min-content and is the usual reason
    a neighbour gets crushed instead. */
@@ -1293,9 +1302,15 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .wselb b{font-family:var(--mono);letter-spacing:var(--tr-caps)}
 .wselb .dim{margin-left:var(--s3)}
 /* Daily: muted unless the reading is strengthening, the same rule the newest
-   histogram bar follows, so the column and the bars agree at a glance. */
-.wtab td.wdaily{opacity:.62}
-.wtab td.wdaily.strong{opacity:1}
+   histogram bar follows, so the column and the bars agree at a glance. Muted as
+   far as AA allows and no further: at .62 a loss read 3.55:1 on its row, and
+   `.85` is the lowest that keeps --ok and --bad at 4.5:1 on every row surface of
+   every theme (the open row's --seg1 is the binding one; a test recomputes it).
+   So the strengthening reading is also set in the label weight, which is what
+   still tells the two apart. Only a signed figure is muted: the dash for a
+   missing one is already --dim, and dimming that again read 2.85:1. */
+.wtab td.wdaily.signed{opacity:.85}
+.wtab td.wdaily.strong{opacity:1;font-weight:var(--w-label)}
 /* Except the one row that is not a row: the empty-filter message. It carries no
    `data-wsel`, so the pointer cursor above would promise a selection that clicking
    it cannot make. */
@@ -1585,6 +1600,21 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .linkish:hover{color:var(--fg)}
 .day .dpl{font-family:var(--fig);font-variant-numeric:tabular-nums;
   font-weight:var(--w-label);font-size:var(--t3)}
+/* The day's figure is in the cell twice (page.html `calendar`): the amount, and
+   `compact` for a grid too narrow for it. Below 700px a day is under 84px wide,
+   which is where the widest four-digit amount stopped fitting and was clipped;
+   an amount wider still wraps rather than clipping. The compact form is at most
+   five glyphs, about 2.9em, so sizing it at 34% of the day's own width (`cqi`,
+   each day its own container) keeps it inside the cell on the narrowest phone
+   while `--t1` caps it everywhere else. */
+.day .dplw{overflow-wrap:anywhere}
+.day .dpln{display:none}
+@media(max-width:700px){
+  .cal{gap:var(--s1)}
+  .cal>.day{padding:var(--s1);container-type:inline-size}
+  .day .top{flex-wrap:wrap}
+  .day .dplw{display:none}
+  .day .dpln{display:inline;font-size:min(var(--t1),34cqi)}}
 .day.g .dct,.day.r .dct{color:var(--onfill)}
 
 /* ---- legs / strategy ---- */
@@ -1863,7 +1893,9 @@ stop.gneg{stop-color:var(--bad)}
 .zread{padding:var(--s3) var(--s4);border-radius:var(--r2);border:1px solid var(--line)}
 .zpadcall .zread{background:var(--callwash)}
 .zpadput .zread{background:var(--putwash)}
-.zread .zk{font-size:var(--t0);letter-spacing:var(--tr-caps);color:var(--dim)}
+/* --kicker, like every other label on this tab: --dim on Leather's call wash read
+   4.45:1 at 10px. */
+.zread .zk{font-size:var(--t0);letter-spacing:var(--tr-caps);color:var(--kicker)}
 .zv{font-size:var(--t5);font-weight:var(--w-fig);font-family:var(--fig);margin-top:var(--s2);
   font-variant-numeric:tabular-nums}
 .zwarn{margin-top:var(--s3);color:var(--warnfg)}

@@ -18,9 +18,12 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import shutil
 import socket
 import sqlite3
+import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import RAW_DIR, ROOT, code_only
@@ -649,7 +652,7 @@ def test_the_stale_server_guard_runs_before_anything_renders(state):
     card is built.
     """
     js = _js()
-    assign = js.index("S.state=await r.json();")
+    assign = js.index("S.state=st;")
     check = js.index("staleServerCheck(S.state);")
     drawn = js.index("draw();", assign)
     assert assign < check < drawn, (
@@ -981,6 +984,28 @@ def test_calendar_day_drilldown_is_wired():
     # The drill-down redraws; only month navigation refetches.
     handler = js.split("[data-calday]")[1].split("forEach")[1][:200]
     assert "load()" not in handler, "day selection must not spend a request"
+
+
+def test_a_drill_down_opens_from_the_keyboard():
+    """M31, the handler half (test_rendered checks the tab stops): a calendar day
+    and a replay row answered a click and nothing else. They now go through
+    `pressable`, as the Market strip's days do, so Enter and Space open them and
+    a key pressed inside one does not.
+    """
+    out = _node_run([
+        *_page_fns("pressable"),
+        "const el={}; let n=0; pressable(el,()=>n++);",
+        "const key=(k,t=el)=>{let held=false;",
+        "  el.onkeydown({key:k,target:t,preventDefault(){held=true;}}); return held;};",
+        "const r=[key('Enter'),key(' '),key('a'),key('Enter',{})];",
+        "el.onclick();",
+        "console.log(JSON.stringify({n,r}));",
+    ])
+    assert out == {"n": 3, "r": [True, True, False, False]}
+    js = _code_only(_js())
+    for sel in ("[data-calday]", "[data-replay]", "[data-marketday]"):
+        binder = js.split(f"querySelectorAll('{sel}')")[1][:80]
+        assert "pressable(el," in binder, f"{sel} is not bound for the keyboard"
 
 
 def test_trades_view_renders_strategy_groups():
@@ -2190,6 +2215,70 @@ def test_a_render_preserves_what_the_user_was_typing():
     )
 
 
+def test_a_redraw_hands_focus_back_to_the_control_that_had_it():
+    """M32: every redraw replaced the pressed button, and focus fell to <body> --
+    Enter on a cost chip, a sort header or the month stepper left a keyboard reader
+    at the top of the page. `preserveInputs` only carried a text field.
+
+    Pinned over the source for that test's reason (no DOM under node); checked in a
+    browser on the rail, sub-view, cost chip, market day, sort header, watchlist
+    row, month stepper, 0DTE toggles, journal button and scoring switch. The key is
+    taken before ANY region is rewritten (the rail goes first) and answered after
+    the body is written; an aria-label outranks the data attributes because the
+    stepper's `data-month` moves with every step while its label does not.
+    """
+    draw = _fn("draw")
+    assert draw.index("focusKey()") < draw.index("renderRail()"), (
+        "the focus key has to be read before the first region is rewritten")
+    assert draw.index("restoreFocus(") > draw.index("$('#body').innerHTML=html"), (
+        "focus can only be handed back once the new markup exists")
+    key = _fn("focusKey")
+    assert key.index("aria-label") < key.index("data-"), (
+        "a data value can move under a control; its label is the stabler name")
+    assert "isConnected" in _fn("restoreFocus"), (
+        "a control draw() did not rewrite never lost focus and must be left alone")
+    assert re.search(r'<div id="msg" role="status" aria-live="polite">', page_html()), (
+        "the message banner is not announced")
+
+
+def _bind_replay(resume: bool) -> dict:
+    """The page's own `bindReplayControls` on a panel parked at bar 3 of 10."""
+    js = _code_only(_js())
+    consts = [_page_const("REPLAY_SECONDS")] if "const REPLAY_SECONDS=" in js else []
+    return _node_run([
+        f"import {{barsPerMs, nextStop}} from '{_static('replay.js')}';",
+        "let RGEO={points:Array.from({length:10},(_,i)=>[i,1]),events:[]}, RTIMER=null;",
+        "let frames=0; const requestAnimationFrame=()=>++frames;",
+        "const cancelAnimationFrame=()=>{};",
+        "const scrub={value:'3',max:'9'}, play={textContent:'▶ play'};",
+        "const box={'#rscrub':scrub,'#rspeed':{value:'1'},'#rstops':{checked:true},",
+        "  '#rloop':{checked:false}};",
+        "const $=sel=>box[sel]||null;",
+        "const document={querySelector:()=>play,querySelectorAll:()=>[]};",
+        "function replaySeek(){} function replayFocus(){}",
+        *consts, *_page_fns("replayStop", "bindReplayControls"),
+        f"bindReplayControls({json.dumps(resume)});",
+        "console.log(JSON.stringify({playing:RTIMER!==null,label:play.textContent,",
+        "  at:scrub.value}));",
+    ])
+
+
+def test_a_redraw_during_playback_keeps_the_replay_playing():
+    """L49: a redraw while a replay played (a theme toggle, a late update banner)
+    stopped it, since draw() must kill the frame loop before replacing the panel
+    it drives. It still does, and now tells the new panel to carry on; the bar
+    the scrubber held comes back through `preserveInputs`, which now also carries
+    a checkbox's `checked`, so "stop on events" no longer comes back ticked.
+    """
+    assert _bind_replay(resume=True) == {"playing": True, "label": "❚❚ pause", "at": "3"}
+    assert _bind_replay(resume=False)["playing"] is False, "a parked replay started"
+    draw = _fn("draw")
+    assert draw.index("RTIMER!==null?S.replay:null") < draw.index("replayStop()"), (
+        "whether it was playing has to be read before the loop is stopped")
+    assert "bindReplayControls(replaying!==null&&replaying===S.replay)" in draw
+    assert "el.checked=was.checked" in _fn("restoreInputs")
+
+
 def test_nothing_this_server_sends_is_cacheable():
     """A cached page is a stale page, and a cached payload is a stale account.
 
@@ -2878,8 +2967,9 @@ def test_a_calday_the_payload_cannot_show_heals_out_of_the_hash():
     dayDetail has its own guard, but it runs during render -- by which point the
     stale key is already in the address bar. A day from another month, or one
     the current filter excludes, must not survive in a URL describing nothing.
-    Client-side only, so a calday change redraws without refetching: the
-    hashchange handler compares only the server-side keys.
+    The handler never names calday itself: it compares the query load() sends,
+    so a day inside the month on screen redraws, and a day in another month
+    (with no month pinned) refetches that month instead of healing away.
     """
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
     assert "if(S.calday&&S.state&&!(((S.state.stats||{}).days)||[])" in js, \
@@ -3014,6 +3104,124 @@ def test_hashchange_only_refetches_when_the_server_side_keys_moved():
     assert "load()" in handler and "draw()" in handler, (
         "the handler must choose between refetching and redrawing"
     )
+
+
+def _page_const(name: str) -> str:
+    """One top-level `const` declaration of the page, whole."""
+    js = _code_only(_js())
+    found = (re.search(rf"^const {name}=\[.*?\n\];", js, re.S | re.M)
+             or re.search(rf"^const {name}=.*?;$", js, re.M))
+    assert found, f"no top-level const {name} in the page"
+    return found.group(0)
+
+
+def _page_fns(*names: str) -> list[str]:
+    """The page's own functions by name, skipping any this version lacks.
+
+    `_fn` runs to the next plain `function`, which for the last one in the file
+    is the page's whole top level, so each is cut at its own closing brace (every
+    function here closes on a `}` in column 0): a harness declares its own
+    stand-ins, and page code after the function would run against them. `_fn`
+    also starts at `function`, so an async one gets its keyword back.
+    """
+    js = _code_only(_js())
+
+    def whole(name: str) -> str:
+        src = _fn(name)
+        first = src.split("\n", 1)[0].rstrip()
+        if first.endswith("}") and first.count("{") == first.count("}"):
+            return first  # a one-line function
+        return re.split(r"\n\}(?=\n|$)", src, maxsplit=1)[0] + "\n}"
+
+    return [("async " if f"async function {name}(" in js else "") + whole(name)
+            for name in names if f"function {name}(" in js]
+
+
+def _static(name: str) -> str:
+    return (ROOT / "src" / "optjournal" / "static" / name).as_uri()
+
+
+def _node_run(lines: list[str]) -> Any:
+    """Run page code under node as a module, and return what it printed as JSON.
+
+    For the page's handlers, which read and write plain state and a handful of
+    DOM nodes: the caller declares stand-ins for those, and every line of
+    behaviour under test is the page's own source.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("no node runtime")
+    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [node, "--input-type=module", "-e", "\n".join(lines)],
+        capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+    return json.loads(result.stdout)
+
+
+def _run_hash_handler(steps: list[tuple[str, str]]) -> list[dict]:
+    """Drive the page's real `applyHash` and `onhashchange` under node.
+
+    Each step lands on its first hash, then moves to the second and fires the
+    handler, reporting whether it asked for a refetch (`load`) or a redraw and
+    which cost scope it parsed. Everything the two read is the page's own code;
+    only `load`, `draw` and `location` are stand-ins.
+    """
+    js = _code_only(_js())
+    handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
+    assert handler, "the hashchange handler moved"
+    consts = [_page_const(name) for name in
+              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS")]
+    return _node_run([
+        f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
+        "const location={hash:''}, window={}, calls=[];",
+        "const S={};",
+        "function load(){calls.push('load');}",
+        "function draw(){calls.push('draw');}",
+        *consts, *_page_fns("applyHash", "stateQuery"), handler.group(0),
+        f"const steps={json.dumps(steps)};",
+        "const out=[];",
+        "for(const [from,to] of steps){",
+        "  location.hash=from; applyHash(); calls.length=0;",
+        "  location.hash=to; window.onhashchange();",
+        "  out.push({call:calls[0],cost:S.cost});",
+        "}",
+        "console.log(JSON.stringify(out));",
+    ])
+
+
+def test_a_hash_change_the_server_would_answer_differently_refetches():
+    """M28: editing `cost`, `scoring` or a `calday` in the hash, typed or by the
+    back and forward buttons, redrew the payload already in hand, so the Costs
+    tab and the win rate stayed on the previous scope (82.8% against 71.9% on a
+    fresh load of the same URL). The handler compared the type and the month
+    only; it now compares the query load() would send.
+    """
+    moves = _run_hash_handler([
+        ("#tab=costs&cost=OPT", "#tab=costs&cost=STK"),
+        ("#month=all", "#month=all&scoring=contract"),
+        ("#tab=calendar", "#tab=calendar&calday=2026-08-03"),
+        ("#month=2026-09&type=odte", "#month=2026-09"),
+        # Nothing the server reads moved, so no request is spent.
+        ("#tab=calendar", "#tab=trades"),
+        ("#tab=costs&cost=OPT", "#tab=costs&cost=OPT&theme=ledger"),
+        ("#month=2026-08&calday=2026-08-03", "#month=2026-08&calday=2026-08-04"),
+    ])
+    assert [m["call"] for m in moves] == [
+        "load", "load", "load", "load", "draw", "draw", "draw"]
+
+
+def test_an_unknown_cost_key_in_the_hash_falls_back_to_the_default():
+    """L42: `#cost=BOGUS` reached the server and rendered a scope with no chip lit.
+    Validated like the tab, the theme and the scoring unit: an unknown key is
+    dropped, and a hash naming no known key means the server's default (null).
+    """
+    moves = _run_hash_handler([
+        ("", "#tab=costs&cost=BOGUS"),
+        ("", "#tab=costs&cost=opt&cost=BOGUS&cost=0DTE"),
+        ("", "#tab=costs&cost=CASH"),
+    ])
+    assert [m["cost"] for m in moves] == [None, ["OPT", "0DTE"], ["CASH"]]
 
 
 def test_serves_path_defaults_do_not_poison_other_subcommands():
@@ -3852,6 +4060,75 @@ def test_the_selected_tab_separates_from_an_unselected_one_in_every_theme():
             f"differs from an unselected one. Lighten --accent -- but check "
             f"--accentfg still clears 4.5 on it, the two pull opposite ways"
         )
+
+
+def _washes() -> dict[str, dict[str, tuple[float, float, float, float]]]:
+    """Every theme's translucent names, as {selector: {name: (r, g, b, alpha)}}."""
+    return {
+        selector: {
+            name.lstrip("-"): tuple(float(part) for part in value.split(","))
+            for name, value in re.findall(
+                r"(--[a-z0-9]+)\s*:\s*rgba\(([^)]*)\)",
+                re.sub(r"/\*.*?\*/", "", body, flags=re.S),
+            )
+        }
+        for selector, body in re.findall(
+            r"^(:root[^{\n]*|\[data-theme=\"[a-z]+\"\])\{(.*?)\n\}",
+            _css(), flags=re.S | re.M,
+        )
+    }
+
+
+def _over(top: tuple[float, ...], alpha: float, ground: str) -> str:
+    """`top` at `alpha` over the hex `ground`, as a hex."""
+    below = [int(ground[i : i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(t * alpha + b * (1 - alpha)):02x}"
+                         for t, b in zip(top, below, strict=False))
+
+
+def _hex_rgb(colour: str) -> tuple[int, int, int]:
+    return (int(colour[1:3], 16), int(colour[3:5], 16), int(colour[5:7], 16))
+
+
+def test_the_watchlists_muted_daily_figure_meets_aa_in_every_theme():
+    """L43: the Daily column is muted with `opacity` unless the reading is
+    strengthening, and at .62 a loss read 3.55 to 3.70:1 on its row, with the
+    dash for a missing reading at 2.85:1. The opacity is read from the rule and
+    recomputed for both signs on every surface a row can sit on: the card, the
+    hover ground, and the open row's gradient stops.
+    """
+    rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "opacity" not in rules.get(".wtab td.wdaily", ""), (
+        "the whole cell is dimmed, including the --dim dash for a missing reading")
+    muted = re.search(r"opacity:([0-9.]+)", rules.get(".wtab td.wdaily.signed", ""))
+    assert muted, "the muted daily figure has no opacity rule to check"
+    alpha = float(muted.group(1))
+    for selector, palette in _themes().items():
+        for sign in ("ok", "bad"):
+            for surface in ("panel", "bg2", "seg1", "seg2"):
+                seen = _over(_hex_rgb(palette[sign]), alpha, palette[surface])
+                ratio = _ratio(seen, palette[surface])
+                assert ratio >= 4.5, (
+                    f"{selector}: --{sign} at opacity {alpha} reads {ratio:.2f}:1 on "
+                    f"--{surface}, below AA for the 13px Daily figure")
+
+
+def test_the_0dte_tile_labels_meet_aa_on_their_washes_in_every_theme():
+    """L43: "Points from SPX" and its neighbours sit on the pad's call or put wash
+    over --bg2, and in --dim they read 4.45:1 on Leather's call wash. Measured
+    against the wash as it composites, for whichever name the rule uses."""
+    body = next(b for s, b in _toplevel_rules() if s.strip() == ".zread .zk")
+    name = re.search(r"color:var\(--([a-z0-9]+)\)", body.replace(" ", ""))
+    assert name, "the tile label's colour is not a theme name"
+    washes = _washes()
+    for selector, palette in _themes().items():
+        for wash in ("callwash", "putwash"):
+            *rgb, alpha = washes[selector][wash]
+            ground = _over(tuple(rgb), alpha, palette["bg2"])
+            ratio = _ratio(palette[name.group(1)], ground)
+            assert ratio >= 4.5, (
+                f"{selector}: --{name.group(1)} is {ratio:.2f}:1 on --{wash} over "
+                f"--bg2, below AA for a 10px label")
 
 
 def test_every_theme_declares_the_same_palette():
@@ -4846,8 +5123,9 @@ def test_the_job_status_word_is_rendered_not_collapsed_to_a_colour():
     strip = _fn("collection")
     # NOT space-stripped, unlike most pins in this file: the fallback string holds
     # a space, and stripping turns `'never run'` into `'neverrun'`, so the
-    # assertion could never match whatever the code said.
-    assert "esc(j.last_status||'never run')" in strip, (
+    # assertion could never match whatever the code said. `status` is
+    # `last_status` unless the newest run is still in flight.
+    assert "esc(status||'never run')" in strip, (
         "the status word is gone, so the row carries only a colour"
     )
     # `nothing` must not be tinted as either success or failure.
@@ -4919,11 +5197,100 @@ def test_every_runnable_job_gets_a_button_and_a_retired_one_does_not():
         "no longer knows, which the endpoint answers 400 to"
     )
     # The button is disabled while the job is running, or a second click races the
-    # first and gets a 409 for a system that is working.
-    assert "busy?'disabled':''" in strip.replace('"', "'"), (
+    # first and gets a 409 for a system that is working. (And in the demo, for a
+    # job that would reach IBKR: see the executed test below.)
+    assert "busy||demoOff?'disabled':''" in strip.replace('"', "'"), (
         "the button stays enabled during a run, so a double click reports a "
         "conflict for a job that is simply still going"
     )
+
+
+def _collection_rows(demo: bool) -> dict[str, str]:
+    """The jobs strip rendered by the page's own `collection`, row by job name.
+
+    `bars_live` has a run in flight (the ledger's newest row says `running`) while
+    its state row still holds the previous outcome, `ok`: that is the payload a
+    page reads for the whole of a run. `sync` is idle and spends a request.
+    """
+    js = _code_only(_js())
+    consts = [_page_const("DEMO_NO_IBKR")] if "const DEMO_NO_IBKR=" in js else []
+    state = {
+        "demo": demo,
+        "audit": {"ever_collected": False},
+        "scheduler": {"ever_ran": False, "jobs": [
+            {"job": "bars_live", "last_status": "ok", "consecutive_failures": 0,
+             "spends_request": False, "requests": 1,
+             "last_run": {"status": "running", "started_at": "2026-09-30T14:00:00",
+                          "finished_at": None, "detail": None}},
+            {"job": "sync", "last_status": "nothing", "consecutive_failures": 0,
+             "spends_request": True, "requests": 1,
+             "last_run": {"status": "nothing", "started_at": "2026-09-30T11:00:00",
+                          "finished_at": "2026-09-30T11:00:04", "detail": None}},
+        ]},
+    }
+    html = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        f"const S={{state:{json.dumps(state)}}};",
+        *consts, *_page_fns("infoTip", "ago", "collection"),
+        "console.log(JSON.stringify(collection()));",
+    ])
+    return dict(re.findall(r'<div class="jobrow">\s*<span class="jobname mono">([a-z_]+)'
+                           r"</span>(.*?)</div>", html, re.S))
+
+
+def test_a_job_in_flight_reads_running_and_cannot_be_started_twice():
+    """L10: while a job ran, its row showed the PREVIOUS outcome and Run stayed
+    live, because `last_status` is written when a run finishes and so is never
+    `running`. The newest run's own status is what says a run is in flight.
+    """
+    rows = _collection_rows(demo=False)
+    running = rows["bars_live"]
+    assert '<span class="jobstat ">running</span>' in running, running
+    assert re.search(r"<button[^>]*\bdisabled\b[^>]*>running</button>", running), running
+    assert not re.search(r"<button[^>]*\bdisabled\b", rows["sync"]), rows["sync"]
+
+
+def test_the_demo_offers_no_run_that_would_reach_ibkr():
+    """Under `serve --demo` the server refuses a job that spends an IBKR request,
+    and the page used to ask the reader to confirm spending one first. That Run is
+    disabled there and says why; a job that costs nothing stays live. The Sync
+    button says the same thing rather than "start with --query-id", and the
+    confirm is skipped in the demo whatever the button's state.
+    """
+    rows = _collection_rows(demo=True)
+    assert re.search(r"<button[^>]*\bdisabled\b[^>]*title=\"The demo journal",
+                     rows["sync"], re.S), rows["sync"]
+    tail = _fn("draw").replace(" ", "")
+    assert "if(st.demo){b.disabled=true;b.title=DEMO_NO_IBKR;}" in tail
+    assert "&&!S.state.demo;" in _fn("bindJobRuns").replace(" ", "").replace("\n", "")
+    assert "S.state.demo?" in _fn("historyImport"), (
+        "the history import spends one request per year and is offered in the demo")
+
+
+@pytest.mark.parametrize("reply", [
+    "fetch=async()=>{throw new TypeError('Failed to fetch');};",
+    "fetch=async()=>({ok:false,status:403,json:async()=>({ok:false,kind:'host'})});",
+    "fetch=async()=>({ok:true,status:200,json:async()=>{throw new SyntaxError('<');}});",
+])
+def test_a_state_reply_that_cannot_be_read_still_hands_the_buttons_back(reply):
+    """Every action button ends in `load()`, and the redraw is what replaces it. A
+    state reply that could not be read returned (or threw) before drawing, so a
+    Sync or a job's Run stayed disabled on "running". It now redraws from the
+    payload already in hand and says why.
+    """
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const S={state:{stats:{}},month:null,type:null,cost:null,scoring:null,calday:null};",
+        "const notes=[]; let draws=0;",
+        "function note(text,kind){notes.push(kind);}",
+        "function draw(){draws++;}",
+        "function staleServerCheck(){}",
+        f"let fetch; {reply}",
+        *_page_fns("stateQuery", "load"),
+        "try{ await load(); }catch(e){ notes.push('threw'); }",
+        "console.log(JSON.stringify({draws,notes}));",
+    ])
+    assert out == {"draws": 1, "notes": ["bad"]}
 
 
 def test_only_the_job_that_spends_a_broker_request_asks_for_confirmation():
@@ -5340,6 +5707,124 @@ def test_the_attribution_sentence_survives_the_rewrite():
     assert "optjournal bars" in body
     # And the typed column says it is typed, which is slice 4's clause.
     assert "earnings dates are ones you recorded" in body
+
+
+def _submit_watch_search(typed: str, accepted: bool) -> dict:
+    """Submit the Watchlist search box through the page's own `bindWatchlist`.
+
+    `watchWrite` is the stand-in: it answers `accepted`, and records what the box
+    and the filter held at the moment of the write, which is what the reload a
+    success triggers renders from.
+    """
+    return _node_run([
+        "const S={wsearch:" + json.dumps(typed) + "}; let seen=null, draws=0;",
+        "const input={value:" + json.dumps(typed) + ",disabled:false,focused:false,",
+        "  focus(){this.focused=true;},setSelectionRange(a){this.caret=a;}};",
+        "const form={};",
+        "const $=sel=>sel==='#waddf'?form:sel==='#wsearch'?input:null;",
+        "const document={querySelectorAll:()=>[]};",
+        "function draw(){draws++;}",
+        "async function loadQuotes(){}",
+        "async function watchWrite(body){seen={body,value:input.value,",
+        "  filter:S.wsearch,disabled:input.disabled};" + (
+            " await 0; return true;}" if accepted else " return false;}"),
+        *_page_fns("bindWatchlist"),
+        "bindWatchlist();",
+        "await form.onsubmit({preventDefault(){}});",
+        "console.log(JSON.stringify({seen,value:input.value,disabled:input.disabled,",
+        "  focused:input.focused,caret:input.caret,filter:S.wsearch,draws}));",
+    ])
+
+
+def test_a_refused_watchlist_symbol_can_be_corrected():
+    """M30: the server refuses `BRK B`, and the search box stayed disabled with no
+    way to fix the one character. It is live again, holds what was typed, keeps
+    focus with the caret at the end, and the filter is the text in the box.
+    """
+    out = _submit_watch_search("BRK B", accepted=False)
+    assert out["seen"]["body"] == {"symbol": "BRK B", "action": "add"}
+    assert (out["disabled"], out["value"], out["focused"], out["filter"]) == (
+        False, "BRK B", True, "BRK B")
+    assert out["caret"] == len("BRK B"), "a correction would be typed at the start"
+
+
+def test_a_watched_symbol_clears_the_search_box_and_its_filter_together():
+    """L40: after a successful add the box kept the typed text while the filter it
+    names was off, because `preserveInputs` put the text back over the empty
+    render. Both are empty BEFORE the write's reload now, and the box is ready
+    for the next symbol.
+    """
+    out = _submit_watch_search(" spy ", accepted=True)
+    assert out["seen"]["body"] == {"symbol": "spy", "action": "add"}
+    assert (out["seen"]["value"], out["seen"]["filter"]) == ("", ""), (
+        "the reload after an add renders from a box and a filter still holding "
+        "the symbol")
+    assert (out["disabled"], out["focused"], out["value"]) == (False, True, "")
+
+
+def _save_query_id(typed: str, reply: dict) -> dict:
+    """Save the Flex query id through the page's own `saveQueryId`.
+
+    `load` stands in for the reload a success triggers, doing what the real one
+    does to this panel: the status span is rebuilt from `settingsPanel`'s markup,
+    and the field keeps whatever `preserveInputs` read off the old one.
+    """
+    return _node_run([
+        "const S={}; const sent=[]; const setTimeout=()=>0;",
+        "const nodes={'#qid':{value:" + json.dumps(typed) + "},'#qidmsg':{textContent:''}};",
+        "const $=sel=>nodes[sel]||null;",
+        f"async function save(body){{sent.push(body); return {json.dumps(reply)};}}",
+        "function load(){nodes['#qid']={value:nodes['#qid'].value};",
+        "  nodes['#qidmsg']={textContent:heldNote('qidmsg')};}",
+        *([_page_const("HELD_MS")] if "const HELD_MS=" in _js() else []),
+        *_page_fns("saveQueryId", "holdNote", "heldNote"),
+        "await saveQueryId('query_id','qid');",
+        "console.log(JSON.stringify({sent,field:nodes['#qid'].value,",
+        "  said:nodes['#qidmsg'].textContent}));",
+    ])
+
+
+def test_a_saved_query_id_says_so_after_the_redraw_and_shows_what_was_stored():
+    """L41: "saved" was written into the status span and the reload that followed
+    rebuilt the panel at once, so the confirmation vanished before it could be
+    read; and the field kept "  123  " because `preserveInputs` put the typed text
+    back over the stored, trimmed value.
+    """
+    out = _save_query_id("  1591754  ", {"ok": True, "kind": "settings"})
+    assert out == {"sent": [{"query_id": "1591754"}], "field": "1591754",
+                   "said": "saved"}
+    panel = _fn("settingsPanel")
+    for span in ("qidmsg", "cqidmsg"):
+        assert f"heldNote('{span}')" in panel, f"#{span} is rebuilt empty"
+
+
+def test_a_refused_query_id_shows_the_servers_reason_and_keeps_the_text():
+    out = _save_query_id("abc", {"ok": False, "kind": "query_id",
+                                  "message": "'abc' is not a Flex query id"})
+    assert out == {"sent": [{"query_id": "abc"}], "field": "abc",
+                   "said": "'abc' is not a Flex query id"}
+
+
+def test_a_refused_stop_watching_hands_its_button_back():
+    """The same failure one button over: "stop watching" disabled itself and a
+    refusal (any `!ok` reply, `busy` or `database` included) draws nothing, so
+    the button stayed dead with the drawer still open under it.
+    """
+    out = _node_run([
+        "const S={wsym:'SPY'};",
+        "const b={dataset:{wrm:'SPY'},disabled:false};",
+        "const $=()=>null;",
+        "const document={querySelectorAll:sel=>sel==='[data-wrm]'?[b]:[]};",
+        "const confirm=()=>true;",
+        "function draw(){}",
+        "async function loadQuotes(){}",
+        "async function watchWrite(){return false;}",
+        *_page_fns("bindWatchlist"),
+        "bindWatchlist();",
+        "await b.onclick();",
+        "console.log(JSON.stringify({disabled:b.disabled,wsym:S.wsym}));",
+    ])
+    assert out == {"disabled": False, "wsym": "SPY"}
 
 
 def test_the_typed_field_is_preserved_across_a_render_and_not_across_subjects():
@@ -6384,6 +6869,37 @@ def test_an_over_long_entry_is_refused_rather_than_read_as_empty(populated):
     )
 
 
+def test_a_refused_journal_entry_says_nothing_was_saved_once(populated):
+    """L46: the page appended "Nothing was saved, and your text is still on
+    screen." to the server's reason, and the size refusal's reason already said
+    "Nothing was saved and nothing was changed", followed by a double hyphen, so
+    the banner said it twice. The real server's 413 reply is pressed through
+    the page's own `bindJournal` here, and so is a refusal that does not say it.
+    """
+    anchor, _account = _an_anchor(populated)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        _, too_long = _post(base, "/api/journal", {
+            "anchor": anchor, "lessons": "x" * (web.JOURNAL_BODY_LIMIT + 1)})
+    other = {"ok": False, "kind": "anchor", "message": "no decision named"}
+    for reply in (too_long, other):
+        said = _node_run([
+            f"import {{esc}} from '{_static('format.js')}';",
+            "const notes=[]; function note(text){notes.push(text);}",
+            "const b={dataset:{jsave:'1'},disabled:false,",
+            "  classList:{add(){},remove(){}}};",
+            "const document={querySelectorAll:sel=>sel==='[data-jsave]'?[b]:[]};",
+            "const $=()=>({value:''}); const S={};",
+            f"const fetch=async()=>({{json:async()=>({json.dumps(reply)})}});",
+            _page_const("JFIELDS"),
+            *_page_fns("bindJournal"),
+            "bindJournal(); await b.onclick();",
+            "console.log(JSON.stringify(notes));",
+        ])
+        assert len(said) == 1, said
+        assert said[0].lower().count("nothing was saved") == 1, said[0]
+        assert "--" not in said[0] and "still on screen" in said[0], said[0]
+
+
 def test_the_lifecycle_cards_carry_the_anchor_the_journal_is_keyed_on(populated):
     """Without it the page has a journal it cannot attach to anything.
 
@@ -7281,6 +7797,9 @@ def test_the_demo_never_resolves_a_real_query_id(populated, tmp_path, monkeypatc
     assert (state["settings"]["query_id"], state["settings"]["query_id_source"],
             state["settings"]["confirm_query_id"]) == (None, "unset", None)
     assert (state["sync"]["query_id"], state["sync"]["configured"]) == (None, False)
+    # The page disables Sync and the request-spending Run buttons from this, so
+    # it must be in the payload, not only in the server's own config.
+    assert state["demo"] is True
     assert (sync_status, sync_reply["kind"]) == (400, "demo")
     assert {name: (status, reply["kind"]) for name, (status, reply) in runs.items()} == {
         name: (400, "demo") for name in spending}
@@ -7692,6 +8211,31 @@ def _media_rules(width: int) -> list[tuple[str, str]]:
             i += 1
         rules += re.findall(r"([^{}]+)\{([^{}]*)\}", css[m.end():i - 1])
     return [(sel.strip(), body) for sel, body in rules]
+
+
+def test_a_phone_calendar_prints_every_day_whole():
+    """M33: at 375px a day is 37px wide and "−€1,729.42" was clipped to "−€1,7",
+    and the pill row ran 7px past the card. Measured in a browser at 320 to 1280px
+    after the fix, on the real journal's two busiest months: nothing clipped.
+
+    The cell carries the amount and its `compact` form (node-tested in
+    format.test.mjs), and below 700px only the compact one shows, sized to the
+    day's own width so it fits the narrowest phone; the day's label keeps the
+    exact figure for a screen reader.
+    """
+    narrow = {sel: body.replace(" ", "") for sel, body in _media_rules(700)}
+    assert "display:none" in narrow.get(".day .dplw", ""), "the full amount still shows"
+    shown = narrow.get(".day .dpln", "")
+    assert "display:inline" in shown and "cqi" in shown, (
+        "the compact amount does not show, or does not scale with the day")
+    assert "container-type:inline-size" in narrow.get(".cal>.day", "")
+    wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "display:none" in wide.get(".day .dpln", ""), (
+        "the compact amount shows beside the full one on a wide screen")
+    assert "max-width:100%" in wide.get(".pills", ""), (
+        "a pill strip with a row to itself cannot wrap, so it overflows its card")
+    cal = _fn("calendar")
+    assert "compact(amountOf(dy.realized))" in cal and "aria-label=" in cal
 
 
 def test_the_content_column_can_shrink_below_its_widest_child():
@@ -8150,3 +8694,77 @@ def test_importing_a_journal_it_did_not_find_is_refused(populated, monkeypatch, 
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         status, reply = _post(base, "/api/install/import", {"source": str(tmp_path)})
     assert status == 400 and reply["kind"] == "refused"
+
+
+#: How a banner POST can fail, as the fetch stand-in the harness answers with.
+_BANNER_FAILURES = {
+    "refused": "fetch=async()=>({json:async()=>({ok:false,message:'no <b>way</b>'})});",
+    "offline": "fetch=async()=>{throw new TypeError('Failed to fetch');};",
+    "not json": "fetch=async()=>({json:async()=>{throw new SyntaxError('Unexpected <');}});",
+    # Accepted, then the server never came back: awaitRestart gives up and returns.
+    "never back": "fetch=async()=>({json:async()=>({ok:true,version:'0.2.0'})});",
+}
+
+
+@pytest.mark.parametrize("failure", sorted(_BANNER_FAILURES))
+@pytest.mark.parametrize(("button", "label"), [
+    ("updgo", "Update to 0.2.0<img src=x>"), ("impgo", "Use this journal")])
+def test_a_banner_button_is_handed_back_after_any_failure(button, label, failure):
+    """M29: the Update button stayed disabled on "Updating…" after a network error
+    or a reply that was not JSON, and so did Use this journal; only a refusal
+    handed it back. L39: that refusal restored the label through `esc` into
+    `textContent`, so it read "Update to 0.2.0&lt;img…". Pressed here through the
+    page's own `bindAppBanners`, against every way the POST can end short of a
+    reload.
+    """
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const notes=[];",
+        "const btn=(id,text)=>({id,textContent:text,disabled:false,dataset:{source:'/x'},",
+        "  cls:new Set(),get classList(){const c=this.cls;",
+        "    return {add:k=>c.add(k),remove:k=>c.delete(k)};}});",
+        f"const b=btn({json.dumps(button)},{json.dumps(label)});",
+        "const $=sel=>sel==='#'+b.id?b:null;",
+        "const S={update:{latest:'0.2.0<img src=x>'}};",
+        "function note(text,kind){notes.push(kind);}",
+        "async function awaitRestart(){}",
+        f"let fetch; {_BANNER_FAILURES[failure]}",
+        *_page_fns("bannerPost", "bindAppBanners"),
+        "bindAppBanners();",
+        "await b.onclick();",
+        "console.log(JSON.stringify({disabled:b.disabled,busy:b.cls.has('busy'),",
+        "  text:b.textContent,notes}));",
+    ])
+    assert (out["disabled"], out["busy"], out["text"]) == (False, False, label)
+    if failure != "never back":
+        assert out["notes"] == ["bad"], "the failure was not reported"
+
+
+def test_a_late_update_banner_leaves_the_focused_field_where_it_was():
+    """L38: the update check answers seconds after the page, and the banner it
+    draws landed above a journal entry being typed, moving the field 123px under
+    the cursor (measured in a browser, and 0px after this fix at 1280 and 375).
+    `checkUpdate` measures the focused element before its redraw and scrolls by
+    exactly what moved it. Over the source, for the preserveInputs test's reason.
+    """
+    fn = _fn("checkUpdate")
+    before = fn.index("getBoundingClientRect().top")
+    assert before < fn.index("draw();") < fn.index("window.scrollBy("), (
+        "the focused field has to be measured before the redraw and put back after")
+
+
+def test_the_app_banners_wrap_on_a_phone():
+    """L37: the "What's new" notes are a `<pre>`, which does not wrap, so at 375px
+    the page scrolled sideways to 942px. L39: the banner is a flex row, so every
+    bare text run was a flex item of its own and the full stop after a found
+    journal's path wrapped onto a line by itself.
+    """
+    rules = [(sel, body.replace(" ", "")) for sel, body in _css_rules()]
+    pre = [body for sel, body in rules if re.search(r"\.card\.banner\s+pre\b", sel)]
+    assert pre and "white-space:pre-wrap" in pre[0], "the release notes do not wrap"
+    path = [body for sel, body in rules if re.search(r"\.card\.banner\s+\.mono\b", sel)]
+    assert path and "overflow-wrap:anywhere" in path[0], "a long path cannot wrap"
+    assert re.search(r"<span><b>Found your journal</b>.*?</span>\.</span>",
+                     _fn("appBanners"), re.S), (
+        "the found-journal sentence is not one span, so its full stop is a flex "
+        "item that wraps alone")

@@ -125,7 +125,10 @@
        state rather than vanishing under the reader's pointer. -->
   <div class="vpop" id="vpop" popover role="dialog" aria-label="View options"></div>
 
-  <div id="msg"></div>
+  <!-- A live region, so a screen reader hears "Watching SPY." or a refusal without
+       leaving the control that caused it. `polite` because the banner reports; an
+       error is still not an interruption of what the reader is saying. -->
+  <div id="msg" role="status" aria-live="polite"></div>
   <div id="body"></div>
   <div class="note" id="foot"></div>
   </div>
@@ -162,7 +165,8 @@ import {
 import {PRICE_TIERS, alertState, bxDirection, bxStrong, earningsSoon, histBars,
   meterKnob,
   priceTier, ringArc, ringPoint, shownPrice} from '/static/watch.js';
-import {cls, dayLabel, dp, esc, level, money, monthLabel, num, pct, strike, sym}
+import {cls, compact, dayLabel, dp, esc, level, money, monthLabel, num, pct, strike,
+  sym}
   from '/static/format.js';
 import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
   from '/static/market.js';
@@ -201,6 +205,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} generated_at
  * @property {boolean} dev -- developer-only surfaces on (settings.dev). Off
  *   unless OPTJOURNAL_DEV or the stored flag says so; the web API cannot set it
+ * @property {boolean} [demo] set under `serve --demo`: the synthetic journal, which
+ *   the server never lets reach IBKR, so Sync and the request-spending jobs are off
  * @property {string} asset_category -- the journal's home category, OPT
  * @property {Object} asset_counts -- fills per category; derives offerable Trade Types
  * @property {string} db
@@ -1436,6 +1442,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local rails sessions sigma
  * @local body others pair pick said m r err Date
  * @local WHIST bars hb cur wf3
+ * @local CSS document box fk node back typed hn live
  */
 
 const $=s=>document.querySelector(s);
@@ -1648,6 +1655,10 @@ const chargeOf=(nat,ccy,base)=>isNativeCharge(nat,ccy)
    closed down. Commission keeps the unsigned form it was written for, below. */
 const moneyOf=mo=>mo==null?cash(null)
   :isNativeCharge(mo.native,mo.ccy)?money(mo.native,mo.ccy):cash(mo.base);
+/** The NUMBER `moneyOf` prints, by the same rule, for a cell that has to print it
+    shorter (`compact`). */
+const amountOf=mo=>mo==null?null
+  :isNativeCharge(mo.native,mo.ccy)?mo.native:conv(mo.base);
 /** A commission: a charge, shown unsigned in the currency it was billed in. */
 const chargeMo=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);
 /** @param {Money|null} mo */
@@ -2620,6 +2631,9 @@ function dashboard(){
  * scheduler without a status surface makes the system quieter AND less
  * trustworthy in the same change.
  */
+/* What a control that would reach IBKR says under `serve --demo`: the Sync button,
+   and every job run that spends a Flex request. */
+const DEMO_NO_IBKR='The demo journal is synthetic data and never fetches from IBKR.';
 function collection(){
   const sc=S.state.scheduler, au=S.state.audit;
   if(!sc||!au) return '';
@@ -2695,16 +2709,23 @@ function collection(){
      dialogues, which is how the one that matters stops being read. */
   const rows=(sc.jobs||[]).map(j=>{
     const run=j.last_run;
-    const busy=j.last_status==='running';
-    const tint=j.last_status==='failed'||j.last_status==='interrupted'?'neg'
-      :j.last_status==='ok'?'pos':'';
+    /* In flight is the newest RUN's status, never `last_status`: the job's state
+       row is written when a run finishes, so it held the previous outcome for the
+       whole of a run and the button stayed live under a job already running. */
+    const status=run&&run.status==='running'?'running':j.last_status;
+    const busy=status==='running';
+    /* The demo journal never reaches IBKR, and the server refuses such a run
+       there; a live button would ask to spend a request and then be refused. */
+    const demoOff=!!S.state.demo&&j.spends_request;
+    const tint=status==='failed'||status==='interrupted'?'neg'
+      :status==='ok'?'pos':'';
     const detail=run&&run.detail?run.detail:'';
     /* `finished_at` over `started_at`: for a job that is still running the
        former is null, and "started 3m ago" is the honest thing to say then. */
     const when=run?(run.finished_at||run.started_at||''):'';
     return `<div class="jobrow">
       <span class="jobname mono">${esc(j.job)}</span>
-      <span class="jobstat ${tint}">${esc(j.last_status||'never run')}</span>
+      <span class="jobstat ${tint}">${esc(status||'never run')}</span>
       <span class="dim jobdet">${esc(detail)}</span>
       <span class="dim2 jobwhen mono">${esc(when.slice(0,16).replace('T',' '))}</span>
       ${j.consecutive_failures>1?`<span class="pill gap neg"
@@ -2720,8 +2741,8 @@ function collection(){
             history is kept so a rename does not erase what it did."
             >retired</span>`
         : `<button class="btn sm jobrun" data-job="${esc(j.job)}"
-        data-requests="${j.requests??1}"${busy?' disabled':''}
-        title="${j.spends_request
+        data-requests="${j.requests??1}"${busy||demoOff?' disabled':''}
+        title="${demoOff?DEMO_NO_IBKR:j.spends_request
           ? `Spends ${(j.requests??1)===1?'one IBKR Flex request':j.requests+' IBKR Flex requests'} against a rate-limited budget.`
           : 'Costs no IBKR request.'}">${busy?'running':'run'}</button>`}
     </div>`;
@@ -2923,10 +2944,21 @@ function calendar(){
        an empty day has nothing to show, and making it clickable would
        promise detail that does not exist. */
     const sel=S.calday===key?' selected':'';
-    cells.push(`<div class="day ${k}${dy?' clk':''}${sel}"${dy?` data-calday="${key}"`:''}>
+    /* A button to the keyboard as well as the pointer, as the Market strip's days
+       are: without the role and the tab stop, Tab walked past every day with fills
+       and the drill-down could only be opened with a mouse. */
+    const fills=dy?dy.trades+(dy.trades===1?' fill':' fills'):'';
+    /* BOTH forms of the figure, and the stylesheet shows one: the amount where it
+       fits, `compact` on a phone, where "−€1,729.42" was clipped to "−€1,7". The
+       label is what a screen reader hears either way, and it has the exact one. */
+    const fig=k?`<span class="dplw">${moneyOf(dy.realized)}</span><span class="dpln">${
+      compact(amountOf(dy.realized))}</span>`:'—';
+    cells.push(`<div class="day ${k}${dy?' clk':''}${sel}"${dy?` data-calday="${key}"
+      role="button" tabindex="0" aria-pressed="${sel?'true':'false'}" aria-label="${
+      esc(`${dayLabel(key)}: ${fills}${k?', '+moneyOf(dy.realized):''}`)}"`:''}>
       <div class="top"><span class="dnum">${d}</span>
-        <span class="dct">${dy?dy.trades+(dy.trades===1?' fill':' fills'):''}</span></div>
-      <div class="dpl ${dy&&!k?'dim':''}">${dy?(k?moneyOf(dy.realized):'—'):'<span class="dim2">—</span>'}</div>
+        <span class="dct">${fills}</span></div>
+      <div class="dpl ${dy&&!k?'dim':''}">${dy?fig:'<span class="dim2">—</span>'}</div>
     </div>`);
   }
   /* No chevrons of its own. The calendar used to carry prev/next beside its
@@ -3372,7 +3404,7 @@ function replaySeek(i){
   });
   return fr.index;
 }
-function bindReplayControls(){
+function bindReplayControls(resume){
   const scrub=$('#rscrub'), speed=$('#rspeed'), play=document.querySelector('[data-rplay]');
   if(!scrub) return;
   /* Sync once on open. The cards render hidden and are revealed by replaySeek, so
@@ -3475,6 +3507,10 @@ function bindReplayControls(){
     if(el.getAttribute('role')==='button')
       el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();seek();}};
   });
+  /* Playing when the page redrew under it: carry on from the bar the scrubber
+     held, which `preserveInputs` has already put back. Through `play.onclick`,
+     the one entry point, so the next stop is found from here as on any press. */
+  if(resume&&play) play.onclick();
 }
 
 function replayPanel(rp,label,valueHtml){
@@ -3531,7 +3567,8 @@ function trades(){
       :['Realised',`<b class="${cls(lc.realized_pnl?.base)}">${
         lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—'}</b>`];
     return `<div class="card">
-      <div class="crow${rp?' rk':''}"${rp?` data-replay="${esc(lc.replay_key)}"`:''}><div><h2>${
+      <div class="crow${rp?' rk':''}"${rp?` data-replay="${esc(lc.replay_key)}"
+        role="button" tabindex="0" aria-expanded="${shown?'true':'false'}"`:''}><div><h2>${
         esc(lc.underlying||'?')}
         <span class="dim lbl">${esc(lc.label)}</span>
         <span class="pill gap"
@@ -3809,8 +3846,11 @@ function bindJournal(){
       }
       if(!jnres.ok){
         b.disabled=false; b.classList.remove('busy');
-        note(esc(jnres.message||'the journal write was refused')
-          +' Nothing was saved, and your text is still on screen.','bad');
+        /* The server's reason, then what did NOT happen, said once: the size
+           refusal already says nothing was saved, and the banner said it twice. */
+        const why=jnres.message||'the journal write was refused';
+        note(esc(why)+(why.toLowerCase().includes('nothing was saved')?' Your'
+          :' Nothing was saved, and your')+' text is still on screen.','bad');
         return;
       }
       /* Closed on success, because the reader has finished the act. Reopening is
@@ -3926,7 +3966,11 @@ function positions(){
   const row=pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
     const key=rkeyOf(pos);
     const shown=key&&S.replay===key&&owner[key]===String(pos.conid);
-    return `<tr${key?` class="rk" data-replay="${esc(key)}"`:''}><td class="mono">${
+    /* A tab stop and Enter/Space, like a Trades card's header. No button role: it
+       would take the row out of the table for a screen reader, and a row that
+       opens a panel beneath it is what `aria-expanded` on a row already says. */
+    return `<tr${key?` class="rk" data-replay="${esc(key)}" tabindex="0"
+      aria-expanded="${shown?'true':'false'}"`:''}><td class="mono">${
       esc(pos.symbol)}</td>
     <td class="side ${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
     <td class="n ${cls(pos.position)}">${pos.position}</td>
@@ -5339,17 +5383,12 @@ const ZTIER=['the session is about this','moves the open, or the range','backgro
 function odte(){
   const od=S.state.odte;
   if(!od) return `<div class="card"><div class="empty">no data</div></div>`;
-  const oc=od.context;
-  /* A null context is a real state -- no `bars` fetch has landed the index closes
-     yet -- and it says how to fix it rather than drawing an empty ladder. */
-  if(!oc) return `<div class="card">
-    <div class="crow"><div><h2>0DTE calculator</h2>
-      <div class="sub">Strike by strike, from the S&amp;P 500 close and the
-      VIX.</div></div></div>
-    <div class="note"><b>Not available yet.</b> The calculator opens on the S&amp;P
-      and VIX daily closes, which arrive with the price bars — run
-      <code>optjournal bars</code> (the daily job fetches them too) and it fills in
-      from the next session.</div></div>`;
+  /* A null context is a real state (no `bars` fetch has landed the index closes
+     yet), and it says how to fix it. It used to say so INSTEAD of the calculator,
+     which then had no fields and ignored a `#spx=…&vix=…` link; both readings can
+     be typed, so the tab is drawn with empty fields and the note in the status
+     line, and `oc` is an empty context rather than a branch per read. */
+  const none=!od.context, oc=od.context||{};
 
   /* What the fields hold: what was typed, or the feed's reading where nothing has
      been. `zread` owns that rule for the handlers too -- see its own comment. */
@@ -5374,6 +5413,7 @@ function odte(){
       aria-describedby="${id}from" value="${esc(zread(key))}">
     <div class="wcap" id="${id}from">${typed==null
       ?(oc.fresh?`the feed's reading, ${esc(day)}`:'no current reading: type one')
+      :feed==null?'typed; there is no feed reading to go back to yet'
       :`typed — the feed read <b>${level(feed)}</b> on ${esc(day)}
         <button class="zlink" data-zreset="${key}">use it</button>`}</div>
   </div>`;
@@ -5458,9 +5498,10 @@ function odte(){
       is where that level falls. Round-trip history for trades opened on their
       expiry date is under <b>Trades</b> with the <b>0DTE</b> filter, and the cohort
       comparison is on the <b>Dashboard</b>.</span>i</span></h2>
-      <div class="sub">Where a same-day move lands for <b>${esc(oc.today)}</b>,
-      strike by strike. Index levels, not ${esc(BASE())}.</div></div></div>
-    ${events.length?`<div class="zevents">${events.map(oe=>`<span
+      <div class="sub">Where a same-day move lands${oc.today?` for <b>${
+      esc(oc.today)}</b>`:''}, strike by strike. Index levels, not ${
+      esc(BASE())}.</div></div></div>
+    ${none?'':events.length?`<div class="zevents">${events.map(oe=>`<span
       class="zevent" title="${ZTIER[oe.tier-1]} — the journal's ranking; the feed grades it
         ${esc(oe.impact)}${oe.count>1?`, the highest of the ${oe.count} releases
         this chip merges`:''}. ${oe.count>1?'First at':'At'} ${esc(oe.at)} in the
@@ -5476,7 +5517,11 @@ function odte(){
        checked" rather than as "nothing scheduled". */
     :`<div class="wcap zevents">No US release on the calendar today — a lighter
       tape than a print day, though nothing rules out an intraday headline.</div>`}
-    ${!S.zat?`<div class="wcap zstat">Checking the feed…</div>`
+    ${none?`<div class="note"><b>Not available yet.</b> The calculator opens on the
+      S&amp;P and VIX daily closes, which arrive with the price bars: run
+      <code>optjournal bars</code>, or wait for the daily job. Until then, type both
+      readings below.</div>`
+    :!S.zat?`<div class="wcap zstat">Checking the feed…</div>`
     :!oc.fresh?`<div class="note zwarn zstat"><b>Not current, so not
       shown.</b> ${esc(oc.stale_reason||'')}.${S.zerr?` The refresh failed:
       ${esc(S.zerr)}.`:''} Type a live reading into either field, or
@@ -5895,9 +5940,12 @@ function appBanners(){
     </div>`;
   }
   const found=(ins.previous||[])[0];
+  /* The sentence is ONE span: the banner is a flex row, so every bare text run in
+     it was a flex item of its own, and the full stop after the path wrapped onto a
+     line by itself. */
   if(found&&ins.supervised){
-    out+=`<div class="card banner"><b>Found your journal</b> in
-      <span class="mono">${esc(found)}</span>.
+    out+=`<div class="card banner"><span><b>Found your journal</b> in
+      <span class="mono">${esc(found)}</span>.</span>
       <button class="btn" id="impgo" data-source="${esc(found)}">Use this journal</button>
       <div class="note">It moves into ${esc(ins.home)}, where every future version
       finds it.</div></div>`;
@@ -5913,7 +5961,17 @@ async function checkUpdate(){
     S.update=await r.json();
   }catch(e){S.update=null;}
   /* The first load may still be in flight; it draws the banner when it lands. */
-  if(S.state) draw();
+  if(!S.state) return;
+  /* The answer can arrive seconds after the page, by which time the reader may be
+     typing into a journal entry, and a banner landing above it moved the field
+     123px under the cursor. So whatever holds focus stays where it was on screen:
+     the page scrolls by exactly the height the banner added above it. */
+  const was=document.activeElement, top=was&&was!==document.body
+    ?was.getBoundingClientRect().top:null;
+  draw();
+  const now=document.activeElement;
+  if(top!==null&&now&&now!==document.body)
+    window.scrollBy(0,now.getBoundingClientRect().top-top);
 }
 
 /* After a restart is asked for, wait for the server to come back, then reload
@@ -5932,34 +5990,34 @@ async function awaitRestart(){
     +'again.','bad');
 }
 
+/* One press of a banner button: POST, then wait for the restart. EVERY way this
+   can end short of a reload hands the button back with its own label: a refusal,
+   a network error, a reply that is not JSON, or a server that never came back.
+   Only the refusal did before, so any other failure left "Updating…" disabled
+   with nothing to press. `textContent`, so the label is not escaped a second time
+   (a refused update read "Update to 0.2.0&lt;img…"). */
+async function bannerPost(b,path,body,failed,started){
+  const label=b.textContent;
+  b.disabled=true; b.classList.add('busy');
+  if(b.id==='updgo') b.textContent='Updating…';
+  let ures=null, why='';
+  try{
+    const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)}:{method:'POST'});
+    ures=await r.json();
+    if(!ures.ok) why=ures.message||'';
+  }catch(e){why=String(e);}
+  if(ures&&ures.ok){note(started(ures),'ok'); await awaitRestart();}
+  else note(failed+esc(why),'bad');
+  b.disabled=false; b.classList.remove('busy'); b.textContent=label;
+}
 function bindAppBanners(){
   const u=$('#updgo');
-  if(u) u.onclick=async()=>{
-    u.disabled=true; u.classList.add('busy'); u.textContent='Updating…';
-    try{
-      const r=await fetch('/api/update',{method:'POST'});
-      const ures=await r.json();
-      if(!ures.ok){note('Could not update: '+esc(ures.message||''),'bad');
-        u.disabled=false; u.classList.remove('busy');
-        u.textContent='Update to '+esc(S.update.latest); return;}
-      note(`Installing version ${esc(ures.version)}. The page reloads by itself.`,'ok');
-      await awaitRestart();
-    }catch(e){note('Could not update: '+esc(e),'bad');}
-  };
+  if(u) u.onclick=()=>bannerPost(u,'/api/update',null,'Could not update: ',
+    ures=>`Installing version ${esc(ures.version)}. The page reloads by itself.`);
   const m=$('#impgo');
-  if(m) m.onclick=async()=>{
-    m.disabled=true; m.classList.add('busy');
-    try{
-      const r=await fetch('/api/install/import',{method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({source:m.dataset.source})});
-      const ures=await r.json();
-      if(!ures.ok){note('Could not use that journal: '+esc(ures.message||''),'bad');
-        m.disabled=false; m.classList.remove('busy'); return;}
-      note('Moving your journal. The page reloads by itself.','ok');
-      await awaitRestart();
-    }catch(e){note('Could not use that journal: '+esc(e),'bad');}
-  };
+  if(m) m.onclick=()=>bannerPost(m,'/api/install/import',{source:m.dataset.source},
+    'Could not use that journal: ',()=>'Moving your journal. The page reloads by itself.');
 }
 
 function settingsPanel(){
@@ -5994,7 +6052,7 @@ function settingsPanel(){
         value="${esc(se.query_id||'')}" placeholder="1591754"
         ${overridden?'disabled':''}>
       <button id="qidsave" ${overridden?'disabled':''}>Save</button>
-      <span id="qidmsg" class="dim"></span>
+      <span id="qidmsg" class="dim">${esc(heldNote('qidmsg'))}</span>
     </div>
     ${overridden?`<div class="note">This id comes from a
       <code>--query-id</code> flag or <code>$OPTJOURNAL_QUERY_ID</code>, which
@@ -6009,7 +6067,7 @@ function settingsPanel(){
       <input id="cqid" class="tin mono" inputmode="numeric" maxlength="32"
         value="${esc(se.confirm_query_id||'')}" placeholder="optional">
       <button id="cqidsave">Save</button>
-      <span id="cqidmsg" class="dim"></span>
+      <span id="cqidmsg" class="dim">${esc(heldNote('cqidmsg'))}</span>
     </div>
     <div class="note">Optional. A <b>Trade Confirmation</b> query makes today's fills
     appear within minutes.${infoTip(
@@ -6091,8 +6149,8 @@ function historyImport(plan){
       <span>Fetch back to <b class="mono">${esc(day(hc.from))}</b>:
         ${plan.length} IBKR request${plan.length===1?'':'s'}, one per year,
         newest first, 30 seconds apart.</span>
-      <button class="btn sm" data-job="history" data-requests="${plan.length}"
-        >Import full history</button>
+      <button class="btn sm" data-job="history" data-requests="${plan.length}"${
+        S.state.demo?` disabled title="${DEMO_NO_IBKR}"`:''}>Import full history</button>
     </div>
     <div class="note">It runs on the server, so closing this page does not stop
     it. The Collection card shows how it ended.</div>`;
@@ -6147,8 +6205,12 @@ function applyHash(){
      already models a repeated key, and `getAll` is the whole parser -- inventing
      a separator would mean the page and the server each carrying a split rule
      that has to agree. Empty stays null ("not chosen") rather than becoming an
-     empty array, which the server would read as a selection of nothing. */
-  const cost=hs.getAll('cost').filter(Boolean);
+     empty array, which the server would read as a selection of nothing.
+     Validated against COST_OPTIONS like the tab and the theme: `#cost=BOGUS`
+     used to reach the server and render a scope with no chip lit, so an unknown
+     key is dropped and a hash naming none falls back to the default. */
+  const cost=hs.getAll('cost').map(c=>c.toUpperCase())
+    .filter(c=>COST_OPTIONS.some(([key])=>key===c));
   S.cost=cost.length?cost:null;
   /* Validated against the two units the server knows, like the tab and the
      theme: an unknown value would otherwise put a chip in an impossible state
@@ -6267,8 +6329,11 @@ function draw(push){
     }
   }
   /* A running playback drives element ids that this render is about to
-     replace, so it has to die with them. */
+     replace, so it stops here, and resumes on the new panel below when that
+     panel is the same replay. A theme toggle used to end it. */
+  const replaying=RTIMER!==null?S.replay:null;
   replayStop();
+  const fk=focusKey();
   syncHash(push);
   renderRail();
   /* Before the body renders, not after: the attribute drives every colour on the
@@ -6322,6 +6387,7 @@ function draw(push){
   }
   $('#body').innerHTML=html;
   restoreInputs(keep);
+  restoreFocus(fk);
   /* One binder for the rail and the sub-view switcher, bound HERE rather than in
      `renderRail` because the switcher is part of the body that has only just been
      written. Both are navigation, so both push a history entry and the back button
@@ -6341,23 +6407,20 @@ function draw(push){
   /* Day drill-down: pure redraw, no request -- the leg data is already in the
      payload. Clicking the selected day again clears it (toggle). */
   document.querySelectorAll('[data-calday]').forEach(el=>
-    el.onclick=()=>{const k=el.dataset.calday;
-      S.calday=S.calday===k?null:k;draw();});
+    pressable(el,()=>{const k=el.dataset.calday;
+      S.calday=S.calday===k?null:k;draw();}));
   /* Market day: pure redraw, no request -- every event is already in the
      payload. Not a toggle, unlike the calendar: the market view always shows
      SOME day, so clearing the selection would leave the panel empty with no way
-     back except reloading. role=button means Enter and Space have to work. */
-  document.querySelectorAll('[data-marketday]').forEach(el=>{
-    const pick=()=>{S.marketday=el.dataset.marketday;draw();};
-    el.onclick=pick;
-    el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();pick();}};
-  });
+     back except reloading. */
+  document.querySelectorAll('[data-marketday]').forEach(el=>
+    pressable(el,()=>{S.marketday=el.dataset.marketday;draw();}));
   /* Replay drill-down: same toggle, same pure redraw. Every bar is already in
      the payload, so opening a chart costs no request. */
   document.querySelectorAll('[data-replay]').forEach(el=>
-    el.onclick=()=>{const k=el.dataset.replay;
-      S.replay=S.replay===k?null:k;draw();});
-  bindReplayControls();
+    pressable(el,()=>{const k=el.dataset.replay;
+      S.replay=S.replay===k?null:k;draw();}));
+  bindReplayControls(replaying!==null&&replaying===S.replay);
   bindJournal();
   /* Opening the 0DTE tab checks the feed at once; the timer keeps it current. */
   zdue();
@@ -6446,25 +6509,12 @@ function draw(push){
     S.tiledraft=null; load();
   };
   const qidsave=$('#qidsave');
-  if(qidsave) qidsave.onclick=async()=>{
-    const el=$('#qid'), msg=$('#qidmsg');
-    if(msg) msg.textContent='saving...';
-    const res=await save({query_id:(el&&el.value||'').trim()});
-    /* The SERVER's message, not a local guess: it holds the shape rule (digits,
-       length) and repeating it here would be two rules to keep in step. */
-    if(msg) msg.textContent=res&&res.ok?'saved':((res&&res.message)||'failed');
-    if(res&&res.ok) load();
-  };
+  if(qidsave) qidsave.onclick=()=>saveQueryId('query_id','qid');
+  /* An EMPTY value is a real choice for the confirms id (it turns the intraday
+     poll off), so this sends the blank rather than refusing it the way the token
+     field does. */
   const cqidsave=$('#cqidsave');
-  if(cqidsave) cqidsave.onclick=async()=>{
-    const el=$('#cqid'), msg=$('#cqidmsg');
-    if(msg) msg.textContent='saving...';
-    /* An EMPTY value is a real choice -- it turns the intraday poll off -- so this
-       sends the blank rather than refusing it the way the token field does. */
-    const res=await save({confirm_query_id:(el&&el.value||'').trim()});
-    if(msg) msg.textContent=res&&res.ok?'saved':((res&&res.message)||'failed');
-    if(res&&res.ok) load();
-  };
+  if(cqidsave) cqidsave.onclick=()=>saveQueryId('confirm_query_id','cqid');
   const toksave=$('#toksave');
   if(toksave) toksave.onclick=async()=>{
     const el=$('#tok'), msg=$('#tokmsg');
@@ -6602,10 +6652,21 @@ function draw(push){
      the button disables, which is the safe direction. */
   const b=$('#sync'), sync=st.sync||{}, rem=sync.cooldown_remaining_s;
   b.classList.remove('busy');
-  if(!sync.configured){b.disabled=true;b.title='No query id — start with --query-id';}
+  if(st.demo){b.disabled=true;b.title=DEMO_NO_IBKR;}
+  else if(!sync.configured){b.disabled=true;b.title='No query id — start with --query-id';}
   else if(rem>0){b.disabled=true;
     b.title=`Cooldown: ${Math.ceil(rem/60)}m left. Prevents spending an IBKR request for data that cannot have changed.`;}
   else {b.disabled=false;b.title='Fetch from IBKR — spends one request';}
+}
+
+/* A click target that is not a <button> but carries a tab stop: the pointer and
+   the keyboard get one handler, and Enter and Space work on it as they do on a
+   button. Only when the key lands on the target itself, so a field inside one
+   keeps its own Space. */
+function pressable(el,fn){
+  el.onclick=fn;
+  el.onkeydown=ev=>{
+    if(ev.target===el&&(ev.key==='Enter'||ev.key===' ')){ev.preventDefault();fn();}};
 }
 
 /* Read every text field's value, selection and focus before a render.
@@ -6635,7 +6696,7 @@ function preserveInputs(){
   document.querySelectorAll('#body input,#body textarea,#body select').forEach(el=>{
     if(!el.id) return;
     keep[el.id]={value:el.value,subject:el.dataset.subject||'',
-      start:el.selectionStart,end:el.selectionEnd,
+      start:el.selectionStart,end:el.selectionEnd,checked:el.checked,
       focused:document.activeElement===el};
   });
   return keep;
@@ -6653,11 +6714,57 @@ function restoreInputs(keep){
     const was=keep[id];
     if((el.dataset.subject||'')!==was.subject) return;
     el.value=was.value;
+    /* A checkbox's state is `checked`, not its value: the replay's "stop on
+       events" came back ticked after every redraw. */
+    if(el.type==='checkbox') el.checked=was.checked;
     if(was.focused){
       el.focus();
       try{ el.setSelectionRange(was.start,was.end); }catch(e){ /* unsupported type */ }
     }
   });
+}
+
+/* WHICH CONTROL HAD FOCUS, said so the next render can answer it.
+ *
+ * `preserveInputs` carries a text field's focus, and nothing carried a button's:
+ * every redraw replaced the pressed button and focus fell to <body>, so a keyboard
+ * reader pressing Enter on a cost chip, a sort header or a calendar day had to tab
+ * back from the top of the page after every press.
+ *
+ * The key is the nearest element, from the focused one upward, that names itself
+ * in a way a re-render keeps: an id, an aria-label, or its data attributes (the
+ * page's behaviour hooks, `[data-cost="STK"]`). An aria-label outranks the data
+ * attributes because a data VALUE can move under a control (the month stepper's
+ * `data-month` is the month it leads to), while "Previous period" stays itself.
+ * Counted within the region draw() rewrote, so a rail tab and a sub-view button
+ * that share `data-tab="annual"` are not confused; `inner` finds a keyless button
+ * inside a keyed row (the watchlist's symbol button in `tr[data-wsel]`). */
+const FOCUSABLE='a[href],button,input,select,textarea,summary,[tabindex]';
+const REDRAWN='#rail,#kicker,#period,#vbtn,#vpop,#body,#foot';
+function focusKey(){
+  const el=document.activeElement, box=el&&el.closest&&el.closest(REDRAWN);
+  if(!box) return null;
+  for(let node=el;node&&node!==box;node=node.parentElement){
+    const aria=node.getAttribute('aria-label');
+    const sel=node.id?'#'+CSS.escape(node.id)
+      :aria?`[aria-label="${CSS.escape(aria)}"]`
+      :[...node.attributes].filter(at=>at.name.startsWith('data-'))
+        .map(at=>`[${at.name}="${CSS.escape(at.value)}"]`).join('');
+    if(!sel) continue;
+    return {el,box:'#'+box.id,sel,nth:[...box.querySelectorAll(sel)].indexOf(node),
+      inner:node===el?-1:[...node.querySelectorAll(FOCUSABLE)].indexOf(el)};
+  }
+  return null;
+}
+/* Only when the node itself was replaced: a control draw() does not rewrite (the
+   theme chip, the sync button) never lost focus, and a field `restoreInputs`
+   already refocused is left alone. */
+function restoreFocus(fk){
+  if(!fk||fk.el.isConnected) return;
+  if(document.activeElement&&document.activeElement!==document.body) return;
+  const box=$(fk.box), host=box&&box.querySelectorAll(fk.sel)[fk.nth];
+  const next=host&&fk.inner>=0?host.querySelectorAll(FOCUSABLE)[fk.inner]:host;
+  if(next) next.focus({preventScroll:true});
 }
 
 /* A CLASS, not three inline colour pairs. This used to set `style.background`,
@@ -6738,8 +6845,11 @@ function bindJobRuns(){
          for a sync, one per year for a history import. Zero means nothing is left
          to ask for, so there is nothing to confirm either. */
       const n=Number(b.dataset.requests??1);
+      /* No dialogue in the demo: nothing is spent there, because the server
+         refuses the run, and asking first would be asking about a cost that
+         does not exist. */
       const spends=(((S.state.scheduler||{}).jobs)||[])
-        .some(j=>j.job===job&&j.spends_request)&&n>0;
+        .some(j=>j.job===job&&j.spends_request)&&n>0&&!S.state.demo;
       if(spends&&!confirm(
         `Run ${job}? This spends ${n===1?'one IBKR Flex request':n+' IBKR Flex requests'} `
         +`against a rate-limited budget.`)) return;
@@ -6828,15 +6938,28 @@ function bindMarketFetch(){
  * bars, no vol and no options as though those were measured and empty. */
 function bindWatchlist(){
   /* The search box's `+` watches what was typed: the field is the one place a
-     symbol is entered, IAG's shape. The search text is cleared on success. */
+     symbol is entered, IAG's shape.
+     On success the box AND the filter are cleared, together and before the
+     reload: `preserveInputs` used to put the typed symbol back over the empty
+     render, so the box kept the text while the filter it names was off. On a
+     refusal (`BRK B`) both come back and the box is live again, so one character
+     can be corrected; it used to stay disabled for good. Focus stays in the box
+     either way, ready for the next symbol. */
   const wf=$('#waddf');
   if(wf) wf.onsubmit=async ev=>{
     ev.preventDefault();
-    const input=$('#wsearch'), symbol=(input.value||'').trim();
+    const input=$('#wsearch'), typed=input.value||'', symbol=typed.trim();
     if(!symbol) return;
-    input.disabled=true;
-    S.wsearch='';
-    await watchWrite({symbol:symbol,action:'add'});
+    input.disabled=true; input.value=''; S.wsearch='';
+    const added=await watchWrite({symbol:symbol,action:'add'});
+    if(!added){
+      S.wsearch=typed;
+      const back=$('#wsearch'); if(back) back.value=typed;
+      draw();
+    }
+    const box=$('#wsearch');
+    if(box){box.disabled=false; box.focus();
+      box.setSelectionRange(box.value.length,box.value.length);}
   };
   document.querySelectorAll('[data-wrm]').forEach(el=>
     el.onclick=async()=>{
@@ -6844,7 +6967,9 @@ function bindWatchlist(){
       if(!confirm(`Stop watching ${symbol}?`)) return;
       el.disabled=true;
       if(S.wsym===symbol) S.wsym=null;
-      await watchWrite({symbol:symbol,action:'remove'});
+      /* A refusal draws nothing, so the button is handed back here. */
+      if(!await watchWrite({symbol:symbol,action:'remove'})){
+        el.disabled=false; S.wsym=symbol;}
     });
   const qb=$('#wquote'); if(qb) qb.onclick=()=>loadQuotes(true);
   /* The ROW carries `data-wsel`; clicks inside the drawer row do not, so typing
@@ -6914,18 +7039,53 @@ async function save(body){
   }
 }
 
+/* One of the two query-id fields, saved; its status span is `<id>msg`.
+   The SERVER's message on a refusal, not a local guess: it holds the shape rule
+   (digits, length) and repeating it here would be two rules to keep in step.
+   On success the field is given the TRIMMED value before the reload, which
+   re-renders the panel: `preserveInputs` used to put "  123  " back over the
+   stored "123". And "saved" is held across that redraw (`holdNote`), which wiped
+   it the moment it appeared. */
+async function saveQueryId(key,id){
+  const el=$('#'+id), msg=$('#'+id+'msg'), value=(el&&el.value||'').trim();
+  if(msg) msg.textContent='saving...';
+  const res=await save({[key]:value});
+  if(!res||!res.ok){
+    const now=$('#'+id+'msg'); if(now) now.textContent=(res&&res.message)||'failed';
+    return;
+  }
+  const live=$('#'+id); if(live) live.value=value;
+  holdNote(id+'msg','saved');
+  load();
+}
+
+/* A status word a redraw must not wipe at once. Held in state for a few seconds
+   and rendered by the panel that owns the span; cleared in place afterwards, and
+   only if the span still says it. */
+const HELD_MS=4000;
+function holdNote(id,text){
+  S.held={...(S.held||{}),[id]:{text,until:Date.now()+HELD_MS}};
+  const shown=$('#'+id); if(shown) shown.textContent=text;
+  setTimeout(()=>{const later=$('#'+id);
+    if(later&&later.textContent===text&&!heldNote(id)) later.textContent='';},HELD_MS+50);
+}
+function heldNote(id){
+  const hn=(S.held||{})[id];
+  return hn&&hn.until>Date.now()?hn.text:'';
+}
+
 /* `said` overrides the toast, because these three writes are not one act: an add
    and a remove announce themselves by what they did to the LIST, while saving a
    field changed one row that is already on screen -- and "Watching DELL." after
    editing a note describes something that did not happen. Pre-escaped by the
-   caller, since it carries markup. */
+   caller, since it carries markup. Answers whether the server took the write. */
 async function watchWrite(body,said){
   let added=false;
   try{
     const r=await fetch('/api/watchlist',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const wres=await r.json();
-    if(!wres.ok){note(esc(wres.message||'watchlist write failed'),'bad');return;}
+    if(!wres.ok){note(esc(wres.message||'watchlist write failed'),'bad');return false;}
     if(wres.action==='remove'&&!wres.changed)
       note(`${esc(wres.symbol)} was not on the watchlist.`,'warn');
     else if(wres.fetch_error)
@@ -6934,11 +7094,12 @@ async function watchWrite(body,said){
     else note(said||(wres.action==='add'?`Watching <b>${esc(wres.symbol)}</b>.`
       :`Stopped watching <b>${esc(wres.symbol)}</b>.`),'ok');
     added=wres.action==='add'&&!said;
-  }catch(e){note('Watchlist write failed: '+esc(e),'bad');return;}
+  }catch(e){note('Watchlist write failed: '+esc(e),'bad');return false;}
   await load();
   /* A new watch gets its quote, name and IV rank at once as well, since the
      server has just stored its history: the row is complete on arrival. */
   if(added||S.quotesAt) await loadQuotes(false);
+  return true;
 }
 
 /* One HTTP request PER SYMBOL, so this is never automatic beyond the first view.
@@ -7019,7 +7180,12 @@ function staleServerCheck(state){
     +`(missing: ${missing.map(esc).join(', ')})`,'bad');
 }
 
-async function load(){
+/* The query `/api/state` is asked with, from the view state. ONE function, read by
+   load() and by the hashchange handler, so "which keys does the server see" has a
+   single answer: the handler used to compare the type and the month only, so a
+   typed or back/forward change of `cost`, `scoring` or a `calday` in another month
+   redrew figures for the previous scope. */
+function stateQuery(){
   /* Not `q` -- that name is the FX quote everywhere else in this page, and one
      name for two shapes is what makes the payload guard unable to check either. */
   const qs=new URLSearchParams();
@@ -7036,9 +7202,26 @@ async function load(){
      'position' mean the same thing to the server, and one spelling of a default
      is one fewer place for the page and stats.py to disagree. */
   if(S.scoring) qs.set('scoring',S.scoring);
-  const r=await fetch('/api/state'+(qs.toString()?'?'+qs:''));
-  if(!r.ok){note('Could not read state: HTTP '+r.status,'bad');return;}
-  S.state=await r.json();
+  return qs.toString();
+}
+
+async function load(){
+  const qs=stateQuery();
+  let st=null, why='';
+  try{
+    const r=await fetch('/api/state'+(qs?'?'+qs:''));
+    if(r.ok) st=await r.json(); else why='HTTP '+r.status;
+  }catch(err){why=String(err);}
+  /* Every action button ends in load(), which is how it is handed back: the
+     redraw replaces it. A reply that cannot be read therefore still redraws, from
+     the payload already in hand, or a Sync or a job's Run stays disabled on
+     "running" with nothing left to wait for. */
+  if(!st){
+    note('Could not read state: '+esc(why),'bad');
+    if(S.state) draw();
+    return;
+  }
+  S.state=st;
   staleServerCheck(S.state);
   /* A month outside the account's lifetime heals away (the server answers with
      selected_month null rather than inventing one). Months WITH no fills are
@@ -7081,13 +7264,13 @@ $('#sync').onclick=async()=>{
    truth rather than a write-only echo of it. `replaceState` does not fire
    hashchange, so `syncHash` cannot feed this back into a loop.
 
-   Reloads only when the server-side keys moved: the tab is drawn from state
-   already in hand, and refetching for it would spend a request to render the
-   same payload. */
+   Reloads only when the query load() would send moved: the tab is drawn from
+   state already in hand, and refetching for it would spend a request to render
+   the same payload. The back and forward buttons arrive here too. */
 window.onhashchange=()=>{
-  const was=[S.type,S.month].join('|');
+  const was=stateQuery();
   applyHash();
-  if([S.type,S.month].join('|')!==was) load(); else draw();
+  if(stateQuery()!==was) load(); else draw();
 };
 
 applyHash();

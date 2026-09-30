@@ -51,6 +51,12 @@ shipped a selected tab too close to its neighbours to read as selected — that 
 found by **screenshot**, since every text-contrast figure passed while the tab
 strip had stopped saying where you were.
 
+Translucency is measured as it composites. The Watchlist's Daily column mutes a
+figure with `opacity`, and the 0DTE read tiles put their labels on a call or put
+wash, so those tests blend the rule's own opacity, or the wash's alpha, over each
+ground before computing the ratio. Both had shipped below AA (a loss at 3.55:1,
+a tile label at 4.45:1) while every solid pair passed.
+
 **Adding a theme**: one `[data-theme="yourname"]` block in `app.css` declaring
 every name `:root` declares → one entry in `page.html`'s `THEMES` table. No
 JavaScript to touch, and the tests will tell you which names you missed and which

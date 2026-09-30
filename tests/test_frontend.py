@@ -13,6 +13,7 @@ code that actually runs.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -277,6 +278,39 @@ def test_the_companion_imports_the_module_rather_than_duplicating_it(module):
     assert not duplicated, (
         f"companion.html redefines {duplicated}, which {module.name} exports"
     )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node runtime")
+def test_the_companion_keeps_the_levels_it_was_last_sent_across_a_reload():
+    """L44: the window's hash was only its OPENING state, so a level moved on the
+    tab (which posts into the window) was lost on reload and the old one came
+    back. The companion's own `take` now writes what it shows into its hash; run
+    here under node with `location`, `history` and `render` as the stand-ins.
+    """
+    script = code_only(COMPANION.read_text(encoding="utf-8")
+                       .split('<script type="module">')[1].split("</script>")[0])
+    fns = re.findall(r"^function \w+\(.*?\n\}", script, re.S | re.M)
+    harness = "\n".join([
+        "const location={hash:'#spx=7706.03&call=7780&theme=ledger',pathname:'/companion'};",
+        "const history={replaceState(s,t,u){location.hash=u.slice(u.indexOf('#'));}};",
+        "function render(){}",
+        re.search(r"^const Z=.*?;$", script, re.M).group(0),
+        *(fn for fn in fns if not fn.startswith("function render(")),
+        "fromHash();",
+        "take({spx:'7710.50',call:'7800',put:'7600',theme:'ledger'});",
+        "const moved=location.hash; Z.call='';",
+        "fromHash();",
+        "console.log(JSON.stringify({moved,reloaded:Z}));",
+    ])
+    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [shutil.which("node") or "node", "--input-type=module", "-e", harness],
+        capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stderr[-3000:]
+    out = json.loads(result.stdout)
+    assert out["moved"] == "#spx=7710.50&call=7800&put=7600&theme=ledger"
+    assert out["reloaded"] == {"spx": "7710.50", "call": "7800", "put": "7600",
+                               "theme": "ledger"}
 
 
 def test_the_companion_wears_the_shared_stylesheet_and_no_rules_of_its_own():
