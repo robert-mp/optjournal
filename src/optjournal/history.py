@@ -710,17 +710,24 @@ def _pre_archive(
     for key, entries in fills.items():
         snapshot = positions.get(key, {})
         entries.sort()
-        gaps: list[float] = []
+        before: float | None = None
         net: float = 0
         index = 0
         for day in dates[key[:2]]:
             while index < len(entries) and entries[index][0] <= day:
                 net += entries[index][1]
                 index += 1
-            gaps.append((snapshot.get(day) or 0) - net)
-        before = gaps[0]
-        if not _flat(before) and all(_flat(gap - before) for gap in gaps):
-            out[key] = before
+            gap = (snapshot.get(day) or 0) - net
+            if before is None:
+                before = gap
+            # Settled by the first date whose gap is flat, or the first that moves
+            # off it: walking on to the end made this contracts times dates, and
+            # nearly every contract is decided on the first date.
+            if _flat(before) or not _flat(gap - before):
+                break
+        else:
+            if before is not None:
+                out[key] = before
     return out
 
 

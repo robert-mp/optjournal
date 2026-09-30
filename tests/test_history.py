@@ -933,6 +933,48 @@ def test_a_gap_present_on_every_snapshot_date_is_still_a_pre_archive_holding(con
     assert ep.entry_outside_window is True and ep.opened_at is None
 
 
+def _pre_archive_lines(tmp_path, n: int) -> int:
+    """Lines `_pre_archive` runs for `n` traded contracts in an account with `n`
+    snapshot dates, every one of them decided on the first date."""
+    import sys
+
+    from optjournal import history
+
+    conn = connect_migrated(tmp_path / f"walk{n}.db")
+    add_statement(conn, from_date="2026-01-01")
+    for day in range(1, n + 1):
+        add_snapshot(conn, "HELD", position=1, date=f"202607{day:02d}")
+    for c in range(n):
+        add_trade(conn, str(c), conid=f"C{c}", date="2026-09-30")
+    rows = conn.execute("SELECT * FROM trades").fetchall()
+    code, count = history._pre_archive.__code__, 0
+
+    def local(frame, event, arg):
+        nonlocal count
+        count += event == "line"
+        return local
+
+    sys.settrace(lambda frame, event, arg: local if frame.f_code is code else None)
+    try:
+        assert history._pre_archive(rows, conn) == {}
+    finally:
+        sys.settrace(None)
+    return count
+
+
+def test_the_pre_archive_walk_stops_once_its_answer_is_settled(tmp_path):
+    """Every contract with fills walked every snapshot date of its account, though
+    the first date already decides almost all of them (a flat gap seeds nothing),
+    so the walk grew as contracts times dates, twice per `/api/state`: 199ms on
+    two and a half years of synthetic daily statements, 23ms stopped where the
+    answer is settled. Counted in lines run rather than timed, which a loaded
+    machine cannot make flaky: tripling both contracts and dates must triple the
+    work (measured 592 to 1752 lines), where the full walk grew it sevenfold
+    (1712 to 12312)."""
+    small, large = _pre_archive_lines(tmp_path, 20), _pre_archive_lines(tmp_path, 60)
+    assert large < 4 * small, (small, large)
+
+
 # --- a bare close past flat -----------------------------------------------------
 
 
