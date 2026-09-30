@@ -1122,7 +1122,7 @@ def test_sync_response_shape_matches_what_the_page_reads():
     `optjournal sync` and the `sync` job) and the refusal shapes from `_do_sync`
     and `_sync_refusal`, which exist precisely to turn its typed exceptions into
     an HTTP body. Reading only the endpoint stopped covering the success keys the
-    moment they moved -- caught here, which is the whole reason all are named.
+    moment they moved (caught here), which is the whole reason all are named.
     """
     import inspect
 

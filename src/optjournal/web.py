@@ -2351,8 +2351,8 @@ def serve(
             # POLLED ON A SHORT SLEEP, for the same reason the `serving` barrier
             # above is, and this asymmetry was a real bug: a bare `Event.wait()`
             # parks the main thread in a lock acquire that Windows does not
-            # interrupt, so CPython -- which runs signal and console-control
-            # handlers on the main thread only -- could not run `_bye` until the
+            # interrupt, so CPython (which runs signal and console-control
+            # handlers on the main thread only) could not run `_bye` until the
             # wait returned. Whether that deadlocked depended purely on whether
             # Ctrl+Break arrived before or after the main thread entered the wait,
             # which is why it presented as flakiness: three consecutive
