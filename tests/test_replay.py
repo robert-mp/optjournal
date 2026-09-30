@@ -640,6 +640,50 @@ def test_the_band_measures_to_the_legs_held_at_each_bar(conn):
             want(day, 0.50, far), abs=1e-4), f"{day}: measured to a leg rolled away"
 
 
+def test_after_the_close_the_band_measures_to_what_was_last_held(conn):
+    """A roll outward, then a close: the context after the close is measured to
+    the leg the position ended on, not to a nearer leg closed days before it.
+
+    With nothing held, every leg still alive was the basis, so the long-closed
+    near call pulled the horizon in: the band tapered to nothing at that call's
+    expiry and then reappeared, measured to the put. Seen on the real AAPL
+    strangle, whose band shrank to zero at legs closed a month earlier.
+    """
+    spot = 100.0
+    days = ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08",
+            "2026-01-09", "2026-01-12", "2026-01-13"]
+    _daily(conn, days, spot)
+    near, far = epoch_et("2026-01-09 16:00:00"), epoch_et("2026-01-23 16:00:00")
+    for conid, strike, right, expiry, vol in (("CALL", 110.0, "C", near, 0.30),
+                                              ("PUT", 90.0, "P", far, 0.50)):
+        _closes(conn, conid, strike, right, expiry, vol, dict.fromkeys(days, spot))
+
+    def price(strike, right, expiry, vol, at):
+        return bs_price(spot, strike, (expiry - epoch_et(at)) / _YEAR, vol, right)
+
+    rolled, closed = "2026-01-06 10:15:00", "2026-01-07 10:15:00"
+    replay = _replay(conn, [
+        _leg("CALL", 110.0, "C", "2026-01-09", "2026-01-05 10:15:00", -1,
+             price(110.0, "C", near, 0.30, "2026-01-05 10:15:00")),
+        _leg("CALL", 110.0, "C", "2026-01-09", rolled, 1,
+             price(110.0, "C", near, 0.30, rolled), marker="C"),
+        _leg("PUT", 90.0, "P", "2026-01-23", rolled, -1,
+             price(90.0, "P", far, 0.50, rolled)),
+        _leg("PUT", 90.0, "P", "2026-01-23", closed, 1,
+             price(90.0, "P", far, 0.50, closed), marker="C"),
+    ], closed=closed)
+
+    half = _half(replay["band"])
+    after = [stamp for stamp, _spot in replay["points"] if stamp > epoch_et(closed)]
+    assert after, "no context bar after the close to measure"
+    for stamp in after:
+        assert stamp in half, "the band vanished after the close"
+        settles = stamp + 6.5 * 3600                  # a 09:30 bar's 16:00 close
+        want = spot * 0.50 * ((far - settles) / _YEAR) ** 0.5
+        assert half[stamp] == pytest.approx(want, abs=1e-4), (
+            "measured to a leg closed before the position ended")
+
+
 def _closes(conn, conid, strike, right, expiry, vol, spots: dict[str, float]) -> None:
     """A contract's daily closes at one vol, each priced at its own 16:00 close."""
     for day, spot in spots.items():

@@ -333,18 +333,37 @@ def _position(leg: ReplayLeg, at: int) -> tuple[float, float]:
 def _basis(legs: list[ReplayLeg], at: int) -> list[tuple[ReplayLeg, int]]:
     """The legs a bar is modelled from, each with its expiry epoch.
 
-    The legs HELD at ``at``, or every leg when nothing is held (the context either
-    side of the trade), less any that have expired by then: an expired contract
-    has no horizon left to measure. Held rather than ever-held, because a roll
-    closes one contract and opens another, and the position after it is the new
-    one's. Empty when everything held has expired, which is a settled position.
+    The legs HELD at ``at``, less any that have expired by then: an expired
+    contract has no horizon left to measure. Held rather than ever-held, because a
+    roll closes one contract and opens another, and the position after it is the
+    new one's. Empty when everything held has expired, which is a settled position.
+
+    With nothing held, the context AFTER the trade is measured to what the
+    position ended on (the legs held just before its last fill), and any other
+    flat bar, the context before entry included, to every leg. Every leg after the
+    close once let a near leg closed weeks earlier pull the horizon in, so the
+    band tapered to nothing at that leg's expiry and then reappeared.
     """
     held = [leg for leg in legs if _position(leg, at)[0]]
+    if not held:
+        held = _ended_on(legs, at) or legs
     return [
         (leg, expiry)
-        for leg in (held or legs)
+        for leg in held
         if (expiry := expiry_epoch(leg.expiry)) is not None and expiry >= at
     ]
+
+
+def _ended_on(legs: list[ReplayLeg], at: int) -> list[ReplayLeg]:
+    """The legs held just before the last fill, when ``at`` is past every fill."""
+    stamps = sorted({fill_at for leg in legs for fill_at, _qty, _price in leg.fills})
+    if not stamps or at < stamps[-1]:
+        return []
+    for stamp in reversed(stamps):
+        held = [leg for leg in legs if _position(leg, stamp - 1)[0]]
+        if held:
+            return held
+    return []
 
 
 def expected_move_band(
