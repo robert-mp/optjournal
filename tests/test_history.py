@@ -491,6 +491,59 @@ def test_the_positions_view_and_the_episode_walk_read_the_same_book(conn):
     assert {conid for _, _, conid in held} == _current_option_conids(conn) == {"B1"}
 
 
+def test_every_category_at_once_is_each_category_read_at_its_own_book(conn):
+    """`history --assets ALL` read the mixed scope flat only where the NAV priced
+    stock AND options at nothing, so an options-only journal whose options went
+    flat by NAV alone (U2), and an account that sold its stock on a day whose
+    statement had no OpenPositions (U5), kept a position the per-category
+    readings, the Positions tab and the allocation all called gone. Each row is
+    now read at its own category's book, so the whole is the union of the parts,
+    including a category the NAV does not price (U6's fund), which no NAV row may
+    empty."""
+    from optjournal.history import _held, book_date
+
+    for account in ("U2", "U3", "U5", "U6"):
+        add_statement(conn, source_file=f"{account}.xml", account_id=account,
+                      asset_filter="ALL")
+
+    def snap(conid, account, date, asset):
+        add_snapshot(conn, conid, position=1, date=date, asset=asset, symbol=conid,
+                     account_id=account,
+                     source_file="t.xml" if account == "U1" else f"{account}.xml")
+
+    # U1: options sold on 0916, the stock still listed.
+    snap("U1OPT", "U1", "20260901", "OPT")
+    snap("U1STK", "U1", "20260901", "STK")
+    snap("U1STK", "U1", "20260916", "STK")
+    add_nav(conn, "20260916", stock=900, options=0)
+    # U2: an --assets OPT journal, whose options go flat by NAV alone.
+    snap("U2OPT", "U2", "20260901", "OPT")
+    add_nav(conn, "20260916", stock=5000, options=0, account_id="U2")
+    # U3: a 0916 statement without OpenPositions, the NAV pricing both.
+    snap("U3OPT", "U3", "20260901", "OPT")
+    snap("U3STK", "U3", "20260901", "STK")
+    add_nav(conn, "20260916", stock=900, options=100, account_id="U3")
+    # U5: the stock sold on 0916, no OpenPositions that day.
+    snap("U5OPT", "U5", "20260901", "OPT")
+    snap("U5STK", "U5", "20260901", "STK")
+    add_nav(conn, "20260916", stock=0, options=100, account_id="U5")
+    # U6: a fund, which the NAV has no column for, beside nothing else held.
+    snap("U6FUND", "U6", "20260901", "FUND")
+    add_nav(conn, "20260916", stock=0, options=0, account_id="U6")
+
+    def held(scope):
+        return {conid for _, _, conid in _held(conn, scope)[0]}
+
+    parts = {scope: held(scope) for scope in ("OPT", "STK", "FUND")}
+    assert parts == {"OPT": {"U3OPT", "U5OPT"}, "STK": {"U1STK", "U3STK"},
+                     "FUND": {"U6FUND"}}
+    assert held(None) == set().union(*parts.values())
+    assert {e.conid for e in build_history(conn, asset_category=None).open} == (
+        set().union(*parts.values()))
+    assert book_date(conn, None) == max(
+        book_date(conn, scope) for scope in ("OPT", "STK", "FUND")) == "20260916"
+
+
 def test_each_account_is_read_at_its_own_newest_date(conn):
     """U2's statements lag U1's. Measured against U1's newer date, U2's held
     position vanished from the book, and its pre-archive episode read CLOSED."""

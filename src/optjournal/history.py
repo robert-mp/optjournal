@@ -494,8 +494,8 @@ NAV_VALUE_BY_CATEGORY: dict[str, str] = {
 }
 
 
-def _nav_flat_where(asset_category: str | None) -> str:
-    """The equity-summary predicate saying this scope holds nothing, or "".
+def _nav_flat_where(asset_category: str) -> str:
+    """The equity-summary predicate saying this category holds nothing, or "".
 
     Per category, because each column speaks only for its own: the option book is
     flat when `options_base` is 0 whatever the stock figure. Reading the two
@@ -503,24 +503,47 @@ def _nav_flat_where(asset_category: str | None) -> str:
     for good, since the day its options go flat has no position row at all and its
     NAV still prices the stock that journal does not track.
 
-    A scope the NAV cannot price gets "" -- no NAV row may empty it. The mixed
-    scope takes every priced column being zero, which is as far as the NAV's own
-    columns reach: an account holding only funds or bonds still reads as flat
-    there on a day whose statement carried no positions.
+    A category the NAV cannot price gets "" -- no NAV row may empty it.
     """
-    if asset_category:
-        column = NAV_VALUE_BY_CATEGORY.get(asset_category.upper())
-        return f"{column} = 0" if column else ""
-    return " AND ".join(
-        f"{column} = 0" for column in sorted(NAV_VALUE_BY_CATEGORY.values())
+    column = NAV_VALUE_BY_CATEGORY.get(asset_category.upper())
+    return f"{column} = 0" if column else ""
+
+
+def _book_dates(flat: str) -> str:
+    """`book_dates_sql` for one category, whose NAV predicate is `flat`."""
+    nav = (
+        " UNION ALL SELECT broker, account_id, report_date FROM equity_summaries"
+        f"  WHERE {flat}"
+    ) if flat else ""
+    return (
+        "SELECT broker, account_id, MAX(d) AS book_date FROM ("
+        " SELECT broker, account_id, report_date AS d FROM position_snapshots"
+        f"{nav})"
+        " GROUP BY broker, account_id"
     )
+
+
+def _book_of(column: str) -> str:
+    """Which of the mixed scope's books a row with this `asset_category` reads:
+    its own category's if the NAV prices it, else the one no NAV row moves."""
+    priced = ", ".join(f"'{category}'" for category in sorted(NAV_VALUE_BY_CATEGORY))
+    return f"CASE WHEN {column} IN ({priced}) THEN {column} ELSE '' END"
 
 
 def book_dates_sql(asset_category: str | None = None) -> str:
     """The date each account's position book is as of, as a derived table.
 
     The newest day the account reported a position in ANY category, or on which
-    its NAV breakdown priced the scope at nothing.
+    its NAV breakdown priced the category at nothing.
+
+    `None`, every category at once, is each category read at its own book: one
+    row per account for each category the NAV prices, tagged with it in
+    `category`, and one tagged '' for every category it does not. So the whole is
+    the union of the parts. Taking the NAV flat only where it priced stock AND
+    options at nothing kept a position both halves called gone: the options of an
+    `--assets OPT` journal, whose NAV still prices stock, or the stock of an
+    account whose statement that day had no OpenPositions. `book_join_sql`
+    matches each row to its own.
 
     Any category, because IBKR's OpenPositions lists only what is held and every
     row of one statement carries the same reportDate (checked across the real
@@ -546,25 +569,26 @@ def book_dates_sql(asset_category: str | None = None) -> str:
     derived table joined on `(broker, account_id)` it is one pass: 2.2s back to
     1ms at that size.
     """
-    flat = _nav_flat_where(asset_category)
-    nav = (
-        " UNION ALL SELECT broker, account_id, report_date FROM equity_summaries"
-        f"  WHERE {flat}"
-    ) if flat else ""
-    return (
-        "SELECT broker, account_id, MAX(d) AS book_date FROM ("
-        " SELECT broker, account_id, report_date AS d FROM position_snapshots"
-        f"{nav})"
-        " GROUP BY broker, account_id"
+    if asset_category:
+        return _book_dates(_nav_flat_where(asset_category))
+    books = [(category, _book_dates(_nav_flat_where(category)))
+             for category in sorted(NAV_VALUE_BY_CATEGORY)]
+    books.append(("", _book_dates("")))
+    return " UNION ALL ".join(
+        f"SELECT broker, account_id, '{category}' AS category, book_date FROM ({sql})"
+        for category, sql in books
     )
 
 
 def book_join_sql(asset_category: str | None = None) -> str:
-    """The join narrowing a `position_snapshots p` to each account's current book."""
+    """The join narrowing a `position_snapshots p` to each account's current book:
+    for every category at once, each row to its own category's (`book_dates_sql`)."""
+    own = "" if asset_category else f"   AND b.category = {_book_of('p.asset_category')}"
     return (
         f" JOIN ({book_dates_sql(asset_category)}) b"
         "  ON b.broker = p.broker AND b.account_id = p.account_id"
         "   AND b.book_date = p.report_date"
+        f"{own}"
     )
 
 
