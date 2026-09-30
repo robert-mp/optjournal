@@ -79,7 +79,7 @@ export function compact(value) {
     : [size / 1e6, "m"];
   /* One decimal below ten of a unit, none above: "9.9k" then "10k", so the digits
      before the suffix never run past three. */
-  const body = !unit ? num(Math.round(size), 0)
+  const body = !unit ? num(Math.round(scaled), 0)
     : scaled < 9.95 ? `${num(scaled, 1)}${unit}`
     : `${num(Math.round(scaled), 0)}${unit}`;
   return `${amount < 0 && body !== "0" ? MINUS : ""}${body}`;

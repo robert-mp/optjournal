@@ -4146,9 +4146,9 @@ def test_the_watchlists_muted_daily_figure_meets_aa_in_every_theme():
     """L43: the Daily column is muted with `opacity` unless the reading is
     strengthening, and at .62 a loss read 3.55 to 3.70:1 on its row, with the
     dash for a missing reading at 2.85:1. The opacity is read from the rule and
-    recomputed for both signs -- and for the plain foreground a reading of zero
-    wears -- on every surface a row can sit on: the card, the hover ground, and the
-    open row's gradient stops.
+    recomputed for both signs, and for the plain foreground a reading of zero wears,
+    on every surface a row can sit on: the card, the hover ground, and the open row's
+    gradient stops.
     """
     rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
     assert "opacity" not in rules.get(".wtab td.wdaily", ""), (
@@ -4168,8 +4168,8 @@ def test_the_watchlists_muted_daily_figure_meets_aa_in_every_theme():
 
 def test_a_daily_reading_of_zero_is_muted_like_every_other_reading():
     """L54: the muting keyed on `.signed`, which `cls()` withholds from a figure that
-    prints as zero -- deliberately, because the hue and the "+" are both claims about
-    a sign it does not have. So a reading of 0.0 was the one number in the column at
+    prints as zero (deliberately, because the hue and the "+" are both claims about a
+    sign it does not have). So a reading of 0.0 was the one number in the column at
     full strength, wearing the emphasis this column keeps for a strengthening one.
 
     The rule now says what it always meant: a cell holding a reading rather than the
@@ -5380,7 +5380,7 @@ def test_a_failed_state_read_leaves_the_controls_over_the_figures_in_hand():
     period and pick Equities while `/api/state` answers 503 and the header said
     "Aug 2026", the view button said "Equities" and the URL said
     `month=2026-08&type=equities`, while Net P&L and the whole body were still
-    September's all-options numbers -- and every later redraw kept it that way until
+    September's all-options numbers, and every later redraw kept it that way until
     the next successful load.
 
     Each control writes into S and then calls load(), so the scope cannot be read
@@ -5943,10 +5943,10 @@ def test_a_refused_query_id_shows_the_servers_reason_and_keeps_the_text():
 def test_a_refusal_ends_the_saved_that_was_being_held():
     """L53: "saved" is held for four seconds so a reload cannot wipe it, and the
     refusal branch left that hold standing. Save a valid id, type `bad!`, save
-    again within the four seconds, and the next redraw -- the theme chip, a load,
-    anything -- rebuilt the span from the hold and put "saved" back beside the
-    value the server had just refused, while the stored id was still the previous
-    one. Driven in headless Chromium on a copy of the real journal too.
+    again within the four seconds, and the next redraw (the theme chip, a load, any
+    of them) rebuilt the span from the hold and put "saved" back beside the value the
+    server had just refused, while the stored id was still the previous one. Driven
+    in headless Chromium on a copy of the real journal too.
     """
     refusal = "'bad!' is not a Flex query id"
     out = _save_query_id(
@@ -8428,7 +8428,7 @@ def test_a_calendar_day_prints_its_figure_whole_at_every_width():
         "the compact amount does not show, or does not scale with the day")
     wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
     assert "container-type:inline-size" in wide.get(".cal>.day:has(>.dpl)", ""), (
-        "a day is not its own container, so the query above can never match -- and "
+        "a day is not its own container, so the query above can never match; and "
         "the Market strip's cells must stay out of it, they size themselves")
     assert "display:none" in wide.get(".day .dpln", ""), (
         "the compact amount shows beside the full one on a wide screen")

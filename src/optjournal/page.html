@@ -3084,8 +3084,8 @@ let RGEO=null, RTIMER=null;
 /* WHICH replay the running loop belongs to, recorded where playback is armed and
    read only while RTIMER is set. draw() cannot ask S.replay for this: the
    `[data-replay]` handler writes the new key BEFORE it redraws, so "is this the
-   same replay" was the new key compared with itself -- always true -- and opening
-   a second chart while the first played started the second one playing too. */
+   same replay" was the new key compared with itself, always true, and opening a
+   second chart while the first played started the second one playing too. */
 let RPKEY=null;
 /* The events a replay can place on the timeline: those carrying a real epoch.
    ONE filter, because two readers must agree about the set -- the geometry
@@ -7237,7 +7237,7 @@ function stateQuery(){
  * load(), which is right while the read succeeds and was a lie when it did not: the
  * page redraws from the payload it still has, so pressing Previous period and then
  * picking Equities against a 503 left the header saying "Aug 2026", the view button
- * saying Equities and the URL saying both, over September's all-options figures --
+ * saying Equities and the URL saying both, over September's all-options figures,
  * and it survived every later redraw until the next successful load. Recorded as
  * each payload lands rather than at the top of load(), because by then S already
  * holds the scope being asked for.
