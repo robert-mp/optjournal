@@ -189,7 +189,7 @@ class Campaign:
     #: has no fills. What journal entries are filed under and what a hand link
     #: names.
     #:
-    #: `episode_indices` cannot be a handle -- they are positions in the list
+    #: `episode_indices` cannot be a handle: they are positions in the list
     #: `link` was handed, and every ingest rebuilds that list. Nor can the
     #: campaign's identity be its membership, which a 90-second heuristic decides
     #: and a later fill can change. An ORDER ID is neither: IBKR issued it, it
@@ -199,8 +199,8 @@ class Campaign:
     #: The LOWEST, so the handle is the decision's earliest placement and a roll
     #: added tomorrow does not move it. Compared numerically, because IBKR order
     #: ids are numbers in text and `min` on strings would rank '999' above '1000'
-    #: -- true today only because the real ids are all ten digits, which is the
-    #: kind of accident that holds until it does not. Ties fall back to the
+    #: (true today only because the real ids are all ten digits, which is the
+    #: kind of accident that holds until it does not). Ties fall back to the
     #: string so the answer is total either way.
     #:
     #: One anchor per card: where two campaigns' lowest handle is the same order,
@@ -210,7 +210,7 @@ class Campaign:
     #:
     #: None for a campaign built only from position snapshots: the archive holds
     #: no fills for it, so there is no order to name. Callers that key anything
-    #: on this have to say what they do about that -- see `journal.py`.
+    #: on this have to say what they do about that; see `journal.py`.
     anchor: str | None = None
     #: The anchor this campaign answered to alongside another, which now owns it,
     #: so writing filed under it may be about either (`serialize.journal_data`
