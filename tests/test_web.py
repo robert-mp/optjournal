@@ -8810,6 +8810,25 @@ def test_the_market_week_strip_is_seven_equal_columns_at_every_width():
         "own truncating box")
 
 
+def test_the_replay_controls_wrap_inside_their_card():
+    """Reviewer finding D2. The control row is three buttons, the scrubber (80px
+    at least), the speed select, two checkboxes and the readout, one `nowrap` flex
+    row. The readout alone is about 270px on a real replay ("Sep 11, 11:30 AM · 104
+    · $396.00 est. P&L · flat"), so from 320 to 920px the row ran past its card
+    and the page scrolled sideways (456px at 320). It wraps now, as `.setrow` and
+    the Market buttons do: where one row fits, nothing moves (the scrubber still
+    takes the spare room and the readout ends the row); where it does not, the
+    controls flow onto further lines, the readout stays at the right, and on a
+    phone its own text wraps rather than widening the page.
+    """
+    rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "flex-wrap:wrap" in rules[".rctl"], "the replay controls cannot wrap"
+    readout = rules[".rread"]
+    assert "white-space:nowrap" not in readout, (
+        "a readout that cannot wrap is wider than a phone's card on its own")
+    assert "margin-left:auto" in readout, "a wrapped readout falls to the left edge"
+
+
 def test_the_content_column_can_shrink_below_its_widest_child():
     """A `1fr` track has an `auto` minimum, so one wide table widened `.wrap`
     past the viewport and the whole page scrolled sideways. `minmax(0,1fr)` is

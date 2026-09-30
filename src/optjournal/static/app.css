@@ -1526,7 +1526,12 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .emband{fill:var(--accent2);opacity:.17}
 .emedge{fill:none;stroke:var(--accent);stroke-width:1;opacity:.5;stroke-dasharray:4 4}
 .cross{stroke:var(--dim);stroke-width:1;opacity:.5}
-.rctl{display:flex;align-items:center;gap:var(--s5);margin-top:var(--s3);padding:0 var(--s0)}
+/* WRAPS, like `.setrow`: three buttons, the scrubber, the speed, two checkboxes
+   and a readout of about 270px need some 730px, so as one unbreakable row they
+   ran past the card at every width up to 920px (456px past a phone's). Where one
+   row fits, nothing moves; where it does not, the controls flow onto further
+   lines. */
+.rctl{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s5);margin-top:var(--s3);padding:0 var(--s0)}
 .rbtn{font:inherit;font-size:var(--t1);font-weight:var(--w-label);padding:var(--s2) var(--s4);
   border-radius:var(--r2);cursor:pointer;white-space:nowrap;
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2)}
@@ -1538,7 +1543,11 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .rspeed{font:inherit;font-size:var(--t1);padding:var(--s1) var(--s2);border-radius:var(--r2);
   width:auto;flex:0 0 auto;
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2);cursor:pointer}
-.rread{font-size:var(--t1);color:var(--dim);white-space:nowrap;min-width:150px;
+/* The readout ends the row, and a wrapped one stays at the right (`margin-left:
+   auto` takes only space the scrubber has not grown into). Its text may wrap: a
+   flex item is placed at its unwrapped width, so it only ever wraps where it is
+   alone on a line narrower than itself, which is a phone. */
+.rread{font-size:var(--t1);color:var(--dim);min-width:150px;margin-left:auto;
   text-align:right;font-family:var(--fig);font-variant-numeric:tabular-nums}
 .rauto{font-size:var(--t1);color:var(--dim2);white-space:nowrap;cursor:pointer;
   display:flex;align-items:center;gap:var(--s1)}
