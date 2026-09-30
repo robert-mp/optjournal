@@ -125,7 +125,10 @@ Four previous calendar years plus the current one, the same as any saved Flex
 query. A single request covers at most ~365 days.
 
 The ARCHIVE keeps one file per day, `confirm-YYYYMMDD.xml`, overwritten by each
-poll -- where a statement gets one file per fetch. The reason is in the payload:
+poll -- where a statement gets one file per fetch. The day is the payload's own
+`toDate` rather than the poll's UTC date, so an evening poll in Europe files the
+US session under that session's name, and each re-ingest refreshes the file's
+`statements` row (period and `whenGenerated`) to match what the file now holds. The reason is in the payload:
 `whenGenerated` changes on every request, so the bytes are never identical and the
 content dedupe cannot collapse them. Polling every 25 minutes would otherwise
 archive fifteen files and open fifteen `statements` rows for one day of fills.

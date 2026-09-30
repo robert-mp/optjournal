@@ -517,7 +517,7 @@ def _archive(
     archive_dir: Path,
     *,
     prefix: str = ACTIVITY_PREFIX,
-    stamp_format: str = "%Y%m%dT%H%M%SZ",
+    stamp: str | None = None,
 ) -> tuple[Path, Path | None]:
     """Archive raw XML, reusing an identical existing file if there is one.
 
@@ -535,7 +535,8 @@ def _archive(
         return existing, existing
 
     archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime(stamp_format)
+    if stamp is None:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     dest = archive_dir / f"{prefix}-{stamp}.xml"
     dest.write_bytes(raw)
     return dest, None
@@ -611,8 +612,14 @@ def fetch_confirms(
         # Nothing is lost by overwriting. A confirm payload is CUMULATIVE for its
         # period, so the last poll of the day is a superset of every earlier one,
         # and the Activity Statement supersedes all of it tomorrow anyway.
+        #
+        # The DAY is the payload's own `toDate`, not the poll's UTC date: an
+        # evening poll in Europe is already tomorrow in UTC, and filed Monday's
+        # session under Tuesday's name, where Tuesday's first poll then
+        # overwrote it.
         path, duplicate_of = _archive(
-            raw, archive_dir, prefix=CONFIRM_PREFIX, stamp_format="%Y%m%d",
+            raw, archive_dir, prefix=CONFIRM_PREFIX,
+            stamp=_payload_to_date(raw) or datetime.now(UTC).strftime("%Y%m%d"),
         )
         if duplicate_of is not None:
             log.info("confirms identical to %s; not archiving a second copy",
@@ -623,6 +630,15 @@ def fetch_confirms(
         return ConfirmFetch(
             raw_path=path, raw_bytes=len(raw), duplicate_of=duplicate_of,
         )
+
+
+_PAYLOAD_TO_DATE = re.compile(rb'<FlexStatement\s[^>]*?toDate="(\d{8})"')
+
+
+def _payload_to_date(raw: bytes) -> str | None:
+    """The first statement block's `toDate`, as YYYYMMDD, or None if absent."""
+    found = _PAYLOAD_TO_DATE.search(raw)
+    return found.group(1).decode() if found else None
 
 
 def _norm_date(value: str | None) -> str | None:

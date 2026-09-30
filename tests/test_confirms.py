@@ -411,3 +411,43 @@ def test_a_date_the_parser_cannot_read_is_kept_as_sent(tmp_path):
     _account, fill = parse_confirms(path, rate_for=lambda c: 1.0)[0]
     assert fill.expiry == "2026-10"
     assert fill.trade_date == "2026-09-24"
+
+
+def test_a_confirm_archive_is_named_for_the_session_it_holds(tmp_path, monkeypatch):
+    """L5: named by the poll's UTC date, an evening poll filed Monday under Tuesday.
+
+    The live archive held `confirm-20260929.xml` whose payload covered 2026-09-28.
+    The name now comes from the payload's own `toDate`, so a file holds what its
+    name says and the next day's first poll cannot overwrite it.
+    """
+    from optjournal import flex
+
+    payload = CONFIRM_XML.replace('fromDate="20260924" toDate="20260924"',
+                                  'fromDate="20260928" toDate="20260928"').encode()
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory", lambda **kw: type(
+        "C", (), {"download": lambda self, *a, **k: payload})())
+    result = flex.fetch_confirms("1621016", archive_dir=tmp_path, force=True)
+    assert result.raw_path.name == "confirm-20260928.xml"
+    assert result.raw_path.read_bytes() == payload
+
+
+def test_re_ingesting_a_grown_confirm_refreshes_its_statement_row(tmp_path):
+    """L5: the upsert kept the FIRST poll's period and stamp forever.
+
+    Each poll overwrites the day's file with a payload that is later and may cover
+    more, so the provenance row has to follow the file it describes.
+    """
+    conn = connect_migrated(tmp_path / "j.db")
+    path = tmp_path / "confirm-20260924.xml"
+    path.write_text(CONFIRM_XML, encoding="utf-8")
+    ingest_confirms(conn, path, base_currency="EUR", rate_for=_fixed_rate())
+
+    path.write_text(CONFIRM_XML.replace(
+        'toDate="20260924"', 'toDate="20260925"').replace(
+        'whenGenerated="20260924;111200"', 'whenGenerated="20260925;153000"'),
+        encoding="utf-8")
+    ingest_confirms(conn, path, base_currency="EUR", rate_for=_fixed_rate())
+    row = conn.execute(
+        "SELECT from_date, to_date, when_generated FROM statements").fetchone()
+    assert tuple(row) == ("2026-09-24", "2026-09-25", "2026-09-25 15:30:00")

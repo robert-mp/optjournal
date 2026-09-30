@@ -365,7 +365,12 @@ def ingest_confirms(
                 " ingested_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(source_file) DO UPDATE SET"
-                " sha256=excluded.sha256, ingested_at=excluded.ingested_at",
+                " sha256=excluded.sha256, ingested_at=excluded.ingested_at,"
+                # Each poll overwrites the day's file with a later payload, so
+                # the row follows the file it describes rather than keeping the
+                # first poll's period and stamp.
+                " from_date=excluded.from_date, to_date=excluded.to_date,"
+                " when_generated=excluded.when_generated",
                 (
                     broker, path.name, digest, meta.account_id, meta.from_date,
                     meta.to_date, meta.generated_at, meta.base_currency,
