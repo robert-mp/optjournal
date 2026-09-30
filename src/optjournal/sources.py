@@ -157,14 +157,29 @@ class IbkrSource:
     broker = "ibkr"
 
     def base_currency(self, path: Path) -> str:
+        """The base currency as the statement states it, or a refusal.
+
+        AccountInformation is where IBKR states it. EquitySummaryInBase rows carry
+        the same code (every real statement agrees), so they answer when a query
+        leaves AccountInformation out. With neither, the statement is refused
+        rather than read as EUR: that default was wrong for every account whose
+        base is not EUR, and it converted every figure by a rate it did not need.
+        """
+        from optjournal.flex import StatementUnreadable
         from optjournal.sections import raw_sections
 
-        rows = raw_sections(path).get("AccountInformation") or []
-        for row in rows:
-            code = (row.get("currency") or "").strip()
-            if code:
-                return code
-        return "EUR"
+        sections = raw_sections(path)
+        for name in ("AccountInformation", "EquitySummaryInBase"):
+            for row in sections.get(name) or ():
+                code = (row.get("currency") or "").strip()
+                if code:
+                    return code
+        raise StatementUnreadable(
+            f"{path.name} does not state the account's base currency: it has no "
+            f"AccountInformation section. Enable Account Information in the "
+            f"Activity Flex query (Client Portal, Performance & Reports, Flex "
+            f"Queries), then fetch again."
+        )
 
     def metadata(self, path: Path) -> Iterator[StatementMeta]:
         from optjournal.flex import load

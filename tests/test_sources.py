@@ -468,3 +468,59 @@ def test_ingest_reads_no_broker_vocabulary_of_its_own():
         f"ingest.py reads IBKR's own vocabulary: {leaked}. Read it in sources.py "
         f"and hand the writer a normalised shape."
     )
+
+
+# --- the base currency is read from the statement, never assumed (L2) ---------
+
+
+def _without(tmp_path, *sections: str):
+    """The fixture statement with whole sections cut out."""
+    import re
+
+    from conftest import STATEMENTS
+
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    for name in sections:
+        text, n = re.subn(rf"\s*<{name}\b[^>]*?(/>|>.*?</{name}>)", "", text,
+                          count=1, flags=re.S)
+        assert n == 1, f"fixture has no {name} section"
+    path = tmp_path / "activity-cut.xml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_the_base_currency_comes_from_the_equity_summary_without_account_info(
+    tmp_path,
+):
+    """The EquitySummaryInBase rows state the same currency, in every statement
+    the journal holds, so they are a second honest source. USD here, so the old
+    EUR default cannot pass by coincidence."""
+    from optjournal.sources import IbkrSource
+
+    path = _without(tmp_path, "AccountInformation")
+    text = path.read_text(encoding="utf-8")
+    marker = 'acctAlias="" currency="EUR" reportDate='
+    assert marker in text
+    path.write_text(text.replace(marker, 'acctAlias="" currency="USD" reportDate='),
+                    encoding="utf-8")
+    assert IbkrSource().base_currency(path) == "USD"
+
+
+def test_a_statement_that_states_no_base_currency_is_refused_not_defaulted(
+    tmp_path,
+):
+    """L2: it silently became EUR, which is wrong for any account in USD.
+
+    Refused with the section to enable named, and nothing is written from it.
+    """
+    from conftest import connect_migrated
+
+    from optjournal.flex import StatementUnreadable
+    from optjournal.ingest import ingest_file
+
+    path = _without(tmp_path, "AccountInformation", "EquitySummaryInBase")
+    conn = connect_migrated(tmp_path / "j.db")
+    with pytest.raises(StatementUnreadable, match="AccountInformation"):
+        ingest_file(conn, path)
+    assert conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
