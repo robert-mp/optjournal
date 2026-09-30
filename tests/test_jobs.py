@@ -2760,6 +2760,23 @@ def test_waiting_out_the_fetch_lock_is_busy_for_the_confirm_poll_too(
     assert (row["status"], row["detail"][:5]) == ("nothing", "busy:")
 
 
+def test_a_busy_poll_does_not_postpone_the_next_one(conn):
+    """A busy run asked nothing, so it is not a poll: counted as one, a confirm
+    poll that met the fetch lock (a page Sync overlapping it, now that the app's
+    wait is short) pushed the next poll a whole 25-minute window out, and
+    same-day fills arrived that late."""
+    from optjournal.jobs import _ledger_snapshot, record_run
+
+    record_run(conn, "confirm", status="nothing", detail="busy: .fetch.lock held")
+    _claimed, last_poll, last_try, _ever, _failures = _ledger_snapshot(conn)
+    assert "confirm" not in last_poll, "a busy run counted as a finished poll"
+    assert "confirm" in last_try, "it is still an attempt, so it is not retried at once"
+
+    record_run(conn, "confirm", status="nothing", detail="no new fills")
+    _claimed, last_poll, _last_try, _ever, _failures = _ledger_snapshot(conn)
+    assert "confirm" in last_poll, "a poll that asked and found nothing IS a poll"
+
+
 def test_a_manual_sync_that_waited_out_the_fetch_lock_reads_busy_too(conn):
     """One mapping for the page's Sync button, the CLI and the job."""
     from optjournal.jobs import record_manual_sync, sync_outcome

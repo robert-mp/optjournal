@@ -607,9 +607,14 @@ def sync_outcome(result: dict[str, Any] | Exception) -> Outcome:
     )
 
 
+#: How a busy run's detail begins. Read back by `_ledger_snapshot`, which must
+#: not count such a run as a poll, so the two spellings live in one place.
+_BUSY_DETAIL = "busy: "
+
+
 def _busy(exc: LockTimeout) -> Outcome:
     """A run that waited out a lock another process held, and so did nothing."""
-    return Outcome("nothing", f"busy: {exc}"[:400], busy=True)
+    return Outcome("nothing", f"{_BUSY_DETAIL}{exc}"[:400], busy=True)
 
 
 def record_manual_sync(
@@ -1114,7 +1119,8 @@ def due_jobs(
     * `ever_ran` -- jobs with ANY recorded run.
     * `failures` -- `consecutive_failures` per job. At `FAILURE_BACKOFF` a job is
       backed off: its fast retries stop and it keeps only its healthy cadence, one
-      attempt per window or one per scheduled instant. It is never parked.
+      attempt per window or one per scheduled instant (plus the one retry `tries`
+      describes below). It is never parked.
     * `tries` -- every attempt's epoch per job (`_tries_by_job`). A backed-off job
       that spends no IBKR request keeps ONE delayed retry per instant: its attempt
       is often the first tick after a wake, which fails while the network comes
@@ -1219,8 +1225,10 @@ TICK_S = 60
 #: At this many consecutive failures a job is BACKED OFF: its fast retries stop,
 #: and it runs only at its own healthy cadence. A window job gets one attempt per
 #: window (55 minutes for `bars_live`, 25 for `confirm`) instead of one per tick,
-#: and a daily job one attempt per scheduled instant instead of a retry every
-#: `RETRY_AFTER_S`. So a job failing for a real reason stops hammering the endpoint
+#: and a daily job one attempt per scheduled instant plus, when it spends no IBKR
+#: request, a single `RETRY_AFTER_S` retry of it: that attempt is often the first
+#: tick after a wake, and a network still coming up would otherwise take every
+#: day. So a job failing for a real reason stops hammering the endpoint
 #: that is failing, and a backed-off job never asks IBKR more often than a healthy
 #: one does. Any healthy outcome resets the count, which is how it comes back on
 #: its own; it stays runnable by hand from the page as well.
@@ -1263,7 +1271,7 @@ def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
     last_try: dict[str, int] = {}
     ever_ran: set[str] = set()
     for row in conn.execute(
-        "SELECT job, fired_for, status, started_at, finished_at FROM job_runs"
+        "SELECT job, fired_for, status, started_at, finished_at, detail FROM job_runs"
     ):
         job = str(row["job"])
         ever_ran.add(job)
@@ -1288,7 +1296,14 @@ def _ledger_snapshot(conn: sqlite3.Connection) -> tuple[
         #
         # `failed` deliberately does NOT brake: a transient failure should retry
         # inside the session, and repeated ones are what FAILURE_BACKOFF is for.
-        if row["status"] in ("ok", "nothing") and row["finished_at"]:
+        #
+        # A BUSY run is not a poll either, and that is the same distinction once
+        # more: it waited out the shared fetch lock and asked nothing, so counting
+        # it made the next poll a whole window later. With the app's lock wait now
+        # short (`flex.FETCH_LOCK_WAIT_S`), a page Sync overlapping a confirm poll
+        # delayed same-day fills by the confirm window, 25 minutes.
+        if (row["status"] in ("ok", "nothing") and row["finished_at"]
+                and not str(row["detail"] or "").startswith(_BUSY_DETAIL)):
             stamp = _epoch_of(str(row["finished_at"]))
             if stamp is not None:
                 last_poll[job] = max(last_poll.get(job, 0), stamp)

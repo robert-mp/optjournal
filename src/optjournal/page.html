@@ -2732,7 +2732,7 @@ function collection(){
       <span class="dim2 jobwhen mono">${esc(when.slice(0,16).replace('T',' '))}</span>
       ${j.consecutive_failures>1?`<span class="pill gap neg"
         title="${j.backed_off
-          ? 'Backed off: the quick retries have stopped. It is still tried at its usual pace (once per window, or once per scheduled time) and comes back on its own when a run succeeds.'
+          ? 'Backed off: the quick retries have stopped. It is still tried at its usual pace (once per window, or once per scheduled time, and once more if it costs no IBKR request) and comes back on its own when a run succeeds.'
           : 'Consecutive failures since the last healthy run.'}"
         >${j.backed_off?'backed off ':''}×${j.consecutive_failures}</span>`:''}
       ${j.retired

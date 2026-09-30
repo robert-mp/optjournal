@@ -808,6 +808,45 @@ def test_a_statement_with_a_malformed_number_is_one_line_not_a_traceback(
     assert "activity-badnumber.xml" in out.out + out.err
 
 
+def test_the_update_probe_is_bounded_by_a_program_that_streams(monkeypatch):
+    """`update` asks the port whether optjournal is running. A program streaming
+    there held that read for as long as it streamed, because the socket timeout
+    bounds each read rather than the probe: the same defect the launcher's twin
+    probe had. It gives up at its own deadline now."""
+    import contextlib
+    import http.server
+    import threading
+    import time
+
+    class Stream(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib naming
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            with contextlib.suppress(OSError):
+                for _ in range(50):
+                    self.wfile.write(b".")
+                    self.wfile.flush()
+                    time.sleep(0.1)
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stream)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("OPTJOURNAL_PORT", str(server.server_address[1]))
+        started = time.monotonic()
+        answered = cli._serving_here(timeout_s=0.5)
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert answered is False
+    assert elapsed < 2.0, f"the probe read the stream for {elapsed:.1f}s"
+
+
 def test_sync_behind_another_fetch_is_busy_not_a_traceback(tmp_path, capsys, monkeypatch):
     """`optjournal sync` waits out a whole fetch for the lock (it has nothing else
     to do), and if another fetch holds it even longer, says busy, exits as

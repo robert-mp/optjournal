@@ -42,8 +42,10 @@ Register with (query ID passed via the cron's message field):
     )
 
 The cron timeout must exceed FETCH_TIMEOUT_S below, which must in turn exceed
-`optjournal.flex.POLL_WORST_CASE_S`. Get that ordering wrong and the outer
-killer fires first, replacing a clean Report with a raw traceback.
+both `optjournal.flex.POLL_WORST_CASE_S` and the LOCK_WAIT_S this hands the CLI.
+Get that ordering wrong and the outer killer fires first, replacing a clean
+Report with a raw traceback, or it kills a sync that is only queuing behind
+another fetch and calls that a timeout. `verify_timeouts` checks both.
 
 Tuesday-Saturday is deliberate: an Activity Statement covers the previous
 trading day, so a Monday run would only re-fetch Friday's already-ingested
@@ -68,6 +70,7 @@ backup that fails quietly is not a backup.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -161,6 +164,12 @@ def verify_timeouts() -> None:
     worst_case = _poll_worst_case()
     if worst_case is None:
         return
+    if LOCK_WAIT_S >= FETCH_TIMEOUT_S:
+        raise RuntimeError(
+            f"LOCK_WAIT_S ({LOCK_WAIT_S}s) must be below FETCH_TIMEOUT_S "
+            f"({FETCH_TIMEOUT_S}s), or the sync is killed while it is still "
+            f"queuing behind another fetch and reports a timeout it never had."
+        )
     if worst_case >= FETCH_TIMEOUT_S:
         raise RuntimeError(
             f"FETCH_TIMEOUT_S ({FETCH_TIMEOUT_S}s) must exceed "
@@ -170,6 +179,14 @@ def verify_timeouts() -> None:
         )
 
 
+#: What the CLI is allowed to spend WAITING for another fetch to release the
+#: shared lock, below the timeout that kills it here. Its own default waits out a
+#: whole fetch, which a person would rather do than be refused; a supervised run
+#: that is about to be killed must not spend its budget queuing, or the kill lands
+#: while nothing has been asked and reports "no statement after 720s".
+LOCK_WAIT_S = FETCH_TIMEOUT_S - 60
+
+
 def _run(query_id: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(CLI), "sync", query_id, "--json"],
@@ -177,6 +194,7 @@ def _run(query_id: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=FETCH_TIMEOUT_S,
         cwd=str(PROJECT),
+        env={**os.environ, "OPTJOURNAL_LOCK_WAIT_S": str(LOCK_WAIT_S)},
     )
 
 

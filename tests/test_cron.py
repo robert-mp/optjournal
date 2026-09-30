@@ -221,6 +221,35 @@ def test_the_timeout_ladder_is_ordered(sync_cron):
     assert sync_cron.FETCH_TIMEOUT_S > POLL_WORST_CASE_S
 
 
+def test_the_cron_bounds_the_wait_it_gives_the_cli(sync_cron, monkeypatch):
+    """The CLI waits out a whole fetch for the shared lock by default, which is
+    longer than this cron's own kill: the kill would land while nothing had been
+    asked and report "no statement after 720s". So the cron hands the CLI a wait
+    below its timeout, through the variable the CLI reads."""
+    from optjournal.cli import LOCK_WAIT_ENV, _lock_wait
+    from optjournal.flex import FETCH_LOCK_TIMEOUT_S
+
+    assert sync_cron.LOCK_WAIT_S < sync_cron.FETCH_TIMEOUT_S
+    assert FETCH_LOCK_TIMEOUT_S > sync_cron.FETCH_TIMEOUT_S, (
+        "the default already fits, so this ladder would not be needed")
+    seen = {}
+    monkeypatch.setattr(sync_cron.subprocess, "run",
+                        lambda *a, **kw: seen.update(kw) or _Completed())
+    sync_cron._run("1591754")
+    assert seen["env"][LOCK_WAIT_ENV] == str(sync_cron.LOCK_WAIT_S)
+
+    monkeypatch.setenv(LOCK_WAIT_ENV, str(sync_cron.LOCK_WAIT_S))
+    assert _lock_wait() == sync_cron.LOCK_WAIT_S
+    monkeypatch.setenv(LOCK_WAIT_ENV, "not a number")
+    assert _lock_wait() == FETCH_LOCK_TIMEOUT_S, "a damaged value falls back"
+
+
+class _Completed:
+    returncode = 0
+    stdout = "{}"
+    stderr = ""
+
+
 def test_a_sync_payload_key_the_cron_reads_still_exists():
     """Every key `_describe` reaches for, against the code that really emits them.
 

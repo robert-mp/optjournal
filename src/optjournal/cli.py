@@ -178,7 +178,7 @@ def cmd_fetch(args) -> int:
         to_date=args.to_date,
         force=args.force,
         # A command line waits its turn behind another fetch rather than giving up.
-        lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
+        lock_timeout_s=_lock_wait(),
     )
     data = summary_data(result.response, result.raw_path)
     data["raw_path"] = str(result.raw_path)
@@ -1009,14 +1009,29 @@ _MIGRATE = (
 
 def _serving_here(timeout_s: float = 1.0) -> bool:
     """Whether optjournal answers on this machine's port (`$OPTJOURNAL_PORT`, else
-    8765), judged by the page's title as the launcher does."""
+    8765), judged by the page's title as the launcher does.
+
+    `launcher/app.py`'s `_whats_on` is the twin, and they cannot share this: the
+    launcher runs before the virtual environment exists, so it imports nothing
+    from this package. Both read up to the title within ONE deadline, because
+    `timeout_s` bounds each read and a program that trickles bytes on that port
+    otherwise holds the probe for as long as it streams (12.1s measured here).
+    """
     import http.client
+    import time
 
     port = int(os.environ.get("OPTJOURNAL_PORT") or 8765)
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout_s)
     try:
         conn.request("GET", "/")
-        head = conn.getresponse().read(4096).decode("utf-8", "replace")
+        response = conn.getresponse()
+        deadline, raw = time.monotonic() + timeout_s, b""
+        while len(raw) < 4096 and b"</title>" not in raw and time.monotonic() < deadline:
+            chunk = response.read1(4096 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+        head = raw.decode("utf-8", "replace")
     except (OSError, http.client.HTTPException):
         return False
     finally:
@@ -1272,7 +1287,7 @@ def cmd_setup(args) -> int:
         try:
             read_token(account)
             result = fetch(effective_qid, archive_dir=DEFAULT_ARCHIVE,
-                           lock_timeout_s=FETCH_LOCK_TIMEOUT_S)
+                           lock_timeout_s=_lock_wait())
         except FetchCooldown as exc:
             print(f"  skipped: {exc}")
         else:
@@ -1324,7 +1339,7 @@ def cmd_confirms(args) -> int:
             # said the same thing twice, and two spellings of one intent are how
             # they eventually disagree.
             cooldown_s=CONFIRM_COOLDOWN_S,
-            lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
+            lock_timeout_s=_lock_wait(),
         )
         ingested = ingest_confirms(
             conn, result.raw_path, base_currency=base,
@@ -1365,6 +1380,25 @@ def _journal_base_currency(conn) -> str | None:
     return str(row["base_currency"]) if row and row["base_currency"] else None
 
 
+#: A supervised caller's deadline for the shared fetch lock, in seconds. The CLI
+#: waits out a whole fetch by default (`FETCH_LOCK_TIMEOUT_S`) because a person
+#: running `optjournal sync` would rather wait than be refused. A caller that will
+#: KILL this process has to bound that wait below its own timeout, or the kill
+#: lands while we are merely queuing and reads as "no statement after Ns": that is
+#: `cron/optjournal_sync.py`'s ladder, which sets this.
+LOCK_WAIT_ENV = "OPTJOURNAL_LOCK_WAIT_S"
+
+
+def _lock_wait() -> float:
+    """How long a command-line fetch waits for another fetch to finish."""
+    raw = (os.environ.get(LOCK_WAIT_ENV) or "").strip()
+    try:
+        wait = float(raw)
+    except ValueError:
+        return FETCH_LOCK_TIMEOUT_S
+    return wait if wait > 0 else FETCH_LOCK_TIMEOUT_S
+
+
 def cmd_sync(args) -> int:
     """Fetch the latest statement, fold it in, and report only what is new.
 
@@ -1396,7 +1430,7 @@ def cmd_sync(args) -> int:
                 from_date=args.from_date,
                 to_date=args.to_date,
                 force=args.force,
-                lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
+                lock_timeout_s=_lock_wait(),
             )
         except (FetchCooldown, TokenMissing, TokenRejected, LockTimeout) as exc:
             # RECORDED BEFORE RE-RAISING, so `main`'s handlers still decide the exit
