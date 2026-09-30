@@ -169,6 +169,12 @@ def _is_loopback(host: str) -> bool:
 #: see `_watchlist_write` on why this journal has no such list.
 _SYMBOL_OK = re.compile(r"^[A-Za-z0-9.\-]+$")
 
+#: A Flex query id as Client Portal shows it: ASCII digits, and not many.
+#: Spelled `[0-9]` rather than `\d` or `str.isdigit()`, both of which also
+#: accept superscripts and other scripts' digits ("²³", "١٢٣") that IBKR can
+#: only refuse.
+_QUERY_ID_OK = re.compile(r"[0-9]{1,32}")
+
 #: How long `/api/settings/token` waits for the OS credential store before
 #: answering "unreadable". Not a guess: `keyring.get_password` was measured on
 #: this machine returning nothing at all within 10s while the keychain waited for
@@ -1362,7 +1368,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # Length- and shape-checked, not verified: only IBKR can say whether
             # a well-formed id exists, and an id that does not simply fails the
             # next fetch with a message that says so.
-            if raw and (len(raw) > 32 or not raw.isdigit()):
+            if raw and not _QUERY_ID_OK.fullmatch(raw):
                 return 400, {"ok": False, "kind": "query_id",
                              "message": f"{raw!r} is not a Flex query id: "
                                         "Client Portal shows it as digits."}
@@ -1373,7 +1379,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # can say whether a well-formed id exists. Absence is a real choice here
             # rather than an error -- clearing the field turns the intraday poll off,
             # which is the supported way to stop it.
-            if raw and (len(raw) > 32 or not raw.isdigit()):
+            if raw and not _QUERY_ID_OK.fullmatch(raw):
                 return 400, {"ok": False, "kind": "confirm_query_id",
                              "message": f"{raw!r} is not a Flex query id: "
                                         "Client Portal shows it as digits."}

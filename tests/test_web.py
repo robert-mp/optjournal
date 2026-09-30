@@ -6725,6 +6725,18 @@ def test_the_settings_endpoint_stores_and_clears_the_confirm_query(populated):
         )
 
 
+@pytest.mark.parametrize("field", ["query_id", "confirm_query_id"])
+@pytest.mark.parametrize("typed", ["²³", "١٢٣", "１２３", "12³"])
+def test_a_query_id_is_ascii_digits_only(populated, field, typed):
+    """M24: `str.isdigit()` is true for superscripts and other scripts' digits,
+    so "²³" was stored as a query id and enabled Sync, and IBKR can only refuse
+    it. Client Portal shows the id as ASCII digits, and that is the rule."""
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/settings", {field: typed})
+    assert (status, reply["kind"]) == (400, field)
+    assert web.prefs.read().get(field) is None, "a refused id was stored anyway"
+
+
 def test_the_server_and_the_page_agree_on_the_dashboard_tiles():
     """Two copies of one vocabulary, pinned together like `sweep.TABS`.
 
