@@ -755,11 +755,12 @@ def run_job(
     and cheap to retry on the next tick, so `JobBusy` is a better answer than a
     queue behind something that spends IBKR requests.
 
-    Raises `UnknownJob` (no such name) or `JobBusy` (already running). Any other
-    exception rolls back the run's uncommitted writes, is recorded as `failed`
-    and is re-raised, because a caller that asked
-    for a run is entitled to the traceback -- swallowing it here is what turned
-    the keychain failure into a message that reached nobody.
+    Raises `UnknownJob` (no such name) or `JobBusy` (already running). A
+    `LockTimeout` from inside the work is recorded as busy and returns normally.
+    Any other exception rolls back the run's uncommitted writes, is recorded as
+    `failed` and is re-raised, because a caller that asked for a run is entitled
+    to the traceback -- swallowing it here is what turned the keychain failure
+    into a message that reached nobody.
     """
     job = job_by_name(name)
     lock = job_lock_path(ctx.archive_dir, job.name)
@@ -1230,6 +1231,7 @@ def is_backed_off(consecutive_failures: int) -> bool:
     (`serialize.jobs_data`), so the pill cannot disagree with the schedule.
     """
     return consecutive_failures >= FAILURE_BACKOFF
+
 
 #: How far the wall clock must run ahead of `monotonic` within one tick before the
 #: run is stamped `slept`. Generous: a normal 60 s tick shows sub-millisecond drift,
