@@ -18,7 +18,7 @@ Delivery policy, which is the part worth getting right for something that runs
                          "we chose not to ask" is handled identically, and so
                          does another fetch holding the fetch lock past
                          LOCK_WAIT_S. Any other lock timeout (the migration's,
-                         the settings file's) exits 1 and is raised.
+                         the settings file's) exits 5 and is raised.
 * No new data (3)     -> return quietly. `sync` does not currently emit this,
                          but every other command uses the
                          `EXIT_OK if data else EXIT_NO_DATA` idiom, so treating
@@ -107,6 +107,9 @@ EXIT_OK = 0
 EXIT_CONFIG = 2
 EXIT_NO_DATA = 3
 EXIT_THROTTLED = 4
+#: A lock other than the fetch lock timed out, so something is wedged. Raised
+#: by the "anything else" branch, like every code not named above.
+EXIT_LOCKED = 5
 
 DEFAULT_QUERY_ID = "1591754"
 

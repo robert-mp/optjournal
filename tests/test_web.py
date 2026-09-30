@@ -7805,21 +7805,37 @@ def test_a_stuck_keyring_holds_one_thread_however_often_it_is_asked(
                 if reply["present"] is not None:
                     break
     finally:
-        release.set()
-    assert (status, reply["present"], len(calls)) == (200, True, 2), (
-        "once the stuck call returned, the next check did not ask again"
-    )
+        _drain_keyring(release)
+    assert (status, reply["present"]) == (200, True), (
+        "once the stuck call returned, the next check still could not read")
+    assert len(calls) <= 2, "the checks after it asked the keychain again each time"
 
 
-def test_token_checks_after_the_read_deadline_still_share_one_stuck_thread(
+def _drain_keyring(release) -> None:
+    """Answer every stuck keyring call and wait for it to return, so a call still
+    pending cannot hand the next test this test's answer (they are shared)."""
+    import threading  # noqa: PLC0415 - local to this helper
+    import time  # noqa: PLC0415
+
+    release.set()
+    deadline = time.monotonic() + 5
+    while (any(t.name == "keyring-read" for t in threading.enumerate())
+           and time.monotonic() < deadline):
+        time.sleep(0.01)
+
+
+def test_token_checks_against_a_keychain_that_never_answers_stay_bounded(
     tmp_path, monkeypatch,
 ):
-    """The bound above held only while `flex.read_token` waited too. The probe
-    calls it, and it gives up at its own deadline (30s) on a thread of its own
-    while the keychain call stays stuck, so the probe's worker finished and freed
-    the one-worker limit: every check made after that started one more stuck
-    thread. Scaled to a 0.2s read deadline, checks spaced past it: one keyring
-    call, however many checks, and the same answer to each."""
+    """Checks spaced past every deadline, against a keychain that answers nothing.
+
+    Each check that timed out used to leave its call stuck and the next started
+    another: ten checks, ten stuck threads. Now the calls are shared across the
+    process, a fresh one is started only once the last has been pending for
+    `flex.KEYRING_STUCK_AFTER_DEADLINES` read deadlines, and never more than
+    `flex.KEYRING_MAX_PENDING`. Each check answers `present: null`, and once the
+    reads are wedged it says a restart clears them.
+    """
     import threading  # noqa: PLC0415 - local to this test
     import time  # noqa: PLC0415
 
@@ -7832,45 +7848,33 @@ def test_token_checks_after_the_read_deadline_still_share_one_stuck_thread(
 
     def locked_keychain(service, account):
         calls.append(1)
-        release.wait(10)
+        release.wait(30)
         return "tok"
 
-    def stuck() -> int:
-        return sum(t.name == "keyring-read" for t in threading.enumerate())
-
     monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.1)
     monkeypatch.setattr(keyring, "get_password", locked_keychain)
-    before, threads = stuck(), threading.active_count()
+    threads = threading.active_count()
     try:
         with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
             replies = []
-            for _ in range(8):
+            for _ in range(15):
                 replies.append(_get(base, "/api/settings/token"))
-                time.sleep(0.3)
-            assert len(calls) == 1, f"{len(calls)} keyring calls in flight at once"
-            assert stuck() - before <= 1
-            assert threading.active_count() - threads <= 4, (
+                time.sleep(0.1)
+            assert len(calls) == flex.KEYRING_MAX_PENDING, f"{len(calls)} keyring calls"
+            assert threading.active_count() - threads <= flex.KEYRING_MAX_PENDING + 3, (
                 "threads grew with the number of checks")
             assert {(s, r["present"]) for s, r in replies} == {(200, None)}
-            release.set()
-            for _ in range(100):
-                status, reply = _get(base, "/api/settings/token")
-                if reply["present"] is not None:
-                    break
-                time.sleep(0.05)
+            assert "restart optjournal" in replies[-1][1]["message"]
     finally:
-        release.set()
-    assert (status, reply["present"]) == (200, True)
+        _drain_keyring(release)
 
 
-def test_a_keychain_past_the_read_deadline_is_unreadable_not_absent(
-    tmp_path, monkeypatch,
-):
-    """`TokenUnreadable` is a `TokenMissing`, and the probe caught that as
-    "absent": if the read deadline ever fell inside the page's own, a pending
-    unlock prompt read as a missing token, the answer `present: null` exists to
-    avoid."""
+def test_a_save_straight_after_a_check_is_not_refused(tmp_path, monkeypatch):
+    """A scheduled fetch met a keychain call that never returns; the reader
+    pressed Check, then Save. The check's worker held the one-worker slot while
+    it waited on that call, so the save was refused 503 "Nothing was stored".
+    A check no longer takes that slot, and the stored token is read at once."""
     import threading  # noqa: PLC0415 - local to this test
 
     import keyring  # noqa: PLC0415
@@ -7878,15 +7882,53 @@ def test_a_keychain_past_the_read_deadline_is_unreadable_not_absent(
     from optjournal import flex  # noqa: PLC0415
 
     release = threading.Event()
-    monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 2.0)
-    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.05)
+    store: dict[str, str] = {}
+    calls: list[int] = []
+
+    def get_password(service, account):
+        calls.append(1)
+        if len(calls) == 1:
+            release.wait(30)
+        return store.get(account)
+
+    monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(keyring, "get_password", get_password)
+    monkeypatch.setattr(keyring, "set_password",
+                        lambda service, account, token: store.__setitem__(account, token))
+    try:
+        with pytest.raises(flex.TokenUnreadable):
+            flex.read_token()                      # the scheduled fetch's read
+        with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
+            status, checked = _get(base, "/api/settings/token")
+            assert (status, checked["present"]) == (200, None)
+            status, saved = _post(base, "/api/settings/token", {"token": "123456789012"})
+            assert (status, saved["ok"]) == (200, True), saved
+            status, checked = _get(base, "/api/settings/token")
+            assert (status, checked["present"]) == (200, True), checked
+    finally:
+        _drain_keyring(release)
+
+
+def test_a_keychain_past_the_read_deadline_is_unreadable_not_absent(
+    tmp_path, monkeypatch,
+):
+    """`TokenUnreadable` is a `TokenMissing`, and the check caught that as
+    "absent": a pending unlock prompt read as a missing token, the answer
+    `present: null` exists to avoid."""
+    import threading  # noqa: PLC0415 - local to this test
+
+    import keyring  # noqa: PLC0415
+
+    release = threading.Event()
+    monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.05)
     monkeypatch.setattr(keyring, "get_password",
                         lambda service, account: release.wait(10) and "tok")
     try:
         with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
             status, reply = _get(base, "/api/settings/token")
     finally:
-        release.set()
+        _drain_keyring(release)
     assert (status, reply["present"]) == (200, None), reply
     assert "did not answer" in reply["message"]
 

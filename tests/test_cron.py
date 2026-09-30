@@ -718,11 +718,97 @@ def test_bars_skips_a_per_window_failure(bars_cron, monkeypatch):
     poll returns every completed bar since the open. That is what makes a Skip
     here lose nothing a later poll cannot recover.
     """
+    import dataclasses
+
     from mesh_claw.cron_script import Skip
 
-    _stub(bars_cron, monkeypatch, _proc(bars_cron.EXIT_ERROR))
+    from optjournal.bars import BackfillOutcome
+
+    failed = BackfillOutcome(requested=3, written=5, failures=("SPX 1h: HTTP 404",))
+    _stub(bars_cron, monkeypatch, _proc(
+        bars_cron.EXIT_ERROR, stdout=json.dumps(dataclasses.asdict(failed))))
     with pytest.raises(Skip):
         bars_cron.live(_Ctx())
+
+
+@pytest.mark.parametrize("entry", ["live", "daily"])
+def test_bars_raises_an_exit_1_that_names_no_failed_window(bars_cron, monkeypatch, entry):
+    """Exit 1 is also every error `main` maps to EXIT_ERROR and every traceback,
+    none of which prints the payload: a database error, a crash. Only the JSON
+    naming failed windows is the partial fetch a later poll recovers, so anything
+    else is raised with what the CLI said, where it used to be skipped in silence
+    seven times a session."""
+    _stub(bars_cron, monkeypatch, _proc(
+        bars_cron.EXIT_ERROR, stderr="Database error: database is locked"))
+    with pytest.raises(RuntimeError, match="database is locked"):
+        getattr(bars_cron, entry)(_Ctx())
+
+
+def test_the_audit_raises_an_exit_1_without_its_report_as_the_cli_said_it(
+    bars_cron, monkeypatch,
+):
+    """The audit parsed stdout on exit 1 unconditionally, so an exit 1 that
+    printed nothing raised a JSONDecodeError and the cause in stderr was lost."""
+    _stub(bars_cron, monkeypatch, _proc(
+        bars_cron.EXIT_ERROR, stderr="Database error: database is locked"))
+    with pytest.raises(RuntimeError, match="database is locked"):
+        bars_cron.audit(_Ctx())
+
+
+def _through_the_real_cli(module, monkeypatch, capsys, db):
+    """Make `module`'s subprocess run the real `cli.main` in this process.
+
+    The cron's own argv, with `--db` added so the run meets this journal. Exit
+    code, stdout and stderr are the ones `main` really produced.
+    """
+    import subprocess
+
+    from optjournal import cli
+
+    monkeypatch.setattr(module, "CLI", Path(__file__))
+
+    def run(argv, **_kw):
+        capsys.readouterr()
+        code = cli.main([*argv[1:], "--db", str(db)])
+        out = capsys.readouterr()
+        return subprocess.CompletedProcess(argv, code, out.out, out.err)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+
+@pytest.mark.parametrize("entry", ["live", "daily", "audit"])
+def test_a_migration_lock_held_elsewhere_is_raised_by_the_bars_crons(
+    bars_cron, monkeypatch, capsys, tmp_path, entry,
+):
+    """The real CLI and the real cron, with another process holding the journal's
+    migration lock. The CLI's EXIT_ERROR for it read as a per-window failure, so
+    `live` and `daily` skipped it in silence and `audit` raised a JSONDecodeError
+    that hid the cause. These three are enabled on the machine this runs on."""
+    from optjournal import db as dbmod
+    from optjournal import locks
+
+    monkeypatch.setattr(dbmod, "locked",
+                        lambda target, **_: locks.locked(target, timeout_s=0))
+    journal = tmp_path / "j.db"               # new, so the migration takes its lock
+    _through_the_real_cli(bars_cron, monkeypatch, capsys, journal)
+    with (locks.locked(Path(f"{journal}.migrate.lock")),
+          pytest.raises(RuntimeError, match=r"exited 5: .*migrate\.lock")):
+        getattr(bars_cron, entry)(_Ctx())
+
+
+def test_a_lock_timeout_is_raised_by_the_sync_and_market_crons(
+    sync_cron, market_cron, monkeypatch, no_backup,
+):
+    """EXIT_LOCKED is not one of the codes either cron stays quiet on."""
+    from optjournal.cli import EXIT_LOCKED
+
+    said = "Gave up waiting for a lock: another process held j.db.migrate.lock"
+    _stub(sync_cron, monkeypatch, _proc(EXIT_LOCKED, stderr=said))
+    with pytest.raises(RuntimeError, match="migrate.lock"):
+        sync_cron.sync(_Ctx())
+    _stub(market_cron, monkeypatch, _proc(EXIT_LOCKED, stderr=said))
+    with pytest.raises(RuntimeError, match="migrate.lock"):
+        market_cron.refresh(None)
 
 
 def test_bars_is_silent_outside_the_session(bars_cron, monkeypatch):

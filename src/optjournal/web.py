@@ -1039,13 +1039,14 @@ _SYNC_STATUS = {"busy": 409, "internal": 500}
 def _keyring_call(
     work: Callable[[], tuple[str, str]], busy: threading.Lock,
 ) -> tuple[str, str] | None:
-    """Run one keyring operation with a deadline. `None` means it never answered.
+    """Run one keyring WRITE with a deadline. `None` means it never answered.
 
     THE DEADLINE IS THE POINT, and it is measured rather than defensive:
     `keyring.get_password` on this machine did not return at all within 10s while
-    the keychain waited for an unlock the HTTP caller could not provide. Without a
-    cap the request stays open with no reply and the button in the page spins
-    forever -- so both token endpoints borrow this, and a new one gets it for free.
+    the keychain waited for an unlock the HTTP caller could not provide, and a
+    write waits on the same unlock. Without a cap the request stays open with no
+    reply and the Save button spins forever. Reads do not come here: `flex`
+    bounds them, shared with the fetches (see `_token_status`).
 
     The worker is a DAEMON so a still-blocked call cannot keep the process alive;
     the OS resolves or cancels its own prompt in its own time. A late answer lands
@@ -1114,7 +1115,7 @@ class ServeConfig:
     #: one lock per server -- not on the handler class, where it would be one
     #: lock per process.
     sync_lock: threading.Lock = field(default_factory=threading.Lock)
-    #: Held by the one keyring worker allowed at a time. See `_keyring_call`.
+    #: Held by the one keyring write allowed at a time. See `_keyring_call`.
     keyring_busy: threading.Lock = field(default_factory=threading.Lock)
     #: Set by an update or a journal import: `serve` stops and reports it, and
     #: the launcher starts it again (see `cli.EXIT_RESTART`).
@@ -1498,45 +1499,32 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         Reports PRESENCE, never the value, and never whether IBKR accepts it:
         only a real fetch can answer that, and that costs a request.
 
-        The read is `flex.read_token`, whose own deadline (30s) ends this worker
-        while a stuck keychain call goes on, so `_keyring_call`'s one-worker bound
-        alone would let each check made after it start another stuck call. The
-        call itself is bounded to one in flight, in `flex`, for the fetches and
-        this check together.
+        The read is `flex.read_token` with this endpoint's deadline, on the
+        request's own thread. NOT through `_keyring_call`: `flex` already bounds
+        the keychain calls, shared with the fetches, and a check that took the
+        one-worker slot while it waited on a stuck call made a Save pressed
+        straight after it answer 503, "Nothing was stored".
         """
         import getpass
 
         account = getpass.getuser()
-
-        def probe() -> tuple[str, str]:
-            try:
-                read_token(account)
-            except TokenUnreadable:
-                # A `TokenMissing`, but not absent: `_keyring_call` reports it as
-                # unreadable, which is what a pending unlock prompt is.
-                raise
-            except TokenMissing as exc:
-                return "absent", str(exc)
-            return "present", "a token is stored for this account"
-
-        answer = _keyring_call(probe, self.cfg.keyring_busy)
-        if answer is None:
-            log.warning("keyring did not answer within %ss", KEYRING_TIMEOUT_S)
-            return 200, {
-                "ok": False, "kind": "keyring", "present": None,
-                "account": account,
-                "message": f"the OS keyring did not answer within "
-                           f"{KEYRING_TIMEOUT_S}s, usually because it is waiting "
-                           f"for you to unlock it. Check for a system prompt, or "
-                           f"run `optjournal setup` in a terminal.",
-            }
-        kind, message = answer
-        if kind == "error":
-            log.warning("keyring unreadable: %s", message)
+        try:
+            read_token(account, timeout_s=KEYRING_TIMEOUT_S)
+        except TokenUnreadable as exc:
+            # A `TokenMissing`, but not absent: a pending unlock prompt is this.
+            log.warning("keyring unreadable: %s", exc)
             return 200, {"ok": False, "kind": "keyring", "present": None,
-                         "account": account, "message": message}
-        return 200, {"ok": True, "kind": "token", "present": kind == "present",
-                     "account": account, "message": message}
+                         "account": account, "message": str(exc)}
+        except TokenMissing as exc:
+            return 200, {"ok": True, "kind": "token", "present": False,
+                         "account": account, "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - a backend failure is an answer
+            log.warning("keyring unreadable: %s", exc)
+            return 200, {"ok": False, "kind": "keyring", "present": None,
+                         "account": account, "message": str(exc)}
+        return 200, {"ok": True, "kind": "token", "present": True,
+                     "account": account,
+                     "message": "a token is stored for this account"}
 
     def _token_write(self) -> tuple[int, dict[str, Any]]:
         """Store a new Flex token from the settings page.

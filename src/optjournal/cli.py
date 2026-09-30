@@ -108,6 +108,11 @@ EXIT_NO_DATA = 3
 #: IBKR asked us to back off. Distinct from EXIT_ERROR so the daily cron can
 #: stay silent on throttling and only alert on a genuine failure.
 EXIT_THROTTLED = 4
+#: Gave up waiting for a lock OTHER than the fetch lock: the migration's or the
+#: settings file's, which guard work taking milliseconds, so something is wedged.
+#: Not EXIT_ERROR, which the bars cron reads as a per-window fetch failure and
+#: skips, and not EXIT_THROTTLED ("try later"): every cron raises this one.
+EXIT_LOCKED = 5
 #: `serve` stopped so the launcher can start it again: an update or a journal
 #: import is waiting (see `launcher/app.py`). 75 is sysexits' EX_TEMPFAIL.
 EXIT_RESTART = 75
@@ -131,7 +136,8 @@ examples:
   optjournal serve --demo                  serve that synthetic data instead
 
 path arguments default to the most recently archived statement.
-exit codes: 0 ok, 1 error, 2 config, 3 no data, 4 throttled by IBKR.
+exit codes: 0 ok, 1 error, 2 config, 3 no data, 4 throttled or busy (try
+later), 5 a lock held elsewhere for too long.
 """
 
 
@@ -1786,9 +1792,9 @@ def main(argv: list[str] | None = None) -> int:
     except LockTimeout as exc:
         # Any other lock (the migration's, the settings file's) guards work that
         # takes milliseconds, so outlasting its wait means something is wedged.
-        # An error, not "try later": the cron would otherwise skip it in silence.
+        # Its own code, not "try later" and not EXIT_ERROR: see EXIT_LOCKED.
         print(f"\nGave up waiting for a lock: {exc}", file=sys.stderr)
-        return EXIT_ERROR
+        return EXIT_LOCKED
     except FlexError as exc:
         print(
             f"\nFlex request failed: {type(exc).__name__}: {exc}", file=sys.stderr

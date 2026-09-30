@@ -962,6 +962,21 @@ def _keychain_waiting_for_an_unlock(monkeypatch) -> threading.Event:
     return release
 
 
+def _drain(release: threading.Event) -> None:
+    """Answer every stuck keyring call and wait for it to return.
+
+    The calls are shared by every reader in the process, so one still pending
+    when the next test starts would hand that test this test's answer.
+    """
+    import time
+
+    release.set()
+    deadline = time.monotonic() + 5
+    while (any(t.name == "keyring-read" for t in threading.enumerate())
+           and time.monotonic() < deadline):
+        time.sleep(0.01)
+
+
 def test_a_keychain_that_does_not_answer_raises_within_the_deadline(monkeypatch):
     """L11: the read had no deadline, so a prompt stalled the scheduler thread,
     and with it every job, while the fetch lock was held."""
@@ -973,42 +988,110 @@ def test_a_keychain_that_does_not_answer_raises_within_the_deadline(monkeypatch)
         with pytest.raises(flex.TokenUnreadable, match="did not answer") as caught:
             flex.read_token("someone")
     finally:
-        release.set()
+        _drain(release)
     assert time.monotonic() - started < 5
     assert isinstance(caught.value, flex.TokenMissing), (
         "every caller that reports a missing token must report this one too"
     )
 
 
-def test_a_keychain_that_never_answers_holds_one_thread_however_often_it_is_read(
+def _stuck(release: threading.Event, calls: list[int], *, then: str | None):
+    """A `get_password` whose first call blocks until `release`; with `then`,
+    every later call answers it at once, as a keychain unlocked since."""
+    def get_password(service, account):
+        calls.append(1)
+        if then is None or len(calls) == 1:
+            release.wait(30)
+            return "tok"
+        return then
+
+    return get_password
+
+
+def _keyring_threads() -> int:
+    return sum(t.name == "keyring-read" for t in threading.enumerate())
+
+
+def test_one_keychain_call_that_never_returns_does_not_block_reads_for_good(
     monkeypatch,
 ):
-    """The read gave up at its deadline and left its thread stuck in the keychain
-    call, so each read after that started another: one stuck thread per fetch
-    attempt or token check, for the life of the process. One read is in flight at
-    a time now, and a read that finds it still pending gives up at its own
-    deadline, as unreadable, without starting a second."""
-    release = _keychain_waiting_for_an_unlock(monkeypatch)
+    """Every read after it waited on the one stuck call, which never returns, so
+    the process could not read the token again until it was restarted: every
+    fetch failed as unreadable and the confirm poll backed off. A call pending
+    for `KEYRING_STUCK_AFTER_DEADLINES` deadlines is given up on, and the next
+    read asks afresh. Until then a read says what is wrong and what clears it."""
+    import time
 
-    def stuck() -> int:
-        return sum(t.name == "keyring-read" for t in threading.enumerate())
-
-    before = stuck()
+    release, calls = threading.Event(), []
+    monkeypatch.setattr(flex.keyring, "get_password",
+                        _stuck(release, calls, then="fresh"))
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.1)
+    before = _keyring_threads()
     try:
-        for _ in range(5):
-            with pytest.raises(flex.TokenUnreadable, match="did not answer"):
-                flex.read_token("someone")
-        assert stuck() - before <= 1, f"{stuck() - before} keyring reads stuck at once"
+        with pytest.raises(flex.TokenUnreadable, match="did not answer"):
+            flex.read_token("someone")
+        time.sleep(0.05)
+        with pytest.raises(flex.TokenUnreadable, match="restart optjournal") as caught:
+            flex.read_token("someone")
+        assert "setup" not in str(caught.value), "setup runs elsewhere, fixing nothing"
+        assert len(calls) == 1, "a read inside the deadlines started a second call"
+        time.sleep(flex.KEYRING_STUCK_AFTER_DEADLINES * flex.KEYRING_READ_TIMEOUT_S)
+        assert flex.read_token("someone") == "fresh"
+        assert flex.read_token("someone") == "fresh"
+        assert _keyring_threads() - before <= 1, "only the stuck call is left"
     finally:
-        release.set()
-    for _ in range(100):                     # the stuck read returns, and frees it
-        try:
-            assert flex.read_token("someone") == "tok"
-            break
-        except flex.TokenUnreadable:
-            continue
-    else:
-        pytest.fail("the keyring stayed unreadable after the stuck read returned")
+        _drain(release)
+
+
+def test_a_keychain_that_never_answers_costs_a_bounded_number_of_threads(monkeypatch):
+    """The leak this bound exists for: each read that timed out left its thread
+    stuck and the next started another, one per fetch attempt and token check
+    for the life of the process. Now a fresh call is started at most once per
+    `KEYRING_STUCK_AFTER_DEADLINES` deadlines, never more than
+    `KEYRING_MAX_PENDING` at once, and past that a read says a restart clears it."""
+    import time
+
+    release, calls = threading.Event(), []
+    monkeypatch.setattr(flex.keyring, "get_password", _stuck(release, calls, then=None))
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.05)
+    before = _keyring_threads()
+    try:
+        for _ in range(40):
+            with pytest.raises(flex.TokenUnreadable) as caught:
+                flex.read_token("someone")
+            time.sleep(0.02)
+        assert len(calls) == flex.KEYRING_MAX_PENDING, f"{len(calls)} keyring calls"
+        assert _keyring_threads() - before <= flex.KEYRING_MAX_PENDING
+        assert "restart optjournal" in str(caught.value)
+    finally:
+        _drain(release)
+    assert flex.read_token("someone") == "tok", "unreadable after the calls returned"
+
+
+def test_a_token_stored_behind_a_stuck_call_is_read_at_once(monkeypatch):
+    """A save answered, so the keychain is answering: a read after it does not
+    wait out the stuck call's deadlines. The page's Save said "press Sync" while
+    no read could see the token it had just stored."""
+    release, calls = threading.Event(), []
+    store: dict[str, str] = {}
+
+    def get_password(service, account):
+        calls.append(1)
+        if len(calls) == 1:
+            release.wait(30)
+        return store.get(account)
+
+    monkeypatch.setattr(flex.keyring, "get_password", get_password)
+    monkeypatch.setattr(flex.keyring, "set_password",
+                        lambda service, account, token: store.__setitem__(account, token))
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.1)
+    try:
+        with pytest.raises(flex.TokenUnreadable):
+            flex.read_token("someone")
+        flex.write_token("123456789012", "someone")
+        assert flex.read_token("someone") == "123456789012"
+    finally:
+        _drain(release)
 
 
 def test_a_keychain_that_does_not_answer_fails_the_sync_job_with_the_cause(
@@ -1025,7 +1108,7 @@ def test_a_keychain_that_does_not_answer_fails_the_sync_job_with_the_cause(
     try:
         outcome = jobs._sync(connect_migrated(tmp_path / "j.db"), ctx)
     finally:
-        release.set()
+        _drain(release)
     assert outcome.status == "failed"
     assert "keyring did not answer" in outcome.detail
 
