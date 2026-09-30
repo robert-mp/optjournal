@@ -853,16 +853,22 @@ def build_history(
             _absorb(current, open_part, fills=0)
             continue
 
+        peak = current.peak_qty
         _absorb(current, row)
 
         if past_flat:
             # A bare `C` opens nothing, so closing more than the walk knew was
             # held says the rest was held before the archive began rather than
             # that a position opened. The close took it flat, and its size is now
-            # known: the whole fill went out of it.
-            current.pre_archive_qty += -current.net_qty
+            # known: the whole fill went out of it. Held all along, so every
+            # reading the walk took was short of it, the largest included, and
+            # the position opened before the archive rather than at the first
+            # fill the walk saw.
+            unseen = -current.net_qty
+            current.pre_archive_qty += unseen
             current.entry_outside_window = True
-            current.peak_qty = max(current.peak_qty, abs(row["quantity"] or 0))
+            current.peak_qty = peak + abs(unseen)
+            current.opened_at = None
             current.net_qty = 0
 
         if _known_size(current) and _flat(current.net_qty):

@@ -1051,6 +1051,41 @@ def test_a_plain_close_past_flat_takes_the_position_flat(conn):
         "the whole sale, not the half a split at zero would have left here")
 
 
+def test_a_bare_close_past_flat_held_everything_it_found_the_whole_time(conn):
+    """Held 2 before the archive (nothing says so), buy 5, sell 3, then sell 4
+    marked `C`. The walk read 5, then 2; the overshoot shows the 2 it never saw
+    were held all along, so the position was 7, then 4. It reported 5 contracts,
+    and kept the add-on's date as when the position opened, though the entry
+    predates the archive: a 0DTE add-on to an older holding read as a 0DTE trade."""
+    add_trade(conn, "1", open_close="O", qty=5, date="2026-09-02")
+    add_trade(conn, "2", open_close="C", qty=-3, date="2026-09-05", realized=30.0)
+    add_trade(conn, "3", open_close="C", qty=-4, date="2026-09-09", realized=40.0)
+    (ep,) = build_history(conn).episodes
+    assert (ep.status, ep.net_qty, ep.pre_archive_qty) == ("CLOSED", 0, 2)
+    assert ep.contracts == 7
+    assert ep.entry_outside_window is True
+    assert (ep.opened_at, ep.holding_days) == (None, None)
+
+
+def test_a_bare_close_past_flat_counts_the_unseen_holding_once(conn):
+    """The overshoot is larger than anything the walk saw: held 3 before the
+    archive, buy 1, sell 4. The walk's own reading after the sale, 3 the wrong
+    side of flat, is the unseen holding and not a second one: 4 held at most."""
+    add_trade(conn, "1", open_close="O", qty=1, date="2026-09-02")
+    add_trade(conn, "2", open_close="C", qty=-4, date="2026-09-09", realized=40.0)
+    (ep,) = build_history(conn).episodes
+    assert (ep.pre_archive_qty, ep.contracts) == (3, 4)
+
+
+def test_a_bare_close_past_a_seeded_holding_adds_what_the_snapshot_missed(conn):
+    """The snapshot said 2 were held before the first fill, and a sale of 5 marked
+    `C` says 3 more were: 5 held, sold in one go."""
+    add_trade(conn, "1", open_close="C", qty=-5, date="2026-09-10", realized=90.0)
+    add_snapshot(conn, "C1", position=2, date="20260901")
+    (ep,) = build_history(conn).episodes
+    assert (ep.status, ep.pre_archive_qty, ep.contracts) == ("CLOSED", 5, 5)
+
+
 def test_a_bare_close_past_flat_does_not_absorb_a_later_re_entry(conn):
     """The episode the overshoot flattened is finished, so a later opening fill
     on the same contract starts a new one."""
