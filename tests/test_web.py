@@ -6630,7 +6630,9 @@ def test_the_payload_reports_how_much_of_the_journal_is_provisional(tmp_path):
     pv = state["provisional"]
     assert pv["fills"] == 1, "the estimated-rate count is wrong"
     assert pv["unsettled"] == 2, "a base-currency confirm was not counted unsettled"
-    assert pv["newest"] == "20260924"
+    # The confirm rows above are written in IBKR's compact form; opening the
+    # journal rewrites them into the statement's ISO form (db._normalise_confirm_dates).
+    assert pv["newest"] == "2026-09-24"
 
 
 def test_a_settled_journal_reports_nothing_provisional(populated):
