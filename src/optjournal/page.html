@@ -1439,7 +1439,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local rails sessions sigma
  * @local body others pair pick said m r err Date
  * @local WHIST bars hb cur wf3
- * @local CSS document box fk node back typed
+ * @local CSS document box fk node back typed hn live
  */
 
 const $=s=>document.querySelector(s);
@@ -6018,7 +6018,7 @@ function settingsPanel(){
         value="${esc(se.query_id||'')}" placeholder="1591754"
         ${overridden?'disabled':''}>
       <button id="qidsave" ${overridden?'disabled':''}>Save</button>
-      <span id="qidmsg" class="dim"></span>
+      <span id="qidmsg" class="dim">${esc(heldNote('qidmsg'))}</span>
     </div>
     ${overridden?`<div class="note">This id comes from a
       <code>--query-id</code> flag or <code>$OPTJOURNAL_QUERY_ID</code>, which
@@ -6033,7 +6033,7 @@ function settingsPanel(){
       <input id="cqid" class="tin mono" inputmode="numeric" maxlength="32"
         value="${esc(se.confirm_query_id||'')}" placeholder="optional">
       <button id="cqidsave">Save</button>
-      <span id="cqidmsg" class="dim"></span>
+      <span id="cqidmsg" class="dim">${esc(heldNote('cqidmsg'))}</span>
     </div>
     <div class="note">Optional. A <b>Trade Confirmation</b> query makes today's fills
     appear within minutes.${infoTip(
@@ -6473,25 +6473,12 @@ function draw(push){
     S.tiledraft=null; load();
   };
   const qidsave=$('#qidsave');
-  if(qidsave) qidsave.onclick=async()=>{
-    const el=$('#qid'), msg=$('#qidmsg');
-    if(msg) msg.textContent='saving...';
-    const res=await save({query_id:(el&&el.value||'').trim()});
-    /* The SERVER's message, not a local guess: it holds the shape rule (digits,
-       length) and repeating it here would be two rules to keep in step. */
-    if(msg) msg.textContent=res&&res.ok?'saved':((res&&res.message)||'failed');
-    if(res&&res.ok) load();
-  };
+  if(qidsave) qidsave.onclick=()=>saveQueryId('query_id','qid');
+  /* An EMPTY value is a real choice for the confirms id -- it turns the intraday
+     poll off -- so this sends the blank rather than refusing it the way the token
+     field does. */
   const cqidsave=$('#cqidsave');
-  if(cqidsave) cqidsave.onclick=async()=>{
-    const el=$('#cqid'), msg=$('#cqidmsg');
-    if(msg) msg.textContent='saving...';
-    /* An EMPTY value is a real choice -- it turns the intraday poll off -- so this
-       sends the blank rather than refusing it the way the token field does. */
-    const res=await save({confirm_query_id:(el&&el.value||'').trim()});
-    if(msg) msg.textContent=res&&res.ok?'saved':((res&&res.message)||'failed');
-    if(res&&res.ok) load();
-  };
+  if(cqidsave) cqidsave.onclick=()=>saveQueryId('confirm_query_id','cqid');
   const toksave=$('#toksave');
   if(toksave) toksave.onclick=async()=>{
     const el=$('#tok'), msg=$('#tokmsg');
@@ -7011,6 +6998,41 @@ async function save(body){
   }catch(e){
     return {ok:false,message:'could not reach the journal: '+e};
   }
+}
+
+/* One of the two query-id fields, saved; its status span is `<id>msg`.
+   The SERVER's message on a refusal, not a local guess: it holds the shape rule
+   (digits, length) and repeating it here would be two rules to keep in step.
+   On success the field is given the TRIMMED value before the reload, which
+   re-renders the panel: `preserveInputs` used to put "  123  " back over the
+   stored "123". And "saved" is held across that redraw (`holdNote`), which wiped
+   it the moment it appeared. */
+async function saveQueryId(key,id){
+  const el=$('#'+id), msg=$('#'+id+'msg'), value=(el&&el.value||'').trim();
+  if(msg) msg.textContent='saving...';
+  const res=await save({[key]:value});
+  if(!res||!res.ok){
+    const now=$('#'+id+'msg'); if(now) now.textContent=(res&&res.message)||'failed';
+    return;
+  }
+  const live=$('#'+id); if(live) live.value=value;
+  holdNote(id+'msg','saved');
+  load();
+}
+
+/* A status word a redraw must not wipe at once. Held in state for a few seconds
+   and rendered by the panel that owns the span; cleared in place afterwards, and
+   only if the span still says it. */
+const HELD_MS=4000;
+function holdNote(id,text){
+  S.held={...(S.held||{}),[id]:{text,until:Date.now()+HELD_MS}};
+  const shown=$('#'+id); if(shown) shown.textContent=text;
+  setTimeout(()=>{const later=$('#'+id);
+    if(later&&later.textContent===text&&!heldNote(id)) later.textContent='';},HELD_MS+50);
+}
+function heldNote(id){
+  const hn=(S.held||{})[id];
+  return hn&&hn.until>Date.now()?hn.text:'';
 }
 
 /* `said` overrides the toast, because these three writes are not one act: an add

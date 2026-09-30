@@ -5460,6 +5460,49 @@ def test_a_watched_symbol_clears_the_search_box_and_its_filter_together():
     assert (out["disabled"], out["focused"], out["value"]) == (False, True, "")
 
 
+def _save_query_id(typed: str, reply: dict) -> dict:
+    """Save the Flex query id through the page's own `saveQueryId`.
+
+    `load` stands in for the reload a success triggers, doing what the real one
+    does to this panel: the status span is rebuilt from `settingsPanel`'s markup,
+    and the field keeps whatever `preserveInputs` read off the old one.
+    """
+    return _node_run([
+        "const S={}; const sent=[]; const setTimeout=()=>0;",
+        "const nodes={'#qid':{value:" + json.dumps(typed) + "},'#qidmsg':{textContent:''}};",
+        "const $=sel=>nodes[sel]||null;",
+        f"async function save(body){{sent.push(body); return {json.dumps(reply)};}}",
+        "function load(){nodes['#qid']={value:nodes['#qid'].value};",
+        "  nodes['#qidmsg']={textContent:heldNote('qidmsg')};}",
+        *([_page_const("HELD_MS")] if "const HELD_MS=" in _js() else []),
+        *_page_fns("saveQueryId", "holdNote", "heldNote"),
+        "await saveQueryId('query_id','qid');",
+        "console.log(JSON.stringify({sent,field:nodes['#qid'].value,",
+        "  said:nodes['#qidmsg'].textContent}));",
+    ])
+
+
+def test_a_saved_query_id_says_so_after_the_redraw_and_shows_what_was_stored():
+    """L41: "saved" was written into the status span and the reload that followed
+    rebuilt the panel at once, so the confirmation vanished before it could be
+    read; and the field kept "  123  " because `preserveInputs` put the typed text
+    back over the stored, trimmed value.
+    """
+    out = _save_query_id("  1591754  ", {"ok": True, "kind": "settings"})
+    assert out == {"sent": [{"query_id": "1591754"}], "field": "1591754",
+                   "said": "saved"}
+    panel = _fn("settingsPanel")
+    for span in ("qidmsg", "cqidmsg"):
+        assert f"heldNote('{span}')" in panel, f"#{span} is rebuilt empty"
+
+
+def test_a_refused_query_id_shows_the_servers_reason_and_keeps_the_text():
+    out = _save_query_id("abc", {"ok": False, "kind": "query_id",
+                                  "message": "'abc' is not a Flex query id"})
+    assert out == {"sent": [{"query_id": "abc"}], "field": "abc",
+                   "said": "'abc' is not a Flex query id"}
+
+
 def test_a_refused_stop_watching_hands_its_button_back():
     """The same failure one button over: "stop watching" disabled itself and a
     refusal (any `!ok` reply, `busy` or `database` included) draws nothing, so
