@@ -3823,9 +3823,8 @@ function bindJournal(){
         /* The server's reason, then what did NOT happen, said once: the size
            refusal already says nothing was saved, and the banner said it twice. */
         const why=jnres.message||'the journal write was refused';
-        note(esc(why)+(why.toLowerCase().includes('nothing was saved')
-          ?' Your text is still on screen.'
-          :' Nothing was saved, and your text is still on screen.'),'bad');
+        note(esc(why)+(why.toLowerCase().includes('nothing was saved')?' Your'
+          :' Nothing was saved, and your')+' text is still on screen.','bad');
         return;
       }
       /* Closed on success, because the reader has finished the act. Reopening is
@@ -5492,10 +5491,10 @@ function odte(){
        checked" rather than as "nothing scheduled". */
     :`<div class="wcap zevents">No US release on the calendar today — a lighter
       tape than a print day, though nothing rules out an intraday headline.</div>`}
-    ${none?`<div class="note zstat"><b>Not available yet.</b> The calculator opens on
-      the S&amp;P and VIX daily closes, which arrive with the price bars: run
-      <code>optjournal bars</code> (the daily job fetches them too) and it fills in
-      from the next session. Until then, type both readings below.</div>`
+    ${none?`<div class="note"><b>Not available yet.</b> The calculator opens on the
+      S&amp;P and VIX daily closes, which arrive with the price bars: run
+      <code>optjournal bars</code>, or wait for the daily job. Until then, type both
+      readings below.</div>`
     :!S.zat?`<div class="wcap zstat">Checking the feed…</div>`
     :!oc.fresh?`<div class="note zwarn zstat"><b>Not current, so not
       shown.</b> ${esc(oc.stale_reason||'')}.${S.zerr?` The refresh failed:
