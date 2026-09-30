@@ -2241,13 +2241,19 @@ def test_a_redraw_hands_focus_back_to_the_control_that_had_it():
         "the message banner is not announced")
 
 
-def _bind_replay(resume: bool) -> dict:
-    """The page's own `bindReplayControls` on a panel parked at bar 3 of 10."""
+def _bind_replay(resume: bool, key: str = "lc:a") -> dict:
+    """The page's own `bindReplayControls` on a panel parked at bar 3 of 10.
+
+    `key` is the replay the panel shows, so the harness can also report which key
+    the frame loop recorded itself against (`RPKEY`).
+    """
     js = _code_only(_js())
     consts = [_page_const("REPLAY_SECONDS")] if "const REPLAY_SECONDS=" in js else []
     return _node_run([
         f"import {{barsPerMs, nextStop}} from '{_static('replay.js')}';",
         "let RGEO={points:Array.from({length:10},(_,i)=>[i,1]),events:[]}, RTIMER=null;",
+        "let RPKEY=null;",
+        f"const S={{replay:{json.dumps(key)}}};",
         "let frames=0; const requestAnimationFrame=()=>++frames;",
         "const cancelAnimationFrame=()=>{};",
         "const scrub={value:'3',max:'9'}, play={textContent:'▶ play'};",
@@ -2259,7 +2265,23 @@ def _bind_replay(resume: bool) -> dict:
         *consts, *_page_fns("replayStop", "bindReplayControls"),
         f"bindReplayControls({json.dumps(resume)});",
         "console.log(JSON.stringify({playing:RTIMER!==null,label:play.textContent,",
-        "  at:scrub.value}));",
+        "  at:scrub.value,key:RPKEY}));",
+    ])
+
+
+def _resume_decision(playing_for: str, opened: str) -> bool:
+    """draw()'s own two lines: a loop is running for `playing_for` and the render
+    about to happen is for `opened`. True means the new panel carries on playing.
+    """
+    draw = _fn("draw")
+    capture = re.search(r"^\s*const replaying=.*?;$", draw, re.M)
+    decide = re.search(r"bindReplayControls\(([^;]*)\);", draw)
+    assert capture and decide, "draw() no longer decides whether to resume playback"
+    return _node_run([
+        f"const S={{replay:{json.dumps(opened)}}};",
+        f"let RPKEY={json.dumps(playing_for)}, RTIMER=1;",
+        capture.group(0),
+        f"console.log(JSON.stringify({decide.group(1)}));",
     ])
 
 
@@ -2270,13 +2292,37 @@ def test_a_redraw_during_playback_keeps_the_replay_playing():
     the scrubber held comes back through `preserveInputs`, which now also carries
     a checkbox's `checked`, so "stop on events" no longer comes back ticked.
     """
-    assert _bind_replay(resume=True) == {"playing": True, "label": "❚❚ pause", "at": "3"}
+    started = _bind_replay(resume=True)
+    assert started == {"playing": True, "label": "❚❚ pause", "at": "3", "key": "lc:a"}
     assert _bind_replay(resume=False)["playing"] is False, "a parked replay started"
     draw = _fn("draw")
-    assert draw.index("RTIMER!==null?S.replay:null") < draw.index("replayStop()"), (
+    assert draw.index("RTIMER!==null?RPKEY:null") < draw.index("replayStop()"), (
         "whether it was playing has to be read before the loop is stopped")
     assert "bindReplayControls(replaying!==null&&replaying===S.replay)" in draw
     assert "el.checked=was.checked" in _fn("restoreInputs")
+
+
+def test_a_second_replay_opened_over_a_playing_one_opens_paused():
+    """L50: pressing play on one replay and then opening another started the SECOND
+    one playing, from the first one's bar. The `[data-replay]` handler writes the new
+    key into `S.replay` before it redraws, so draw() comparing "was playing" against
+    `S.replay` was comparing the new key with itself and always found them equal.
+
+    Playback now records the key it was started FOR, which is the question draw()
+    was trying to ask, and the scrubber names the replay it belongs to so
+    `restoreInputs` refuses to carry a bar index into a different trade. Driven in
+    headless Chromium on the demo journal both ways round.
+    """
+    assert _resume_decision(playing_for="lc:a", opened="lc:a") is True, (
+        "a redraw of the replay that is playing must carry on")
+    assert _resume_decision(playing_for="lc:a", opened="lc:b") is False, (
+        "opening a second replay while one plays must leave the new one paused")
+    assert _resume_decision(playing_for="lc:a", opened="") is False, (
+        "closing the panel that was playing must not resume anything")
+    chart = _fn("replayChart")
+    assert 'id="rscrub" data-subject="${esc(S.replay||\'\')}"' in chart, (
+        "the scrubber does not name its replay, so the bar index of the one that "
+        "was playing is restored onto the one just opened")
 
 
 def test_nothing_this_server_sends_is_cacheable():
@@ -4090,27 +4136,62 @@ def _hex_rgb(colour: str) -> tuple[int, int, int]:
     return (int(colour[1:3], 16), int(colour[3:5], 16), int(colour[5:7], 16))
 
 
+#: The rule that mutes a Daily reading. Keyed on the cell NOT holding the dash for
+#: a missing reading, which is the distinction the column is drawing; `.signed` used
+#: to stand in for it and let a reading of 0.0 through at full strength.
+_DAILY_MUTED = ".wtab td.wdaily:not(:has(>.dim))"
+
+
 def test_the_watchlists_muted_daily_figure_meets_aa_in_every_theme():
     """L43: the Daily column is muted with `opacity` unless the reading is
     strengthening, and at .62 a loss read 3.55 to 3.70:1 on its row, with the
     dash for a missing reading at 2.85:1. The opacity is read from the rule and
-    recomputed for both signs on every surface a row can sit on: the card, the
-    hover ground, and the open row's gradient stops.
+    recomputed for both signs, and for the plain foreground a reading of zero wears,
+    on every surface a row can sit on: the card, the hover ground, and the open row's
+    gradient stops.
     """
     rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
     assert "opacity" not in rules.get(".wtab td.wdaily", ""), (
         "the whole cell is dimmed, including the --dim dash for a missing reading")
-    muted = re.search(r"opacity:([0-9.]+)", rules.get(".wtab td.wdaily.signed", ""))
+    muted = re.search(r"opacity:([0-9.]+)", rules.get(_DAILY_MUTED, ""))
     assert muted, "the muted daily figure has no opacity rule to check"
     alpha = float(muted.group(1))
     for selector, palette in _themes().items():
-        for sign in ("ok", "bad"):
+        for sign in ("ok", "bad", "fg"):
             for surface in ("panel", "bg2", "seg1", "seg2"):
                 seen = _over(_hex_rgb(palette[sign]), alpha, palette[surface])
                 ratio = _ratio(seen, palette[surface])
                 assert ratio >= 4.5, (
                     f"{selector}: --{sign} at opacity {alpha} reads {ratio:.2f}:1 on "
                     f"--{surface}, below AA for the 13px Daily figure")
+
+
+def test_a_daily_reading_of_zero_is_muted_like_every_other_reading():
+    """L54: the muting keyed on `.signed`, which `cls()` withholds from a figure that
+    prints as zero (deliberately, because the hue and the "+" are both claims about a
+    sign it does not have). So a reading of 0.0 was the one number in the column at
+    full strength, wearing the emphasis this column keeps for a strengthening one.
+
+    The rule now says what it always meant: a cell holding a reading rather than the
+    dash for a missing one. Measured in headless Chromium with a 0.0 reading injected
+    into the payload: the cell computed opacity 1 beside 0.85 on its neighbours, and
+    0.85 now, with the dash still at 1 and a strengthening reading still at 1.
+    """
+    rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "opacity" in rules.get(_DAILY_MUTED, ""), (
+        "the Daily column is no longer muted by whether the cell holds a reading")
+    assert not any("opacity" in body for sel, body in rules.items()
+                   if sel == ".wtab td.wdaily.signed"), (
+        "the muting is back on `.signed`, which a reading of 0.0 does not carry")
+    # The dash is the only thing left out, and it is a `.dim` span (page.html
+    # `wdash`), which is what the selector above names.
+    assert 'wdash=why=>`<span class="dim"' in _code_only(_js()), (
+        "the missing-reading dash is not a `.dim` child any more, so the rule above "
+        "either mutes it or mutes nothing")
+    # And the strengthening reading still wins, which here is source order.
+    css = re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)
+    assert css.index(_DAILY_MUTED) < css.index(".wtab td.wdaily.strong"), (
+        "the two selectors tie on specificity, so the muting rule must come first")
 
 
 def test_the_0dte_tile_labels_meet_aa_on_their_washes_in_every_theme():
@@ -5286,11 +5367,56 @@ def test_a_state_reply_that_cannot_be_read_still_hands_the_buttons_back(reply):
         "function draw(){draws++;}",
         "function staleServerCheck(){}",
         f"let fetch; {reply}",
+        _page_const("SCOPE_KEYS"), "let LOADED={};",
         *_page_fns("stateQuery", "load"),
         "try{ await load(); }catch(e){ notes.push('threw'); }",
         "console.log(JSON.stringify({draws,notes}));",
     ])
     assert out == {"draws": 1, "notes": ["bad"]}
+
+
+def test_a_failed_state_read_leaves_the_controls_over_the_figures_in_hand():
+    """L51: the page showed the NEW scope over the OLD figures. Press Previous
+    period and pick Equities while `/api/state` answers 503 and the header said
+    "Aug 2026", the view button said "Equities" and the URL said
+    `month=2026-08&type=equities`, while Net P&L and the whole body were still
+    September's all-options numbers, and every later redraw kept it that way until
+    the next successful load.
+
+    Each control writes into S and then calls load(), so the scope cannot be read
+    back at the top of load(): what is remembered is the scope each payload ARRIVED
+    with, and a failed read puts it back before redrawing. Driven in headless
+    Chromium as well (month step, then a trade-type change, both against a 503).
+    """
+    payload = {"month_range": ["2026-08", "2026-09"], "trade_type": "all", "stats": {}}
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const S={state:null,month:'2026-09',type:null,cost:['OPT'],scoring:null,"
+        "calday:null};",
+        "const notes=[]; let draws=0;",
+        "function note(text,kind){notes.push(kind);}",
+        "function draw(){draws++;}",
+        "function staleServerCheck(){}",
+        f"const payload={json.dumps(payload)};",
+        "let fetch=async()=>({ok:true,status:200,json:async()=>payload});",
+        _page_const("SCOPE_KEYS"), "let LOADED={};",
+        *_page_fns("stateQuery", "load"),
+        "await load();",
+        # What the month stepper and the trade-type buttons do, then a read that fails.
+        "S.month='2026-08';S.type='equities';S.cost=['OPT','STK'];S.scoring='campaign';",
+        "fetch=async()=>({ok:false,status:503,json:async()=>({})});",
+        "await load();",
+        "console.log(JSON.stringify({month:S.month,type:S.type,cost:S.cost,",
+        "  scoring:S.scoring,query:stateQuery(),draws,notes}));",
+    ])
+    assert out["notes"] == ["bad"], "the banner no longer says the read failed"
+    assert out["draws"] == 2, "a failed read must still redraw and hand the buttons back"
+    assert out["month"] == "2026-09", "the header still names a month the figures are not for"
+    assert out["type"] is None, "the view button still names a scope the figures are not for"
+    assert out["cost"] == ["OPT"], "the cost chips still name a scope the figures are not for"
+    assert out["scoring"] is None, "the scoreboard unit still disagrees with its figures"
+    # The URL is written from the same keys, so agreeing here is agreeing there.
+    assert out["query"] == "month=2026-09&cost=OPT"
 
 
 def test_only_the_job_that_spends_a_broker_request_asks_for_confirmation():
@@ -5762,23 +5888,32 @@ def test_a_watched_symbol_clears_the_search_box_and_its_filter_together():
     assert (out["disabled"], out["focused"], out["value"]) == (False, True, "")
 
 
-def _save_query_id(typed: str, reply: dict) -> dict:
-    """Save the Flex query id through the page's own `saveQueryId`.
+def _save_query_id(*saves: tuple[str, dict], redraw: bool = False) -> dict:
+    """Save the Flex query id through the page's own `saveQueryId`, once per
+    (typed, reply) pair, and report the field and its status span at the end.
 
-    `load` stands in for the reload a success triggers, doing what the real one
-    does to this panel: the status span is rebuilt from `settingsPanel`'s markup,
-    and the field keeps whatever `preserveInputs` read off the old one.
+    `redraw` stands in for the render a success triggers, and for any other one that
+    lands while a status word is still held, doing what the real one does to this
+    panel: the status span is rebuilt from `settingsPanel`'s markup, and the field
+    keeps whatever `preserveInputs` read off the old one.
     """
+    typed, replies = [t for t, _ in saves], [r for _, r in saves]
     return _node_run([
         "const S={}; const sent=[]; const setTimeout=()=>0;",
-        "const nodes={'#qid':{value:" + json.dumps(typed) + "},'#qidmsg':{textContent:''}};",
+        "const nodes={'#qid':{value:''},'#qidmsg':{textContent:''}};",
         "const $=sel=>nodes[sel]||null;",
-        f"async function save(body){{sent.push(body); return {json.dumps(reply)};}}",
-        "function load(){nodes['#qid']={value:nodes['#qid'].value};",
+        f"const replies={json.dumps(replies)};",
+        "async function save(body){sent.push(body); return replies[sent.length-1];}",
+        "function redraw(){nodes['#qid']={value:nodes['#qid'].value};",
         "  nodes['#qidmsg']={textContent:heldNote('qidmsg')};}",
+        "function load(){redraw();}",
         *([_page_const("HELD_MS")] if "const HELD_MS=" in _js() else []),
         *_page_fns("saveQueryId", "holdNote", "heldNote"),
-        "await saveQueryId('query_id','qid');",
+        f"for(const t of {json.dumps(typed)})"
+        "{nodes['#qid'].value=t; await saveQueryId('query_id','qid');}",
+        # One more redraw (a theme chip, a landing load) INSIDE the hold, which is
+        # where a stale "saved" comes back from.
+        *(["redraw();"] if redraw else []),
         "console.log(JSON.stringify({sent,field:nodes['#qid'].value,",
         "  said:nodes['#qidmsg'].textContent}));",
     ])
@@ -5790,7 +5925,7 @@ def test_a_saved_query_id_says_so_after_the_redraw_and_shows_what_was_stored():
     read; and the field kept "  123  " because `preserveInputs` put the typed text
     back over the stored, trimmed value.
     """
-    out = _save_query_id("  1591754  ", {"ok": True, "kind": "settings"})
+    out = _save_query_id(("  1591754  ", {"ok": True, "kind": "settings"}))
     assert out == {"sent": [{"query_id": "1591754"}], "field": "1591754",
                    "said": "saved"}
     panel = _fn("settingsPanel")
@@ -5799,10 +5934,31 @@ def test_a_saved_query_id_says_so_after_the_redraw_and_shows_what_was_stored():
 
 
 def test_a_refused_query_id_shows_the_servers_reason_and_keeps_the_text():
-    out = _save_query_id("abc", {"ok": False, "kind": "query_id",
-                                  "message": "'abc' is not a Flex query id"})
+    out = _save_query_id(("abc", {"ok": False, "kind": "query_id",
+                                  "message": "'abc' is not a Flex query id"}))
     assert out == {"sent": [{"query_id": "abc"}], "field": "abc",
                    "said": "'abc' is not a Flex query id"}
+
+
+def test_a_refusal_ends_the_saved_that_was_being_held():
+    """L53: "saved" is held for four seconds so a reload cannot wipe it, and the
+    refusal branch left that hold standing. Save a valid id, type `bad!`, save
+    again within the four seconds, and the next redraw (the theme chip, a load, any
+    of them) rebuilt the span from the hold and put "saved" back beside the value the
+    server had just refused, while the stored id was still the previous one. Driven
+    in headless Chromium on a copy of the real journal too.
+    """
+    refusal = "'bad!' is not a Flex query id"
+    out = _save_query_id(
+        ("1591754", {"ok": True, "kind": "settings"}),
+        ("bad!", {"ok": False, "kind": "query_id", "message": refusal}),
+        redraw=True,
+    )
+    assert out["sent"] == [{"query_id": "1591754"}, {"query_id": "bad!"}]
+    assert out["field"] == "bad!", "the refused text is what the reader must correct"
+    assert out["said"] == "", (
+        f"a redraw after the refusal says {out['said']!r}: the held word outlived "
+        "the claim it was making")
 
 
 def test_a_refused_stop_watching_hands_its_button_back():
@@ -8232,11 +8388,11 @@ def test_each_stats_block_ranks_strategies_over_its_own_period():
     assert "strategy_ranking(state[\"lifecycles\"],period)" in src
 
 
-def _media_rules(width: int) -> list[tuple[str, str]]:
-    """(selector, body) for every rule inside `@media(max-width:<width>px)`."""
+def _at_rules(width: int, kind: str = "media") -> list[tuple[str, str]]:
+    """(selector, body) for every rule inside `@<kind> (max-width:<width>px)`."""
     css = re.sub(r"/\*.*?\*/", "", _css(), flags=re.S)
     rules: list[tuple[str, str]] = []
-    for m in re.finditer(rf"@media\s*\(max-width:\s*{width}px\)\s*\{{", css):
+    for m in re.finditer(rf"@{kind}\s*\(\s*max-width:\s*{width}px\s*\)\s*\{{", css):
         depth, i = 1, m.end()
         while depth:
             depth += {"{": 1, "}": -1}.get(css[i], 0)
@@ -8245,25 +8401,40 @@ def _media_rules(width: int) -> list[tuple[str, str]]:
     return [(sel.strip(), body) for sel, body in rules]
 
 
-def test_a_phone_calendar_prints_every_day_whole():
-    """M33: at 375px a day is 37px wide and "−€1,729.42" was clipped to "−€1,7",
-    and the pill row ran 7px past the card. Measured in a browser at 320 to 1280px
-    after the fix, on the real journal's two busiest months: nothing clipped.
+def _media_rules(width: int) -> list[tuple[str, str]]:
+    return _at_rules(width)
 
-    The cell carries the amount and its `compact` form (node-tested in
-    format.test.mjs), and below 700px only the compact one shows, sized to the
-    day's own width so it fits the narrowest phone; the day's label keeps the
-    exact figure for a screen reader.
+
+def test_a_calendar_day_prints_its_figure_whole_at_every_width():
+    """M33 and L52, which are the same rule read at two widths.
+
+    M33: at 375px a day is 41px wide and "−€1,729.42" was clipped to "−€1,7", and
+    the pill row ran 7px past the card. L52: the cell carries the amount and its
+    `compact` form (node-tested in format.test.mjs) and the choice between them was
+    made by the WINDOW, so from 761px, where the rail is back but the window is
+    still narrow, a 78px day showed the full amount with `overflow-wrap:anywhere`
+    and broke it inside its digits: "−", "€1,729.4", "2".
+
+    The question belongs to the cell, so each day that carries a figure is a
+    container and one query answers it everywhere. Measured in a browser on the real
+    journal's two busiest months, 320px to 2560px in 5px steps: no digit split, no
+    clipping, and nothing wraps at all. The day's label keeps the exact figure for a
+    screen reader at every width.
     """
-    narrow = {sel: body.replace(" ", "") for sel, body in _media_rules(700)}
+    narrow = {sel: body.replace(" ", "") for sel, body in _at_rules(72, "container")}
     assert "display:none" in narrow.get(".day .dplw", ""), "the full amount still shows"
     shown = narrow.get(".day .dpln", "")
     assert "display:inline" in shown and "cqi" in shown, (
         "the compact amount does not show, or does not scale with the day")
-    assert "container-type:inline-size" in narrow.get(".cal>.day", "")
     wide = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "container-type:inline-size" in wide.get(".cal>.day:has(>.dpl)", ""), (
+        "a day is not its own container, so the query above can never match; and "
+        "the Market strip's cells must stay out of it, they size themselves")
     assert "display:none" in wide.get(".day .dpln", ""), (
         "the compact amount shows beside the full one on a wide screen")
+    assert not any("anywhere" in body for sel, body in _css_rules()
+                   if sel.strip() in (".day .dplw", ".day .dpl")), (
+        "overflow-wrap:anywhere is back, which lets an amount break between digits")
     assert "max-width:100%" in wide.get(".pills", ""), (
         "a pill strip with a row to itself cannot wrap, so it overflows its card")
     cal = _fn("calendar")

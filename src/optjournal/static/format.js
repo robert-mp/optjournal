@@ -61,17 +61,27 @@ export function money(value, currency, digits) {
 /** An amount in at most five characters, for a cell too narrow for `money`: a
  * calendar day on a phone, where "−€1,729.42" was clipped to "−€1,7". No symbol
  * and no cents, because the month's total beside the grid carries the currency
- * and the day's own label carries the exact figure: 716, −198, 1.1k, −3.3k, 12k.
- * Anything that rounds to zero prints without a sign, so there is no "−0".
+ * and the day's own label carries the exact figure: 716, −198, 1.1k, −3.3k, 12k,
+ * 1.0m. Anything that rounds to zero prints without a sign, so there is no "−0".
+ *
+ * The UNIT rolls over at 999.5 of the one below, which is what keeps the promise
+ * above: from 999.5k this used to print "1,000k", six characters, because the
+ * thousands were the last rung on the ladder. Millions are the last one now, which
+ * covers every amount a journal of one account can hold.
  */
 export function compact(value) {
   if (value == null) return "—";
   const amount = Number(value);
   if (!Number.isFinite(amount)) return "—";
   const size = Math.abs(amount);
-  const body = size < 999.5 ? num(Math.round(size), 0)
-    : size < 9950 ? `${num(size / 1000, 1)}k`
-    : `${num(Math.round(size / 1000), 0)}k`;
+  const [scaled, unit] = size < 999.5 ? [size, ""]
+    : size < 999500 ? [size / 1000, "k"]
+    : [size / 1e6, "m"];
+  /* One decimal below ten of a unit, none above: "9.9k" then "10k", so the digits
+     before the suffix never run past three. */
+  const body = !unit ? num(Math.round(scaled), 0)
+    : scaled < 9.95 ? `${num(scaled, 1)}${unit}`
+    : `${num(Math.round(scaled), 0)}${unit}`;
   return `${amount < 0 && body !== "0" ? MINUS : ""}${body}`;
 }
 

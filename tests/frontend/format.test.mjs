@@ -32,6 +32,25 @@ test("a compact amount rolls over at its edges instead of printing 1000 or 10.0k
   assert.equal(compact(999.5), "1.0k");
   assert.equal(compact(9949), "9.9k");
   assert.equal(compact(9950), "10k");
+  /* And into millions at the same edge, one unit up: from 999.5k this printed
+     "1,000k", which is six characters in a cell that has room for five. */
+  assert.equal(compact(999499), "999k");
+  assert.equal(compact(999500), "1.0m");
+  assert.equal(compact(-999500), "−1.0m");
+  assert.equal(compact(9949999), "9.9m");
+  assert.equal(compact(9950000), "10m");
+  assert.equal(compact(123456789), "123m");
+});
+
+test("no compact amount a journal can hold is wider than five characters", () => {
+  /* The rule the docstring states, checked across the whole range rather than at
+     the edges it was written from: every step of a decade, both signs. */
+  for (let size = 0.5; size < 1e9; size *= 1.7) {
+    for (const v of [size, -size]) {
+      assert.ok(compact(v).length <= 5,
+                `compact(${v}) is "${compact(v)}", too wide for a day cell`);
+    }
+  }
 });
 
 test("a compact amount that rounds to zero has no sign, and absence is a dash", () => {
