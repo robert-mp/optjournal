@@ -309,6 +309,30 @@ def test_a_write_that_names_another_row_than_the_card_shows_is_refused(tmp_path)
     assert _rows(db) == [("ibkr", "U1", "100", "took profits")]
 
 
+def test_the_page_says_which_row_the_card_shows_when_it_saves():
+    """Save posts the card's anchor and `shows`, the key of the entry drawn on
+    the card, which the server needs to edit that row rather than add one."""
+    from test_web import _node_run, _page_const, _page_fns, _static
+
+    entry = {"broker": "ibkr", "account_id": "U1", "anchor": "100", "lessons": "x"}
+    posted = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "function note(){} async function load(){}",
+        "const b={dataset:{jsave:'50'},disabled:false,classList:{add(){},remove(){}}};",
+        "const document={querySelectorAll:sel=>sel==='[data-jsave]'?[b]:[]};",
+        "const $=()=>({value:''});",
+        f"const S={{state:{{journal:{{entries:{{'50':{json.dumps(entry)}}}}}}}}};",
+        "let body=null;",
+        "const fetch=async(_url,init)=>{body=JSON.parse(init.body);",
+        "  return {json:async()=>({ok:true,entry:null})};};",
+        _page_const("JFIELDS"), _page_const("JENTRY"),
+        *_page_fns("bindJournal"),
+        "bindJournal(); await b.onclick();",
+        "console.log(JSON.stringify([body.anchor, body.shows]));",
+    ])
+    assert posted == ["50", ["ibkr", "U1", "100"]]
+
+
 #: Z, an older position on another contract (30, closed by 35), beside the
 #: holding of `_CLOSED`.
 _OLDER = [("z1", "U1", "30", "2026-07-01 10:00:00", 1, "O", None, "22"),
