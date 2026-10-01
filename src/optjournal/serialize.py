@@ -1698,7 +1698,7 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     equities, and not computed at all when nothing has been written.
     """
     written = journal_entries(conn)
-    shown = _journal_shown(written, journal_cards(conn)) if written else {}
+    shown = journal_shown(written, journal_cards(conn)) if written else {}
     on_cards = {id(entry) for entry in shown.values()}
     return {
         "entries": {anchor: entry.payload() for anchor, entry in shown.items()},
@@ -1718,7 +1718,7 @@ def journal_cards(conn: sqlite3.Connection) -> list[Any]:
                                    build_history(conn, asset_category=category).episodes)]
 
 
-def _journal_shown(
+def journal_shown(
     written: dict[tuple[str, str, str], Any], cards: list[Any],
 ) -> dict[str, Any]:
     """The entry each card shows, by the card's anchor.

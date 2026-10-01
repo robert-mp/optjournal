@@ -129,6 +129,7 @@ from optjournal.serialize import (
     journal_cards,
     journal_data,
     journal_review,
+    journal_shown,
     logbook_data,
     market_data,
     odte_context_data,
@@ -250,10 +251,10 @@ def _tiles_problem(tiles: Any) -> str | None:
 #: The keys `/api/journal` reads for itself. Everything else in the body is a
 #: journal field, and `journal.FIELDS` is what judges it -- see `_journal_write`
 #: on why this endpoint must not do its own filtering.
-_JOURNAL_CONTROL = frozenset({"anchor", "broker", "account"})
+_JOURNAL_CONTROL = frozenset({"anchor", "broker", "account", "shows"})
 
 
-def _the_card(conn: Any, anchor: str, body: dict[str, Any]) -> tuple[Any, str | None]:
+def _the_card(cards: list[Any], anchor: str, body: dict[str, Any]) -> tuple[Any, str | None]:
     """The one current card `anchor` names, or None and why not.
 
     An anchor is unique among the current cards (`campaigns.Campaign.key`), so
@@ -262,7 +263,7 @@ def _the_card(conn: Any, anchor: str, body: dict[str, Any]) -> tuple[Any, str | 
     must be that card's, so a stale page cannot file writing under the wrong
     account's row either.
     """
-    cards = [c for c in journal_cards(conn) if c.anchor == anchor
+    cards = [c for c in cards if c.anchor == anchor
              and all(body.get(name) in (None, "", c.key[k])
                      for name, k in (("broker", 0), ("account", 1)))]
     if len(cards) == 1:
@@ -1903,10 +1904,28 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # The row is the card's: its broker and account, and the anchor that
             # names it alone. Never the order's alone, which a GTC order that
             # filled again, or one allocated to two accounts, gives two cards.
-            card, why = _the_card(conn, anchor, body)
+            cards = journal_cards(conn)
+            card, why = _the_card(cards, anchor, body)
             if card is None:
                 return 409, {"ok": False, "kind": "stale", "message": why}
             broker, account, _anchor = card.key
+            # The row the card shows, which the write edits: where it was filed
+            # under another id (the card's anchor has moved since), it is moved
+            # to the card's key in the same transaction, so editing it leaves one
+            # row and emptying it deletes it. The page says which row it shows,
+            # and a row that no longer is this card's is refused, not re-keyed.
+            shown = journal_shown(journal.entries(conn), cards).get(anchor)
+            showing = (None if shown is None else
+                       (shown.broker, shown.account_id, shown.anchor_order_id))
+            said = body.get("shows")
+            told = None if said is None else tuple(str(x) for x in said)
+            if ("shows" in body and told != showing) or (
+                    "shows" not in body and showing not in (None, card.key)):
+                return 409, {
+                    "ok": False, "kind": "stale",
+                    "message": "this position's write-up has changed since the page "
+                               "loaded. Reload the page and save again. Nothing was "
+                               "saved."}
             trades = sorted({part.partition("~")[0] for _b, _o, part in card.parts})
             target = conn.execute(
                 # Options carry the underlying; equities ARE it.
@@ -1919,7 +1938,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 entry = journal.save(
                     conn, anchor, account_id=account, values=values,
                     underlying_symbol=target["underlying"],
-                    opened_on=target["opened_on"], broker=broker,
+                    opened_on=target["opened_on"], broker=broker, replacing=showing,
                 )
             except journal.JournalError as exc:
                 return 400, {"ok": False, "kind": "journal", "message": str(exc)}
@@ -1988,8 +2007,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 unders[end] = row["u"]
             # Each end the one current card it names, as a journal write's is:
             # the anchor alone, never the order, which can name two cards.
+            cards = journal_cards(conn)
             for end in (a, b):
-                card, why = _the_card(conn, end, {"broker": broker})
+                card, why = _the_card(cards, end, {"broker": broker})
                 if card is None:
                     return 409, {"ok": False, "kind": "stale", "message": why}
             if unders[a] != unders[b]:

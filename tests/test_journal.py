@@ -734,7 +734,7 @@ def _matching_seconds(n: int) -> float:
     import time
 
     from optjournal.campaigns import Campaign
-    from optjournal.serialize import _journal_shown
+    from optjournal.serialize import journal_shown
 
     cards = [Campaign(episode_indices=(k,), conids=("1",),
                       order_ids=frozenset({str(10_000 + k)}), is_decided=False,
@@ -748,7 +748,7 @@ def _matching_seconds(n: int) -> float:
     best = float("inf")
     for _ in range(5):
         start = time.perf_counter()
-        _journal_shown(written, cards)
+        journal_shown(written, cards)
         best = min(best, time.perf_counter() - start)
     return best
 

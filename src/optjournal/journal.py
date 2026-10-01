@@ -257,6 +257,7 @@ def save(
     underlying_symbol: str | None = None,
     opened_on: str | None = None,
     broker: str = DEFAULT_BROKER,
+    replacing: tuple[str, str, str] | None = None,
 ) -> Entry | None:
     """Write one decision's entry, or delete it when nothing is left.
 
@@ -276,6 +277,13 @@ def save(
 
     `created_at` survives an update for the same reason `trades.first_seen_at`
     does: when the journal first gained this entry is a fact about the journal.
+
+    `replacing` is the key of the row a card shows when it was filed under
+    another id, `(broker, account_id, anchor)`: a card whose anchor moved shows
+    the row written under the old one. That row is moved to this key first, in
+    the same transaction, so the write edits the text the reader was shown and
+    one row remains; and emptying every field deletes it rather than leaving it
+    listed as an orphan with the text the reader cleared.
     """
     if anchor_order_id is None:
         raise JournalError(
@@ -284,6 +292,31 @@ def save(
         )
     fields = _validated(values)
     anchor = str(anchor_order_id)
+    try:
+        if replacing is not None and tuple(replacing) != (broker, account_id, anchor):
+            conn.execute(
+                "UPDATE journal_entries SET broker = ?, account_id = ?,"
+                " anchor_order_id = ? WHERE broker = ? AND account_id = ?"
+                " AND anchor_order_id = ?",
+                (broker, account_id, anchor, *replacing))
+        return _write(conn, anchor, account_id=account_id, broker=broker, fields=fields,
+                      underlying_symbol=underlying_symbol, opened_on=opened_on)
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _write(
+    conn: sqlite3.Connection,
+    anchor: str,
+    *,
+    account_id: str,
+    broker: str,
+    fields: dict[str, str | None],
+    underlying_symbol: str | None,
+    opened_on: str | None,
+) -> Entry | None:
+    """`save` past its checks: merge, then upsert or delete, then commit."""
     existing = entry_for(conn, anchor, account_id=account_id, broker=broker)
     merged = dict(existing.values) if existing else {}
     merged.update(fields)

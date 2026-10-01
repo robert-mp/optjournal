@@ -236,6 +236,79 @@ def test_one_click_opens_one_editor(tmp_path):
     assert sorted(drawn) == [0, 1]
 
 
+#: A holding from before the archive, closed by order 100; a history import
+#: later brings its opening fill, order 50, so the card answers to 50 and shows
+#: the write-up filed under 100.
+_CLOSED = [("t1", "U1", "100", "2026-09-02 10:00:00", -1, "C", 50.0, "21")]
+_OPENED = [("h1", "U1", "50", "2026-08-01 10:00:00", 1, "O", None, "21")]
+
+
+def _form(state: dict, anchor: str, **changes) -> dict:
+    """What the page's Save posts: every field, as the form was filled from the
+    entry the card shows, and which row that is."""
+    from optjournal.journal import FIELDS
+
+    je = state["journal"]["entries"].get(anchor)
+    body = {"anchor": anchor, **{f: (je or {}).get(f) or "" for f in FIELDS},
+            "shows": [je["broker"], je["account_id"], je["anchor"]] if je else None}
+    body.update(changes)
+    return body
+
+
+def _moved(tmp_path: Path) -> tuple[Path, str]:
+    db = _journal(tmp_path, _CLOSED)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        _post(base, "/api/journal", _form(_state(base), "100", entry_note="took profits",
+                                          lessons="should have sized up"))
+    _insert(db, _OPENED)
+    return db, "50"
+
+
+def test_editing_a_write_up_filed_under_an_older_anchor_leaves_one_row(tmp_path):
+    """Clearing one sentence on the card wrote a second row under 50 and left the
+    one under 100, with the sentence still in it, in the unclaimed notes."""
+    db, anchor = _moved(tmp_path)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        state = _state(base)
+        assert state["journal"]["entries"][anchor]["anchor"] == "100"
+        status, reply = _post(base, "/api/journal", _form(state, anchor, lessons=""))
+        assert status == 200, reply
+        state = _state(base)
+    assert state["journal"]["orphans"] == []
+    assert state["journal"]["entries"][anchor]["lessons"] is None
+    assert _rows(db) == [("ibkr", "U1", "50", "took profits")]
+
+
+def test_emptying_a_write_up_filed_under_an_older_anchor_deletes_it(tmp_path):
+    """Emptying every field answered "Entry deleted" and left the row under 100,
+    which came back on the next load."""
+    from optjournal.journal import FIELDS
+
+    db, anchor = _moved(tmp_path)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, reply = _post(base, "/api/journal", _form(
+            _state(base), anchor, **dict.fromkeys(FIELDS, "")))
+        assert (status, reply["entry"]) == (200, None)
+        state = _state(base)
+    assert (state["journal"]["entries"], state["journal"]["orphans"]) == ({}, [])
+    assert _rows(db) == []
+
+
+def test_a_write_that_names_another_row_than_the_card_shows_is_refused(tmp_path):
+    """A page that loaded before the history import shows the card as 100 with no
+    knowledge of 50; one that names a row the card does not show, or names none
+    while the card shows one filed elsewhere, could only edit the wrong text."""
+    db, anchor = _moved(tmp_path)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        state = _state(base)
+        for body in (_form(state, anchor, shows=None),
+                     _form(state, anchor, shows=["ibkr", "U1", "999"]),
+                     {"anchor": anchor, "lessons": "x"}):
+            status, reply = _post(base, "/api/journal", body)
+            assert (status, reply["kind"]) == (409, "stale"), body
+    assert _rows(db) == [("ibkr", "U1", "100", "took profits")]
+
+
 # ------------------------------------------------------------------- fuzz
 #
 # Random option journals arriving as statements do, written up through the
@@ -283,8 +356,9 @@ def _shown_rows(state: dict) -> dict[str, tuple]:
 @pytest.mark.parametrize("seed", range(12))
 def test_no_write_through_the_handlers_touches_a_row_another_card_shows(tmp_path, seed):
     """Keys are unique across the current cards, every stored row is shown on at
-    most one card, and a write from one card changes no row another card shows,
-    through two statements and a write on every card after each."""
+    most one card, and a write from one card changes no row another card shows
+    and leaves the card's own row filed under its anchor, through two statements
+    and a write on every card after each, posted as the page posts it."""
     rnd = random.Random(seed)
     fills = _random_fills(rnd)
     cut = rnd.randint(1, len(fills))
@@ -299,8 +373,8 @@ def test_no_write_through_the_handlers_touches_a_row_another_card_shows(tmp_path
             for anchor in anchors:
                 before = _shown_rows(state)
                 rows = _full_rows(db)
-                status, _reply = _post(base, "/api/journal", {
-                    "anchor": anchor, "lessons": f"{step} {anchor}"})
+                status, _reply = _post(base, "/api/journal", _form(
+                    state, anchor, lessons=f"{step} {anchor}"))
                 assert status == 200, (anchor, _reply)
                 state = _state(base)
                 after = _full_rows(db)
@@ -309,3 +383,5 @@ def test_no_write_through_the_handlers_touches_a_row_another_card_shows(tmp_path
                         assert after.get(row) == rows.get(row), (anchor, other)
                 shown = list(_shown_rows(state).values())
                 assert len(shown) == len(set(shown))
+                assert _shown_rows(state)[anchor][2] == anchor
+                assert len(after) <= len(rows) + (anchor not in before)

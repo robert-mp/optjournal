@@ -3873,7 +3873,11 @@ function bindJournal(){
   document.querySelectorAll('[data-jsave]').forEach(b=>
     b.onclick=async()=>{
       const anchor=b.dataset.jsave;
-      const body={anchor};
+      /* `shows` is the row this card shows, by its own key: filed under another
+         id when the card's anchor has moved, and the server moves it to the
+         card's key as it writes, so editing or emptying it leaves one row. */
+      const je=JENTRY(anchor);
+      const body={anchor,shows:je?[je.broker,je.account_id,je.anchor]:null};
       /* Every field is one element with an id -- textarea or select -- so this
          reads them all the same way. That uniformity is the point: it is what lets
          `preserveInputs` protect the whole form with one selector. */
