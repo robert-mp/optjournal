@@ -966,15 +966,18 @@ def _drain(release: threading.Event) -> None:
     """Answer every stuck keyring call and wait for it to return.
 
     The calls are shared by every reader in the process, so one still pending
-    when the next test starts would hand that test this test's answer.
+    when the next test starts would hand that test this test's answer, and a
+    write finishing late would count as a save made during it.
     """
     import time
 
     release.set()
     deadline = time.monotonic() + 5
-    while (any(t.name == "keyring-read" for t in threading.enumerate())
+    while (any(t.name.startswith("keyring-") for t in threading.enumerate())
            and time.monotonic() < deadline):
         time.sleep(0.01)
+    assert not any(t.name.startswith("keyring-") for t in threading.enumerate()), (
+        "a keyring call outlived its test")
 
 
 def test_a_keychain_that_does_not_answer_raises_within_the_deadline(monkeypatch):
@@ -1092,6 +1095,95 @@ def test_a_token_stored_behind_a_stuck_call_is_read_at_once(monkeypatch):
         assert flex.read_token("someone") == "123456789012"
     finally:
         _drain(release)
+
+
+def test_a_token_saved_with_every_call_stuck_is_still_read(monkeypatch):
+    """At `KEYRING_MAX_PENDING` stuck calls a read starts no more, and a save did
+    not change that: the page said "stored, press Sync" and the next Check and
+    fetch were refused as "3 reads ... restart". A successful save may start one
+    call past the cap, so the token it stored is read, and the threads stay
+    bounded at `KEYRING_MAX_PENDING + 1` whatever is saved."""
+    import time
+
+    release, calls = threading.Event(), []
+    store: dict[str, str] = {}
+
+    def get_password(service, account):
+        calls.append(1)
+        if len(calls) <= flex.KEYRING_MAX_PENDING:
+            release.wait(30)                 # stuck until the test ends
+        return store.get(account)
+
+    monkeypatch.setattr(flex.keyring, "get_password", get_password)
+    monkeypatch.setattr(flex.keyring, "set_password",
+                        lambda service, account, token: store.__setitem__(account, token))
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.05)
+    try:
+        for _ in range(100):
+            with pytest.raises(flex.TokenUnreadable) as caught:
+                flex.read_token("someone")
+            if len(calls) == flex.KEYRING_MAX_PENDING and "no more" in str(caught.value):
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("the reads never reached the cap")
+        flex.write_token("123456789012", "someone")
+        assert flex.read_token("someone") == "123456789012"
+        assert _keyring_threads() <= flex.KEYRING_MAX_PENDING + 1
+    finally:
+        _drain(release)
+
+
+def test_a_refused_save_does_not_count_as_one(monkeypatch):
+    """Recorded in a `finally`, a refused write marked the token stored, so each
+    refused Save let the next read give up on the pending call and start
+    another: the cap in a fraction of the two stuck periods it should take."""
+    release, calls = threading.Event(), []
+    monkeypatch.setattr(flex.keyring, "get_password", _stuck(release, calls, then=None))
+
+    def refused(service, account, token):
+        raise RuntimeError("(-25244, 'Unknown Error')")
+
+    monkeypatch.setattr(flex.keyring, "set_password", refused)
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.2)   # stuck after 0.6s
+    try:
+        for _ in range(3):
+            with pytest.raises(flex.TokenUnreadable):
+                flex.read_token("someone", timeout_s=0.05)
+            with pytest.raises(flex.TokenWriteRefused):
+                flex.write_token("123456789012", "someone")
+        assert len(calls) == 1, f"{len(calls)} keyring calls after refused saves"
+    finally:
+        _drain(release)
+
+
+def test_a_read_never_returns_an_answer_asked_for_before_it_began(monkeypatch):
+    """A token rotated by ANOTHER process (`optjournal setup` in a terminal)
+    moves nothing in this one, so a read begun after it joined a call begun
+    before it and returned the OLD token, which a Sync would then spend an IBKR
+    request on. A read now waits for such a call to finish and asks itself."""
+    import time
+
+    store = {"someone": "OLD-TOKEN-1111"}
+
+    def slow(service, account):
+        value = store[account]                # looked up at once...
+        time.sleep(0.3)                       # ...answered 0.3s later
+        return value
+
+    monkeypatch.setattr(flex.keyring, "get_password", slow)
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 2.0)
+    first: dict[str, str] = {}
+    earlier = threading.Thread(
+        target=lambda: first.setdefault("token", flex.read_token("someone")))
+    earlier.start()
+    time.sleep(0.05)
+    store["someone"] = "NEW-TOKEN-2222"       # written by another process
+    try:
+        assert flex.read_token("someone") == "NEW-TOKEN-2222"
+    finally:
+        earlier.join()
+    assert first["token"] == "OLD-TOKEN-1111"
 
 
 def test_a_keychain_that_does_not_answer_fails_the_sync_job_with_the_cause(
