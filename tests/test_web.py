@@ -9079,6 +9079,22 @@ def test_a_calendar_day_prints_its_figure_whole_at_every_width():
     assert "compact(amountOf(dy.realized))" in cal and "aria-label=" in cal
 
 
+def test_a_long_event_title_breaks_inside_its_row():
+    """Follow-up review, optional item. The selected day's list below the Market
+    strip prints each title whole, as one flex item, and a flex item will not
+    shrink below its longest word: a 29-character title with no break opportunity
+    ran its row 125px past the card at 320px and scrolled the page sideways by
+    92px (injected in a browser; wide letters, since the width depends on them).
+    The title may now break inside the word, which only ever happens where the row
+    is narrower than that word.
+    """
+    rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "overflow-wrap:anywhere" in rules.get(".mkrow-h b", ""), (
+        "an unbreakable event title widens its row past the card")
+    assert "<span class=\"pill\">${esc(mev.country)}</span>" in _fn("market"), (
+        "the row's markup moved; the rule above may no longer reach the title")
+
+
 def test_a_browser_without_container_queries_still_shows_a_fitting_figure():
     """Reviewer finding D3. The day's figure leans on three things an older browser
     lacks: container queries and `:has()` (Safari and iOS before 16, Firefox

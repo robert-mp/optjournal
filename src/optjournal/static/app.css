@@ -1133,6 +1133,11 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .mkrow{border:1px solid var(--line);border-radius:var(--r2);padding:var(--s4) var(--s5);
   background:var(--bg2);margin-top:var(--s3)}
 .mkrow-h{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap}
+/* The title may break inside a word. As a flex item it would not shrink below its
+   longest one, so a 29-character title with no space ran its row 125px past a
+   phone's card. `anywhere` rather than `break-word` because only it lowers the
+   item's minimum width, and it only ever breaks where the row is narrower. */
+.mkrow-h b{overflow-wrap:anywhere}
 .mkfig{font-size:var(--t1);margin-top:var(--s1)}
 .mkattr{font-size:var(--t1);margin-top:var(--s6)}
 .wnote{font-size:var(--t0);margin-top:var(--s0)}
