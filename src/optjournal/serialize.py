@@ -1702,29 +1702,13 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     unless the card's entry already says everything it says.
     """
     written = journal_entries(conn)
-    by_anchor = {anchor: entry for (_broker, _account, anchor), entry in written.items()}
-    shown = dict(by_anchor)
+    shown: dict[str, Any] = {}
     claimed: set[str] = set()
     if written:
-        cards = [c for category in ("OPT", EQUITY_CATEGORY)
-                 for c in campaigns_for(conn, category,
-                                        build_history(conn, asset_category=category).episodes)]
-        live = {c.anchor for c in cards if c.anchor}
-        claimed |= live
-        # Every (filed order, card anchor) pair first, then taken in one sorted
-        # pass, so which of two older entries a card shows never rests on the
-        # order the cards came in.
-        pairs = {(filed, str(c.anchor)) for c in cards
-                 for filed in c.answers_to & (by_anchor.keys() - live)}
-        for filed, anchor in sorted(pairs, key=lambda pair: [(len(x), x) for x in pair]):
-            older, own = by_anchor[filed], shown.get(anchor)
-            if own is None:
-                shown[anchor] = older
-                claimed.add(filed)
-            elif all(own.values.get(name) == value
-                     for name, value in older.values.items()
-                     if value not in (None, "")):
-                claimed.add(filed)
+        shown, claimed = _journal_shown(written, [
+            c for category in ("OPT", EQUITY_CATEGORY)
+            for c in campaigns_for(conn, category,
+                                   build_history(conn, asset_category=category).episodes)])
     return {
         "entries": {anchor: entry.payload() for anchor, entry in shown.items()},
         "orphans": [entry.payload() for entry in journal_orphans(conn, claimed)]
@@ -1733,3 +1717,33 @@ def journal_data(conn: sqlite3.Connection) -> Row:
                      for key, label in JOURNAL_TRIGGERS.items()],
         "adherence": list(JOURNAL_ADHERENCE),
     }
+
+
+def _journal_shown(
+    written: dict[tuple[str, str, str], Any], cards: list[Any],
+) -> tuple[dict[str, Any], set[str]]:
+    """The entry each card shows, by its anchor, and the anchors claimed.
+
+    One pass over the cards: the entries filed under no card's anchor are found
+    once, not once per card, which made a journal of 10,000 written cards take
+    seconds to draw.
+    """
+    by_anchor = {anchor: entry for (_broker, _account, anchor), entry in written.items()}
+    shown = dict(by_anchor)
+    live = {c.anchor for c in cards if c.anchor}
+    claimed = set(live)
+    unfiled = by_anchor.keys() - live
+    # Every (filed order, card anchor) pair first, then taken in one sorted
+    # pass, so which of two older entries a card shows never rests on the
+    # order the cards came in.
+    pairs = {(filed, str(c.anchor)) for c in cards for filed in c.answers_to & unfiled}
+    for filed, anchor in sorted(pairs, key=lambda pair: [(len(x), x) for x in pair]):
+        older, own = by_anchor[filed], shown.get(anchor)
+        if own is None:
+            shown[anchor] = older
+            claimed.add(filed)
+        elif all(own.values.get(name) == value
+                 for name, value in older.values.items()
+                 if value not in (None, "")):
+            claimed.add(filed)
+    return shown, claimed

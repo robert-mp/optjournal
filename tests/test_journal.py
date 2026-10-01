@@ -716,3 +716,35 @@ def test_which_older_entry_a_shared_anchor_shows_does_not_read_the_list_order(
     assert serialize.journal_data(db) == as_built
     assert as_built["entries"]["100"]["entry_note"] == "note 200"
     assert [e["anchor"] for e in as_built["orphans"]] == ["300"]
+
+
+def _matching_seconds(n: int) -> float:
+    """The best of five runs of matching `n` written entries to `n` cards."""
+    import time
+
+    from optjournal.campaigns import Campaign
+    from optjournal.serialize import _journal_shown
+
+    cards = [Campaign(episode_indices=(k,), conids=("1",),
+                      order_ids=frozenset({str(10_000 + k)}), is_decided=False,
+                      closed_at=None, realized=None, commission=None)
+             for k in range(n)]
+    written = {("ibkr", "U1", str(10_000 + k)): journal.Entry(
+        broker="ibkr", account_id="U1", anchor_order_id=str(10_000 + k),
+        underlying_symbol=None, opened_on=None, created_at="", updated_at="",
+        values={"entry_note": "n"}) for k in range(n)}
+    best = float("inf")
+    for _ in range(5):
+        start = time.perf_counter()
+        _journal_shown(written, cards)
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+def test_matching_entries_to_cards_costs_their_number_not_its_square():
+    """The entries filed under no card's anchor were worked out again for every
+    card, a set the size of the journal each time, so 10,000 written cards took
+    2.5 s to draw. That work is in C, out of a line count's sight, so this one is
+    timed: four times the cards is about four times the time, not sixteen."""
+    small, large = _matching_seconds(1000), _matching_seconds(4000)
+    assert large < 8 * small, (small, large)
