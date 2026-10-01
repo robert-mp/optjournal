@@ -3337,6 +3337,113 @@ def test_a_hash_change_the_server_would_answer_differently_refetches():
         "load", "load", "load", "load", "draw", "draw", "draw"]
 
 
+def _hash_harness(script: list[str]) -> Any:
+    """The page's real `applyHash`, `stateQuery`, `load`, `syncHash` and hashchange
+    handler against a stand-in server with build_state's month rule.
+
+    The server's range is 2026-09 (current) and 2026-08, a month outside it is
+    answered with all-time figures, and every month holds fills on its 3rd. `draw`
+    is a stand-in that runs draw()'s own calday heal and whatever draw() calls after
+    it before `syncHash` (see `_draw_heals`), then records what the page shows:
+    `shown` (the figures' month), `hash` and `asks` (the next query). `fresh(hash)`
+    loads a hash as a new page would; `typed(hash)` changes it as the address bar
+    does and waits for any read the handler starts.
+    """
+    js = _code_only(_js())
+    handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
+    assert handler, "the hashchange handler moved"
+    consts = [_page_const(name) for name in
+              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS",
+               "SCOPE_KEYS")]
+    return _node_run([
+        f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
+        "const location={hash:'',pathname:'/'}, window={};",
+        "const history={replaceState:(a,b,u)=>{location.hash=u.slice(1);},",
+        "  pushState:(a,b,u)=>{location.hash=u.slice(1);}};",
+        "let S={}, LOADED={}, READ_NOTE=null, drawn=null;",
+        "const $=()=>({innerHTML:'',className:''});",
+        "const RANGE=['2026-09','2026-08'];",
+        # The server's month rule, as build_state applies it.
+        "async function fetch(url){",
+        "  const m=new URLSearchParams(url.split('?')[1]||'').get('month');",
+        "  const month=m==='current'?RANGE[0]:m;",
+        "  const selected=RANGE.includes(month)?month:null;",
+        "  const days=(selected?[selected]:RANGE).map(mo=>({day:mo+'-03'}));",
+        "  return {ok:true,json:async()=>({month_range:RANGE,months:RANGE,",
+        "    selected_month:selected,trade_type:'all',",
+        "    stats:{month:selected||'ALL',days}})};",
+        "}",
+        "function note(){} function staleServerCheck(){}",
+        f"function draw(){{{_draw_heals()} syncHash();drawn={{shown:S.state.stats.month,",
+        "  hash:location.hash,asks:stateQuery()};}",
+        *consts, *_page_fns("applyHash", "stateQuery", "syncHash", "load"),
+        *_page_fns("pinDayMonth"),
+        handler.group(0),
+        "const flush=()=>new Promise(r=>setTimeout(r,0));",
+        "async function fresh(hash){S={};location.hash=hash;applyHash();await load();",
+        "  return drawn;}",
+        "async function typed(hash){location.hash=hash;window.onhashchange();",
+        "  await flush();await flush();return drawn;}",
+        *script,
+    ])
+
+
+def _draw_heals() -> str:
+    """draw()'s own calday heal and every statement after it up to the replay heal:
+    the part of a redraw that decides which day and month the URL is written with.
+    """
+    draw = _code_only(_fn("draw"))
+    start = draw.index("if(S.calday&&S.state&&")
+    return draw[start:draw.index("if(S.replay&&S.state&&", start)]
+
+
+def test_the_wire_spelling_of_the_current_month_is_the_current_month():
+    """Follow-up review, finding 3. `current` is how the page asks the server for
+    the default month, so `#month=current` is a real link (the request's own
+    spelling). applyHash kept it as a month, the server resolved it to September,
+    and the out-of-range heal then found `current` in no month_range and healed it
+    to all: the header said "All time" over September's figures and card titles,
+    the URL became `#month=all`, and the next control or a reload showed all time.
+    It is read as the default now, on a fresh load and on a typed hash alike.
+    """
+    out = _hash_harness([
+        "const out={fresh:await fresh('#month=current')};",
+        "await fresh('#month=2026-08'); out.typed=await typed('#month=current');",
+        "console.log(JSON.stringify(out));",
+    ])
+    for path in ("fresh", "typed"):
+        assert out[path] == {"shown": "2026-09", "hash": "", "asks": "month=current"}, (
+            f"{path}: #month=current did not land on the current month: {out[path]}")
+
+
+def test_a_linked_days_month_is_kept_when_the_same_link_is_followed_again():
+    """Follow-up review, finding 4. load() pins the month a linked day names
+    (cdb3a43), but the hashchange handler only reloads when the query moves, and
+    following the same old-format link again (`#tab=calendar&calday=2026-08-03`
+    while it is open) asks for the same month: no read, applyHash put S.month back
+    to null, and the redraw wrote the URL without its month. Clearing the day then
+    left `#tab=calendar` over August's figures with "Aug 2026" in the header, and a
+    reload or the next control opened the current month. The redraw now applies the
+    same pin, after its own calday heal, so both paths keep the month.
+    """
+    out = _hash_harness([
+        "const out={opened:await fresh('#tab=calendar&calday=2026-08-03')};",
+        "out.again=await typed('#tab=calendar&calday=2026-08-03');",
+        "S.calday=null; draw(); out.cleared=drawn;",
+        "console.log(JSON.stringify(out));",
+    ])
+    kept = "#tab=calendar&month=2026-08&calday=2026-08-03"
+    assert out["opened"]["hash"] == out["again"]["hash"] == kept, out
+    assert out["cleared"] == {"shown": "2026-08", "hash": "#tab=calendar&month=2026-08",
+                              "asks": "month=2026-08"}, (
+        f"clearing the day left August's figures under the current month: {out}")
+    draw = _code_only(_fn("draw"))
+    assert (draw.index("if(S.calday&&S.state&&") < draw.index("pinDayMonth();")
+            < draw.index("syncHash(push);")), (
+        "the pin must follow the redraw's calday heal and precede the URL write")
+    assert "pinDayMonth();" in _code_only(_fn("load"))
+
+
 def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_paths():
     """`#month=1999-01`, loaded fresh or typed into the address bar, is answered
     with all-time figures: `build_state` heals a month outside the account's life to
@@ -3352,41 +3459,11 @@ def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_path
     and hashchange handler, against a stand-in server that answers the way
     `build_state` does; only `fetch`, `draw` and `history` are stand-ins.
     """
-    js = _code_only(_js())
-    handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
-    assert handler, "the hashchange handler moved"
-    consts = [_page_const(name) for name in
-              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS",
-               "SCOPE_KEYS")]
-    out = _node_run([
-        f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
-        "const location={hash:'',pathname:'/'}, window={};",
-        "const history={replaceState:(a,b,u)=>{location.hash=u.slice(1);},",
-        "  pushState:(a,b,u)=>{location.hash=u.slice(1);}};",
-        "let S={}, LOADED={}, READ_NOTE=null, drawn=null;",
-        "const $=()=>({innerHTML:'',className:''});",
-        "const RANGE=['2026-09','2026-08'];",
-        # The server's month rule, as build_state applies it.
-        "async function fetch(url){",
-        "  const m=new URLSearchParams(url.split('?')[1]||'').get('month');",
-        "  const month=m==='current'?RANGE[0]:m;",
-        "  const selected=RANGE.includes(month)?month:null;",
-        "  return {ok:true,json:async()=>({month_range:RANGE,months:RANGE,",
-        "    selected_month:selected,trade_type:'all',stats:{month:selected||'ALL'}})};",
-        "}",
-        "function note(){} function staleServerCheck(){}",
-        "function draw(){syncHash();drawn={shown:S.state.stats.month,",
-        "  hash:location.hash,asks:stateQuery()};}",
-        *consts, *_page_fns("applyHash", "stateQuery", "syncHash", "load"),
-        handler.group(0),
-        "const flush=()=>new Promise(r=>setTimeout(r,0));",
-        "async function fresh(hash){S={};location.hash=hash;applyHash();await load();",
-        "  return drawn;}",
+    out = _hash_harness([
         "const out={};",
         "out.fresh=await fresh('#month=1999-01');",
         "await fresh('#month=2026-08');",
-        "location.hash='#month=1999-01'; window.onhashchange(); await flush(); await flush();",
-        "out.typed=drawn;",
+        "out.typed=await typed('#month=1999-01');",
         "out.reloaded=await fresh(out.fresh.hash);",
         "console.log(JSON.stringify(out));",
     ])
@@ -3432,8 +3509,8 @@ def _load_harness(stored: str = "position", real_note: bool = False) -> list[str
         "}",
         *banner, "function staleServerCheck(){} function draw(){}",
         "function esc(s){return String(s);}",
-        *consts, "const SCORING=()=>S.scoring||SCORINGS[0];",
-        *_page_fns("stateQuery", "load"),
+        *consts, _page_const("SCORING"),
+        *_page_fns("stateQuery", "pinDayMonth", "load"),
     ]
 
 
@@ -3501,17 +3578,19 @@ def _load_under(stored: str, steps: list[str]) -> list[dict]:
 
     Each step is `ok` (a good read) or `503`, optionally prefixed `pick:<unit>=`
     to apply the scoring switch's own write first (S.scoring, as its handler sets
-    it, after a save that stored the unit). After each step: the unit the control
-    shows, the unit the figures on screen were counted in, and the month the page
-    would ask for next.
+    it, after a save that stored the unit), or `link:<unit>=` for a unit the URL
+    names (S.scoring, as applyHash sets it; nothing is stored). After each step:
+    the unit the control shows, the unit the figures on screen were counted in,
+    and the query the page would send next.
     """
     return _node_run([
         *_load_harness(stored),
         f"const steps={json.dumps(steps)}, out=[];",
         "for(const step of steps){",
-        "  const [pick,read]=step.includes('=')?step.split('='):[null,step];",
-        "  if(pick){const unit=pick.split(':')[1];",
-        "    S.scoring=unit===SCORINGS[0]?null:unit; stored=unit;}",
+        "  const [act,read]=step.includes('=')?step.split('='):[null,step];",
+        "  if(act){const [how,unit]=act.split(':');",
+        "    if(how==='pick'){S.scoring=unit===SCORINGS[0]?null:unit; stored=unit;}",
+        "    else S.scoring=unit;}",
         "  down=read==='503'; await load();",
         "  out.push({control:SCORING(),figures:S.state.stats.scoring,asks:stateQuery()});",
         "}",
@@ -3539,6 +3618,35 @@ def test_the_scoring_control_shows_the_unit_the_figures_were_counted_in():
     assert picked[2]["control"] == picked[2]["figures"] == "contract", picked
     back = _load_under("contract", ["ok", "pick:position=ok"])[1]
     assert back["control"] == back["figures"] == "position", back
+
+
+def test_the_stored_scoring_unit_is_never_written_back_as_if_the_reader_chose_it():
+    """Follow-up review, findings 1 and 2. The fix above lit the switch by copying
+    the payload's unit into S.scoring, but on the wire an absent unit means "use
+    the stored one", and S.scoring is what the request sends. So the unit the
+    server INFERRED became one the page NAMED: with contract stored, the page wrote
+    `#scoring=contract`, and after "Per position" (saved) against a 503 the
+    rollback restored that explicit contract, the next read sent it, the server let
+    it win, and the page stayed per contract although the preference said position
+    (a reload too). And a link naming `#scoring=position` collapsed to null, so the
+    next unrelated control switched to the stored contract. The switch now reads
+    the payload's unit and S.scoring stays the unit the request explicitly named.
+    """
+    fresh = _load_under("contract", ["ok"])[0]
+    assert (fresh["control"], fresh["figures"], fresh["asks"]) == (
+        "contract", "contract", "month=current"), (
+        "the stored unit leaked into the request, or the switch does not show it")
+    rolled = _load_under("contract", ["ok", "pick:position=503", "ok"])
+    assert rolled[1]["control"] == rolled[1]["figures"] == "contract", (
+        "a failed read must leave the switch on the figures still on screen")
+    assert "scoring" not in rolled[1]["asks"], (
+        "the rollback restored an inferred unit as an explicit one")
+    assert rolled[2]["control"] == rolled[2]["figures"] == "position", (
+        f"the next good read kept the old stored unit over the new one: {rolled}")
+    linked = _load_under("contract", ["link:position=ok", "ok"])
+    assert [x["figures"] for x in linked] == ["position", "position"], (
+        f"a link's explicit unit gave way to the stored one on the next read: {linked}")
+    assert all(x["control"] == "position" for x in linked)
 
 
 def test_an_unknown_cost_key_in_the_hash_falls_back_to_the_default():
@@ -5653,7 +5761,7 @@ def test_a_state_reply_that_cannot_be_read_still_hands_the_buttons_back(reply):
         f"let fetch; {reply}",
         _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
         "const $=()=>({innerHTML:'',className:''});",
-        *_page_fns("stateQuery", "load"),
+        *_page_fns("stateQuery", "pinDayMonth", "load"),
         "try{ await load(); }catch(e){ notes.push('threw'); }",
         "console.log(JSON.stringify({draws,notes}));",
     ])
@@ -5686,7 +5794,7 @@ def test_a_failed_state_read_leaves_the_controls_over_the_figures_in_hand():
         "let fetch=async()=>({ok:true,status:200,json:async()=>payload});",
         _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
         "const $=()=>({innerHTML:'',className:''});",
-        *_page_fns("stateQuery", "load"),
+        *_page_fns("stateQuery", "pinDayMonth", "load"),
         "await load();",
         # What the month stepper and the trade-type buttons do, then a read that fails.
         "S.month='2026-08';S.type='equities';S.cost=['OPT','STK'];S.scoring='campaign';",
@@ -8971,6 +9079,22 @@ def test_a_calendar_day_prints_its_figure_whole_at_every_width():
     assert "compact(amountOf(dy.realized))" in cal and "aria-label=" in cal
 
 
+def test_a_long_event_title_breaks_inside_its_row():
+    """Follow-up review, optional item. The selected day's list below the Market
+    strip prints each title whole, as one flex item, and a flex item will not
+    shrink below its longest word: a 29-character title with no break opportunity
+    ran its row 125px past the card at 320px and scrolled the page sideways by
+    92px (injected in a browser; wide letters, since the width depends on them).
+    The title may now break inside the word, which only ever happens where the row
+    is narrower than that word.
+    """
+    rules = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert "overflow-wrap:anywhere" in rules.get(".mkrow-h b", ""), (
+        "an unbreakable event title widens its row past the card")
+    assert "<span class=\"pill\">${esc(mev.country)}</span>" in _fn("market"), (
+        "the row's markup moved; the rule above may no longer reach the title")
+
+
 def test_a_browser_without_container_queries_still_shows_a_fitting_figure():
     """Reviewer finding D3. The day's figure leans on three things an older browser
     lacks: container queries and `:has()` (Safari and iOS before 16, Firefox
@@ -9052,6 +9176,35 @@ def test_the_replay_controls_wrap_inside_their_card():
     assert "white-space:nowrap" not in readout, (
         "a readout that cannot wrap is wider than a phone's card on its own")
     assert "margin-left:auto" in readout, "a wrapped readout falls to the left edge"
+
+
+def test_the_replay_row_keeps_its_lines_while_the_readout_changes():
+    """Follow-up review, finding 5, left by the wrapping above. The readout had no
+    width of its own, so its text decided the row's line breaks: during playback
+    the row flipped between one line and two and the event strip under it jumped
+    28px (on an 84-bar replay of the real-journal copy, at 320 to 365, 420 to 475,
+    740 to 760 and 840 to 950px; at 935px one 1x playback flipped twice). The
+    readout now RESERVES its width, 30em, which every bar of every replay on that
+    copy fits (the widest reads 25.1em), so the row breaks by the window alone;
+    where a phone's card is narrower than that, its two lines are reserved too.
+    Measured over every bar at every width from 320 to 1500px in 5px steps: the
+    row's height never changes with the bar.
+    """
+    readout = {sel.strip(): body for sel, body in _toplevel_rules()}[".rread"]
+    flex = re.search(r"flex:\s*([^;}]+)", readout)
+    assert flex and flex.group(1).split() == ["0", "0", "30em"], (
+        "the readout's width follows its text again, so the row reflows by the bar")
+    assert "max-width:100%" in readout.replace(" ", "")
+    assert "line-height:1.5" in readout.replace(" ", "")
+    phone = {sel: body.replace(" ", "") for sel, body in _media_rules(420)}
+    assert "min-height:3em" in phone.get(".rread", ""), (
+        "on a phone the readout's second line comes and goes with the bar")
+    # The play button's own label is the other moving part: "❚❚ pause" is 9px
+    # wider than "▶ play", which at 340px pushed the scrubber onto a line of its
+    # own the moment playback started.
+    play = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert re.search(r"min-width:[\d.]+em", play.get(".rbtn[data-rplay]", "")), (
+        "the play button is sized by its label, so starting playback reflows the row")
 
 
 def test_the_content_column_can_shrink_below_its_widest_child():
