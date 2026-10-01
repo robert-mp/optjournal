@@ -3416,6 +3416,23 @@ def test_the_wire_spelling_of_the_current_month_is_the_current_month():
             f"{path}: #month=current did not land on the current month: {out[path]}")
 
 
+def test_an_explicit_position_unit_stays_in_the_url():
+    """Review of round 3, pre-existing since aee8c81. syncHash left `scoring=position`
+    out of the URL as if it were the default, but null is the default (the stored
+    preference), so with `contract` stored a `#scoring=position` link lost its unit
+    at once and a reload or back/forward read per contract. An explicit unit is
+    kept, either way, and no unit is written when none was named."""
+    out = _hash_harness([
+        "const out={position:await fresh('#scoring=position'),",
+        "  contract:await fresh('#scoring=contract'), none:await fresh('')};",
+        "console.log(JSON.stringify(out));",
+    ])
+    assert out["position"]["hash"] == "#scoring=position", out["position"]
+    assert "scoring=position" in out["position"]["asks"], out["position"]
+    assert out["contract"]["hash"] == "#scoring=contract", out["contract"]
+    assert out["none"]["hash"] == "", out["none"]
+
+
 def test_a_linked_days_month_is_kept_when_the_same_link_is_followed_again():
     """Follow-up review, finding 4. load() pins the month a linked day names
     (cdb3a43), but the hashchange handler only reloads when the query moves, and

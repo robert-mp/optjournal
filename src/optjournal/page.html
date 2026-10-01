@@ -6314,10 +6314,10 @@ function syncHash(push){
      reads. `set` would keep only the last one and silently narrow a four-way
      selection to one on the next reload. */
   (S.cost||[]).forEach(c=>hs.append('cost',c));
-  /* Only the non-default, like the theme and the display currency: recording
-     'position' would put a key in every URL to say what the server already
-     assumes. */
-  if(S.scoring&&S.scoring!==SCORINGS[0]) hs.set('scoring',S.scoring);
+  /* Only an EXPLICIT unit. null already means "the stored preference", so an
+     explicit 'position' is a choice, not the default: dropping it let a reload or
+     back/forward under a stored 'contract' read per contract again. */
+  if(S.scoring) hs.set('scoring',S.scoring);
   /* Only what was TYPED, and only while it differs from the feed -- `draw()` heals
      a reading that has come back into agreement with the payload, so this writes
      an override and never a restatement of what the server already sent. The two
