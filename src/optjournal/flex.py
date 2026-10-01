@@ -225,13 +225,15 @@ KEYRING_READ_TIMEOUT_S = 30.0
 
 #: A keyring call pending for this many read deadlines is taken to be stuck for
 #: good (a keychain waiting on an unlock prompt nobody will answer), and the next
-#: read starts a fresh call instead of waiting on it. Until then reads share the
-#: pending call. So a stuck call costs one more thread per this many deadlines.
+#: read starts a fresh call instead of waiting for it to finish. So a stuck call
+#: costs one more thread per this many deadlines.
 KEYRING_STUCK_AFTER_DEADLINES = 3
 
-#: The most keyring calls ever pending at once. A keychain that answers nothing
-#: costs this many threads, and then reads stop starting calls: they say the
-#: keyring is wedged and that restarting optjournal clears it.
+#: The most keyring calls pending at once. A keychain that answers nothing costs
+#: this many threads, and then reads stop starting calls: they say the keyring is
+#: wedged and that restarting optjournal clears it. A token saved in this process
+#: may take ONE call past it, so the next read can see it: at most this plus one
+#: threads, however many saves there are.
 KEYRING_MAX_PENDING = 3
 
 #: Worst-case wall time of one fetch, from taking the lock to stamping the
@@ -427,51 +429,71 @@ class _KeyringCall:
 
 
 class _Keyring:
-    """The keyring reads pending in this process, shared by every reader.
+    """The keyring reads pending in this process.
 
-    SHARED, NOT ONE PER READER, and bounded, for two measured failures. One call
-    per read leaked a stuck thread per fetch attempt and per token check while a
-    keychain waited on an unlock. One call at a time, held until it returned,
-    meant a single call that never returns blocked every read until a restart:
-    each fetch failed as unreadable and a stored token could not be seen. So a
-    read waits on the pending call, a call pending past its deadlines is given
-    up on, and a call from before a token was stored is not waited on at all.
+    A READ NEVER TAKES AN ANSWER ASKED FOR BEFORE IT BEGAN. It shares a call
+    only if the call started after the read did; a call already pending from
+    before, it waits to finish and then asks again. So a token another process
+    stored (`optjournal setup` in a terminal) is read by any read that begins
+    after it, and calls run one at a time per account but for the two bypasses
+    below. Joining an older call returned the old token, which a Sync would
+    then have spent a request on.
+
+    BOUNDED, for two measured failures. One call per read leaked a stuck thread
+    per fetch attempt and per token check while a keychain waited on an unlock;
+    and a single call that never returns must not block every read until a
+    restart. So a call pending `KEYRING_STUCK_AFTER_DEADLINES` deadlines is
+    given up on, at most `KEYRING_MAX_PENDING` are pending, and a successful save
+    lets the next read ask at once, one call past that cap (see `saved`).
     """
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.pending: list[_KeyringCall] = []
-        #: When a token was last stored, per account. A read pending from before
-        #: then cannot return it, and the keychain has plainly answered since.
-        self.stored_at: dict[str, float] = {}
+        #: When a token was last stored by this process, per account. The keychain
+        #: has answered since, so a call pending from before then is not waited on.
+        self.saved_at: dict[str, float] = {}
 
-    def stored(self, account: str) -> None:
+    def saved(self, account: str) -> None:
         with self.lock:
-            self.stored_at[account] = time.monotonic()
+            self.saved_at[account] = time.monotonic()
 
-    def call_for(self, account: str, now: float) -> _KeyringCall | None:
-        """The call a read arriving `now` waits on, started if need be.
+    def next_call(self, account: str, arrived: float) -> tuple[bool, _KeyringCall | None]:
+        """For a read that began at `arrived`: (answers it, the call to wait on).
 
-        None when `KEYRING_MAX_PENDING` calls are stuck, and no more may start.
+        `(True, call)`: the call's answer is the read's, because it started after
+        the read began. `(False, call)`: an older call, to wait on until it
+        finishes or is stuck, then ask here again. `(False, None)`: every call
+        allowed is pending, and no more may start.
         """
-        stuck_after = KEYRING_STUCK_AFTER_DEADLINES * KEYRING_READ_TIMEOUT_S
+        now = time.monotonic()
         with self.lock:
             self.pending = [c for c in self.pending if not c.done.is_set()]
-            stored = self.stored_at.get(account, float("-inf"))
-            for call in reversed(self.pending):
-                if (call.account == account and call.started > stored
-                        and now - call.started < stuck_after):
-                    return call
-            if len(self.pending) >= KEYRING_MAX_PENDING:
-                return None
+            mine = [c for c in self.pending if c.account == account]
+            newest = mine[-1] if mine else None
+            if newest is not None and newest.started >= arrived:
+                return True, newest
+            since_save = (newest is not None
+                          and newest.started < self.saved_at.get(account, float("-inf")))
+            if (newest is not None and not since_save
+                    and now - newest.started < _stuck_after()):
+                return False, newest
+            if len(self.pending) >= KEYRING_MAX_PENDING + int(since_save):
+                return False, None
             call = _KeyringCall(account)
             self.pending.append(call)
         threading.Thread(target=call.run, name="keyring-read", daemon=True).start()
-        return call
+        return True, call
 
-    def oldest_age(self, now: float) -> float:
+    def wedged(self, now: float) -> tuple[int, float]:
+        """How many calls are pending, and the oldest one's age."""
         with self.lock:
-            return max((now - c.started for c in self.pending), default=0.0)
+            ages = [now - c.started for c in self.pending if not c.done.is_set()]
+        return len(ages), max(ages, default=0.0)
+
+
+def _stuck_after() -> float:
+    return KEYRING_STUCK_AFTER_DEADLINES * KEYRING_READ_TIMEOUT_S
 
 
 _KEYRING = _Keyring()
@@ -481,9 +503,10 @@ def _unreadable(call: _KeyringCall | None, arrived: float, wait_s: float) -> str
     """Why a read got no answer, and what clears it."""
     now = time.monotonic()
     if call is None:
+        count, oldest = _KEYRING.wedged(now)
         return (
-            f"{KEYRING_MAX_PENDING} reads of the OS keyring have not returned, the "
-            f"oldest after {_KEYRING.oldest_age(now):.0f}s, so no more are started. "
+            f"{count} reads of the OS keyring have not returned, the "
+            f"oldest after {oldest:.0f}s, so no more are started. "
             f"Nothing was sent to IBKR. The keychain is waiting on an unlock prompt: "
             f"unlock it if one is showing, and if none is, restart optjournal, "
             f"which clears them."
@@ -510,9 +533,9 @@ def read_token(account: str | None = None, *, timeout_s: float | None = None) ->
 
     Waits `timeout_s` (default `KEYRING_READ_TIMEOUT_S`) and raises
     `TokenUnreadable` past it, saying whether the keychain is merely slow to
-    answer or a call is stuck. A read already pending is waited on rather than
-    repeated (see `_Keyring`). An error the keyring backend raises is raised as
-    itself.
+    answer or a call is stuck. A call already pending from before the read began
+    is waited for and then asked again, never taken (see `_Keyring`). An error
+    the keyring backend raises is raised as itself.
     """
     if account is None:
         import getpass
@@ -521,9 +544,19 @@ def read_token(account: str | None = None, *, timeout_s: float | None = None) ->
 
     wait_s = KEYRING_READ_TIMEOUT_S if timeout_s is None else timeout_s
     arrived = time.monotonic()
-    call = _KEYRING.call_for(account, arrived)
-    if call is None or not call.done.wait(wait_s):
-        raise TokenUnreadable(_unreadable(call, arrived, wait_s))
+    deadline = arrived + wait_s
+    while True:
+        answers, call = _KEYRING.next_call(account, arrived)
+        if call is None:
+            raise TokenUnreadable(_unreadable(None, arrived, wait_s))
+        # An older call is waited on only until it counts as stuck, when the next
+        # pass starts a fresh one instead.
+        until = deadline if answers else min(deadline, call.started + _stuck_after())
+        finished = call.done.wait(max(0.0, until - time.monotonic()))
+        if finished and answers:
+            break
+        if not finished and time.monotonic() >= deadline:
+            raise TokenUnreadable(_unreadable(call, arrived, wait_s))
     answer = call.answer
     if isinstance(answer, Exception):
         raise answer
@@ -574,11 +607,10 @@ def write_token(token: str, account: str | None = None) -> str:
         keyring.set_password(KEYRING_SERVICE, account, token)
     except Exception as exc:
         raise TokenWriteRefused(_write_refusal(exc, account)) from exc
-    finally:
-        # A read still pending from before this cannot return the token just
-        # stored, so the next read asks afresh rather than wait on it (for as
-        # long as a stuck call's deadlines, before this).
-        _KEYRING.stored(account)
+    # STORED, and only then: the keychain answered, so the next read asks at
+    # once rather than wait out a call pending from before, which may be stuck
+    # and cannot hold this token anyway. A refused write proves neither.
+    _KEYRING.saved(account)
     return account
 
 

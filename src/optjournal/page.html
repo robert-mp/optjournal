@@ -2008,7 +2008,14 @@ function renderViewOptions(){
    because applyHash and syncHash both treat element 0 as the value not worth
    recording in a URL. */
 const SCORINGS=['position','contract'];
-const SCORING=()=>S.scoring||SCORINGS[0];
+/* The unit IN FORCE, which is the one the figures in hand were counted in: the
+   server applies the stored preference whenever a request names no unit, so
+   reading only S.scoring lit "Per position" over per-contract figures on a fresh
+   page with contract stored. S.scoring itself stays the unit the request
+   explicitly names (the hash's, or null for "the stored one"). Copying the
+   payload's unit into it made an inferred unit an explicit one: a rolled-back or
+   bookmarked contract then overrode a later change of the preference. */
+const SCORING=()=>((S.state||{}).stats||{}).scoring||S.scoring||SCORINGS[0];
 /* Whether the journal holds any position made of more than one contract. When
    nothing is grouped the two readings are ARITHMETICALLY IDENTICAL, and a
    toggle that visibly changes nothing reads as broken rather than as agreement
@@ -6219,7 +6226,12 @@ function applyHash(){
      the old tab made syncHash rewrite it into the entry just navigated to. */
   S.tab=(tab&&HASH_TABS().includes(tab))?tab:'dashboard';
   S.type=hs.get('type')||null;
-  S.month=hs.get('month')||null;
+  /* `current` is the REQUEST's spelling of the default month (stateQuery), so a
+     link can carry it; on the page the default is null. Kept as a month it reached
+     load()'s out-of-range heal, which found it in no month_range and healed it to
+     all time, over September's figures. */
+  const mo=hs.get('month');
+  S.month=mo&&mo!=='current'?mo:null;
   S.ccy=(hs.get('ccy')||'').toUpperCase()||null;
   /* The drill-down selection was the one piece of view state the URL did not
      carry, so a link to "that day" was unshareable and a reload silently
@@ -6341,6 +6353,11 @@ function draw(push){
      already been written to the address bar. */
   if(S.calday&&S.state&&!(((S.state.stats||{}).days)||[])
       .some(dy=>dy.day===S.calday)) S.calday=null;
+  /* A surviving day holds fills in the payload, so its month is the payload's
+     own, and it is pinned before the URL is written. After the heal: a day the
+     payload does not hold (a failed read's leftover, say) must not name a month
+     over figures from another. */
+  pinDayMonth();
   /* Same discipline for the replay key: a lifecycle that the current trade-type
      filter excludes leaves its key describing nothing, and a key that outlives
      its panel is how the old registry rotted. Checked before syncHash so the
@@ -7251,6 +7268,21 @@ function stateQuery(){
   return qs.toString();
 }
 
+/* A linked day with no month key names its own month (stateQuery above), and the
+   figures in hand are for it, so it is pinned as the month. It lived nowhere else:
+   the day heals away when it holds no fills, a failed read rolls back to LOADED,
+   and the reader clears it, and each one left the figures of the day's month under
+   a URL that means the current month, which a reload then opened. The current month
+   keeps its default spelling, null, as the stepper leaves it. TWO callers, because
+   the day can arrive by two paths: load() for a read, and draw() for a hash the
+   handler did not reload for (the same link followed again asks for the same
+   month, so no read runs and applyHash has just put the month back to null). */
+function pinDayMonth(){
+  if(S.month||!S.calday||!S.state) return;
+  const dm=S.calday.slice(0,7);
+  if(dm!==(S.state.month_range||[])[0]) S.month=dm;
+}
+
 /* THE SCOPE THE PAYLOAD IN HAND WAS READ FOR, so a failed read can put it back.
  *
  * Every control that changes the query writes its new value into S and THEN calls
@@ -7300,17 +7332,9 @@ async function load(){
   READ_NOTE=null;
   S.state=st;
   staleServerCheck(S.state);
-  /* A linked day with no month key names its own month (stateQuery), and these
-     figures are for it, so it is pinned as the month here. It lived nowhere else:
-     the day heals away when it holds no fills, and a failed read rolls back to
-     LOADED, and either one left the figures of the day's month under a URL that
-     means the current month, which a reload then opened. The current month keeps
-     its default spelling, null, as the stepper leaves it. Before the heal below,
-     so a day in a month the account never had still heals to all time. */
-  if(!S.month&&S.calday){
-    const dm=S.calday.slice(0,7);
-    if(dm!==(S.state.month_range||[])[0]) S.month=dm;
-  }
+  /* Before the heal below, so a day in a month the account never had still heals
+     to all time. */
+  pinDayMonth();
   /* A month outside the account's lifetime heals to ALL TIME, because that is
      what the server answered it with (selected_month null, all-time figures).
      It healed to null, which was right while an absent month meant all time and
@@ -7326,15 +7350,6 @@ async function load(){
   /* Server-resolved, so an unrecognised type falls back to everything here too
      instead of leaving the button set out of step with the numbers. */
   S.type=S.state.trade_type==='all'?null:S.state.trade_type;
-  /* And the scoring unit, from the unit these figures were COUNTED in. The server
-     applies the stored preference when the request names none, so a fresh page
-     with "contract" stored, or a pick saved just before a read that failed and
-     was rolled back, drew per-contract figures under a lit "Per position", and
-     `groupingMatters` then judged a contract payload by the position rule. The
-     default stays null, as the switch and the hash spell it; so does a reply
-     with no stats block, which staleServerCheck has already reported. */
-  const sco=(S.state.stats||{}).scoring;
-  S.scoring=sco&&sco!==SCORINGS[0]?sco:null;
   /* AFTER the heals, so what is remembered is the scope these figures are for
      rather than the one that was asked for. */
   LOADED=Object.fromEntries(SCOPE_KEYS.map(k=>[k,S[k]]));

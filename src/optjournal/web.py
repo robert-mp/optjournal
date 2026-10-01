@@ -1079,7 +1079,7 @@ def _keyring_call(
         finally:
             busy.release()
 
-    worker = threading.Thread(target=run, daemon=True)
+    worker = threading.Thread(target=run, name="keyring-write", daemon=True)
     worker.start()
     worker.join(max(0.0, deadline - time.monotonic()))
     return outcome[0] if outcome else None
