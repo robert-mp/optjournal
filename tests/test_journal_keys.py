@@ -309,6 +309,42 @@ def test_a_write_that_names_another_row_than_the_card_shows_is_refused(tmp_path)
     assert _rows(db) == [("ibkr", "U1", "100", "took profits")]
 
 
+#: Z, an older position on another contract (30, closed by 35), beside the
+#: holding of `_CLOSED`.
+_OLDER = [("z1", "U1", "30", "2026-07-01 10:00:00", 1, "O", None, "22"),
+          ("z2", "U1", "35", "2026-07-20 10:00:00", -1, "C", 20.0, "22")]
+
+
+def test_a_link_between_two_written_cards_is_refused_whatever_ids_they_show(tmp_path):
+    """Y shows the write-up filed under 100 since its anchor moved to 50, and Z
+    has its own. The guard only looked for a row under the later anchor, 50,
+    found none, and linked them, and Y's write-up stopped showing anywhere."""
+    db = _journal(tmp_path, [*_OLDER, *_CLOSED])
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        for anchor, note in (("30", "Z: earnings play"), ("100", "Y: took profits")):
+            _post(base, "/api/journal", _form(_state(base), anchor, entry_note=note))
+        _insert(db, _OPENED)
+        status, reply = _post(base, "/api/links", {"anchor": "50", "joins": "30"})
+        state = _state(base)
+    assert (status, reply["ok"]) == (409, False)
+    assert sorted(c["note"] for c in _cards(state)) == ["Y: took profits",
+                                                        "Z: earnings play"]
+    assert state["journal"]["orphans"] == []
+
+
+def test_a_link_where_one_card_has_a_write_up_keeps_it_showing(tmp_path):
+    """Refused before because the write-up was filed under the later anchor,
+    which the joined card does not answer to; it shows on the joined card."""
+    db = _journal(tmp_path, [*_OLDER, *_CLOSED])
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        _post(base, "/api/journal", _form(_state(base), "100", entry_note="Y: took profits"))
+        status, _reply = _post(base, "/api/links", {"anchor": "100", "joins": "30"})
+        state = _state(base)
+    assert status == 200
+    assert [c["note"] for c in _cards(state)] == ["Y: took profits"]
+    assert state["journal"]["orphans"] == []
+
+
 # ------------------------------------------------------------------- fuzz
 #
 # Random option journals arriving as statements do, written up through the

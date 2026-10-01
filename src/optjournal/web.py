@@ -1973,10 +1973,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         and joining two symbols would merge two decisions the reader can then
         only see as one.
 
-        REFUSED when it would hide writing. A merged card is filed under the
-        lower anchor, so a write-up on the higher one would stop showing on any
-        card. It is still in the table, but nothing on the page reaches it, and
-        for the one table a re-ingest cannot rebuild that reads as lost.
+        REFUSED when it would hide writing. A card shows one write-up, so where
+        BOTH cards show one, whatever id each was filed under, the joined card
+        would show one of them and the other would stop showing on any card. It
+        would still be in the table, but nothing on the page reaches it, and for
+        the one table a re-ingest cannot rebuild that reads as lost. Where only
+        one shows a write-up, the joined card shows it.
         """
         body = self._body()
         a = str(body.get("anchor") or "").strip()
@@ -2008,28 +2010,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # Each end the one current card it names, as a journal write's is:
             # the anchor alone, never the order, which can name two cards.
             cards = journal_cards(conn)
+            ends = []
             for end in (a, b):
                 card, why = _the_card(cards, end, {"broker": broker})
                 if card is None:
                     return 409, {"ok": False, "kind": "stale", "message": why}
+                ends.append(card)
             if unders[a] != unders[b]:
                 return 400, {"ok": False, "kind": "link",
                              "message": f"{unders[a]} and {unders[b]} are different "
                                         f"underlyings, so they cannot be one "
                                         f"position."}
-            # The card a merge files under is the lower anchor, same order
-            # `journal` stores the pair in.
-            high = max((a, b), key=lambda o: (len(o), o))
-            if conn.execute(
-                "SELECT 1 FROM journal_entries WHERE broker = ?"
-                " AND anchor_order_id = ?", (broker, high),
-            ).fetchone():
+            shown = journal_shown(journal.entries(conn), cards)
+            if all(card.anchor in shown for card in ends):
                 return 409, {"ok": False, "kind": "link",
-                             "message": "the later position has a write-up, and "
-                                        "joining would file the card under the "
-                                        "earlier one, so that write-up would stop "
-                                        "showing. Copy it across and clear it "
-                                        "first. Nothing was linked."}
+                             "message": "both positions have a write-up, and the "
+                                        "joined card shows one, so the other would "
+                                        "stop showing. Copy what you need into one "
+                                        "and clear the other first. Nothing was "
+                                        "linked."}
             try:
                 pair = journal.link(conn, a, b, broker=broker)
             except journal.JournalError as exc:

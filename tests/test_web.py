@@ -9364,12 +9364,13 @@ def test_linking_two_cards_by_hand_makes_them_one_and_unlinking_undoes_it(popula
 
 
 def test_a_link_that_would_hide_a_write_up_is_refused(populated):
-    """The merged card files under the lower anchor, so writing on the higher one
-    would stop showing anywhere. Refused, and nothing is stored."""
+    """A card shows one write-up, so joining two cards that each show one would
+    leave one showing nowhere. Refused, and nothing is stored."""
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         _, state = _get(base, "/api/state")
         low, high = _two_cards_on_one_underlying(state)
         _post(base, "/api/journal", {"anchor": high, "lessons": "keep me"})
+        _post(base, "/api/journal", {"anchor": low, "lessons": "and me"})
         status, refused = _post(base, "/api/links", {"anchor": high, "joins": low})
         _, after = _get(base, "/api/state")
     assert (status, refused["ok"]) == (409, False)
