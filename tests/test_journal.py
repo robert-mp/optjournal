@@ -304,7 +304,100 @@ def test_an_order_cannot_be_linked_to_itself(db):
 # ------------------------------------------------------------------- anchors
 #
 # What an entry or a hand link is filed under. A card answers to the lowest of its
-# own orders, which nothing but its own fills decides.
+# own orders, which nothing but its own fills decides. Entries and links already
+# stored were filed by the released code (0.2.0), whose rule is frozen below as
+# the oracle the cases are checked against.
+
+
+def _released_cards(db, links=()) -> list[tuple[str | None, frozenset[str]]]:
+    """The cards the released code drew over this journal, as `(anchor, trade
+    ids)`: its `stats.campaigns_for` and `campaigns.link`, frozen from `main`.
+
+    Every order of a 90-second window joined every episode it touched, IBKR's own
+    orders included; a card's anchor was the lowest order of its fills' window
+    groups; and a link found the first episode, in list order, holding the id.
+    Read over today's episodes, which are the released ones for the plain
+    opening and closing fills these cases use.
+    """
+    from datetime import datetime
+
+    from optjournal.history import build_history
+
+    episodes = build_history(db, asset_category="OPT").episodes
+    order_of_trade: dict[str, str] = {}
+    first: dict[str, tuple[str, str | None]] = {}
+    for row in db.execute(
+        "SELECT trade_id, ib_order_id, date_time, trade_date, underlying_symbol,"
+        " symbol FROM trades WHERE asset_category = 'OPT' AND ib_order_id IS NOT NULL"
+    ):
+        oid = str(row["ib_order_id"])
+        order_of_trade[str(row["trade_id"])] = oid
+        at = str(row["date_time"] or row["trade_date"] or "")
+        under = row["underlying_symbol"] or row["symbol"]
+        if oid not in first or at < first[oid][0]:
+            first[oid] = (at, under)
+
+    def lowest(ids):
+        def key(oid):
+            try:
+                return (0, float(oid)), oid
+            except ValueError:
+                return (1, float("inf")), oid
+        return min(ids, key=key, default=None)
+
+    rows = sorted(((oid, datetime.fromisoformat(at) if at else None, under)
+                   for oid, (at, under) in first.items()),
+                  key=lambda r: (r[2] or f"￿{r[0]}", str(r[1] or ""), r[0]))
+    groups: list[list[tuple]] = []
+    for row in rows:
+        last = groups[-1][-1] if groups else None
+        if (last is not None and row[2] is not None and row[2] == last[2]
+                and row[1] is not None and last[1] is not None
+                and abs((row[1] - last[1]).total_seconds()) <= 90):
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    group_of = {r[0]: g for g, members in enumerate(groups) for r in members}
+    parent = list(range(len(episodes)))
+
+    def find(i):
+        while parent[i] != i:
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    first_in_group: dict[int, int] = {}
+    orders_of: dict[int, set[str]] = {}
+    for i, episode in enumerate(episodes):
+        for tid in episode.trade_ids:
+            oid = order_of_trade.get(str(tid))
+            if oid is None:
+                continue
+            orders_of.setdefault(i, set()).add(oid)
+            g = group_of.get(oid)
+            if g is None:
+                continue
+            orders_of[i].update(o for o, gg in group_of.items() if gg == g)
+            union(first_in_group.setdefault(g, i), i)
+    episode_of: dict[str, int] = {}
+    for i, oids in orders_of.items():
+        for oid in oids:
+            episode_of.setdefault(oid, i)
+    for a, b in links:
+        ia, ib = episode_of.get(a), episode_of.get(b)
+        if ia is not None and ib is not None:
+            union(ia, ib)
+    cards: dict[int, list[int]] = {}
+    for i in range(len(episodes)):
+        cards.setdefault(find(i), []).append(i)
+    return sorted(
+        (lowest({o for i in idxs for o in orders_of.get(i, ())}),
+         frozenset(t for i in idxs for t in episodes[i].trade_ids))
+        for idxs in cards.values())
 
 
 def _journal_of(db, fills, *, statement=True) -> None:
@@ -460,6 +553,38 @@ def test_a_later_statement_moves_no_anchor_and_no_entry(db, fills, cut):
         assert grown[0] == anchor, (anchor, grown)
         assert shown[grown[1]] == f"note {anchor}"
     assert orphans == []
+
+
+@pytest.mark.parametrize("fills", [_REENTRY, _PRE_OPEN, _ALLOCATED, _TWO_ACCOUNTS,
+                                   _scalps(6)],
+                         ids=["re-entry", "open re-entry", "allocated", "two accounts",
+                              "scalps"])
+def test_an_entry_the_released_code_filed_shows_on_a_card_it_was_shown_on(db, fills):
+    """Written under every anchor the released code drew, each entry shows on a
+    card holding fills of the card it was written on, and on no other."""
+    _journal_of(db, fills)
+    released = _released_cards(db)
+    for anchor, _ in released:
+        _note(db, anchor)
+    shown, orphans = _shown(db)
+    assert orphans == []
+    for anchor, tids in released:
+        on = [t for t, note in shown.items() if note == f"note {anchor}"]
+        assert on, f"note {anchor} is on no card"
+        assert all(t <= tids for t in on), f"note {anchor} is on a card it was not on"
+
+
+def test_a_link_the_released_code_stored_joins_what_it_joined(db):
+    """A link between two cards' anchors as the released code drew them: A and B
+    were one card there (anchor 50), C another (200). It joins A, the part of
+    that card holding 50, with C, and leaves B, a decision of its own now."""
+    _journal_of(db, _REENTRY)
+    released = dict(_released_cards(db))
+    journal.link(db, "50", "200")
+    (joined,) = [tids for anchor, tids in _cards(db) if anchor == "50"]
+    assert joined <= released["50"] | released["200"]
+    assert joined & released["50"] and joined & released["200"]
+    assert joined == {"t1", "t2", "t5", "t6"}
 
 
 def test_a_link_finds_the_card_whose_anchor_it_names(db):
