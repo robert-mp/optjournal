@@ -8104,6 +8104,28 @@ def test_a_check_behind_a_pending_read_has_room_for_its_own(tmp_path, monkeypatc
     assert (status, reply["present"]) == (200, True), reply
 
 
+def test_a_write_still_running_is_a_thread_the_drains_can_see(tmp_path, monkeypatch):
+    """The drains wait for every "keyring-" thread. An unnamed write worker
+    slipped past them, finished inside a later test and counted as a save made
+    there, which is the flake this name exists for."""
+    import threading  # noqa: PLC0415 - local to this test
+
+    import keyring  # noqa: PLC0415
+
+    release = threading.Event()
+    monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(keyring, "set_password",
+                        lambda service, account, token: release.wait(5))
+    try:
+        with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
+            status, _payload = _post(base, "/api/settings/token", {"token": "12345"})
+            assert status == 503
+            assert any(t.name == "keyring-write" for t in threading.enumerate()), (
+                "the write still waiting on the keychain is not named for the drains")
+    finally:
+        _drain_keyring(release)
+
+
 def test_a_keychain_past_the_read_deadline_is_unreadable_not_absent(
     tmp_path, monkeypatch,
 ):

@@ -1250,6 +1250,80 @@ def test_a_burst_of_saves_against_a_working_keychain_is_never_refused(monkeypatc
         _drain(threading.Event())
 
 
+def test_saves_never_take_the_reads_past_one_call_over_the_cap(monkeypatch):
+    """"However many saves": each save may start one call past the cap, never
+    more, so a keychain whose reads never return keeps at most
+    `KEYRING_MAX_PENDING + 1` threads through any number of saves."""
+    release, calls = threading.Event(), []
+    store: dict[str, str] = {}
+    monkeypatch.setattr(flex.keyring, "get_password", _stuck(release, calls, then=None))
+    monkeypatch.setattr(flex.keyring, "set_password",
+                        lambda service, account, token: store.__setitem__(account, token))
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.05)
+    try:
+        for i in range(8):
+            flex.write_token(f"12345678{i}", "someone")
+            with pytest.raises(flex.TokenUnreadable):
+                flex.read_token("someone", timeout_s=0.02)
+            assert _keyring_threads() <= flex.KEYRING_MAX_PENDING + 1, (
+                f"{_keyring_threads()} keyring threads after save {i + 1}")
+    finally:
+        _drain(release)
+
+
+def test_a_read_waiting_on_an_older_call_asks_itself_once_that_call_is_stuck(
+    monkeypatch,
+):
+    """A read never takes an older call's answer, so it waits for that call to
+    finish. One that never finishes must not hold the read to its deadline: once
+    the call counts as stuck the read starts its own, and gets the answer."""
+    import time
+
+    release, calls = threading.Event(), []
+    monkeypatch.setattr(flex.keyring, "get_password",
+                        _stuck(release, calls, then="fresh"))
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.1)    # stuck after 0.3s
+    try:
+        with pytest.raises(flex.TokenUnreadable):
+            flex.read_token("someone", timeout_s=0.05)
+        started = time.monotonic()
+        assert flex.read_token("someone", timeout_s=2.0) == "fresh"
+        assert time.monotonic() - started < 1.0, "it waited out its whole deadline"
+    finally:
+        _drain(release)
+
+
+def test_the_cap_message_counts_the_calls_really_pending(monkeypatch):
+    """A save may take the pending calls one past `KEYRING_MAX_PENDING`, so a
+    message naming the constant would understate them."""
+    import time
+
+    release, calls = threading.Event(), []
+    store: dict[str, str] = {}
+    monkeypatch.setattr(flex.keyring, "get_password", _stuck(release, calls, then=None))
+    monkeypatch.setattr(flex.keyring, "set_password",
+                        lambda service, account, token: store.__setitem__(account, token))
+    monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 0.05)    # stuck after 0.15s
+    stuck_s = flex.KEYRING_STUCK_AFTER_DEADLINES * flex.KEYRING_READ_TIMEOUT_S
+    try:
+        for _ in range(100):
+            with pytest.raises(flex.TokenUnreadable) as caught:
+                flex.read_token("someone")
+            if "no more" in str(caught.value):
+                break
+            time.sleep(0.02)
+        flex.write_token("123456789012", "someone")
+        with pytest.raises(flex.TokenUnreadable):
+            flex.read_token("someone")             # the one call past the cap
+        time.sleep(stuck_s + 0.05)
+        with pytest.raises(flex.TokenUnreadable) as caught:
+            flex.read_token("someone")
+        assert len(calls) == flex.KEYRING_MAX_PENDING + 1
+        assert f"{flex.KEYRING_MAX_PENDING + 1} reads of the OS keyring" in str(caught.value)
+    finally:
+        _drain(release)
+
+
 def test_a_keychain_that_does_not_answer_fails_the_sync_job_with_the_cause(
     tmp_path, monkeypatch,
 ):
