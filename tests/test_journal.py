@@ -9,17 +9,10 @@ a reader's own sentence quietly gone.
 
 from __future__ import annotations
 
-import importlib.util
-import subprocess
-import sys
-from pathlib import Path
-
 import pytest
 
 from optjournal import journal
 from optjournal.db import connect, migrate
-
-ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture
@@ -308,39 +301,114 @@ def test_an_order_cannot_be_linked_to_itself(db):
         journal.link(db, "42", "42")
 
 
-# ------------------------------------------------ handles made under an older rule
+# ------------------------------------------------------------------- anchors
 #
-# Every entry and hand link a reader already has was made against the anchors the
-# page offered when it was written. These cases are read twice: by the rule that
-# stored them, `campaigns.py` as of 51ff771 loaded from git, and by the code here,
-# which must resolve each stored handle to the same card.
+# What an entry or a hand link is filed under. A card answers to the lowest of its
+# own orders, which nothing but its own fills decides. Entries and links already
+# stored were filed by the released code (0.2.0), whose rule is frozen below as
+# the oracle the cases are checked against.
 
 
-def _stored_under_51ff771(tmp_path, monkeypatch):
-    """`campaigns.py` as of 51ff771, loaded from git as a module of its own."""
-    shown = subprocess.run(
-        ["git", "show", "51ff771:src/optjournal/campaigns.py"], cwd=ROOT,
-        capture_output=True, check=False)
-    if shown.returncode:
-        pytest.skip("git cannot show 51ff771, so there is no older rule to compare")
-    path = tmp_path / "campaigns_51ff771.py"
-    path.write_bytes(shown.stdout)
-    spec = importlib.util.spec_from_file_location("campaigns_51ff771", path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, "campaigns_51ff771", module)
-    spec.loader.exec_module(module)
-    return module
+def _released_cards(db, links=()) -> list[tuple[str | None, frozenset[str]]]:
+    """The cards the released code drew over this journal, as `(anchor, trade
+    ids)`: its `stats.campaigns_for` and `campaigns.link`, frozen from `main`.
+
+    Every order of a 90-second window joined every episode it touched, IBKR's own
+    orders included; a card's anchor was the lowest order of its fills' window
+    groups; and a link found the first episode, in list order, holding the id.
+    Read over today's episodes, which are the released ones for the plain
+    opening and closing fills these cases use.
+    """
+    from datetime import datetime
+
+    from optjournal.history import build_history
+
+    episodes = build_history(db, asset_category="OPT").episodes
+    order_of_trade: dict[str, str] = {}
+    first: dict[str, tuple[str, str | None]] = {}
+    for row in db.execute(
+        "SELECT trade_id, ib_order_id, date_time, trade_date, underlying_symbol,"
+        " symbol FROM trades WHERE asset_category = 'OPT' AND ib_order_id IS NOT NULL"
+    ):
+        oid = str(row["ib_order_id"])
+        order_of_trade[str(row["trade_id"])] = oid
+        at = str(row["date_time"] or row["trade_date"] or "")
+        under = row["underlying_symbol"] or row["symbol"]
+        if oid not in first or at < first[oid][0]:
+            first[oid] = (at, under)
+
+    def lowest(ids):
+        def key(oid):
+            try:
+                return (0, float(oid)), oid
+            except ValueError:
+                return (1, float("inf")), oid
+        return min(ids, key=key, default=None)
+
+    rows = sorted(((oid, datetime.fromisoformat(at) if at else None, under)
+                   for oid, (at, under) in first.items()),
+                  key=lambda r: (r[2] or f"￿{r[0]}", str(r[1] or ""), r[0]))
+    groups: list[list[tuple]] = []
+    for row in rows:
+        last = groups[-1][-1] if groups else None
+        if (last is not None and row[2] is not None and row[2] == last[2]
+                and row[1] is not None and last[1] is not None
+                and abs((row[1] - last[1]).total_seconds()) <= 90):
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    group_of = {r[0]: g for g, members in enumerate(groups) for r in members}
+    parent = list(range(len(episodes)))
+
+    def find(i):
+        while parent[i] != i:
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    first_in_group: dict[int, int] = {}
+    orders_of: dict[int, set[str]] = {}
+    for i, episode in enumerate(episodes):
+        for tid in episode.trade_ids:
+            oid = order_of_trade.get(str(tid))
+            if oid is None:
+                continue
+            orders_of.setdefault(i, set()).add(oid)
+            g = group_of.get(oid)
+            if g is None:
+                continue
+            orders_of[i].update(o for o, gg in group_of.items() if gg == g)
+            union(first_in_group.setdefault(g, i), i)
+    episode_of: dict[str, int] = {}
+    for i, oids in orders_of.items():
+        for oid in oids:
+            episode_of.setdefault(oid, i)
+    for a, b in links:
+        ia, ib = episode_of.get(a), episode_of.get(b)
+        if ia is not None and ib is not None:
+            union(ia, ib)
+    cards: dict[int, list[int]] = {}
+    for i in range(len(episodes)):
+        cards.setdefault(find(i), []).append(i)
+    return sorted(
+        (lowest({o for i in idxs for o in orders_of.get(i, ())}),
+         frozenset(t for i in idxs for t in episodes[i].trade_ids))
+        for idxs in cards.values())
 
 
-def _journal_of(db, fills) -> None:
-    """Option fills on one SPY put, `(trade, account, order, at, qty, open_close,
-    realised)`, in a journal with its statement."""
-    db.execute(
-        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-        " to_date, base_currency, asset_filter, ingested_at)"
-        " VALUES ('t.xml','x','U1','2025-01-01','2026-12-31','EUR','OPT','now')")
-    for tid, account, oid, at, qty, open_close, pnl in fills:
+def _journal_of(db, fills, *, statement=True) -> None:
+    """Option fills, `(trade, account, order, at, qty, open_close, realised[,
+    conid])`, in a journal with its statement."""
+    if statement:
+        db.execute(
+            "INSERT INTO statements (source_file, sha256, account_id, from_date,"
+            " to_date, base_currency, asset_filter, ingested_at)"
+            " VALUES ('t.xml','x','U1','2025-01-01','2026-12-31','EUR','OPT','now')")
+    for tid, account, oid, at, qty, open_close, pnl, *conid in fills:
         db.execute(
             "INSERT INTO trades (broker, trade_id, ib_exec_id, transaction_id,"
             " ib_order_id, account_id, trade_date, date_time, asset_category,"
@@ -349,38 +417,60 @@ def _journal_of(db, fills) -> None:
             " fx_rate_to_base, proceeds, proceeds_base, ib_commission,"
             " ib_commission_base, fifo_pnl_realized, fifo_pnl_realized_base,"
             " raw, source_file, first_seen_at)"
-            " VALUES ('ibkr',?,?,?,?,?,?,?,'OPT','SPY P','1','SPY','P',500,"
+            " VALUES ('ibkr',?,?,?,?,?,?,?,'OPT',?,?,'SPY','P',500,"
             "'2026-12-18',100,?,?,?,1.0,'USD',1.0,?,?,-1.0,-1.0,?,?,'{}','t.xml','now')",
-            (tid, tid, tid, oid, account, at[:10], at, "SELL" if qty < 0 else "BUY",
-             open_close, qty, -qty * 100.0, -qty * 100.0, pnl, pnl))
+            (tid, tid, tid, oid, account, at[:10], at, f"SPY {conid[0] if conid else '1'}",
+             conid[0] if conid else "1", "SELL" if qty < 0 else "BUY", open_close, qty,
+             -qty * 100.0, -qty * 100.0, pnl, pnl))
     db.commit()
 
 
-def _cards(db, old=None, monkeypatch=None) -> list[tuple[str | None, frozenset[int]]]:
-    """Every campaign as `(anchor, episode indices)`, by today's rule or `old`'s."""
-    from optjournal import stats
+def _cards(db, *, reverse=False) -> list[tuple[str | None, frozenset[str]]]:
+    """Today's cards as `(anchor, trade ids)`, over the episode list as built or
+    reversed."""
     from optjournal.history import build_history
+    from optjournal.stats import campaigns_for
 
     episodes = build_history(db, asset_category="OPT").episodes
-    if old is None:
-        camps = stats.campaigns_for(db, "OPT", episodes)
-    else:
-        with monkeypatch.context() as patch:
-            patch.setattr(stats, "campaigns", old)
-            camps = stats.campaigns_for(db, "OPT", episodes)
-    return sorted(((c.anchor, frozenset(c.episode_indices)) for c in camps),
-                  key=lambda card: sorted(card[1]))
+    if reverse:
+        episodes = episodes[::-1]
+    return sorted((c.anchor, frozenset(t for i in c.episode_indices
+                                       for t in episodes[i].trade_ids))
+                  for c in campaigns_for(db, "OPT", episodes))
 
 
-def _episode_of(db, trade_id: str) -> int:
-    from optjournal.history import build_history
+def _note(db, anchor: str) -> None:
+    """An entry under `anchor`, filed the way `web._journal_write` files one."""
+    row = db.execute("SELECT account_id FROM trades WHERE ib_order_id = ?",
+                     (anchor,)).fetchone()
+    journal.save(db, anchor, account_id=row["account_id"],
+                 values={"entry_note": f"note {anchor}"})
 
-    episodes = build_history(db, asset_category="OPT").episodes
-    return next(i for i, e in enumerate(episodes) if e.trade_ids[:1] == [trade_id])
+
+def _shown(db) -> tuple[dict[frozenset[str], str | None], list[str]]:
+    """The note each card shows, by its trade ids, and the orphans' anchors."""
+    from optjournal.serialize import journal_data
+
+    data = journal_data(db)
+    return ({tids: (data["entries"].get(str(anchor)) or {}).get("entry_note")
+             for anchor, tids in _cards(db)},
+            sorted(e["anchor"] for e in data["orphans"]))
+
+
+def _scalps(n: int, *, gap: int = 40, base: int = 7000) -> list[tuple]:
+    """`n` round trips in one contract, each order `gap` seconds after the last."""
+    out = []
+    for k in range(2 * n):
+        at = 10 * 3600 + k * gap
+        out.append((f"t{k}", "U1", str(base + k),
+                    f"2026-09-10 {at // 3600:02d}:{at % 3600 // 60:02d}:{at % 60:02d}",
+                    1 if k % 2 == 0 else -1, "O" if k % 2 == 0 else "C",
+                    None if k % 2 == 0 else 5.0))
+    return out
 
 
 #: A opened by 50 and closed by 100; B re-opened by 101 thirty seconds later and
-#: closed by 150; C a later position, opened by 200 and closed by 250.
+#: closed by 150; C a later position opened by 200 and closed by 250.
 _REENTRY = [
     ("t1", "U1", "50", "2026-09-01 10:00:00", 1, "O", None),
     ("t2", "U1", "100", "2026-09-02 10:00:00", -1, "C", 10.0),
@@ -389,80 +479,240 @@ _REENTRY = [
     ("t5", "U1", "200", "2026-09-04 10:00:00", 1, "O", None),
     ("t6", "U1", "250", "2026-09-05 10:00:00", -1, "C", 30.0),
 ]
-
-
-@pytest.mark.parametrize("fills", [
-    _REENTRY,
-    [(tid, "U2" if oid in ("101", "150") else account, oid, at, qty, oc, pnl)
-     for tid, account, oid, at, qty, oc, pnl in _REENTRY],
-], ids=["same account", "re-entry in another account"])
-def test_a_re_entry_inside_the_window_keeps_the_anchor_its_writing_was_filed_under(
-        db, tmp_path, monkeypatch, fills):
-    """A closed by order 100, B re-opened by 101 thirty seconds later (in the same
-    account or another: the window group spans both). The anchor the page offered
-    for B was 100, and narrowing a campaign's orders to its own fills moved it to
-    101: an entry written on B's card showed on no card, and a link made from it,
-    (100, 200), joined A with C instead of B."""
-    old = _stored_under_51ff771(tmp_path, monkeypatch)
-    _journal_of(db, fills)
-    journal.link(db, "100", "200")
-    assert _cards(db) == _cards(db, old, monkeypatch)
-    journal.unlink(db, "100", "200")
-    assert _cards(db) == _cards(db, old, monkeypatch)
-    assert ("100", frozenset({_episode_of(db, "t3")})) in _cards(db), (
-        "B, the re-entry, answers to 100")
-
-
-def test_an_entry_on_the_re_entry_card_is_still_on_it(db):
-    """The same case read through the payload the page looks entries up in."""
-    from optjournal.serialize import journal_data
-
-    _journal_of(db, _REENTRY[:4])
-    journal.save(db, "100", account_id="U1", values={"entry_note": "why I re-entered"})
-    assert dict(_cards(db))["100"] == frozenset({_episode_of(db, "t3")})
-    data = journal_data(db)
-    assert data["entries"]["100"]["entry_note"] == "why I re-entered"
-    assert data["orphans"] == []
-
-
-#: A: a holding from before the archive closed by 100, then B re-opened by 101
-#: thirty seconds later and closed by 150. Both cards answered to 100.
-_PRE = [
+#: A holding from before the archive closed by 100, re-entered by 101 thirty
+#: seconds later, and still open.
+_PRE_OPEN = [
     ("t2", "U1", "100", "2026-09-02 10:00:00", -1, "C", 10.0),
     ("t3", "U1", "101", "2026-09-02 10:00:30", 1, "O", None),
-    ("t4", "U1", "150", "2026-09-03 10:00:00", -1, "C", 20.0),
 ]
-#: A short from before the archive bought back and a long opened by one order, in
-#: two fills, the long then sold by 1003. Both cards answered to 1002.
-_DIVIDED = [
-    ("t1", "U1", "1002", "2026-09-15 10:00:00", 2, "C", 48.0),
-    ("t2", "U1", "1002", "2026-09-15 10:00:01", 1, "O", None),
-    ("t3", "U1", "1003", "2026-09-20 10:00:00", -1, "C", 25.0),
+#: One order allocated to two accounts, each closed on its own day.
+_ALLOCATED = [
+    ("t1", "U1", "100", "2026-09-01 10:00:00", -1, "O", None),
+    ("t2", "U2", "100", "2026-09-01 10:00:00", -1, "O", None),
+    ("t3", "U2", "200", "2026-09-03 10:00:00", 1, "C", 20.0),
+    ("t4", "U1", "300", "2026-09-05 10:00:00", 1, "C", 30.0),
+]
+#: The same put sold in two accounts 30 seconds apart, U2 closing first.
+_TWO_ACCOUNTS = [
+    ("t1", "U1", "100", "2026-09-01 10:00:00", -1, "O", None),
+    ("t2", "U2", "101", "2026-09-01 10:00:30", -1, "O", None),
+    ("t3", "U2", "150", "2026-09-02 10:00:00", 1, "C", 20.0),
+    ("t4", "U1", "200", "2026-09-03 10:00:00", 1, "C", 30.0),
 ]
 
 
-@pytest.mark.parametrize("fills, shared, first, other", [
-    (_PRE, "100", "t2", "101"),
-    (_DIVIDED, "1002", "t1", "1003"),
-], ids=["closed then re-entered", "one order dividing two positions"])
-def test_an_anchor_two_cards_answered_to_has_one_owner_and_is_reported(
-        db, tmp_path, monkeypatch, fills, shared, first, other):
-    """The older rule gave two cards one anchor, so one entry showed on both and a
-    save from either rewrote the other's note. The card that took the anchor
-    order's first execution keeps it; the other answers to the lowest order of its
-    own that nothing else claims, and an entry filed under the shared anchor is
-    listed with the notes no single card claims, since it may be about either."""
-    from optjournal.serialize import journal_data
+def test_every_card_with_a_fill_answers_to_its_own_lowest_order(db):
+    """Six round trips in one 0DTE contract, each order 40 seconds after the
+    last, are one window chain and six cards. Anchors read across the chain's
+    groups and then made unique left four of the six with no anchor, so they
+    could not be journalled or linked and the page said they had no fills."""
+    _journal_of(db, _scalps(6))
+    assert [anchor for anchor, _ in _cards(db)] == [
+        "7000", "7002", "7004", "7006", "7008", "7010"]
 
-    old = _stored_under_51ff771(tmp_path, monkeypatch)
+
+def test_an_open_re_entry_has_an_anchor_while_it_is_open(db):
+    """A holding from before the archive closed by 100 and re-entered by 101
+    thirty seconds later: the re-entry had no anchor until it closed."""
+    _journal_of(db, _PRE_OPEN)
+    assert [anchor for anchor, _ in _cards(db)] == ["100", "101"]
+
+
+@pytest.mark.parametrize("fills", [_REENTRY, _PRE_OPEN, _ALLOCATED, _TWO_ACCOUNTS,
+                                   _scalps(6)],
+                         ids=["re-entry", "open re-entry", "allocated", "two accounts",
+                              "scalps"])
+def test_no_anchor_reads_the_order_of_the_episode_list(db, fills):
+    """`build_history` sorts episodes by when they closed, open ones last, so a
+    later statement reorders them. An anchor, and the card a link finds, chosen
+    by position in that list moved with it."""
     _journal_of(db, fills)
-    journal.save(db, shared, account_id="U1", values={"entry_note": "which one?"})
-    before = _cards(db, old, monkeypatch)
-    assert [anchor for anchor, _ in before] == [shared, shared], "the premise"
+    journal.link(db, fills[0][2], fills[-1][2])
+    assert _cards(db) == _cards(db, reverse=True)
+
+
+@pytest.mark.parametrize("fills, cut", [
+    (_TWO_ACCOUNTS, 3), (_ALLOCATED, 2), (_ALLOCATED, 3), (_PRE_OPEN + [
+        ("t4", "U1", "415", "2026-09-03 10:41:18", 1, "O", None),
+        ("t5", "U1", "417", "2026-09-04 10:25:43", -2, "C", 30.0)], 2),
+    (_scalps(3) + [("t9", "U1", "7100", "2026-09-11 10:00:00", 1, "O", None)], 5),
+], ids=["two accounts", "allocated, both open", "allocated, one closed",
+        "open re-entry scaled in and closed", "scalps, then the last one closes"])
+def test_a_later_statement_moves_no_anchor_and_no_entry(db, fills, cut):
+    """Entries written on every card, then the rest of the fills ingested: each
+    card keeps its anchor and its note, and no note lands on another card."""
+    _journal_of(db, fills[:cut])
+    before = _cards(db)
+    for anchor, _ in before:
+        _note(db, anchor)
+    _journal_of(db, fills[cut:], statement=False)
     after = _cards(db)
-    assert {episodes for _, episodes in after} == {episodes for _, episodes in before}
-    assert dict(after)[shared] == frozenset({_episode_of(db, first)})
-    assert sorted(anchor for anchor, _ in after) == sorted([shared, other])
-    data = journal_data(db)
-    assert data["entries"][shared]["entry_note"] == "which one?"
-    assert [e["anchor"] for e in data["orphans"]] == [shared]
+    shown, orphans = _shown(db)
+    for anchor, tids in before:
+        (grown,) = [(a, t) for a, t in after if tids <= t]
+        assert grown[0] == anchor, (anchor, grown)
+        assert shown[grown[1]] == f"note {anchor}"
+    assert orphans == []
+
+
+@pytest.mark.parametrize("fills", [_REENTRY, _PRE_OPEN, _ALLOCATED, _TWO_ACCOUNTS,
+                                   _scalps(6)],
+                         ids=["re-entry", "open re-entry", "allocated", "two accounts",
+                              "scalps"])
+def test_an_entry_the_released_code_filed_shows_on_a_card_it_was_shown_on(db, fills):
+    """Written under every anchor the released code drew, each entry shows on a
+    card holding fills of the card it was written on, and on no other."""
+    _journal_of(db, fills)
+    released = _released_cards(db)
+    for anchor, _ in released:
+        _note(db, anchor)
+    shown, orphans = _shown(db)
+    assert orphans == []
+    for anchor, tids in released:
+        on = [t for t, note in shown.items() if note == f"note {anchor}"]
+        assert on, f"note {anchor} is on no card"
+        assert all(t <= tids for t in on), f"note {anchor} is on a card it was not on"
+
+
+def test_a_link_the_released_code_stored_joins_what_it_joined(db):
+    """A link between two cards' anchors as the released code drew them: A and B
+    were one card there (anchor 50), C another (200). It joins A, the part of
+    that card holding 50, with C, and leaves B, a decision of its own now."""
+    _journal_of(db, _REENTRY)
+    released = dict(_released_cards(db))
+    journal.link(db, "50", "200")
+    (joined,) = [tids for anchor, tids in _cards(db) if anchor == "50"]
+    assert joined <= released["50"] | released["200"]
+    assert joined & released["50"] and joined & released["200"]
+    assert joined == {"t1", "t2", "t5", "t6"}
+
+
+def test_a_link_finds_the_card_whose_anchor_it_names(db):
+    """A after B (order 101 inside A's window): a link from B's card posts 101,
+    which B answers to, so it joins B with C whatever order the list is in."""
+    _journal_of(db, _REENTRY)
+    journal.link(db, "101", "200")
+    assert ("101", frozenset({"t3", "t4", "t5", "t6"})) in _cards(db)
+    assert ("101", frozenset({"t3", "t4", "t5", "t6"})) in _cards(db, reverse=True)
+
+
+def test_an_entry_under_an_order_no_card_answers_to_shows_on_the_card_that_filled_it(db):
+    """A position opened by 100 gets a later fill of order 90, placed the day
+    before: its anchor moves to 90. The note written under 100 stays on the card
+    that filled 100, and once the card has a note of its own the older one is
+    listed with the orphans unless the new one already says what it said."""
+    _journal_of(db, [("t1", "U1", "100", "2026-09-02 10:00:00", 1, "O", None)])
+    _note(db, "100")
+    _journal_of(db, [("t2", "U1", "90", "2026-09-02 11:00:00", 1, "O", None)],
+                statement=False)
+    assert [anchor for anchor, _ in _cards(db)] == ["90"]
+    assert _shown(db) == ({frozenset({"t1", "t2"}): "note 100"}, [])
+    journal.save(db, "90", account_id="U1", values={"entry_note": "note 100",
+                                                    "lessons": "added later"})
+    assert _shown(db)[1] == []
+    journal.save(db, "90", account_id="U1", values={"entry_note": "rewritten"})
+    assert _shown(db) == ({frozenset({"t1", "t2"}): "rewritten"}, ["100"])
+
+
+#: N long from 50, closed by 100 through zero, which opens K short; M opened by
+#: 20 on another contract; P opened by 300 on a third. Then K and M are closed
+#: by two orders thirty seconds apart, which joins them into one card.
+_MERGE = [
+    ("t1", "U1", "50", "2026-09-01 10:00:00", 1, "O", None, "1"),
+    ("t2", "U1", "100", "2026-09-02 10:00:00", -2, "C;O", 10.0, "1"),
+    ("t3", "U1", "20", "2026-09-03 10:00:00", 1, "O", None, "2"),
+    ("t4", "U1", "300", "2026-09-04 10:00:00", 1, "O", None, "3"),
+    ("t5", "U1", "500", "2026-09-05 10:00:00", 1, "C", 5.0, "1"),
+    ("t6", "U1", "501", "2026-09-05 10:00:30", -1, "C", 5.0, "2"),
+]
+#: A long from 10 and 15, closed by 30 through zero, which opens B short; C
+#: opened by 400 on another contract. Then B sells more through order 20.
+_LOWER = [
+    ("t1", "U1", "10", "2026-09-01 10:00:00", 1, "O", None, "1"),
+    ("t2", "U1", "15", "2026-09-01 11:00:00", 1, "O", None, "1"),
+    ("t3", "U1", "30", "2026-09-02 10:00:00", -3, "C;O", 10.0, "1"),
+    ("t4", "U1", "400", "2026-09-04 10:00:00", 1, "O", None, "3"),
+    ("t5", "U1", "20", "2026-09-05 10:00:00", -1, "O", None, "1"),
+]
+
+
+@pytest.mark.parametrize("fills, before, after", [
+    (_MERGE, [("100", {"t2"}), ("20", {"t3"}), ("300", {"t4"}), ("50", {"t1", "t2"})],
+     [("20", {"t2", "t3", "t5", "t6"}), ("300", {"t4"}), ("50", {"t1", "t2"})]),
+    (_LOWER, [("10", {"t1", "t2", "t3"}), ("30", {"t3"}), ("400", {"t4"})],
+     [("10", {"t1", "t2", "t3"}), ("20", {"t3", "t5"}), ("400", {"t4"})]),
+], ids=["merge", "lower order"])
+def test_the_cards_a_merge_and_a_lower_order_build(db, fills, before, after):
+    """What the cases below start from, and what the later statement makes."""
+    _journal_of(db, fills[:4])
+    assert _cards(db) == [(a, frozenset(t)) for a, t in before]
+    _journal_of(db, fills[4:], statement=False)
+    assert _cards(db) == [(a, frozenset(t)) for a, t in after]
+
+
+def test_a_link_to_a_card_that_merged_since_joins_the_card_it_merged_into(db):
+    """K, linked to P under its anchor 100, is joined with M by a later
+    statement and answers to 20. N filled 100 too (its closing half), and took
+    it first, but the link was made on K's card, so it joins K's card with P."""
+    _journal_of(db, _MERGE[:4])
+    journal.link(db, "100", "300")
+    _journal_of(db, _MERGE[4:], statement=False)
+    assert ("20", frozenset({"t2", "t3", "t4", "t5", "t6"})) in _cards(db)
+    assert ("50", frozenset({"t1", "t2"})) in _cards(db)
+
+
+def test_an_entry_on_a_card_that_merged_since_shows_on_the_card_it_merged_into(db):
+    """The note written on K's card shows on the card K merged into, and not on
+    N's, which also filled 100."""
+    _journal_of(db, _MERGE[:4])
+    _note(db, "100")
+    _journal_of(db, _MERGE[4:], statement=False)
+    shown, orphans = _shown(db)
+    assert {tids: note for tids, note in shown.items() if note} == {
+        frozenset({"t2", "t3", "t5", "t6"}): "note 100"}
+    assert orphans == []
+
+
+def test_a_card_a_lower_order_moved_keeps_its_link_and_its_entry(db):
+    """B answered to 30 until order 20 added to it. A also filled 30, closing
+    with it, and took it first; but 30 is the next order up on B and the third
+    on A, so a link and a note filed under it stay with B."""
+    _journal_of(db, _LOWER[:4])
+    journal.link(db, "30", "400")
+    _note(db, "30")
+    _journal_of(db, _LOWER[4:], statement=False)
+    assert ("20", frozenset({"t3", "t4", "t5"})) in _cards(db)
+    shown, orphans = _shown(db)
+    assert {tids: note for tids, note in shown.items() if note} == {
+        frozenset({"t3", "t4", "t5"}): "note 30"}
+    assert orphans == []
+
+
+def test_which_older_entry_a_shared_anchor_shows_does_not_read_the_list_order(
+        db, monkeypatch):
+    """Y (U2, from 200) and X (U1, from 300) each have a note; then order 100,
+    allocated to both accounts, adds to both, and both answer to 100. One note
+    can show under one anchor: the one filed under the lower order, whichever
+    card comes first in the episode list, and the other is listed, not lost."""
+    import dataclasses
+
+    from optjournal import serialize
+
+    _journal_of(db, [("t1", "U2", "200", "2026-09-01 10:00:00", -1, "O", None),
+                     ("t2", "U1", "300", "2026-09-02 10:00:00", -1, "O", None)])
+    _note(db, "200")
+    _note(db, "300")
+    _journal_of(db, [("t3", "U1", "100", "2026-09-03 10:00:00", -1, "O", None),
+                     ("t4", "U2", "100", "2026-09-03 10:00:00", -1, "O", None)],
+                statement=False)
+    as_built = serialize.journal_data(db)
+    real = serialize.build_history
+
+    def reversed_history(conn, **kwargs):
+        report = real(conn, **kwargs)
+        return dataclasses.replace(report, episodes=report.episodes[::-1])
+
+    monkeypatch.setattr(serialize, "build_history", reversed_history)
+    assert serialize.journal_data(db) == as_built
+    assert as_built["entries"]["100"]["entry_note"] == "note 200"
+    assert [e["anchor"] for e in as_built["orphans"]] == ["300"]
