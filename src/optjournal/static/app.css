@@ -1542,6 +1542,10 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
   border-radius:var(--r2);cursor:pointer;white-space:nowrap;
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2)}
 .rbtn:hover{border-color:var(--accent)}
+/* Wide enough for either label: "❚❚ pause" is 6em at this size and "▶ play" 5.2,
+   so sized by its label the button grew as playback started and, on a wrapped
+   row, pushed the scrubber onto a line of its own. */
+.rbtn[data-rplay]{min-width:6.5em}
 .rscrub{flex:1;accent-color:var(--accent);cursor:pointer;min-width:80px}
 /* width and flex are explicit because the page has a global `select{width:100%}`
    for the month picker, which as a flex item claimed the whole control row and
@@ -1550,11 +1554,18 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
   width:auto;flex:0 0 auto;
   background:var(--panel2);color:var(--fg);border:1px solid var(--line2);cursor:pointer}
 /* The readout ends the row, and a wrapped one stays at the right (`margin-left:
-   auto` takes only space the scrubber has not grown into). Its text may wrap: a
-   flex item is placed at its unwrapped width, so it only ever wraps where it is
-   alone on a line narrower than itself, which is a phone. */
-.rread{font-size:var(--t1);color:var(--dim);min-width:150px;margin-left:auto;
-  text-align:right;font-family:var(--fig);font-variant-numeric:tabular-nums}
+   auto` takes only space the scrubber has not grown into). Its width is RESERVED,
+   not taken from its text: sized by the text, the bar being shown decided where the
+   row broke, so during playback the row flipped between one line and two and the
+   event strip below jumped 28px. 30em holds every bar of every replay on the real
+   journal (the widest reads 25.1em) with room for a four-digit price; on a card
+   narrower than that it takes the card's width and may wrap, and the phone rule
+   below reserves its second line. */
+.rread{font-size:var(--t1);color:var(--dim);flex:0 0 30em;max-width:100%;margin-left:auto;
+  line-height:1.5;text-align:right;font-family:var(--fig);font-variant-numeric:tabular-nums}
+/* Where the card is narrower than 30em (below about 418px of window), the text
+   takes one line or two depending on the bar, so two are reserved. */
+@media(max-width:420px){.rread{min-height:3em}}
 .rauto{font-size:var(--t1);color:var(--dim2);white-space:nowrap;cursor:pointer;
   display:flex;align-items:center;gap:var(--s1)}
 .rkey{font-size:var(--t0);color:var(--dim);margin-top:var(--s3);display:flex;

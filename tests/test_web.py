@@ -9106,6 +9106,35 @@ def test_the_replay_controls_wrap_inside_their_card():
     assert "margin-left:auto" in readout, "a wrapped readout falls to the left edge"
 
 
+def test_the_replay_row_keeps_its_lines_while_the_readout_changes():
+    """Follow-up review, finding 5, left by the wrapping above. The readout had no
+    width of its own, so its text decided the row's line breaks: during playback
+    the row flipped between one line and two and the event strip under it jumped
+    28px (on an 84-bar replay of the real-journal copy, at 320 to 365, 420 to 475,
+    740 to 760 and 840 to 950px; at 935px one 1x playback flipped twice). The
+    readout now RESERVES its width, 30em, which every bar of every replay on that
+    copy fits (the widest reads 25.1em), so the row breaks by the window alone;
+    where a phone's card is narrower than that, its two lines are reserved too.
+    Measured over every bar at every width from 320 to 1500px in 5px steps: the
+    row's height never changes with the bar.
+    """
+    readout = {sel.strip(): body for sel, body in _toplevel_rules()}[".rread"]
+    flex = re.search(r"flex:\s*([^;}]+)", readout)
+    assert flex and flex.group(1).split() == ["0", "0", "30em"], (
+        "the readout's width follows its text again, so the row reflows by the bar")
+    assert "max-width:100%" in readout.replace(" ", "")
+    assert "line-height:1.5" in readout.replace(" ", "")
+    phone = {sel: body.replace(" ", "") for sel, body in _media_rules(420)}
+    assert "min-height:3em" in phone.get(".rread", ""), (
+        "on a phone the readout's second line comes and goes with the bar")
+    # The play button's own label is the other moving part: "❚❚ pause" is 9px
+    # wider than "▶ play", which at 340px pushed the scrubber onto a line of its
+    # own the moment playback started.
+    play = {sel.strip(): body.replace(" ", "") for sel, body in _toplevel_rules()}
+    assert re.search(r"min-width:[\d.]+em", play.get(".rbtn[data-rplay]", "")), (
+        "the play button is sized by its label, so starting playback reflows the row")
+
+
 def test_the_content_column_can_shrink_below_its_widest_child():
     """A `1fr` track has an `auto` minimum, so one wide table widened `.wrap`
     past the viewport and the whole page scrolled sideways. `minmax(0,1fr)` is
