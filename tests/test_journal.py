@@ -440,11 +440,22 @@ def _cards(db, *, reverse=False) -> list[tuple[str | None, frozenset[str]]]:
 
 
 def _note(db, anchor: str) -> None:
-    """An entry under `anchor`, filed the way `web._journal_write` files one."""
-    row = db.execute("SELECT account_id FROM trades WHERE ib_order_id = ?",
-                     (anchor,)).fetchone()
+    """An entry under `anchor`, filed the way the released `web._journal_write`
+    filed one: under the account of the order's earliest fill."""
+    row = db.execute("SELECT account_id, MIN(trade_date) FROM trades"
+                     " WHERE ib_order_id = ?", (anchor,)).fetchone()
     journal.save(db, anchor, account_id=row["account_id"],
                  values={"entry_note": f"note {anchor}"})
+
+
+def _write(db, anchor: str, text: str | None = None) -> None:
+    """An entry on today's card `anchor`, filed under that card's key, which is
+    what `web._journal_write` files it under."""
+    from optjournal.serialize import journal_cards
+
+    (key,) = [c.key for c in journal_cards(db) if c.anchor == anchor]
+    journal.save(db, anchor, account_id=key[1], broker=key[0],
+                 values={"entry_note": text or f"note {anchor}"})
 
 
 def _shown(db) -> tuple[dict[frozenset[str], str | None], list[str]]:
@@ -544,7 +555,7 @@ def test_a_later_statement_moves_no_anchor_and_no_entry(db, fills, cut):
     _journal_of(db, fills[:cut])
     before = _cards(db)
     for anchor, _ in before:
-        _note(db, anchor)
+        _write(db, anchor)
     _journal_of(db, fills[cut:], statement=False)
     after = _cards(db)
     shown, orphans = _shown(db)
@@ -597,20 +608,17 @@ def test_a_link_finds_the_card_whose_anchor_it_names(db):
 
 
 def test_an_entry_under_an_order_no_card_answers_to_shows_on_the_card_that_filled_it(db):
-    """A position opened by 100 gets a later fill of order 90, placed the day
-    before: its anchor moves to 90. The note written under 100 stays on the card
-    that filled 100, and once the card has a note of its own the older one is
-    listed with the orphans unless the new one already says what it said."""
+    """A position opened by 100 gets a later fill of a lower order, 90: its
+    anchor moves to 90. The note written under 100 stays on the card that filled
+    100. A row filed under the card's own key is the one it shows, and the older
+    one is then listed with the orphans, not lost."""
     _journal_of(db, [("t1", "U1", "100", "2026-09-02 10:00:00", 1, "O", None)])
-    _note(db, "100")
+    _write(db, "100")
     _journal_of(db, [("t2", "U1", "90", "2026-09-02 11:00:00", 1, "O", None)],
                 statement=False)
     assert [anchor for anchor, _ in _cards(db)] == ["90"]
     assert _shown(db) == ({frozenset({"t1", "t2"}): "note 100"}, [])
-    journal.save(db, "90", account_id="U1", values={"entry_note": "note 100",
-                                                    "lessons": "added later"})
-    assert _shown(db)[1] == []
-    journal.save(db, "90", account_id="U1", values={"entry_note": "rewritten"})
+    _write(db, "90", "rewritten")
     assert _shown(db) == ({frozenset({"t1", "t2"}): "rewritten"}, ["100"])
 
 
@@ -688,23 +696,25 @@ def test_a_card_a_lower_order_moved_keeps_its_link_and_its_entry(db):
     assert orphans == []
 
 
-def test_which_older_entry_a_shared_anchor_shows_does_not_read_the_list_order(
+def test_one_order_allocated_to_two_positions_leaves_each_its_own_note(
         db, monkeypatch):
     """Y (U2, from 200) and X (U1, from 300) each have a note; then order 100,
-    allocated to both accounts, adds to both, and both answer to 100. One note
-    can show under one anchor: the one filed under the lower order, whichever
-    card comes first in the episode list, and the other is listed, not lost."""
+    allocated to both accounts, adds to both. Both answered to 100, so both drew
+    one note and the other was listed. X, whose account sorts first, now answers
+    to 100 and Y to its own fill of it, and each shows its own note, whichever
+    card comes first in the episode list."""
     import dataclasses
 
     from optjournal import serialize
 
     _journal_of(db, [("t1", "U2", "200", "2026-09-01 10:00:00", -1, "O", None),
                      ("t2", "U1", "300", "2026-09-02 10:00:00", -1, "O", None)])
-    _note(db, "200")
-    _note(db, "300")
+    _write(db, "200")
+    _write(db, "300")
     _journal_of(db, [("t3", "U1", "100", "2026-09-03 10:00:00", -1, "O", None),
                      ("t4", "U2", "100", "2026-09-03 10:00:00", -1, "O", None)],
                 statement=False)
+    assert [a for a, _ in _cards(db)] == ["100", "100~t4"]
     as_built = serialize.journal_data(db)
     real = serialize.build_history
 
@@ -714,5 +724,39 @@ def test_which_older_entry_a_shared_anchor_shows_does_not_read_the_list_order(
 
     monkeypatch.setattr(serialize, "build_history", reversed_history)
     assert serialize.journal_data(db) == as_built
-    assert as_built["entries"]["100"]["entry_note"] == "note 200"
-    assert [e["anchor"] for e in as_built["orphans"]] == ["300"]
+    assert {a: e["entry_note"] for a, e in as_built["entries"].items()} == {
+        "100": "note 300", "100~t4": "note 200"}
+    assert as_built["orphans"] == []
+
+
+def _matching_seconds(n: int) -> float:
+    """The best of five runs of matching `n` written entries to `n` cards."""
+    import time
+
+    from optjournal.campaigns import Campaign
+    from optjournal.serialize import journal_shown
+
+    cards = [Campaign(episode_indices=(k,), conids=("1",),
+                      order_ids=frozenset({str(10_000 + k)}), is_decided=False,
+                      closed_at=None, realized=None, commission=None,
+                      key=("ibkr", "U1", str(10_000 + k)))
+             for k in range(n)]
+    written = {("ibkr", "U1", str(10_000 + k)): journal.Entry(
+        broker="ibkr", account_id="U1", anchor_order_id=str(10_000 + k),
+        underlying_symbol=None, opened_on=None, created_at="", updated_at="",
+        values={"entry_note": "n"}) for k in range(n)}
+    best = float("inf")
+    for _ in range(5):
+        start = time.perf_counter()
+        journal_shown(written, cards)
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+def test_matching_entries_to_cards_costs_their_number_not_its_square():
+    """The entries filed under no card's anchor were worked out again for every
+    card, a set the size of the journal each time, so 10,000 written cards took
+    2.5 s to draw. That work is in C, out of a line count's sight, so this one is
+    timed: four times the cards is about four times the time, not sixteen."""
+    small, large = _matching_seconds(1000), _matching_seconds(4000)
+    assert large < 8 * small, (small, large)

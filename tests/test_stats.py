@@ -855,7 +855,9 @@ def test_the_same_order_id_at_two_brokers_is_two_orders(conn):
     """Order ids are each broker's own, so 5000 at IBKR and 5000 at another broker
     are two placements. Each order row took both brokers' legs, since the legs
     were read by order id alone, and the cards and the Calendar then drew each
-    broker's 5000 in both positions: 1 and 2 contracts, twice over, in each."""
+    broker's 5000 in both positions: 1 and 2 contracts, twice over, in each. The
+    later one's card answers to its own fill of its 5000, since the page posts
+    an anchor alone and the two would otherwise be one journal entry."""
     _at_broker(conn, "ibkr", [
         ("a1", "U1", "5000", "2026-09-01 10:00:00", 1, "O", None),
         ("a2", "U1", "5001", "2026-09-03 10:00:00", -1, "C", 10.0)])
@@ -868,7 +870,7 @@ def test_the_same_order_id_at_two_brokers_is_two_orders(conn):
         ("b2", "5000", ["b2"], 1), ("b2", "6001", ["b2"], 1),
         ("ibkr", "5000", ["ibkr"], 1), ("ibkr", "5001", ["ibkr"], 1)]
     assert cards == [
-        ([("b2", "5000", "b2", 2), ("b2", "6001", "b2", -2)], 2, "5000"),
+        ([("b2", "5000", "b2", 2), ("b2", "6001", "b2", -2)], 2, "5000~b1"),
         ([("ibkr", "5000", "ibkr", 1), ("ibkr", "5001", "ibkr", -1)], 2, "5000")]
     assert calendar == [("b2", "5000", "b2", 2), ("b2", "6001", "b2", -2),
                         ("ibkr", "5000", "ibkr", 1), ("ibkr", "5001", "ibkr", -1)]
@@ -899,9 +901,10 @@ def test_the_same_order_id_at_two_brokers_joins_no_positions(conn):
 
 def test_one_journal_at_two_brokers_is_two_sets_of_cards(conn):
     """The same statement read for two brokers: every id the same, trade ids
-    included. Each broker's positions are drawn once each, from its own fills,
-    and each keeps the anchor its own order gives it: the same id, which is no
-    clash, since an entry is filed per broker."""
+    included. Each broker's positions are drawn once each, from its own fills.
+    The page posts an anchor alone, so one broker's card answers to the order
+    and the other's to its own first fill of it, and the note filed under the
+    order at the first broker stays on that broker's card."""
     from optjournal import journal
     from optjournal.serialize import journal_data
 
@@ -914,10 +917,11 @@ def test_one_journal_at_two_brokers_is_two_sets_of_cards(conn):
     _orders, cards, calendar = _drawn_by_broker(conn)
     assert cards == [
         ([("b2", "100", "b2", 2), ("b2", "101", "b2", -2)], 3, "100"),
-        ([("ibkr", "100", "ibkr", 2), ("ibkr", "101", "ibkr", -2)], 3, "100")]
+        ([("ibkr", "100", "ibkr", 2), ("ibkr", "101", "ibkr", -2)], 3, "100~t1")]
     assert calendar == [("b2", "100", "b2", 2), ("b2", "101", "b2", -2),
                         ("ibkr", "100", "ibkr", 2), ("ibkr", "101", "ibkr", -2)]
     assert journal_data(conn)["orphans"] == []
+    assert journal_data(conn)["entries"]["100"]["entry_note"] == "b2"
 
 
 def test_a_split_execution_is_listed_under_the_position_it_closed(conn):

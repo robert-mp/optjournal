@@ -943,7 +943,8 @@ def test_no_date_anywhere_is_a_null_source(conn):
 def test_a_note_no_decision_claims_is_listed_rather_than_lost(tmp_path):
     """`journal.orphans` had no caller, so a note whose anchor stopped naming a
     campaign matched no card and vanished from the page without a word. The
-    payload lists it; a note on a live decision, options or equities, is not."""
+    payload lists it; a note on a live decision, options or equities, is not,
+    and `entries` holds what the cards show."""
     from conftest import add_statement
 
     from optjournal import journal
@@ -966,7 +967,7 @@ def test_a_note_no_decision_claims_is_listed_rather_than_lost(tmp_path):
     data = journal_data(conn)
     assert [o["anchor"] for o in data["orphans"]] == ["999"]
     assert data["orphans"][0]["entry_note"] == "note 999"
-    assert set(data["entries"]) == {"100", "200", "999"}, "entries are unchanged"
+    assert set(data["entries"]) == {"100", "200"}
 
 
 def test_no_writing_means_no_orphan_check(conn):

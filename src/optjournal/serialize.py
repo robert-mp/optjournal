@@ -36,6 +36,7 @@ from optjournal.bars import (
 from optjournal.bars import (
     close_series as bars_close_series,
 )
+from optjournal.campaigns import named as campaign_named
 from optjournal.clock import MARKET_TZ, et_day, parse_day
 from optjournal.costs import (
     AUTOFX_MARKUP_BPS,
@@ -61,7 +62,6 @@ from optjournal.journal import ADHERENCE as JOURNAL_ADHERENCE
 from optjournal.journal import FIELDS as JOURNAL_FIELDS
 from optjournal.journal import TRIGGERS as JOURNAL_TRIGGERS
 from optjournal.journal import entries as journal_entries
-from optjournal.journal import orphans as journal_orphans
 from optjournal.marketdata import BarFetchError, fetch_bars
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
@@ -1624,8 +1624,13 @@ def journal_review(lifecycles: list[Row], entries: dict[str, Row]) -> Row:
     held, broken, unreviewed = [], [], []
     by_trigger: dict[str, list[Row]] = {}
     answers: dict[str, Counter[str]] = {"target": Counter(), "invalidation": Counter()}
+    # Each row read once. `entries` holds one row per anchor and a card's anchor
+    # is unique, so this only holds the count to that if two cards ever drew
+    # under one anchor, where it counted the same write-up once for each.
+    read: set[str] = set()
     for lc in closed:
-        je = entries.get(str(lc["anchor"])) or {}
+        je = {} if str(lc["anchor"]) in read else entries.get(str(lc["anchor"])) or {}
+        read.add(str(lc["anchor"]))
         if any(v not in (None, "") for k, v in je.items() if k in JOURNAL_FIELDS):
             written.append(lc)
         if je.get("plan_target") or je.get("plan_invalidation"):
@@ -1673,63 +1678,65 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     of the answer: the triggers read from "went to plan" to "taken out of my
     hands", and a reader scanning them should meet them in that order.
 
-    Entries are keyed by the anchor its decision is filed under.
-
-    Keyed by ANCHOR ALONE, dropping the account and broker the table also keys on,
-    because an order id names one placement and a placement belongs to one
-    account: `(broker, anchor)` already resolves to exactly one row, and with one
-    broker configured the anchor does too. So the page can look an entry up from a
-    lifecycle card without carrying an account it would only be able to get wrong.
+    Entries are keyed by the anchor of the card that shows them. A card's anchor
+    is unique among the current cards, account and broker included
+    (`campaigns.Campaign.key`), so the page can look an entry up from a
+    lifecycle card, and post a write from it, without carrying an account it
+    would only be able to get wrong.
 
     The whole map in one payload, rather than a lookup per card. The Trades tab
     asks "has this decision been written up" for every card it draws, and a
     request each would put a network round trip inside a render loop.
 
-    `orphans` are the entries no current decision claims: a campaign can change
-    membership when a fill lands inside its window, and its anchor with it, and
-    a note keyed on the old anchor then matched no card and vanished from the
-    page without a word. Listed so the reader sees the writing and what it was
-    about. Checked against the decisions the Trades tab can draw, options and
+    Each row shows on the one card its key names (`campaigns.named`): the card
+    filed under it, or, for a row filed under an id that is no card's key now
+    (the card it was written on has since merged into another, or moved its
+    anchor), the card holding the fill that id names. A card shows one row:
+    its own where it has one, else the lowest filed. `orphans` are the rows no
+    card shows. Listed so the reader sees the writing and what it was about.
+    Checked against the decisions the Trades tab can draw, options and
     equities, and not computed at all when nothing has been written.
-
-    An entry filed under an order that is no card's anchor now (the card it was
-    written on has since merged into another, or moved its anchor, or the anchor
-    was read another way when it was written) shows on the one card that answers
-    to that order (`Campaign.answers_to`), which is the card a hand link filed
-    under it joins. It shows keyed by the card's anchor, which is what the page
-    looks it up by, and saving from the card then files it there. Where that
-    card already holds its own entry, the older one is listed with the orphans,
-    unless the card's entry already says everything it says.
     """
     written = journal_entries(conn)
-    by_anchor = {anchor: entry for (_broker, _account, anchor), entry in written.items()}
-    shown = dict(by_anchor)
-    claimed: set[str] = set()
-    if written:
-        cards = [c for category in ("OPT", EQUITY_CATEGORY)
-                 for c in campaigns_for(conn, category,
-                                        build_history(conn, asset_category=category).episodes)]
-        live = {c.anchor for c in cards if c.anchor}
-        claimed |= live
-        # Every (filed order, card anchor) pair first, then taken in one sorted
-        # pass, so which of two older entries a card shows never rests on the
-        # order the cards came in.
-        pairs = {(filed, str(c.anchor)) for c in cards
-                 for filed in c.answers_to & (by_anchor.keys() - live)}
-        for filed, anchor in sorted(pairs, key=lambda pair: [(len(x), x) for x in pair]):
-            older, own = by_anchor[filed], shown.get(anchor)
-            if own is None:
-                shown[anchor] = older
-                claimed.add(filed)
-            elif all(own.values.get(name) == value
-                     for name, value in older.values.items()
-                     if value not in (None, "")):
-                claimed.add(filed)
+    shown = journal_shown(written, journal_cards(conn)) if written else {}
+    on_cards = {id(entry) for entry in shown.values()}
     return {
         "entries": {anchor: entry.payload() for anchor, entry in shown.items()},
-        "orphans": [entry.payload() for entry in journal_orphans(conn, claimed)]
-        if written else [],
+        "orphans": [entry.payload() for _key, entry in sorted(written.items())
+                    if id(entry) not in on_cards],
         "triggers": [{"key": key, "label": label}
                      for key, label in JOURNAL_TRIGGERS.items()],
         "adherence": list(JOURNAL_ADHERENCE),
     }
+
+
+def journal_cards(conn: sqlite3.Connection) -> list[Any]:
+    """Every current card a journal row can be filed on: options and equities,
+    the two categories the Trades tab draws."""
+    return [c for category in ("OPT", EQUITY_CATEGORY)
+            for c in campaigns_for(conn, category,
+                                   build_history(conn, asset_category=category).episodes)]
+
+
+def journal_shown(
+    written: dict[tuple[str, str, str], Any], cards: list[Any],
+) -> dict[str, Any]:
+    """The entry each card shows, by the card's anchor.
+
+    Each row goes to the card its key names, and each card shows one: its own
+    row first, then by the filed id, account and broker. An anchor two cards
+    share (an order in two asset categories, which IBKR does not issue) shows
+    nothing, and its rows are listed as orphans, rather than one row on both.
+
+    One pass over the rows, which made a journal of 10,000 written cards take
+    seconds to draw when it was one pass per card.
+    """
+    find = campaign_named(cards)
+    twice = {anchor for anchor, n in Counter(c.anchor for c in cards).items() if n > 1}
+    claims: dict[str, list[tuple[Any, ...]]] = {}
+    for key, entry in written.items():
+        card = find(*key)
+        if card is not None and card.anchor is not None and card.anchor not in twice:
+            claims.setdefault(card.anchor, []).append(
+                (key != card.key, len(key[2]), key[2], key[1], key[0], entry))
+    return {anchor: min(rows, key=lambda row: row[:5])[-1] for anchor, rows in claims.items()}

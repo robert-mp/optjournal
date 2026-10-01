@@ -126,8 +126,10 @@ from optjournal.serialize import (
     costs_data,
     history_data,
     jobs_data,
+    journal_cards,
     journal_data,
     journal_review,
+    journal_shown,
     logbook_data,
     market_data,
     odte_context_data,
@@ -249,7 +251,29 @@ def _tiles_problem(tiles: Any) -> str | None:
 #: The keys `/api/journal` reads for itself. Everything else in the body is a
 #: journal field, and `journal.FIELDS` is what judges it -- see `_journal_write`
 #: on why this endpoint must not do its own filtering.
-_JOURNAL_CONTROL = frozenset({"anchor", "broker"})
+_JOURNAL_CONTROL = frozenset({"anchor", "broker", "account", "shows"})
+
+
+def _the_card(cards: list[Any], anchor: str, body: dict[str, Any]) -> tuple[Any, str | None]:
+    """The one current card `anchor` names, or None and why not.
+
+    An anchor is unique among the current cards (`campaigns.Campaign.key`), so
+    it names one card or none: none where the statements since the page loaded
+    regrouped the card it was drawn on. A `broker` or `account` the body sends
+    must be that card's, so a stale page cannot file writing under the wrong
+    account's row either.
+    """
+    cards = [c for c in cards if c.anchor == anchor
+             and all(body.get(name) in (None, "", c.key[k])
+                     for name, k in (("broker", 0), ("account", 1)))]
+    if len(cards) == 1:
+        return cards[0], None
+    if not cards:
+        return None, (f"no current position is filed under {anchor}: a statement "
+                      f"since this page loaded has regrouped it. Reload the page and "
+                      f"try again. Nothing was changed.")
+    return None, (f"{anchor} names {len(cards)} current positions, so there is no "
+                  f"telling which one this is about. Nothing was changed.")
 
 #: The watchlist columns a request may write, in the order the upsert names them.
 #: A tuple rather than "whatever keys the body has", because these names are
@@ -1856,7 +1880,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             }
         body = self._body(limit=JOURNAL_BODY_LIMIT)
         anchor = str(body.get("anchor") or "").strip()
-        broker = str(body.get("broker") or DEFAULT_BROKER).strip()
         if not anchor:
             return 400, {"ok": False, "kind": "anchor",
                          "message": "no decision named: this position has no "
@@ -1870,25 +1893,52 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # decides what is writable, in one place, and refuses the rest loudly.
         values = {k: v for k, v in body.items() if k not in _JOURNAL_CONTROL}
         with open_journal(self.cfg.db_path) as conn:
-            target = conn.execute(
-                "SELECT account_id,"
-                # Options carry the underlying; equities ARE it.
-                " COALESCE(underlying_symbol, symbol) AS underlying,"
-                " MIN(trade_date) AS opened_on"
-                " FROM trades WHERE broker = ? AND ib_order_id = ?",
-                (broker, anchor),
-            ).fetchone()
-            if target is None or target["account_id"] is None:
+            order_id = anchor.partition("~")[0]
+            if conn.execute("SELECT 1 FROM trades WHERE ib_order_id = ? LIMIT 1",
+                            (order_id,)).fetchone() is None:
                 return 404, {
                     "ok": False, "kind": "anchor",
                     "message": f"no fill in this journal was placed under order "
-                               f"{anchor}, so there is no decision to write up.",
+                               f"{order_id}, so there is no decision to write up.",
                 }
+            # The row is the card's: its broker and account, and the anchor that
+            # names it alone. Never the order's alone, which a GTC order that
+            # filled again, or one allocated to two accounts, gives two cards.
+            cards = journal_cards(conn)
+            card, why = _the_card(cards, anchor, body)
+            if card is None:
+                return 409, {"ok": False, "kind": "stale", "message": why}
+            broker, account, _anchor = card.key
+            # The row the card shows, which the write edits: where it was filed
+            # under another id (the card's anchor has moved since), it is moved
+            # to the card's key in the same transaction, so editing it leaves one
+            # row and emptying it deletes it. The page says which row it shows,
+            # and a row that no longer is this card's is refused, not re-keyed.
+            shown = journal_shown(journal.entries(conn), cards).get(anchor)
+            showing = (None if shown is None else
+                       (shown.broker, shown.account_id, shown.anchor_order_id))
+            said = body.get("shows")
+            told = None if said is None else tuple(str(x) for x in said)
+            if ("shows" in body and told != showing) or (
+                    "shows" not in body and showing not in (None, card.key)):
+                return 409, {
+                    "ok": False, "kind": "stale",
+                    "message": "this position's write-up has changed since the page "
+                               "loaded. Reload the page and save again. Nothing was "
+                               "saved."}
+            trades = sorted({part.partition("~")[0] for _b, _o, part in card.parts})
+            target = conn.execute(
+                # Options carry the underlying; equities ARE it.
+                "SELECT COALESCE(underlying_symbol, symbol) AS underlying,"
+                f" MIN(trade_date) AS opened_on FROM trades WHERE broker = ?"
+                f" AND trade_id IN ({', '.join('?' for _ in trades)})",
+                (broker, *trades),
+            ).fetchone()
             try:
                 entry = journal.save(
-                    conn, anchor, account_id=target["account_id"], values=values,
+                    conn, anchor, account_id=account, values=values,
                     underlying_symbol=target["underlying"],
-                    opened_on=target["opened_on"], broker=broker,
+                    opened_on=target["opened_on"], broker=broker, replacing=showing,
                 )
             except journal.JournalError as exc:
                 return 400, {"ok": False, "kind": "journal", "message": str(exc)}
@@ -1923,15 +1973,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         and joining two symbols would merge two decisions the reader can then
         only see as one.
 
-        REFUSED when it would hide writing. A merged card is filed under the
-        lower anchor, so a write-up on the higher one would stop showing on any
-        card. It is still in the table, but nothing on the page reaches it, and
-        for the one table a re-ingest cannot rebuild that reads as lost.
+        REFUSED when it would hide writing. A card shows one write-up, so where
+        BOTH cards show one, whatever id each was filed under, the joined card
+        would show one of them and the other would stop showing on any card. It
+        would still be in the table, but nothing on the page reaches it, and for
+        the one table a re-ingest cannot rebuild that reads as lost. Where only
+        one shows a write-up, the joined card shows it.
         """
         body = self._body()
         a = str(body.get("anchor") or "").strip()
         b = str(body.get("joins") or "").strip()
         broker = str(body.get("broker") or DEFAULT_BROKER).strip()
+        order_of = {a: a.partition("~")[0], b: b.partition("~")[0]}
         if not a or not b:
             return 400, {"ok": False, "kind": "link",
                          "message": "a link needs two positions to join."}
@@ -1943,34 +1996,39 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 gone = journal.unlink(conn, a, b, broker=broker)
                 return 200, {"ok": True, "kind": "link", "removed": gone}
             unders: dict[str, Any] = {}
-            for oid in (a, b):
+            for end in (a, b):
                 row = conn.execute(
                     "SELECT COALESCE(underlying_symbol, symbol) AS u FROM trades"
-                    " WHERE broker = ? AND ib_order_id = ? LIMIT 1", (broker, oid),
+                    " WHERE broker = ? AND ib_order_id = ? LIMIT 1",
+                    (broker, order_of[end]),
                 ).fetchone()
                 if row is None:
                     return 404, {"ok": False, "kind": "link",
                                  "message": f"no fill in this journal was placed "
-                                            f"under order {oid}."}
-                unders[oid] = row["u"]
+                                            f"under order {order_of[end]}."}
+                unders[end] = row["u"]
+            # Each end the one current card it names, as a journal write's is:
+            # the anchor alone, never the order, which can name two cards.
+            cards = journal_cards(conn)
+            ends = []
+            for end in (a, b):
+                card, why = _the_card(cards, end, {"broker": broker})
+                if card is None:
+                    return 409, {"ok": False, "kind": "stale", "message": why}
+                ends.append(card)
             if unders[a] != unders[b]:
                 return 400, {"ok": False, "kind": "link",
                              "message": f"{unders[a]} and {unders[b]} are different "
                                         f"underlyings, so they cannot be one "
                                         f"position."}
-            # The card a merge files under is the lower anchor, same order
-            # `journal` stores the pair in.
-            high = max((a, b), key=lambda o: (len(o), o))
-            if conn.execute(
-                "SELECT 1 FROM journal_entries WHERE broker = ?"
-                " AND anchor_order_id = ?", (broker, high),
-            ).fetchone():
+            shown = journal_shown(journal.entries(conn), cards)
+            if all(card.anchor in shown for card in ends):
                 return 409, {"ok": False, "kind": "link",
-                             "message": "the later position has a write-up, and "
-                                        "joining would file the card under the "
-                                        "earlier one, so that write-up would stop "
-                                        "showing. Copy it across and clear it "
-                                        "first. Nothing was linked."}
+                             "message": "both positions have a write-up, and the "
+                                        "joined card shows one, so the other would "
+                                        "stop showing. Copy what you need into one "
+                                        "and clear the other first. Nothing was "
+                                        "linked."}
             try:
                 pair = journal.link(conn, a, b, broker=broker)
             except journal.JournalError as exc:
