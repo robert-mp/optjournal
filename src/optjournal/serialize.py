@@ -1691,20 +1691,43 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     page without a word. Listed so the reader sees the writing and what it was
     about. Checked against the decisions the Trades tab can draw, options and
     equities, and not computed at all when nothing has been written.
+
+    An entry filed under an order that is no card's anchor now (the card it was
+    written on has since merged into another, or moved its anchor, or the anchor
+    was read another way when it was written) shows on the one card that answers
+    to that order (`Campaign.answers_to`), which is the card a hand link filed
+    under it joins. It shows keyed by the card's anchor, which is what the page
+    looks it up by, and saving from the card then files it there. Where that
+    card already holds its own entry, the older one is listed with the orphans,
+    unless the card's entry already says everything it says.
     """
     written = journal_entries(conn)
-    live: set[str] = set()
+    by_anchor = {anchor: entry for (_broker, _account, anchor), entry in written.items()}
+    shown = dict(by_anchor)
+    claimed: set[str] = set()
     if written:
-        for category in ("OPT", EQUITY_CATEGORY):
-            report = build_history(conn, asset_category=category)
-            live |= {c.anchor for c in campaigns_for(conn, category, report.episodes)
-                     if c.anchor}
+        cards = [c for category in ("OPT", EQUITY_CATEGORY)
+                 for c in campaigns_for(conn, category,
+                                        build_history(conn, asset_category=category).episodes)]
+        live = {c.anchor for c in cards if c.anchor}
+        claimed |= live
+        # Every (filed order, card anchor) pair first, then taken in one sorted
+        # pass, so which of two older entries a card shows never rests on the
+        # order the cards came in.
+        pairs = {(filed, str(c.anchor)) for c in cards
+                 for filed in c.answers_to & (by_anchor.keys() - live)}
+        for filed, anchor in sorted(pairs, key=lambda pair: [(len(x), x) for x in pair]):
+            older, own = by_anchor[filed], shown.get(anchor)
+            if own is None:
+                shown[anchor] = older
+                claimed.add(filed)
+            elif all(own.values.get(name) == value
+                     for name, value in older.values.items()
+                     if value not in (None, "")):
+                claimed.add(filed)
     return {
-        "entries": {
-            anchor: entry.payload()
-            for (_broker, _account, anchor), entry in written.items()
-        },
-        "orphans": [entry.payload() for entry in journal_orphans(conn, live)]
+        "entries": {anchor: entry.payload() for anchor, entry in shown.items()},
+        "orphans": [entry.payload() for entry in journal_orphans(conn, claimed)]
         if written else [],
         "triggers": [{"key": key, "label": label}
                      for key, label in JOURNAL_TRIGGERS.items()],

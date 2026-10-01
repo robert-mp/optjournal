@@ -594,3 +594,125 @@ def test_a_link_finds_the_card_whose_anchor_it_names(db):
     journal.link(db, "101", "200")
     assert ("101", frozenset({"t3", "t4", "t5", "t6"})) in _cards(db)
     assert ("101", frozenset({"t3", "t4", "t5", "t6"})) in _cards(db, reverse=True)
+
+
+def test_an_entry_under_an_order_no_card_answers_to_shows_on_the_card_that_filled_it(db):
+    """A position opened by 100 gets a later fill of order 90, placed the day
+    before: its anchor moves to 90. The note written under 100 stays on the card
+    that filled 100, and once the card has a note of its own the older one is
+    listed with the orphans unless the new one already says what it said."""
+    _journal_of(db, [("t1", "U1", "100", "2026-09-02 10:00:00", 1, "O", None)])
+    _note(db, "100")
+    _journal_of(db, [("t2", "U1", "90", "2026-09-02 11:00:00", 1, "O", None)],
+                statement=False)
+    assert [anchor for anchor, _ in _cards(db)] == ["90"]
+    assert _shown(db) == ({frozenset({"t1", "t2"}): "note 100"}, [])
+    journal.save(db, "90", account_id="U1", values={"entry_note": "note 100",
+                                                    "lessons": "added later"})
+    assert _shown(db)[1] == []
+    journal.save(db, "90", account_id="U1", values={"entry_note": "rewritten"})
+    assert _shown(db) == ({frozenset({"t1", "t2"}): "rewritten"}, ["100"])
+
+
+#: N long from 50, closed by 100 through zero, which opens K short; M opened by
+#: 20 on another contract; P opened by 300 on a third. Then K and M are closed
+#: by two orders thirty seconds apart, which joins them into one card.
+_MERGE = [
+    ("t1", "U1", "50", "2026-09-01 10:00:00", 1, "O", None, "1"),
+    ("t2", "U1", "100", "2026-09-02 10:00:00", -2, "C;O", 10.0, "1"),
+    ("t3", "U1", "20", "2026-09-03 10:00:00", 1, "O", None, "2"),
+    ("t4", "U1", "300", "2026-09-04 10:00:00", 1, "O", None, "3"),
+    ("t5", "U1", "500", "2026-09-05 10:00:00", 1, "C", 5.0, "1"),
+    ("t6", "U1", "501", "2026-09-05 10:00:30", -1, "C", 5.0, "2"),
+]
+#: A long from 10 and 15, closed by 30 through zero, which opens B short; C
+#: opened by 400 on another contract. Then B sells more through order 20.
+_LOWER = [
+    ("t1", "U1", "10", "2026-09-01 10:00:00", 1, "O", None, "1"),
+    ("t2", "U1", "15", "2026-09-01 11:00:00", 1, "O", None, "1"),
+    ("t3", "U1", "30", "2026-09-02 10:00:00", -3, "C;O", 10.0, "1"),
+    ("t4", "U1", "400", "2026-09-04 10:00:00", 1, "O", None, "3"),
+    ("t5", "U1", "20", "2026-09-05 10:00:00", -1, "O", None, "1"),
+]
+
+
+@pytest.mark.parametrize("fills, before, after", [
+    (_MERGE, [("100", {"t2"}), ("20", {"t3"}), ("300", {"t4"}), ("50", {"t1", "t2"})],
+     [("20", {"t2", "t3", "t5", "t6"}), ("300", {"t4"}), ("50", {"t1", "t2"})]),
+    (_LOWER, [("10", {"t1", "t2", "t3"}), ("30", {"t3"}), ("400", {"t4"})],
+     [("10", {"t1", "t2", "t3"}), ("20", {"t3", "t5"}), ("400", {"t4"})]),
+], ids=["merge", "lower order"])
+def test_the_cards_a_merge_and_a_lower_order_build(db, fills, before, after):
+    """What the cases below start from, and what the later statement makes."""
+    _journal_of(db, fills[:4])
+    assert _cards(db) == [(a, frozenset(t)) for a, t in before]
+    _journal_of(db, fills[4:], statement=False)
+    assert _cards(db) == [(a, frozenset(t)) for a, t in after]
+
+
+def test_a_link_to_a_card_that_merged_since_joins_the_card_it_merged_into(db):
+    """K, linked to P under its anchor 100, is joined with M by a later
+    statement and answers to 20. N filled 100 too (its closing half), and took
+    it first, but the link was made on K's card, so it joins K's card with P."""
+    _journal_of(db, _MERGE[:4])
+    journal.link(db, "100", "300")
+    _journal_of(db, _MERGE[4:], statement=False)
+    assert ("20", frozenset({"t2", "t3", "t4", "t5", "t6"})) in _cards(db)
+    assert ("50", frozenset({"t1", "t2"})) in _cards(db)
+
+
+def test_an_entry_on_a_card_that_merged_since_shows_on_the_card_it_merged_into(db):
+    """The note written on K's card shows on the card K merged into, and not on
+    N's, which also filled 100."""
+    _journal_of(db, _MERGE[:4])
+    _note(db, "100")
+    _journal_of(db, _MERGE[4:], statement=False)
+    shown, orphans = _shown(db)
+    assert {tids: note for tids, note in shown.items() if note} == {
+        frozenset({"t2", "t3", "t5", "t6"}): "note 100"}
+    assert orphans == []
+
+
+def test_a_card_a_lower_order_moved_keeps_its_link_and_its_entry(db):
+    """B answered to 30 until order 20 added to it. A also filled 30, closing
+    with it, and took it first; but 30 is the next order up on B and the third
+    on A, so a link and a note filed under it stay with B."""
+    _journal_of(db, _LOWER[:4])
+    journal.link(db, "30", "400")
+    _note(db, "30")
+    _journal_of(db, _LOWER[4:], statement=False)
+    assert ("20", frozenset({"t3", "t4", "t5"})) in _cards(db)
+    shown, orphans = _shown(db)
+    assert {tids: note for tids, note in shown.items() if note} == {
+        frozenset({"t3", "t4", "t5"}): "note 30"}
+    assert orphans == []
+
+
+def test_which_older_entry_a_shared_anchor_shows_does_not_read_the_list_order(
+        db, monkeypatch):
+    """Y (U2, from 200) and X (U1, from 300) each have a note; then order 100,
+    allocated to both accounts, adds to both, and both answer to 100. One note
+    can show under one anchor: the one filed under the lower order, whichever
+    card comes first in the episode list, and the other is listed, not lost."""
+    import dataclasses
+
+    from optjournal import serialize
+
+    _journal_of(db, [("t1", "U2", "200", "2026-09-01 10:00:00", -1, "O", None),
+                     ("t2", "U1", "300", "2026-09-02 10:00:00", -1, "O", None)])
+    _note(db, "200")
+    _note(db, "300")
+    _journal_of(db, [("t3", "U1", "100", "2026-09-03 10:00:00", -1, "O", None),
+                     ("t4", "U2", "100", "2026-09-03 10:00:00", -1, "O", None)],
+                statement=False)
+    as_built = serialize.journal_data(db)
+    real = serialize.build_history
+
+    def reversed_history(conn, **kwargs):
+        report = real(conn, **kwargs)
+        return dataclasses.replace(report, episodes=report.episodes[::-1])
+
+    monkeypatch.setattr(serialize, "build_history", reversed_history)
+    assert serialize.journal_data(db) == as_built
+    assert as_built["entries"]["100"]["entry_note"] == "note 200"
+    assert [e["anchor"] for e in as_built["orphans"]] == ["300"]

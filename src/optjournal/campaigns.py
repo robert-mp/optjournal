@@ -157,6 +157,10 @@ class Campaign:
     #: campaign, as stored. Empty for a campaign the window alone built, which is
     #: how the Trades tab knows which cards it may offer to unlink.
     links: tuple[tuple[str, str], ...] = ()
+    #: Own orders that name ANOTHER card, which answers to them more nearly
+    #: (`link`): an order that ended one position and began the next, or was
+    #: allocated to two accounts, names one card of the two. See `answers_to`.
+    ceded: frozenset[str] = frozenset()
     #: `order_ids` with the broker that issued each, `(broker, order id)`, which
     #: is how the Trades tab finds an order's campaigns: an order id is the
     #: issuing broker's own, and two brokers can both number an order 5000.
@@ -210,6 +214,15 @@ class Campaign:
         on this have to say what they do about that; see `journal.py`.
         """
         return _lowest(self.order_ids)
+
+    @property
+    def answers_to(self) -> frozenset[str]:
+        """The order ids that name this campaign, each of which names one card
+        alone: its own orders less those it `ceded`. How an entry or a hand link
+        filed under an id that is no card's anchor now (the card it named has
+        since merged into this one, or a later fill gave it a lower order) finds
+        the card it was filed on (`link`, `serialize.journal_data`)."""
+        return self.order_ids - self.ceded
 
     @property
     def brokers(self) -> frozenset[str]:
@@ -302,11 +315,13 @@ def link(
 
     `links` are pairs of order ids the reader joined by hand: a roll whose two
     halves were placed further apart than `WINDOW_S`. The page posts two cards'
-    anchors, so each end is the card the window built whose anchor it is, and an
-    id that is no card's anchor (one stored when anchors were read another way)
-    is the card that filled that order. A pair naming an order no episode
-    reached (another category, or a fill since re-keyed) is skipped rather than
-    raised, because the row is the reader's and the page still has to render.
+    anchors, so each end is the card the window built whose anchor it is. An id
+    that is no card's anchor now (the card it named has since merged into
+    another, or a later fill gave it a lower order, or the anchor was read
+    another way when the link was stored) is the card that answers to it most
+    nearly; see `Campaign.answers_to`. A pair naming an order no episode reached
+    (another category, or a fill since re-keyed) is skipped rather than raised,
+    because the row is the reader's and the page still has to render.
     """
     parent = list(range(len(episodes)))
 
@@ -362,11 +377,16 @@ def link(
     def orders_of(idxs: Iterable[int]) -> set[str]:
         return {oid for i in idxs for oid in orders_of_episode.get(i, ())}
 
-    # The card each end of a hand link names, among the cards the window built
-    # before any link is applied: the one card that filled it, nearly always.
-    # Where several did, the card whose anchor it is, then the one that took the
-    # order's first execution, then the one whose own orders, and then fills,
-    # sort first. Nothing here reads the order of the episode list.
+    # The card each order id names, among the cards the window built before any
+    # link is applied: the one card that filled it, nearly always. Where several
+    # did, the card whose anchor it is; else one holding an episode whose anchor
+    # it is (a card since merged into a bigger one by a later fill); else the one
+    # with the fewest own orders below it (the nearest to answering to it: a
+    # later fill of a lower order moves a card's anchor, and the card that closed
+    # with the order already had lower ones). Then the one that took the order's
+    # first execution, then the one whose own orders, and then fills, sort first.
+    # Nothing here reads the order of the episode list, and hand links and
+    # journal entries read an id the same way.
     window = _members(find, len(episodes))
     owners: dict[str, list[int]] = {}
     for root, idxs in window.items():
@@ -374,7 +394,8 @@ def link(
             owners.setdefault(order_id, []).append(root)
     # What `nearness` reads of a card, built once per card and only for the
     # cards that share an order, so the common case costs one pass.
-    seen: dict[int, tuple[dict[str, tuple[bool, str, bool]], tuple[Any, ...]]] = {}
+    seen: dict[int, tuple[dict[str, int], set[str | None],
+                          dict[str, tuple[bool, str, bool]], tuple[Any, ...]]] = {}
 
     def nearness(root: int, order_id: str) -> tuple[Any, ...]:
         if root not in seen:
@@ -387,11 +408,15 @@ def link(
                     if oid is not None and (oid not in first or _taken_first(part) < first[oid]):
                         first[oid] = _taken_first(part)
             seen[root] = (
+                {oid: rank for rank, oid in enumerate(own_ids)},
+                {_lowest(orders_of_episode.get(i, ())) for i in idxs},
                 first,
                 (own_ids, sorted(str(t) for i in idxs
                                  for t in getattr(episodes[i], "trade_ids", ()) or ())))
-        first, rest = seen[root]
-        return (rest[0][0] != order_id, first.get(order_id, (True, "", True)), rest)
+        rank_of, heads, first, rest = seen[root]
+        rank = rank_of[order_id]
+        return (0 if rank == 0 else 1 if order_id in heads else 2, rank,
+                first.get(order_id, (True, "", True)), rest)
 
     def nearest(roots: list[int], order_id: str) -> int:
         if len(roots) == 1:
@@ -413,6 +438,13 @@ def link(
     links_of_root: dict[int, list[tuple[str, str]]] = {}
     for i, pair in applied:
         links_of_root.setdefault(find(i), []).append(pair)
+    ceded: dict[int, set[str]] = {}
+    for order_id, roots in owners.items():
+        if len(roots) > 1:
+            named = find(nearest(roots, order_id))
+            for root in roots:
+                if find(root) != named:
+                    ceded.setdefault(find(root), set()).add(order_id)
 
     # What each campaign took of each order leg, per (order, contract), which is
     # the shape a leg has: its episodes' own fill parts. A leg more than one
@@ -443,6 +475,7 @@ def link(
             conids=tuple(sorted({str(getattr(e, "conid", "") or "") for e in eps})),
             order_ids=frozenset(oid for _broker, oid in own),
             orders=own,
+            ceded=frozenset(ceded.get(root, ())),
             is_decided=decided,
             closed_at=max(
                 (str(e.closed_at) for e in eps if e.closed_at), default=None
