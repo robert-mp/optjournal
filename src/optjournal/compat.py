@@ -40,12 +40,18 @@ __all__ = ["install_code_fallback", "unknown_codes", "unknown_values"]
 log = logging.getLogger(__name__)
 
 #: Trade codes encountered at runtime that py_ibkr does not declare. Printed by
-#: the CLI after a run.
+#: the CLI after a run, which clears it first: recorded on EVERY lookup, so a
+#: value met again in a later run in the same process is named again.
 unknown_codes: set[str] = set()
 
 #: Values of py_ibkr's OTHER enums encountered at runtime and not declared, as
-#: "EnumName=value" (for example "OrderType=LIT").
+#: "EnumName=value" (for example "OrderType=LIT"). Recorded like `unknown_codes`.
 unknown_values: set[str] = set()
+
+#: The member minted for each undeclared (enum, value), so a repeat lookup returns
+#: the same object. Kept HERE rather than in the enum's `_value2member_map_`,
+#: where a repeat lookup would never reach `_missing_` and never be recorded.
+_minted: dict[tuple[type[enum.Enum], str], enum.Enum] = {}
 
 _INSTALLED = False
 
@@ -67,6 +73,8 @@ def _missing_(cls: type[enum.Enum], value: Any) -> enum.Enum | None:
         unknown_codes.add(value)
     else:
         unknown_values.add(f"{cls.__name__}={value}")
+    if (cls, value) in _minted:
+        return _minted[(cls, value)]
     log.debug(
         "IBKR value %r is not declared by py_ibkr's %s; accepting it as an "
         "ad-hoc member", value, cls.__name__,
@@ -81,9 +89,9 @@ def _missing_(cls: type[enum.Enum], value: Any) -> enum.Enum | None:
         member = object.__new__(cls)
     member._name_ = value.upper().replace(" ", "_")
     member._value_ = value
-    # Register so repeat occurrences resolve to the same object and identity
-    # comparisons behave like a declared member.
-    cls._value2member_map_[value] = member
+    # Kept so repeat occurrences resolve to the same object and identity
+    # comparisons behave like a declared member (see `_minted`).
+    _minted[(cls, value)] = member
     cls._member_map_.setdefault(member._name_, member)
     return member
 

@@ -69,6 +69,18 @@ def test_an_undeclared_value_of_any_py_ibkr_enum_is_accepted(enum_name, value):
     assert f"{enum_name}={value}" in unknown_values
 
 
+def test_an_undeclared_value_is_recorded_each_time_it_is_met():
+    """Recorded on the first lookup only, a value met again after the record
+    was cleared (a new CLI run in the same process) went unreported. Every
+    lookup records it, and still returns the one member."""
+    from py_ibkr.flex.enums import OrderType
+
+    first = OrderType("ZZQ-again")
+    unknown_values.discard("OrderType=ZZQ-again")
+    assert OrderType("ZZQ-again") is first
+    assert "OrderType=ZZQ-again" in unknown_values
+
+
 def test_declared_values_of_the_other_enums_still_resolve_normally():
     from py_ibkr.flex.enums import CashAction, OrderType
 
