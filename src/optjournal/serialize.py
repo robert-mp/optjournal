@@ -1691,30 +1691,21 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     page without a word. Listed so the reader sees the writing and what it was
     about. Checked against the decisions the Trades tab can draw, options and
     equities, and not computed at all when nothing has been written.
-
-    Listed there too: an entry filed under an anchor two cards answered to
-    (`campaigns.Campaign.shared_anchor`). It shows on the card that owns the
-    anchor now, and it may have been written about the other, which showed it
-    as well, so the reader is told rather than left to find it gone.
     """
     written = journal_entries(conn)
     live: set[str] = set()
-    shared: set[tuple[str, str]] = set()
     if written:
         for category in ("OPT", EQUITY_CATEGORY):
             report = build_history(conn, asset_category=category)
-            for c in campaigns_for(conn, category, report.episodes):
-                live |= {c.anchor} if c.anchor else set()
-                shared |= {(broker, c.shared_anchor) for broker in c.brokers
-                           if c.shared_anchor}
-    orphans = journal_orphans(conn, live) if written else []
-    orphans += [entry for key, entry in written.items() if (key[0], key[2]) in shared]
+            live |= {c.anchor for c in campaigns_for(conn, category, report.episodes)
+                     if c.anchor}
     return {
         "entries": {
             anchor: entry.payload()
             for (_broker, _account, anchor), entry in written.items()
         },
-        "orphans": [entry.payload() for entry in orphans],
+        "orphans": [entry.payload() for entry in journal_orphans(conn, live)]
+        if written else [],
         "triggers": [{"key": key, "label": label}
                      for key, label in JOURNAL_TRIGGERS.items()],
         "adherence": list(JOURNAL_ADHERENCE),

@@ -259,18 +259,14 @@ def test_a_group_that_joins_nothing_lends_neither_side_its_other_order():
     order: one window group on one contract, so it joins nothing. Each campaign
     still listed every order of the group, and the Trades tab, which reaches a
     campaign through its orders, drew both orders whole in both cards. Each now
-    lists the orders of its own fills.
-
-    The anchor does not follow: the re-entry's card has always answered to the
-    sale's order, 1002, and what was written or linked against it has to keep
-    finding it (`test_journal`), so it still does."""
+    lists the orders of its own fills, and answers to the lowest of them."""
     eps = [_Ep("C1", ["t1", "t2"], pnl=48.0), _Ep("C1", ["t3", "t4"], pnl=43.0)]
     camps = link(eps, order_groups=[("1001",), ("1002", "1003"), ("1004",)],
                  order_of_trade={"t1": "1001", "t2": "1002", "t3": "1003",
                                  "t4": "1004"})
     assert [c.order_ids for c in camps] == [
         frozenset({"1001", "1002"}), frozenset({"1003", "1004"})]
-    assert [c.anchor for c in camps] == ["1001", "1002"]
+    assert [c.anchor for c in camps] == ["1001", "1003"]
 
 
 def _part(quantity, open_close, at, price, *, proceeds=0.0, pnl=0.0):
@@ -570,3 +566,38 @@ def test_a_link_naming_an_order_no_episode_filled_is_skipped():
                  links=[("a1", "zz")])
     assert len(camps) == 2
     assert all(c.links == () for c in camps)
+
+
+def _link_lines(n: int) -> int:
+    """Lines `link` runs, helpers included, for `n` round trips on one contract
+    whose orders are one 90-second chain, scalping-style."""
+    import sys
+
+    from optjournal import campaigns
+
+    eps = [_Ep("C1", [f"o{k}", f"c{k}"]) for k in range(n)]
+    orders = {f"{side}{k}": f"{side}{k}" for k in range(n) for side in "oc"}
+    chain = [tuple(orders.values())]
+    count = 0
+
+    def local(frame, event, arg):
+        nonlocal count
+        count += event == "line"
+        return local
+
+    sys.settrace(lambda frame, event, arg: (
+        local if frame.f_code.co_filename == campaigns.__file__ else None))
+    try:
+        assert len(link(eps, order_groups=chain, order_of_trade=orders)) == n
+    finally:
+        sys.settrace(None)
+    return count
+
+
+def test_a_long_window_chain_costs_its_length_not_its_square():
+    """A scalper's day is one window chain of hundreds of orders, and reading an
+    anchor across every order of a card's groups made the linkage grow with the
+    square of its length (600 round trips a day: 32 to 622 ms). Counted in lines
+    run rather than timed: three times the chain is about three times the work."""
+    small, large = _link_lines(50), _link_lines(150)
+    assert large < 4 * small, (small, large)
