@@ -1193,8 +1193,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   in this database a re-ingest cannot rebuild
  * @property {Array} triggers -- Trigger options, in the order they read
  * @property {Array} adherence -- the answers `followed_*` accepts
- * @property {Array} orphans -- JournalEntry rows no current decision claims, or
- *   filed under an anchor two decisions shared (`Campaign.shared_anchor`)
+ * @property {Array} orphans -- JournalEntry rows no current decision claims
  * @property {JournalReview} review -- set by web.build_state over the scoped cards
  */
 
@@ -3688,9 +3687,7 @@ function orphanNotes(){
   return `<div class="card">
     <div class="crow"><div><h2>Notes no position claims${infoTip(
       `Written against a decision whose grouping has since changed, so its anchor
-       order no longer names a card below, or filed under an order two positions
-       shared, in which case it also shows on the card that owns that order.
-       Nothing was deleted.`)}</h2>
+       order no longer names a card below. Nothing was deleted.`)}</h2>
       <div class="sub">${rows.length} entr${rows.length===1?'y':'ies'}, kept as written.</div></div></div>
     ${rows.map(je=>`<div class="note"><b>${esc(je.underlying||'?')}</b>
       <span class="dim2 mono">opened ${esc(String(je.opened_on||'?').slice(0,10))}
