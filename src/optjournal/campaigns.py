@@ -49,10 +49,41 @@ rule, two readers that cannot see each other, the previous state being the rule
 written twice. This holds `money.py` and `notes.py`, both leaves, so any layer may hold it
 and every case below is testable against literals.
 
+WHAT A CARD IS FILED UNDER. A card's journal row is `(broker, account_id,
+anchor)`, the key `journal_entries` is keyed on, and no two current cards share
+one: two cards sharing a row show one write-up, and saving either overwrites the
+other's. The anchor is the card's LOWEST own order id when the card holds that
+order's first fill (IBKR's own, so rows the released code filed under it stay
+with the card), and otherwise `{order}~{part}`, the part being the card's own
+first fill of it: a GTC order that fills again after its first position closed,
+or one order allocated to two accounts, opens a second card on the same order,
+and that card answers to its own fill. A part is the fill's trade id, or for the
+closing half of a fill through zero (IBKR's `C;O`) the trade id and `~C`, since
+its two halves open and close two cards. `~` is the separator because IBKR
+order and trade ids are digits.
+
+Where a fill through zero is an order's first, the card it OPENED holds the
+plain id, not the one it closed: the opening half always makes a position,
+while the closing half makes one only when the holding it closed is on record,
+which a history import can change. So the key is a function of the card's own
+fills and of which fill was its order's first, never of what other cards exist
+or of the episode list's order, and a later statement leaves it alone unless
+the card's own fills change. The one exception is a history import bringing an
+EARLIER fill of an order already on record, which takes the plain id with it.
+Unique across the cards one `link` returns; across the two asset categories it
+rests on IBKR never giving one order id to both (`db.trade_orders`), and
+`serialize.journal_data` and the write handlers refuse an anchor two cards
+share rather than pick one.
+
+A stored id finds its card the same way (`named`): the card whose key it is;
+else, for `{order}~{part}`, the card holding that part; else, for a plain order
+id, the card holding that order's first fill in the row's account. That is the
+card the row was written on, or the one that card has since merged into.
+
 Episodes are duck-typed rather than imported. Everything here reads is
 `conid`, `trade_ids`, `is_closed`, `closed_at`, `realized_pnl{,_base}`,
-`commission{,_base}`, `currency` and `fill_parts`, which is why this stays a
-leaf holder instead of acquiring `history.py`.
+`commission{,_base}`, `currency`, `broker`, `account_id` and `fill_parts`,
+which is why this stays a leaf holder instead of acquiring `history.py`.
 """
 
 from __future__ import annotations
@@ -72,6 +103,7 @@ __all__ = [
     "cluster_orders",
     "first_taken",
     "link",
+    "named",
     "placed_by_broker",
     "position_count",
 ]
@@ -157,10 +189,19 @@ class Campaign:
     #: campaign, as stored. Empty for a campaign the window alone built, which is
     #: how the Trades tab knows which cards it may offer to unlink.
     links: tuple[tuple[str, str], ...] = ()
-    #: Own orders that name ANOTHER card, which answers to them more nearly
-    #: (`link`): an order that ended one position and began the next, or was
-    #: allocated to two accounts, names one card of the two. See `answers_to`.
-    ceded: frozenset[str] = frozenset()
+    #: The journal row this card is filed under, `(broker, account_id, anchor)`,
+    #: unique across the cards `link` returns; see "What a card is filed under"
+    #: in the module docstring. None for a card built only from position
+    #: snapshots, which has no order to file writing under.
+    key: tuple[str, str, str] | None = None
+    #: Every fill part it holds, `(broker, order id, part)`, a part being a trade
+    #: id or, for the closing half of a fill through zero, the trade id and `~C`.
+    #: How an id of the `{order}~{part}` form finds the card again (`named`).
+    parts: frozenset[tuple[str, str, str]] = frozenset()
+    #: `(broker, account_id, order id)` for each order whose first fill in that
+    #: account it holds. How a plain order id finds the card again once it is no
+    #: card's anchor (`named`).
+    firsts: frozenset[tuple[str, str, str]] = frozenset()
     #: `order_ids` with the broker that issued each, `(broker, order id)`, which
     #: is how the Trades tab finds an order's campaigns: an order id is the
     #: issuing broker's own, and two brokers can both number an order 5000.
@@ -185,8 +226,9 @@ class Campaign:
 
     @property
     def anchor(self) -> str | None:
-        """The campaign's stable handle: its lowest order id, or None if it has
-        no fills.
+        """The campaign's stable handle, the last part of `key`: its lowest order
+        id, or `{order}~{part}` where another card holds that order's first fill.
+        None if it has no fills.
 
         `episode_indices` cannot be a handle: they are positions in the list
         `link` was handed, and every ingest rebuilds that list. Nor can the
@@ -196,33 +238,19 @@ class Campaign:
         because the Trades tab reaches campaigns through orders.
 
         The LOWEST of its OWN orders, so the handle is the decision's earliest
-        placement, a roll added tomorrow does not move it, and nothing but the
-        card's own fills decides it: not the episode list's order, and not which
-        other cards exist. Compared numerically, because IBKR order ids are
-        numbers in text and `min` on strings would rank '999' above '1000' (true
-        today only because the real ids are all ten digits, which is the kind of
-        accident that holds until it does not). Ties fall back to the string so
-        the answer is total either way.
-
-        Two cards share one only where one order is the lowest of each: a
-        holding from before the archive closed by the order that opened the next
-        position, or one order allocated to two accounts. Both show what is
-        filed under it, as the released code showed it.
+        placement and a roll added tomorrow does not move it. Compared
+        numerically, because IBKR order ids are numbers in text and `min` on
+        strings would rank '999' above '1000' (true today only because the real
+        ids are all ten digits, which is the kind of accident that holds until it
+        does not). Ties fall back to the string so the answer is total either
+        way. Unique across the cards one `link` returns, account and broker
+        included, so the page can find a card's editor and a card's row by it.
 
         None for a campaign built only from position snapshots: the archive holds
         no fills for it, so there is no order to name. Callers that key anything
         on this have to say what they do about that; see `journal.py`.
         """
-        return _lowest(self.order_ids)
-
-    @property
-    def answers_to(self) -> frozenset[str]:
-        """The order ids that name this campaign, each of which names one card
-        alone: its own orders less those it `ceded`. How an entry or a hand link
-        filed under an id that is no card's anchor now (the card it named has
-        since merged into this one, or a later fill gave it a lower order) finds
-        the card it was filed on (`link`, `serialize.journal_data`)."""
-        return self.order_ids - self.ceded
+        return self.key[2] if self.key else None
 
     @property
     def brokers(self) -> frozenset[str]:
@@ -315,11 +343,11 @@ def link(
 
     `links` are pairs of order ids the reader joined by hand: a roll whose two
     halves were placed further apart than `WINDOW_S`. The page posts two cards'
-    anchors, so each end is the card the window built whose anchor it is. An id
-    that is no card's anchor now (the card it named has since merged into
-    another, or a later fill gave it a lower order, or the anchor was read
-    another way when the link was stored) is the card that answers to it most
-    nearly; see `Campaign.answers_to`. A pair naming an order no episode reached
+    anchors, so each end is the episode holding the fill the anchor names: for
+    `{order}~{part}` that part, and for a plain order id that order's first
+    fill (see the module docstring). So an end stays with the card it was
+    posted from, or the card that card has since merged into, whatever else
+    a later statement changed. A pair naming an order no episode reached
     (another category, or a fill since re-keyed) is skipped rather than raised,
     because the row is the reader's and the page still has to render.
     """
@@ -374,77 +402,69 @@ def link(
             for i in touched:
                 union(touched[0], i)
 
-    def orders_of(idxs: Iterable[int]) -> set[str]:
-        return {oid for i in idxs for oid in orders_of_episode.get(i, ())}
+    # Every fill part each episode took, and the first fill of every order,
+    # anywhere and in each account: what a card's key and a stored id are read
+    # from (see "What a card is filed under" in the module docstring). The two
+    # halves of a fill through zero sort together, the opening half first.
+    account_of = [str(getattr(episode, "account_id", "") or "") for episode in episodes]
+    halves: dict[str, int] = {}
+    for episode in episodes:
+        for tid in _parts_of(episode):
+            halves[tid] = halves.get(tid, 0) + 1
+    held: list[list[tuple[tuple[Any, ...], str, str]]] = []
+    first: dict[str, tuple[tuple[Any, ...], int]] = {}
+    first_in: dict[tuple[str, str, str], tuple[tuple[Any, ...], int]] = {}
+    holder: dict[tuple[str, str], int] = {}
+    for i, episode in enumerate(episodes):
+        mine = []
+        for tid, part in _parts_of(episode).items():
+            order_id = order_of_trade.get(tid)
+            if order_id is None:
+                continue
+            closing = halves[tid] > 1 and str(getattr(part, "open_close", "")).upper() == "C"
+            name = f"{tid}~C" if closing else tid
+            dated = getattr(part, "date_time", None)
+            when = (not dated, str(dated or ""), broker_of[i], account_of[i], tid, closing)
+            mine.append((when, order_id, name))
+            holder[(order_id, name)] = i
+            if order_id not in first or when < first[order_id][0]:
+                first[order_id] = (when, i)
+            at = (broker_of[i], account_of[i], order_id)
+            if at not in first_in or when < first_in[at][0]:
+                first_in[at] = (when, i)
+        held.append(mine)
 
-    # The card each order id names, among the cards the window built before any
-    # link is applied: the one card that filled it, nearly always. Where several
-    # did, the card whose anchor it is; else one holding an episode whose anchor
-    # it is (a card since merged into a bigger one by a later fill); else the one
-    # with the fewest own orders below it (the nearest to answering to it: a
-    # later fill of a lower order moves a card's anchor, and the card that closed
-    # with the order already had lower ones). Then the one that took the order's
-    # first execution, then the one whose own orders, and then fills, sort first.
-    # Nothing here reads the order of the episode list, and hand links and
-    # journal entries read an id the same way.
-    window = _members(find, len(episodes))
-    owners: dict[str, list[int]] = {}
-    for root, idxs in window.items():
-        for order_id in orders_of(idxs):
-            owners.setdefault(order_id, []).append(root)
-    # What `nearness` reads of a card, built once per card and only for the
-    # cards that share an order, so the common case costs one pass.
-    seen: dict[int, tuple[dict[str, int], set[str | None],
-                          dict[str, tuple[bool, str, bool]], tuple[Any, ...]]] = {}
-
-    def nearness(root: int, order_id: str) -> tuple[Any, ...]:
-        if root not in seen:
-            idxs = window[root]
-            own_ids = sorted(orders_of(idxs), key=lambda oid: (_order_sort_key(oid), oid))
-            first: dict[str, tuple[bool, str, bool]] = {}
-            for i in idxs:
-                for tid, part in (getattr(episodes[i], "fill_parts", None) or {}).items():
-                    oid = order_of_trade.get(str(tid))
-                    if oid is not None and (oid not in first or _taken_first(part) < first[oid]):
-                        first[oid] = _taken_first(part)
-            seen[root] = (
-                {oid: rank for rank, oid in enumerate(own_ids)},
-                {_lowest(orders_of_episode.get(i, ())) for i in idxs},
-                first,
-                (own_ids, sorted(str(t) for i in idxs
-                                 for t in getattr(episodes[i], "trade_ids", ()) or ())))
-        rank_of, heads, first, rest = seen[root]
-        rank = rank_of[order_id]
-        return (0 if rank == 0 else 1 if order_id in heads else 2, rank,
-                first.get(order_id, (True, "", True)), rest)
-
-    def nearest(roots: list[int], order_id: str) -> int:
-        if len(roots) == 1:
-            return roots[0]
-        return min(roots, key=lambda root: nearness(root, order_id))
-
-    def card_of(order_id: str) -> int | None:
-        roots = owners.get(order_id)
-        return window[nearest(roots, order_id)][0] if roots else None
+    def episode_of(filed: str) -> int | None:
+        """The episode holding the fill a hand link's end names."""
+        order_id, sep, name = filed.partition("~")
+        if sep:
+            return holder.get((order_id, name))
+        hit = first.get(filed)
+        return hit[1] if hit else None
 
     applied: list[tuple[int, tuple[str, str]]] = []
     for a, b in links:
-        ia, ib = card_of(str(a)), card_of(str(b))
+        ia, ib = episode_of(str(a)), episode_of(str(b))
         if ia is not None and ib is not None:
             union(ia, ib)
             applied.append((ia, (str(a), str(b))))
 
-    members = _members(find, len(episodes)) if applied else window
+    members = _members(find, len(episodes))
     links_of_root: dict[int, list[tuple[str, str]]] = {}
     for i, pair in applied:
         links_of_root.setdefault(find(i), []).append(pair)
-    ceded: dict[int, set[str]] = {}
-    for order_id, roots in owners.items():
-        if len(roots) > 1:
-            named = find(nearest(roots, order_id))
-            for root in roots:
-                if find(root) != named:
-                    ceded.setdefault(find(root), set()).add(order_id)
+    firsts_of: dict[int, list[tuple[str, str, str]]] = {}
+    for at, (_when, i) in first_in.items():
+        firsts_of.setdefault(i, []).append(at)
+
+    def key_of(idxs: list[int]) -> tuple[str, str, str] | None:
+        lowest = _lowest({order_id for i in idxs for _w, order_id, _n in held[i]})
+        if lowest is None:
+            return None
+        when, name, i = min((when, name, i) for i in idxs
+                            for when, order_id, name in held[i] if order_id == lowest)
+        plain = find(first[lowest][1]) == find(i)
+        return broker_of[i], account_of[i], lowest if plain else f"{lowest}~{name}"
 
     # What each campaign took of each order leg, per (order, contract), which is
     # the shape a leg has: its episodes' own fill parts. A leg more than one
@@ -475,7 +495,10 @@ def link(
             conids=tuple(sorted({str(getattr(e, "conid", "") or "") for e in eps})),
             order_ids=frozenset(oid for _broker, oid in own),
             orders=own,
-            ceded=frozenset(ceded.get(root, ())),
+            key=key_of(idxs),
+            parts=frozenset((broker_of[i], order_id, name) for i in idxs
+                            for _when, order_id, name in held[i]),
+            firsts=frozenset(at for i in idxs for at in firsts_of.get(i, ())),
             is_decided=decided,
             closed_at=max(
                 (str(e.closed_at) for e in eps if e.closed_at), default=None
@@ -504,6 +527,43 @@ def _members(find: Callable[[int], int], count: int) -> dict[int, list[int]]:
     for i in range(count):
         members.setdefault(find(i), []).append(i)
     return members
+
+
+def _parts_of(episode: Any) -> dict[str, Any]:
+    """An episode's fill parts by trade id (`history.FillPart`), with None for a
+    fill it lists without one."""
+    parts = {str(tid): part for tid, part in (getattr(episode, "fill_parts", None) or {}).items()}
+    for tid in getattr(episode, "trade_ids", ()) or ():
+        parts.setdefault(str(tid), None)
+    return parts
+
+
+def named(cards: Iterable[Campaign]) -> Callable[[str, str, str], Campaign | None]:
+    """The card a stored `(broker, account_id, id)` names, or None for none.
+
+    The card whose key it is; else, for `{order}~{part}`, the card holding that
+    part; else, for a plain order id, the card holding that order's first fill
+    in that account. See "What a card is filed under" in the module docstring.
+    """
+    by_key: dict[tuple[str, str, str], Campaign] = {}
+    by_part: dict[tuple[str, str, str], Campaign] = {}
+    by_first: dict[tuple[str, str, str], Campaign] = {}
+    for card in cards:
+        if card.key is not None:
+            by_key[card.key] = card
+        by_part.update(dict.fromkeys(card.parts, card))
+        by_first.update(dict.fromkeys(card.firsts, card))
+
+    def find(broker: str, account_id: str, filed: str) -> Campaign | None:
+        hit = by_key.get((broker, account_id, filed))
+        if hit is not None:
+            return hit
+        order_id, sep, name = filed.partition("~")
+        if sep:
+            return by_part.get((broker, order_id, name))
+        return by_first.get((broker, account_id, filed))
+
+    return find
 
 
 def _lowest(order_ids: Iterable[str]) -> str | None:

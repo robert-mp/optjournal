@@ -1150,8 +1150,10 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string|null} closed_at
  * @property {Array} conids
  * @property {string|null} anchor -- the decision's stable handle, an IBKR order
- *   id (campaigns.Campaign.anchor). Null for a card no campaign claims, which has
- *   no order to file writing under. Index into State.journal
+ *   id, or `{order}~{fill}` where another card holds that order's first fill
+ *   (campaigns.Campaign.anchor). Unique among the cards, so it names one editor
+ *   and one journal row. Null for a card no campaign claims, which has no order
+ *   to file writing under. Index into State.journal
  * @property {Array} links -- [order, order] pairs the reader joined by hand
  *   (campaigns.Campaign.links), so the card can offer to undo exactly those
  * @property {number} episodes
@@ -1232,7 +1234,9 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *  (journal.Entry.payload). Every field is nullable: an entry exists the moment
  *  ANY of them is written, and a plan noted at entry sits beside a review that
  *  will not be written for weeks
- * @property {string} anchor
+ * @property {string} broker
+ * @property {string} anchor -- the row's own key: the card's anchor, or the id it
+ *   was filed under before the card it was written on regrouped
  * @property {string} account_id
  * @property {string|null} underlying
  * @property {string|null} opened_on

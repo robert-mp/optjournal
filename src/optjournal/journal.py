@@ -21,7 +21,10 @@ clustering heuristic, and its `episode_indices` are positions in a list that is
 itself rebuilt, so keying notes on any of that would lose them the first time a
 roll changed a grouping. `Campaign.anchor` is the lowest order id the decision
 filled under: IBKR issued it, it names one placement forever, and it does not
-move when the campaign grows.
+move when the campaign grows. Where another card holds that order's first fill
+(a GTC order filling again after its first position closed, one order allocated
+to two accounts) it is the order and the card's own fill of it, so no two cards
+share a row; `campaigns`' docstring states the rule.
 
 The anchor can still be orphaned -- a fill arriving inside the 90-second window
 could join a cluster and lower its anchor -- so an entry also records the
@@ -136,6 +139,7 @@ class Entry:
 
     def payload(self) -> dict[str, Any]:
         return {
+            "broker": self.broker,
             "anchor": self.anchor_order_id,
             "account_id": self.account_id,
             "underlying": self.underlying_symbol,
