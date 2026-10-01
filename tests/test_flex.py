@@ -1186,6 +1186,70 @@ def test_a_read_never_returns_an_answer_asked_for_before_it_began(monkeypatch):
     assert first["token"] == "OLD-TOKEN-1111"
 
 
+def _slow(seconds: float, store: dict[str, str]):
+    """A `get_password` that answers every call, `seconds` after it is asked."""
+    import time
+
+    def get_password(service, account):
+        time.sleep(seconds)
+        return store.get(account)
+
+    return get_password
+
+
+def test_a_read_behind_a_slow_answer_says_the_keychain_is_slow(monkeypatch):
+    """Two overlapping reads cost two round trips now, so the later one can run
+    out of time against a keychain that answers every call. It said "waiting
+    for you to unlock it", which nothing was; it says the keychain is slow and
+    how long the read before it took."""
+    import time
+
+    monkeypatch.setattr(flex.keyring, "get_password", _slow(0.3, {"someone": "tok"}))
+    first = threading.Thread(target=lambda: flex.read_token("someone", timeout_s=2.0))
+    first.start()
+    time.sleep(0.05)
+    try:
+        with pytest.raises(flex.TokenUnreadable) as caught:
+            flex.read_token("someone", timeout_s=0.4)
+    finally:
+        first.join()
+        _drain(threading.Event())
+    message = str(caught.value)
+    assert "slow" in message and "the read before this one" in message, message
+    assert "unlock" not in message, message
+    assert "Always Allow" in message, "a per-read macOS prompt looks the same"
+
+
+def test_a_burst_of_saves_against_a_working_keychain_is_never_refused(monkeypatch):
+    """Each successful save let the next read start a call, so a few saves made
+    while reads were pending filled the cap against a keychain answering every
+    call in a fraction of a second, and the next read was refused as "4 reads
+    ... have not returned ... restart". At the cap a read waits on a call that is
+    merely pending; only calls stuck for good refuse it."""
+    import time
+
+    store: dict[str, str] = {}
+    monkeypatch.setattr(flex.keyring, "get_password", _slow(0.3, store))
+    monkeypatch.setattr(flex.keyring, "set_password",
+                        lambda service, account, token: store.__setitem__(account, token))
+    readers = []
+    try:
+        for i in range(4):
+            reader = threading.Thread(
+                target=lambda: flex.read_token("someone", timeout_s=2.0))
+            reader.start()
+            readers.append(reader)
+            time.sleep(0.01)
+            flex.write_token(f"12345678{i}", "someone")
+            time.sleep(0.01)
+        assert flex.read_token("someone", timeout_s=2.0) == "123456783"
+        assert _keyring_threads() <= flex.KEYRING_MAX_PENDING + 1
+    finally:
+        for reader in readers:
+            reader.join()
+        _drain(threading.Event())
+
+
 def test_a_keychain_that_does_not_answer_fails_the_sync_job_with_the_cause(
     tmp_path, monkeypatch,
 ):

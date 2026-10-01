@@ -8074,6 +8074,36 @@ def test_a_save_at_the_cap_of_stuck_reads_is_read_by_the_next_check(
         _drain_keyring(release)
 
 
+def test_a_check_behind_a_pending_read_has_room_for_its_own(tmp_path, monkeypatch):
+    """A Check never takes an answer asked for before it began, so behind a
+    fetch's read it waits for that one and then asks: two round trips. Its
+    deadline is two of the write's, so a keychain answering within the write's
+    deadline still answers the Check."""
+    import threading  # noqa: PLC0415 - local to this test
+    import time  # noqa: PLC0415
+
+    import keyring  # noqa: PLC0415
+
+    from optjournal import flex  # noqa: PLC0415
+
+    def answers_in_a_moment(service, account):
+        time.sleep(0.25)
+        return "tok"
+
+    monkeypatch.setattr(web, "KEYRING_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(keyring, "get_password", answers_in_a_moment)
+    fetch = threading.Thread(target=lambda: flex.read_token(timeout_s=2.0))
+    try:
+        with web.serve_ephemeral(db_path=tmp_path / "j.db", archive_dir=tmp_path) as base:
+            fetch.start()
+            time.sleep(0.05)
+            status, reply = _get(base, "/api/settings/token")
+    finally:
+        fetch.join()
+        _drain_keyring(threading.Event())
+    assert (status, reply["present"]) == (200, True), reply
+
+
 def test_a_keychain_past_the_read_deadline_is_unreadable_not_absent(
     tmp_path, monkeypatch,
 ):
