@@ -416,6 +416,7 @@ class _KeyringCall:
     def __init__(self, account: str) -> None:
         self.account = account
         self.started = time.monotonic()
+        self.finished = self.started
         self.done = threading.Event()
         self.answer: object = None
 
@@ -425,6 +426,7 @@ class _KeyringCall:
         except Exception as exc:  # noqa: BLE001 - handed to every reader
             self.answer = exc
         finally:
+            self.finished = time.monotonic()
             self.done.set()
 
 
@@ -479,7 +481,12 @@ class _Keyring:
                     and now - newest.started < _stuck_after()):
                 return False, newest
             if len(self.pending) >= KEYRING_MAX_PENDING + int(since_save):
-                return False, None
+                # At the cap. A call merely pending is waited on, then asked
+                # after, like any older call: saves made while reads were in
+                # flight fill the cap against a keychain that answers. Only
+                # calls stuck for good refuse a read.
+                live = [c for c in self.pending if now - c.started < _stuck_after()]
+                return False, (live[-1] if live else None)
             call = _KeyringCall(account)
             self.pending.append(call)
         threading.Thread(target=call.run, name="keyring-read", daemon=True).start()
@@ -499,17 +506,23 @@ def _stuck_after() -> float:
 _KEYRING = _Keyring()
 
 
-def _unreadable(call: _KeyringCall | None, arrived: float, wait_s: float) -> str:
-    """Why a read got no answer, and what clears it."""
+def _unreadable(
+    call: _KeyringCall | None, arrived: float, wait_s: float,
+    behind: _KeyringCall | None = None,
+) -> str:
+    """Why a read got no answer, and what clears it.
+
+    `behind` is an older call this read waited for, which answered during it.
+    """
     now = time.monotonic()
     if call is None:
         count, oldest = _KEYRING.wedged(now)
         return (
             f"{count} reads of the OS keyring have not returned, the "
             f"oldest after {oldest:.0f}s, so no more are started. "
-            f"Nothing was sent to IBKR. The keychain is waiting on an unlock prompt: "
-            f"unlock it if one is showing, and if none is, restart optjournal, "
-            f"which clears them."
+            f"Nothing was sent to IBKR. The keychain is usually waiting on a prompt "
+            f"nobody answered: unlock it if one is showing, and if none is, "
+            f"restart optjournal, which clears them."
         )
     if arrived - call.started >= KEYRING_READ_TIMEOUT_S:
         return (
@@ -517,6 +530,16 @@ def _unreadable(call: _KeyringCall | None, arrived: float, wait_s: float) -> str
             f"{now - call.started:.0f}s, usually a keychain waiting on an unlock "
             f"prompt nobody answered. Nothing was sent to IBKR. Unlock the keychain "
             f"if a prompt is showing; if none is, restart optjournal, which clears it."
+        )
+    if behind is not None:
+        # The keychain answered the call before this one, so it is not waiting
+        # on an unlock. It is slow, or it asked again (see `read_token`).
+        return (
+            f"the OS keyring is slow or asking again: it took "
+            f"{behind.finished - behind.started:.1f}s to answer the read before this "
+            f"one, and this one got no answer within {wait_s:g}s. Nothing was sent "
+            f"to IBKR. If macOS asks for permission on every read, choose Always "
+            f"Allow so it stops; otherwise try again."
         )
     return (
         f"the OS keyring did not answer within {wait_s:g}s, usually because it is "
@@ -532,10 +555,19 @@ def read_token(account: str | None = None, *, timeout_s: float | None = None) ->
     created:  security add-generic-password -a "$USER" -s ibkr-flex-token -w
 
     Waits `timeout_s` (default `KEYRING_READ_TIMEOUT_S`) and raises
-    `TokenUnreadable` past it, saying whether the keychain is merely slow to
-    answer or a call is stuck. A call already pending from before the read began
-    is waited for and then asked again, never taken (see `_Keyring`). An error
-    the keyring backend raises is raised as itself.
+    `TokenUnreadable` past it, saying whether the keychain is slow to answer or a
+    call is stuck. A call already pending from before the read began is waited
+    for and then asked again, never taken (see `_Keyring`). An error the keyring
+    backend raises is raised as itself.
+
+    THE COST OF ASKING AGAIN, accepted rather than fixed. A read behind another
+    pays two round trips, so against a slow keychain the later one can run out
+    of time; the message says the keychain is slow. And on macOS, a prompt
+    answered with "Allow" grants ONE read: the read waiting behind it then asks
+    again, the keychain shows a second prompt, and that read fails if nobody
+    answers it. Taking the first call's answer instead would avoid both, and
+    is exactly what let a read return a token replaced before it began. So the
+    message on that path, and the README, say to choose "Always Allow".
     """
     if account is None:
         import getpass
@@ -545,6 +577,7 @@ def read_token(account: str | None = None, *, timeout_s: float | None = None) ->
     wait_s = KEYRING_READ_TIMEOUT_S if timeout_s is None else timeout_s
     arrived = time.monotonic()
     deadline = arrived + wait_s
+    behind: _KeyringCall | None = None
     while True:
         answers, call = _KEYRING.next_call(account, arrived)
         if call is None:
@@ -555,8 +588,10 @@ def read_token(account: str | None = None, *, timeout_s: float | None = None) ->
         finished = call.done.wait(max(0.0, until - time.monotonic()))
         if finished and answers:
             break
-        if not finished and time.monotonic() >= deadline:
-            raise TokenUnreadable(_unreadable(call, arrived, wait_s))
+        if finished:
+            behind = call
+        elif time.monotonic() >= deadline:
+            raise TokenUnreadable(_unreadable(call, arrived, wait_s, behind))
     answer = call.answer
     if isinstance(answer, Exception):
         raise answer

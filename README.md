@@ -75,6 +75,12 @@ token but never read it back, so it reports presence and never a value — and
 since only a real fetch can tell whether IBKR still accepts what it was given,
 press **Sync** after saving.
 
+On macOS the keychain may ask whether optjournal (it can appear as Python) may
+read the token. Choose **Always Allow**. **Allow** grants a single read, and
+optjournal asks the keychain afresh for every read rather than reuse an answer
+given before the read began, which is what keeps a token replaced elsewhere from
+being read stale. With **Allow**, every Check and every scheduled sync asks again.
+
 No IBKR account handy? `uv run optjournal demo` writes synthetic data to
 `demo/`, and `uv run optjournal serve --demo` browses it.
 

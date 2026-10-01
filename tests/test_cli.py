@@ -817,6 +817,26 @@ def test_ingest_names_a_value_py_ibkr_does_not_declare(tmp_path, capsys):
 
 
 @pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
+def test_each_run_names_the_undeclared_values_it_met_and_no_others(tmp_path, capsys):
+    """The notes were process-wide sets, never cleared, and a value was recorded
+    only the first time the process met it. So a second run in one process
+    repeated the first run's notes, about a file it never read, and stopped
+    naming a value it did read again. Seen as a shuffled-suite failure."""
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    path = tmp_path / "activity-unfamiliar.xml"
+    path.write_text(text.replace('orderType="LMT"', 'orderType="LIT"', 1), encoding="utf-8")
+    bad = tmp_path / "activity-bad.xml"
+    bad.write_bytes(b"<FlexQueryResponse")
+
+    assert main(["ingest", str(path), "--db", str(tmp_path / "a.db")]) == 0
+    assert "OrderType=LIT" in capsys.readouterr().err
+    main(["show", str(bad)])
+    assert "does not declare" not in capsys.readouterr().err, "a note from another run"
+    assert main(["ingest", str(path), "--db", str(tmp_path / "b.db")]) == 0
+    assert "OrderType=LIT" in capsys.readouterr().err, "met again, and not named"
+
+
+@pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
 @pytest.mark.parametrize("command", ["costs", "show", "ingest"])
 def test_a_statement_with_a_malformed_number_is_one_line_not_a_traceback(
     tmp_path, capsys, command,

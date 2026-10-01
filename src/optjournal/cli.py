@@ -1760,6 +1760,10 @@ def _configure_logging(args) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _configure_logging(args)
+    # The notes below are about THIS run. The sets are process-wide, so a second
+    # run in one process repeated the first one's notes about a file it never read.
+    unknown_codes.clear()
+    unknown_values.clear()
 
     try:
         code = args.func(args)

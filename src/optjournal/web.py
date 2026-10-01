@@ -1499,8 +1499,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         Reports PRESENCE, never the value, and never whether IBKR accepts it:
         only a real fetch can answer that, and that costs a request.
 
-        The read is `flex.read_token` with this endpoint's deadline, on the
-        request's own thread. NOT through `_keyring_call`: `flex` already bounds
+        The read is `flex.read_token` with twice this endpoint's write deadline,
+        on the request's own thread. NOT through `_keyring_call`: `flex` already bounds
         the keychain calls, shared with the fetches, and a check that took the
         one-worker slot while it waited on a stuck call made a Save pressed
         straight after it answer 503, "Nothing was stored".
@@ -1509,7 +1509,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         account = getpass.getuser()
         try:
-            read_token(account, timeout_s=KEYRING_TIMEOUT_S)
+            # Two of the write's deadline: a read never takes an answer asked for
+            # before it began, so behind a fetch's read it waits for that one and
+            # then asks, two round trips where a write makes one.
+            read_token(account, timeout_s=2 * KEYRING_TIMEOUT_S)
         except TokenUnreadable as exc:
             # A `TokenMissing`, but not absent: a pending unlock prompt is this.
             log.warning("keyring unreadable: %s", exc)
