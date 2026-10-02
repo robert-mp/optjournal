@@ -228,29 +228,6 @@ def test_entries_is_keyed_for_lookup_by_a_page_full_of_decisions(db):
     assert set(got) == {("ibkr", "U1", "1"), ("ibkr", "U1", "2")}
 
 
-def test_an_entry_whose_campaign_regrouped_is_reported_not_lost(db):
-    """The one way this key can fail, and what happens when it does.
-
-    Membership is decided by a 90-second window, so a fill arriving late inside
-    it can join a cluster and LOWER the campaign's anchor. The note written
-    against the old anchor then points at no campaign. It still records its
-    underlying and open date, so it is something a reader can act on -- the row
-    reads "the META decision opened 2026-08-03" -- rather than a loss they never
-    hear about.
-    """
-    _save(db, plan_target="take at 50%")
-    journal.save(db, "1299999999", account_id="U1", underlying_symbol="GOOG",
-                 opened_on="2026-08-04", values={"plan_target": "still live"})
-
-    orphaned = journal.orphans(db, live_anchors={"1299999999"})
-
-    assert [e.anchor_order_id for e in orphaned] == ["1241544513"]
-    assert (orphaned[0].underlying_symbol, orphaned[0].opened_on) == (
-        "META", "2026-08-03"
-    ), "an orphan that cannot say which decision it belonged to is a loss"
-    assert orphaned[0].values["plan_target"] == "take at 50%", "the text went"
-
-
 def test_deleting_an_entry_reports_whether_a_row_went(db):
     _save(db, plan_target="take at 50%")
 
@@ -610,10 +587,13 @@ def test_a_link_finds_the_card_whose_anchor_it_names(db):
 def test_an_entry_under_an_order_no_card_answers_to_shows_on_the_card_that_filled_it(db):
     """A position opened by 100 gets a later fill of a lower order, 90: its
     anchor moves to 90. The note written under 100 stays on the card that filled
-    100. A row filed under the card's own key is the one it shows, and the older
-    one is then listed with the orphans, not lost."""
+    100. The released version then filed the next write-up under 90 and showed
+    that one: so does this, the newer of the two, and the older is listed with
+    the orphans, not lost."""
     _journal_of(db, [("t1", "U1", "100", "2026-09-02 10:00:00", 1, "O", None)])
     _write(db, "100")
+    db.execute("UPDATE journal_entries SET created_at = '2026-09-02T12:00:00+00:00'")
+    db.commit()
     _journal_of(db, [("t2", "U1", "90", "2026-09-02 11:00:00", 1, "O", None)],
                 statement=False)
     assert [anchor for anchor, _ in _cards(db)] == ["90"]
@@ -701,7 +681,7 @@ def test_one_order_allocated_to_two_positions_leaves_each_its_own_note(
     """Y (U2, from 200) and X (U1, from 300) each have a note; then order 100,
     allocated to both accounts, adds to both. Both answered to 100, so both drew
     one note and the other was listed. X, whose account sorts first, now answers
-    to 100 and Y to its own fill of it, and each shows its own note, whichever
+    to 100 and Y to its own first fill, and each shows its own note, whichever
     card comes first in the episode list."""
     import dataclasses
 
@@ -714,7 +694,7 @@ def test_one_order_allocated_to_two_positions_leaves_each_its_own_note(
     _journal_of(db, [("t3", "U1", "100", "2026-09-03 10:00:00", -1, "O", None),
                      ("t4", "U2", "100", "2026-09-03 10:00:00", -1, "O", None)],
                 statement=False)
-    assert [a for a, _ in _cards(db)] == ["100", "100~t4"]
+    assert [a for a, _ in _cards(db)] == ["100", "t:t1"]
     as_built = serialize.journal_data(db)
     real = serialize.build_history
 
@@ -725,7 +705,7 @@ def test_one_order_allocated_to_two_positions_leaves_each_its_own_note(
     monkeypatch.setattr(serialize, "build_history", reversed_history)
     assert serialize.journal_data(db) == as_built
     assert {a: e["entry_note"] for a, e in as_built["entries"].items()} == {
-        "100": "note 300", "100~t4": "note 200"}
+        "100": "note 300", "t:t1": "note 200"}
     assert as_built["orphans"] == []
 
 
@@ -739,12 +719,14 @@ def _matching_seconds(n: int) -> float:
     cards = [Campaign(episode_indices=(k,), conids=("1",),
                       order_ids=frozenset({str(10_000 + k)}), is_decided=False,
                       closed_at=None, realized=None, commission=None,
-                      key=("ibkr", "U1", str(10_000 + k)))
+                      anchor=str(10_000 + k), key=("ibkr", "U1", f"t:x{k}"),
+                      parts={("ibkr", f"x{k}"): (False, f"2026-09-01 {k}")})
              for k in range(n)]
-    written = {("ibkr", "U1", str(10_000 + k)): journal.Entry(
-        broker="ibkr", account_id="U1", anchor_order_id=str(10_000 + k),
+    written = {("ibkr", "U1", f"t:x{k}"): journal.Entry(
+        broker="ibkr", account_id="U1", anchor_order_id=f"t:x{k}",
         underlying_symbol=None, opened_on=None, created_at="", updated_at="",
         values={"entry_note": "n"}) for k in range(n)}
+    assert len(journal_shown(written, cards)) == n, "every entry is on its card"
     best = float("inf")
     for _ in range(5):
         start = time.perf_counter()

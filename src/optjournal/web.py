@@ -254,26 +254,43 @@ def _tiles_problem(tiles: Any) -> str | None:
 _JOURNAL_CONTROL = frozenset({"anchor", "broker", "account", "shows"})
 
 
-def _the_card(cards: list[Any], anchor: str, body: dict[str, Any]) -> tuple[Any, str | None]:
-    """The one current card `anchor` names, or None and why not.
+def _the_card(cards: list[Any], anchor: str, body: dict[str, Any], *,
+              after: str) -> tuple[Any, str | None]:
+    """The one current card `anchor` names, or None and why not, ending `after`.
 
-    An anchor is unique among the current cards (`campaigns.Campaign.key`), so
-    it names one card or none: none where the statements since the page loaded
-    regrouped the card it was drawn on. A `broker` or `account` the body sends
-    must be that card's, so a stale page cannot file writing under the wrong
-    account's row either.
+    An anchor is unique among the current cards (`campaigns.Campaign.anchor`),
+    so it names one card or none: none where the statements since the page
+    loaded regrouped the card it was drawn on. A `broker` or `account` the body
+    sends must be that card's, so a stale page cannot file writing under the
+    wrong account's row either.
     """
-    cards = [c for c in cards if c.anchor == anchor
+    cards = [c for c in cards if c.anchor == anchor and c.key is not None
              and all(body.get(name) in (None, "", c.key[k])
                      for name, k in (("broker", 0), ("account", 1)))]
     if len(cards) == 1:
         return cards[0], None
     if not cards:
         return None, (f"no current position is filed under {anchor}: a statement "
-                      f"since this page loaded has regrouped it. Reload the page and "
-                      f"try again. Nothing was changed.")
+                      f"since this page loaded has regrouped it. {after}")
     return None, (f"{anchor} names {len(cards)} current positions, so there is no "
-                  f"telling which one this is about. Nothing was changed.")
+                  f"telling which one this is about. {after}")
+
+
+#: What a refused journal write tells the reader to do. Not to reload: the
+#: editor does not survive a reload, so that loses what they typed.
+_KEEP_TEXT = ("Copy what you typed before you reload the page, since reloading "
+              "closes this editor. Nothing was saved.")
+
+
+def _shows(body: dict[str, Any]) -> tuple[str, str, str] | None | str:
+    """The row the page says the card shows, None for none, or "bad" when
+    `shows` is not null or three strings."""
+    said = body.get("shows")
+    if said is None:
+        return None
+    if isinstance(said, list) and len(said) == 3 and all(isinstance(x, str) for x in said):
+        return (said[0], said[1], said[2])
+    return "bad"
 
 #: The watchlist columns a request may write, in the order the upsert names them.
 #: A tuple rather than "whatever keys the body has", because these names are
@@ -1891,54 +1908,65 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # would post successfully and the text would never be seen again, which for
         # this table means gone, since nothing can re-derive it. `journal.save`
         # decides what is writable, in one place, and refuses the rest loudly.
+        told = _shows(body)
+        if told == "bad":
+            return 400, {"ok": False, "kind": "journal",
+                         "message": "`shows` must be null or the [broker, account, "
+                                    "anchor] of the entry the card shows. Nothing "
+                                    "was saved."}
         values = {k: v for k, v in body.items() if k not in _JOURNAL_CONTROL}
         with open_journal(self.cfg.db_path) as conn:
-            order_id = anchor.partition("~")[0]
-            if conn.execute("SELECT 1 FROM trades WHERE ib_order_id = ? LIMIT 1",
-                            (order_id,)).fetchone() is None:
+            if anchor.startswith("t:"):
+                seen = conn.execute("SELECT 1 FROM trades WHERE trade_id = ? LIMIT 1",
+                                    (anchor[2:].partition("~")[0],)).fetchone()
+            else:
+                seen = conn.execute("SELECT 1 FROM trades WHERE ib_order_id = ? LIMIT 1",
+                                    (anchor,)).fetchone()
+            if seen is None:
                 return 404, {
                     "ok": False, "kind": "anchor",
-                    "message": f"no fill in this journal was placed under order "
-                               f"{order_id}, so there is no decision to write up.",
+                    "message": f"no fill in this journal is {anchor}, so there is "
+                               f"no decision to write up.",
                 }
-            # The row is the card's: its broker and account, and the anchor that
-            # names it alone. Never the order's alone, which a GTC order that
-            # filled again, or one allocated to two accounts, gives two cards.
             cards = journal_cards(conn)
-            card, why = _the_card(cards, anchor, body)
+            card, why = _the_card(cards, anchor, body, after=_KEEP_TEXT)
             if card is None:
                 return 409, {"ok": False, "kind": "stale", "message": why}
-            broker, account, _anchor = card.key
-            # The row the card shows, which the write edits: where it was filed
-            # under another id (the card's anchor has moved since), it is moved
-            # to the card's key in the same transaction, so editing it leaves one
-            # row and emptying it deletes it. The page says which row it shows,
-            # and a row that no longer is this card's is refused, not re-keyed.
+            # The row the card shows is the one the write edits, IN PLACE under
+            # its own key: a key names a fill, which stays with its card, so the
+            # row stays on the card it was written on whatever links and later
+            # statements do. A card showing none starts one under its own key.
+            # The page says which row it shows, and is refused where that is no
+            # longer this card's, which a write could only get wrong.
             shown = journal_shown(journal.entries(conn), cards).get(anchor)
             showing = (None if shown is None else
                        (shown.broker, shown.account_id, shown.anchor_order_id))
-            said = body.get("shows")
-            told = None if said is None else tuple(str(x) for x in said)
+            own = (card.key, (card.key[0], card.key[1], card.anchor))
             if ("shows" in body and told != showing) or (
-                    "shows" not in body and showing not in (None, card.key)):
+                    "shows" not in body and showing is not None and showing not in own):
                 return 409, {
                     "ok": False, "kind": "stale",
                     "message": "this position's write-up has changed since the page "
-                               "loaded. Reload the page and save again. Nothing was "
-                               "saved."}
-            trades = sorted({part.partition("~")[0] for _b, _o, part in card.parts})
-            target = conn.execute(
-                # Options carry the underlying; equities ARE it.
-                "SELECT COALESCE(underlying_symbol, symbol) AS underlying,"
-                f" MIN(trade_date) AS opened_on FROM trades WHERE broker = ?"
-                f" AND trade_id IN ({', '.join('?' for _ in trades)})",
-                (broker, *trades),
-            ).fetchone()
+                               f"loaded, so saving here could overwrite other text. "
+                               f"{_KEEP_TEXT}"}
+            if shown is not None:
+                broker, account, filed = shown.broker, shown.account_id, shown.anchor_order_id
+                underlying, opened_on = shown.underlying_symbol, shown.opened_on
+            else:
+                broker, account, filed = card.key
+                trades = sorted({part.partition("~")[0] for _b, part in card.parts})
+                target = conn.execute(
+                    # Options carry the underlying; equities ARE it.
+                    "SELECT COALESCE(underlying_symbol, symbol) AS underlying,"
+                    f" MIN(trade_date) AS opened_on FROM trades WHERE broker = ?"
+                    f" AND trade_id IN ({', '.join('?' for _ in trades)})",
+                    (broker, *trades),
+                ).fetchone()
+                underlying, opened_on = target["underlying"], target["opened_on"]
             try:
                 entry = journal.save(
-                    conn, anchor, account_id=account, values=values,
-                    underlying_symbol=target["underlying"],
-                    opened_on=target["opened_on"], broker=broker, replacing=showing,
+                    conn, filed, account_id=account, values=values,
+                    underlying_symbol=underlying, opened_on=opened_on, broker=broker,
                 )
             except journal.JournalError as exc:
                 return 400, {"ok": False, "kind": "journal", "message": str(exc)}
@@ -1968,10 +1996,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """Join two decisions by hand, or undo a join.
 
         The body names two ANCHORS, the handles of the two cards, and
-        `unlink: true` to remove the pair instead. Both must be orders this
-        journal holds fills for, on one underlying: a roll continues a position,
-        and joining two symbols would merge two decisions the reader can then
-        only see as one.
+        `unlink: true` to remove the pair instead, as stored (`Lifecycle.links`).
+        Both must be current cards, on one underlying: a roll continues a
+        position, and joining two symbols would merge two decisions the reader
+        can then only see as one. The pair is stored under the two cards' keys,
+        their first fills, so it stays with the fills it joined.
 
         REFUSED when it would hide writing. A card shows one write-up, so where
         BOTH cards show one, whatever id each was filed under, the joined card
@@ -1984,7 +2013,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         a = str(body.get("anchor") or "").strip()
         b = str(body.get("joins") or "").strip()
         broker = str(body.get("broker") or DEFAULT_BROKER).strip()
-        order_of = {a: a.partition("~")[0], b: b.partition("~")[0]}
         if not a or not b:
             return 400, {"ok": False, "kind": "link",
                          "message": "a link needs two positions to join."}
@@ -1995,30 +2023,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if body.get("unlink"):
                 gone = journal.unlink(conn, a, b, broker=broker)
                 return 200, {"ok": True, "kind": "link", "removed": gone}
-            unders: dict[str, Any] = {}
-            for end in (a, b):
-                row = conn.execute(
-                    "SELECT COALESCE(underlying_symbol, symbol) AS u FROM trades"
-                    " WHERE broker = ? AND ib_order_id = ? LIMIT 1",
-                    (broker, order_of[end]),
-                ).fetchone()
-                if row is None:
-                    return 404, {"ok": False, "kind": "link",
-                                 "message": f"no fill in this journal was placed "
-                                            f"under order {order_of[end]}."}
-                unders[end] = row["u"]
             # Each end the one current card it names, as a journal write's is:
             # the anchor alone, never the order, which can name two cards.
             cards = journal_cards(conn)
             ends = []
             for end in (a, b):
-                card, why = _the_card(cards, end, {"broker": broker})
+                card, why = _the_card(cards, end, {"broker": broker},
+                                      after="Reload the page and link again. Nothing "
+                                            "was linked.")
                 if card is None:
                     return 409, {"ok": False, "kind": "stale", "message": why}
                 ends.append(card)
-            if unders[a] != unders[b]:
+            unders = [conn.execute(
+                "SELECT COALESCE(underlying_symbol, symbol) AS u FROM trades"
+                " WHERE broker = ? AND trade_id = ?",
+                (card.key[0], card.key[2][2:].partition("~")[0])).fetchone()["u"]
+                for card in ends]
+            if unders[0] != unders[1]:
                 return 400, {"ok": False, "kind": "link",
-                             "message": f"{unders[a]} and {unders[b]} are different "
+                             "message": f"{unders[0]} and {unders[1]} are different "
                                         f"underlyings, so they cannot be one "
                                         f"position."}
             shown = journal_shown(journal.entries(conn), cards)
@@ -2030,7 +2053,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                                         "and clear the other first. Nothing was "
                                         "linked."}
             try:
-                pair = journal.link(conn, a, b, broker=broker)
+                # Filed under the two cards' keys, their first fills, so the link
+                # stays with the fills it joined; see `campaigns.link`.
+                pair = journal.link(conn, ends[0].key[2], ends[1].key[2], broker=broker)
             except journal.JournalError as exc:
                 return 400, {"ok": False, "kind": "link", "message": str(exc)}
         return 200, {"ok": True, "kind": "link", "pair": list(pair)}

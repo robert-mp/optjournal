@@ -199,8 +199,8 @@ def test_the_journal_holds_only_the_database():
     rebuild, and everything it attaches to -- campaigns, episodes, statistics --
     IS rebuilt, on every ingest. So the dependency runs one way only: the layer
     that derives may read the journal, and the journal may not read the layer
-    that derives. `orphans()` is handed the live anchors for exactly this reason,
-    where computing them itself would have been shorter.
+    that derives. Which card a row belongs to is decided in `serialize`, which
+    reads both, for exactly this reason.
 
     Not `IMPORTS_LEAVES_ONLY`, because `db` is not a leaf. The property here is
     narrower and about direction rather than purity: `journal.py` can open
@@ -209,8 +209,8 @@ def test_the_journal_holds_only_the_database():
     held = sorted(_internal_imports(PACKAGE / "journal.py"))
     assert set(held) <= {"db", *LEAVES}, (
         f"journal.py imports {sorted(set(held) - {'db', *LEAVES})}. The one table "
-        "that cannot be re-derived must not depend on the layers that are: pass "
-        "what it needs in, as `orphans()` does with the live anchors."
+        "that cannot be re-derived must not depend on the layers that are: "
+        "decide in `serialize` which card a row belongs to, as it does now."
     )
 
 

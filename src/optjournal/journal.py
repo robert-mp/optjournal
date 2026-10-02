@@ -14,29 +14,30 @@ that the app could compute is a number that will disagree with the app. What is
 computable stays computed (`vol.rank` for IV rank, `campaigns` for the grouping,
 `stats` for the outcome); what is not computable is what lives here.
 
-KEYED ON AN ORDER ID. The unit a reader journals is the DECISION -- a strangle is
-one entry, and a roll continues it rather than starting a second -- and that is
+KEYED ON A FILL. The unit a reader journals is the DECISION (a strangle is one
+entry, and a roll continues it rather than starting a second), and that is
 `campaigns.Campaign`. But a campaign is rebuilt on every ingest from a 90-second
 clustering heuristic, and its `episode_indices` are positions in a list that is
 itself rebuilt, so keying notes on any of that would lose them the first time a
-roll changed a grouping. `Campaign.anchor` is the lowest order id the decision
-filled under: IBKR issued it, it names one placement forever, and it does not
-move when the campaign grows. Where another card holds that order's first fill
-(a GTC order filling again after its first position closed, one order allocated
-to two accounts) it is the order and the card's own fill of it, so no two cards
-share a row; `campaigns`' docstring states the rule.
+roll changed a grouping. A new row is filed under `t:` and the card's first fill
+(`Campaign.key`): a fill is in exactly one card, so the row stays with the
+decision it was written about while cards merge, split and gain fills. Rows the
+released code wrote are filed under the card's lowest ORDER id instead, which a
+GTC order filling twice or one order allocated to two accounts gives to two
+cards; `campaigns.named` reads those by account and by the day they record.
+`campaigns`' docstring states the rule.
 
-The anchor can still be orphaned -- a fill arriving inside the 90-second window
-could join a cluster and lower its anchor -- so an entry also records the
-underlying and the open date it was written against, and `orphans` reports any
-row no campaign claims. The row then reads as "the META decision opened
-2026-08-03" and can be re-attached by hand. Losing a reader's own writing
-silently is the one failure this table may not have.
+A row can still match no card, where a later statement or a history import
+regrouped the fills it was filed under; so an entry also records the
+underlying and the open date it was written against, and `serialize` lists any
+row no card shows. The row then reads as "the META decision opened 2026-08-03"
+and can be re-attached by hand. Losing a reader's own writing silently is the
+one failure this table may not have.
 
-A campaign built only from position snapshots has no fills, therefore no order
-id, therefore no anchor. It cannot be journalled, and `save` says so rather than
-inventing a key: a position the archive holds no fills for is one this journal
-cannot yet describe.
+A campaign built only from position snapshots has no fills, therefore no key.
+It cannot be journalled, and `save` says so rather than inventing a key: a
+position the archive holds no fills for is one this journal cannot yet
+describe.
 
 The one other thing here is a LINK: the reader saying two orders were one
 decision when the 90-second window could not see it, a roll closed one day and
@@ -63,7 +64,6 @@ __all__ = [
     "links",
     "entry_for",
     "entries",
-    "orphans",
     "save",
     "unlink",
 ]
@@ -257,7 +257,6 @@ def save(
     underlying_symbol: str | None = None,
     opened_on: str | None = None,
     broker: str = DEFAULT_BROKER,
-    replacing: tuple[str, str, str] | None = None,
 ) -> Entry | None:
     """Write one decision's entry, or delete it when nothing is left.
 
@@ -277,13 +276,6 @@ def save(
 
     `created_at` survives an update for the same reason `trades.first_seen_at`
     does: when the journal first gained this entry is a fact about the journal.
-
-    `replacing` is the key of the row a card shows when it was filed under
-    another id, `(broker, account_id, anchor)`: a card whose anchor moved shows
-    the row written under the old one. That row is moved to this key first, in
-    the same transaction, so the write edits the text the reader was shown and
-    one row remains; and emptying every field deletes it rather than leaving it
-    listed as an orphan with the text the reader cleared.
     """
     if anchor_order_id is None:
         raise JournalError(
@@ -292,31 +284,6 @@ def save(
         )
     fields = _validated(values)
     anchor = str(anchor_order_id)
-    try:
-        if replacing is not None and tuple(replacing) != (broker, account_id, anchor):
-            conn.execute(
-                "UPDATE journal_entries SET broker = ?, account_id = ?,"
-                " anchor_order_id = ? WHERE broker = ? AND account_id = ?"
-                " AND anchor_order_id = ?",
-                (broker, account_id, anchor, *replacing))
-        return _write(conn, anchor, account_id=account_id, broker=broker, fields=fields,
-                      underlying_symbol=underlying_symbol, opened_on=opened_on)
-    except BaseException:
-        conn.rollback()
-        raise
-
-
-def _write(
-    conn: sqlite3.Connection,
-    anchor: str,
-    *,
-    account_id: str,
-    broker: str,
-    fields: dict[str, str | None],
-    underlying_symbol: str | None,
-    opened_on: str | None,
-) -> Entry | None:
-    """`save` past its checks: merge, then upsert or delete, then commit."""
     existing = entry_for(conn, anchor, account_id=account_id, broker=broker)
     merged = dict(existing.values) if existing else {}
     merged.update(fields)
@@ -366,29 +333,6 @@ def delete(
     )
     conn.commit()
     return bool(cur.rowcount)
-
-
-def orphans(
-    conn: sqlite3.Connection, live_anchors: set[str]
-) -> list[Entry]:
-    """Entries no current campaign claims.
-
-    `live_anchors` is every `Campaign.anchor` the caller resolved, PASSED IN rather
-    than derived here, so the irreplaceable table's module does not acquire the
-    layer that rebuilds everything else. `tests/test_layering.py` holds that to
-    `db` alone.
-
-    Expected to be empty, and worth reporting anyway. Clustering decides
-    membership from a 90-second window, so a fill arriving late inside that window
-    can lower a campaign's anchor and leave the note written against the old one
-    pointing at nothing. The row still records its underlying and open date, so an
-    orphan is a thing a reader can act on rather than a loss they never hear
-    about.
-    """
-    return [
-        entry for key, entry in sorted(entries(conn).items())
-        if key[2] not in live_anchors
-    ]
 
 
 def _pair(a: str, b: str) -> tuple[str, str]:

@@ -32,7 +32,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from optjournal import journal
+from optjournal import campaigns, journal
 from optjournal.bars import (
     close_series,
     upsert_bars,
@@ -1096,36 +1096,40 @@ def write_demo_journal(conn) -> int:
     writer the endpoint does -- a seed that bypassed it could store a row the real
     path could not produce, which is the failure mode of every hand-built fixture.
 
-    SKIPPED where an entry already exists, which is `write_demo_watchlist`'s rule
-    and the same reasoning: this is the user-input table, `save` MERGES rather than
-    replacing, and a re-run must not be able to overwrite a sentence a reader wrote
-    into their demo database. `reset_demo_rows` leaves the table alone for the same
-    reason. The cost is stated rather than hidden: editing the seeds above does not
-    reach a demo database that already holds them.
+    SKIPPED where a card already shows an entry, which is `write_demo_watchlist`'s
+    rule and the same reasoning: this is the user-input table, `save` MERGES rather
+    than replacing, and a re-run must not be able to overwrite a sentence a reader
+    wrote into their demo database, nor add a second row beside one the released
+    version seeded. `reset_demo_rows` leaves the table alone for the same reason.
+    The cost is stated rather than hidden: editing the seeds above does not reach a
+    demo database that already holds them.
     """
-    # Filed under decisions' anchors, the key the Trades cards look an entry up
-    # by. The Nth order id was used once, and the second order is a close, so
-    # that write-up matched no card and showed only as an orphan.
+    # Filed under each card's key, its first fill, as the endpoint files a card's
+    # first write-up, with the endpoint's underlying and open date. Picked by the
+    # cards' anchors in order, as the seeds have always been.
     report = build_history(conn, asset_category="OPT")
-    anchors = sorted(
-        {c.anchor for c in campaigns_for(conn, "OPT", report.episodes) if c.anchor},
-        key=lambda a: (int(a) if a.isdigit() else math.inf, a),
+    cards = sorted(
+        ((c.anchor, c.key, c) for c in campaigns_for(conn, "OPT", report.episodes)
+         if c.key and c.anchor),
+        key=lambda row: (int(row[0]) if row[0].isdigit() else math.inf, row[0]),
     )
+    find = campaigns.named(card for *_filed, card in cards)
+    shown = {hit[0].anchor for key, entry in journal.entries(conn).items()
+             if (hit := find(*key, entry.opened_on)) is not None}
     written = 0
     for index, values in DEMO_JOURNAL:
-        if index >= len(anchors):
+        if index >= len(cards) or cards[index][0] in shown:
             continue
-        anchor = anchors[index]
-        if journal.entry_for(conn, anchor, account_id=DEMO_ACCOUNT) is not None:
-            continue
+        _anchor, (broker, account, filed), card = cards[index]
+        trades = sorted({part.partition("~")[0] for _broker, part in card.parts})
         target = conn.execute(
             "SELECT COALESCE(underlying_symbol, symbol) AS underlying,"
-            " MIN(trade_date) AS opened_on FROM trades"
-            " WHERE account_id = ? AND ib_order_id = ?",
-            (DEMO_ACCOUNT, anchor),
+            " MIN(trade_date) AS opened_on FROM trades WHERE broker = ?"
+            f" AND trade_id IN ({', '.join('?' for _ in trades)})",
+            (broker, *trades),
         ).fetchone()
         journal.save(
-            conn, anchor, account_id=DEMO_ACCOUNT, values=dict(values),
+            conn, filed, account_id=account, broker=broker, values=dict(values),
             underlying_symbol=target["underlying"],
             opened_on=target["opened_on"],
         )

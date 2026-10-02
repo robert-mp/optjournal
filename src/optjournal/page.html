@@ -1149,11 +1149,11 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string|null} opened_at
  * @property {string|null} closed_at
  * @property {Array} conids
- * @property {string|null} anchor -- the decision's stable handle, an IBKR order
- *   id, or `{order}~{fill}` where another card holds that order's first fill
+ * @property {string|null} anchor -- the card's handle, an IBKR order id, or `t:`
+ *   and its first fill where another card holds that order's first fill
  *   (campaigns.Campaign.anchor). Unique among the cards, so it names one editor
- *   and one journal row. Null for a card no campaign claims, which has no order
- *   to file writing under. Index into State.journal
+ *   and the one write-up the card shows. Null for a card no campaign claims,
+ *   which has no fill to file writing under. Index into State.journal
  * @property {Array} links -- [order, order] pairs the reader joined by hand
  *   (campaigns.Campaign.links), so the card can offer to undo exactly those
  * @property {number} episodes
@@ -1235,8 +1235,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *  ANY of them is written, and a plan noted at entry sits beside a review that
  *  will not be written for weeks
  * @property {string} broker
- * @property {string} anchor -- the row's own key: the card's anchor, or the id it
- *   was filed under before the card it was written on regrouped
+ * @property {string} anchor -- the row's own key: `t:` and the fill it was filed
+ *   under, or an order id for a row the released version wrote
  * @property {string} account_id
  * @property {string|null} underlying
  * @property {string|null} opened_on
@@ -3688,21 +3688,22 @@ function jcount(je){
   return JFIELDS.filter(jf=>je[jf.name]!=null&&String(je[jf.name])!=='').length;
 }
 
-/* Writing no card claims. A decision's anchor can move when a late fill joins it,
-   and a note filed under the old one matched no card and simply vanished; the
-   server lists those (serialize.journal_data) so they stay readable, with the
-   underlying and open date they were written against. */
+/* Writing no card claims. Where later statements regroup the fills a note was
+   filed under, or two written cards become one, a note can match no card, and
+   it simply vanished; the server lists those (serialize.journal_data) so they
+   stay readable, with the underlying and open date they were written against. */
 function orphanNotes(){
   const rows=(S.state.journal||{}).orphans||[];
   if(!rows.length) return '';
   return `<div class="card">
     <div class="crow"><div><h2>Notes no position claims${infoTip(
-      `Written against a decision whose grouping has since changed, so its anchor
-       order no longer names a card below. Nothing was deleted.`)}</h2>
+      `Written against a decision whose grouping has since changed, so it no
+       longer names a card below. Nothing was deleted.`)}</h2>
       <div class="sub">${rows.length} entr${rows.length===1?'y':'ies'}, kept as written.</div></div></div>
     ${rows.map(je=>`<div class="note"><b>${esc(je.underlying||'?')}</b>
       <span class="dim2 mono">opened ${esc(String(je.opened_on||'?').slice(0,10))}
-        · order ${esc(je.anchor)}</span>
+        · ${String(je.anchor).startsWith('t:')?'fill '+esc(String(je.anchor).slice(2))
+          :'order '+esc(je.anchor)}</span>
       ${JFIELDS.filter(jf=>je[jf.name]!=null&&String(je[jf.name])!=='').map(jf=>
         `<div><span class="dim">${esc(jf.label)}:</span> ${esc(je[jf.name])}</div>`
       ).join('')}</div>`).join('')}
@@ -3873,9 +3874,9 @@ function bindJournal(){
   document.querySelectorAll('[data-jsave]').forEach(b=>
     b.onclick=async()=>{
       const anchor=b.dataset.jsave;
-      /* `shows` is the row this card shows, by its own key: filed under another
-         id when the card's anchor has moved, and the server moves it to the
-         card's key as it writes, so editing or emptying it leaves one row. */
+      /* `shows` is the row this card shows, by its own key. The server edits
+         that row in place, and refuses the write where it is no longer this
+         card's, which a statement since this page loaded can do. */
       const je=JENTRY(anchor);
       const body={anchor,shows:je?[je.broker,je.account_id,je.anchor]:null};
       /* Every field is one element with an id -- textarea or select -- so this

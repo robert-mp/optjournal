@@ -483,12 +483,13 @@ CREATE TABLE IF NOT EXISTS watchlist (
 -- the table is deliberately dull -- text and small enums, nothing derived, no
 -- cached figure that could disagree with what it was computed from.
 --
--- KEYED ON AN ORDER ID, not on a campaign. A campaign is recomputed on every
--- ingest by a 90-second heuristic (`campaigns.link`), and its `episode_indices`
--- are positions in a list that is rebuilt each time -- so keying on any of that
--- would lose a reader's notes the first time a roll changed the grouping. An
--- order id is IBKR's own, issued once, naming one placement forever.
--- `Campaign.anchor` is its lowest, so a roll added tomorrow does not move it.
+-- KEYED ON A FILL, not on a campaign. A campaign is recomputed on every ingest
+-- by a 90-second heuristic (`campaigns.link`), and its `episode_indices` are
+-- positions in a list that is rebuilt each time, so keying on any of that would
+-- lose a reader's notes the first time a roll changed the grouping.
+-- `anchor_order_id` holds `t:` and the card's first fill (`Campaign.key`), since
+-- a fill is in exactly one card; rows the released code wrote hold the card's
+-- lowest order id instead. See `campaigns`' docstring.
 --
 -- `underlying_symbol` and `opened_on` are RECORDED but not part of the key. They
 -- are what makes an orphan legible: if the clustering ever changes such that no
@@ -537,10 +538,12 @@ CREATE TABLE IF NOT EXISTS journal_entries (
 -- ROLLS THE WINDOW MISSED, joined by hand. `campaigns.cluster_orders` links
 -- orders placed within 90 seconds; a roll closed on Monday and reopened on
 -- Tuesday is two decisions to it, and only the reader knows it was one. Each row
--- says two orders were one decision, and `campaigns.link` unions the episodes
--- they filled. Keyed on ORDER IDS, not campaigns, for the reason
--- `journal_entries` is: IBKR issued them, and every ingest rebuilds campaigns.
--- Stored with the lower id first, so one pair has one spelling.
+-- says two cards were one decision, and `campaigns.link` unions the episodes
+-- holding the fills it names. Keyed on FILLS (`t:` and each card's first fill),
+-- not campaigns, for the reason `journal_entries` is: every ingest rebuilds
+-- campaigns. Rows the released code stored name two order ids instead, and
+-- still resolve (`campaigns.link`). Stored with the lower id first, so one pair
+-- has one spelling.
 CREATE TABLE IF NOT EXISTS campaign_links (
   broker           TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}',
   order_id         TEXT NOT NULL,

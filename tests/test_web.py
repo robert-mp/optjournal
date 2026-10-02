@@ -9343,22 +9343,24 @@ def _two_cards_on_one_underlying(state) -> tuple[str, str]:
 
 
 def test_linking_two_cards_by_hand_makes_them_one_and_unlinking_undoes_it(populated):
-    """The whole round trip against the real fills: two cards become one filed
-    under the lower anchor, carrying the pair so the page can offer the undo,
-    and the undo restores both cards."""
+    """The whole round trip against the real fills: two cards become one under
+    the lower anchor, carrying the pair, stored under the two cards' first fills,
+    so the page can offer the undo, and the undo restores both cards."""
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         _, before = _get(base, "/api/state")
         low, high = _two_cards_on_one_underlying(before)
         status, wrote = _post(base, "/api/links", {"anchor": high, "joins": low})
-        assert (status, wrote["ok"], wrote["pair"]) == (200, True, [low, high])
+        assert (status, wrote["ok"]) == (200, True)
+        pair = wrote["pair"]
+        assert all(end.startswith("t:") for end in pair), pair
 
         _, after = _get(base, "/api/state")
         anchors = {lc["anchor"]: lc for lc in after["lifecycles"]}
         assert high not in anchors, "the later card is still drawn on its own"
-        assert anchors[low]["links"] == [[low, high]]
+        assert anchors[low]["links"] == [pair]
         assert len(after["lifecycles"]) == len(before["lifecycles"]) - 1
 
-        _post(base, "/api/links", {"anchor": high, "joins": low, "unlink": True})
+        _post(base, "/api/links", {"anchor": pair[0], "joins": pair[1], "unlink": True})
         _, undone = _get(base, "/api/state")
     assert len(undone["lifecycles"]) == len(before["lifecycles"])
 

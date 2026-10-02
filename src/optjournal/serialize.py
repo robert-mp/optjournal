@@ -1624,13 +1624,10 @@ def journal_review(lifecycles: list[Row], entries: dict[str, Row]) -> Row:
     held, broken, unreviewed = [], [], []
     by_trigger: dict[str, list[Row]] = {}
     answers: dict[str, Counter[str]] = {"target": Counter(), "invalidation": Counter()}
-    # Each row read once. `entries` holds one row per anchor and a card's anchor
-    # is unique, so this only holds the count to that if two cards ever drew
-    # under one anchor, where it counted the same write-up once for each.
-    read: set[str] = set()
+    # Each row is read once: `entries` holds the one row each card shows, and
+    # a card's anchor is unique (`journal_shown`).
     for lc in closed:
-        je = {} if str(lc["anchor"]) in read else entries.get(str(lc["anchor"])) or {}
-        read.add(str(lc["anchor"]))
+        je = entries.get(str(lc["anchor"])) or {}
         if any(v not in (None, "") for k, v in je.items() if k in JOURNAL_FIELDS):
             written.append(lc)
         if je.get("plan_target") or je.get("plan_invalidation"):
@@ -1680,7 +1677,7 @@ def journal_data(conn: sqlite3.Connection) -> Row:
 
     Entries are keyed by the anchor of the card that shows them. A card's anchor
     is unique among the current cards, account and broker included
-    (`campaigns.Campaign.key`), so the page can look an entry up from a
+    (`campaigns.Campaign.anchor`), so the page can look an entry up from a
     lifecycle card, and post a write from it, without carrying an account it
     would only be able to get wrong.
 
@@ -1689,11 +1686,11 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     request each would put a network round trip inside a render loop.
 
     Each row shows on the one card its key names (`campaigns.named`): the card
-    filed under it, or, for a row filed under an id that is no card's key now
-    (the card it was written on has since merged into another, or moved its
-    anchor), the card holding the fill that id names. A card shows one row:
-    its own where it has one, else the lowest filed. `orphans` are the rows no
-    card shows. Listed so the reader sees the writing and what it was about.
+    holding the fill a `t:` key names, or for an order id the released code
+    filed, the card holding that order's fill on the day the row records. A
+    card shows one row (`journal_shown` says which).
+    `orphans` are the rows no card shows. Listed so the reader sees the writing
+    and what it was about.
     Checked against the decisions the Trades tab can draw, options and
     equities, and not computed at all when nothing has been written.
     """
@@ -1723,8 +1720,16 @@ def journal_shown(
 ) -> dict[str, Any]:
     """The entry each card shows, by the card's anchor.
 
-    Each row goes to the card its key names, and each card shows one: its own
-    row first, then by the filed id, account and broker. An anchor two cards
+    Each row goes to the card its key names (`campaigns.named`), and each card
+    shows one, picked by facts about the rows alone, never the card's anchor or
+    key, which move as fills and links join it, so the row a card shows changes
+    only when another row comes to reach it. A row the released code
+    filed under an order id first, since every one predates every `t:` row and
+    is what the reader last saw: the newest of them, which is the one that code
+    showed once the card's anchor moved and the reader wrote again. Else the
+    row filed under the earliest fill. Two rows reach one card where two
+    written cards have since become one, or where the released code filed a
+    card's writing under two order ids as its anchor moved. An anchor two cards
     share (an order in two asset categories, which IBKR does not issue) shows
     nothing, and its rows are listed as orphans, rather than one row on both.
 
@@ -1735,8 +1740,20 @@ def journal_shown(
     twice = {anchor for anchor, n in Counter(c.anchor for c in cards).items() if n > 1}
     claims: dict[str, list[tuple[Any, ...]]] = {}
     for key, entry in written.items():
-        card = find(*key)
-        if card is not None and card.anchor is not None and card.anchor not in twice:
-            claims.setdefault(card.anchor, []).append(
-                (key != card.key, len(key[2]), key[2], key[1], key[0], entry))
-    return {anchor: min(rows, key=lambda row: row[:5])[-1] for anchor, rows in claims.items()}
+        hit = find(*key, entry.opened_on)
+        if hit is None:
+            continue
+        card, when = hit
+        if card.key is not None and card.anchor is not None and card.anchor not in twice:
+            claims.setdefault(card.anchor, []).append((when, key, entry))
+    return {anchor: _shown_of(rows) for anchor, rows in claims.items()}
+
+
+def _shown_of(rows: list[tuple[Any, ...]]) -> Any:
+    """The row a card shows of the `(when, key, entry)` rows that reach it: the
+    newest one filed under an order id, else the one under the earliest fill."""
+    released = [(entry.created_at, key, entry) for _when, key, entry in rows
+                if not key[2].startswith("t:")]
+    if released:
+        return max(released, key=lambda row: row[:2])[-1]
+    return min(rows, key=lambda row: row[:2])[-1]
