@@ -1721,14 +1721,17 @@ def journal_shown(
     """The entry each card shows, by the card's anchor.
 
     Each row goes to the card its key names (`campaigns.named`), and each card
-    shows one. First a row filed under the card's anchor: only the released
-    code filed rows under an order id, and that is the row it showed there.
-    Then the row filed under the card's earliest fill, which a fill joining the
-    card later does not change. Two rows reach one card where two written cards
-    have since become one, or where the released code filed a card's writing
-    under two order ids as its anchor moved. An anchor two cards share (an order
-    in two asset categories, which IBKR does not issue) shows nothing, and its
-    rows are listed as orphans, rather than one row on both.
+    shows one, picked by facts about the rows alone, never the card's anchor or
+    key, which move as fills and links join it, so the row a card shows changes
+    only when another row comes to reach it. A row the released code
+    filed under an order id first, since every one predates every `t:` row and
+    is what the reader last saw: the newest of them, which is the one that code
+    showed once the card's anchor moved and the reader wrote again. Else the
+    row filed under the earliest fill. Two rows reach one card where two
+    written cards have since become one, or where the released code filed a
+    card's writing under two order ids as its anchor moved. An anchor two cards
+    share (an order in two asset categories, which IBKR does not issue) shows
+    nothing, and its rows are listed as orphans, rather than one row on both.
 
     One pass over the rows, which made a journal of 10,000 written cards take
     seconds to draw when it was one pass per card.
@@ -1742,6 +1745,15 @@ def journal_shown(
             continue
         card, when = hit
         if card.key is not None and card.anchor is not None and card.anchor not in twice:
-            claims.setdefault(card.anchor, []).append(
-                (key[2] != card.anchor, when, key, entry))
-    return {anchor: min(rows, key=lambda row: row[:3])[-1] for anchor, rows in claims.items()}
+            claims.setdefault(card.anchor, []).append((when, key, entry))
+    return {anchor: _shown_of(rows) for anchor, rows in claims.items()}
+
+
+def _shown_of(rows: list[tuple[Any, ...]]) -> Any:
+    """The row a card shows of the `(when, key, entry)` rows that reach it: the
+    newest one filed under an order id, else the one under the earliest fill."""
+    released = [(entry.created_at, key, entry) for _when, key, entry in rows
+                if not key[2].startswith("t:")]
+    if released:
+        return max(released, key=lambda row: row[:2])[-1]
+    return min(rows, key=lambda row: row[:2])[-1]

@@ -587,10 +587,13 @@ def test_a_link_finds_the_card_whose_anchor_it_names(db):
 def test_an_entry_under_an_order_no_card_answers_to_shows_on_the_card_that_filled_it(db):
     """A position opened by 100 gets a later fill of a lower order, 90: its
     anchor moves to 90. The note written under 100 stays on the card that filled
-    100. A row filed under the card's own key is the one it shows, and the older
-    one is then listed with the orphans, not lost."""
+    100. The released version then filed the next write-up under 90 and showed
+    that one: so does this, the newer of the two, and the older is listed with
+    the orphans, not lost."""
     _journal_of(db, [("t1", "U1", "100", "2026-09-02 10:00:00", 1, "O", None)])
     _write(db, "100")
+    db.execute("UPDATE journal_entries SET created_at = '2026-09-02T12:00:00+00:00'")
+    db.commit()
     _journal_of(db, [("t2", "U1", "90", "2026-09-02 11:00:00", 1, "O", None)],
                 statement=False)
     assert [anchor for anchor, _ in _cards(db)] == ["90"]

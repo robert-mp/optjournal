@@ -554,9 +554,9 @@ def named(cards: Iterable[Campaign]) -> Callable[[str, str, str, str | None],
     order's earliest fill on the row's `opened_on` trade date, and failing that
     the one holding the order's first fill there. See the module docstring.
 
-    The time is how a card two rows reach picks between them
+    The time is how a card two `t:` rows reach picks between them
     (`serialize.journal_shown`): a fill joining the card later, however early,
-    moves no row's fill, so it does not change which row the card shows.
+    moves neither row's fill, so it does not change which one the card shows.
     """
     by_part: dict[tuple[str, str], Named] = {}
     by_first: dict[tuple[str, str, str], Named] = {}

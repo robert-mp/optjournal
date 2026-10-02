@@ -242,6 +242,37 @@ def test_an_earlier_fill_joining_a_card_does_not_change_the_write_up_it_shows(tm
     assert [o["entry_note"] for o in state["journal"]["orphans"]] == ["B"]
 
 
+@pytest.mark.parametrize("then", ["link", "import"])
+def test_a_released_write_up_keeps_its_card_when_the_cards_anchor_moves(tmp_path, then):
+    """A carries a row the released version filed under 200; B is written up
+    now. A roll joins them, the card shows A's row and the reader revises it.
+    Then the card's anchor moves: a link to an older unwritten card (order
+    100), or a history import of 200's first fill into a card of its own.
+    Picked by the card's anchor, the card switched to B's row and listed the
+    revised A as unclaimed."""
+    db = _journal(tmp_path, [
+        ("c1", "U1", "100", "2026-09-01 10:00:00", 1, "O", None, "23"),
+        ("c2", "U1", "110", "2026-09-03 10:00:00", -1, "C", 5.0, "23"),
+        ("b1", "U1", "300", "2026-09-05 10:00:00", 1, "O", None, "22"),
+        ("a1", "U1", "200", "2026-09-10 10:00:00", 1, "O", None, "21")])
+    _released(db, "200", "U1", "2026-09-10", "A, by the released version")
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        assert _post(base, "/api/journal", _form(_state(base), "300",
+                                                 entry_note="B"))[0] == 200
+        _insert(db, [("r1", "U1", "400", "2026-09-15 10:00:00", -1, "C", 10.0, "21"),
+                     ("r2", "U1", "401", "2026-09-15 10:00:30", -1, "C", 10.0, "22")])
+        assert _post(base, "/api/journal", _form(_state(base), "200",
+                                                 entry_note="A, revised"))[0] == 200
+        if then == "link":
+            assert _post(base, "/api/links", {"anchor": "200", "joins": "100"})[0] == 200
+        else:
+            _insert(db, [("h1", "U1", "200", "2026-08-20 10:00:00", 1, "O", None, "21"),
+                         ("h2", "U1", "150", "2026-08-22 10:00:00", -1, "C", 3.0, "21")])
+        state = _state(base)
+    assert "A, revised" in [c["note"] for c in _cards(state)]
+    assert [o["entry_note"] for o in state["journal"]["orphans"]] == ["B"]
+
+
 def test_a_link_from_the_second_card_of_an_order_joins_that_card(tmp_path):
     """B (the GTC order's second fill, closed by 5090) linked to C (5100) from
     B's card posted 5040, which landed on A. Stored under the two cards' first
