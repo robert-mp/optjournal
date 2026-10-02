@@ -538,10 +538,12 @@ CREATE TABLE IF NOT EXISTS journal_entries (
 -- ROLLS THE WINDOW MISSED, joined by hand. `campaigns.cluster_orders` links
 -- orders placed within 90 seconds; a roll closed on Monday and reopened on
 -- Tuesday is two decisions to it, and only the reader knows it was one. Each row
--- says two orders were one decision, and `campaigns.link` unions the episodes
--- they filled. Keyed on ORDER IDS, not campaigns, for the reason
--- `journal_entries` is: IBKR issued them, and every ingest rebuilds campaigns.
--- Stored with the lower id first, so one pair has one spelling.
+-- says two cards were one decision, and `campaigns.link` unions the episodes
+-- holding the fills it names. Keyed on FILLS (`t:` and each card's first fill),
+-- not campaigns, for the reason `journal_entries` is: every ingest rebuilds
+-- campaigns. Rows the released code stored name two order ids instead, and
+-- still resolve (`campaigns.link`). Stored with the lower id first, so one pair
+-- has one spelling.
 CREATE TABLE IF NOT EXISTS campaign_links (
   broker           TEXT NOT NULL DEFAULT '{DEFAULT_BROKER}',
   order_id         TEXT NOT NULL,

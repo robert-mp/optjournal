@@ -202,15 +202,22 @@ class Campaign:
     #: Every fill part it holds, `(broker, part)`, a part being a trade id or,
     #: for the closing half of a fill through zero, the trade id and `~C`. How a
     #: stored `t:` key finds the card again (`named`).
-    parts: frozenset[tuple[str, str]] = frozenset()
+    #:
+    #: This and the next two map each entry to when its fill was taken, which
+    #: is how a card two rows reach picks the one it shows (`named`); a mapping,
+    #: so `hash=False` as `leg_parts` says.
+    parts: Mapping[tuple[str, str], tuple[Any, ...]] = field(
+        default_factory=dict, hash=False)
     #: `(broker, account_id, order id)` for each order whose first fill in that
     #: account it holds. How a plain order id finds the card (`named`).
-    firsts: frozenset[tuple[str, str, str]] = frozenset()
+    firsts: Mapping[tuple[str, str, str], tuple[Any, ...]] = field(
+        default_factory=dict, hash=False)
     #: `(broker, account_id, order id, trade date)` for each order and trade date
     #: whose earliest fill in that account it holds. How a plain order id, which
     #: the released code filed with the order's first trade date on record then,
     #: finds the card it was written on (`named`).
-    opened: frozenset[tuple[str, str, str, str]] = frozenset()
+    opened: Mapping[tuple[str, str, str, str], tuple[Any, ...]] = field(
+        default_factory=dict, hash=False)
     #: `order_ids` with the broker that issued each, `(broker, order id)`, which
     #: is how the Trades tab finds an order's campaigns: an order id is the
     #: issuing broker's own, and two brokers can both number an order 5000.
@@ -323,8 +330,8 @@ def link(
     contract held from before the archive has no fills at all (this journal's
     LEAP), and it is still a position.
 
-    `links` are pairs of order ids the reader joined by hand: a roll whose two
-    halves were placed further apart than `WINDOW_S`. The handler files a link
+    `links` are pairs the reader joined by hand: a roll whose two halves were
+    placed further apart than `WINDOW_S`. The handler files a link
     under the two cards' `t:` keys, so each end is the episode holding that fill
     part, wherever it is now; a plain order id stored by the released code is
     the episode holding that order's first fill (see the module docstring). A
@@ -442,12 +449,12 @@ def link(
     links_of_root: dict[int, list[tuple[str, str]]] = {}
     for i, pair in applied:
         links_of_root.setdefault(find(i), []).append(pair)
-    firsts_of: dict[int, list[tuple[str, str, str]]] = {}
-    for at, (_when, i) in first_in.items():
-        firsts_of.setdefault(i, []).append(at)
-    opened_of: dict[int, list[tuple[str, str, str, str]]] = {}
-    for on, (_when, i) in first_on.items():
-        opened_of.setdefault(i, []).append(on)
+    firsts_of: dict[int, dict[tuple[str, str, str], tuple[Any, ...]]] = {}
+    for at, (when, i) in first_in.items():
+        firsts_of.setdefault(i, {})[at] = when
+    opened_of: dict[int, dict[tuple[str, str, str, str], tuple[Any, ...]]] = {}
+    for on, (when, i) in first_on.items():
+        opened_of.setdefault(i, {})[on] = when
 
     def filed(idxs: list[int]) -> tuple[str | None, tuple[str, str, str] | None]:
         """A card's anchor and key: see the module docstring."""
@@ -492,9 +499,9 @@ def link(
             orders=own,
             anchor=anchor,
             key=filed_as,
-            parts=frozenset((broker_of[i], name) for i in idxs for *_rest, name in held[i]),
-            firsts=frozenset(at for i in idxs for at in firsts_of.get(i, ())),
-            opened=frozenset(on for i in idxs for on in opened_of.get(i, ())),
+            parts={(broker_of[i], name): when for i in idxs for when, _o, name in held[i]},
+            firsts={at: when for i in idxs for at, when in firsts_of.get(i, {}).items()},
+            opened={on: when for i in idxs for on, when in opened_of.get(i, {}).items()},
             is_decided=decided,
             closed_at=max(
                 (str(e.closed_at) for e in eps if e.closed_at), default=None
@@ -534,26 +541,33 @@ def _parts_of(episode: Any) -> dict[str, Any]:
     return parts
 
 
+Named = tuple[Campaign, tuple[Any, ...]]
+
+
 def named(cards: Iterable[Campaign]) -> Callable[[str, str, str, str | None],
-                                                 Campaign | None]:
-    """The card a stored row `(broker, account_id, filed, opened_on)` names, or
-    None for none.
+                                                 Named | None]:
+    """The card a stored row `(broker, account_id, filed, opened_on)` names, and
+    when the fill it names it by was taken; None for no card.
 
     A `t:` key names the card holding that fill part. A plain order id, stored
     by the released code, names the card in the row's account holding that
     order's earliest fill on the row's `opened_on` trade date, and failing that
     the one holding the order's first fill there. See the module docstring.
+
+    The time is how a card two rows reach picks between them
+    (`serialize.journal_shown`): a fill joining the card later, however early,
+    moves no row's fill, so it does not change which row the card shows.
     """
-    by_part: dict[tuple[str, str], Campaign] = {}
-    by_first: dict[tuple[str, str, str], Campaign] = {}
-    by_day: dict[tuple[str, str, str, str], Campaign] = {}
+    by_part: dict[tuple[str, str], Named] = {}
+    by_first: dict[tuple[str, str, str], Named] = {}
+    by_day: dict[tuple[str, str, str, str], Named] = {}
     for card in cards:
-        by_part.update(dict.fromkeys(card.parts, card))
-        by_first.update(dict.fromkeys(card.firsts, card))
-        by_day.update(dict.fromkeys(card.opened, card))
+        by_part.update((at, (card, when)) for at, when in card.parts.items())
+        by_first.update((at, (card, when)) for at, when in card.firsts.items())
+        by_day.update((at, (card, when)) for at, when in card.opened.items())
 
     def find(broker: str, account_id: str, filed: str,
-             opened_on: str | None = None) -> Campaign | None:
+             opened_on: str | None = None) -> Named | None:
         if filed.startswith("t:"):
             return by_part.get((broker, filed[2:]))
         hit = by_day.get((broker, account_id, filed, str(opened_on or "")[:10]))

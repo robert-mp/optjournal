@@ -545,7 +545,7 @@ def test_the_two_halves_of_a_fill_through_zero_are_two_keys():
     assert (closed.key, opened.key) == (("", "", "t:t2~C"), ("", "", "t:t2"))
     assert (closed.anchor, opened.anchor) == ("t:t2~C", "100")
     find = named([closed, opened])
-    assert (find("", "", "t:t2~C"), find("", "", "t:t2")) == (closed, opened)
+    assert (find("", "", "t:t2~C")[0], find("", "", "t:t2")[0]) == (closed, opened)
 
 
 def test_a_released_row_names_the_card_with_its_orders_earliest_fill_that_trade_date():
@@ -562,10 +562,15 @@ def test_a_released_row_names_the_card_with_its_orders_earliest_fill_that_trade_
                    order_of_trade={"t1": "5040", "t2": "5040", "t3": "5040"},
                    trade_day={"t1": "2026-09-01", "t2": "2026-09-09", "t3": "2026-09-09"})
     find = named([a, b, c])
-    assert find("", "", "5040", "2026-09-09") == b
-    assert find("", "", "5040", "2026-09-01") == a
-    assert find("", "", "5040", "2026-09-05") == a, "no fill that day: the order's first"
+    assert find("", "", "5040", "2026-09-09")[0] == b
+    assert find("", "", "5040", "2026-09-01")[0] == a
+    assert find("", "", "5040", "2026-09-05")[0] == a, "no fill that day: the order's first"
     assert find("", "U2", "5040", "2026-09-09") is None, "another account's row"
+    # And when the fill each was found by was taken, which picks between two
+    # rows on one card (`serialize.journal_shown`).
+    assert [find("", "", filed, day)[1][1] for filed, day in (
+        ("5040", "2026-09-09"), ("5040", "2026-09-05"), ("t:t3", None))] == [
+        "2026-09-08 20:03:00", "2026-09-01 10:34:11", "2026-09-09 10:00:00"]
 
 
 # ------------------------------------------------------------ links by hand

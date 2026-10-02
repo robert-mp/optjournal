@@ -716,12 +716,14 @@ def _matching_seconds(n: int) -> float:
     cards = [Campaign(episode_indices=(k,), conids=("1",),
                       order_ids=frozenset({str(10_000 + k)}), is_decided=False,
                       closed_at=None, realized=None, commission=None,
-                      key=("ibkr", "U1", str(10_000 + k)))
+                      anchor=str(10_000 + k), key=("ibkr", "U1", f"t:x{k}"),
+                      parts={("ibkr", f"x{k}"): (False, f"2026-09-01 {k}")})
              for k in range(n)]
-    written = {("ibkr", "U1", str(10_000 + k)): journal.Entry(
-        broker="ibkr", account_id="U1", anchor_order_id=str(10_000 + k),
+    written = {("ibkr", "U1", f"t:x{k}"): journal.Entry(
+        broker="ibkr", account_id="U1", anchor_order_id=f"t:x{k}",
         underlying_symbol=None, opened_on=None, created_at="", updated_at="",
         values={"entry_note": "n"}) for k in range(n)}
+    assert len(journal_shown(written, cards)) == n, "every entry is on its card"
     best = float("inf")
     for _ in range(5):
         start = time.perf_counter()

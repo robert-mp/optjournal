@@ -214,28 +214,32 @@ def test_a_released_row_on_an_evening_fill_finds_its_card_by_trade_date(tmp_path
             None, "B, by the released version"]
 
 
-def test_two_rows_on_one_card_show_the_older_and_list_the_other(tmp_path):
-    """Two written cards became one, and a history import then gave it an
-    earlier fill, so neither row is filed under the card's own key: it shows
-    the row written first and lists the other as unclaimed, whichever key
-    sorts first."""
-    db = _journal(tmp_path, [("t1", "U1", "300", "2026-09-01 10:00:00", 1, "O", None, "21"),
-                             ("t5", "U1", "400", "2026-09-03 10:00:00", 1, "O", None, "22")])
+def test_an_earlier_fill_joining_a_card_does_not_change_the_write_up_it_shows(tmp_path):
+    """B is written up, then A. A roll joins the two cards, which shows A, filed
+    under the earlier fill, and lists B; the reader revises A on the joined card.
+    A history import then brings an older fill of A's contract: the card's first
+    fill moved, neither row was its own any more, and the older row, B's stale
+    one, took the card while the revised A was listed as unclaimed."""
+    db = _journal(tmp_path, [("a1", "U1", "200", "2026-09-10 10:00:00", 1, "O", None, "21"),
+                             ("b1", "U1", "300", "2026-09-12 10:00:00", 1, "O", None, "22")])
     with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
-        for anchor, note in (("300", "P"), ("400", "Q")):
+        for anchor, note in (("300", "B"), ("200", "A")):
             assert _post(base, "/api/journal", _form(_state(base), anchor,
                                                      entry_note=note))[0] == 200
         conn = connect(db)
-        for filed, at in (("t:t5", "2026-09-03"), ("t:t1", "2026-09-04")):
-            conn.execute("UPDATE journal_entries SET created_at = ? WHERE anchor_order_id = ?",
-                         (f"{at}T00:00:00+00:00", filed))
+        conn.execute("UPDATE journal_entries SET created_at = '2026-09-01T00:00:00+00:00'"
+                     " WHERE anchor_order_id = 't:b1'")
         conn.commit()
-        journal.link(conn, "t:t1", "t:t5")
         conn.close()
-        _insert(db, [("t0", "U1", "300", "2026-08-28 10:00:00", 1, "O", None, "21")])
+        _insert(db, [("r1", "U1", "400", "2026-09-15 10:00:00", -1, "C", 10.0, "21"),
+                     ("r2", "U1", "401", "2026-09-15 10:00:30", -1, "C", 10.0, "22")])
+        (card,) = _cards(_state(base))
+        assert _post(base, "/api/journal", _form(_state(base), card["anchor"],
+                                                 entry_note="A, revised"))[0] == 200
+        _insert(db, [("h1", "U1", "150", "2026-09-05 10:00:00", 1, "O", None, "21")])
         state = _state(base)
-    assert [(c["anchor"], c["note"]) for c in _cards(state)] == [("300", "Q")]
-    assert [o["entry_note"] for o in state["journal"]["orphans"]] == ["P"]
+    assert [c["note"] for c in _cards(state)] == ["A, revised"]
+    assert [o["entry_note"] for o in state["journal"]["orphans"]] == ["B"]
 
 
 def test_a_link_from_the_second_card_of_an_order_joins_that_card(tmp_path):

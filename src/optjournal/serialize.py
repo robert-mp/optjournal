@@ -1677,7 +1677,7 @@ def journal_data(conn: sqlite3.Connection) -> Row:
 
     Entries are keyed by the anchor of the card that shows them. A card's anchor
     is unique among the current cards, account and broker included
-    (`campaigns.Campaign.key`), so the page can look an entry up from a
+    (`campaigns.Campaign.anchor`), so the page can look an entry up from a
     lifecycle card, and post a write from it, without carrying an account it
     would only be able to get wrong.
 
@@ -1686,11 +1686,11 @@ def journal_data(conn: sqlite3.Connection) -> Row:
     request each would put a network round trip inside a render loop.
 
     Each row shows on the one card its key names (`campaigns.named`): the card
-    filed under it, or, for a row filed under an id that is no card's key now
-    (the card it was written on has since merged into another, or moved its
-    anchor), the card holding the fill that id names. A card shows one row:
-    its own where it has one, else the lowest filed. `orphans` are the rows no
-    card shows. Listed so the reader sees the writing and what it was about.
+    holding the fill a `t:` key names, or for an order id the released code
+    filed, the card holding that order's fill on the day the row records. A
+    card shows one row (`journal_shown` says which).
+    `orphans` are the rows no card shows. Listed so the reader sees the writing
+    and what it was about.
     Checked against the decisions the Trades tab can draw, options and
     equities, and not computed at all when nothing has been written.
     """
@@ -1721,11 +1721,14 @@ def journal_shown(
     """The entry each card shows, by the card's anchor.
 
     Each row goes to the card its key names (`campaigns.named`), and each card
-    shows one: a row filed under its own key or anchor first, then the oldest.
-    Two rows reach one card only where two written cards have since become one.
-    An anchor two cards share (an order in two asset categories, which IBKR does
-    not issue) shows nothing, and its rows are listed as orphans, rather than
-    one row on both.
+    shows one. First a row filed under the card's anchor: only the released
+    code filed rows under an order id, and that is the row it showed there.
+    Then the row filed under the card's earliest fill, which a fill joining the
+    card later does not change. Two rows reach one card where two written cards
+    have since become one, or where the released code filed a card's writing
+    under two order ids as its anchor moved. An anchor two cards share (an order
+    in two asset categories, which IBKR does not issue) shows nothing, and its
+    rows are listed as orphans, rather than one row on both.
 
     One pass over the rows, which made a journal of 10,000 written cards take
     seconds to draw when it was one pass per card.
@@ -1734,10 +1737,11 @@ def journal_shown(
     twice = {anchor for anchor, n in Counter(c.anchor for c in cards).items() if n > 1}
     claims: dict[str, list[tuple[Any, ...]]] = {}
     for key, entry in written.items():
-        card = find(*key, entry.opened_on)
-        if (card is not None and card.key is not None and card.anchor is not None
-                and card.anchor not in twice):
-            own = key in (card.key, (card.key[0], card.key[1], card.anchor))
+        hit = find(*key, entry.opened_on)
+        if hit is None:
+            continue
+        card, when = hit
+        if card.key is not None and card.anchor is not None and card.anchor not in twice:
             claims.setdefault(card.anchor, []).append(
-                (not own, entry.created_at, key, entry))
+                (key[2] != card.anchor, when, key, entry))
     return {anchor: min(rows, key=lambda row: row[:3])[-1] for anchor, rows in claims.items()}

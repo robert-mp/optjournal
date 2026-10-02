@@ -1394,11 +1394,14 @@ def test_the_demo_seeds_write_ups_without_making_every_card_complete(conn):
 
     entries = journal.entries(conn)
     assert len(entries) == len(DEMO_JOURNAL)
-    for (_broker, account, _anchor), entry in entries.items():
+    for (_broker, account, filed), entry in entries.items():
         assert account == DEMO_ACCOUNT
         assert entry.underlying_symbol and entry.opened_on, (
             "the entry cannot say which decision it belongs to"
         )
+        assert filed.startswith("t:"), (
+            f"{filed} is filed the released way, not as the endpoint files a card's "
+            "first write-up, so the demo never draws a row the endpoint writes")
     # Filed under a DECISION's anchor, not just any order id: a note keyed on a
     # closing order matches no card and shows only as an orphan.
     assert journal_data(conn)["orphans"] == [], (
@@ -1440,3 +1443,24 @@ def test_re_running_the_demo_never_overwrites_a_seeded_write_up(conn):
     assert kept.values["plan_target"] == "what the reader typed", (
         "the re-run overwrote a note the reader had written"
     )
+
+
+def test_re_running_the_demo_on_a_released_seed_adds_no_second_row(conn):
+    """The released version seeded each write-up under its card's order id. A
+    re-run has to see those cards as written: a `t:` row beside each would take
+    the card, and list the text the reader may have edited as unclaimed."""
+    from optjournal import journal
+    from optjournal.demo import write_demo_journal
+    from optjournal.serialize import journal_cards, journal_data
+
+    write_demo_journal(conn)
+    anchor_of = {c.key[2]: c.anchor for c in journal_cards(conn) if c.key}
+    for _broker, _account, filed in list(journal.entries(conn)):
+        conn.execute("UPDATE journal_entries SET anchor_order_id = ?"
+                     " WHERE anchor_order_id = ?", (anchor_of[filed], filed))
+    conn.commit()
+    released = sorted(journal.entries(conn))
+
+    assert write_demo_journal(conn) == 0, "a re-run filed a second row on a seeded card"
+    assert sorted(journal.entries(conn)) == released
+    assert journal_data(conn)["orphans"] == []
