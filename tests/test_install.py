@@ -134,6 +134,15 @@ def test_previous_journals_finds_other_downloads_but_not_empty_ones(tmp_path):
     assert install.previous_journals(tmp_path / "home", search_root=tmp_path) == [found]
 
 
+def test_previous_journals_finds_a_clone_in_the_home_folder_but_goes_no_deeper(tmp_path):
+    """A friend who cloned from a new terminal has `~/optjournal`; walking the
+    whole home folder would reach `~/Library` on every page load."""
+    clone = _download(tmp_path / "optjournal")
+    _download(tmp_path / "code" / "optjournal")
+
+    assert install.previous_journals(tmp_path / "home", search_root=tmp_path) == [clone]
+
+
 def test_previous_journals_offers_nothing_to_a_journal_with_data(tmp_path):
     _download(tmp_path / "Downloads" / "optjournal-main")
     home = _journal(tmp_path / "home")

@@ -91,7 +91,8 @@ def test_an_update_replaces_the_code_and_leaves_the_journal(tmp_path, monkeypatc
     assert not (root / "src" / "optjournal" / "old.py").exists(), "src/ was merged, not replaced"
     assert (root / "journal.db").read_bytes() == b"my trades"
     assert (root / "raw" / "activity-1.xml").exists()
-    assert (root / "Start optjournal.command").stat().st_mode & 0o111, (
+    # Windows has no executable bit to keep, and never runs the macOS Start file.
+    assert os.name == "nt" or (root / "Start optjournal.command").stat().st_mode & 0o111, (
         "the macOS Start file lost its executable bit, so it no longer opens")
     assert not (root / updates.STAGING).exists() and not (root / ".update-old").exists()
 
