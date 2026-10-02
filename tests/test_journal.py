@@ -228,29 +228,6 @@ def test_entries_is_keyed_for_lookup_by_a_page_full_of_decisions(db):
     assert set(got) == {("ibkr", "U1", "1"), ("ibkr", "U1", "2")}
 
 
-def test_an_entry_whose_campaign_regrouped_is_reported_not_lost(db):
-    """The one way this key can fail, and what happens when it does.
-
-    Membership is decided by a 90-second window, so a fill arriving late inside
-    it can join a cluster and LOWER the campaign's anchor. The note written
-    against the old anchor then points at no campaign. It still records its
-    underlying and open date, so it is something a reader can act on -- the row
-    reads "the META decision opened 2026-08-03" -- rather than a loss they never
-    hear about.
-    """
-    _save(db, plan_target="take at 50%")
-    journal.save(db, "1299999999", account_id="U1", underlying_symbol="GOOG",
-                 opened_on="2026-08-04", values={"plan_target": "still live"})
-
-    orphaned = journal.orphans(db, live_anchors={"1299999999"})
-
-    assert [e.anchor_order_id for e in orphaned] == ["1241544513"]
-    assert (orphaned[0].underlying_symbol, orphaned[0].opened_on) == (
-        "META", "2026-08-03"
-    ), "an orphan that cannot say which decision it belonged to is a loss"
-    assert orphaned[0].values["plan_target"] == "take at 50%", "the text went"
-
-
 def test_deleting_an_entry_reports_whether_a_row_went(db):
     _save(db, plan_target="take at 50%")
 
@@ -701,7 +678,7 @@ def test_one_order_allocated_to_two_positions_leaves_each_its_own_note(
     """Y (U2, from 200) and X (U1, from 300) each have a note; then order 100,
     allocated to both accounts, adds to both. Both answered to 100, so both drew
     one note and the other was listed. X, whose account sorts first, now answers
-    to 100 and Y to its own fill of it, and each shows its own note, whichever
+    to 100 and Y to its own first fill, and each shows its own note, whichever
     card comes first in the episode list."""
     import dataclasses
 
@@ -714,7 +691,7 @@ def test_one_order_allocated_to_two_positions_leaves_each_its_own_note(
     _journal_of(db, [("t3", "U1", "100", "2026-09-03 10:00:00", -1, "O", None),
                      ("t4", "U2", "100", "2026-09-03 10:00:00", -1, "O", None)],
                 statement=False)
-    assert [a for a, _ in _cards(db)] == ["100", "100~t4"]
+    assert [a for a, _ in _cards(db)] == ["100", "t:t1"]
     as_built = serialize.journal_data(db)
     real = serialize.build_history
 
@@ -725,7 +702,7 @@ def test_one_order_allocated_to_two_positions_leaves_each_its_own_note(
     monkeypatch.setattr(serialize, "build_history", reversed_history)
     assert serialize.journal_data(db) == as_built
     assert {a: e["entry_note"] for a, e in as_built["entries"].items()} == {
-        "100": "note 300", "100~t4": "note 200"}
+        "100": "note 300", "t:t1": "note 200"}
     assert as_built["orphans"] == []
 
 

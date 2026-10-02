@@ -19,6 +19,7 @@ from optjournal.campaigns import (
     WINDOW_S,
     cluster_orders,
     link,
+    named,
     position_count,
 )
 
@@ -531,6 +532,40 @@ def test_a_campaign_with_no_fills_has_no_anchor():
     """
     campaigns = link([_Ep("C1", [])], order_groups=[], order_of_trade={})
     assert campaigns[0].anchor is None
+
+
+def test_the_two_halves_of_a_fill_through_zero_are_two_keys():
+    """A long held from before the archive, closed by one SELL through zero:
+    the closed card's only fill is the closing half, the open card's the
+    opening half. Named by the trade id alone, both cards were filed under it."""
+    eps = [_Ep("C1", ["t2"]), _Ep("C1", ["t2"], closed=False)]
+    eps[0].fill_parts = {"t2": _part(-2, "C", "2026-09-02 10:00:00", 1.0)}
+    eps[1].fill_parts = {"t2": _part(-1, "O", "2026-09-02 10:00:00", 1.0)}
+    closed, opened = link(eps, order_groups=[("100",)], order_of_trade={"t2": "100"})
+    assert (closed.key, opened.key) == (("", "", "t:t2~C"), ("", "", "t:t2"))
+    assert (closed.anchor, opened.anchor) == ("t:t2~C", "100")
+    find = named([closed, opened])
+    assert (find("", "", "t:t2~C"), find("", "", "t:t2")) == (closed, opened)
+
+
+def test_a_released_row_names_the_card_with_its_orders_earliest_fill_that_trade_date():
+    """The released code filed a write-up under the card's lowest order id,
+    with that order's first trade date on record then. GTC 5040 opened A on
+    Sep 1, B in the evening of Sep 8 (trade date Sep 9) and C on Sep 9. A row
+    recording Sep 9 was written on B before a history import brought A: it
+    names B, not A (the order's first fill now) nor C (later that trade date)."""
+    eps = [_Ep("C1", ["t1"]), _Ep("C1", ["t2"]), _Ep("C1", ["t3"], closed=False)]
+    eps[0].fill_parts = {"t1": _part(1, "O", "2026-09-01 10:34:11", 1.0)}
+    eps[1].fill_parts = {"t2": _part(1, "O", "2026-09-08 20:03:00", 1.0)}
+    eps[2].fill_parts = {"t3": _part(1, "O", "2026-09-09 10:00:00", 1.0)}
+    a, b, c = link(eps, order_groups=[("5040",)],
+                   order_of_trade={"t1": "5040", "t2": "5040", "t3": "5040"},
+                   trade_day={"t1": "2026-09-01", "t2": "2026-09-09", "t3": "2026-09-09"})
+    find = named([a, b, c])
+    assert find("", "", "5040", "2026-09-09") == b
+    assert find("", "", "5040", "2026-09-01") == a
+    assert find("", "", "5040", "2026-09-05") == a, "no fill that day: the order's first"
+    assert find("", "U2", "5040", "2026-09-09") is None, "another account's row"
 
 
 # ------------------------------------------------------------ links by hand

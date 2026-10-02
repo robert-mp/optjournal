@@ -1624,13 +1624,10 @@ def journal_review(lifecycles: list[Row], entries: dict[str, Row]) -> Row:
     held, broken, unreviewed = [], [], []
     by_trigger: dict[str, list[Row]] = {}
     answers: dict[str, Counter[str]] = {"target": Counter(), "invalidation": Counter()}
-    # Each row read once. `entries` holds one row per anchor and a card's anchor
-    # is unique, so this only holds the count to that if two cards ever drew
-    # under one anchor, where it counted the same write-up once for each.
-    read: set[str] = set()
+    # Each row is read once: `entries` holds the one row each card shows, and
+    # a card's anchor is unique (`journal_shown`).
     for lc in closed:
-        je = {} if str(lc["anchor"]) in read else entries.get(str(lc["anchor"])) or {}
-        read.add(str(lc["anchor"]))
+        je = entries.get(str(lc["anchor"])) or {}
         if any(v not in (None, "") for k, v in je.items() if k in JOURNAL_FIELDS):
             written.append(lc)
         if je.get("plan_target") or je.get("plan_invalidation"):
@@ -1723,10 +1720,12 @@ def journal_shown(
 ) -> dict[str, Any]:
     """The entry each card shows, by the card's anchor.
 
-    Each row goes to the card its key names, and each card shows one: its own
-    row first, then by the filed id, account and broker. An anchor two cards
-    share (an order in two asset categories, which IBKR does not issue) shows
-    nothing, and its rows are listed as orphans, rather than one row on both.
+    Each row goes to the card its key names (`campaigns.named`), and each card
+    shows one: a row filed under its own key or anchor first, then the oldest.
+    Two rows reach one card only where two written cards have since become one.
+    An anchor two cards share (an order in two asset categories, which IBKR does
+    not issue) shows nothing, and its rows are listed as orphans, rather than
+    one row on both.
 
     One pass over the rows, which made a journal of 10,000 written cards take
     seconds to draw when it was one pass per card.
@@ -1735,8 +1734,10 @@ def journal_shown(
     twice = {anchor for anchor, n in Counter(c.anchor for c in cards).items() if n > 1}
     claims: dict[str, list[tuple[Any, ...]]] = {}
     for key, entry in written.items():
-        card = find(*key)
-        if card is not None and card.anchor is not None and card.anchor not in twice:
+        card = find(*key, entry.opened_on)
+        if (card is not None and card.key is not None and card.anchor is not None
+                and card.anchor not in twice):
+            own = key in (card.key, (card.key[0], card.key[1], card.anchor))
             claims.setdefault(card.anchor, []).append(
-                (key != card.key, len(key[2]), key[2], key[1], key[0], entry))
-    return {anchor: min(rows, key=lambda row: row[:5])[-1] for anchor, rows in claims.items()}
+                (not own, entry.created_at, key, entry))
+    return {anchor: min(rows, key=lambda row: row[:3])[-1] for anchor, rows in claims.items()}

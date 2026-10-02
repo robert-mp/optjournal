@@ -483,12 +483,13 @@ CREATE TABLE IF NOT EXISTS watchlist (
 -- the table is deliberately dull -- text and small enums, nothing derived, no
 -- cached figure that could disagree with what it was computed from.
 --
--- KEYED ON AN ORDER ID, not on a campaign. A campaign is recomputed on every
--- ingest by a 90-second heuristic (`campaigns.link`), and its `episode_indices`
--- are positions in a list that is rebuilt each time -- so keying on any of that
--- would lose a reader's notes the first time a roll changed the grouping. An
--- order id is IBKR's own, issued once, naming one placement forever.
--- `Campaign.anchor` is its lowest, so a roll added tomorrow does not move it.
+-- KEYED ON A FILL, not on a campaign. A campaign is recomputed on every ingest
+-- by a 90-second heuristic (`campaigns.link`), and its `episode_indices` are
+-- positions in a list that is rebuilt each time, so keying on any of that would
+-- lose a reader's notes the first time a roll changed the grouping.
+-- `anchor_order_id` holds `t:` and the card's first fill (`Campaign.key`), since
+-- a fill is in exactly one card; rows the released code wrote hold the card's
+-- lowest order id instead. See `campaigns`' docstring.
 --
 -- `underlying_symbol` and `opened_on` are RECORDED but not part of the key. They
 -- are what makes an orphan legible: if the clustering ever changes such that no

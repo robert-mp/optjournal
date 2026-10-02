@@ -202,6 +202,7 @@ def campaigns_for(
         "WHERE ib_order_id IS NOT NULL"
     )
     order_of_trade: dict[str, str] = {}
+    trade_day: dict[str, str] = {}
     first_fill: dict[str, tuple[str, str | None]] = {}
     #: Orders IBKR generated (an expiry, an assignment), which the window must
     #: not merge: every expiration is stamped 16:20:00. See `cluster_orders`.
@@ -212,6 +213,7 @@ def campaigns_for(
     ):
         oid = str(row["ib_order_id"])
         order_of_trade[str(row["trade_id"])] = oid
+        trade_day[str(row["trade_id"])] = str(row["trade_date"] or "")
         at = str(row["date_time"] or row["trade_date"] or "")
         under = row["underlying_symbol"] or row["symbol"]
         if oid not in first_fill or at < first_fill[oid][0]:
@@ -226,6 +228,7 @@ def campaigns_for(
         ),
         order_of_trade=order_of_trade,
         links=journal.links(conn),
+        trade_day=trade_day,
     )
 
 
