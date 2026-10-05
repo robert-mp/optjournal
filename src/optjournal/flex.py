@@ -59,6 +59,8 @@ __all__ = [
     "FetchLockTimeout",
     "FetchResult",
     "FlexBusy",
+    "FlexUnreachable",
+    "KeychainAsleep",
     "StatementUnreadable",
     "TokenMissing",
     "TokenRejected",
@@ -284,9 +286,12 @@ class _TimeoutFlexClient(FlexClient):
             with urlopen(request, timeout=self.timeout_s) as response:  # noqa: S310
                 return bytes(response.read())
         except HTTPError as exc:
-            raise FlexError(f"HTTP Error {exc.code}: {exc.reason}") from exc
+            # A 5xx is IBKR's side failing, which clears by itself; a 4xx is this
+            # request being wrong, which a retry would only repeat.
+            error = FlexUnreachable if exc.code >= 500 else FlexError
+            raise error(f"HTTP Error {exc.code}: {exc.reason}") from exc
         except URLError as exc:
-            raise FlexError(f"URL Error: {exc.reason}") from exc
+            raise FlexUnreachable(f"URL Error: {exc.reason}") from exc
         except TimeoutError as exc:
             # MEASURED, and my first version got it wrong: a socket timeout raises a
             # BARE `TimeoutError`, which is an `OSError` and NOT a `URLError`
@@ -295,13 +300,24 @@ class _TimeoutFlexClient(FlexClient):
             # every other transport failure does, so `sync_journal`'s callers would
             # have seen a raw traceback -- exactly the shape of the 2026-08-07
             # keychain failure this plan exists to stop.
-            raise FlexError(f"timed out after {self.timeout_s}s: {exc}") from exc
+            raise FlexUnreachable(f"timed out after {self.timeout_s}s: {exc}") from exc
         except (http.client.HTTPException, OSError) as exc:
             # The same gap one level over: a body cut short raises IncompleteRead,
             # an `http.client.HTTPException` and not an `OSError`, and a server
             # that hangs up raises RemoteDisconnected or ConnectionResetError. None
             # is a `URLError` once the response has started.
-            raise FlexError(f"connection failed: {type(exc).__name__}: {exc}") from exc
+            raise FlexUnreachable(
+                f"connection failed: {type(exc).__name__}: {exc}") from exc
+
+
+class FlexUnreachable(FlexError):
+    """IBKR could not be reached, or failed on its side: no network yet after a
+    wake, DNS, a timeout, a dropped connection, a 5xx.
+
+    A `FlexError`, so every handler of a failed request still catches it. Its own
+    type so the scheduler can retry the same day (`jobs._gives_back`): nothing
+    about the token, the query or the journal is wrong.
+    """
 
 
 #: What `fetch` constructs. A module-level indirection so there is exactly ONE name
@@ -363,6 +379,21 @@ class TokenUnreadable(TokenMissing):
     job ledger, the Sync button and the CLI. Its own type because the remedy
     differs: the token is probably stored, and the keychain is waiting for an
     unlock nobody is there to give.
+    """
+
+
+#: macOS `errSecInDarkWake`: the keychain refuses every read while the Mac is in
+#: a dark wake (awake for maintenance with the display off). The scheduler's tick
+#: often lands in one, and nothing is wrong with the token.
+DARK_WAKE_STATUS = "-25320"
+
+
+class KeychainAsleep(RuntimeError):
+    """The keychain refused the read because the Mac is in a dark wake.
+
+    Raised before any request, so nothing was asked of IBKR. Its own type so the
+    scheduler can treat it like a held lock, retrying shortly without counting a
+    failure: five of these once stopped `sync` for two weeks.
     """
 
 
@@ -558,7 +589,8 @@ def read_token(account: str | None = None, *, timeout_s: float | None = None) ->
     `TokenUnreadable` past it, saying whether the keychain is slow to answer or a
     call is stuck. A call already pending from before the read began is waited
     for and then asked again, never taken (see `_Keyring`). An error the keyring
-    backend raises is raised as itself.
+    backend raises is raised as itself, except macOS's dark-wake refusal, which is
+    `KeychainAsleep`.
 
     THE COST OF ASKING AGAIN, accepted rather than fixed. A read behind another
     pays two round trips, so against a slow keychain the later one can run out
@@ -594,6 +626,9 @@ def read_token(account: str | None = None, *, timeout_s: float | None = None) ->
             raise TokenUnreadable(_unreadable(call, arrived, wait_s, behind))
     answer = call.answer
     if isinstance(answer, Exception):
+        if DARK_WAKE_STATUS in str(answer):
+            raise KeychainAsleep(
+                f"the keychain is unavailable while the Mac sleeps ({answer})") from answer
         raise answer
     token = answer if isinstance(answer, str) else None
     if not token:

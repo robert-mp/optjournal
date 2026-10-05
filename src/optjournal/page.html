@@ -229,6 +229,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Array} watchlist -- Watch rows (serialize.watchlist_data)
  * @property {Scheduler} scheduler -- what the jobs did, and whether the loop is
  *   alive (serialize.jobs_data). Two separate questions: see the typedef
+ * @property {Collection} collection -- the one answer to "is this journal being
+ *   fed", for the Sync button's dot and the banner (serialize.collection_status)
  * @property {Install} install -- where the journal lives, whether the launcher is
  *   supervising this server, and journals a previous download left (web.build_state)
  * @property {Array} history_plan -- HistoryChunk rows a history import would
@@ -299,6 +301,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   off to re-enter it
  * @property {string} account -- the OS user the entry is filed under
  * @property {string} message
+ * @property {boolean} [collecting] -- a successful POST only: the save started
+ *   the first collection (web._Handler._collect_now)
  */
 
 /** @typedef {Object} BrokerCosts -- the Costs tab's whole payload
@@ -746,6 +750,16 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string|null} previous
  */
 
+/** @typedef {Object} Collection -- whether the journal is being fed
+ *  (serialize.collection_status). What replaced the Dashboard's Collection
+ *  card: one state the header can colour, not six job rows to read.
+ * @property {string} state -- demo, setup, running, attention, stalled, off,
+ *   waiting, behind or ok. Only setup and attention ask the reader for anything
+ * @property {string} message -- the sentence to show
+ * @property {string|null} fix -- "settings" when the reader has to act there
+ * @property {string|null} through -- the last day the newest statement covers
+ */
+
 /** @typedef {Object} Scheduler -- the scheduler's own state (serialize.jobs_data)
  *
  *  TWO SEPARATE QUESTIONS, and conflating them is the failure this exists for.
@@ -839,6 +853,14 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   row. Null on a journal where nothing has happened yet
  * @property {number|null} day -- which day of the log today is, counting the
  *   opening day as 1. Null exactly when `opened` is
+ */
+
+/** @typedef {Object} SettingsWrite -- POST /api/settings (web._settings_write)
+ * @property {boolean} ok
+ * @property {string} kind
+ * @property {string} [message] -- a refusal's reason
+ * @property {boolean} [collecting] -- a saved query id started the first
+ *   collection (web._Handler._collect_now)
  */
 
 /** @typedef {Object} JobReply -- POST/GET /api/jobs/run (web._job_run,
@@ -1425,6 +1447,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload ivr:IvRank ir:IvRank
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook hc:HistoryChunk ins:Install upd:UpdateCheck ures:UpdateReply
+ * @payload cn:Collection sres:SettingsWrite
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite lkres:LinkWrite
  * @payload rv:JournalReview ty:Tally tt:TriggerTally zr2:OdteRefresh
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
@@ -1444,6 +1467,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local SCORINGS qidsave cqidsave tokcheck toksave
  * @local WMETER WRING arc tin tout sb
  * @local events
+ * @local COLLECT_BANNER c adv
  * @local zrows clean
  * @local rails sessions sigma
  * @local body others pair pick said m r err Date
@@ -2623,29 +2647,29 @@ function dashboard(){
     </div>
     ${chart(s.days)}
   </div>
-  ${odteCohorts()}
-  ${collection()}`;
+  ${odteCohorts()}`;
 }
 
-/* ------------------------------------------------ collection health
+/* ------------------------------------------------ collection details
  *
- * WHY THIS IS ON THE DASHBOARD AND NOT A TAB. It answers one question -- "is this
- * journal still being fed?" -- and the answer is worthless if you have to go
- * looking for it. The whole failure this surface exists for is a system that
- * looked fine from the outside: `~/.meshclaw/crons.json` read `last_status: "ok"`
- * for bars-live, bars-daily AND bars-audit while `price_bars.fetched_at` shows 28
- * hourly rows written on 08-06, two on 08-07, and nothing after until a human ran
- * the command by hand. Three jobs green for two days, including the audit job
- * whose only purpose was to notice.
+ * WHAT EACH BACKGROUND JOB DID LAST, in Settings → Advanced. Collection runs by
+ * itself (the scheduler's clock, a save in Settings, the first start), so the
+ * reader's question "is this journal still being fed?" is answered by ONE state,
+ * `collection_status`, on the Sync button and in a banner when it needs them.
+ * This table is what you open when that state says something is wrong.
  *
- * READ-ONLY, deliberately. Nothing here schedules or triggers anything; the
- * runner and the run-now button arrive in step 5. Shipping the status surface
- * BEFORE the scheduler is the one point all three design reviews agreed on -- a
- * scheduler without a status surface makes the system quieter AND less
- * trustworthy in the same change.
+ * It still reads the two signals apart, for the failure it was built for:
+ * `~/.meshclaw/crons.json` read `last_status: "ok"` for bars-live, bars-daily AND
+ * bars-audit while `price_bars.fetched_at` showed 28 hourly rows on 08-06, two on
+ * 08-07, and nothing after. A row can be green on outcome while the loop is dead,
+ * so the heartbeat pill says whether anything drives the schedule at all.
+ *
+ * READ-ONLY. No Run button per job: every job runs by itself, and the one worth
+ * starting sooner, the history import, has its own button above it with the
+ * request count in front of the reader.
  */
 /* What a control that would reach IBKR says under `serve --demo`: the Sync button,
-   and every job run that spends a Flex request. */
+   and the history import. */
 const DEMO_NO_IBKR='The demo journal is synthetic data and never fetches from IBKR.';
 function collection(){
   const sc=S.state.scheduler, au=S.state.audit;
@@ -2653,14 +2677,14 @@ function collection(){
 
   /* THE HEARTBEAT PILL, and its three states are three different situations.
      `ever_ran:false` is NOT an alarm: no scheduler has ever written a heartbeat
-     here, which is the normal state of a journal driven by the CLI or by a cron,
-     and tinting it red would be the noise this project avoids. Stale IS an alarm.
-     Fresh is fine. `running` already encodes fresh-vs-stale server-side, so the
-     page does not hold its own copy of the 5-minute threshold. */
+     here, which is a server started with `--no-scheduler` (or a journal fed by
+     the CLI), and tinting it red would be the noise this project avoids. Stale IS
+     an alarm. Fresh is fine. `running` already encodes fresh-vs-stale server-side,
+     so the page does not hold its own copy of the 5-minute threshold. */
   const beat=!sc.ever_ran
     ? `<span class="pill" title="No scheduler has ever recorded a heartbeat in
-        this journal. Jobs are being run by the CLI or by a cron, which is the
-        current arrangement -- this is not a fault.">scheduler <b>not running</b></span>`
+        this journal: it is fed by hand, with Sync or the CLI. This is not a
+        fault.">scheduler <b>not running</b></span>`
     : sc.running
     ? `<span class="pill" title="The tick loop wrote a heartbeat ${
         ago(sc.heartbeat_age_s)}, within the ${sc.stale_after_s}s freshness
@@ -2682,11 +2706,11 @@ function collection(){
        stored a bar produces a payload byte-identical to one whose collector died
        -- measured on a copy of the real journal with `price_bars` emptied -- so
        without `ever_collected` the demo journal, and every journal before its
-       first `optjournal bars`, showed a red blackout for the absence of something
-       that was never there. Same distinction `ever_ran` draws for the heartbeat. */
+       first bars run, showed a red blackout for the absence of something that
+       was never there. Same distinction `ever_ran` draws for the heartbeat. */
     ? `<span class="pill" title="No price bars have ever been stored in this
-        journal, so there is nothing to audit yet. Run optjournal bars to start
-        collecting -- this is not a fault.">bars <b>none collected</b></span>`
+        journal, so there is nothing to audit yet. They are collected by
+        themselves after the first sync. This is not a fault.">bars <b>none collected</b></span>`
     : au.blackout
     ? `<span class="pill" title="No underlying traded anywhere in the last ten
         days, and this journal HAS collected bars before. Nine US market holidays a
@@ -2711,25 +2735,13 @@ function collection(){
   /* One row per registered job. `last_status` is rendered as itself rather than
      collapsed to a colour: `nothing` (a legitimately empty run) and `ok` are both
      healthy and must stay distinguishable, because conflating them is exactly what
-     let three cron jobs report health while collecting nothing.
-
-     EACH ROW CARRIES A RUN BUTTON, which is the point of the whole exercise --
-     nothing here should need a terminal. `sync` gets a confirm() and the others do
-     not, and the line between them is not caution but COST: sync spends one of
-     IBKR's rate-limited Flex requests against a lockout budget, and the other
-     three hit a public chart endpoint or a calendar feed where the penalty for an
-     extra call is nothing. A dialogue on all four would train you to click through
-     dialogues, which is how the one that matters stops being read. */
+     let three cron jobs report health while collecting nothing. */
   const rows=(sc.jobs||[]).map(j=>{
     const run=j.last_run;
     /* In flight is the newest RUN's status, never `last_status`: the job's state
-       row is written when a run finishes, so it held the previous outcome for the
-       whole of a run and the button stayed live under a job already running. */
+       row is written when a run finishes, so it holds the previous outcome for the
+       whole of a run. */
     const status=run&&run.status==='running'?'running':j.last_status;
-    const busy=status==='running';
-    /* The demo journal never reaches IBKR, and the server refuses such a run
-       there; a live button would ask to spend a request and then be refused. */
-    const demoOff=!!S.state.demo&&j.spends_request;
     const tint=status==='failed'||status==='interrupted'?'neg'
       :status==='ok'?'pos':'';
     const detail=run&&run.detail?run.detail:'';
@@ -2747,32 +2759,21 @@ function collection(){
           : 'Consecutive failures since the last healthy run.'}"
         >${j.backed_off?'backed off ':''}×${j.consecutive_failures}</span>`:''}
       ${j.retired
-        /* No button: the job left the registry, so there is nothing to run. Its
-           history stays visible and labelled rather than disappearing, because a
-           row that vanishes reads as "this never happened". */
+        /* The job left the registry. Its history stays visible and labelled
+           rather than disappearing, because a row that vanishes reads as "this
+           never happened". */
         ? `<span class="dim2 lbl-sm" title="This job is no longer registered. Its
             history is kept so a rename does not erase what it did."
-            >retired</span>`
-        : `<button class="btn sm jobrun" data-job="${esc(j.job)}"
-        data-requests="${j.requests??1}"${busy||demoOff?' disabled':''}
-        title="${demoOff?DEMO_NO_IBKR:j.spends_request
-          ? `Spends ${(j.requests??1)===1?'one IBKR Flex request':j.requests+' IBKR Flex requests'} against a rate-limited budget.`
-          : 'Costs no IBKR request.'}">${busy?'running':'run'}</button>`}
+            >retired</span>`:''}
     </div>`;
   }).join('');
 
-  return `<div class="card">
-    <div class="crow"><div><h2>Collection${infoTip(
-      `A green status means the last run SUCCEEDED, which is a different question
-       from whether anything is running at all — read it with the scheduler pill
-       beside this heading, which answers the second.`)}</h2>
-      <div class="sub">Whether this journal is still being fed — and by what.</div></div>
-      <div class="pills">${beat}${audit}</div></div>
-    ${rows||`<div class="empty">no job has recorded a run in this journal yet —
-      today the bars and sync commands are driven by cron, and they write here
-      from now on</div>`}
-
-  </div>`;
+  return `<h2 class="sub3 mt-5">Collection details${infoTip(
+      `What each background job did last. A green status means the last run
+       SUCCEEDED, which is a different question from whether anything is running
+       at all. The scheduler pill answers the second.`)}</h2>
+    <div class="pills">${beat}${audit}</div>
+    ${rows}`;
 }
 
 /* Seconds, in words. Small enough to inline, and the wording matters: an age with
@@ -3129,7 +3130,8 @@ function replayStop(){ if(RTIMER!==null){const h=RTIMER;RTIMER=null;cancelAnimat
 function replayChart(rp){
   const pts=(rp.points||[]).filter(p=>p&&isFinite(p[1]));
   if(pts.length<MIN_POINTS) return `<div class="empty">no price bars stored for ${
-    esc(rp.underlying||'this underlying')} yet — run <code>optjournal bars</code></div>`;
+    esc(rp.underlying||'this underlying')} yet. The daily price job collects
+    them by itself after each sync.</div>`;
   const sks=(rp.strikes||[]).filter(sk=>sk&&isFinite(sk.strike));
   const W=920,H=280,L=52,R=46,T=22,B=30, iw=W-L-R, ih=H-T-B;
   const mks=rp.marks||[];
@@ -4827,8 +4829,8 @@ const WDIR={up:'↑',down:'↓',flat:'→'};
    fortnight's, and an undated price is the one thing `marketdata.parse_quote`
    discards outright rather than storing. */
 function wprice(px,w){
-  if(px.price==null) return wdash(`no close stored for ${w.symbol} yet: run `
-    +`optjournal bars`);
+  if(px.price==null) return wdash(`no close stored for ${w.symbol} yet: the `
+    +`daily price job fills it in`);
   const stamped=w.closes_through?`stored close from ${w.closes_through}`
     :'stored close';
   return num(px.price,2)+(px.live?'':`<span class="dim wstale" title="${
@@ -5111,8 +5113,8 @@ function watchTable(rows,open){
       <td class="n wdaily ${cls(w.bx_daily,1)}${bxStrong(w.bx_recent||[])?' strong':''
         }">${w.bx_daily==null
         ?wdash(`${w.closes} of ${BX_SETTLED} sessions stored: inside that window `
-          +`the reading is a warm-up figure and its sign can be wrong. Run `
-          +`optjournal bars`)
+          +`the reading is a warm-up figure and its sign can be wrong. The daily `
+          +`price job adds one each session`)
         :num(w.bx_daily,1)}</td>
       <td class="n">${(()=>{const ir=ivrOf(w.symbol);
         return ir?num(ir.rank,1):wdash(ivrWhy(w.symbol));})()}</td>
@@ -5364,7 +5366,7 @@ function watchlist(){
     ${watchFilters()}
     <div class="wtpane">${watchTable(rows,open)}</div>
     ${thin.length?`<div class="dim mkattr">no stored history yet for ${
-      esc(thin.join(', '))}: run <code>optjournal bars</code></div>`:''}
+      esc(thin.join(', '))}: the daily price job fills it in</div>`:''}
   </div>`;
 }
 
@@ -5573,9 +5575,8 @@ function odte(){
     :`<div class="wcap zevents">No US release on the calendar today — a lighter
       tape than a print day, though nothing rules out an intraday headline.</div>`}
     ${none?`<div class="note"><b>Not available yet.</b> The calculator opens on the
-      S&amp;P and VIX daily closes, which arrive with the price bars: run
-      <code>optjournal bars</code>, or wait for the daily job. Until then, type both
-      readings below.</div>`
+      S&amp;P and VIX daily closes, which the daily price job collects by itself
+      after each sync. Until then, type both readings below.</div>`
     :!S.zat?`<div class="wcap zstat">Checking the feed…</div>`
     :!oc.fresh?`<div class="note zwarn zstat"><b>Not current, so not
       shown.</b> ${esc(oc.stale_reason||'')}.${S.zerr?` The refresh failed:
@@ -5978,12 +5979,27 @@ function provisionalBanner(){
       no realised P&L exists for these yet; tomorrow's statement settles them.`;
 }
 
-/* The two things the app itself can offer: a newer version, and a journal a
-   previous download left. Both are one button because the people this is for
-   do not use a terminal; everything the button does is on the server. */
+/* The collection states worth interrupting the page for: the reader has to act
+   (setup, attention), or a retry has gone on long enough to tell them (behind,
+   stalled). Every other state is only the dot on the Sync button. */
+const COLLECT_BANNER=['setup','attention','behind','stalled'];
+/* The dot each state puts on Sync. Running, waiting, off and the demo have none;
+   the tooltip says which. */
+const COLLECT_DOT={ok:'collect-ok',behind:'collect-behind',
+  setup:'collect-need',attention:'collect-need',stalled:'collect-need'};
+
+/* What the app itself has to say: collection needs you, a newer version, and a
+   journal a previous download left. Each is at most one button because the people
+   this is for do not use a terminal; everything the button does is on the server. */
 function appBanners(){
   const upd=S.update, ins=(S.state&&S.state.install)||{};
+  const cn=(S.state&&S.state.collection)||{};
   let out='';
+  if(COLLECT_BANNER.includes(cn.state)){
+    out+=`<div class="card banner"><span><b>Collection:</b> ${esc(cn.message)}</span>
+      ${cn.fix==='settings'&&!S.showCog
+        ?`<button class="btn" id="collectfix">Open Settings</button>`:''}</div>`;
+  }
   if(upd&&upd.available){
     out+=`<div class="card banner"><b>Version ${esc(upd.latest)} is available</b>
       <span class="dim">(you have ${esc(upd.current)})</span>
@@ -6073,7 +6089,22 @@ function bindAppBanners(){
   const m=$('#impgo');
   if(m) m.onclick=()=>bannerPost(m,'/api/install/import',{source:m.dataset.source},
     'Could not use that journal: ',()=>'Moving your journal. The page reloads by itself.');
+  const c=$('#collectfix');
+  if(c) c.onclick=()=>{S.showCog=true;draw();};
 }
+
+/* How long the page follows collection after a save asked for it. The scheduler
+   starts the run within a second, but the first reload must not land before it
+   and stop following an idle state. */
+const COLLECT_FOLLOW_MS=20000;
+/* While collection runs, the page follows it: Sync's dot turns from running to
+   done, and the figures fill in, without a reload by hand. Only while visible,
+   and only then, since each is a full /api/state. */
+setInterval(()=>{
+  if(S.state&&document.visibilityState==='visible'
+     &&((S.state.collection||{}).state==='running'||Date.now()<(S.collectUntil||0)))
+    load();
+},5000);
 
 function settingsPanel(){
   const st=S.state, se=st.settings||{};
@@ -6115,8 +6146,8 @@ function settingsPanel(){
       accepting a value that would not take effect. Drop the flag to edit it
       from this page.</div>`
       :src==='unset'?`<div class="note"><b>No query id yet.</b> Client Portal →
-        Performance &amp; Reports → Flex Queries. Sync stays disabled until this
-        is set.</div>`:''}
+        Performance &amp; Reports → Flex Queries. Collection starts by itself once
+        this and the token are saved.</div>`:''}
     <div class="setrow mt-4">
       <label class="flabel" for="cqid">Confirms Query ID</label>
       <input id="cqid" class="tin mono" inputmode="numeric" maxlength="32"
@@ -6146,16 +6177,18 @@ function settingsPanel(){
       <button id="tokcheck">Check keyring</button>
       <span class="dim">presence only, and never the value</span>
     </div>
-    <div class="note">Client Portal → Settings → Flex Web Service. Press
-    <b>Sync</b> after saving.${infoTip(
+    <div class="note">Client Portal → Settings → Flex Web Service. Saving it starts
+    collecting by itself.${infoTip(
     `An expired token still reads as <b>stored</b> here: the keyring holds whatever
-     it was given, and only a real fetch can say whether IBKR still accepts it.`
+     it was given, and only a real fetch can say whether IBKR still accepts it. The
+     fetch a save starts is that check, and the dot on the Sync button says how it
+     went.`
     )}</div>
 
     ${scoringRow()}
     ${tileChooser()}
 
-    <details class="adv mt-5"${st.dev?' open':''}>
+    <details class="adv mt-5" id="adv"${st.dev||S.advOpen?' open':''}>
       <summary>Advanced — journal details and archive</summary>
       <div class="note">Diagnostics, not settings: nothing here is editable, and
       it is what you want when something looks wrong rather than when you are
@@ -6179,6 +6212,7 @@ function settingsPanel(){
           <td class="dim">${esc(stm.asset_filter||'-')}</td></tr>`).join('')}
       </tbody></table>
       ${historyImport(st.history_plan||[])}
+      ${collection()}
       <div class="note"><b>Needs the Flex query template:</b>
         <i>Gain % of Net Liq</i> reads the Equity Summary section — enable it on the
         query and sync, and the figure fills in from the next statement. <i>Trade
@@ -6188,11 +6222,11 @@ function settingsPanel(){
   </div>`;
 }
 
-/* The one-off import of the years before the journal's oldest statement.
-   In Advanced rather than beside Sync because it is not a routine: it runs once,
-   spends one IBKR request per year, and the first sync already fetched the
-   last year. The count and the oldest date are the server's plan, not a guess
-   made here, so the dialogue and the button cannot disagree about the cost. */
+/* The import of the years before the journal's oldest statement. It runs BY
+   ITSELF, once, after the first sync (`jobs.Catchup.ONCE`), so this is a status
+   with a button for running it again sooner, not a step of setup. The count and
+   the oldest date are the server's plan, not a guess made here, so the dialogue
+   and the button cannot disagree about the cost. */
 function historyImport(plan){
   const day=d=>String(d||'').replace(/^(\d{4})(\d\d)(\d\d)$/,'$1-$2-$3');
   if(!plan.length) return `<h2 class="sub3 mt-5">History import</h2>
@@ -6201,14 +6235,15 @@ function historyImport(plan){
   const hc=plan[plan.length-1];
   return `<h2 class="sub3 mt-5">History import</h2>
     <div class="setrow">
-      <span>Fetch back to <b class="mono">${esc(day(hc.from))}</b>:
+      <span>Back to <b class="mono">${esc(day(hc.from))}</b> still to fetch:
         ${plan.length} IBKR request${plan.length===1?'':'s'}, one per year,
         newest first, 30 seconds apart.</span>
       <button class="btn sm" data-job="history" data-requests="${plan.length}"${
-        S.state.demo?` disabled title="${DEMO_NO_IBKR}"`:''}>Import full history</button>
+        S.state.demo?` disabled title="${DEMO_NO_IBKR}"`:''}>Import now</button>
     </div>
-    <div class="note">It runs on the server, so closing this page does not stop
-    it. The Collection card shows how it ended.</div>`;
+    <div class="note">It runs by itself once, after the first sync, so there is
+    no need to press this. It runs on the server, so closing this page does not
+    stop it; Collection details below show how it ended.</div>`;
 }
 
 /* ------------------------------------------------ view state in the URL
@@ -6575,6 +6610,10 @@ function draw(push){
     if(!res||!res.ok){note(esc((res&&res.message)||'could not reset the tiles'),'bad');return;}
     S.tiledraft=null; load();
   };
+  /* Open stays open across a redraw: the page redraws every 5 s while
+     collection runs, and the details it points the reader to are in here. */
+  const adv=$('#adv');
+  if(adv) adv.ontoggle=()=>{S.advOpen=adv.open;};
   const qidsave=$('#qidsave');
   if(qidsave) qidsave.onclick=()=>saveQueryId('query_id','qid');
   /* An EMPTY value is a real choice for the confirms id (it turns the intraday
@@ -6611,6 +6650,9 @@ function draw(push){
          lands and the line below reports "stored" for itself -- rather than the
          page claiming it from the fact that a request came back. */
       if(S.state&&S.state.settings) S.state.settings.token=tok;
+      /* What happens next is the server's to say: fetching now, waiting for the
+         query id, or Sync by hand on a server with no scheduler. */
+      if(tok.collecting) collectingNote(); else note('Token '+esc(tok.message||''),'ok');
       draw();
     }catch(err){
       if(msg) msg.textContent='could not reach the journal: '+err;
@@ -6699,14 +6741,15 @@ function draw(push){
      and a redraw happens on every toggle, filter and edit. `quotesAt` is the
      latch; Refresh is the way to ask again. */
   if(S.tab==='watchlist'&&!S.quotesAt&&(S.state.watchlist||[]).length) loadQuotes(false);
-  const st=S.state;
+  const st=S.state, cn=st.collection||{};
   /* innerHTML rather than textContent because dev mode adds a marked pill, so
      the dynamic pieces are escaped. A visible, always-on marker on purpose: a
      dev should never wonder whether dev mode is on, and should never ship a
      screenshot not knowing it was -- the same reason IAG surfaces `is_admin` as
      a signal rather than hiding it. Off for a friend, so the footer reads
      exactly as before. */
-  $('#foot').innerHTML=`optjournal ${esc(st.version)} · ${esc(st.db)} · loopback only, `
+  $('#foot').innerHTML=`optjournal ${esc(st.version)} · ${esc(st.db)}`
+    +`${cn.through?` · statements through ${esc(cn.through)}`:''} · loopback only, `
     +`no authentication${st.dev?' · <b class="devtag">dev mode</b>':''}`;
   /* `st.sync||{}`, the same idiom as `(S.state.scheduler||{}).jobs` elsewhere, and
      it is load-bearing rather than defensive habit. This is the LAST thing draw()
@@ -6717,13 +6760,32 @@ function draw(push){
      already said so in a banner by this point; the button must not also lie.
      An absent block leaves `configured` undefined, so the first branch takes it and
      the button disables, which is the safe direction. */
+  drawSync(st);
+}
+
+/* The Sync button from one payload: whether it can be pressed, its tooltip, and
+   the collection dot. Its own function so it can be run against a payload without
+   the rest of the page. */
+function drawSync(st){
+  const cn=st.collection||{};
   const b=$('#sync'), sync=st.sync||{}, rem=sync.cooldown_remaining_s;
   b.classList.remove('busy');
-  if(st.demo){b.disabled=true;b.title=DEMO_NO_IBKR;}
-  else if(!sync.configured){b.disabled=true;b.title='No query id — start with --query-id';}
+  /* THE COLLECTION DOT. Sync is where a reader looks to ask "is this up to date",
+     so the one answer (`collection_status`) is its colour and the first line of
+     its tooltip; the second line is what pressing it would do. */
+  b.classList.remove(...Object.values(COLLECT_DOT));
+  if(COLLECT_DOT[cn.state]) b.classList.add(COLLECT_DOT[cn.state]);
+  let does;
+  if(st.demo){b.disabled=true;does=DEMO_NO_IBKR;}
+  else if(!sync.configured){b.disabled=true;does='Add your Flex query id in Settings first.';}
+  /* Running is busy, not pressable: a second fetch would only be refused by the
+     server's fetch lock, after the dialogue had asked about spending a request. */
+  else if(cn.state==='running'){b.disabled=true;b.classList.add('busy');
+    does='Wait for this fetch to finish.';}
   else if(rem>0){b.disabled=true;
-    b.title=`Cooldown: ${Math.ceil(rem/60)}m left. Prevents spending an IBKR request for data that cannot have changed.`;}
-  else {b.disabled=false;b.title='Fetch from IBKR — spends one request';}
+    does=`Cooldown: ${Math.ceil(rem/60)}m left. Prevents spending an IBKR request for data that cannot have changed.`;}
+  else {b.disabled=false;does='Fetch from IBKR now (spends one request).';}
+  b.title=(cn.message&&cn.state!=='demo'?cn.message+'\n':'')+does;
 }
 
 /* A click target that is not a <button> but carries a tab stop: the pointer and
@@ -6875,16 +6937,14 @@ function note(text,kind){
   },NOTE_MS);
 }
 
-/* Run a registered job from the page. The reason the strip exists.
+/* Run a registered job from the page: today only the history import's "Import
+ * now", since every other job runs by itself.
  *
- * WHICH BUTTON ASKS FOR CONFIRMATION IS DECIDED SERVER-SIDE, by
+ * WHETHER IT ASKS FOR CONFIRMATION IS DECIDED SERVER-SIDE, by
  * `JobRow.spends_request`, which comes from the registry's
  * `spends_broker_request`. The page holds no list of which jobs touch the broker,
  * for the same reason it holds no copy of the calendar's default filter: a second
- * copy of a fact is a copy that drifts. Only `sync` spends one of IBKR's rate-limited
- * requests today; the others hit a public chart endpoint or a calendar feed where
- * an extra call costs nothing, and a dialogue on all four would train you to click
- * through the one that matters.
+ * copy of a fact is a copy that drifts.
  *
  * EVERY REPLY THE ENDPOINT CAN SEND IS RENDERED AS ITSELF. 409 means the job is
  * already running -- a working system, not an error -- so it polls the run already
@@ -6902,7 +6962,7 @@ function note(text,kind){
    (the collision with the journal's row, see app.css `the Jobs strip`). The
    stylesheet, the markup and the layout tests all moved together and every test
    stayed green -- because nothing asserted on the SELECTOR. The strip rendered
-   perfectly and none of its five buttons did anything. A class rename cannot reach
+   perfectly and none of its buttons did anything. A class rename cannot reach
    `[data-job]`. */
 function bindJobRuns(){
   document.querySelectorAll('button[data-job]').forEach(b=>{
@@ -7116,19 +7176,27 @@ async function save(body){
 async function saveQueryId(key,id){
   const el=$('#'+id), msg=$('#'+id+'msg'), value=(el&&el.value||'').trim();
   if(msg) msg.textContent='saving...';
-  const res=await save({[key]:value});
-  if(!res||!res.ok){
+  const sres=await save({[key]:value});
+  if(!sres||!sres.ok){
     /* The refusal ENDS any held "saved": a hold outlives the render it was written
        for, so saving a valid id and then a bad one within the four seconds had the
        next redraw put "saved" back beside the value the server had just refused,
        while the stored id was still the previous one. */
     if(S.held) delete S.held[id+'msg'];
-    const now=$('#'+id+'msg'); if(now) now.textContent=(res&&res.message)||'failed';
+    const now=$('#'+id+'msg'); if(now) now.textContent=(sres&&sres.message)||'failed';
     return;
   }
   const live=$('#'+id); if(live) live.value=value;
   holdNote(id+'msg','saved');
+  if(sres.collecting) collectingNote();
   load();
+}
+
+/* A save the server answered with `collecting: true` started the first
+   collection, so the page says so and follows it (COLLECT_FOLLOW_MS). */
+function collectingNote(){
+  S.collectUntil=Date.now()+COLLECT_FOLLOW_MS;
+  note('Saved. Collection starts now, and this page updates by itself.','ok');
 }
 
 /* A status word a redraw must not wipe at once. Held in state for a few seconds
@@ -7318,12 +7386,17 @@ let LOADED={};
 let READ_NOTE=null;
 
 async function load(){
+  /* The newest load wins. The page reloads by itself while collection runs, and
+     a slower reply landing after the reader's own (a filter, a month) would put
+     the scope it was asked for back over the one on screen. */
+  const seq=S.loadSeq=(S.loadSeq||0)+1;
   const qs=stateQuery();
   let st=null, why='';
   try{
     const r=await fetch('/api/state'+(qs?'?'+qs:''));
     if(r.ok) st=await r.json(); else why='HTTP '+r.status;
   }catch(err){why=String(err);}
+  if(seq!==S.loadSeq) return;
   /* Every action button ends in load(), which is how it is handed back: the
      redraw replaces it. A reply that cannot be read therefore still redraws, from
      the payload already in hand, or a Sync or a job's Run stays disabled on
@@ -7339,6 +7412,11 @@ async function load(){
   /* Before the payload guard, whose own banner this must not take down. */
   if(READ_NOTE!==null&&$('#msg').innerHTML===READ_NOTE) $('#msg').className='';
   READ_NOTE=null;
+  /* The token's presence is never on the payload (see Settings.token), so the
+     answer already in hand carries over. Without it the page following a
+     collection put "not checked" back under a token just stored. */
+  const tok=S.state&&S.state.settings&&S.state.settings.token;
+  if(tok&&st.settings&&st.settings.token==null) st.settings.token=tok;
   S.state=st;
   staleServerCheck(S.state);
   /* Before the heal below, so a day in a month the account never had still heals

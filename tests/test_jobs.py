@@ -465,38 +465,102 @@ def test_the_live_poll_is_a_window_and_the_rest_are_wall_clock():
         "Confirmation poll. Both ask 'is it session time, and is the last success "
         "stale' rather than claiming a wall-clock minute"
     )
-    # And only the unscheduled job is NONE: a job that silently drops a missed
-    # instant would have to earn that, and `history` does by having no instants.
-    assert [j.name for j in JOBS if j.catchup is Catchup.NONE] == ["history"]
+    # And no job is NONE, which silently drops a missed instant; `history` has no
+    # instants at all, and runs ONCE by itself after the first sync.
+    assert [j.name for j in JOBS if j.catchup is Catchup.NONE] == []
+    assert [j.name for j in JOBS if j.catchup is Catchup.ONCE] == ["history"]
 
 
-def test_a_catchup_window_is_bounded_by_the_schedules_own_period():
-    """A window may reach back to the previous fire, and no further.
+def test_the_history_import_is_due_once_a_statement_exists_until_it_completes():
+    """Every new journal wants the years before its first statement, so the
+    import runs by itself, once. Not before a statement exists (it would ask
+    again for the first sync's year), not again once done, a day between failed
+    attempts, a busy run retried soon, and nothing once backed off."""
+    from datetime import UTC, datetime
 
-    HONEST ABOUT WHAT THIS DOES NOT GUARD. My first version asserted
-    `window_s < 24h` on the theory that a wider window makes two instants due at
-    once, and `market` at exactly 24 h failed it. The theory was wrong: `LATEST`
-    means the MOST RECENT missed instant only, and replay is prevented by the
-    partial unique index on `(job, fired_for)` -- a database constraint, not
-    arithmetic. So a wide window cannot spend two IBKR requests on one statement
-    however wide it is.
+    from optjournal.jobs import (
+        FAILURE_BACKOFF,
+        ONCE_RETRY_S,
+        RETRY_BROKER_AFTER_S,
+        due_jobs,
+        job_by_name,
+    )
 
-    What a window wider than the period WOULD do is make a job due for an instant
-    whose successor has already passed, which for a daily job means running
-    yesterday's slot after today's was available. `<=` the period is the honest
-    bound, and it is what these four satisfy.
+    history = job_by_name("history")
+    now = datetime(2026, 10, 4, 15, 0, tzinfo=UTC)          # a Sunday
+    epoch = int(now.timestamp())
+
+    def due(**kw):
+        kw.setdefault("has_statements", True)
+        args = {"claimed": {}, "last_poll": {}, "last_try": {}, "ever_ran": set(),
+                "failures": {}, "tries": {}, **kw}
+        return [d.job.name for d in due_jobs(now, registry=(history,), **args)]
+
+    assert due(has_statements=False) == [], "imported before any statement"
+    assert due() == ["history"], "a journal with a statement never imported"
+    assert due(last_poll={"history": epoch - 10 * ONCE_RETRY_S}) == [], "ran twice"
+    failed = epoch - ONCE_RETRY_S + 60
+    assert due(last_try={"history": failed}, tries={"history": [failed]}) == []
+    retry = epoch - ONCE_RETRY_S - 60
+    assert due(last_try={"history": retry}, tries={"history": [retry]}) == ["history"]
+    busy = epoch - RETRY_BROKER_AFTER_S - 60                # asked nothing
+    assert due(last_try={"history": busy}) == ["history"], "a busy run cost a day"
+    # But not on the next tick: a held lock or a sleeping keychain is still there
+    # a minute later, and every tick would start another run against it.
+    just_busy = epoch - RETRY_BROKER_AFTER_S + 60
+    assert due(last_try={"history": just_busy}) == [], "a busy run retried every tick"
+    assert due(failures={"history": FAILURE_BACKOFF}) == [], "retried while backed off"
+
+
+def test_the_scheduler_runs_the_history_import_once_and_then_never_again(
+    conn, ctx, monkeypatch
+):
+    """Through the real reconciler: one run, then nothing on the next tick."""
+    from datetime import UTC, datetime, timedelta
+
+    from conftest import add_statement
+
+    from optjournal import jobs as mod
+    from optjournal.jobs import Outcome
+
+    _stub(monkeypatch, "history", lambda _c, _x: Outcome("ok", "imported 2 year(s)"))
+    sunday = datetime(2026, 10, 4, 15, 0, tzinfo=UTC)
+    # A same-day confirmation is no anchor: the import walks back from the oldest
+    # ACTIVITY statement, and with none it would ask for the first sync's year.
+    add_statement(conn, source_file="confirm-20261002.xml", sha256="c")
+    conn.commit()
+    assert mod.reconcile(conn, ctx=ctx, now=sunday) == []
+    add_statement(conn, source_file="activity-20261002.xml")
+    conn.commit()
+    assert mod.reconcile(conn, ctx=ctx, now=sunday) == ["history"]
+    assert mod.reconcile(conn, ctx=ctx, now=sunday + timedelta(days=6)) == []
+
+
+def test_a_catchup_window_is_bounded_and_only_ever_offers_the_latest_instant():
+    """A week, so a laptop shut for days collects on its first tick, and never a
+    backlog: only the most recent instant is ever offered.
+
+    `LATEST` means the MOST RECENT missed instant only (`_last_instant`), and
+    replay is prevented by the partial unique index on `(job, fired_for)`, so a
+    wide window cannot spend two IBKR requests on one statement. The window only
+    says how long a missed latest instant is still worth running.
     """
-    from optjournal.jobs import JOBS, Catchup
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from optjournal.jobs import CATCH_UP_S, JOBS, Catchup
 
     for job in JOBS:
         if job.catchup is not Catchup.LATEST:
             continue
-        # Every LATEST job here is daily on the days it runs at all.
-        assert job.window_s <= 24 * 3600, (
-            f"{job.name}'s {job.window_s}s window reaches back past the previous "
-            "fire, so it could run a slot two schedules old"
-        )
-        assert job.window_s > 0, f"{job.name} claims catch-up but has no window"
+        assert 0 < job.window_s <= CATCH_UP_S, (
+            f"{job.name}'s {job.window_s}s window is outside (0, {CATCH_UP_S}]")
+    # Shut from Tuesday noon to the next Monday: only Saturday's slot is due.
+    monday = datetime(2026, 8, 17, 9, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    (found,) = [d for d in _due(monday) if d.job.name == "sync"]
+    saturday = datetime(2026, 8, 15, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
+    assert found.fired_for == int(saturday.timestamp())
+    assert monday - saturday < timedelta(seconds=CATCH_UP_S)
 
 
 def test_every_schedule_names_a_real_zone_and_a_real_time():
@@ -615,6 +679,187 @@ def _stub(monkeypatch, name, outcome):
         for job in mod.JOBS
     )
     monkeypatch.setattr(mod, "JOBS", replaced)
+
+
+def _only(monkeypatch, home, *names):
+    """The registry cut to `names`, each stubbed to succeed, with a settings file
+    of the test's own (the session's is shared, so a saved id would leak in)."""
+    from optjournal import jobs as mod
+    from optjournal import settings
+
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv(settings.HOME_ENV, str(home))
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    for name in names:
+        _stub(monkeypatch, name, lambda _c, _x: mod.Outcome("ok", "done"))
+    monkeypatch.setattr(mod, "JOBS", tuple(j for j in mod.JOBS if j.name in names))
+
+
+def _wait_for_rows(conn, n, seconds=5.0):
+    import time
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        rows = conn.execute("SELECT job, status FROM job_runs ORDER BY id").fetchall()
+        if len(rows) >= n:
+            return rows
+        time.sleep(0.05)
+    return conn.execute("SELECT job, status FROM job_runs ORDER BY id").fetchall()
+
+
+def test_a_request_runs_on_the_next_pass_not_at_the_end_of_the_tick(
+    conn, tmp_path, monkeypatch
+):
+    """A saved token must not wait out a 60 s tick to start collecting.
+
+    The request lands AFTER the first tick, with the loop already waiting out its
+    hour: one made before it would be taken by that tick whether or not anything
+    wakes the loop, and the test would pass without the wake."""
+    import time
+
+    from optjournal import jobs as mod
+
+    _only(monkeypatch, tmp_path / "home", "market")
+    clock = mod.Scheduler(ctx=mod.Context(archive_dir=tmp_path / "raw",
+                                          db_path=tmp_path / "j.db"), tick_s=3600)
+    clock.start()
+    try:
+        deadline = time.monotonic() + 5
+        while clock.ticks < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.5)                  # an empty tick, finished and waiting
+        assert _wait_for_rows(conn, 0) == [] and clock.ticks == 1
+        clock.request("market")
+        rows = _wait_for_rows(conn, 1)
+    finally:
+        clock.stop()
+    assert [(r["job"], r["status"]) for r in rows] == [("market", "ok")]
+
+
+def test_a_long_tick_leaves_a_fresh_heartbeat(conn, tmp_path, monkeypatch):
+    """The heartbeat is stamped at the start of a tick, and a first collection
+    can hold one tick for minutes: without a second stamp at its end, the page
+    read "stalled" for the minute after the work was done."""
+    import time
+
+    from optjournal import jobs as mod
+
+    _only(monkeypatch, tmp_path / "home", "market")
+    _stub(monkeypatch, "market",
+          lambda _c, _x: (time.sleep(1.3), mod.Outcome("ok", "done"))[1])
+    clock = mod.Scheduler(ctx=mod.Context(archive_dir=tmp_path / "raw",
+                                          db_path=tmp_path / "j.db"), tick_s=3600)
+    clock.start()
+    try:
+        clock.request("market")
+        rows = _wait_for_rows(conn, 1)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and conn.execute(
+                "SELECT finished_at FROM job_runs").fetchone()["finished_at"] is None:
+            time.sleep(0.05)
+        time.sleep(0.3)
+    finally:
+        clock.stop()
+    assert [r["job"] for r in rows] == ["market"]
+    finished = mod._epoch_of(str(conn.execute("SELECT finished_at FROM job_runs")
+                                 .fetchone()["finished_at"]))
+    beat = conn.execute("SELECT MAX(heartbeat_at) FROM job_state").fetchone()[0]
+    assert finished is not None and beat >= finished, (beat, finished)
+
+
+@pytest.mark.parametrize("statement", [None, "activity-20261002.xml",
+                                       "confirm-20261002.xml"])
+def test_a_configured_journal_with_no_statement_collects_as_soon_as_it_starts(
+    conn, ctx, tmp_path, monkeypatch, statement
+):
+    """Set up from the CLI or the environment, or quit before the first sync
+    finished: the first collection runs at start, in order. A journal that has
+    an activity statement waits for its schedule; a same-day confirmation alone
+    is one day of fills, not coverage, so that journal still collects."""
+    import time
+
+    from conftest import add_statement
+
+    from optjournal import jobs as mod
+
+    has_statement = bool(statement and statement.startswith("activity-"))
+    if statement:
+        add_statement(conn, source_file=statement)
+        conn.commit()
+    _only(monkeypatch, tmp_path / "home", *mod.FIRST_COLLECTION)
+    clock = mod.Scheduler(ctx=ctx, tick_s=3600)
+    clock.start()
+    try:
+        rows = _wait_for_rows(conn, 3, seconds=1.0 if has_statement else 5.0)
+        time.sleep(0.2)
+    finally:
+        clock.stop()
+    expected = [] if has_statement else list(mod.FIRST_COLLECTION)
+    assert [r["job"] for r in rows] == expected
+
+
+def test_a_failing_first_sync_is_not_asked_again_on_every_start(
+    conn, ctx, tmp_path, monkeypatch
+):
+    """The start-up collection runs on every start, so a mistyped query id
+    (IBKR's 1014) would spend one request per restart: a crash respawn, an
+    update, a reader restarting to fix it. A failing sync waits out
+    `RETRY_BROKER_AFTER_S` between starts and stops at the backoff; a clean or
+    interrupted one still collects at once."""
+    from optjournal import jobs as mod
+
+    _only(monkeypatch, tmp_path / "home", "sync")
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", "1591754")
+    assert mod._first_collection_wanted(conn, ctx), "a new journal waits for noon"
+
+    def fail_then_age(minutes: int) -> bool:
+        mod.run_job(conn, "sync", ctx=ctx, fired_for=None)
+        conn.execute("UPDATE job_runs SET started_at = datetime(started_at, ?),"
+                     " finished_at = datetime(finished_at, ?)",
+                     (f"-{minutes} minutes", f"-{minutes} minutes"))
+        conn.commit()
+        return mod._first_collection_wanted(conn, ctx)
+
+    # A run a minute ago that did not fail (a cooldown, a quit mid-fetch) is no
+    # reason to wait: the journal still has no statement.
+    _stub(monkeypatch, "sync", lambda _c, _x: mod.Outcome("nothing", "cooldown: 900s"))
+    assert fail_then_age(1), "a sync that did not fail held the first collection back"
+    _stub(monkeypatch, "sync", lambda _c, _x: mod.Outcome(
+        "failed", "FlexError: Flex API Error 1014: Query is invalid."))
+    assert not fail_then_age(1), "a failing sync asked again a minute later"
+    wait = mod.RETRY_BROKER_AFTER_S // 60 + 1
+    assert fail_then_age(wait), "a failing sync never asked again on a start"
+    for _ in range(mod.FAILURE_BACKOFF):
+        fail_then_age(wait)
+    assert not fail_then_age(wait), "a backed-off sync asked again on a start"
+
+
+def test_a_requested_run_fills_the_latest_slot_so_it_does_not_run_twice(
+    conn, ctx, tmp_path, monkeypatch
+):
+    """Saved at 13:00 on a Tuesday: the request stands for today's noon, so the
+    schedule does not fetch the same statement again a minute later."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from optjournal import jobs as mod
+
+    _only(monkeypatch, tmp_path / "home", "sync")
+    dublin = ZoneInfo("Europe/Dublin")
+    saved = datetime(2026, 9, 29, 13, 0, tzinfo=dublin)
+    assert mod.reconcile(conn, ctx=ctx, now=saved, requested=frozenset({"sync"})) == [
+        "sync"]
+    noon = datetime(2026, 9, 29, 12, 0, tzinfo=dublin)
+    assert conn.execute("SELECT fired_for FROM job_runs").fetchone()[0] == int(
+        noon.timestamp())
+    assert mod.reconcile(conn, ctx=ctx, now=saved + timedelta(minutes=1)) == []
+    # Saved AGAIN after that: the slot is taken, so this run claims nothing, like
+    # a press of Sync, rather than claim noon twice and be refused by the index.
+    again = saved + timedelta(minutes=30)
+    assert mod.reconcile(conn, ctx=ctx, now=again, requested=frozenset({"sync"})) == [
+        "sync"]
+    assert [r[0] for r in conn.execute("SELECT fired_for FROM job_runs ORDER BY id")] == [
+        int(noon.timestamp()), None]
 
 
 def test_the_claim_row_is_committed_before_the_work_starts(conn, ctx, monkeypatch):
@@ -1341,24 +1586,27 @@ def test_due_ness_keys_on_recorded_not_on_succeeded():
 def test_a_job_too_far_behind_is_not_caught_up():
     """The catch-up window is a bound, not a suggestion.
 
-    `sync`'s window is 12 h: a missed noon is worth running at 18:00, because the
-    docstring records a badly-timed sync missing Monday's fills twice. It is NOT
-    worth running at 04:00 the next morning against a statement that the next noon
-    run will fetch anyway.
+    Every daily job here fires more often than its window, so the bound is
+    exercised on a weekly job: one instant older than the window is not run.
     """
+    import dataclasses
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
-    from optjournal.jobs import job_by_name
+    from optjournal.jobs import due_jobs, job_by_name
 
-    job = job_by_name("sync")
-    noon = datetime(2026, 8, 12, 12, 0, tzinfo=ZoneInfo("Europe/Dublin"))
-    inside = noon + timedelta(seconds=job.window_s - 60)
-    outside = noon + timedelta(seconds=job.window_s + 60)
-    assert "sync" in _names(_due(inside)), "a job inside its window is not due"
-    assert "sync" not in _names(_due(outside)), (
-        "a job past its catch-up window was still caught up"
-    )
+    weekly = dataclasses.replace(job_by_name("market"), weekdays=(3,),
+                                 window_s=12 * 3600)
+    noon = datetime(2026, 8, 12, 11, 0, tzinfo=ZoneInfo("Europe/Dublin"))   # a Wed
+
+    def due(at):
+        return due_jobs(at, claimed={}, last_poll={}, last_try={},
+                        ever_ran={"market"}, failures={}, registry=(weekly,))
+
+    assert due(noon + timedelta(seconds=weekly.window_s - 60)), (
+        "a job inside its window is not due")
+    assert due(noon + timedelta(seconds=weekly.window_s + 60)) == [], (
+        "a job past its catch-up window was still caught up")
 
 
 def test_the_live_poll_is_due_inside_the_session_and_never_outside_it():
@@ -2099,6 +2347,23 @@ def test_starting_a_running_scheduler_is_refused(tmp_path):
         clock.stop()
 
 
+def test_a_stop_sent_while_the_loop_is_starting_is_not_lost(tmp_path):
+    """The tick clears its wake event before taking requests, and a `stop()` that
+    landed just before that clear was swallowed: the loop then slept a whole tick
+    and `stop()` gave up after its 10 s join. Stopped at once, many times."""
+    import time
+
+    from optjournal.jobs import Context, Scheduler
+
+    ctx = Context(archive_dir=tmp_path / "raw", db_path=tmp_path / "s.db")
+    for _ in range(20):
+        clock = Scheduler(ctx=ctx, tick_s=3600)
+        clock.start()
+        started = time.monotonic()
+        clock.stop()
+        assert time.monotonic() - started < 2, "the stop waited out the tick"
+
+
 def test_replacing_the_registry_actually_reaches_due_jobs(monkeypatch):
     """A REAL BUG THIS FILE COULD NOT SEE, and the tests were the reason.
 
@@ -2639,6 +2904,85 @@ def test_a_failed_sync_keeps_its_instant_because_it_may_have_spent_a_request(
         run_job(conn, "sync", ctx=ctx, fired_for=instant)
 
 
+@pytest.mark.parametrize(("raised", "gives_back"), [
+    ("unreachable", True), ("ibkr busy", True), ("token rejected", False)])
+def test_a_sync_retries_the_same_day_only_after_a_failure_that_clears_by_itself(
+    conn, ctx, monkeypatch, raised, gives_back
+):
+    """No network after a wake, or IBKR's "try again shortly", used to cost the
+    whole day, because a failed `sync` keeps its instant. Those two now give it
+    back; a rejected token, which only the reader can fix, still keeps it."""
+    from optjournal import jobs as mod
+    from optjournal.flex import FlexBusy, FlexUnreachable, TokenRejected
+
+    error = {"unreachable": FlexUnreachable("URL Error: nodename nor servname"),
+             "ibkr busy": FlexBusy("Please try again shortly.", "1018"),
+             "token rejected": TokenRejected("IBKR says your Flex token is expired")}
+
+    def fails(**_kw):
+        raise error[raised]
+
+    monkeypatch.setattr(mod, "sync_journal", fails)
+    instant = 1786310000
+    mod.run_job(conn, "sync", ctx=ctx, fired_for=instant)
+    row = conn.execute("SELECT status, fired_for FROM job_runs").fetchone()
+    assert row["status"] == "failed"
+    assert (row["fired_for"] is None) is gives_back, (
+        f"{raised}: the instant was {'kept' if gives_back else 'given back'}")
+    assert conn.execute("SELECT consecutive_failures FROM job_state WHERE job = 'sync'"
+                        ).fetchone()[0] == 1, "a failure that counts toward the backoff"
+
+
+def test_a_sync_in_a_dark_wake_asked_nothing_and_counts_no_failure(conn, ctx, monkeypatch):
+    """The keychain refuses every read while the Mac is in a dark wake, before any
+    request. Five of those once backed `sync` off for two weeks; now each is a
+    busy run, which gives the instant back and leaves the count alone."""
+    from optjournal import jobs as mod
+    from optjournal.flex import KeychainAsleep
+
+    def asleep(**_kw):
+        raise KeychainAsleep("the keychain is unavailable while the Mac sleeps (-25320)")
+
+    monkeypatch.setattr(mod, "sync_journal", asleep)
+    for _ in range(mod.FAILURE_BACKOFF + 1):
+        mod.run_job(conn, "sync", ctx=ctx, fired_for=1786310000)
+    rows = conn.execute("SELECT status, fired_for, detail FROM job_runs").fetchall()
+    assert {(r["status"], r["fired_for"]) for r in rows} == {("nothing", None)}
+    assert all(r["detail"].startswith("busy: ") for r in rows)
+    assert conn.execute("SELECT consecutive_failures FROM job_state WHERE job = 'sync'"
+                        ).fetchone()[0] == 0
+
+
+def test_only_a_credentials_failure_asks_the_reader_for_anything():
+    """`needs_reader` is what turns a failed sync into the header's "attention":
+    a plain sentence naming the fix, for the three failures only the reader can
+    clear. Everything that clears by itself (IBKR down, busy, a cooldown, the
+    keychain asleep) reads None, because the schedule retries it."""
+    from optjournal.flex import (
+        FetchCooldown,
+        FlexBusy,
+        FlexUnreachable,
+        KeychainAsleep,
+        TokenMissing,
+        TokenRejected,
+        TokenUnreadable,
+    )
+    from optjournal.jobs import needs_reader, sync_outcome
+
+    def fix(exc: Exception) -> str | None:
+        return needs_reader(sync_outcome(exc).detail)
+
+    assert "Settings" in (fix(TokenMissing("no token for 'me'")) or "")
+    assert "expired" in (fix(TokenRejected("IBKR error 1012")) or "")
+    assert "Unlock" in (fix(TokenUnreadable("the keyring did not answer")) or "")
+    from datetime import datetime
+    for clears in (FlexUnreachable("timed out"), FlexBusy("generating", "1019"),
+                   FetchCooldown("1591754", datetime(2026, 10, 5, 12), 600),
+                   KeychainAsleep("-25320")):
+        assert fix(clears) is None, type(clears).__name__
+    assert needs_reader(None) is None and needs_reader("no Flex query id configured") is None
+
+
 def test_a_given_back_instant_is_retried_after_a_delay_not_on_the_next_tick():
     """Due again, but only once `RETRY_AFTER_S` has passed since the attempt."""
     from datetime import datetime
@@ -2854,7 +3198,7 @@ def test_a_backed_off_sync_that_met_the_fetch_lock_keeps_its_day(conn, clock):
     """Keeping the backoff must not cost a broker job its instant. A backed-off
     `sync` has no retry of a claimed instant (a failed fetch may have reached
     IBKR), but a busy run asked nothing and gave the instant back, so it is still
-    that instant's one attempt to make, `RETRY_AFTER_S` later."""
+    that instant's one attempt to make, `RETRY_BROKER_AFTER_S` later."""
     from datetime import UTC, datetime, timedelta
     from zoneinfo import ZoneInfo
 
@@ -2877,7 +3221,9 @@ def test_a_backed_off_sync_that_met_the_fetch_lock_keeps_its_day(conn, clock):
                             tries=mod._tries_by_job(conn), registry=(sync,))
 
     assert due(clock["t"] + timedelta(minutes=1)) == [], "retried on the next tick"
-    later = due(clock["t"] + timedelta(seconds=mod.RETRY_AFTER_S))
+    assert due(clock["t"] + timedelta(seconds=mod.RETRY_AFTER_S)) == [], (
+        "a sync retried inside the statement cooldown, which closes its day")
+    later = due(clock["t"] + timedelta(seconds=mod.RETRY_BROKER_AFTER_S))
     assert [d.fired_for for d in later] == [int(noon.timestamp())], (
         "a backed-off sync lost its day to another fetch holding the lock")
 
@@ -2956,10 +3302,16 @@ def test_a_week_offline_never_asks_ibkr_faster_than_a_healthy_week(
     confirm = [t for t, q in asked if q == "1621016"]
     assert len(sync) + len(confirm) == len(asked), "a request for an unknown query"
 
-    # `sync`: one request per scheduled noon (Tuesday to Saturday), never more.
+    # `sync`: the Saturday it missed is caught up on the first tick, and retried
+    # every `RETRY_BROKER_AFTER_S` while the failure is transient until it backs
+    # off; then one request per scheduled noon (Tuesday to Saturday). So at most a
+    # healthy week plus the backoff's retries.
     dublin = ZoneInfo("Europe/Dublin")
+    assert mod.RETRY_BROKER_AFTER_S == 20 * 60
     assert [t.astimezone(dublin).strftime("%a %H:%M") for t in sync] == [
+        "Mon 01:00", "Mon 01:20", "Mon 01:40", "Mon 02:00", "Mon 02:20",
         "Tue 12:00", "Wed 12:00", "Thu 12:00", "Fri 12:00", "Sat 12:00"]
+    assert len(sync) <= 5 + mod.FAILURE_BACKOFF
 
     # `confirm`: at most a healthy week's polls, plus the five quick retries.
     job = mod.job_by_name("confirm")

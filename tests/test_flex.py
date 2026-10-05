@@ -1346,11 +1346,51 @@ def test_a_keychain_that_does_not_answer_fails_the_sync_job_with_the_cause(
 def test_a_keychain_error_is_still_raised_as_itself(monkeypatch):
     """The deadline must not swallow what the backend actually said."""
     def broken(service, account):
-        raise RuntimeError("(-25320, 'Unknown Error')")
+        raise RuntimeError("(-25293, 'Unknown Error')")
 
     monkeypatch.setattr(flex.keyring, "get_password", broken)
-    with pytest.raises(RuntimeError, match="-25320"):
+    with pytest.raises(RuntimeError, match="-25293") as caught:
         flex.read_token("someone")
+    assert type(caught.value) is RuntimeError
+
+
+def test_a_dark_wake_refusal_is_keychain_asleep_with_the_cause_kept(monkeypatch):
+    """macOS refuses every keychain read in a dark wake (-25320). Its own type, so
+    the scheduler retries shortly rather than counting a failure, and the
+    backend's own error is kept as the cause."""
+    def asleep(service, account):
+        raise RuntimeError("Can't get password from keychain: (-25320, 'Unknown Error')")
+
+    monkeypatch.setattr(flex.keyring, "get_password", asleep)
+    with pytest.raises(flex.KeychainAsleep, match="-25320") as caught:
+        flex.read_token("someone")
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+@pytest.mark.parametrize(("raised", "unreachable"), [
+    ("dns", True), ("timeout", True), ("reset", True), ("503", True), ("404", False)])
+def test_only_a_failure_that_clears_by_itself_is_unreachable(monkeypatch, raised, unreachable):
+    """`FlexUnreachable` is what lets the scheduler retry `sync` the same day, so it
+    names only what a retry can fix: no network, a timeout, IBKR's own 5xx. A 4xx
+    is this request being wrong, and a retry would only repeat it."""
+    import socket
+    from urllib.error import HTTPError, URLError
+
+    from optjournal.flex import FlexError, FlexUnreachable, _TimeoutFlexClient
+
+    error = {"dns": URLError(socket.gaierror(8, "nodename nor servname provided")),
+             "timeout": TimeoutError("timed out"),
+             "reset": ConnectionResetError("reset by peer"),
+             "503": HTTPError("https://x", 503, "Service Unavailable", None, None),  # type: ignore[arg-type]
+             "404": HTTPError("https://x", 404, "Not Found", None, None)}  # type: ignore[arg-type]
+
+    def urlopen(_request, timeout=None):
+        raise error[raised]
+
+    monkeypatch.setattr(flex, "urlopen", urlopen)
+    with pytest.raises(FlexError) as caught:
+        _TimeoutFlexClient(user_agent="test", timeout_s=1)._get("https://x/")
+    assert isinstance(caught.value, FlexUnreachable) is unreachable
 
 
 # --- a reply broken off mid-way is this module's typed error (L3) -------------
