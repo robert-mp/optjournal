@@ -3273,12 +3273,15 @@ def _node_run(lines: list[str]) -> Any:
     For the page's handlers, which read and write plain state and a handful of
     DOM nodes: the caller declares stand-ins for those, and every line of
     behaviour under test is the page's own source.
+
+    The program goes in on stdin, not `-e`: a caller inlining enough of the
+    page passes Windows' 32,767-character command line (WinError 206).
     """
     node = shutil.which("node")
     if node is None:
         pytest.skip("no node runtime")
     result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [node, "--input-type=module", "-e", "\n".join(lines)],
+        [node, "--input-type=module"], input="\n".join(lines),
         capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
     )
     assert result.returncode == 0, result.stderr[-3000:]
