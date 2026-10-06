@@ -144,6 +144,33 @@ carries no intraday
 reading, so a scored band is drawn from the PRIOR session's VIX close while the
 live ladder uses the current level.
 
+## The Portfolio tab: value against what was put in
+
+A net-liquidation curve on its own reads every deposit as a gain. This account is
+funded month by month (43,300 sent in over the span the statements cover), so its
+value roughly doubled while the trading itself lost money, and a single line would
+have shown the doubling. The tab therefore draws two: the broker's reported net
+liquidation, and **put in**, which is the first reported value plus every deposit
+since, less withdrawals. The gap between them is the account's result, and the
+monthly table reads that gap one month at a time. The months sum to the headline
+by construction, and `test_serialize.py` checks that they do.
+
+* **Reported, never derived.** Every value is an `EquitySummaryInBase` row. A
+  trade ledger cannot rebuild cash without a starting balance no statement
+  carries, which is why `equity_summaries` exists at all.
+* **A money figure, not a return percentage.** A percentage needs a rule for
+  weighting money that arrived mid-month, and printing one nobody chose would be
+  the kind of precise-looking guess the pricing quarantine exists to refuse.
+* **Deposits at the edges.** One dated on or before the first reported session is
+  already inside that value, and one after the last has not reached any value
+  yet, so neither is counted. That keeps the gap at zero on day one.
+* **More than one broker.** A session counts only where every broker reported.
+  Summing a day one account skipped would print the other account's value as the
+  whole and read the missing half as a loss.
+* **The known gap.** Only CASH counts as money put in. Shares transferred in from
+  another broker are not ingested, so a transfer would read as a gain. The tab
+  says so in its tooltip.
+
 ## Clocks
 
 Every journal timestamp is **US Eastern**, settled from the data rather than

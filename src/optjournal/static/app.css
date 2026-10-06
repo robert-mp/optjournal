@@ -1870,6 +1870,22 @@ stop.gneg{stop-color:var(--bad)}
 /* Allocation: the bar column takes what the figures leave. */
 .alloc .abcell{width:30%;min-width:calc(var(--s8) * 4)}
 .alloc td{white-space:nowrap}
+/* ---- the Portfolio tab ----
+   Two lines and the gap between them. Net liquidation takes the chart's own line
+   colour, so it reads as the same kind of figure as the Dashboard's curve; what was
+   put in is dashed and dimmer, because it is the reference the first line is read
+   against rather than a result. The gap is a wash, not a signed fill: its sign is
+   already on the Market result tile, and colouring it would make a deposit month
+   flash like a loss. */
+.pgap{fill:var(--chartline);fill-opacity:.12;stroke:none}
+.pnav{stroke:var(--chartline);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.pput{stroke:var(--dim);stroke-width:1.5;stroke-dasharray:5 4;stroke-linejoin:round}
+.plegend{display:flex;gap:var(--s6);justify-content:flex-end;margin-top:var(--s3);
+  font-size:var(--t1);color:var(--dim)}
+.plegend span{display:inline-flex;align-items:center;gap:var(--s2)}
+.pkey{display:inline-block;width:18px;height:0;border-top:2px solid var(--chartline)}
+.pkey.put{border-top:1.5px dashed var(--dim)}
+.pmon td{white-space:nowrap;font-variant-numeric:tabular-nums}
 .abar{display:block;width:100%;height:var(--s3)}
 .abtrack{fill:var(--bg2)}
 .abfill{fill:var(--ok)}

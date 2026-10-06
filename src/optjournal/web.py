@@ -137,6 +137,7 @@ from optjournal.serialize import (
     odte_context_data,
     odte_scoring_data,
     orders_data,
+    portfolio_data,
     positions_data,
     refresh_odte_bars,
     statements_data,
@@ -765,6 +766,10 @@ def build_state(
             ),
             "positions": positions_data(conn),
             "allocation": allocation_data(conn),
+            # Net liquidation over time against the money put in, for the
+            # Portfolio tab. All-time and unfiltered like `allocation`: an
+            # account's value is not something a trade-type filter narrows.
+            "portfolio": portfolio_data(conn),
             "orders": orders,
             # The same orders folded into the strategies they were placed
             # as (a strangle sold as two same-second orders is one group), and

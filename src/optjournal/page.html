@@ -222,6 +222,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Stats} all_time
  * @property {Array} positions -- Position rows, newest snapshot
  * @property {Allocation} allocation -- the account by holding (serialize.allocation_data)
+ * @property {Portfolio} portfolio -- net liquidation over time against the money put
+ *   in (serialize.portfolio_data)
  * @property {Array} orders -- Order rows in scope
  * @property {Array} strategies -- StrategyGroup rows: same orders, grouped
  * @property {Array} lifecycles -- Lifecycle rows: strategies linked by episode
@@ -486,6 +488,41 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number|null} cash
  * @property {number|null} cash_share -- null without a net liquidation figure
  * @property {Array} rows -- AllocationRow, largest absolute net first
+ */
+
+/** @typedef {Object} Portfolio -- the account's value over time, against deposits
+ *  (serialize.portfolio_data). Empty, with `total` null, until an equity summary exists
+ * @property {Array} days -- PortfolioDay, one per reported session, oldest first
+ * @property {Array} months -- PortfolioMonth, oldest first
+ * @property {PortfolioTotal|null} total
+ */
+
+/** @typedef {Object} PortfolioDay -- one reported session
+ * @property {string} day -- YYYY-MM-DD
+ * @property {number} nav -- the broker's net liquidation, base currency
+ * @property {number} put_in -- the first session's value plus every deposit since
+ */
+
+/** @typedef {Object} PortfolioMonth -- one calendar month, closed at its last session
+ * @property {string} month -- YYYY-MM
+ * @property {string} end -- the session the month's figures are read from
+ * @property {number} nav
+ * @property {number} cash
+ * @property {number} stock
+ * @property {number} options -- negative when short premium outweighs long
+ * @property {number} other -- the broker's total beyond cash, stock and options
+ * @property {number} deposits -- net of withdrawals
+ * @property {number} gain -- the change in value deposits do not explain
+ */
+
+/** @typedef {Object} PortfolioTotal -- the same reckoning across the whole span
+ * @property {string} start
+ * @property {number} start_nav
+ * @property {string} end
+ * @property {number} nav
+ * @property {number} deposits
+ * @property {number} put_in
+ * @property {number} gain
  */
 
 /** @typedef {Object} AllocationRow -- one holding: the stock, or the underlying an
@@ -1457,6 +1494,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload cn:Collection sres:SettingsWrite pl:Pulse
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite lkres:LinkWrite
  * @payload rv:JournalReview ty:Tally tt:TriggerTally zr2:OdteRefresh
+ * @payload pf:Portfolio pday:PortfolioDay pmo:PortfolioMonth ptot:PortfolioTotal
+ * @payload pd0:PortfolioDay pdn:PortfolioDay
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
  * @local leaves PERIOD_TABS pop quotes steps TILES
  * @local draft dr order known tilesave tilereset Array
@@ -1732,6 +1771,7 @@ const TABS=[
   ['positions','Positions'],
   ['costs','Costs'],
   ['annual','Annual'],
+  ['portfolio','Portfolio'],
   ['review','Journal'],
   ['odte','0DTE'],
   ['market','Market'],
@@ -1757,7 +1797,7 @@ const RAIL=[
   ['dashboard','Dashboard',['dashboard']],
   ['calendar','Calendar',['calendar']],
   ['trades','Trades',['trades','positions']],
-  ['analysis','Analysis',['costs','annual','review']],
+  ['analysis','Analysis',['costs','annual','portfolio','review']],
   ['odte','0DTE',['odte']],
   ['market','Market',['market']],
   ['watchlist','Watchlist',['watchlist']],
@@ -4117,6 +4157,119 @@ function allocationCard(){
       ${al.cash!=null?line('Cash',null,null,al.cash,al.cash_share):''}
     </tbody></table>
   </div>`;
+}
+
+/* ------------------------------------------------ portfolio */
+/* WHAT THE ACCOUNT IS WORTH, AND HOW MUCH OF THAT IT EARNED. Two lines rather than
+   one, because a net-liquidation curve alone reads every deposit as a gain: on an
+   account funded month by month it climbs whether the trading worked or not. The
+   dashed line is what was PUT IN -- the first reported value plus every deposit
+   since -- and the shaded gap between them is the account's own result, which is
+   the one figure here a reader cannot get from the broker's balance at a glance.
+
+   Every value is the broker's reported net liquidation (`serialize.portfolio_data`
+   says why it cannot be derived), so this tab adds arithmetic only where the
+   deposits come in, and the monthly gains sum to the headline gain by
+   construction. */
+function portfolio(){
+  const pf=S.state.portfolio;
+  const ptot=pf&&pf.total;
+  if(!ptot) return `<div class="card"><div class="empty">no account value yet — net
+    liquidation arrives with the statements' equity summary section</div></div>`;
+  const shown=(v,pmo)=>pmo.nav?pct(v/pmo.nav*100,0):'—';
+  /* The broker's total can hold things this split does not name (bonds, funds,
+     accruals). The column appears only where it is ever non-trivial, so an account
+     with none of them is not handed a column of dashes. */
+  const other=pf.months.some(pmo=>Math.abs(pmo.other)>=1);
+  const line=pmo=>`<tr><td>${esc(monthLabel(pmo.month))}</td>
+    <td class="n">${cash(pmo.nav)}</td>
+    <td class="n">${pmo.deposits?cash(pmo.deposits):'—'}</td>
+    <td class="n ${cls(pmo.gain)}">${cash(pmo.gain)}</td>
+    <td class="n">${cash(pmo.cash)} <span class="dim">${shown(pmo.cash,pmo)}</span></td>
+    <td class="n">${cash(pmo.stock)} <span class="dim">${shown(pmo.stock,pmo)}</span></td>
+    <td class="n">${cash(pmo.options)} <span class="dim">${
+      shown(pmo.options,pmo)}</span></td>
+    ${other?`<td class="n">${cash(pmo.other)}</td>`:''}</tr>`;
+  return `<div class="card">
+    <div class="crow"><div><h2>Portfolio${infoTip(
+      `<b>Net liquidation</b> is the broker's own reported value of the account.
+       <b>Put in</b> is its first reported value plus every deposit since, less
+       withdrawals. The gap between them is what the account earned or lost, so a
+       deposit moves both lines and changes nothing about the result.
+       <br><br>Only cash counts as money put in. Shares transferred in from
+       another broker are not ingested, so a transfer would read as a gain.`)}</h2>
+      <div class="sub">${esc(dayLabel(ptot.start,true))} to
+        ${esc(dayLabel(ptot.end,true))}, in ${esc(DISP())}.</div></div></div>
+    <div class="stats c3">
+      ${statCard('Net liquidation',cash(ptot.nav),`As reported for ${ptot.end}.`)}
+      ${statCard('Put in',cash(ptot.put_in),
+        `${cash(ptot.start_nav)} on ${ptot.start}, plus ${cash(ptot.deposits)} deposited since.`)}
+      ${statCard('Market result',cash(ptot.gain),
+        'Net liquidation less the money put in.',cls(ptot.gain))}
+    </div>
+    ${navChart(pf.days)}
+  </div>
+  <div class="card">
+    <div class="crow"><div><h2>Month by month${infoTip(
+      `<b>Result</b> is the change in net liquidation that deposits do not explain.
+       It is marked to market, so it moves with open positions as well as closed
+       ones: a stock or an option that lost value this month counts here whether or
+       not it was sold. The Dashboard's P&amp;L counts closed trades only, so the two
+       differ whenever something is still open.
+       <br><br><b>Cash, stock and options</b> are what each held on the month's last
+       session, not gains. <b>Options</b> is the value of the open contracts: long
+       ones are worth something to the account, short ones are owed back, so it is
+       negative when the short premium outweighs the long.`)}</h2>
+      <div class="sub">Each month at its last reported session. Result includes
+        open positions; cash, stock and options are holdings, not gains.</div></div></div>
+    <table class="pmon"><thead><tr><th>month</th><th class="n">net liq</th>
+      <th class="n">deposits</th><th class="n">result</th><th class="n">cash</th>
+      <th class="n">stock</th><th class="n">options value</th>${
+      other?'<th class="n">other</th>':''}</tr></thead>
+      <tbody>${[...pf.months].reverse().map(line).join('')}</tbody></table>
+  </div>`;
+}
+
+/* The two lines and the gap between them. Built like `chart()` -- the same box,
+   the same ticks picked in display space and mapped back, sessions evenly spaced
+   rather than on a calendar axis -- because it sits in the same kind of card and
+   the reader should not have to re-learn the scale between tabs. */
+function navChart(days){
+  if(days.length<2) return '';
+  const W=1400,H=230,PL=76,PR=18,PT=16,PB=28;
+  const ys=days.flatMap(pday=>[pday.nav,pday.put_in]);
+  let lo=Math.min(...ys), hi=Math.max(...ys);
+  if(lo===hi){lo-=1;hi+=1;}
+  const pad=(hi-lo)*0.08; lo-=pad; hi+=pad;
+  const sx=i=>PL+i*(W-PL-PR)/(days.length-1);
+  const sy=v=>PT+(hi-v)*(H-PT-PB)/(hi-lo);
+  const at=(pday,i,key)=>`${sx(i).toFixed(1)},${sy(pday[key]).toFixed(1)}`;
+  const path=key=>days.map((pday,i)=>`${i?'L':'M'}${at(pday,i,key)}`).join('');
+  /* The gap as one closed shape: along net liquidation, back along what was put
+     in. It crosses itself where the result changes sign, which fills correctly
+     under the default nonzero rule and needs no crossing points found. */
+  const gap=path('nav')+days.map((pday,i)=>`L${at(pday,i,'put_in')}`).reverse().join('')+'Z';
+  const ticks=niceTicks(conv(lo),conv(hi)).map(dv=>{
+    const v=unconv(dv), y=sy(v).toFixed(1);
+    return `<line class="grid" x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}"/>
+     <text class="axis" x="${PL-8}" y="${(sy(v)+3.5).toFixed(1)}"
+       text-anchor="end">${cash(v,0)}</text>`;
+  }).join('');
+  const pd0=days[0], pdn=days[days.length-1];
+  const spansYears=pd0.day.slice(0,4)!==pdn.day.slice(0,4);
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet"
+    role="img" aria-label="Net liquidation against the money put in">
+    ${ticks}
+    <path class="pgap" d="${gap}"/>
+    <path class="pput" d="${path('put_in')}" fill="none"/>
+    <path class="pnav" d="${path('nav')}" fill="none"/>
+    <text class="axis" x="${sx(0).toFixed(1)}" y="${H-9}"
+      text-anchor="start">${esc(dayLabel(pd0.day,spansYears))}</text>
+    <text class="axis" x="${sx(days.length-1).toFixed(1)}" y="${H-9}"
+      text-anchor="end">${esc(dayLabel(pdn.day,spansYears))}</text>
+  </svg>
+  <div class="plegend"><span><i class="pkey"></i>net liquidation</span>
+    <span><i class="pkey put"></i>put in</span></div>`;
 }
 
 /* ------------------------------------------------ costs */
@@ -6499,7 +6652,7 @@ function draw(push){
   renderKicker();
   renderPeriod();
   renderViewOptions();
-  const views={dashboard,calendar,trades,positions,costs,annual,review,odte,market,
+  const views={dashboard,calendar,trades,positions,costs,annual,portfolio,review,odte,market,
     watchlist};
   const v=views[S.tab];
   /* WHAT THE USER WAS TYPING SURVIVES THE RENDER.

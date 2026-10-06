@@ -25,7 +25,7 @@ from conftest import connect_migrated
 from optjournal.bars import upsert_bars
 from optjournal.clock import MARKET_TZ
 from optjournal.marketdata import Bar
-from optjournal.serialize import allocation_data, watchlist_data
+from optjournal.serialize import allocation_data, portfolio_data, watchlist_data
 from optjournal.trend import bucket, bxtrender_short
 from optjournal.vol import rank, rank_band, realised_vol, realised_vol_series
 
@@ -735,6 +735,113 @@ def test_allocation_without_a_net_liquidation_figure_has_no_shares(tmp_path):
     al = allocation_data(conn)
     assert al["nav"] is None and al["cash"] is None
     assert all(r["share"] is None for r in al["rows"])
+
+
+# ------------------------------------------------------------------ portfolio
+
+
+def _portfolio_fixture(conn, *, navs, deposits=(), broker="ibkr"):
+    """Reported values per session and cash moved in, as the ingest stores them.
+
+    `navs` is (YYYYMMDD, cash, stock, options, total); `deposits` is
+    (YYYY-MM-DD, amount_base). Real IBKR shapes: summary dates are compact and a
+    deposit's `date_time` carries a clock, so the reader's day normalisation is
+    exercised rather than assumed.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO statements (source_file, sha256, account_id, from_date,"
+        " to_date, base_currency, asset_filter, ingested_at)"
+        " VALUES ('t.xml','x','U1','20250801','20260930','EUR','ALL','now')")
+    for day, cash, stock, options, total in navs:
+        conn.execute(
+            "INSERT INTO equity_summaries (broker, report_date, account_id, currency,"
+            " cash_base, stock_base, options_base, total_base, raw, source_file,"
+            " ingested_at) VALUES (?,?,'U1','EUR',?,?,?,?,'{}','t.xml','now')",
+            (broker, day, cash, stock, options, total))
+    for i, (day, amount) in enumerate(deposits):
+        conn.execute(
+            "INSERT INTO cash_transactions (broker, transaction_id, account_id,"
+            " date_time, type, amount, currency, fx_rate_to_base, amount_base, raw,"
+            " source_file, first_seen_at) VALUES"
+            " (?,?,'U1',?,'Deposits & Withdrawals',?,'EUR',1,?,'{}','t.xml','now')",
+            (broker, f"{broker}-d{i}", f"{day} 00:00:00", amount, amount))
+    conn.commit()
+
+
+def test_portfolio_separates_what_was_earned_from_what_was_deposited(tmp_path):
+    """A deposit raises net liquidation and the result by nothing.
+
+    The whole reason the tab draws two lines: 1,000 grows to 1,600, and 500 of
+    that was sent in, so the account earned 100 -- not 600.
+    """
+    conn = connect_migrated(tmp_path / "journal.db")
+    _portfolio_fixture(conn, navs=[
+        ("20260130", 100, 900, 0, 1000),
+        ("20260227", 600, 950, 0, 1550),    # +500 deposited, +50 earned
+        ("20260331", 600, 1000, 0, 1600),   # +50 earned
+    ], deposits=[("2026-02-10", 500)])
+
+    pf = portfolio_data(conn)
+    assert pf["total"] == {
+        "start": "2026-01-30", "start_nav": 1000, "end": "2026-03-31",
+        "nav": 1600, "deposits": 500, "put_in": 1500, "gain": 100,
+    }
+    assert [(d["day"], d["put_in"]) for d in pf["days"]] == [
+        ("2026-01-30", 1000), ("2026-02-27", 1500), ("2026-03-31", 1500)]
+    assert [(m["month"], m["deposits"], m["gain"]) for m in pf["months"]] == [
+        ("2026-01", 0, 0), ("2026-02", 500, 50), ("2026-03", 0, 50)]
+    assert sum(m["gain"] for m in pf["months"]) == pf["total"]["gain"], (
+        "the months must account for the headline, or one of them is wrong")
+
+
+def test_a_deposit_outside_the_reported_span_is_not_counted_twice(tmp_path):
+    """One before the first session is already inside its value; one after the
+    last has not reached any value yet. Counting either would put a gap between
+    the lines that the account did not earn."""
+    conn = connect_migrated(tmp_path / "journal.db")
+    _portfolio_fixture(conn, navs=[
+        ("20260130", 1000, 0, 0, 1000),
+        ("20260227", 1000, 0, 0, 1000),
+    ], deposits=[("2026-01-30", 999), ("2026-01-02", 999), ("2026-03-02", 999)])
+    total = portfolio_data(conn)["total"]
+    assert (total["deposits"], total["gain"]) == (0, 0)
+
+
+def test_a_withdrawal_lowers_what_was_put_in(tmp_path):
+    """Money taken out is the same flow with the other sign, not a loss."""
+    conn = connect_migrated(tmp_path / "journal.db")
+    _portfolio_fixture(conn, navs=[
+        ("20260130", 1000, 0, 0, 1000),
+        ("20260227", 700, 0, 0, 700),
+    ], deposits=[("2026-02-05", -300)])
+    total = portfolio_data(conn)["total"]
+    assert (total["put_in"], total["gain"]) == (700, 0)
+
+
+def test_the_monthly_split_sums_to_the_value_it_splits(tmp_path):
+    """Short options are a negative share, and whatever the broker's total holds
+    beyond the three named classes lands in `other` rather than going missing."""
+    conn = connect_migrated(tmp_path / "journal.db")
+    _portfolio_fixture(conn, navs=[("20260130", 200, 900, -150, 1000)])
+    (month,) = portfolio_data(conn)["months"]
+    assert (month["cash"], month["stock"], month["options"], month["other"]) == (
+        200, 900, -150, 50)
+
+
+def test_a_session_counts_only_where_every_broker_reported(tmp_path):
+    """Summing a day one broker skipped prints the other account's value as the
+    whole, and reads the missing half as a loss."""
+    conn = connect_migrated(tmp_path / "journal.db")
+    _portfolio_fixture(conn, navs=[
+        ("20260130", 0, 1000, 0, 1000), ("20260227", 0, 1100, 0, 1100)])
+    _portfolio_fixture(conn, broker="schwab", navs=[("20260227", 0, 400, 0, 400)])
+    pf = portfolio_data(conn)
+    assert [(d["day"], d["nav"]) for d in pf["days"]] == [("2026-02-27", 1500)]
+
+
+def test_no_equity_summary_is_an_absence_not_a_zero_account(tmp_path):
+    conn = connect_migrated(tmp_path / "journal.db")
+    assert portfolio_data(conn) == {"days": [], "months": [], "total": None}
 
 
 # ------------------------------------------------------------ journal review

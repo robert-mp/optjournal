@@ -65,7 +65,7 @@ from optjournal.journal import entries as journal_entries
 from optjournal.marketdata import BarFetchError, fetch_bars
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
-from optjournal.stats import EQUITY_CATEGORY, campaigns_for, first_activity
+from optjournal.stats import EQUITY_CATEGORY, _day_of, campaigns_for, first_activity
 from optjournal.trend import bucket, bxtrender_short
 from optjournal.vol import (
     expected_move,
@@ -324,6 +324,115 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
         "cash": cash,
         "cash_share": share(cash),
         "rows": rows,
+    }
+
+
+def portfolio_data(conn: sqlite3.Connection) -> Row:
+    """Net liquidation over time, against the money that was put in to make it.
+
+    `days` is one point per session the broker reported a value for: `nav`, and
+    `put_in`, which is the first reported value plus every deposit since, less
+    every withdrawal. `months` is one row per calendar month, closing at its last
+    reported session, with the account split into cash, stock and options, what
+    was deposited that month, and `gain`: the change in value that deposits do not
+    explain. `total` is the same reckoning across the whole span. All base
+    currency, all None/empty until an equity summary exists.
+
+    WHY `put_in` IS THE POINT. A net-liquidation curve on its own reads a deposit
+    as a gain: on this account 43,300 of the value came from transfers in, so the
+    raw curve would credit the account with most of what was simply sent to it.
+    The gap between the two lines is what the account EARNED, and the monthly
+    `gain` is that gap measured one month at a time. A money figure rather than a
+    return percentage on purpose -- a percentage needs a weighting rule for money
+    that arrived mid-month, and printing one nobody chose would be the precise-
+    looking guess this journal refuses elsewhere.
+
+    REPORTED, NOT DERIVED. Every value is the broker's `EquitySummaryInBase` row,
+    for the reason `equity_summaries` exists at all: a trade ledger cannot rebuild
+    cash without a starting balance no statement carries. Deposits are the cash
+    rows the broker types as such, matched the way the fee reader matches fees.
+
+    A deposit on or before the first reported session is already INSIDE that
+    session's value, so it is not added again; one after the last reported
+    session has not landed in any value yet, so it waits. Both are what make the
+    gap between the lines zero on day one and honest on the last.
+
+    With more than one broker, a session counts only where EVERY broker reported:
+    summing a day that one account skipped would print the other's value as the
+    whole account's and read the missing half as a loss. `other` is whatever the
+    broker's total holds beyond cash, stock and options (bonds, funds, accruals),
+    so the split always sums to the value.
+    """
+    brokers = {r[0] for r in conn.execute("SELECT DISTINCT broker FROM equity_summaries")}
+    by_day: dict[str, Row] = {}
+    for r in conn.execute(
+        "SELECT broker, report_date, cash_base, stock_base, options_base, total_base"
+        " FROM equity_summaries"
+    ):
+        day = _day_of(r["report_date"])
+        if day is None:
+            continue
+        row = by_day.setdefault(day, {
+            "brokers": set(), "nav": 0.0, "cash": 0.0, "stock": 0.0, "options": 0.0})
+        row["brokers"].add(r["broker"])
+        row["nav"] += r["total_base"]
+        row["cash"] += r["cash_base"] or 0.0
+        row["stock"] += r["stock_base"] or 0.0
+        row["options"] += r["options_base"] or 0.0
+    days = sorted(day for day, row in by_day.items() if row["brokers"] == brokers)
+    if not days:
+        return {"days": [], "months": [], "total": None}
+
+    flows: Counter[str] = Counter()
+    for r in conn.execute(
+        "SELECT date_time, amount_base FROM cash_transactions"
+        " WHERE UPPER(type) LIKE '%DEPOSIT%'"
+    ):
+        day = _day_of(r["date_time"])
+        if day is not None and days[0] < day <= days[-1]:
+            flows[day] += r["amount_base"]
+
+    def moved_in(after: str, through: str) -> float:
+        return sum(v for day, v in flows.items() if after < day <= through)
+
+    start = by_day[days[0]]["nav"]
+    points = [{"day": day, "nav": by_day[day]["nav"],
+               "put_in": start + moved_in(days[0], day)} for day in days]
+
+    ends: dict[str, str] = {}
+    for day in days:
+        ends[day[:7]] = day  # ascending, so the last write is the month's close
+    months = []
+    before = days[0]
+    for month, end in ends.items():
+        row = by_day[end]
+        deposits = moved_in(before, end)
+        months.append({
+            "month": month,
+            "end": end,
+            "nav": row["nav"],
+            "cash": row["cash"],
+            "stock": row["stock"],
+            "options": row["options"],
+            "other": row["nav"] - row["cash"] - row["stock"] - row["options"],
+            "deposits": deposits,
+            "gain": row["nav"] - by_day[before]["nav"] - deposits,
+        })
+        before = end
+
+    last = points[-1]
+    return {
+        "days": points,
+        "months": months,
+        "total": {
+            "start": days[0],
+            "start_nav": start,
+            "end": last["day"],
+            "nav": last["nav"],
+            "deposits": last["put_in"] - start,
+            "put_in": last["put_in"],
+            "gain": last["nav"] - last["put_in"],
+        },
     }
 
 
