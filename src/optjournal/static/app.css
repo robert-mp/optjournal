@@ -1142,7 +1142,7 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .mkattr{font-size:var(--t1);margin-top:var(--s6)}
 .wnote{font-size:var(--t0);margin-top:var(--s0)}
 
-/* ---- collection health (the Jobs strip) ----
+/* ---- collection details (the Jobs strip, in Settings → Advanced) ----
    One row per registered job. GRID, not flex, and the columns are fixed rather
    than content-sized on purpose: a job whose detail is "3 windows" and one whose
    detail is "0 bar(s), 4 empty" must put their status in the same place, or the
@@ -1173,7 +1173,7 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 
    The journal's row keeps `j` because it is the journal. A strip of jobs is not,
    and calling it `job` is what makes the collision unrepeatable. */
-.jobrow{display:grid;grid-template-columns:96px 74px 1fr auto auto auto;gap:var(--s4);
+.jobrow{display:grid;grid-template-columns:96px 74px 1fr auto auto;gap:var(--s4);
   align-items:baseline;padding:var(--s3) var(--s0)}
 .jobrow+.jobrow{border-top:1px solid var(--line)}
 .jobname{font-size:var(--t2);font-weight:var(--w-label)}
@@ -1184,19 +1184,25 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .jobdet{font-size:var(--t1);min-width:0;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
 .jobwhen{font-size:var(--t1)}
-/* The run button. Smaller than a card-header action and right-aligned in its own
-   column, so a row of them makes a clean edge rather than a ragged one -- the
-   detail column absorbs the width difference, which is why it is the `1fr`. */
-.jobrun{padding:var(--s1) var(--s4);font-size:var(--t1);min-width:64px;justify-self:end}
 .pill.neg{border-color:var(--badedge)}
 @media(max-width:760px){
   /* The timestamp is the first thing to go: on a narrow screen the status and
-     the detail are what answer the question. The BUTTON stays: it is the reason
-     this panel is not read-only, and a control that disappears on a narrow
-     window is a control you cannot find. */
-  .jobrow{grid-template-columns:88px 70px 1fr auto auto}
+     the detail are what answer the question. */
+  .jobrow{grid-template-columns:88px 70px 1fr auto}
   .jobwhen{display:none}
 }
+
+/* ---- the collection dot on Sync ----
+   From `collection_status`, through the page's COLLECT_DOT. A dot in the corner
+   rather than a recoloured glyph, so the button keeps its own disabled and
+   spinning looks. Up to date is a quiet green, a journal falling behind is the
+   warning hue, and the states that need the reader are red. */
+#sync{position:relative}
+#sync.collect-ok::after,#sync.collect-behind::after,#sync.collect-need::after{
+  content:"";position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%}
+#sync.collect-ok::after{background:var(--ok)}
+#sync.collect-behind::after{background:var(--warnfg)}
+#sync.collect-need::after{background:var(--bad)}
 /* Actions inside a card header. Borrowed from .seg's palette rather than given a
    new one, so a Refresh beside a segmented toggle reads as the same family of
    control. `sm` is the only size, kept as a modifier because a bare `.btn` would

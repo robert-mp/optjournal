@@ -74,7 +74,7 @@ from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.bars import fetch_watch_bars
 from optjournal.campaigns import position_count
-from optjournal.clock import parse_day
+from optjournal.clock import MARKET_TZ, parse_day
 from optjournal.costs import CostScope, build_costs
 from optjournal.db import (
     CONFIRM_SOURCE,
@@ -106,6 +106,7 @@ from optjournal.ingest import DEFAULT_ASSET_FILTER
 from optjournal.iv import IvFetchError, fetch_iv_rank
 from optjournal.iv import band as iv_band
 from optjournal.jobs import (
+    FIRST_COLLECTION,
     JOBS,
     JobBusy,
     Scheduler,
@@ -123,6 +124,7 @@ from optjournal.serialize import (
     allocation_data,
     audit_data,
     broker_costs_data,
+    collection_status,
     costs_data,
     history_data,
     jobs_data,
@@ -163,7 +165,7 @@ from optjournal.strategies import (
     campaign_events,
     position_groups,
 )
-from optjournal.sync import history_plan, sync_journal
+from optjournal.sync import history_plan, newest_statement_end, sync_journal
 
 __all__ = ["build_state", "serve", "serve_ephemeral"]
 
@@ -608,6 +610,7 @@ def build_state(
     scoring: str | None = None,
     query_id_source: str | None = None,
     demo: bool = False,
+    scheduled: bool = True,
 ) -> dict[str, Any]:
     """Everything the page renders, in one JSON-safe payload.
 
@@ -617,6 +620,8 @@ def build_state(
     that precedence is an argument, so the source defaults to "override".
     `demo` blanks the confirm query id the same way the handler blanks the
     statement's: the demo journal shows no real id and fetches with none.
+    `scheduled` is whether this server runs a scheduler, so a journal a
+    scheduler once fed, served with `--no-scheduler`, does not read "stalled".
 
     Opens its own connection: sqlite3 objects cannot cross threads and the
     server is threaded, so a shared handle would fail intermittently under the
@@ -660,6 +665,11 @@ def build_state(
         # sub-millisecond `LOCK_NB` attempts in the common case, and zero when no
         # row says `running`.
         interrupted_runs(conn, archive_dir=archive_dir)
+        # BEFORE anything is read: a run finishing mid-build then leaves an old
+        # stamp over new figures, and the next pulse reloads once more for
+        # nothing. Read after, it would leave a new stamp over old figures, and
+        # the page would never reload for that run at all.
+        stamp = data_stamp(conn)
         plan = history_plan(conn, archive_dir)
         # One history pass over the home category, reused by the scope, the
         # cohorts and every period row below.
@@ -723,6 +733,8 @@ def build_state(
         state: dict[str, Any] = {
             "version": __version__,
             "generated_at": _now(),
+            # What `/api/pulse` is compared against: see `data_stamp`.
+            "stamp": stamp,
             # Developer-only surfaces on? Resolved per request from the env var or
             # the stored flag (`settings.dev`), never from anything the browser
             # sent -- so a page in another tab cannot turn it on over this
@@ -769,13 +781,13 @@ def build_state(
             ),
             "history": history_data(report),
             "statements": statements_data(archive_dir, conn),
-            # Read-only: the page never fetches the calendar. `optjournal market
-            # --fetch` does, from the nightly cron, because the feed rate limits
-            # (429 with a retry-after) and a tab reload is not a reason to spend
-            # a request against it.
+            # Read-only: a page load never fetches the calendar. The daily
+            # `market` job does (and Refresh, by hand), because the feed rate
+            # limits (429 with a retry-after) and a tab reload is not a reason to
+            # spend a request against it.
             "market": market_data(conn, now=datetime.now(UTC)),
             # Prices and realised vol from bars already stored, so this
-            # spends nothing. `optjournal bars` is what fills them in.
+            # spends nothing. The daily `bars_daily` job is what fills them in.
             "watchlist": watchlist_data(conn),
             # What the scheduler has done, and whether it is running at all.
             # Read-only here: the runner writes, the page renders.
@@ -863,6 +875,7 @@ def build_state(
         # across 24 tests at once. Computed here, attached there, so the payload's
         # reading order still matches how a reader thinks about it.
         provisional = _provisional(conn)
+        statements_end = newest_statement_end(conn)   # for `collection`, likewise
         state["odte"] = {
             "cohort": cohort_data(odte),
             "rest": cohort_data(rest),
@@ -961,7 +974,53 @@ def build_state(
             cooldown_remaining(archive_dir, query_id) if query_id else 0
         ),
     }
+    # The header's one answer to "is this journal being fed", which replaced the
+    # Dashboard's Collection card: see `collection_status`.
+    state["collection"] = _collection(state["scheduler"], statements_end,
+                                      query_id=query_id, demo=demo, scheduled=scheduled)
     return state
+
+
+def _collection(scheduler: dict[str, Any], newest: date | None, *, query_id: str | None,
+                demo: bool, scheduled: bool) -> dict[str, Any]:
+    """`collection_status` as both `/api/state` and `/api/pulse` call it."""
+    return collection_status(scheduler, configured=bool(query_id), demo=demo,
+                             newest=newest, today=datetime.now(MARKET_TZ).date(),
+                             scheduled=scheduled)
+
+
+def data_stamp(conn: sqlite3.Connection) -> str:
+    """What moves when something the page shows changed outside the page: the
+    newest run that wrote anything. Every way data arrives records one (the
+    scheduler, Sync, the CLI), and `ok` is the status that means it wrote:
+    `nothing` changed nothing, so it reloads nothing.
+
+    Never the heartbeat, which moves every minute and would reload an idle page
+    with it. A journal entry or a watchlist edit is made BY the page, which
+    reloads after its own writes.
+    """
+    row = conn.execute("SELECT MAX(id) FROM job_runs WHERE status = 'ok'").fetchone()
+    return str(row[0] or 0)
+
+
+def pulse_state(*, db_path: Path, archive_dir: Path, query_id: str | None, demo: bool,
+                scheduled: bool) -> dict[str, Any]:
+    """What an open page checks every minute (`GET /api/pulse`): `stamp`, to
+    reload when the data moved, and `collection`, which moves with the clock
+    alone (a sync failing overnight, a scheduler that stopped) and is cheap.
+
+    A full `/api/state` every minute would cost the whole payload and a redraw
+    for the few times a day anything changes.
+    """
+    with open_journal(db_path) as conn:
+        # As `build_state` does, so a run whose process died reads as such here
+        # too, rather than as `running` until the next full load.
+        interrupted_runs(conn, archive_dir=archive_dir)
+        stamp = data_stamp(conn)
+        scheduler = jobs_data(conn, now=datetime.now(UTC))
+        newest = newest_statement_end(conn)
+    return {"stamp": stamp, "collection": _collection(
+        scheduler, newest, query_id=query_id, demo=demo, scheduled=scheduled)}
 
 
 def _with_request_counts(
@@ -1161,6 +1220,9 @@ class ServeConfig:
     #: Set by an update or a journal import: `serve` stops and reports it, and
     #: the launcher starts it again (see `cli.EXIT_RESTART`).
     restart: threading.Event = field(default_factory=threading.Event)
+    #: This server's scheduler, so a settings save can ask it to collect now
+    #: (`_Handler._collect_now`). None with `--no-scheduler` and in the demo.
+    collector: Scheduler | None = None
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -1312,6 +1374,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     query_id_source=("unset" if self.cfg.demo
                                      else prefs.query_id_source(self.cfg.query_id)),
                     demo=self.cfg.demo,
+                    scheduled=self.cfg.collector is not None,
                     month=month[0] if month else None,
                     trade_type=trade_type[0] if trade_type else None,
                     # Repeatable, so `?cost=OPT&cost=CASH` is a multi-select
@@ -1324,6 +1387,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     # unit is.
                     scoring=scoring[0] if scoring else None,
                 ))
+            except sqlite3.OperationalError as exc:
+                self._json(500, {"error": f"database not readable: {exc}"})
+        elif path == "/api/pulse":
+            try:
+                self._json(200, pulse_state(
+                    db_path=self.cfg.db_path, archive_dir=self.cfg.archive_dir,
+                    query_id=self._effective_query_id(), demo=self.cfg.demo,
+                    scheduled=self.cfg.collector is not None))
             except sqlite3.OperationalError as exc:
                 self._json(500, {"error": f"database not readable: {exc}"})
         elif path == "/api/settings/token":
@@ -1597,11 +1668,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         for two weeks on an expired token, and `optjournal setup` is a poor answer
         to hand somebody you gave a trading journal to.
 
-        Storing is NOT verifying, and this deliberately does not spend an IBKR
-        request to find out. The Sync button asks for confirmation first because
-        IBKR locks out clients that ask too often; firing a fetch off a settings
-        save would route around a guard that exists on purpose. So the reply says
-        stored, and the reader presses Sync.
+        Storing is not verifying, and the save does not fetch. It ASKS this
+        server's scheduler for the first collection (`Scheduler.request`), which
+        runs the same `sync` job as the schedule: under the fetch lock and the
+        statement cooldown, so saving twice in a minute costs one request, not
+        two. It used to say "press Sync", which left a new user's setup one step
+        short of collecting anything. With no scheduler (`--no-scheduler`) the
+        reply still says to press Sync.
         """
         import getpass
 
@@ -1661,11 +1734,30 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                          "account": account,
                          "message": f"the OS keyring refused the write: {message}"}
         log.info("stored a new Flex token for account %s", account)
+        # Only with a query id to fetch with: without one the sync would record a
+        # failure the reader has not caused yet, mid-setup.
+        has_query = bool(self._effective_query_id())
+        collecting = has_query and self._collect_now()
         return 200, {
             "ok": True, "kind": "token", "present": True, "account": account,
-            "message": "stored in the OS keyring — press Sync to try it against "
-                       "IBKR, which is the only thing that can confirm it works",
+            "collecting": collecting,
+            "message": ("stored in the OS keyring, and fetching from IBKR now, which "
+                        "is the only thing that can confirm it works" if collecting
+                        else "stored in the OS keyring. Save the query id too, and "
+                             "collection starts by itself" if not has_query
+                        else "stored in the OS keyring — press Sync to try it against "
+                             "IBKR, which is the only thing that can confirm it works"),
         }
+
+    def _collect_now(self) -> bool:
+        """Ask this server's scheduler for the first collection. False with none
+        (`--no-scheduler`), when the reader has to press Sync. The demo never gets
+        here: it refuses both saves that call this."""
+        clock = self.cfg.collector
+        if clock is None:
+            return False
+        clock.request(*FIRST_COLLECTION)
+        return True
 
     def _settings_write(self) -> tuple[int, dict[str, Any]]:
         """Save preferences from the settings page.
@@ -1737,8 +1829,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # The file is the real journal's: its ids are not the demo's to show.
             stored = {k: v for k, v in stored.items()
                       if k not in ("query_id", "confirm_query_id")}
+        # A statement id saved is setup finished, so collection starts now; see
+        # `_token_write` for why a save may ask for it.
+        collecting = bool(changes.get("query_id")) and self._collect_now()
         return 200, {"ok": True, "kind": "settings", "stored": stored,
-                     "query_id": self._effective_query_id()}
+                     "query_id": self._effective_query_id(), "collecting": collecting}
 
     def _watchlist_write(self) -> tuple[int, dict[str, Any]]:
         """Add or remove one watched symbol, and write the fields the body carries.
@@ -2337,12 +2432,21 @@ def serve(
     # signal the old import-time read gave us.
     page_html()
 
+    # `query_id` is the explicit override only, for the reason `ServeConfig`
+    # gives: each run resolves the stored id through `settings.query_id`, so
+    # one saved from the page reaches the next scheduled sync. Built before the
+    # config, which carries it so a settings save can ask it to collect now.
+    clock = Scheduler(ctx=JobContext(
+        archive_dir=archive_dir, db_path=db_path, query_id=query_id,
+        assets=tuple(assets),
+    )) if scheduler else None
     cfg = ServeConfig(
         db_path=db_path,
         archive_dir=archive_dir,
         query_id=query_id,
         assets=tuple(assets),
         demo=demo,
+        collector=clock,
     )
 
     # `ThreadingHTTPServer(...)` binds and starts listening in its constructor,
@@ -2364,14 +2468,6 @@ def serve(
     # ThreadingHTTPServer instantiates its handler class per request; partial
     # prepends the config, which is the stdlib-sanctioned way to inject
     # dependencies into a BaseHTTPRequestHandler.
-    #
-    # `query_id` is the explicit override only, for the reason `ServeConfig`
-    # gives: each run resolves the stored id through `settings.query_id`, so
-    # one saved from the page reaches the next scheduled sync.
-    clock = Scheduler(ctx=JobContext(
-        archive_dir=archive_dir, db_path=db_path, query_id=query_id,
-        assets=tuple(assets),
-    )) if scheduler else None
 
     # Install stop handlers BEFORE binding the listener. A parent process can
     # observe the bound socket immediately, and the shutdown tests do exactly
@@ -2420,7 +2516,8 @@ def serve(
             print("  scheduler OFF (--no-scheduler): nothing runs unless you press it")
         else:
             clock.start()
-            print(f"  scheduler on, {clock.tick_s}s tick -- Collection shows what it did")
+            print(f"  scheduler on, {clock.tick_s}s tick; Settings > Advanced shows "
+                  f"what each job did")
 
         # SERVE_FOREVER ON A THREAD, MAIN THREAD BLOCKED ON AN EVENT, and this
         # shape is forced rather than stylistic.
@@ -2500,6 +2597,7 @@ def serve_ephemeral(
     query_id: str | None = None,
     assets: tuple[str, ...] = DEFAULT_ASSET_FILTER,
     demo: bool = False,
+    collector: Scheduler | None = None,
 ) -> Iterator[str]:
     """A real server on an OS-picked port, for the duration of the block.
 
@@ -2526,7 +2624,8 @@ def serve_ephemeral(
     `.fetch-state.json`, spending a rate-limited budget on a `pytest` run. There is
     deliberately no parameter to turn it on: a test that wants the loop constructs
     `jobs.Scheduler` directly against a scratch database, which is explicit at the
-    call site and cannot be defaulted wrong.
+    call site and cannot be defaulted wrong. Such a test may hand it in as
+    `collector`, so a settings save reaches it; it is never started here.
     """
     cfg = ServeConfig(
         db_path=db_path,
@@ -2534,6 +2633,7 @@ def serve_ephemeral(
         query_id=query_id,
         assets=tuple(assets),
         demo=demo,
+        collector=collector,
     )
 
     class _Ephemeral(http.server.ThreadingHTTPServer):

@@ -974,3 +974,164 @@ def test_no_writing_means_no_orphan_check(conn):
     from optjournal.serialize import journal_data
 
     assert journal_data(conn)["orphans"] == []
+
+
+# ---------------------------------------------------------------- collection status
+
+
+def _scheduler(*, running: bool = True, ever_ran: bool = True,
+               sync: dict | None = None, history: dict | None = None) -> dict:
+    """The `scheduler` block `collection_status` reads: the heartbeat's two flags
+    and each job's newest run."""
+    jobs = [{"job": name, "last_run": run}
+            for name, run in (("sync", sync), ("history", history)) if run is not None]
+    return {"running": running, "ever_ran": ever_ran, "jobs": jobs}
+
+
+def _failed_sync(exc: Exception) -> dict:
+    """A failed sync run, with the detail the real job writes for `exc`."""
+    from optjournal.jobs import sync_outcome
+    return {"status": "failed", "detail": sync_outcome(exc).detail}
+
+
+#: A Tuesday, so "behind" counts the weekdays since the newest statement.
+_TODAY = date(2026, 10, 6)
+
+
+@pytest.mark.parametrize(("kwargs", "state", "fix"), [
+    ({"demo": True, "configured": False}, "demo", None),
+    ({"configured": False}, "setup", "settings"),
+    ({"sync": {"status": "running"}}, "running", None),
+    ({"history": {"status": "running"}}, "running", None),
+    ({"sync": "rejected"}, "attention", "settings"),
+    ({"sync": "missing"}, "attention", "settings"),
+    ({"running": False}, "stalled", None),
+    ({"running": False, "ever_ran": False}, "off", None),
+    ({"newest": None}, "waiting", None),
+    ({"newest": date(2026, 9, 30)}, "behind", None),
+    ({"newest": date(2026, 10, 2)}, "ok", None),
+])
+def test_collection_status_names_one_state(kwargs, state, fix):
+    """Every state the header can show, from the inputs that produce it. Only
+    setup and attention point at Settings: a failure that clears by itself is the
+    schedule's to retry, and saying "fix this" over it would send the reader
+    looking for something that is not broken."""
+    from optjournal.flex import TokenMissing, TokenRejected
+    from optjournal.serialize import collection_status
+    made = {"rejected": _failed_sync(TokenRejected("IBKR error 1012")),
+            "missing": _failed_sync(TokenMissing("no token for 'me'"))}
+    sync = kwargs.get("sync")
+    got = collection_status(
+        _scheduler(running=kwargs.get("running", True),
+                   ever_ran=kwargs.get("ever_ran", True),
+                   sync=made.get(sync, sync) if isinstance(sync, str) else sync,
+                   history=kwargs.get("history")),
+        configured=kwargs.get("configured", True), demo=kwargs.get("demo", False),
+        newest=kwargs.get("newest", date(2026, 10, 5)), today=_TODAY)
+    assert (got["state"], got["fix"]) == (state, fix), got
+    assert got["message"]
+
+
+def test_a_journal_behind_says_why_and_that_it_keeps_trying():
+    """Behind is the one state a transient failure reaches, and only once three
+    weekdays have gone by. It names the last day the statements cover and what the
+    last attempt said, so the reader can tell a holiday from IBKR being down."""
+    from optjournal.flex import FlexUnreachable
+    from optjournal.serialize import collection_status
+    down = _failed_sync(FlexUnreachable("could not reach IBKR: timed out"))
+    got = collection_status(_scheduler(sync=down), configured=True, demo=False,
+                            newest=date(2026, 9, 30), today=_TODAY)
+    assert got["state"] == "behind" and got["through"] == "2026-09-30"
+    assert "keeps trying" in got["message"] and "timed out" in got["message"]
+    assert got["fix"] is None, "a failure that clears by itself is not the reader's"
+    # Two weekdays behind is not yet worth a banner: a morning before the sync,
+    # or a holiday, looks exactly like this.
+    calm = collection_status(_scheduler(sync=down), configured=True, demo=False,
+                             newest=date(2026, 10, 1), today=_TODAY)
+    assert calm["state"] == "ok"
+
+
+def test_a_long_first_collection_reads_running_not_stalled():
+    """The loop stamps its heartbeat once per tick, and a first collection (a
+    year's statement, the prices, then four years of history) holds one tick for
+    minutes. Read off the heartbeat alone, the page said "stalled, restart" in
+    the middle of the import, and a reader who did as told interrupted it."""
+    from optjournal.serialize import collection_status
+    stale = {"running": False, "ever_ran": True,
+             "jobs": [{"job": "sync", "last_run": {"status": "ok"}},
+                      {"job": "bars_daily", "last_run": {"status": "running"}}]}
+    got = collection_status(stale, configured=True, demo=False, newest=None, today=_TODAY)
+    assert got["state"] == "running", got
+    # And it says which: the import is the long one, worth naming.
+    importing = collection_status(_scheduler(history={"status": "running"}),
+                                  configured=True, demo=False, newest=_TODAY, today=_TODAY)
+    assert "earlier years" in importing["message"], importing
+
+
+@pytest.mark.parametrize(("detail", "state", "fix"), [
+    # IBKR refused the query: no retry changes that, and the fix is in Settings.
+    ("FlexError: Flex API Error 1014: Query is invalid.", "attention", "settings"),
+    # Something else broke: said, but not sent to Settings for it.
+    ("KeyError: 'FlexStatements'", "attention", None),
+    # IBKR down at the first try: the schedule retries, so this still waits.
+    ("FlexUnreachable (retried by itself): timed out after 30s", "waiting", None),
+])
+def test_a_first_sync_that_cannot_succeed_says_why(detail, state, fix):
+    """A mistyped query id read "Waiting for the first statement" for ever, with
+    no dot and no banner, while every run failed with IBKR's 1014."""
+    from optjournal.serialize import collection_status
+    got = collection_status(_scheduler(sync={"status": "failed", "detail": detail}),
+                            configured=True, demo=False, newest=None, today=_TODAY)
+    assert (got["state"], got["fix"]) == (state, fix), got
+    if state == "attention":
+        assert detail[:40] in got["message"]
+
+
+def test_a_transient_detail_is_read_back_as_one():
+    """`clears_by_itself` reads the ledger's detail, so it has to match what
+    `sync_outcome` writes for exactly the failures it marks transient."""
+    from optjournal.flex import FlexBusy, FlexUnreachable, TokenRejected
+    from optjournal.jobs import clears_by_itself, sync_outcome
+    for exc in (FlexUnreachable("timed out"), FlexBusy("generating", "1019")):
+        out = sync_outcome(exc)
+        assert out.transient and clears_by_itself(out.detail), out
+    assert not clears_by_itself(sync_outcome(TokenRejected("1012")).detail)
+    assert not clears_by_itself("FlexError: Flex API Error 1014: Query is invalid.")
+
+
+def test_a_server_without_a_scheduler_is_off_not_stalled():
+    """`serve --no-scheduler` on a journal a scheduler once fed: the old heartbeat
+    is stale, and "stopped answering, restart" would be advice that changes
+    nothing. The server knows it has none."""
+    from optjournal.serialize import collection_status
+    old = _scheduler(running=False, ever_ran=True)
+    got = collection_status(old, configured=True, demo=False,
+                            newest=date(2026, 10, 5), today=_TODAY, scheduled=False)
+    assert got["state"] == "off", got
+    assert collection_status(old, configured=True, demo=False, newest=date(2026, 10, 5),
+                             today=_TODAY)["state"] == "stalled"
+
+
+def test_an_old_credentials_row_gets_advice_that_fits_it():
+    """Rows written before the class went into the detail read "credentials: IBKR
+    says your Flex token is expired..." and got "No IBKR Flex token is stored",
+    which is the wrong fix for an expired one."""
+    from optjournal.jobs import needs_reader
+    fix = needs_reader("credentials: IBKR says your Flex token is expired. Nothing...")
+    assert fix and "stored" not in fix and "Settings" in fix
+
+
+def test_a_weekend_does_not_count_toward_behind():
+    """Friday's statement read on Monday is up to date, and so is Thursday's read
+    on Tuesday: Saturday and Sunday have no session to report."""
+    from optjournal.serialize import collection_status
+    monday = collection_status(_scheduler(), configured=True, demo=False,
+                               newest=date(2026, 10, 2), today=date(2026, 10, 5))
+    assert monday["state"] == "ok" and monday["through"] == "2026-10-02"
+    tuesday = collection_status(_scheduler(), configured=True, demo=False,
+                                newest=date(2026, 10, 1), today=_TODAY)
+    assert tuesday["state"] == "ok"
+    # The edge: three weekdays missing (Wed..Fri), with the weekend between.
+    late = collection_status(_scheduler(), configured=True, demo=False,
+                             newest=date(2026, 9, 29), today=date(2026, 10, 5))
+    assert late["state"] == "behind"

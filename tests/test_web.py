@@ -392,6 +392,12 @@ _UNSAMPLED = frozenset({
     # carries them all and a sampled one would make four of them look absent.
     # Pinned against the handlers' source below instead.
     "JobReply",
+    # `POST /api/settings`: a write's reply, never on `/api/state`, and its keys
+    # are conditional too (`message` on a refusal, `collecting` on a saved id).
+    "SettingsWrite",
+    # `GET /api/pulse`: its own endpoint, pinned against a real reply by
+    # `test_the_pulse_moves_only_when_a_run_wrote_something`.
+    "Pulse",
 })
 
 
@@ -479,6 +485,7 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "Trigger": first(state["journal"]["triggers"]),
         "JournalEntry": first(list(state["journal"]["entries"].values())),
         "Scheduler": state["scheduler"],
+        "Collection": state["collection"],
         # Sampled from the real payload, and the `scheduler` fixture seeds a
         # job_state row so this anchors something rather than being None on a
         # journal where no job has ever run -- which is every fresh journal, and
@@ -5670,32 +5677,28 @@ def test_no_handler_is_bound_to_a_styling_class():
     )
 
 
-def test_every_runnable_job_gets_a_button_and_a_retired_one_does_not():
-    """Step 5e replaces step 4c's read-only pin. That pin is why this one exists.
+def test_collection_details_live_in_settings_and_run_nothing():
+    """The Dashboard's Collection card asked the reader to run six jobs by hand,
+    which is friction for something the app does by itself: the scheduler's clock,
+    a save in Settings, and the first start all collect without a press. So the job
+    table moved to Settings → Advanced as diagnosis, with no Run button per job.
 
-    The old test forbade `<button` in the strip while `POST /api/jobs/run` did not
-    exist, because a button posting to a missing endpoint fails silently in the
-    console -- on the panel whose whole purpose is to be trusted. The endpoint
-    exists now, so the invariant flips: every REGISTERED job must be runnable from
-    here (that is what "no need to run anything from the CLI" means), and a row
-    whose job has left the registry must NOT offer a button that cannot work.
+    The history import keeps its own "Import now", with the request count in front
+    of the reader, and a retired job stays visible and labelled, because a row that
+    vanishes reads as "this never happened".
     """
-    strip = _fn("collection").replace(" ", "").replace("\n", "")
-    assert 'class="btnsmjobrun"data-job="${esc(j.job)}"' in strip, (
-        "the run button is gone, so the strip is read-only again and the jobs can "
-        "only be started from a terminal"
+    strip = _fn("collection")
+    assert "<button" not in strip, (
+        "the collection details offer a button again; every job runs by itself, "
+        "and the one worth starting sooner has the history import's own"
     )
-    assert "j.retired" in strip, (
-        "a retired job would be offered a button that posts a name the registry "
-        "no longer knows, which the endpoint answers 400 to"
-    )
-    # The button is disabled while the job is running, or a second click races the
-    # first and gets a 409 for a system that is working. (And in the demo, for a
-    # job that would reach IBKR: see the executed test below.)
-    assert "busy||demoOff?'disabled':''" in strip.replace('"', "'"), (
-        "the button stays enabled during a run, so a double click reports a "
-        "conflict for a job that is simply still going"
-    )
+    assert "j.retired" in strip and ">retired</span>" in strip.replace(" ", "").replace(
+        "\n", ""), "a retired job's row is no longer labelled"
+    assert "${collection()}" not in _fn("dashboard"), (
+        "the Collection card is back on the Dashboard")
+    assert "${collection()}" in _fn("settingsPanel"), (
+        "the collection details are gone, so a failing job has nowhere to be read")
+    assert 'data-job="history"' in _fn("historyImport")
 
 
 def _collection_rows(demo: bool) -> dict[str, str]:
@@ -5731,33 +5734,196 @@ def _collection_rows(demo: bool) -> dict[str, str]:
                            r"</span>(.*?)</div>", html, re.S))
 
 
-def test_a_job_in_flight_reads_running_and_cannot_be_started_twice():
-    """L10: while a job ran, its row showed the PREVIOUS outcome and Run stayed
-    live, because `last_status` is written when a run finishes and so is never
-    `running`. The newest run's own status is what says a run is in flight.
+def test_a_job_in_flight_reads_running():
+    """L10: while a job ran, its row showed the PREVIOUS outcome, because
+    `last_status` is written when a run finishes and so is never `running`. The
+    newest run's own status is what says a run is in flight.
     """
     rows = _collection_rows(demo=False)
-    running = rows["bars_live"]
-    assert '<span class="jobstat ">running</span>' in running, running
-    assert re.search(r"<button[^>]*\bdisabled\b[^>]*>running</button>", running), running
-    assert not re.search(r"<button[^>]*\bdisabled\b", rows["sync"]), rows["sync"]
+    assert '<span class="jobstat ">running</span>' in rows["bars_live"], rows["bars_live"]
+    assert '<span class="jobstat ">nothing</span>' in rows["sync"], rows["sync"]
 
 
-def test_the_demo_offers_no_run_that_would_reach_ibkr():
-    """Under `serve --demo` the server refuses a job that spends an IBKR request,
-    and the page used to ask the reader to confirm spending one first. That Run is
-    disabled there and says why; a job that costs nothing stays live. The Sync
-    button says the same thing rather than "start with --query-id", and the
-    confirm is skipped in the demo whatever the button's state.
+def test_the_demo_offers_nothing_that_would_reach_ibkr():
+    """Under `serve --demo` the server refuses anything that spends an IBKR
+    request. The Sync button and the history import are disabled there and say
+    why, rather than asking the reader to confirm a spend first, and the confirm
+    is skipped in the demo whatever a button's state.
     """
-    rows = _collection_rows(demo=True)
-    assert re.search(r"<button[^>]*\bdisabled\b[^>]*title=\"The demo journal",
-                     rows["sync"], re.S), rows["sync"]
-    tail = _fn("draw").replace(" ", "")
-    assert "if(st.demo){b.disabled=true;b.title=DEMO_NO_IBKR;}" in tail
+    assert _sync_button({"demo": True, "sync": {"configured": True},
+                         "collection": {"state": "demo", "message": "x"}}) == {
+        "disabled": True, "title": "The demo journal is synthetic data and never "
+        "fetches from IBKR.", "classes": []}
     assert "&&!S.state.demo;" in _fn("bindJobRuns").replace(" ", "").replace("\n", "")
     assert "S.state.demo?" in _fn("historyImport"), (
         "the history import spends one request per year and is offered in the demo")
+
+
+def _sync_button(state: dict, had: tuple[str, ...] = ()) -> dict:
+    """The Sync button after the page's own `drawSync` read `state`, starting from
+    a button that already wore the classes in `had`."""
+    dots = re.search(r"^const COLLECT_DOT=\{.*?\};", _code_only(_js()), re.S | re.M)
+    assert dots, "no COLLECT_DOT in the page"
+    return _node_run([
+        _page_const("DEMO_NO_IBKR"), dots.group(0),
+        f"const cls=new Set({json.dumps(list(had))});",
+        "const b={disabled:false,title:'',classList:{add:c=>cls.add(c),",
+        "  remove:(...cs)=>cs.forEach(c=>cls.delete(c))}};",
+        "const $=()=>b;",
+        *_page_fns("drawSync"),
+        f"drawSync({json.dumps(state)});",
+        "console.log(JSON.stringify({disabled:b.disabled,title:b.title,",
+        "  classes:[...cls].sort()}));",
+    ])
+
+
+@pytest.mark.parametrize(("collection", "sync", "disabled", "classes", "starts"), [
+    # Up to date: a quiet green dot, and pressing it still fetches.
+    ({"state": "ok", "message": "Up to date: statements through 2026-10-02."},
+     {"configured": True, "cooldown_remaining_s": 0}, False, ["collect-ok"], "Up to date"),
+    # The reader has to act: a red dot, and Sync stays pressable to try again.
+    ({"state": "attention", "message": "IBKR refused the token."},
+     {"configured": True, "cooldown_remaining_s": 0}, False, ["collect-need"], "IBKR"),
+    # Behind: the warning hue, the reason first.
+    ({"state": "behind", "message": "Statements end 2026-09-25."},
+     {"configured": True, "cooldown_remaining_s": 0}, False, ["collect-behind"], "Statements"),
+    # Running is busy and not pressable: a second fetch would only meet the lock.
+    ({"state": "running", "message": "Fetching from IBKR…"},
+     {"configured": True, "cooldown_remaining_s": 0}, True, ["busy"], "Fetching"),
+    # Not set up: red, disabled, and the way out is Settings rather than a flag.
+    ({"state": "setup", "message": "Add your IBKR Flex token and query id in Settings."},
+     {"configured": False}, True, ["collect-need"], "Add your IBKR"),
+    # Waiting and off say so in the tooltip and wear no dot.
+    ({"state": "waiting", "message": "Waiting for the first statement from IBKR."},
+     {"configured": True, "cooldown_remaining_s": 600}, True, [], "Waiting"),
+])
+def test_the_sync_button_carries_the_collection_state(collection, sync, disabled,
+                                                      classes, starts):
+    """The Dashboard's Collection card became one state on the Sync button, where
+    a reader already looks to ask "is this up to date": a dot for the state, its
+    sentence first in the tooltip, and what pressing it would do second. The dot
+    from the PREVIOUS payload goes, so a journal that caught up does not stay red.
+    """
+    got = _sync_button({"demo": False, "sync": sync, "collection": collection},
+                       had=("collect-need", "busy"))
+    assert got["disabled"] is disabled, got
+    assert got["classes"] == classes, got
+    assert got["title"].startswith(starts), got
+    assert "\n" in got["title"], "the tooltip no longer says what pressing it does"
+
+
+def _banners(collection: dict, show_cog: bool = False) -> str:
+    return _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        _page_const("COLLECT_BANNER"),
+        f"const S={{showCog:{json.dumps(show_cog)},update:null,",
+        f"  state:{{install:{{}},collection:{json.dumps(collection)}}}}};",
+        *_page_fns("appBanners"),
+        "console.log(JSON.stringify(appBanners()));",
+    ])
+
+
+@pytest.mark.parametrize(("state", "fix", "shown"), [
+    ("setup", "settings", True), ("attention", "settings", True),
+    ("behind", None, True), ("stalled", None, True),
+    ("ok", None, False), ("running", None, False), ("waiting", None, False),
+    ("off", None, False), ("demo", None, False),
+])
+def test_a_collection_banner_appears_only_when_the_reader_is_needed(state, fix, shown):
+    """The banner is for the four states that ask something of the reader or have
+    gone on long enough to tell them; everything else is the dot. "Open Settings"
+    is offered only where the fix is there, and not over an open Settings panel.
+    """
+    html = _banners({"state": state, "message": "Something <b>happened</b>.",
+                     "fix": fix, "through": None})
+    assert ("Something &lt;b&gt;happened&lt;/b&gt;." in html) is shown, html
+    assert ('id="collectfix"' in html) is (fix == "settings"), html
+    if fix == "settings":
+        assert 'id="collectfix"' not in _banners(
+            {"state": state, "message": "m", "fix": fix}, show_cog=True)
+    assert "$('#collectfix')" in _fn("bindAppBanners")
+
+
+@pytest.mark.parametrize("collecting", [True, False])
+def test_a_save_that_started_collecting_says_so_and_follows_it(collecting):
+    """A saved query id the server answered with `collecting: true` started the
+    first collection, so the page says so and keeps reloading for a while
+    (COLLECT_FOLLOW_MS) rather than waiting for a reload by hand. A save that did
+    not start anything (no scheduler) says only "saved".
+    """
+    out = _node_run([
+        "const S={}; const notes=[]; const setTimeout=()=>0;",
+        "const nodes={'#qid':{value:'1591754'},'#qidmsg':{textContent:''}};",
+        "const $=sel=>nodes[sel]||null;",
+        f"async function save(){{return {{ok:true,kind:'settings',"
+        f"collecting:{json.dumps(collecting)}}};}}",
+        "function load(){}",
+        "function note(text,kind){notes.push(kind+': '+text);}",
+        _page_const("HELD_MS"), _page_const("COLLECT_FOLLOW_MS"),
+        *_page_fns("saveQueryId", "holdNote", "heldNote", "collectingNote"),
+        "const before=Date.now(); await saveQueryId('query_id','qid');",
+        "console.log(JSON.stringify({notes,",
+        "  follows:(S.collectUntil||0)-before}));",
+    ])
+    if collecting:
+        assert out["notes"] == ["ok: Saved. Collection starts now, and this page "
+                                "updates by itself."]
+        assert out["follows"] >= 20000 - 50
+    else:
+        assert out["notes"] == [] and out["follows"] <= 0, out
+
+
+def test_a_slower_older_reply_does_not_land_over_a_newer_one():
+    """The page reloads by itself every 5 s while collection runs. A poll that
+    answered after the reader's own load (a month, a type) put the scope it had
+    asked for back on screen, and `load()` resets the controls from the reply."""
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const S={state:null,month:null,type:null,cost:null,scoring:null,calday:null};",
+        "let draws=0; function note(){} function draw(){draws++;} function staleServerCheck(){}",
+        "let release; const slow=new Promise(r=>{release=r;});",
+        "const replies=[slow.then(()=>({stats:{},trade_type:'odte'})),",
+        "  Promise.resolve({stats:{},trade_type:'all'})];",
+        "let calls=0; const fetch=async()=>{const body=await replies[calls++];",
+        "  return {ok:true,status:200,json:async()=>body};};",
+        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        "const $=()=>({innerHTML:'',className:''});",
+        *_page_fns("stateQuery", "pinDayMonth", "load"),
+        "const older=load(); const newer=load(); await newer; release(); await older;",
+        "console.log(JSON.stringify({type:S.state.trade_type,draws}));",
+    ])
+    assert out == {"type": "all", "draws": 1}, out
+
+
+def test_settings_advanced_stays_open_across_a_redraw():
+    """The redraw every 5 s while collection runs rebuilt Settings → Advanced
+    closed, and the history import and the collection details are inside it."""
+    panel = _fn("settingsPanel")
+    assert 'id="adv"${st.dev||S.advOpen?' in panel
+    binder = _code_only(_js())
+    assert "adv.ontoggle=()=>{S.advOpen=adv.open;}" in binder.replace(" ", "")
+
+
+def test_a_reload_keeps_the_token_status_already_in_hand():
+    """The token's presence is never on `/api/state` (the keyring can take 8s), so
+    every reload came back with `settings.token: null` and the panel said "not
+    checked" under a token stored a moment before. With the page now reloading by
+    itself while a collection runs, that happened within five seconds of a save.
+    """
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const S={state:{settings:{token:{ok:true,present:true,account:'me'}}},",
+        "  month:null,type:null,cost:null,scoring:null,calday:null};",
+        "function note(){} function draw(){} function staleServerCheck(){}",
+        "const fetch=async()=>({ok:true,status:200,json:async()=>(",
+        "  {stats:{},settings:{token:null}})});",
+        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        "const $=()=>({innerHTML:'',className:''});",
+        *_page_fns("stateQuery", "pinDayMonth", "load"),
+        "await load();",
+        "console.log(JSON.stringify(S.state.settings.token));",
+    ])
+    assert out == {"ok": True, "present": True, "account": "me"}
 
 
 @pytest.mark.parametrize("reply", [
@@ -6240,11 +6406,12 @@ def test_the_attribution_sentence_survives_the_rewrite():
         "the footer is denying that implied vol is reachable while an IVR column is "
         "on screen two cells away"
     )
-    assert "no stored history yet for ${\n      esc(thin.join(', '))}: run" in body, (
-        "the remedy no longer names the thin symbols, so a reader cannot tell "
-        "which rows a `bars` run would fill in"
+    assert "no stored history yet for ${\n      esc(thin.join(', '))}: the daily" in body, (
+        "the footer no longer names the thin symbols, so a reader cannot tell "
+        "which rows the daily price job will fill in"
     )
-    assert "optjournal bars" in body
+    # Collection runs by itself, so the page never sends a reader to a terminal.
+    assert "optjournal bars" not in body
     # And the typed column says it is typed, which is slice 4's clause.
     assert "earnings dates are ones you recorded" in body
 
@@ -7686,7 +7853,8 @@ def test_the_footer_marks_dev_mode_only_when_it_is_on():
     decides, so it cannot disagree with the flag the server resolved.
     """
     js = _code_only(_js())
-    foot = js[js.index("$('#foot')"):js.index("$('#foot')") + 260]
+    start = js.index("$('#foot')")
+    foot = js[start:js.index(";", js.index("no authentication", start))]
     assert "st.dev?" in foot and "dev mode" in foot, (
         "the footer does not render a dev marker off the payload's dev flag"
     )
@@ -7699,7 +7867,7 @@ def test_dev_mode_opens_the_diagnostics_block_rather_than_hiding_it():
     not gate the whole block away, because a friend still wants to check whether a
     statement ingested."""
     panel = _fn("settingsPanel")
-    assert 'class="adv mt-5"${st.dev?\' open\':\'\'}' in panel, (
+    assert 'class="adv mt-5" id="adv"${st.dev||S.advOpen?\' open\':\'\'}' in panel, (
         "the Advanced block is not opened by dev mode (or is hidden by it)"
     )
     # The block itself is unconditional: its content shows for everyone.
@@ -7781,6 +7949,186 @@ def test_the_token_endpoint_stores_a_pasted_token_stripped(populated, monkeypatc
     assert payload["present"] is True
     assert payload["account"] == getpass.getuser()
     assert wrote == [("ibkr-flex-token", getpass.getuser(), "123456789012345")]
+
+
+@pytest.mark.parametrize("with_scheduler", [True, False])
+def test_saving_the_query_id_starts_collecting_without_a_press_of_sync(
+    tmp_path, monkeypatch, with_scheduler
+):
+    """Setup used to end one step short: the reply said "press Sync", and a new
+    user's journal stayed empty until they did. Saved, the first collection now
+    runs on this server's scheduler, in order. With no scheduler the reply says
+    so, and Sync is still the way."""
+    import dataclasses  # noqa: PLC0415 - local to this test
+    import time  # noqa: PLC0415
+
+    from conftest import connect_migrated  # noqa: PLC0415
+
+    from optjournal import jobs, settings  # noqa: PLC0415
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv(settings.HOME_ENV, str(home))
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    monkeypatch.setattr(jobs, "JOBS", tuple(
+        dataclasses.replace(job, run=lambda _c, _x: jobs.Outcome("ok", "done"))
+        for job in jobs.JOBS if job.name in jobs.FIRST_COLLECTION))
+    db = tmp_path / "j.db"
+    conn = connect_migrated(db)
+    clock = jobs.Scheduler(ctx=jobs.Context(archive_dir=tmp_path / "raw", db_path=db),
+                           tick_s=3600) if with_scheduler else None
+    if clock:
+        clock.start()
+    try:
+        with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw",
+                                 collector=clock) as base:
+            status, reply = _post(base, "/api/settings", {"query_id": "1591754"})
+        deadline = time.monotonic() + 5
+        while clock and time.monotonic() < deadline and conn.execute(
+                "SELECT COUNT(*) FROM job_runs").fetchone()[0] < 3:
+            time.sleep(0.05)
+    finally:
+        if clock:
+            clock.stop()
+    assert (status, reply["collecting"]) == (200, with_scheduler)
+    ran = [r[0] for r in conn.execute("SELECT job FROM job_runs ORDER BY id")]
+    assert ran == (list(jobs.FIRST_COLLECTION) if with_scheduler else [])
+
+
+def test_the_pulse_moves_only_when_a_run_wrote_something(tmp_path, monkeypatch):
+    """The open page reloads when `/api/pulse` answers a different stamp than the
+    payload it holds, so the stamp must move when data arrived and only then. A
+    run that wrote (`ok`) moves it; an empty run, a failure and the heartbeat,
+    which beats every minute, do not, or an idle page would reload all day."""
+    from conftest import connect_migrated  # noqa: PLC0415 - local to this test
+
+    from optjournal import jobs  # noqa: PLC0415
+
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", "1591754")
+    db = tmp_path / "j.db"
+    conn = connect_migrated(db)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        def pulse() -> dict:
+            status, reply = _get(base, "/api/pulse")
+            assert status == 200, reply
+            return reply
+
+        first = pulse()
+        _status, state = _get(base, "/api/state")
+        assert first["stamp"] == state["stamp"], "a fresh page would reload at once"
+        assert first["collection"] == state["collection"]
+        assert set(first) == set(_parse_contract(_js())[0]["Pulse"]), first
+        jobs.heartbeat(conn)
+        jobs.record_run(conn, "market", status="nothing", detail="0 event(s)")
+        jobs.record_run(conn, "sync", status="failed",
+                        detail="FlexBusy (retried by itself): 1019")
+        conn.commit()
+        assert pulse()["stamp"] == first["stamp"], "nothing new, and the page reloaded"
+        jobs.record_run(conn, "bars_daily", status="ok", detail="12 bar(s)")
+        conn.commit()
+        assert pulse()["stamp"] != first["stamp"], "new bars, and the page kept the old"
+
+
+def _pulse(state: dict, reply: dict | None, *, visible: bool = True) -> dict:
+    """The page's own `pulse` against `reply` (None: the request failed), from a
+    page holding `state`. Reports what it did: reloaded, redrew, or neither."""
+    answer = ("throw new TypeError('Failed to fetch');" if reply is None
+              else f"return {{ok:true,json:async()=>({json.dumps(reply)})}};")
+    shown = "visible" if visible else "hidden"
+    return _node_run([
+        f"const S={{state:{json.dumps(state)}}}; let loads=0, draws=0;",
+        f"const document={{visibilityState:'{shown}',activeElement:null}};",
+        "const nodes={'#fresh':{textContent:''}}; const $=sel=>nodes[sel]||null;",
+        "async function load(){loads++;} function draw(){draws++;}",
+        f"const fetch=async()=>{{{answer}}};",
+        *_page_fns("keepPlace", "freshNote", "pulse"),
+        "await pulse();",
+        "console.log(JSON.stringify({loads,draws,collection:S.state.collection,",
+        "  fresh:nodes['#fresh'].textContent}));",
+    ])
+
+
+def test_the_open_page_follows_the_server_without_a_refresh_button():
+    """A page left open overnight showed yesterday's trades after the noon sync,
+    and its dot kept the state it loaded with through a failure. Now it asks
+    `/api/pulse` once a minute: a new stamp reloads, a new collection status alone
+    redraws the dot and banner, and nothing new only updates "checked"."""
+    ok = {"state": "ok", "message": "Up to date.", "fix": None, "through": "2026-10-05"}
+    behind = {**ok, "state": "behind", "message": "Statements end 2026-10-01."}
+    held = {"stamp": "7", "collection": ok}
+    assert _pulse(held, {"stamp": "8", "collection": ok})["loads"] == 1
+    same = _pulse(held, {"stamp": "7", "collection": ok})
+    assert (same["loads"], same["draws"]) == (0, 0) and same["fresh"].startswith("checked")
+    moved = _pulse(held, {"stamp": "7", "collection": behind})
+    assert (moved["loads"], moved["draws"]) == (0, 1)
+    assert moved["collection"]["state"] == "behind", moved
+    # A pulse that could not reach the server leaves the page as it is.
+    assert _pulse(held, None) == {"loads": 0, "draws": 0, "collection": ok, "fresh": ""}
+    # A hidden tab asks nothing: it catches up when it is shown again.
+    assert _pulse(held, {"stamp": "8", "collection": behind}, visible=False) == {
+        "loads": 0, "draws": 0, "collection": ok, "fresh": ""}
+    # Checked every minute while visible, and on coming back to the tab.
+    js = _code_only(_js())
+    assert "document.addEventListener('visibilitychange',pulse);" in js
+    assert "if(Date.now()-(S.pulseAt||0)>=PULSE_MS)pulse();" in js.replace(" ", "")
+
+
+def test_a_server_with_no_scheduler_reports_collection_off(tmp_path, monkeypatch):
+    """`serve --no-scheduler` on a journal a scheduler once fed: the old heartbeat
+    is stale, and the server, which knows it runs none, says "off" rather than
+    "stopped answering, restart"."""
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from conftest import connect_migrated  # noqa: PLC0415
+
+    from optjournal import jobs  # noqa: PLC0415
+
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", "1591754")
+    db = tmp_path / "j.db"
+    jobs.heartbeat(connect_migrated(db), now=datetime.now(UTC) - timedelta(days=2))
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        status, state = _get(base, "/api/state")
+    assert status == 200 and state["scheduler"]["ever_ran"] is True
+    assert state["collection"]["state"] == "off", state["collection"]
+
+
+@pytest.mark.parametrize(("path", "body", "query_id", "demo", "collects"), [
+    # The control: a token saved with a query id in force collects.
+    ("/api/settings/token", {"token": "123456789012345"}, "1591754", False, True),
+    # A token with no query id yet: the sync would only record a failure the
+    # reader has not caused, halfway through setup.
+    ("/api/settings/token", {"token": "123456789012345"}, None, False, False),
+    # A save that is not the query id (the tiles) has nothing to start.
+    ("/api/settings", {"tiles": None}, "1591754", False, False),
+    # The demo never fetches from IBKR: it refuses both saves outright.
+    ("/api/settings/token", {"token": "123456789012345"}, "1591754", True, False),
+    ("/api/settings", {"query_id": "1591754"}, None, True, False),
+])
+def test_only_a_save_that_completes_setup_asks_for_a_collection(
+    tmp_path, monkeypatch, path, body, query_id, demo, collects
+):
+    """`collecting` is a promise to the reader that a fetch is on its way, and a
+    request to the scheduler that spends one. Each refusal here is a fetch that
+    would have been asked of IBKR, or a failure recorded, for nothing."""
+    from optjournal import jobs, settings  # noqa: PLC0415 - local to this test
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv(settings.HOME_ENV, str(home))
+    monkeypatch.delenv("OPTJOURNAL_QUERY_ID", raising=False)
+    if query_id:
+        monkeypatch.setenv("OPTJOURNAL_QUERY_ID", query_id)
+    _no_keyring_writes(monkeypatch)
+    db = tmp_path / "j.db"
+    # Not started: what a save asked for stays queued where this can read it.
+    clock = jobs.Scheduler(ctx=jobs.Context(archive_dir=tmp_path / "raw", db_path=db))
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw", demo=demo,
+                             collector=clock) as base:
+        status, reply = _post(base, path, body)
+    assert status == (400 if demo else 200), reply
+    assert reply.get("collecting", False) is collects, reply
+    assert clock._take_requested() == (frozenset(jobs.FIRST_COLLECTION) if collects
+                                       else frozenset())
 
 
 def test_storing_a_token_never_echoes_it_back(populated, monkeypatch):
@@ -8912,7 +9260,7 @@ def test_the_calculator_explains_itself_on_hover_rather_than_on_the_page():
     notes = view.count('class="note"')
     assert notes == 1 and "Not available yet" in view, (
         f"{notes} prose blocks on the tab -- explanation belongs in one of the two "
-        "tips; only the 'run optjournal bars' instruction stays on the page"
+        "tips; only the 'not available yet' empty state stays on the page"
     )
     # Keyboard-reachable, or the explanation exists only for a mouse.
     assert view.count('class="info tipped"\n      tabindex="0"') + view.count(
@@ -9791,9 +10139,10 @@ def test_a_late_update_banner_leaves_the_focused_field_where_it_was():
     `checkUpdate` measures the focused element before its redraw and scrolls by
     exactly what moved it. Over the source, for the preserveInputs test's reason.
     """
-    fn = _fn("checkUpdate")
+    assert "await keepPlace(draw);" in _fn("checkUpdate")
+    fn = _fn("keepPlace")
     before = fn.index("getBoundingClientRect().top")
-    assert before < fn.index("draw();") < fn.index("window.scrollBy("), (
+    assert before < fn.index("await redraw();") < fn.index("window.scrollBy("), (
         "the focused field has to be measured before the redraw and put back after")
 
 

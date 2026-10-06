@@ -1472,6 +1472,86 @@ def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
     }
 
 
+#: Weekdays the newest statement may trail yesterday by before the page says the
+#: journal is behind. Three, so a holiday or a morning before the noon sync is
+#: not reported as a problem, and a sync failing for two days still is.
+BEHIND_WEEKDAYS = 3
+
+
+def collection_status(
+    scheduler: Row, *, configured: bool, demo: bool, newest: date | None, today: date,
+    scheduled: bool = True,
+) -> Row:
+    """One answer to "is this journal being fed", for the header and its banner.
+
+    What replaced the Dashboard's Collection card: a reader should not read six
+    job rows to learn that everything is fine, or that one thing needs them.
+    `state` is one of demo, setup, running, attention, stalled, off, waiting,
+    behind, ok; `fix` is "settings" when the reader has to act there; `message`
+    is the sentence to show. `scheduled` is whether this server runs a scheduler
+    at all (`serve --no-scheduler` does not).
+
+    Only `attention` and `setup` ask anything of the reader. A failure that
+    clears by itself (no network, IBKR busy, the keychain asleep) is the
+    schedule's to retry, so it shows only once the journal falls
+    `BEHIND_WEEKDAYS` behind, and then says the app is still trying.
+    """
+    from optjournal.jobs import (  # noqa: PLC0415 - see `jobs_data`
+        clears_by_itself,
+        needs_reader,
+    )
+
+    jobs = {str(j["job"]): j for j in scheduler.get("jobs", [])}
+    running = {name for name, j in jobs.items()
+               if (j.get("last_run") or {}).get("status") == "running"}
+    sync_run = (jobs.get("sync") or {}).get("last_run") or {}
+    failed = str(sync_run.get("detail") or "") if sync_run.get("status") == "failed" else ""
+    through = newest.isoformat() if newest else None
+
+    def say(state: str, message: str, fix: str | None = None) -> Row:
+        return {"state": state, "message": message, "fix": fix, "through": through}
+
+    if demo:
+        return say("demo", "The demo journal collects nothing from IBKR.")
+    if not configured:
+        return say("setup", "Add your IBKR Flex token and query id in Settings, and "
+                            "collection starts by itself.", "settings")
+    # ANY job in flight, and before the heartbeat is read: the loop stamps it once
+    # per tick, and a first collection (a year's statement, then the history
+    # import) can hold one tick for minutes, which read as "stalled" mid-import.
+    if "sync" in running:
+        return say("running", "Fetching from IBKR…" if newest
+                   else "Fetching your first year from IBKR…")
+    if "history" in running:
+        return say("running", "Importing your earlier years from IBKR…")
+    if running:
+        return say("running", "Collecting in the background…")
+    fix = needs_reader(failed) if failed else None
+    if fix:
+        return say("attention", fix, "settings")
+    # A first sync refused for a reason no retry changes (IBKR's 1014, "Query is
+    # invalid", for a mistyped id) would otherwise read "waiting" for ever.
+    if newest is None and failed and not clears_by_itself(failed):
+        ibkr = "Flex API Error" in failed
+        return say("attention", f"The first sync failed: {failed[:160]}"
+                   + (" Check the query id in Settings." if ibkr else ""),
+                   "settings" if ibkr else None)
+    if not scheduled or not scheduler.get("running"):
+        if scheduled and scheduler.get("ever_ran"):
+            return say("stalled", "Background collection stopped answering. Close "
+                                  "Bitácora and open it again.")
+        return say("off", "Background collection is off in this server; Sync "
+                          "fetches by hand.")
+    if newest is None:
+        return say("waiting", "Waiting for the first statement from IBKR.")
+    behind = sum(1 for n in range(1, (today - newest).days)
+                 if (newest + timedelta(days=n)).weekday() < 5)
+    if behind >= BEHIND_WEEKDAYS:
+        return say("behind", f"Statements end {through}. Bitácora keeps trying"
+                             + (f"; the last attempt said: {failed[:160]}" if failed else "."))
+    return say("ok", f"Up to date: statements through {through}.")
+
+
 def audit_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
     """Did the last session's perishable option bars actually land?
 

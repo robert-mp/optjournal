@@ -26,9 +26,11 @@ run their own copy; an install is never shared between them.
 3. A window opens and the first start installs what optjournal needs, which takes
    a minute. Then your browser opens the journal. **Keep that window open** while
    you use it; closing it stops optjournal.
-4. In the page, open Settings (the gear), paste your IBKR Flex token and query
-   id, and press **Sync**. The first sync fetches the last year. For older years,
-   Settings → Advanced has **Import full history**.
+4. In the page, open Settings (the gear) and paste your IBKR Flex token and query
+   id. Saving them starts collecting by itself: the last year first, then the
+   older years IBKR keeps, then each trading day's statement the day after,
+   while optjournal is open. The dot on the Sync button says whether the journal
+   is up to date, and a banner appears only when something needs you.
 
 **Updates:** when a new version is out, the page shows a banner. Click
 **Update**, and optjournal installs it and reloads by itself.
@@ -73,7 +75,7 @@ A token expires, and replacing it does not need a terminal: Settings in the page
 takes a new one and writes it to the same keyring entry. The page can replace the
 token but never read it back, so it reports presence and never a value — and
 since only a real fetch can tell whether IBKR still accepts what it was given,
-press **Sync** after saving.
+saving one starts a fetch by itself.
 
 On macOS the keychain may ask whether optjournal (it can appear as Python) may
 read the token. Choose **Always Allow**. **Allow** grants a single read, and

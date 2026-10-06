@@ -43,8 +43,8 @@ from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
 from optjournal.locks import LockTimeout
 
 __all__ = [
-    "SNAPSHOTS_KEPT", "SNAPSHOT_DIR", "first_sync_window", "history_chunks",
-    "import_history", "sync_journal",
+    "GAP_DAYS", "SNAPSHOTS_KEPT", "SNAPSHOT_DIR", "first_sync_window", "gap_window",
+    "history_chunks", "import_history", "newest_statement_end", "sync_journal",
 ]
 
 log = logging.getLogger(__name__)
@@ -71,6 +71,51 @@ def first_sync_window(today: date) -> tuple[str, str]:
     """
     to = _weekday_back(today - timedelta(days=1))
     start = to - timedelta(days=FIRST_SYNC_SPAN_DAYS - 1)
+    return start.strftime("%Y%m%d"), to.strftime("%Y%m%d")
+
+
+#: How far behind the newest statement may fall before a sync asks for the whole
+#: gap instead of the query's own `Last30CalendarDays`. Two days short of thirty,
+#: so the oldest missing day is never lost to where in the day the sync runs.
+GAP_DAYS = 28
+
+
+def newest_statement_end(conn: sqlite3.Connection) -> date | None:
+    """The last day the newest activity statement covers, or None for none.
+
+    `activity-` statements only: a confirmation writes a `statements` row too,
+    for one day of fills, which is not coverage of the days before it. Dates are
+    spelled two ways in the table (`2026-09-29` from a statement, `20260928`
+    from a confirmation), so both are read as one.
+    """
+    row = conn.execute(
+        "SELECT MAX(REPLACE(to_date, '-', '')) AS last FROM statements"
+        " WHERE source_file LIKE 'activity-%'"
+    ).fetchone()
+    if row is None or not row["last"]:
+        return None
+    try:
+        return datetime.strptime(str(row["last"]), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def gap_window(conn: sqlite3.Connection, today: date) -> tuple[str, str] | None:
+    """The `fd`/`td` pair from the newest activity statement's end to yesterday,
+    when that is more than `GAP_DAYS`; None when the query's 30 days cover it.
+
+    WHY: a laptop shut for five weeks synced the last 30 days on waking, and the
+    days before them were never asked for. The gap starts on the statement's
+    last day (re-ingesting one day is a no-op) and is capped at the 365 days
+    IBKR serves per request, under the same weekday rules as `first_sync_window`.
+    """
+    last = newest_statement_end(conn)
+    if last is None:
+        return None
+    to = _weekday_back(today - timedelta(days=1))
+    if (to - last).days <= GAP_DAYS:
+        return None
+    start = _weekday_forward(max(last, to - timedelta(days=FIRST_SYNC_SPAN_DAYS - 1)))
     return start.strftime("%Y%m%d"), to.strftime("%Y%m%d")
 
 
@@ -123,6 +168,7 @@ def sync_journal(
     to_date: str | None = None,
     force: bool = False,
     lock_timeout_s: float = FETCH_LOCK_WAIT_S,
+    today: date | None = None,
 ) -> dict[str, Any]:
     """Fetch the newest statement, fold it in, snapshot. THE one sync path.
 
@@ -167,12 +213,22 @@ def sync_journal(
     query is `Last30CalendarDays`, so every statement comes back for a request.
     """
     started = _now()
+    day = today or datetime.now(MARKET_TZ).date()
     first_sync = from_date is None and to_date is None and _is_new_journal(conn)
+    gap: tuple[str, str] | None = None
     if first_sync:
         # Still ONE request under the same lock and cooldown, so the lockout
         # guard is untouched; it only asks that request for a longer period.
-        from_date, to_date = first_sync_window(datetime.now(MARKET_TZ).date())
+        from_date, to_date = first_sync_window(day)
         log.info("new journal: requesting %s to %s", from_date, to_date)
+    elif from_date is None and to_date is None:
+        # The same single request, asked for the days since the newest statement
+        # when they are more than the query's 30 (`gap_window`).
+        gap = gap_window(conn, day)
+        if gap is not None:
+            from_date, to_date = gap
+            log.info("newest statement is over %s days old: requesting %s to %s",
+                     GAP_DAYS, from_date, to_date)
     result = fetch(
         query_id, archive_dir=archive_dir,
         from_date=from_date, to_date=to_date, force=force,
@@ -212,6 +268,8 @@ def sync_journal(
     )
     if first_sync:
         summary = f"first sync, fetched {from_date} to {to_date}: {summary}"
+    elif gap is not None:
+        summary = f"caught up a gap, fetched {from_date} to {to_date}: {summary}"
     return {
         "ok": True,
         "kind": "synced",

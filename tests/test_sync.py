@@ -333,13 +333,20 @@ def test_a_new_journal_asks_for_the_last_year(tmp_path, monkeypatch):
     )
 
 
+def _newest_statement_end(conn) -> date:
+    (last,) = conn.execute("SELECT MAX(REPLACE(to_date, '-', '')) FROM statements"
+                           " WHERE source_file LIKE 'activity-%'").fetchone()
+    return datetime.strptime(last, "%Y%m%d").date()
+
+
 def test_a_journal_with_statements_keeps_the_template_period(populated, monkeypatch):
     from optjournal.db import connect  # noqa: PLC0415 - local to this test
 
     calls: list[dict] = []
     mod = _stub_fetch(monkeypatch, calls)
     conn = connect(populated)
-    result = mod.sync_journal(conn=conn, archive_dir=RAW_DIR, query_id="1")
+    today = _newest_statement_end(conn) + timedelta(days=3)
+    result = mod.sync_journal(conn=conn, archive_dir=RAW_DIR, query_id="1", today=today)
     conn.close()
 
     (asked,) = calls
@@ -347,6 +354,49 @@ def test_a_journal_with_statements_keeps_the_template_period(populated, monkeypa
         "a daily sync re-requested a year, spending a longer generation for nothing"
     )
     assert not result["summary"].startswith("first sync")
+
+
+def test_a_journal_behind_by_more_than_the_query_asks_for_the_whole_gap(
+    populated, monkeypatch
+):
+    """Shut for five weeks, the query's 30 days left the days before them unasked
+    for, for good. One request still, for the days since the newest statement."""
+    from optjournal.db import connect  # noqa: PLC0415 - local to this test
+
+    calls: list[dict] = []
+    mod = _stub_fetch(monkeypatch, calls)
+    conn = connect(populated)
+    last = _newest_statement_end(conn)
+    result = mod.sync_journal(conn=conn, archive_dir=RAW_DIR, query_id="1",
+                              today=last + timedelta(days=40))
+    conn.close()
+
+    (asked,) = calls
+    start, end = (datetime.strptime(asked[k], "%Y%m%d").date()
+                  for k in ("from_date", "to_date"))
+    assert start <= last + timedelta(days=2) and start.weekday() < 5
+    assert end >= last + timedelta(days=36) and end.weekday() < 5
+    assert result["summary"].startswith("caught up a gap")
+
+
+def test_the_gap_counts_activity_statements_only_and_is_capped_at_a_year(tmp_path):
+    from conftest import add_statement, connect_migrated  # noqa: PLC0415
+
+    from optjournal.sync import FIRST_SYNC_SPAN_DAYS, GAP_DAYS, gap_window  # noqa: PLC0415
+
+    conn = connect_migrated(tmp_path / "j.db")
+    add_statement(conn, source_file="activity-1.xml", sha256="a",
+                  from_date="2025-01-01", to_date="2025-03-31")
+    # A confirmation is one day of fills, not coverage of the days before it.
+    add_statement(conn, source_file="confirm-20260601.xml", sha256="c",
+                  from_date="20260601", to_date="20260601")
+    conn.commit()
+    today = date(2026, 6, 3)
+    start, end = (datetime.strptime(d, "%Y%m%d").date() for d in gap_window(conn, today))
+    assert end == date(2026, 6, 2)
+    assert (end - start).days + 1 <= FIRST_SYNC_SPAN_DAYS
+    assert start.weekday() < 5
+    assert gap_window(conn, date(2025, 3, 31) + timedelta(days=GAP_DAYS)) is None
 
 
 def test_dates_passed_explicitly_win_on_a_new_journal(tmp_path, monkeypatch):
