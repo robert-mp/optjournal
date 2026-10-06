@@ -696,12 +696,15 @@ def _only(monkeypatch, home, *names):
 
 
 def _wait_for_rows(conn, n, seconds=5.0):
+    """Until `n` runs have FINISHED. A run's row is committed as 'running' before
+    its work starts, so returning on the row alone raced the job on a slow runner
+    and read [('market', 'running')] on Windows CI."""
     import time
 
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         rows = conn.execute("SELECT job, status FROM job_runs ORDER BY id").fetchall()
-        if len(rows) >= n:
+        if len(rows) >= n and all(r["status"] != "running" for r in rows):
             return rows
         time.sleep(0.05)
     return conn.execute("SELECT job, status FROM job_runs ORDER BY id").fetchall()
