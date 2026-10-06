@@ -665,6 +665,11 @@ def build_state(
         # sub-millisecond `LOCK_NB` attempts in the common case, and zero when no
         # row says `running`.
         interrupted_runs(conn, archive_dir=archive_dir)
+        # BEFORE anything is read: a run finishing mid-build then leaves an old
+        # stamp over new figures, and the next pulse reloads once more for
+        # nothing. Read after, it would leave a new stamp over old figures, and
+        # the page would never reload for that run at all.
+        stamp = data_stamp(conn)
         plan = history_plan(conn, archive_dir)
         # One history pass over the home category, reused by the scope, the
         # cohorts and every period row below.
@@ -728,6 +733,8 @@ def build_state(
         state: dict[str, Any] = {
             "version": __version__,
             "generated_at": _now(),
+            # What `/api/pulse` is compared against: see `data_stamp`.
+            "stamp": stamp,
             # Developer-only surfaces on? Resolved per request from the env var or
             # the stored flag (`settings.dev`), never from anything the browser
             # sent -- so a page in another tab cannot turn it on over this
@@ -774,13 +781,13 @@ def build_state(
             ),
             "history": history_data(report),
             "statements": statements_data(archive_dir, conn),
-            # Read-only: the page never fetches the calendar. `optjournal market
-            # --fetch` does, from the nightly cron, because the feed rate limits
-            # (429 with a retry-after) and a tab reload is not a reason to spend
-            # a request against it.
+            # Read-only: a page load never fetches the calendar. The daily
+            # `market` job does (and Refresh, by hand), because the feed rate
+            # limits (429 with a retry-after) and a tab reload is not a reason to
+            # spend a request against it.
             "market": market_data(conn, now=datetime.now(UTC)),
             # Prices and realised vol from bars already stored, so this
-            # spends nothing. `optjournal bars` is what fills them in.
+            # spends nothing. The daily `bars_daily` job is what fills them in.
             "watchlist": watchlist_data(conn),
             # What the scheduler has done, and whether it is running at all.
             # Read-only here: the runner writes, the page renders.
@@ -969,11 +976,51 @@ def build_state(
     }
     # The header's one answer to "is this journal being fed", which replaced the
     # Dashboard's Collection card: see `collection_status`.
-    state["collection"] = collection_status(
-        state["scheduler"], configured=bool(query_id), demo=demo,
-        newest=statements_end, today=datetime.now(MARKET_TZ).date(),
-        scheduled=scheduled)
+    state["collection"] = _collection(state["scheduler"], statements_end,
+                                      query_id=query_id, demo=demo, scheduled=scheduled)
     return state
+
+
+def _collection(scheduler: dict[str, Any], newest: date | None, *, query_id: str | None,
+                demo: bool, scheduled: bool) -> dict[str, Any]:
+    """`collection_status` as both `/api/state` and `/api/pulse` call it."""
+    return collection_status(scheduler, configured=bool(query_id), demo=demo,
+                             newest=newest, today=datetime.now(MARKET_TZ).date(),
+                             scheduled=scheduled)
+
+
+def data_stamp(conn: sqlite3.Connection) -> str:
+    """What moves when something the page shows changed outside the page: the
+    newest run that wrote anything. Every way data arrives records one (the
+    scheduler, Sync, the CLI), and `ok` is the status that means it wrote:
+    `nothing` changed nothing, so it reloads nothing.
+
+    Never the heartbeat, which moves every minute and would reload an idle page
+    with it. A journal entry or a watchlist edit is made BY the page, which
+    reloads after its own writes.
+    """
+    row = conn.execute("SELECT MAX(id) FROM job_runs WHERE status = 'ok'").fetchone()
+    return str(row[0] or 0)
+
+
+def pulse_state(*, db_path: Path, archive_dir: Path, query_id: str | None, demo: bool,
+                scheduled: bool) -> dict[str, Any]:
+    """What an open page checks every minute (`GET /api/pulse`): `stamp`, to
+    reload when the data moved, and `collection`, which moves with the clock
+    alone (a sync failing overnight, a scheduler that stopped) and is cheap.
+
+    A full `/api/state` every minute would cost the whole payload and a redraw
+    for the few times a day anything changes.
+    """
+    with open_journal(db_path) as conn:
+        # As `build_state` does, so a run whose process died reads as such here
+        # too, rather than as `running` until the next full load.
+        interrupted_runs(conn, archive_dir=archive_dir)
+        stamp = data_stamp(conn)
+        scheduler = jobs_data(conn, now=datetime.now(UTC))
+        newest = newest_statement_end(conn)
+    return {"stamp": stamp, "collection": _collection(
+        scheduler, newest, query_id=query_id, demo=demo, scheduled=scheduled)}
 
 
 def _with_request_counts(
@@ -1340,6 +1387,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     # unit is.
                     scoring=scoring[0] if scoring else None,
                 ))
+            except sqlite3.OperationalError as exc:
+                self._json(500, {"error": f"database not readable: {exc}"})
+        elif path == "/api/pulse":
+            try:
+                self._json(200, pulse_state(
+                    db_path=self.cfg.db_path, archive_dir=self.cfg.archive_dir,
+                    query_id=self._effective_query_id(), demo=self.cfg.demo,
+                    scheduled=self.cfg.collector is not None))
             except sqlite3.OperationalError as exc:
                 self._json(500, {"error": f"database not readable: {exc}"})
         elif path == "/api/settings/token":

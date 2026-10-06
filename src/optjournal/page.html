@@ -203,6 +203,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
 /** @typedef {Object} State -- the /api/state payload (web.build_state)
  * @property {string} version
  * @property {string} generated_at
+ * @property {string} stamp -- moves when a run wrote data (web.data_stamp); the
+ *   page reloads when `/api/pulse` answers a different one
  * @property {boolean} dev -- developer-only surfaces on (settings.dev). Off
  *   unless OPTJOURNAL_DEV or the stored flag says so; the web API cannot set it
  * @property {boolean} [demo] set under `serve --demo`: the synthetic journal, which
@@ -855,6 +857,11 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   opening day as 1. Null exactly when `opened` is
  */
 
+/** @typedef {Object} Pulse -- GET /api/pulse (web.pulse_state), once a minute
+ * @property {string} stamp -- `State.stamp` as it is now
+ * @property {Collection} collection -- as on /api/state, read fresh
+ */
+
 /** @typedef {Object} SettingsWrite -- POST /api/settings (web._settings_write)
  * @property {boolean} ok
  * @property {string} kind
@@ -1447,7 +1454,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload ivr:IvRank ir:IvRank
  * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
  * @payload lb:Logbook hc:HistoryChunk ins:Install upd:UpdateCheck ures:UpdateReply
- * @payload cn:Collection sres:SettingsWrite
+ * @payload cn:Collection sres:SettingsWrite pl:Pulse
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite lkres:LinkWrite
  * @payload rv:JournalReview ty:Tally tt:TriggerTally zr2:OdteRefresh
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
@@ -4640,8 +4647,8 @@ function market(){
      nothing at all. Conflating any two is how a working calendar reads as
      broken -- which is what the old single message did. */
   const empty=(mk.total_events||0)===0
-    ? `<div class="empty">no events stored for this week —
-        <b>Refresh</b> above, or run <code>optjournal market --fetch</code></div>`
+    ? `<div class="empty">no events stored for this week yet. The daily calendar
+        job fetches them by itself, or press <b>Refresh</b> above.</div>`
     : evs.length===0
     ? `<div class="empty">no events match this filter.
         ${hidden} of ${mk.total_events||0} stored event(s) are hidden — widen a row
@@ -6033,13 +6040,19 @@ async function checkUpdate(){
   }catch(e){S.update=null;}
   /* The first load may still be in flight; it draws the banner when it lands. */
   if(!S.state) return;
-  /* The answer can arrive seconds after the page, by which time the reader may be
-     typing into a journal entry, and a banner landing above it moved the field
-     123px under the cursor. So whatever holds focus stays where it was on screen:
-     the page scrolls by exactly the height the banner added above it. */
+  await keepPlace(draw);
+}
+
+/* Redraw without moving what the reader is in. The update check answers seconds
+   after the page, by which time the reader may be typing into a journal entry,
+   and a banner landing above it moved the field 123px under the cursor. So
+   whatever holds focus stays where it was on screen: the page scrolls by exactly
+   the height the redraw added above it. Shared by every redraw the reader did
+   not ask for: the update banner, and the page following the server. */
+async function keepPlace(redraw){
   const was=document.activeElement, top=was&&was!==document.body
     ?was.getBoundingClientRect().top:null;
-  draw();
+  await redraw();
   const now=document.activeElement;
   if(top!==null&&now&&now!==document.body)
     window.scrollBy(0,now.getBoundingClientRect().top-top);
@@ -6103,8 +6116,51 @@ const COLLECT_FOLLOW_MS=20000;
 setInterval(()=>{
   if(S.state&&document.visibilityState==='visible'
      &&((S.state.collection||{}).state==='running'||Date.now()<(S.collectUntil||0)))
-    load();
+    keepPlace(load);
 },5000);
+
+/* THE PAGE FOLLOWS THE SERVER. Collection runs by itself, so the data moves while
+   the page sits open: a page left open overnight showed yesterday's trades after
+   the noon sync, and the dot kept the state it loaded with through a failure.
+   Every minute while visible, and on coming back to the tab, the page asks
+   `/api/pulse` (web.pulse_state). A moved `stamp` reloads everything; a changed
+   collection status alone redraws the dot and the banner.
+
+   NOT A REFRESH BUTTON PER TAB: one payload feeds every tab, so each button would
+   reload the same thing, and a button is something to remember to press. The
+   refreshes that stay are the outside feeds read on demand (quotes, the 0DTE
+   readings, the calendar). */
+const PULSE_MS=60000;
+async function pulse(){
+  if(!S.state||document.visibilityState!=='visible') return;
+  S.pulseAt=Date.now();
+  let pl;
+  try{
+    const r=await fetch('/api/pulse');
+    if(!r.ok) return;
+    pl=await r.json();
+  }catch(e){return;}  /* a missed pulse is the next minute's to make up */
+  if(!S.state) return;
+  if(pl.stamp!==S.state.stamp){await keepPlace(load);return;}
+  S.checkedAt=Date.now();
+  if(JSON.stringify(pl.collection)!==JSON.stringify(S.state.collection)){
+    S.state.collection=pl.collection;
+    await keepPlace(draw);
+  }else{
+    const fresh=$('#fresh'); if(fresh) fresh.textContent=freshNote();
+  }
+}
+/* Every 15 s, a pulse once a minute has passed: a hidden tab's timers are
+   throttled, and the first check after it is shown again is the one that counts. */
+setInterval(()=>{if(Date.now()-(S.pulseAt||0)>=PULSE_MS) pulse();},15000);
+document.addEventListener('visibilitychange',pulse);
+
+/* When the page last confirmed it shows what the server holds: a load, or a
+   pulse that found nothing new. */
+function freshNote(){
+  return 'checked '+new Date(S.checkedAt||Date.now())
+    .toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+}
 
 function settingsPanel(){
   const st=S.state, se=st.settings||{};
@@ -6120,8 +6176,7 @@ function settingsPanel(){
     : tok.present===true
       ? `<span class="pos">stored</span> <span class="dim">for ${esc(tok.account||'')}</span>`
       : tok.present===false
-        ? `<span class="neg">missing</span> <span class="dim">— run
-           <code>optjournal setup</code></span>`
+        ? `<span class="neg">missing</span> <span class="dim">(paste it below)</span>`
         : `<span class="neg">unreadable</span> <span class="dim">${esc(
            tok.message||'')}</span>`;
   return `<div class="card">
@@ -6749,7 +6804,8 @@ function draw(push){
      a signal rather than hiding it. Off for a friend, so the footer reads
      exactly as before. */
   $('#foot').innerHTML=`optjournal ${esc(st.version)} · ${esc(st.db)}`
-    +`${cn.through?` · statements through ${esc(cn.through)}`:''} · loopback only, `
+    +`${cn.through?` · statements through ${esc(cn.through)}`:''}`
+    +` · <span id="fresh">${esc(freshNote())}</span> · loopback only, `
     +`no authentication${st.dev?' · <b class="devtag">dev mode</b>':''}`;
   /* `st.sync||{}`, the same idiom as `(S.state.scheduler||{}).jobs` elsewhere, and
      it is load-bearing rather than defensive habit. This is the LAST thing draw()
@@ -7417,7 +7473,7 @@ async function load(){
      collection put "not checked" back under a token just stored. */
   const tok=S.state&&S.state.settings&&S.state.settings.token;
   if(tok&&st.settings&&st.settings.token==null) st.settings.token=tok;
-  S.state=st;
+  S.state=st; S.checkedAt=Date.now();
   staleServerCheck(S.state);
   /* Before the heal below, so a day in a month the account never had still heals
      to all time. */

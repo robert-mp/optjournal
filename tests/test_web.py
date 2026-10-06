@@ -395,6 +395,9 @@ _UNSAMPLED = frozenset({
     # `POST /api/settings`: a write's reply, never on `/api/state`, and its keys
     # are conditional too (`message` on a refusal, `collecting` on a saved id).
     "SettingsWrite",
+    # `GET /api/pulse`: its own endpoint, pinned against a real reply by
+    # `test_the_pulse_moves_only_when_a_run_wrote_something`.
+    "Pulse",
 })
 
 
@@ -7850,7 +7853,8 @@ def test_the_footer_marks_dev_mode_only_when_it_is_on():
     decides, so it cannot disagree with the flag the server resolved.
     """
     js = _code_only(_js())
-    foot = js[js.index("$('#foot')"):js.index("$('#foot')") + 260]
+    start = js.index("$('#foot')")
+    foot = js[start:js.index(";", js.index("no authentication", start))]
     assert "st.dev?" in foot and "dev mode" in foot, (
         "the footer does not render a dev marker off the payload's dev flag"
     )
@@ -7989,6 +7993,84 @@ def test_saving_the_query_id_starts_collecting_without_a_press_of_sync(
     assert (status, reply["collecting"]) == (200, with_scheduler)
     ran = [r[0] for r in conn.execute("SELECT job FROM job_runs ORDER BY id")]
     assert ran == (list(jobs.FIRST_COLLECTION) if with_scheduler else [])
+
+
+def test_the_pulse_moves_only_when_a_run_wrote_something(tmp_path, monkeypatch):
+    """The open page reloads when `/api/pulse` answers a different stamp than the
+    payload it holds, so the stamp must move when data arrived and only then. A
+    run that wrote (`ok`) moves it; an empty run, a failure and the heartbeat,
+    which beats every minute, do not, or an idle page would reload all day."""
+    from conftest import connect_migrated  # noqa: PLC0415 - local to this test
+
+    from optjournal import jobs  # noqa: PLC0415
+
+    monkeypatch.setenv("OPTJOURNAL_QUERY_ID", "1591754")
+    db = tmp_path / "j.db"
+    conn = connect_migrated(db)
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
+        def pulse() -> dict:
+            status, reply = _get(base, "/api/pulse")
+            assert status == 200, reply
+            return reply
+
+        first = pulse()
+        _status, state = _get(base, "/api/state")
+        assert first["stamp"] == state["stamp"], "a fresh page would reload at once"
+        assert first["collection"] == state["collection"]
+        assert set(first) == set(_parse_contract(_js())[0]["Pulse"]), first
+        jobs.heartbeat(conn)
+        jobs.record_run(conn, "market", status="nothing", detail="0 event(s)")
+        jobs.record_run(conn, "sync", status="failed",
+                        detail="FlexBusy (retried by itself): 1019")
+        conn.commit()
+        assert pulse()["stamp"] == first["stamp"], "nothing new, and the page reloaded"
+        jobs.record_run(conn, "bars_daily", status="ok", detail="12 bar(s)")
+        conn.commit()
+        assert pulse()["stamp"] != first["stamp"], "new bars, and the page kept the old"
+
+
+def _pulse(state: dict, reply: dict | None, *, visible: bool = True) -> dict:
+    """The page's own `pulse` against `reply` (None: the request failed), from a
+    page holding `state`. Reports what it did: reloaded, redrew, or neither."""
+    answer = ("throw new TypeError('Failed to fetch');" if reply is None
+              else f"return {{ok:true,json:async()=>({json.dumps(reply)})}};")
+    shown = "visible" if visible else "hidden"
+    return _node_run([
+        f"const S={{state:{json.dumps(state)}}}; let loads=0, draws=0;",
+        f"const document={{visibilityState:'{shown}',activeElement:null}};",
+        "const nodes={'#fresh':{textContent:''}}; const $=sel=>nodes[sel]||null;",
+        "async function load(){loads++;} function draw(){draws++;}",
+        f"const fetch=async()=>{{{answer}}};",
+        *_page_fns("keepPlace", "freshNote", "pulse"),
+        "await pulse();",
+        "console.log(JSON.stringify({loads,draws,collection:S.state.collection,",
+        "  fresh:nodes['#fresh'].textContent}));",
+    ])
+
+
+def test_the_open_page_follows_the_server_without_a_refresh_button():
+    """A page left open overnight showed yesterday's trades after the noon sync,
+    and its dot kept the state it loaded with through a failure. Now it asks
+    `/api/pulse` once a minute: a new stamp reloads, a new collection status alone
+    redraws the dot and banner, and nothing new only updates "checked"."""
+    ok = {"state": "ok", "message": "Up to date.", "fix": None, "through": "2026-10-05"}
+    behind = {**ok, "state": "behind", "message": "Statements end 2026-10-01."}
+    held = {"stamp": "7", "collection": ok}
+    assert _pulse(held, {"stamp": "8", "collection": ok})["loads"] == 1
+    same = _pulse(held, {"stamp": "7", "collection": ok})
+    assert (same["loads"], same["draws"]) == (0, 0) and same["fresh"].startswith("checked")
+    moved = _pulse(held, {"stamp": "7", "collection": behind})
+    assert (moved["loads"], moved["draws"]) == (0, 1)
+    assert moved["collection"]["state"] == "behind", moved
+    # A pulse that could not reach the server leaves the page as it is.
+    assert _pulse(held, None) == {"loads": 0, "draws": 0, "collection": ok, "fresh": ""}
+    # A hidden tab asks nothing: it catches up when it is shown again.
+    assert _pulse(held, {"stamp": "8", "collection": behind}, visible=False) == {
+        "loads": 0, "draws": 0, "collection": ok, "fresh": ""}
+    # Checked every minute while visible, and on coming back to the tab.
+    js = _code_only(_js())
+    assert "document.addEventListener('visibilitychange',pulse);" in js
+    assert "if(Date.now()-(S.pulseAt||0)>=PULSE_MS)pulse();" in js.replace(" ", "")
 
 
 def test_a_server_with_no_scheduler_reports_collection_off(tmp_path, monkeypatch):
@@ -10057,9 +10139,10 @@ def test_a_late_update_banner_leaves_the_focused_field_where_it_was():
     `checkUpdate` measures the focused element before its redraw and scrolls by
     exactly what moved it. Over the source, for the preserveInputs test's reason.
     """
-    fn = _fn("checkUpdate")
+    assert "await keepPlace(draw);" in _fn("checkUpdate")
+    fn = _fn("keepPlace")
     before = fn.index("getBoundingClientRect().top")
-    assert before < fn.index("draw();") < fn.index("window.scrollBy("), (
+    assert before < fn.index("await redraw();") < fn.index("window.scrollBy("), (
         "the focused field has to be measured before the redraw and put back after")
 
 
