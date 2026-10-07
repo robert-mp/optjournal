@@ -626,13 +626,13 @@ def test_every_fill_is_drawn_once_across_the_cards_and_once_on_the_calendar(conn
     assert sum(ev["fills"] for ev in events) == executions
     stats = month_stats(conn, None, asset_category="OPT", report=report)
     assert stats.total_trades == executions
-    # The Dashboard scores the round trips its money sums.
+    # The Dashboard scores the closed round trips.
     assert (stats.closed_episodes, stats.wins, stats.losses) == (
         len(report.closed),
         sum(e.realized_pnl_base > 0 for e in report.closed),
         sum(e.realized_pnl_base < 0 for e in report.closed))
-    # And that money is what the cards show: each card carries what its closed
-    # contracts realised, whether or not the position is still running.
+    # And the money is what the cards show: each card carries what IBKR booked
+    # on its fills, whether or not the position is still running.
     shown = [card["realized_pnl"]["base"] for card in cards if card["realized_pnl"]]
     assert stats.net_pnl.base == pytest.approx(sum(shown))
 
@@ -748,7 +748,7 @@ def test_a_position_opened_by_the_far_half_of_a_split_counts_that_fill(conn):
 
 #: A short put rolled out and then partly bought back, as `_MEETINGS` fills. The
 #: near contract closes in two fills three seconds apart, the real GOOG roll's
-#: shape: its episode closes on the second, inside the roll's leg.
+#: shape, and one of the two far puts the roll sold is bought back two days on.
 _ROLLED = [
     ("1", "1001", "2026-09-24 10:00:00", -2, 600.0, None, "O"),
     ("1", "1002", "2026-09-28 14:16:20", 1, -100.0, 100.0, "C"),
@@ -762,40 +762,62 @@ def _realised(money) -> float | None:
     return None if money is None else round(money["base"], 6)
 
 
-def test_an_open_card_carries_its_rolled_leg_and_not_a_partial_close(conn):
-    """The Calendar books the near leg's +195 the day the roll closes it, and the
-    card said nothing until the whole position was flat. Now the card and the roll
-    carry it, and the partial close carries nothing: its contract is still held,
-    so its +90 is not counted anywhere yet, though IBKR booked it on the fill."""
-    _report, _camps, _orders, (card,), _events = _ingest(conn, _ROLLED)
+def _shown(event) -> float | None:
+    """An event's realised figure as its card header shows it: only where the
+    event holds a closing leg."""
+    closes = any("C" in str(leg["open_close"] or "").upper()
+                 for order in event["orders"] for leg in order["legs"])
+    return _realised(event["realized_pnl"]) if closes else None
+
+
+def test_a_partial_close_counts_on_its_card_its_event_and_its_day(conn):
+    """IBKR booked +90 on buying back one of the two far puts, and the open card,
+    the event holding that fill and its Calendar day all carry it beside the
+    roll's +195. The scoreboard does not: the near contract is flat and won, and
+    the far one is still held, so its +90 is money and not yet an outcome."""
+    from optjournal.stats import month_stats
+
+    report, _camps, _orders, (card,), _events = _ingest(conn, _ROLLED)
     assert card["status"] == "open"
-    assert _realised(card["realized_pnl"]) == 195.0
-    assert [(e["label"], _realised(e["realized"])) for e in card["events"]] == [
-        ("Short put", None), ("Roll", 195.0), ("Short put close", None)]
-    assert _realised(card["events"][2]["realized_pnl"]) == 90.0
+    assert _realised(card["realized_pnl"]) == 285.0
+    assert [(e["label"], _shown(e)) for e in card["events"]] == [
+        ("Short put", None), ("Roll", 195.0), ("Short put close", 90.0)]
     assert "commission" not in card
+    september = month_stats(conn, "2026-09", report=report)
+    assert {d.day: _realised(d.realized.payload()) for d in september.days} == {
+        "2026-09-24": 0.0, "2026-09-28": 195.0, "2026-09-30": 90.0}
+    assert _realised(september.net_pnl.payload()) == 285.0
+    assert (september.closed_episodes, september.wins, september.losses) == (1, 1, 0)
+    assert _realised(september.open_premium.payload()) == 260.0, (
+        "the far contract's 350 of premium less the 90 already in net P&L")
+
+
+def test_a_round_trip_that_nets_zero_is_neither_a_win_nor_a_loss(conn):
+    from optjournal.stats import month_stats
+
+    report, *_ = _ingest(conn, [
+        ("1", "1001", "2026-09-24 10:00:00", -1, 300.0, None, "O"),
+        ("1", "1002", "2026-09-25 10:00:00", 1, -300.0, 0.0, "C"),
+    ])
+    s = month_stats(conn, "2026-09", report=report)
+    assert (s.closed_episodes, s.wins, s.losses) == (1, 0, 0)
 
 
 def test_a_decided_cards_realised_is_its_campaigns(conn):
     """Once every contract is closed the card's figure is `Campaign.realized`, the
-    one the Dashboard's scoreboard reads, to the last key."""
-    _report, (camp,), _orders, (card,), _events = _ingest(conn, _ROLLED + [
+    one the strategy ranking reads, to the last key. The far contract scores its
+    whole +170 as one win the day it goes flat, while its money stays on the two
+    days IBKR booked it."""
+    from optjournal.stats import month_stats
+
+    report, (camp,), _orders, (card,), _events = _ingest(conn, _ROLLED + [
         ("2", "1004", "2026-10-02 11:00:00", 1, -150.0, 80.0, "C")])
     assert card["status"] == "closed"
     assert card["realized_pnl"] == camp.realized.payload()
-    assert [_realised(e["realized"]) for e in card["events"]] == [
-        None, 195.0, None, 170.0]
-
-
-@pytest.mark.parametrize("fills", [*_MEETINGS.values(), _ROLLED], ids=[*_MEETINGS, "rolled"])
-def test_a_cards_events_add_up_to_the_card(conn, fills):
-    """Each closed contract sits on the one event holding its final closing fill,
-    so the events add up to the card through every way two positions meet."""
-    *_, cards, _events = _ingest(conn, fills)
-    for card in cards:
-        on_events = [e["realized"]["base"] for e in card["events"] if e["realized"]]
-        assert _realised(card["realized_pnl"]) == (
-            round(sum(on_events), 6) if on_events else None)
+    october = month_stats(conn, "2026-10", report=report)
+    assert _realised(october.net_pnl.payload()) == 80.0
+    assert (october.closed_episodes, october.wins, october.losses) == (1, 1, 0)
+    assert _realised(october.largest_win.payload()) == 170.0
 
 
 def _at_broker(conn, broker: str, fills) -> None:

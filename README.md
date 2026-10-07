@@ -177,11 +177,14 @@ contain any journal file.
 
 ## Wins and losses
 
-The scoreboard counts each closed contract round trip as one outcome. Those are
-the same round trips net P&L and commission are summed over. A round trip closed
-by two partial fills is one outcome, not two. Each leg of a strangle, and each
-leg of a roll, is its own win or loss in the month it closed, which is what a
-broker trade log shows, so the scoreboard reconciles against one directly.
+Net P&L and commission are what IBKR booked on each fill, on the fill's trade
+date, so every month reconciles with the statement and a partial close counts
+the day it fills. The scoreboard counts each closed contract round trip as one
+outcome, in the month of its last closing fill. A round trip closed by two
+partial fills is one outcome, not two, and a contract still held is no outcome
+yet. Each leg of a strangle, and each leg of a roll, is its own win or loss,
+which is what a broker trade log shows, so the scoreboard reconciles against one
+directly.
 
 The Trades tab groups those contracts into positions, so a roll or a multi-leg
 structure is one card there.

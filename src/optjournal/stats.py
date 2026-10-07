@@ -5,34 +5,25 @@ statement) and from `history` (which reconstructs position episodes). This
 module answers the calendar-shaped questions a journal dashboard asks: what
 happened in March, and what happened on the 14th.
 
-Two deliberate choices about what gets counted, because the obvious approach
-is wrong in both cases:
+Two deliberate choices about what gets counted:
 
-* **Options P&L counts only fully closed round trips, attributed to the day
-  the contract closed.** Summing IBKR's per-fill `fifo_pnl_realized_base` --
-  the previous rule, still used for other asset categories -- has two leaks
-  for options: a *partial* close books realised P&L while the position is
-  still open (sell 2, buy back 1: IBKR realises the 1-lot immediately), and
-  a close spanning two days scatters one outcome across both. Episode-based
-  P&L makes the money follow the same rule as the win/loss counts: nothing
-  counts until the contract is flat, and the whole outcome lands on the
-  close date. Premium collected on an open short is therefore never P&L --
-  it is a liability until the contract closes. A roll closes one contract,
-  so its P&L counts on the day of the roll.
+* **Money is what IBKR booked, on the day it booked it.** Realised P&L and
+  commission are each fill's `fifo_pnl_realized` and `ib_commission`, on the
+  fill's trade date, for every asset category. So a partial close counts the
+  day it fills (sell 6, buy back 2: IBKR realises the 2-lot then, and so does
+  every figure here), and a month's net P&L and commission reconcile with the
+  statement's own. Premium collected on a contract still held is not P&L: IBKR
+  realises none of it until a fill closes some of the contract.
 
-* **Win/loss counts closed contract round trips, the money's own unit.** A
-  round trip closed by two partial fills is one outcome, not two, so counting
-  fills would inflate both the trade count and the win rate. One unit for the
-  money and the count is what lets every figure on every tab agree: a roll's
-  closed contract is a decided outcome on the day its P&L lands, and a
-  strangle's two legs are two. Grouping contracts into positions is the Trades
-  tab's view (`campaigns.py`), and nothing here counts by it, so a Trades card
-  and the Dashboard can never disagree about a roll.
-
-Other asset categories keep the per-fill sum: IBKR's per-fill realised P&L
-is the correct realisation rule for share lots (each lot sold is realised,
-full stop), and "closed" for an open-ended stock holding is not the crisp
-event it is for an options round trip.
+* **Win/loss counts closed contract round trips.** A round trip closed by two
+  partial fills is one outcome, not two, so counting fills would inflate both
+  the trade count and the win rate. It is decided on the trade date of its
+  last closing fill, the day its last P&L is booked, so a win lands in the
+  month its money finishes landing. A partial close is money, not yet an
+  outcome. A roll's closed contract is decided on the day of the roll, and a
+  strangle's two legs are two outcomes. Grouping contracts into positions is
+  the Trades tab's view (`campaigns.py`), and nothing here counts by it, so a
+  Trades card and the Dashboard can never disagree about a roll.
 """
 
 from __future__ import annotations
@@ -286,9 +277,9 @@ def month_range(conn: sqlite3.Connection) -> list[str]:
 class DayPnl:
     day: str
     trades: int = 0
-    #: Realised P&L for the day. IBKR reports it natively per fill and per
-    #: episode with the currency it settled in, so a day whose trades all
-    #: settled in one currency has an exact figure, not only a translation.
+    #: Realised P&L IBKR booked on the day's fills. It reports it natively per
+    #: fill with the currency it settled in, so a day whose trades all settled
+    #: in one currency has an exact figure, not only a translation.
     realized: Money = Money.restated(0.0)
 
     @property
@@ -308,17 +299,17 @@ class MonthStats:
 
     total_trades: int = 0          #: fills
     orders: int = 0
-    #: Realised, already net of commission. IBKR reports each episode's P&L in
-    #: the currency it settled in, so the dollars that actually moved are known
-    #: -- `.base` is the translation, `.native` the exact figure where one
-    #: currency accounts for the whole period.
+    #: Realised P&L IBKR booked on the period's fills, already net of
+    #: commission. IBKR reports each fill's P&L in the currency it settled in,
+    #: so the dollars that actually moved are known. `.base` is the
+    #: translation, `.native` the exact figure where one currency accounts for
+    #: the whole period.
     net_pnl: Money = Money.restated(0.0)
-    #: For options, the commission of round trips *closed in the period* --
-    #: the same attribution as the P&L, wins and trade count, because IBKR's
-    #: episode P&L is already net of every leg's commission. Summing by fill
-    #: date (the old rule, still used for other categories) showed the same
-    #: euros twice across months: July displayed the opening legs' commission,
-    #: and August's net P&L contained it again. Signed, like the fill sum was.
+    #: Commission IBKR billed on the period's fills, signed, on each fill's
+    #: trade date. A closing fill's realised P&L already nets the opening fill's
+    #: commission, so a month that opens a position bills it here and the
+    #: month that closes it nets it again in `net_pnl`. That is what the
+    #: statement shows, month by month.
     #:
     #: `.base` is an accounting translation: each row converted at IBKR's own
     #: rate for ITS OWN date. Displaying that sum in a non-base currency
@@ -336,8 +327,10 @@ class MonthStats:
     #: same charges.
     fees: Money = Money.restated(0.0)
 
-    #: Episode-derived, so a two-fill close counts once. Still the MONEY's unit:
-    #: `net_pnl` and `commissions` are attributed by the episode's close date.
+    #: Episode-derived, so a two-fill close counts once, in the period holding
+    #: the trade date of its last closing fill. The scoreboard's unit, not the
+    #: money's: a partial close books P&L in `net_pnl` while its contract stays
+    #: open, and adds nothing here until the contract is flat.
     closed_episodes: int = 0
     open_episodes: int = 0
     #: Of `closed_episodes`, those that netted up and those that netted down.
@@ -368,21 +361,11 @@ class MonthStats:
     #: premium was collected, negative for long debits. Point-in-time like
     #: `open_episodes`, not a period figure. Reported so the money excluded
     #: from Net P&L is visible somewhere honest -- collected premium is a
-    #: liability until the position closes, not profit. Premium is cash in the
-    #: contract's own currency, so it takes the same native treatment as
-    #: commission.
+    #: liability until the position closes, not profit. A partial close has
+    #: already put its share in Net P&L, so that share is taken back out here
+    #: and no cash is in both. Premium is cash in the contract's own currency,
+    #: so it takes the same native treatment as commission.
     open_premium: Money = Money.restated(0.0)
-
-    #: Commission already paid on *currently open* episodes. Point-in-time,
-    #: like `open_premium`, and excluded from `commissions` for the same reason
-    #: the premium is excluded from P&L: it belongs to an outcome that has not
-    #: landed yet. Surfaced so the cash is visible somewhere honest rather than
-    #: vanishing until the close month.
-    #:
-    #: A separate figure from `commissions` because the populations differ:
-    #: one is closed round trips, the other still-open ones, and a scope can
-    #: easily be single-currency in one and mixed in the other.
-    open_commission: Money = Money.restated(0.0)
 
     #: Net Asset Value at the period's end, from the newest equity summary on
     #: or before it. None when the Flex query template does not have the
@@ -787,34 +770,21 @@ def cohort_data(c: Cohort) -> dict[str, Any]:
     }
 
 
-#: The category whose P&L is episode-based. Exactly "OPT": for anything else
-#: -- including the mixed `asset_category=None` -- the per-fill rule stands,
-#: which is what "preserve existing behaviour for other asset types" means.
-_EPISODE_PNL_CATEGORY = "OPT"
-
 def daily_series(
     conn: sqlite3.Connection,
     period: str | None = None,
     asset_category: str | None = "OPT",
     scope: TradeScope = ALL_TRADES,
-    report: Any = None,
 ) -> list[DayPnl]:
     """Realised P&L and fill count per calendar day, ascending.
 
-    `period` is a year or a month; see `_in_period`. Fill counts always land
-    on the fill's own day -- they measure activity. Where the *money* lands
-    depends on the category: options P&L is attributed to the day the round
-    trip closed (see the module docstring), so a day with only opening or
-    partial-close fills shows activity and no P&L. Other categories keep
-    IBKR's per-fill realisation on the fill's day.
+    `period` is a year or a month; see `_in_period`. Both land on the fill's
+    trade date, the day IBKR books its P&L (see the module docstring), so a
+    day holding only opening fills shows activity and no P&L.
     """
-    episode_pnl = asset_category == _EPISODE_PNL_CATEGORY
     where, params = _category_where(asset_category)
-
-    # Counts and P&L rows accumulate separately because a `Money` is frozen:
-    # the figure is built once per day, from every row that contributed, rather
-    # than advanced in place with its currency tracked somewhere else.
-    counts: dict[str, int] = {}
+    # Rows rather than running totals because a `Money` is frozen: each day's
+    # figure is built once, from every fill that contributed.
     ledger: dict[str, list[tuple[float | None, float | None, str | None]]] = {}
     for row in conn.execute(
         f"SELECT trade_date, trade_id, fifo_pnl_realized_base, fifo_pnl_realized,"
@@ -825,29 +795,12 @@ def daily_series(
             continue
         if not scope.has_trade(row["trade_id"]):
             continue
-        counts[day] = counts.get(day, 0) + 1
-        if not episode_pnl:
-            ledger.setdefault(day, []).append(
-                (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"],
-                 row["currency"])
-            )
-
-    if episode_pnl:
-        if report is None:
-            report = build_history(conn, asset_category=asset_category)
-        for ep in report.closed:
-            day = _day_of(ep.closed_at)
-            if day is None or not _in_period(ep.closed_at, period):
-                continue
-            if not scope.has_episode(ep):
-                continue
-            ledger.setdefault(day, []).append(
-                (ep.realized_pnl_base, ep.realized_pnl, ep.currency)
-            )
+        ledger.setdefault(day, []).append(
+            (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"], row["currency"])
+        )
     return [
-        DayPnl(day=day, trades=counts.get(day, 0),
-               realized=Money.charged(ledger.get(day, ())))
-        for day in sorted(set(counts) | set(ledger))
+        DayPnl(day=day, trades=len(rows), realized=Money.charged(rows))
+        for day, rows in sorted(ledger.items())
     ]
 
 
@@ -916,7 +869,6 @@ def month_stats(
 
     where, params = _category_where(asset_category)
 
-    episode_pnl = asset_category == _EPISODE_PNL_CATEGORY
     orders: set[str] = set()
     #: Rows, not running totals, so this reads like the fourteen other figures in
     #: this module rather than being the one place that still hand-rolls the
@@ -938,19 +890,13 @@ def month_stats(
         stats.total_trades += 1
         if row["ib_order_id"]:
             orders.add(str(row["ib_order_id"]))
-        if not episode_pnl:
-            # Per-fill realisation: the rule for share lots, where each lot
-            # sold is realised and "fully closed" is not a crisp event.
-            # Commission rides the same basis: on the fill's day, because
-            # that is also where the P&L it nets against is attributed.
-            fill_pnl.append((row["fifo_pnl_realized_base"],
-                             row["fifo_pnl_realized"], row["currency"]))
-            fill_commission.append((row["ib_commission_base"],
-                                    row["ib_commission"], row["currency"]))
+        fill_pnl.append((row["fifo_pnl_realized_base"],
+                         row["fifo_pnl_realized"], row["currency"]))
+        fill_commission.append((row["ib_commission_base"],
+                                row["ib_commission"], row["currency"]))
     stats.orders = len(orders)
-    if not episode_pnl:
-        stats.commissions = Money.charged(fill_commission)
-        stats.net_pnl = Money.charged(fill_pnl)
+    stats.commissions = Money.charged(fill_commission)
+    stats.net_pnl = Money.charged(fill_pnl)
 
     # Fees are account-level CashTransaction rows, never trade-linked -- verified
     # against real data, where none of the 65 fee rows carries a conid or tradeID.
@@ -976,14 +922,12 @@ def month_stats(
     # 2026 one. Attributing by entry instead would make the annual rows stop
     # summing to the monthly ones.
     #
-    # By the SAME clock as the category's money, so an outcome lands in the month
-    # its P&L does. Options money is the episode's, on its ET close stamp. The
-    # per-fill categories book money on IBKR's trade date, so their outcomes take
-    # the closing fill's trade date: a Korean sale at 20:03 ET on 31 August is a
-    # 1 September trade, and on the ET stamp its win landed in August with its
-    # P&L in September.
+    # By the money's clock, IBKR's trade date, so an outcome lands in the month
+    # its last P&L does: a Korean sale at 20:03 ET on 31 August is a 1 September
+    # trade, and on the ET stamp its win landed in August with its P&L in
+    # September.
     def close_of(e: Any) -> str | None:
-        return e.closed_at if episode_pnl else (e.closed_on or e.closed_at)
+        return e.closed_on or e.closed_at
 
     closed = [
         e for e in report.closed
@@ -991,39 +935,13 @@ def month_stats(
     ]
     stats.closed_episodes = len(closed)
     stats.open_episodes = sum(1 for e in report.open if scope.has_episode(e))
-    if episode_pnl:
-        # The whole outcome of a fully closed round trip, landing on its close
-        # date. An open episode contributes nothing -- including any realised
-        # P&L IBKR booked on a *partial* close, and any premium collected on
-        # the opening sale. Those count on the day the position goes flat.
-        stats.net_pnl = Money.charged(
-            (e.realized_pnl_base, e.realized_pnl, e.currency) for e in closed
-        )
-        # Commission follows the trade, not the fill: the round trip's whole
-        # commission -- opening legs included -- lands in the close period,
-        # because the net P&L above already contains it. A month that merely
-        # opened a position shows no commission, exactly as it shows no trade.
-        #
-        # Episodes carry the base amount, the native amount AND the currency it
-        # was charged in, so the exact figure needs no extra query -- only the
-        # check that one currency speaks for the whole round-trip set, which is
-        # what `Money.charged` does in the same pass as the sum.
-        stats.commissions = Money.charged(
-            (e.commission_base, e.commission, e.currency) for e in closed
-        )
-        stats.open_commission = Money.charged(
-            (e.commission_base, e.commission, e.currency)
-            for e in report.open if scope.has_episode(e)
-        )
     # Premium is cash received or paid in the contract's own currency, so it
     # takes the same treatment as commission: exact when one currency accounts
     # for the whole figure, withheld when they are mixed.
     stats.open_premium = Money.charged(
-        (e.proceeds_base, e.proceeds, e.currency)
+        (e.proceeds_base - e.realized_pnl_base, e.proceeds - e.realized_pnl, e.currency)
         for e in report.open if scope.has_episode(e)
     )
-    # The scoreboard counts the same closed round trips the money above sums,
-    # so a win always lands in the month its P&L does.
     won = [e for e in closed if e.realized_pnl_base > 0]
     lost = [e for e in closed if e.realized_pnl_base < 0]
     stats.wins, stats.losses = len(won), len(lost)
@@ -1049,7 +967,7 @@ def month_stats(
     )
     stats.net_liq_base, stats.net_liq_date = _net_liq_for(conn, period)
 
-    stats.days = daily_series(conn, period, asset_category, scope, report=report)
+    stats.days = daily_series(conn, period, asset_category, scope)
     return stats
 
 
@@ -1082,7 +1000,6 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "largest_win": None if stats.largest_win is None else stats.largest_win.payload(),
         "largest_loss": None if stats.largest_loss is None else stats.largest_loss.payload(),
         "open_premium": stats.open_premium.payload(),
-        "open_commission": stats.open_commission.payload(),
         "net_liq_base": stats.net_liq_base,
         "net_liq_date": stats.net_liq_date,
         "gain_pct_of_net_liq": stats.gain_pct_of_net_liq,

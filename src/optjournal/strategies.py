@@ -304,41 +304,6 @@ def campaign_events(
             _campaign_events(orders, campaign_list, divide=False)]
 
 
-def _realized(episodes: list[Any]) -> Row | None:
-    """What these episodes realised, gated across their currencies, or None for
-    none. `campaigns.link` sums a decided campaign's with the same call."""
-    if not episodes:
-        return None
-    return Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in episodes
-    ).payload()
-
-
-def _closed_by_event(events: list[Row], closed: list[Any]) -> list[list[Any]]:
-    """The closed episodes each event finished, by the event's position.
-
-    An episode belongs to the event holding its final closing fill: a leg on its
-    contract, account and broker whose fills span its `closed_at`. Both are ET
-    stamps in one format, so they compare as text. The first such event takes
-    it, and an episode no event holds is on none.
-    """
-    out: list[list[Any]] = [[] for _ in events]
-    for episode in closed:
-        at = str(episode.closed_at or "")
-        mine = (str(episode.broker), str(episode.account_id), str(episode.conid))
-        for position, event in enumerate(events):
-            if at and any(
-                (str(leg.get("broker") or ""), str(leg.get("account_id") or ""),
-                 str(leg.get("conid") or "")) == mine
-                and str(leg.get("first_fill_at") or "") <= at
-                <= str(leg.get("last_fill_at") or "")
-                for order in event.get("orders", ()) for leg in order.get("legs", ())
-            ):
-                out[position].append(episode)
-                break
-    return out
-
-
 def position_groups(
     orders: list[Row],
     *,
@@ -362,8 +327,8 @@ def position_groups(
       lifecycle rather than reviving the old card.
     * A roll shares an episode with the old lifecycle AND opens a new one --
       the union links the whole chain into one campaign card. That is the
-      intended reading of a roll: one continuing decision, with each episode's
-      P&L still landing in its own close month underneath.
+      intended reading of a roll: one continuing decision, with each fill's
+      P&L still landing on its own trade date underneath.
 
     Events whose orders map to no episode (nothing but snapshots, or an
     unmatched category) stay as singleton lifecycles.
@@ -375,12 +340,12 @@ def position_groups(
     no total adds cards' fills up, and the ones that count executions across
     cards (the Dashboard's, the Calendar's) count each once.
 
-    Realised P&L is counted per CONTRACT, the money rule in `stats.py`: a card
-    carries what its closed episodes realised, so a roll's closed leg shows on
-    the open card the day the Calendar books it, and each event carries the
-    episodes it closed (`_closed_by_event`). A contract still held adds nothing,
-    not even what IBKR booked on a partial close, since the Calendar does not
-    count that either. On a decided card this is `Campaign.realized`.
+    Realised P&L is what IBKR booked on the card's fills, the money rule in
+    `stats.py`, so a partial close or a roll's closed leg shows on the open card
+    the day the Calendar books it, and on the event that holds the fill (each
+    event's own `realized_pnl`). None while no leg has closed anything. On a
+    decided card it equals `Campaign.realized`: the same fills, summed per
+    contract.
     """
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own
@@ -401,8 +366,9 @@ def position_groups(
         opening = members[0]
         camp = campaign_list[index] if linked else None
         eps = [episodes[i] for i in camp.episode_indices] if camp else []
-        closed = [e for e in eps if e.is_closed]
-        closed_by = _closed_by_event(members, closed)
+        # Down to the same leaf rows again, through every event's orders.
+        legs = [lg for ev in members for o in ev.get("orders", ())
+                for lg in o.get("legs", ())]
         out.append({
             "underlying": opening.get("underlying"),
             # The shape it was OPENED as names the position; later events
@@ -424,18 +390,13 @@ def position_groups(
             "links": [list(pair) for pair in camp.links] if camp else [],
             "episodes": len(eps),
             "fills": sum(e.get("fills") or 0 for e in members),
-            # Down to the same leaf rows again, through every event's orders.
-            "proceeds": Money.from_rows(
-                (lg for ev in members for o in ev.get("orders", ())
-                 for lg in o.get("legs", ())),
-                "proceeds",
-            ).payload(),
-            # Episode-sourced, so it is the Dashboard's figure for the same
-            # contracts. Episodes carry the native and the currency, so it is
-            # exact wherever one currency closed them all.
-            "realized_pnl": _realized(closed),
-            "events": [{**event, "realized": _realized(closed_by[position])}
-                       for position, event in enumerate(members)],
+            "proceeds": Money.from_rows(legs, "proceeds").payload(),
+            "realized_pnl": (
+                Money.from_rows(legs, "realized_pnl").payload()
+                if any("C" in str(lg.get("open_close") or "").upper() for lg in legs)
+                else None
+            ),
+            "events": members,
         })
     out.sort(key=lambda p: str(p["opened_at"] or ""), reverse=True)
     return out

@@ -77,8 +77,8 @@ expected-move band, the per-bar P&L on the scorecard, and the effective-delta
 series — each labelled as modelled, on a panel whose caption says so. `stats.py`,
 `analysis.py` and `serialize.py` never import it, so no headline number, no
 calendar day and no annual row can be traced back to a model. The journal's
-credibility rests on that separation: "nothing counts until the position is
-flat" is worth little if a modelled figure can reach the same card.
+credibility rests on that separation: "every figure is what IBKR booked" is
+worth little if a modelled figure can reach the same card.
 
 **The allowlist names a module that exists for pricing.** This layer lived in
 `bars.py` while that module owned both the modelled series and the manifest, the
@@ -365,24 +365,24 @@ Four invariants worth knowing before changing the UI:
   every selection, in their own block, labelled as attributable to nothing.
   Hiding them under a narrow scope would make a tab captioned "broker cost"
   quietly measure less than it claims.
-* **Options P&L counts fully closed round trips only, attributed to the
-  close date.** A partial close (sold 3, bought back 1) contributes
-  nothing until the position is flat, and premium collected on an open
-  short is a liability, not profit — it is shown separately as "open
-  premium". Other asset categories keep IBKR's per-fill realisation.
-  `Gain % of Net Liq` divides that P&L by the NAV from the statement's
+* **P&L and commission are what IBKR booked on each fill, on its trade
+  date, for every asset category.** A partial close (sold 3, bought back 1)
+  counts the day it fills, and every month's net P&L and commission
+  reconcile with the statement. Premium collected on a contract still held
+  is not profit until a fill closes it, and is shown separately as "open
+  premium". `Gain % of Net Liq` divides that P&L by the NAV from the statement's
   Equity Summary section (enable it on the Flex query template; the demo
   carries synthetic NAV rows).
-* **The money and the scoreboard count one unit, the contract round trip.**
-  Three counts, narrowing: `fills` are executions, `closed` are contract
-  round trips (an *episode*, and what net P&L is attributed by), and W, L,
-  win rate and the averages score those same round trips. A round trip closed
-  by two partial fills is one outcome, not two. A roll closes one contract and
-  opens the next, so the closed contract is a decided outcome on the day its
-  P&L lands, and a strangle's two legs are two outcomes, which is what a broker
-  trade log shows. Measured on the demo: 9 closed, 7W / 2L, 77.8%, net P&L
-  3695.08. One unit is what lets every scoreboard figure land in the month its
-  money does.
+* **The scoreboard counts one unit, the contract round trip.** Three counts,
+  narrowing: `fills` are executions, `closed` are contract round trips (an
+  *episode*, dated by the trade date of its last closing fill), and W, L, win
+  rate and the averages score those same round trips. A round trip closed by
+  two partial fills is one outcome, not two, and a partial close is money but
+  not yet an outcome. A roll closes one contract and opens the next, so the
+  closed contract is a decided outcome on the day of the roll, and a
+  strangle's two legs are two outcomes, which is what a broker trade log
+  shows. Measured on the demo: 9 closed, 7W / 2L, 77.8%, net P&L 4054.25, of
+  which 359.18 is the partial close on a contract still held.
 
   Grouping contracts into positions (a *campaign*) is the Trades tab's view,
   and `campaigns.py` owns it. The scoreboard does not count by it. The Best

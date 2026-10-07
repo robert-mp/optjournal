@@ -823,15 +823,22 @@ def test_a_fill_free_month_is_an_honest_zero_not_all_time(populated):
 
 
 def test_a_trade_counts_only_in_the_month_it_closed(populated):
-    """A round trip opened in one month and closed in the next belongs -- as a
-    trade, a win/loss and P&L -- to the close month alone. The open month gets
-    fills (activity) but no outcome. Verified against a real spanning episode
-    rather than asserted in the abstract, with an independent recount as the
-    oracle so other episodes in either month cannot mask a leak.
+    """A round trip opened in one month and closed in the next belongs, as a
+    trade and a win or loss, to the close month alone. The open month gets fills
+    (activity) and what IBKR booked on them, but no outcome. Verified against a
+    real spanning episode rather than asserted in the abstract, with an
+    independent recount as the oracle so other episodes in either month cannot
+    mask a leak.
     """
     conn = connect(populated)
     try:
         report = build_history(conn, asset_category="OPT")
+        booked = {
+            row[0]: (row[1], row[2]) for row in conn.execute(
+                "SELECT substr(trade_date, 1, 7), SUM(fifo_pnl_realized_base),"
+                " SUM(ib_commission_base) FROM trades WHERE asset_category = 'OPT'"
+                " GROUP BY 1")
+        }
     finally:
         conn.close()
     spanning = [
@@ -856,41 +863,28 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
     # The open month has the fills but only the outcomes that closed IN it.
     assert opened["total_trades"] > 0, "the opening fills are that month's activity"
     assert opened["closed_episodes"] == len(closed_in(open_month))
-    assert opened["net_pnl"]["base"] == pytest.approx(
-        sum(e.realized_pnl_base for e in closed_in(open_month))
-    ), "the spanning episode's outcome must not leak into the month that opened it"
-    # The scoreboard scores those same round trips, so a win lands in the month
-    # its P&L does.
     assert (opened["wins"], opened["losses"]) == (
         sum(e.realized_pnl_base > 0 for e in closed_in(open_month)),
         sum(e.realized_pnl_base < 0 for e in closed_in(open_month)))
-    # Commission rides the same rule: IBKR's episode P&L is already net of
-    # every leg's commission, so fill-date commission showed the same euros
-    # twice -- once in the open month's card, again inside the close month's
-    # net P&L. The open month reports only commission of trades closed in it.
-    assert opened["commissions"]["base"] == pytest.approx(
-        sum(e.commission_base for e in closed_in(open_month))
-    )
+    # The money is what IBKR booked on each month's own fills: the opening fills'
+    # commission in the month that opened it, the buyback's P&L in the month
+    # that closed it.
+    for stats, month in ((opened, open_month), (closed, close_month)):
+        assert (stats["net_pnl"]["base"], stats["commissions"]["base"]) == (
+            pytest.approx(booked[month][0]), pytest.approx(booked[month][1])), month
 
     # The close month carries the outcome, spanning episode included.
     assert closed["closed_episodes"] == len(closed_in(close_month)) >= 1
-    assert closed["net_pnl"]["base"] == pytest.approx(
-        sum(e.realized_pnl_base for e in closed_in(close_month))
-    )
-    # ... and the round trip's WHOLE commission, opening legs included.
-    assert closed["commissions"]["base"] == pytest.approx(
-        sum(e.commission_base for e in closed_in(close_month))
-    )
 
 
-def test_options_commission_reconciles_and_open_commission_is_separate(populated):
-    """Monthly commissions must sum to the closed-episodes total, with the
-    commission of still-open positions reported separately -- excluded for the
-    same reason open premium is excluded from P&L, visible for the same reason
-    the premium is: real cash, no outcome yet."""
+def test_options_commission_reconciles_with_the_fills(populated):
+    """Monthly commissions sum to the all-time figure, and that is every option
+    fill's commission, still-open positions' opening fills included."""
     conn = connect(populated)
     try:
-        report = build_history(conn, asset_category="OPT")
+        billed = conn.execute(
+            "SELECT SUM(ib_commission_base) FROM trades WHERE asset_category = 'OPT'"
+        ).fetchone()[0]
     finally:
         conn.close()
     everything = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
@@ -900,15 +894,8 @@ def test_options_commission_reconciles_and_open_commission_is_separate(populated
         )["stats"]["commissions"]["base"]
         for m in everything["month_range"]
     )
-    closed_total = sum(e.commission_base for e in report.closed)
-    assert monthly_sum == pytest.approx(closed_total)
-    assert everything["stats"]["commissions"]["base"] == pytest.approx(closed_total)
-    open_total = sum(e.commission_base for e in report.open)
-    assert everything["stats"]["open_commission"]["base"] == pytest.approx(open_total)
-    if open_total:  # strictness: real data currently has open META shorts
-        assert everything["stats"]["commissions"]["base"] != pytest.approx(
-            closed_total + open_total
-        ), "open commission must not be folded into the headline figure"
+    assert monthly_sum == pytest.approx(billed)
+    assert everything["all_time"]["commissions"]["base"] == pytest.approx(billed)
 
 
 def test_calendar_day_drilldown_is_wired():
@@ -998,18 +985,13 @@ def test_a_lifecycle_spans_open_and_close_and_matches_the_dashboard(populated):
     assert lc["opened_at"][:10] == ep.opened_at[:10]
     assert lc["closed_at"][:10] == ep.closed_at[:10]
     assert lc["realized_pnl"]["base"] == pytest.approx(ep.realized_pnl_base)
-    # An open lifecycle keeps the Dashboard's rule too: each contract counts once
-    # it is flat, so the open cards carry what closed inside positions still held.
-    conn = connect(populated)
-    try:
-        camps = campaigns_for(conn, "OPT", report.episodes)
-    finally:
-        conn.close()
-    running = sum(report.episodes[i].realized_pnl_base
-                  for c in camps if not c.is_decided
-                  for i in c.episode_indices if report.episodes[i].is_closed)
+    # Every card keeps the Dashboard's rule, open ones too: each carries what
+    # IBKR booked on its fills, a partial close included, so the cards add up to
+    # the all-time Net P&L.
+    assert any(x["status"] == "open" and x["realized_pnl"] for x in st["lifecycles"]), (
+        "precondition: an open card has booked P&L")
     assert sum(x["realized_pnl"]["base"] for x in st["lifecycles"]
-               if x["status"] == "open" and x["realized_pnl"]) == pytest.approx(running)
+               if x["realized_pnl"]) == pytest.approx(st["all_time"]["net_pnl"]["base"])
 
 
 def test_dashboard_headline_counts_closed_round_trips_for_options():
@@ -3777,18 +3759,11 @@ def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
     assert "money(Math.abs(nat),ccy):cash(Math.abs(base))" in js
     assert "cash(Math.abs(nat)" not in js
 
-    # BOTH commission figures route through the one rule. They share a sentence
-    # on the card -- "as charged - $2.83 on open positions" -- so one being a
-    # restatement while the other is a charge would be a contradiction in a
-    # single line of prose.
     # One entry point now, not a wrapper per figure: `moneyOf` applies the rule
     # to any Money-shaped key, so a new gated figure needs no new helper and
     # cannot arrive with a subtly different rule of its own.
     assert "constchargeMo=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);" in js
-    card = _fn("dashboard").replace(" ", "").replace("\n", "")
-    assert "chargeMo(s.commissions)" in card and "chargeMo(s.open_commission)" in card
-    assert "cash(Math.abs(s.open_commission.base))" not in card, \
-        "the open-positions figure bypasses the shared rule"
+    assert "chargeMo(s.commissions)" in _fn("dashboard").replace(" ", "").replace("\n", "")
 
 
 def test_net_pnl_is_shown_as_realised_not_restated(state):

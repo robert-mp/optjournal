@@ -217,9 +217,12 @@ def test_profit_factor_and_average_outcome_reconcile_with_the_averages(conn):
     won, lost = s.avg_win.base * s.wins, s.avg_loss.base * s.losses
     assert s.profit_factor == pytest.approx(won / -lost)
     assert s.avg_pnl.base == pytest.approx((won + lost) / s.closed_episodes)
-    # Every closed round trip is a decided outcome, so the mean is also Net P&L
-    # over the count.
-    assert s.avg_pnl.base == pytest.approx(s.net_pnl.base / s.closed_episodes)
+    # Net P&L also holds what IBKR booked on a contract still held (the demo's
+    # partial close), which no outcome counts yet. Without it, Net P&L is the
+    # closed round trips' P&L, so the mean is that over their count.
+    held = sum(e.realized_pnl_base for e in build_history(conn, asset_category="OPT").open)
+    assert held, "the demo's partial close books P&L on a contract still held"
+    assert s.avg_pnl.base == pytest.approx((s.net_pnl.base - held) / s.closed_episodes)
 
 
 def test_a_month_with_wins_and_no_losses_has_no_profit_factor(conn):
@@ -243,18 +246,24 @@ def test_the_scoreboard_counts_each_contract_round_trip(conn):
     outcomes, 7 wins and 2 losses (77.8%): each leg of the roll and each leg of
     the vertical is its own outcome, which is what a broker trade log shows.
 
-    The money is the same money the Trades tab groups into positions. Every demo
-    position finishes, so the decided positions account for all of it.
+    The money is the same money the Trades tab draws: the cards' realised
+    figures add up to Net P&L, the open card's partial close included, and every
+    contract's commission is in the total, the open ones' too.
     """
+    from optjournal.serialize import orders_data
+    from optjournal.strategies import position_groups
+
     s = month_stats(conn, None)
     assert (s.closed_episodes, s.wins, s.losses) == (9, 7, 2)
     assert s.win_rate == pytest.approx(77.777, abs=1e-2)
 
     report = build_history(conn, asset_category="OPT")
-    decided = [c for c in campaigns_for(conn, "OPT", report.episodes) if c.is_decided]
-    assert s.net_pnl.base == pytest.approx(sum(c.realized.base for c in decided))
+    cards = position_groups(orders_data(conn), episodes=report.episodes,
+                            campaign_list=campaigns_for(conn, "OPT", report.episodes))
+    assert s.net_pnl.base == pytest.approx(
+        sum(c["realized_pnl"]["base"] for c in cards if c["realized_pnl"]))
     assert s.commissions.base == pytest.approx(
-        sum(report.episodes[i].commission_base for c in decided for i in c.episode_indices))
+        sum(e.commission_base for e in report.episodes))
 
 
 def test_a_rolled_contract_scores_in_the_month_its_cash_lands(conn):
@@ -320,8 +329,8 @@ def test_has_a_zero_day_round_trip(conn):
 
 def test_leaves_positions_open_including_one_without_fills(conn):
     """All three open-position paths: reconstructed from fills, snapshot-only,
-    and partially closed -- the one whose booked P&L must stay out of the
-    totals until the position is flat."""
+    and partially closed (the one whose booked P&L counts while its contract is
+    still held, and whose outcome waits until it is flat)."""
     open_eps = build_history(conn).open
     assert len(open_eps) == 3
     assert any(e.snapshot_only for e in open_eps), "no snapshot-only position"
@@ -667,48 +676,54 @@ def test_the_scope_reaches_the_payload_end_to_end(demo, tmp_path):
     assert scoped["all_time"]["total_trades"] < everything["all_time"]["total_trades"]
 
 
-# ------------------------------------------------- closed-trades-only P&L
+# ------------------------------------------------------------- per-fill P&L
 
 
-def test_a_partial_close_contributes_nothing_until_the_position_is_flat(conn):
-    """The case that separates episode P&L from summing per-fill realisation.
+def test_every_month_reconciles_with_the_statement(conn):
+    """Net P&L and commission are what IBKR booked, month by month: the sums of
+    the statement's own `fifo_pnl_realized_base` and `ib_commission_base` over
+    the month's option fills. Every month in range, the empty ones included, so a
+    figure that moved a fill's money into another month fails both."""
+    from optjournal.stats import month_range
 
-    The demo sells 3 puts and buys back 1: IBKR books realised P&L on that
-    fill immediately, but the position is not flat, so a "fully closed trades
-    only" Net P&L must exclude it. The strictness assertion first proves the
-    data really contains the disagreement -- without it, this test would pass
-    on any archive where every close is total, i.e. on data that cannot tell
-    the two rules apart.
-    """
-    booked = conn.execute(
-        "SELECT SUM(COALESCE(fifo_pnl_realized_base, 0)) AS s FROM trades"
-        " WHERE asset_category = 'OPT'"
-    ).fetchone()["s"]
-    stats = month_stats(conn, None)
-    assert booked > stats.net_pnl.base, (
-        "precondition: a partial close must have booked per-fill P&L that the"
-        " episode rule excludes"
-    )
-    report = build_history(conn)
-    assert stats.net_pnl.base == pytest.approx(
-        sum(e.realized_pnl_base for e in report.closed)
-    ), "Net P&L must equal the sum of fully closed round trips, nothing else"
-
-    partial_month = month_stats(conn, "2026-02")
-    assert partial_month.total_trades == 1, "the buyback fill is activity"
-    assert partial_month.net_pnl.base == 0, (
-        "the month holding only the partial close realises nothing"
-    )
+    months = month_range(conn)
+    assert len(months) > 12, "the demo spans more than a year of months"
+    for month in months:
+        pnl, commission = conn.execute(
+            "SELECT COALESCE(SUM(fifo_pnl_realized_base), 0),"
+            " COALESCE(SUM(ib_commission_base), 0) FROM trades"
+            " WHERE asset_category = 'OPT' AND trade_date LIKE ?", (f"{month}%",),
+        ).fetchone()
+        s = month_stats(conn, month)
+        assert s.net_pnl.base == pytest.approx(pnl, abs=1e-9), month
+        assert s.commissions.base == pytest.approx(commission, abs=1e-9), month
 
 
-def test_the_whole_outcome_lands_on_the_day_the_round_trip_closed(conn):
-    """Attribution: money follows the close date, activity stays on fill days."""
+def test_a_partial_close_is_money_on_its_day_and_no_outcome_until_flat(conn):
+    """The demo sells 3 puts and buys back 1: IBKR books realised P&L on that
+    fill, so its month and its Calendar day carry it, while the contract stays
+    open and so is neither a win nor a loss. The precondition first proves the
+    data really holds that case. Without it, this test would pass on an archive
+    where every close is total."""
+    from optjournal.stats import daily_series
+
+    (partial,) = [e for e in build_history(conn, asset_category="OPT").open
+                  if e.close_fills and e.realized_pnl_base]
+    month = month_stats(conn, "2026-02")
+    assert month.total_trades == 1, "the buyback is the month's one fill"
+    assert month.net_pnl.base == pytest.approx(partial.realized_pnl_base)
+    assert (month.closed_episodes, month.wins, month.losses) == (0, 0, 0)
+    (day,) = daily_series(conn, "2026-02")
+    assert (day.day, day.trades) == ("2026-02-11", 1)
+    assert day.realized.base == pytest.approx(partial.realized_pnl_base)
+
+
+def test_money_lands_on_the_day_of_each_fill(conn):
+    """Money and activity both stay on fill days, so a day with no closing fill
+    carries none, and a round trip opened and closed in one day sits whole on it."""
     from optjournal.stats import daily_series
 
     days = {d.day: d for d in daily_series(conn)}
-    # The partial-close day shows the fill and no money.
-    partial = days["2026-02-11"]
-    assert partial.trades == 1 and partial.realized.base == 0
     # The 0DTE round trip opened and closed on 2026-01-16; the whole outcome
     # sits on that day and equals the episode's own figure.
     report = build_history(conn)
@@ -716,10 +731,13 @@ def test_the_whole_outcome_lands_on_the_day_the_round_trip_closed(conn):
     assert days["2026-01-16"].realized.base == pytest.approx(
         zero_dte.realized_pnl_base
     )
-    # And nothing realised sits on any day without a close.
-    close_days = {_day_of(e.closed_at) for e in report.closed}
+    # And nothing realised sits on any day without a closing fill.
+    closing_days = {r[0] for r in conn.execute(
+        "SELECT DISTINCT trade_date FROM trades"
+        " WHERE asset_category = 'OPT' AND open_close LIKE '%C%'")}
+    assert closing_days < set(days), "some day holds only opening fills"
     for day, bucket in days.items():
-        if day not in close_days:
+        if day not in closing_days:
             assert bucket.realized.base == 0, day
 
 

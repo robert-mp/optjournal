@@ -733,8 +733,8 @@ def test_native_commission_is_exact_where_the_restatement_was_not(tmp_path):
         "SELECT SUM(ib_commission) FROM trades WHERE asset_category='OPT'"
         " AND currency = ?", (st["commissions"]["ccy"],)
     ).fetchone()[0]
-    # Native is a subset of billed (closed round trips only), never larger.
-    assert abs(st["commissions"]["native"]) <= abs(billed) + 1e-9
+    # Native is what IBKR billed on every option fill.
+    assert st["commissions"]["native"] == pytest.approx(billed)
     # And it is a genuinely different number from the base figure, which is
     # what makes the display distinction worth drawing.
     assert st["commissions"]["native"] != st["commissions"]["base"]
