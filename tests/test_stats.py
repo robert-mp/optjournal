@@ -558,12 +558,17 @@ _LEG_SUMS = ("quantity", "proceeds", "proceeds_base", "commission",
 
 def _meet(conn, name: str):
     """Ingest one `_MEETINGS` case and read it the way `/api/state` does."""
+    return _ingest(conn, _MEETINGS[name])
+
+
+def _ingest(conn, fills):
+    """Ingest fills shaped as `_MEETINGS` and read them the way `/api/state` does."""
     from optjournal.history import build_history
     from optjournal.serialize import orders_data
     from optjournal.stats import campaigns_for
     from optjournal.strategies import campaign_events, position_groups
 
-    for conid, order_id, at, qty, proceeds, pnl, open_close, *right in _MEETINGS[name]:
+    for conid, order_id, at, qty, proceeds, pnl, open_close, *right in fills:
         _leg(conn, conid=conid, order_id=order_id, at=at, qty=qty,
              proceeds=proceeds, pnl=pnl, open_close=open_close,
              put_call=right[0] if right else "P")
@@ -626,13 +631,10 @@ def test_every_fill_is_drawn_once_across_the_cards_and_once_on_the_calendar(conn
         len(report.closed),
         sum(e.realized_pnl_base > 0 for e in report.closed),
         sum(e.realized_pnl_base < 0 for e in report.closed))
-    # And that money is what the cards show: each decided card's outcome, plus
-    # whatever closed inside a card still running.
-    decided = [card["realized_pnl"]["base"] for card in cards if card["realized_pnl"]]
-    running = sum(report.episodes[i].realized_pnl_base
-                  for c in camps if not c.is_decided
-                  for i in c.episode_indices if report.episodes[i].is_closed)
-    assert stats.net_pnl.base == pytest.approx(sum(decided) + running)
+    # And that money is what the cards show: each card carries what its closed
+    # contracts realised, whether or not the position is still running.
+    shown = [card["realized_pnl"]["base"] for card in cards if card["realized_pnl"]]
+    assert stats.net_pnl.base == pytest.approx(sum(shown))
 
 
 def _cards_read(cards) -> dict[str, tuple]:
@@ -742,6 +744,58 @@ def test_a_position_opened_by_the_far_half_of_a_split_counts_that_fill(conn):
                             campaign_list=campaigns_for(conn, "OPT", episodes))
     assert {(card["label"], card["status"]): card["fills"] for card in cards} == {
         ("Long put", "closed"): 2, ("Short put", "open"): 1}
+
+
+#: A short put rolled out and then partly bought back, as `_MEETINGS` fills. The
+#: near contract closes in two fills three seconds apart, the real GOOG roll's
+#: shape: its episode closes on the second, inside the roll's leg.
+_ROLLED = [
+    ("1", "1001", "2026-09-24 10:00:00", -2, 600.0, None, "O"),
+    ("1", "1002", "2026-09-28 14:16:20", 1, -100.0, 100.0, "C"),
+    ("2", "1002", "2026-09-28 14:16:21", -2, 500.0, None, "O"),
+    ("1", "1002", "2026-09-28 14:16:23", 1, -100.0, 95.0, "C"),
+    ("2", "1003", "2026-09-30 11:00:00", 1, -150.0, 90.0, "C"),
+]
+
+
+def _realised(money) -> float | None:
+    return None if money is None else round(money["base"], 6)
+
+
+def test_an_open_card_carries_its_rolled_leg_and_not_a_partial_close(conn):
+    """The Calendar books the near leg's +195 the day the roll closes it, and the
+    card said nothing until the whole position was flat. Now the card and the roll
+    carry it, and the partial close carries nothing: its contract is still held,
+    so its +90 is not counted anywhere yet, though IBKR booked it on the fill."""
+    _report, _camps, _orders, (card,), _events = _ingest(conn, _ROLLED)
+    assert card["status"] == "open"
+    assert _realised(card["realized_pnl"]) == 195.0
+    assert [(e["label"], _realised(e["realized"])) for e in card["events"]] == [
+        ("Short put", None), ("Roll", 195.0), ("Short put close", None)]
+    assert _realised(card["events"][2]["realized_pnl"]) == 90.0
+    assert "commission" not in card
+
+
+def test_a_decided_cards_realised_is_its_campaigns(conn):
+    """Once every contract is closed the card's figure is `Campaign.realized`, the
+    one the Dashboard's scoreboard reads, to the last key."""
+    _report, (camp,), _orders, (card,), _events = _ingest(conn, _ROLLED + [
+        ("2", "1004", "2026-10-02 11:00:00", 1, -150.0, 80.0, "C")])
+    assert card["status"] == "closed"
+    assert card["realized_pnl"] == camp.realized.payload()
+    assert [_realised(e["realized"]) for e in card["events"]] == [
+        None, 195.0, None, 170.0]
+
+
+@pytest.mark.parametrize("fills", [*_MEETINGS.values(), _ROLLED], ids=[*_MEETINGS, "rolled"])
+def test_a_cards_events_add_up_to_the_card(conn, fills):
+    """Each closed contract sits on the one event holding its final closing fill,
+    so the events add up to the card through every way two positions meet."""
+    *_, cards, _events = _ingest(conn, fills)
+    for card in cards:
+        on_events = [e["realized"]["base"] for e in card["events"] if e["realized"]]
+        assert _realised(card["realized_pnl"]) == (
+            round(sum(on_events), 6) if on_events else None)
 
 
 def _at_broker(conn, broker: str, fills) -> None:

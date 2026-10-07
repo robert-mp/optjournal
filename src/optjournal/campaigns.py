@@ -182,10 +182,9 @@ class Campaign:
     #: When the LAST episode closed, so the scoreboard credits the month the
     #: decision finished. None while undecided.
     closed_at: str | None
-    #: Summed realised P&L, gated across currencies. None while undecided,
-    #: matching the lifecycle card and the Dashboard's own rule.
+    #: Summed realised P&L, gated across currencies. None while undecided. A
+    #: decided campaign's equals its Trades card's `realized_pnl`.
     realized: Money | None
-    commission: Money | None
     #: The hand-made links (`link`'s `links`) that joined episodes into this
     #: campaign, as stored. Empty for a campaign the window alone built, which is
     #: how the Trades tab knows which cards it may offer to unlink.
@@ -512,9 +511,6 @@ def link(
             # instead of labelling one figure with the other's currency.
             realized=Money.charged(
                 (e.realized_pnl_base, e.realized_pnl, e.currency) for e in eps
-            ) if decided else None,
-            commission=Money.charged(
-                (e.commission_base, e.commission, e.currency) for e in eps
             ) if decided else None,
             links=tuple(sorted(links_of_root.get(root, ()))),
             leg_parts={(order_id, conid): _leg_share(taken)

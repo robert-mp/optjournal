@@ -794,12 +794,12 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
 
    THE COLUMN COUNT IS PER SITE, because `.stats` serves four panels and they do
    not hold the same number of tiles. Four columns is the dashboard's; the
-   lifecycle card and the watchlist detail hold THREE, which a four-column grid
-   orphans exactly the way five orphaned nine; and the 0DTE cohort holds four
-   inside a half-width `.duo` card, where four columns measured 148px per tile and
-   wrapped `€3,279.87` onto two lines. So each site names its count and the
-   invariant is checked rather than assumed: every count divides its card total,
-   at every breakpoint. A modifier is more words than `auto-fit` and it is the
+   portfolio summary holds THREE, which a four-column grid orphans exactly the
+   way five orphaned nine; an open lifecycle card holds two; and the 0DTE cohort
+   holds four inside a half-width `.duo` card, where four columns measured 148px
+   per tile and wrapped `€3,279.87` onto two lines. So each site names its count
+   and the invariant is checked rather than assumed: every count divides its card
+   total, at every breakpoint. A modifier is more words than `auto-fit` and it is the
    right ones -- `auto-fit` sizes to the container and would have put five columns
    under a twelve-tile dashboard, which is the orphan again by another route. */
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s5)}

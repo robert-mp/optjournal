@@ -998,9 +998,18 @@ def test_a_lifecycle_spans_open_and_close_and_matches_the_dashboard(populated):
     assert lc["opened_at"][:10] == ep.opened_at[:10]
     assert lc["closed_at"][:10] == ep.closed_at[:10]
     assert lc["realized_pnl"]["base"] == pytest.approx(ep.realized_pnl_base)
-    # An open lifecycle keeps the Dashboard's rule: nothing until flat.
-    for open_lc in (x for x in st["lifecycles"] if x["status"] == "open"):
-        assert open_lc["realized_pnl"] is None
+    # An open lifecycle keeps the Dashboard's rule too: each contract counts once
+    # it is flat, so the open cards carry what closed inside positions still held.
+    conn = connect(populated)
+    try:
+        camps = campaigns_for(conn, "OPT", report.episodes)
+    finally:
+        conn.close()
+    running = sum(report.episodes[i].realized_pnl_base
+                  for c in camps if not c.is_decided
+                  for i in c.episode_indices if report.episodes[i].is_closed)
+    assert sum(x["realized_pnl"]["base"] for x in st["lifecycles"]
+               if x["status"] == "open" and x["realized_pnl"]) == pytest.approx(running)
 
 
 def test_dashboard_headline_counts_closed_round_trips_for_options():
@@ -4995,7 +5004,7 @@ def test_every_control_has_a_visible_keyboard_focus_ring():
 #: given}. The dashboard's is a SET because the reader chooses how many tiles to
 #: show; the others are fixed. The divisibility check reads every count listed,
 #: and the dashboard's set is pinned against the page's own `TILE_STEP` below.
-STATS_GRIDS = {"": (4, 8, 12, 16, 20), "c3": (3,), "c2": (4,)}
+STATS_GRIDS = {"": (4, 8, 12, 16, 20), "c3": (3,), "c2": (4, 2)}
 
 #: Columns per modifier at each breakpoint, widest first. Read off the stylesheet
 #: by the test rather than trusted, so a retune cannot drift from this table.

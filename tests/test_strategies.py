@@ -156,6 +156,10 @@ class _Ep:
         self.realized_pnl = pnl
         self.commission = comm
         self.currency = "USD"
+        # Blank, as the hand-built orders carry no broker or account: the
+        # campaign finds an order by `(broker, order id)`.
+        self.broker = ""
+        self.account_id = ""
 
 
 def _camps(orders, episodes, trade_to_order=None):
@@ -224,15 +228,18 @@ def test_open_and_close_events_link_into_one_closed_lifecycle():
     assert len(lc["events"]) == 2, "both events stay visible beneath"
 
 
-def test_an_open_lifecycle_reports_no_realised_pnl():
-    """Same rule as the Dashboard: nothing counts until the position is flat."""
+def test_an_open_lifecycle_with_nothing_closed_reports_no_realised_pnl():
+    """Same rule as the Dashboard: a contract counts once it is flat, and none
+    of this card's is. No commission figure either, since realised P&L is
+    already net of it."""
     opening = _order("10", "2026-08-03 11:11:19", [_leg()])
     ep = _Ep("C1", ["t1"], closed=False)
     (lc,) = _lifecycles([opening], episodes=[ep],
                         trade_to_order={"t1": "10"})
     assert lc["status"] == "open"
     assert lc["realized_pnl"] is None
-    assert lc["commission"] is None
+    assert [e["realized"] for e in lc["events"]] == [None]
+    assert "commission" not in lc
 
 
 def test_unrelated_contracts_never_share_a_lifecycle():
@@ -262,7 +269,7 @@ def test_a_roll_event_chains_lifecycles_into_one_campaign():
     assert len(got) == 1, "the campaign is one lifecycle"
     lc = got[0]
     assert lc["status"] == "open", "the rolled-into leg is still open"
-    assert lc["realized_pnl"] is None, "campaign not decided yet"
+    assert lc["realized_pnl"]["base"] == 100.0, "the closed near leg counts already"
     assert {e["label"] for e in lc["events"]} == {"Short put", "Roll"}
 
 

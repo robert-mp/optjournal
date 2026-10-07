@@ -253,7 +253,8 @@ def test_the_scoreboard_counts_each_contract_round_trip(conn):
     report = build_history(conn, asset_category="OPT")
     decided = [c for c in campaigns_for(conn, "OPT", report.episodes) if c.is_decided]
     assert s.net_pnl.base == pytest.approx(sum(c.realized.base for c in decided))
-    assert s.commissions.base == pytest.approx(sum(c.commission.base for c in decided))
+    assert s.commissions.base == pytest.approx(
+        sum(report.episodes[i].commission_base for c in decided for i in c.episode_indices))
 
 
 def test_a_rolled_contract_scores_in_the_month_its_cash_lands(conn):

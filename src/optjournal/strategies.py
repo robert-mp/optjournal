@@ -304,6 +304,41 @@ def campaign_events(
             _campaign_events(orders, campaign_list, divide=False)]
 
 
+def _realized(episodes: list[Any]) -> Row | None:
+    """What these episodes realised, gated across their currencies, or None for
+    none. `campaigns.link` sums a decided campaign's with the same call."""
+    if not episodes:
+        return None
+    return Money.charged(
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in episodes
+    ).payload()
+
+
+def _closed_by_event(events: list[Row], closed: list[Any]) -> list[list[Any]]:
+    """The closed episodes each event finished, by the event's position.
+
+    An episode belongs to the event holding its final closing fill: a leg on its
+    contract, account and broker whose fills span its `closed_at`. Both are ET
+    stamps in one format, so they compare as text. The first such event takes
+    it, and an episode no event holds is on none.
+    """
+    out: list[list[Any]] = [[] for _ in events]
+    for episode in closed:
+        at = str(episode.closed_at or "")
+        mine = (str(episode.broker), str(episode.account_id), str(episode.conid))
+        for position, event in enumerate(events):
+            if at and any(
+                (str(leg.get("broker") or ""), str(leg.get("account_id") or ""),
+                 str(leg.get("conid") or "")) == mine
+                and str(leg.get("first_fill_at") or "") <= at
+                <= str(leg.get("last_fill_at") or "")
+                for order in event.get("orders", ()) for leg in order.get("legs", ())
+            ):
+                out[position].append(episode)
+                break
+    return out
+
+
 def position_groups(
     orders: list[Row],
     *,
@@ -339,6 +374,13 @@ def position_groups(
     every execution it draws, so a split `C;O` one counts in both of its cards:
     no total adds cards' fills up, and the ones that count executions across
     cards (the Dashboard's, the Calendar's) count each once.
+
+    Realised P&L is counted per CONTRACT, the money rule in `stats.py`: a card
+    carries what its closed episodes realised, so a roll's closed leg shows on
+    the open card the day the Calendar books it, and each event carries the
+    episodes it closed (`_closed_by_event`). A contract still held adds nothing,
+    not even what IBKR booked on a partial close, since the Calendar does not
+    count that either. On a decided card this is `Campaign.realized`.
     """
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own
@@ -359,6 +401,8 @@ def position_groups(
         opening = members[0]
         camp = campaign_list[index] if linked else None
         eps = [episodes[i] for i in camp.episode_indices] if camp else []
+        closed = [e for e in eps if e.is_closed]
+        closed_by = _closed_by_event(members, closed)
         out.append({
             "underlying": opening.get("underlying"),
             # The shape it was OPENED as names the position; later events
@@ -386,17 +430,12 @@ def position_groups(
                  for lg in o.get("legs", ())),
                 "proceeds",
             ).payload(),
-            # Campaign-sourced, so these equal the Dashboard's accounting
-            # exactly -- populated only when the position is decided, same
-            # rule. Episodes carry the native and the currency, so the figure
-            # is exact wherever one currency closed the whole position.
-            "realized_pnl": (
-                camp.realized.payload() if camp and camp.realized else None
-            ),
-            "commission": (
-                camp.commission.payload() if camp and camp.commission else None
-            ),
-            "events": members,
+            # Episode-sourced, so it is the Dashboard's figure for the same
+            # contracts. Episodes carry the native and the currency, so it is
+            # exact wherever one currency closed them all.
+            "realized_pnl": _realized(closed),
+            "events": [{**event, "realized": _realized(closed_by[position])}
+                       for position, event in enumerate(members)],
         })
     out.sort(key=lambda p: str(p["opened_at"] or ""), reverse=True)
     return out

@@ -1193,6 +1193,10 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Money} commission
  * @property {Money} realized_pnl
  * @property {Array} orders -- the member Order rows, fully visible
+ * @property {Money|null} [realized] sent on a Lifecycle's events only. The closed
+ *   contracts whose final closing fill this event holds, summed, so a partial
+ *   close adds nothing where `realized_pnl` carries what IBKR booked on it. Null
+ *   where it closed none
  */
 
 /** @typedef {Object} Lifecycle -- strategy events linked by episode (strategies.position_groups)
@@ -1212,8 +1216,9 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} episodes
  * @property {number} fills
  * @property {Money} proceeds
- * @property {Money|null} realized_pnl -- null until the lifecycle is closed
- * @property {Money|null} commission -- same rule
+ * @property {Money|null} realized_pnl summed over its CLOSED contracts, net of
+ *   commission. Each counts from the day it went flat, as on the Dashboard and
+ *   the Calendar, and a contract still held adds nothing. Null until one closes
  * @property {Array} events -- StrategyGroup rows
  * @property {string} replay_key -- index into State.replays
  */
@@ -3444,22 +3449,22 @@ function trades(){
      grouping can never join two different contracts or split one. Below the
      lifecycle, each EVENT (the strategy-grouped orders from strategies.py)
      stays fully visible with its legs, so the order-level truth is intact.
-     Realised P&L and commission are episode-sourced and appear only once
-     the lifecycle is closed -- the same rule the Dashboard follows. */
+     Realised P&L is episode-sourced and counted per contract, the day that
+     contract is flat, which is the Dashboard's and the Calendar's rule. So an
+     open card already carries a roll's closed leg, on the card and on the
+     event that closed it. */
   const lcs=S.state.lifecycles||[];
   if(!lcs.length) return `${scopeNote()}${orphanNotes()}<div class="card"><div class="empty">no option orders</div></div>`;
   return scopeNote()+orphanNotes()+lcs.map(lc=>{
     const evs=lc.events||[];
     const legs=evs.flatMap(g=>(g.orders||[]).flatMap(o=>o.legs||[]));
-    const nat=legs[0]?legs[0].currency:'';
     const openLc=lc.status==='open';
     const when=openLc?`opened ${esc((lc.opened_at||'').slice(0,10))} · still open`
       :`${esc((lc.opened_at||'').slice(0,10))} → ${esc((lc.closed_at||'').slice(0,10))}`;
     /* Unrealised for an open lifecycle comes from the position snapshot, summed
-       over the legs this lifecycle holds -- realised money does not exist until
-       the position is flat, the same rule the Dashboard and the stat cards
-       follow. Summed in base through `.base` because two legs can be quoted in
-       different currencies, which is what the Money gate exists to catch. */
+       over the contracts this lifecycle still holds. Summed in base through
+       `.base` because two legs can be quoted in different currencies, which is
+       what the Money gate exists to catch. */
     const rp=(S.state.replays||{})[lc.replay_key];
     const shown=S.replay===lc.replay_key;
     let uz=0; (S.state.positions||[]).forEach(pos=>{
@@ -3468,6 +3473,10 @@ function trades(){
     const score=openLc?['Unrealised',`<b class="${cls(uz)}">${cash(uz)}</b>`]
       :['Realised',`<b class="${cls(lc.realized_pnl?.base)}">${
         lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—'}</b>`];
+    const realised=statCard('Realised',
+      lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—',
+      openLc?'closed contracts so far, net of commission':'net of commission',
+      'sm '+cls(lc.realized_pnl?.base));
     return `<div class="card">
       <div class="crow${rp?' rk':''}"${rp?` data-replay="${esc(lc.replay_key)}"
         role="button" tabindex="0" aria-expanded="${shown?'true':'false'}"`:''}><div><h2>${
@@ -3480,19 +3489,8 @@ function trades(){
           } <span class="caret${shown?' open':''}">▸</span></div>`:''}
       </div>
       ${shown&&rp?replayPanel(rp,score[0],score[1]):''}
-      <div class="stats c3">
-        ${statCard('Proceeds', moneyOf(lc.proceeds),
-          nat&&nat!==DISP()?`${money(legs.reduce((a,l)=>a+(l.proceeds||0),0),nat)} as filled`:'',
-          'sm '+cls(lc.proceeds.base))}
-        ${statCard('Comms & Fees',
-          lc.commission!=null?chargeMo(lc.commission):'—',
-          openLc?'lands with the outcome, on close':'all legs, whole lifecycle',
-          'sm '+cls(lc.commission?.base))}
-        ${statCard('Realised P&L',
-          lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—',
-          openLc?'nothing counts until the position is flat':'net of commission',
-          'sm '+cls(lc.realized_pnl?.base))}
-      </div>
+      ${openLc?`<div class="stats c2">${realised}${statCard('Unrealised',cash(uz),
+        'contracts still held, as last reported','sm '+cls(uz))}</div>`:realised}
       ${evs.map(g=>{
         const glegs=(g.orders||[]).flatMap(o=>o.legs||[]);
         /* Inside its own card, an event whose shape merely repeats the
@@ -3509,7 +3507,7 @@ function trades(){
         <div class="gh"><span class="gl">${esc((g.first_fill_at||'').slice(0,10))} — ${
           esc(evl)} <span class="dim2 mono">order${(g.order_ids||[]).length>1?'s':''} ${
           esc((g.order_ids||[]).join(', '))}</span></span>
-          <span class="fig ${cls(g.proceeds.base)}">${moneyOf(g.proceeds)}</span></div>
+          ${g.realized?`<span class="fig ${cls(g.realized.base)}">${moneyOf(g.realized)}</span>`:''}</div>
         ${glegs.map(l=>legRow(l)).join('')}
       </div>`;}).join('')}
       ${legs.length>1?'':`<div class="note">One leg, so this is a single-leg
