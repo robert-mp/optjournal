@@ -22,7 +22,6 @@ from pathlib import Path
 import pytest
 from conftest import LIVE_RAW_DIR, ROOT, add_statement, connect_migrated
 
-from optjournal.campaigns import Campaign
 from optjournal.demo import (
     FROM_DATE,
     TO_DATE,
@@ -34,7 +33,6 @@ from optjournal.demo import (
 from optjournal.flex import load
 from optjournal.history import build_history
 from optjournal.ingest import ingest_file
-from optjournal.money import Money
 from optjournal.stats import (
     ALL_TRADES,
     _day_of,
@@ -211,18 +209,17 @@ def test_profit_factor_and_average_outcome_reconcile_with_the_averages(conn):
     tiles sit beside Avg Win and Avg Loss, so a reader can check one against the
     others, and they must agree. Gross won is `avg_win * wins`; the ratio divides
     it by gross lost. The mean outcome includes scratches -- decided at exactly
-    zero, neither won nor lost -- which is why it divides by `decided_campaigns`
+    zero, neither won nor lost -- which is why it divides by `closed_episodes`
     rather than by `wins + losses`, and why a scratch adds nothing to the sum.
     """
     s = month_stats(conn, period=None)
     assert s.avg_win is not None and s.avg_loss is not None and s.avg_pnl is not None
     won, lost = s.avg_win.base * s.wins, s.avg_loss.base * s.losses
     assert s.profit_factor == pytest.approx(won / -lost)
-    assert s.avg_pnl.base == pytest.approx((won + lost) / s.decided_campaigns)
-    # And NOT net P&L over decided: net P&L also holds cash settled inside a
-    # position still running, which no decided outcome earned.
-    if s.inflight_realized.base:
-        assert s.avg_pnl.base != pytest.approx(s.net_pnl.base / s.decided_campaigns)
+    assert s.avg_pnl.base == pytest.approx((won + lost) / s.closed_episodes)
+    # Every closed round trip is a decided outcome, so the mean is also Net P&L
+    # over the count.
+    assert s.avg_pnl.base == pytest.approx(s.net_pnl.base / s.closed_episodes)
 
 
 def test_a_month_with_wins_and_no_losses_has_no_profit_factor(conn):
@@ -237,174 +234,44 @@ def test_a_month_with_wins_and_no_losses_has_no_profit_factor(conn):
         assert s.avg_pnl is not None and s.avg_pnl.base > 0
 
 
-def test_the_campaign_unit_is_the_default_not_an_opt_in(conn):
-    """A caller who passes no linkage must still get the corrected figures.
-
-    This is the whole point of `month_stats` building its own: the argument used
-    to be the only way to get the campaign unit, and omitting it fell back to one
-    campaign per episode. So every call site that forgot it -- which was most of
-    this suite -- silently measured the pre-campaign reading, scoring the demo's
-    roll twice and its vertical as a win plus a loss. A default that is wrong in
-    silence is worse than a required argument, and this pins that it is gone.
-    """
-    bare = month_stats(conn, None)
-    assert (bare.decided_campaigns, bare.wins, bare.losses) == (7, 6, 1)
-    assert bare.win_rate == pytest.approx(85.714, abs=1e-2)
-    assert bare.wins + bare.losses == bare.decided_campaigns
-
-    # And identical to the figures an explicit linkage produces, since the only
-    # difference is who ran the query.
-    report = build_history(conn, asset_category="OPT")
-    explicit = month_stats(
-        conn, None, report=report,
-        campaign_list=campaigns_for(conn, "OPT", report.episodes),
-    )
-    assert bare.decided_campaigns == explicit.decided_campaigns
-    assert (bare.wins, bare.losses) == (explicit.wins, explicit.losses)
-
-
-def test_pairing_campaigns_with_a_foreign_report_is_refused(conn):
-    """A campaign holds INDICES into its report's episode list, so pairing it
-    with another report would read the wrong episodes and score the wrong
-    outcomes -- quietly, since the indices are all in range. Raised rather than
-    documented, because a silent wrong answer is the failure mode this whole
-    change exists to remove."""
-    report = build_history(conn, asset_category="OPT")
-    campaigns = campaigns_for(conn, "OPT", report.episodes)
-    with pytest.raises(ValueError, match="report they were built from"):
-        month_stats(conn, None, campaign_list=campaigns)
-
-
-def test_the_scoreboard_counts_positions_where_episodes_double_counted(conn):
+def test_the_scoreboard_counts_each_contract_round_trip(conn):
     """The roll and the vertical, measured end to end through the real path.
 
-    The generator holds both defects on purpose: a SPY roll (Nov -> Dec, one
-    order closing 560P and opening 555P) and an NVDA put vertical whose two legs
-    closed at +1150.86 and -588.54. On the episode unit that is 9 closed round
-    trips, 7 wins and 2 losses (77.8%): the roll scores one decision twice, and
-    the vertical scores a +562.33 spread as one win PLUS one loss. On the
-    campaign unit it is 7 decided, 6 wins, 1 loss (85.7%).
+    The generator holds both on purpose: a SPY roll (Nov -> Dec, one order
+    closing 560P and opening 555P) and an NVDA put vertical whose two legs closed
+    at +1150.86 and -588.54. Counted per closed contract round trip that is 9
+    outcomes, 7 wins and 2 losses (77.8%): each leg of the roll and each leg of
+    the vertical is its own outcome, which is what a broker trade log shows.
 
-    Net P&L is identical either way, which is the whole point of the split: the
-    money did not move, only the counting.
-
-    The episode unit is reached by handing `month_stats` one campaign per closed
-    episode, which is what it used to build for itself when a caller passed
-    nothing. It no longer does -- omitting the argument now builds the real
-    linkage -- so the old reading has to be constructed deliberately here, and
-    that is the point: the wrong answer is no longer the default.
+    The money is the same money the Trades tab groups into positions. Every demo
+    position finishes, so the decided positions account for all of it.
     """
+    s = month_stats(conn, None)
+    assert (s.closed_episodes, s.wins, s.losses) == (9, 7, 2)
+    assert s.win_rate == pytest.approx(77.777, abs=1e-2)
+
     report = build_history(conn, asset_category="OPT")
-    campaigns = campaigns_for(conn, "OPT", report.episodes)
-    per_episode = [
-        Campaign(
-            episode_indices=(index,),
-            conids=(str(e.conid),),
-            order_ids=frozenset(),
-            is_decided=True,
-            closed_at=e.closed_at,
-            realized=Money.charged(
-                [(e.realized_pnl_base, e.realized_pnl, e.currency)]
-            ),
-            commission=Money.charged(
-                [(e.commission_base, e.commission, e.currency)]
-            ),
-        )
-        for index, e in enumerate(report.episodes) if e.is_closed
-    ]
-
-    episode_unit = month_stats(
-        conn, None, report=report, campaign_list=per_episode
-    )
-    campaign_unit = month_stats(
-        conn, None, report=report, campaign_list=campaigns
-    )
-
-    assert (episode_unit.wins, episode_unit.losses) == (7, 2)
-    assert episode_unit.win_rate == pytest.approx(77.777, abs=1e-2)
-
-    assert campaign_unit.decided_campaigns == 7
-    assert (campaign_unit.wins, campaign_unit.losses) == (6, 1)
-    assert campaign_unit.win_rate == pytest.approx(85.714, abs=1e-2)
-    assert campaign_unit.wins + campaign_unit.losses == \
-        campaign_unit.decided_campaigns, "the scoreboard accounts for itself"
-
-    assert campaign_unit.closed_episodes == episode_unit.closed_episodes == 9, (
-        "the money's unit is untouched"
-    )
-    assert campaign_unit.net_pnl.base == pytest.approx(episode_unit.net_pnl.base)
-    assert campaign_unit.commissions.base == pytest.approx(
-        episode_unit.commissions.base
-    )
+    decided = [c for c in campaigns_for(conn, "OPT", report.episodes) if c.is_decided]
+    assert s.net_pnl.base == pytest.approx(sum(c.realized.base for c in decided))
+    assert s.commissions.base == pytest.approx(sum(c.commission.base for c in decided))
 
 
-def test_inflight_realised_counts_only_positions_that_never_finished(conn):
-    """IN FLIGHT means the position is still running, not merely that its cash
-    landed in another period. Two different reasons a month can show P&L with no
-    decided position, and only one of them is this figure's business.
+def test_a_rolled_contract_scores_in_the_month_its_cash_lands(conn):
+    """The SPY roll spans November into December, and each month scores its own
+    contract.
 
-    The demo's SPY roll is the OTHER one: November settles the 560P for +585.82
-    and December's expiry ends the chain, so by any period's reckoning that
-    campaign finished. November's cash is attributed elsewhere, which the `closed`
-    versus `decided` columns already show, and nothing about it is unfinished.
-    Every demo campaign completes, so this figure is zero for every period --
-    including November, where an earlier draft of this test wrongly expected
-    585.82 and the code was right.
-
-    The real journal is where it is non-zero: see the GOOG chain, rolled and still
-    open, in the README's counting section.
+    November closed the 560P for +585.82, so November has that money and that
+    win. December's expiry closes the 555P, so December has its own +1044.76 and
+    its own win. The outcome lands where the P&L does.
     """
-    report = build_history(conn, asset_category="OPT")
-    campaigns = campaigns_for(conn, "OPT", report.episodes)
-
-    nov = month_stats(conn, "2025-11", report=report, campaign_list=campaigns)
-    assert nov.net_pnl.base == pytest.approx(585.82, abs=1e-2)
-    assert nov.decided_campaigns == 0, "the outcome landed in December"
-    assert nov.inflight_realized.base == 0.0, (
-        "the position DID finish, so its cash is attributed elsewhere rather "
-        "than sitting in flight"
-    )
-
-    everything = month_stats(conn, None, report=report, campaign_list=campaigns)
-    assert everything.inflight_realized.base == 0.0
-    assert everything.decided_campaigns == 7, "the control: things did finish"
-
-
-def test_inflight_realised_is_a_subset_of_the_p_and_l_it_qualifies(conn):
-    """The note reads "of this figure", so the part may never exceed the whole.
-
-    Scoped and period-filtered identically to the episodes `net_pnl` sums, which
-    is the only thing that keeps that true. Asserted over every period the demo
-    has, because a mismatch would show up in exactly one month rather than in the
-    all-time row.
-    """
-    report = build_history(conn, asset_category="OPT")
-    campaigns = campaigns_for(conn, "OPT", report.episodes)
-    for period in [None, *available_months(conn), "2025", "2026"]:
-        s = month_stats(conn, period, report=report, campaign_list=campaigns)
-        assert abs(s.inflight_realized.base) <= abs(s.net_pnl.base) + 1e-9, period
-
-
-def test_a_rolled_position_scores_where_it_finished_not_where_cash_landed(conn):
-    """The SPY roll spans November into December, and the two units part company.
-
-    November closed the 560P for +585.82 and that cash is November's, but the
-    decision was still running: nothing is decided there. December's expiry ends
-    it, so the whole +1630.58 chain scores as one win in December against
-    December's own P&L of +1044.76. That is the mismatch the dashboard prints a
-    note for, pinned here so it stays deliberate.
-    """
-    report = build_history(conn, asset_category="OPT")
-    campaigns = campaigns_for(conn, "OPT", report.episodes)
-    nov = month_stats(conn, "2025-11", report=report, campaign_list=campaigns)
-    dec = month_stats(conn, "2025-12", report=report, campaign_list=campaigns)
+    nov = month_stats(conn, "2025-11")
+    dec = month_stats(conn, "2025-12")
 
     assert nov.closed_episodes == 1, "a contract really did close in November"
     assert nov.net_pnl.base == pytest.approx(585.82, abs=1e-2)
-    assert nov.decided_campaigns == 0, "the decision was still running"
-    assert nov.wins == nov.losses == 0 and nov.win_rate is None
+    assert (nov.wins, nov.losses) == (1, 0)
 
-    assert dec.decided_campaigns == 1 and dec.wins == 1
+    assert (dec.closed_episodes, dec.wins) == (1, 1)
     assert dec.net_pnl.base == pytest.approx(1044.76, abs=1e-2), (
         "December's money is December's, not the whole chain's"
     )

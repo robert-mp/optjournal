@@ -160,17 +160,15 @@ MUTANTS: tuple[Mutant, ...] = (
         module="campaigns.py",
         find="        decided = bool(eps) and all(e.is_closed for e in eps)",
         replace="        decided = bool(eps) and any(e.is_closed for e in eps)",
-        breaks="a roll would be decided while its rolled-into leg is still open, "
-               "scoring an in-flight position and counting the chain twice",
+        breaks="a roll would close its Trades card while the rolled-into leg is "
+               "still open",
     ),
     Mutant(
-        key="campaign-sum",
+        key="scratch-is-no-win",
         module="stats.py",
-        find="    won = [c for c in decided if _campaign_pnl(c).base > 0]",
-        replace="    won = [c for c in decided if c[-1].realized_pnl_base > 0]",
-        breaks="a loser rolled out and scratched on its final leg would score a "
-               "win, because the outcome would be the last contract's and not "
-               "the whole decision's",
+        find="    won = [e for e in closed if e.realized_pnl_base > 0]",
+        replace="    won = [e for e in closed if e.realized_pnl_base >= 0]",
+        breaks="a round trip that netted exactly zero would count as a win",
     ),
     Mutant(
         key="episode-attrib",
@@ -284,14 +282,12 @@ MUTANTS: tuple[Mutant, ...] = (
         find='        state["annual"] = [\n'
              "            stats_data(s) for s in annual_stats(\n"
              "                conn, asset_category=asset_category,\n"
-             "                report=report, campaign_list=home_campaigns,"
-             " scoring=scoring,\n"
+             "                report=report,\n"
              "            )\n        ]",
         replace='        state["annual"] = [\n'
                 "            stats_data(s) for s in annual_stats(\n"
                 "                conn, asset_category=asset_category,\n"
-                "                report=report, campaign_list=home_campaigns,"
-                " scoring=scoring,\n"
+                "                report=report,\n"
                 "            )\n"
                 "            if selected is None or s.month.startswith(selected[:4])\n"
                 "        ]",

@@ -9,29 +9,25 @@ Two deliberate choices about what gets counted, because the obvious approach
 is wrong in both cases:
 
 * **Options P&L counts only fully closed round trips, attributed to the day
-  the position closed.** Summing IBKR's per-fill `fifo_pnl_realized_base` --
+  the contract closed.** Summing IBKR's per-fill `fifo_pnl_realized_base` --
   the previous rule, still used for other asset categories -- has two leaks
   for options: a *partial* close books realised P&L while the position is
   still open (sell 2, buy back 1: IBKR realises the 1-lot immediately), and
   a close spanning two days scatters one outcome across both. Episode-based
   P&L makes the money follow the same rule as the win/loss counts: nothing
-  counts until the position is flat, and the whole outcome lands on the
+  counts until the contract is flat, and the whole outcome lands on the
   close date. Premium collected on an open short is therefore never P&L --
-  it is a liability until the position closes.
+  it is a liability until the contract closes. A roll closes one contract,
+  so its P&L counts on the day of the roll.
 
-* **Win/loss counts come from campaigns, not fills and not episodes.** A round
-  trip closed by two partial fills is one outcome, not two, so counting fills
-  would inflate both the trade count and the win rate. Counting EPISODES
-  inflates them too, one level up: an episode is per contract, so a roll ended
-  one and opened another and scored a single continuing decision as two closed
-  trades and two wins, while a two-conid vertical scored one win plus one loss
-  on a spread that netted +562.33. `campaigns.py` owns that unit and states the
-  evidence. `total_trades` counts fills because that is what "how many
-  executions" means; `closed_episodes` counts contract round trips because that
-  is the money's unit; the win/loss block counts campaigns because that is what
-  "did it work" means. The dashboard labels which is which rather than blurring
-  them, and `wins + losses == decided_campaigns` is the invariant that lets a
-  reader reconcile the three.
+* **Win/loss counts closed contract round trips, the money's own unit.** A
+  round trip closed by two partial fills is one outcome, not two, so counting
+  fills would inflate both the trade count and the win rate. One unit for the
+  money and the count is what lets every figure on every tab agree: a roll's
+  closed contract is a decided outcome on the day its P&L lands, and a
+  strangle's two legs are two. Grouping contracts into positions is the Trades
+  tab's view (`campaigns.py`), and nothing here counts by it, so a Trades card
+  and the Dashboard can never disagree about a roll.
 
 Other asset categories keep the per-fill sum: IBKR's per-fill realised P&L
 is the correct realisation rule for share lots (each lot sold is realised,
@@ -52,14 +48,11 @@ from optjournal.money import Money, win_rate
 
 __all__ = [
     "ALL_TRADES",
-    "CONTRACT_SCORING",
     "Cohort",
     "DayPnl",
     "EQUITY_CATEGORY",
     "EQUITY_TRADES",
     "MonthStats",
-    "POSITION_SCORING",
-    "SCORINGS",
     "TradeScope",
     "annual_stats",
     "available_months",
@@ -73,42 +66,7 @@ __all__ = [
     "odte_cohorts",
     "odte_scope",
     "scope_for",
-    "scoring_or_default",
 ]
-
-#: The unit the scoreboard counts an outcome in. Only wins, losses, the
-#: averages and `decided_campaigns` read this; the MONEY is unaffected, and that
-#: is the whole point -- `net_pnl` is a sum over episodes either way, so the two
-#: readings differ in how many outcomes that same cash is divided into, never in
-#: how much of it there was.
-#:
-#: POSITION groups a multi-leg structure and every leg of a roll into ONE
-#: decision, which is `campaigns.py`'s argument and the default. CONTRACT scores
-#: each round trip alone: the hedge leg of a winning strangle counts as its own
-#: loss, and a roll counts once per contract. That is what a broker-style trade
-#: log shows, so it is offered rather than argued away -- measured on the real
-#: journal, the same 29 closed round trips read 14W/1L by position and 24W/5L by
-#: contract, and a reader comparing this journal against a broker's is otherwise
-#: left to reconcile two definitions by hand.
-POSITION_SCORING = "position"
-CONTRACT_SCORING = "contract"
-#: Validated against, so an unknown value heals to the default rather than
-#: reaching the `units` branch and being scored by position while a control
-#: claims otherwise.
-SCORINGS = (POSITION_SCORING, CONTRACT_SCORING)
-
-
-def scoring_or_default(value: str | None) -> str:
-    """`value` if it names a scoring unit, else the default.
-
-    One place, because three layers ask the same question -- the HTTP handler,
-    `month_stats` and `_period_stats` -- and a query string is user input. A
-    `?scoring=positon` typo must render the default and say so through the
-    control, never reach the branch in `month_stats` and be read as the other
-    unit.
-    """
-    return value if value in SCORINGS else POSITION_SCORING
-
 
 def _in_period(value: str | None, period: str | None) -> bool:
     """Whether a stored date falls inside `period`, which may be a year.
@@ -188,11 +146,9 @@ def campaigns_for(
     real journal arrives as separate order ids filled in the SAME SECOND, so
     order-id union alone links nothing at all -- see `campaigns.py`.
 
-    Lives in this module, beside the only figures that must not be computed
-    without it, so `month_stats` can build its own default rather than trusting
-    every caller to pass one. It was briefly `web._campaigns_for`, which worked
-    but meant a caller who forgot the argument silently got the pre-campaign
-    reading: a roll scored twice, with nothing raised and no test failing.
+    What the Trades tab's cards, the journal and the open-position count read.
+    The scoreboard does not: it counts contract round trips (see the module
+    docstring).
 
     `episodes` must be the list the returned campaigns will be resolved against,
     because a `Campaign` holds INDICES into it.
@@ -384,34 +340,17 @@ class MonthStats:
     #: `net_pnl` and `commissions` are attributed by the episode's close date.
     closed_episodes: int = 0
     open_episodes: int = 0
-    #: Which unit the four figures below count, `POSITION_SCORING` or
-    #: `CONTRACT_SCORING`. Carried on the stats rather than left to the caller
-    #: to remember, because a win rate is meaningless without it: 93% by
-    #: position and 83% by contract are the same account, and a surface that
-    #: displays one while labelling it the other is the defect this exists to
-    #: make impossible.
-    scoring: str = POSITION_SCORING
-    #: Outcomes decided in the period: the scoreboard's unit, and the headline
-    #: trade count. Always equals `wins + losses`, which is what lets a reader
-    #: reconcile it against `closed_episodes`. Under position scoring the two
-    #: differ exactly when a roll carried a decision across the period boundary
-    #: or is still in flight; under contract scoring they agree by construction,
-    #: since each closed round trip is its own outcome. See `campaigns.py` for
-    #: why position is the default.
-    decided_campaigns: int = 0
+    #: Of `closed_episodes`, those that netted up and those that netted down.
+    #: A scratch is neither, so the two need not sum to it.
     wins: int = 0
     losses: int = 0
     #: None -- not zero -- when nothing won or lost: an average of no outcomes
     #: is undefined, and zero would read as a break-even trade.
     avg_win: Money | None = None
     avg_loss: Money | None = None
-    #: The mean outcome over every decided unit, wins, losses and scratches
+    #: The mean outcome over every closed round trip, wins, losses and scratches
     #: together -- the same name and meaning as `Cohort.avg_pnl`. None under the
-    #: rule above: no decided unit, no average. NOT `net_pnl / decided`: net P&L
-    #: also holds cash settled inside a position still running
-    #: (`inflight_realized`), which belongs to no decided outcome, and dividing it
-    #: across the ones that are decided would credit them with money they did
-    #: not make.
+    #: rule above: nothing closed, no average.
     avg_pnl: Money | None = None
     #: Gross won over gross lost, both in base. None when nothing was lost -- the
     #: ratio is then infinite, and a very large finite number would read as a
@@ -419,7 +358,7 @@ class MonthStats:
     #: same `won` and `lost` lists the averages divide, so it cannot disagree
     #: with the Avg Win and Avg Loss tiles beside it.
     profit_factor: float | None = None
-    #: The single best and worst decided outcomes. None when nothing won or lost,
+    #: The single best and worst closed round trips. None when nothing won or lost,
     #: under the averages' rule. Chosen from the same `won` and `lost` lists, so
     #: the largest win can never be smaller than Avg Win beside it.
     largest_win: Money | None = None
@@ -444,26 +383,6 @@ class MonthStats:
     #: one is closed round trips, the other still-open ones, and a scope can
     #: easily be single-currency in one and mixed in the other.
     open_commission: Money = Money.restated(0.0)
-
-    #: How much of `net_pnl` closed inside a position that is STILL RUNNING.
-    #:
-    #: A roll closes one contract and opens the next, so its near leg settles
-    #: real cash while the decision carries on. That cash belongs in `net_pnl` --
-    #: it left the broker, it is on the tax return, and removing it would stop
-    #: this panel reconciling against the statement. But it is not part of any
-    #: outcome yet, so the scoreboard excludes it, and the two figures then
-    #: disagree on screen with nothing to explain why: the real journal shows
-    #: 2 decided positions beside a P&L containing three positions' cash.
-    #:
-    #: The third member of a family: `open_premium` is cash collected with no
-    #: outcome yet, `open_commission` is cash paid with no outcome yet, and this
-    #: is cash SETTLED with no outcome yet. Reported rather than netted out, for
-    #: the same reason as both of those.
-    #:
-    #: Provenance, never a forecast. It can fall as well as rise -- roll a winner
-    #: into a loser and the finished campaign is worth less than this suggests --
-    #: so nothing that displays it may call it an unrealised gain.
-    inflight_realized: Money = Money.restated(0.0)
 
     #: Net Asset Value at the period's end, from the newest equity summary on
     #: or before it. None when the Flex query template does not have the
@@ -696,16 +615,10 @@ def available_years(
     return sorted(years, reverse=True)
 
 
-def _campaign_pnl(campaign: list[Any]) -> Money:
-    """One campaign's realised outcome: the SUM of its episodes.
-
-    A sum, not the final episode, which is the whole reason the campaign unit
-    exists. Roll a short put that is down 1200 and scratch the last leg at +50
-    and this reads -1150; the last leg alone would read +50 and score a win.
-    """
+def _outcome(episode: Any) -> Money:
+    """One round trip's realised P&L, with its native where it has one."""
     return Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in campaign
-    )
+        [(episode.realized_pnl_base, episode.realized_pnl, episode.currency)])
 
 
 def _period_stats(
@@ -715,43 +628,22 @@ def _period_stats(
     asset_category: str | None,
     base_currency: str,
     report: Any = None,
-    campaign_list: list[campaigns.Campaign] | None = None,
-    scoring: str | None = None,
 ) -> list[MonthStats]:
     """`month_stats` over several periods, sharing one episode history pass.
 
     The Annual tab asks for every month, every year and an all-time row at
     once. Each `month_stats` call otherwise rebuilds the whole episode history,
     so a thirteen-month archive did that fifteen times per page load for
-    identical results. The campaign linkage rides along for the same reason: it
-    is derived from that one report, so leaving each period to build its own
-    would repeat the query fifteen times -- which is what `month_stats` does when
-    called alone, correctly but not cheaply.
-
-    `report` and `campaign_list` travel together or not at all: a campaign holds
-    INDICES into its report's episode list, so pairing them with a different
-    report would silently read the wrong episodes. Enforced rather than
-    documented, because the failure is quiet.
+    identical results.
     """
-    if campaign_list is not None and report is None:
-        raise ValueError(
-            "campaigns index into a specific report's episodes, so pass the "
-            "report they were built from or neither"
-        )
     if report is None:
         report = build_history(
             conn, asset_category=asset_category, base_currency=base_currency
         )
-    # Not built under contract scoring, which reads no linkage: this function
-    # exists to hoist work out of the per-period loop, and hoisting a query
-    # nothing below will look at is the same waste in one place instead of many.
-    if campaign_list is None and scoring_or_default(scoring) != CONTRACT_SCORING:
-        campaign_list = campaigns_for(conn, asset_category, report.episodes)
     return [
         month_stats(
             conn, period, asset_category=asset_category,
-            base_currency=base_currency, report=report, campaign_list=campaign_list,
-            scoring=scoring,
+            base_currency=base_currency, report=report,
         )
         for period in periods
     ]
@@ -763,8 +655,6 @@ def annual_stats(
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
     report: Any = None,
-    campaign_list: list[campaigns.Campaign] | None = None,
-    scoring: str | None = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar year, newest first.
 
@@ -778,17 +668,10 @@ def annual_stats(
     filter bar, and a tab whose numbers move with a control it does not display
     leaves the reader nothing to explain the change with. A scope parameter here
     would be an unused hook inviting exactly that.
-
-    Takes `scoring` despite that, and the asymmetry is the point: the
-    scoreboard's UNIT is a global reading of the journal, chosen beside the
-    display currency in the header and rendered on every tab, so this table
-    moving with it is the control working rather than an unexplained change. A
-    scope is per-tab; the unit is not.
     """
     return _period_stats(
         conn, available_years(conn, asset_category),
-        asset_category=asset_category, base_currency=base_currency,
-        report=report, campaign_list=campaign_list, scoring=scoring,
+        asset_category=asset_category, base_currency=base_currency, report=report,
     )
 
 
@@ -798,16 +681,12 @@ def monthly_stats(
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
     report: Any = None,
-    campaign_list: list[campaigns.Campaign] | None = None,
-    scoring: str | None = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar month, newest first.
 
     The same rows the month selector produces one at a time, so the Annual
     tab's breakdown and the Dashboard agree for any month the reader checks --
-    they are the same call with the same period string. `scoring` travels for
-    that reason: pass a different unit here than the Dashboard used and the two
-    surfaces would disagree about the same month.
+    they are the same call with the same period string.
 
     Unscoped for the same reason as `annual_stats`: it feeds the Annual tab,
     which carries no filter.
@@ -815,7 +694,7 @@ def monthly_stats(
     return _period_stats(
         conn, available_months(conn, asset_category),
         asset_category=asset_category, base_currency=base_currency,
-        report=report, campaign_list=campaign_list, scoring=scoring,
+        report=report,
     )
 
 
@@ -1017,8 +896,6 @@ def month_stats(
     base_currency: str = "EUR",
     scope: TradeScope = ALL_TRADES,
     report: Any = None,
-    campaign_list: list[campaigns.Campaign] | None = None,
-    scoring: str | None = None,
 ) -> MonthStats:
     """Statistics for one period, or for everything when `period` is None.
 
@@ -1030,26 +907,11 @@ def month_stats(
     lets a caller building many periods reuse one `build_history` pass -- the
     Annual tab asks for a dozen months, two years and an all-time row on every
     page load, and rebuilding the episode history for each was the whole cost.
-
-    `campaign_list` is `campaigns.link`'s output over `report.episodes`, and it is
-    what the win/loss block counts. Optional for COST, never for correctness:
-    omit it and this builds its own via `campaigns_for`, so the figures are the
-    same either way and only the query is repeated. It used to fall back to one
-    campaign per episode, which made a forgotten keyword score a roll twice with
-    nothing raised -- the kind of default that is wrong in silence.
-
-    `scoring` picks the scoreboard's unit (`POSITION_SCORING` or
-    `CONTRACT_SCORING`); see those constants. It moves wins, losses, the averages
-    and `decided_campaigns` and NOTHING else -- net P&L, commission and the fill
-    counts are identical under both, so the two readings always agree on the
-    money. Under contract scoring `campaign_list` goes unread, so a caller that
-    knows the unit up front can skip building the linkage entirely.
     """
     stats = MonthStats(
         month=period or "ALL",
         base_currency=base_currency,
         asset_category=asset_category or "ALL",
-        scoring=scoring_or_default(scoring),
     )
 
     where, params = _category_where(asset_category)
@@ -1105,11 +967,6 @@ def month_stats(
         fee_rows.append((row["amount_base"], row["amount"], row["currency"]))
     stats.fees = Money.charged(fee_rows)
 
-    if campaign_list is not None and report is None:
-        raise ValueError(
-            "campaigns index into a specific report's episodes, so pass the "
-            "report they were built from or neither"
-        )
     if report is None:
         report = build_history(
             conn, asset_category=asset_category, base_currency=base_currency
@@ -1165,95 +1022,30 @@ def month_stats(
         (e.proceeds_base, e.proceeds, e.currency)
         for e in report.open if scope.has_episode(e)
     )
-    # The scoreboard's unit is the CAMPAIGN, not the episode. A roll is one
-    # continuing decision, so it is decided only when every episode in it is
-    # closed, and its outcome is the SUM of them: counting only the final leg
-    # would let any loser be rolled out and scratched into a win. Attributed to
-    # the period its LAST episode closed, while the money above stays split by
-    # episode across months -- which is why `wins + losses` need not equal
-    # `closed_episodes`, and why the page shows both.
-    #
-    # Built here when the caller offers none, rather than falling back to one
-    # episode per campaign. That fallback was this function answering the same
-    # question two ways depending on an argument, and the wrong way was the
-    # SILENT one: a forgotten keyword scored a roll twice with nothing raised and
-    # no test failing. A caller with many periods still passes its own, because
-    # the linkage is per report and rebuilding it fifteen times is the cost
-    # `_period_stats` exists to avoid.
-    #: The population every figure below counts, as a list of outcomes each
-    #: holding the episodes that settle it. ONE list comprehension apart, the two
-    #: scorings share every line that follows -- the filter, the win/loss split,
-    #: the averages and the in-flight figure -- so neither reading can acquire a
-    #: rule the other lacks.
-    if stats.scoring == CONTRACT_SCORING:
-        # Each round trip alone. No linkage is read, so no query is spent: this
-        # is the reading that deliberately does NOT group, and building the
-        # grouping to then ignore it would be the one wasted query in the module.
-        units: list[list[Any]] = [[e] for e in report.episodes]
-    else:
-        if campaign_list is None:
-            campaign_list = campaigns_for(conn, asset_category, report.episodes)
-        units = [
-            [report.episodes[i] for i in c.episode_indices] for c in campaign_list
-        ]
-    # Decided when the WHOLE unit is closed, and in the period its last episode
-    # closed, whatever the scope: the same test the in-flight figure below and the
-    # Trades tab's cards apply. The scope only picks which episodes' cash the
-    # outcome carries. Judging a unit by its in-scope episodes alone decided a
-    # 0DTE leg rolled into a next-day contract still open, so under the 0DTE scope
-    # the same -302 was a decided loss AND cash inside a position still running.
-    decided = [
-        scoped for unit, scoped in ((u, [e for e in u if scope.has_episode(e)])
-                                    for u in units)
-        if scoped
-        and all(e.is_closed for e in unit)
-        and _in_period(max(str(close_of(e) or "") for e in unit), period)
-    ]
-    stats.decided_campaigns = len(decided)
-    won = [c for c in decided if _campaign_pnl(c).base > 0]
-    lost = [c for c in decided if _campaign_pnl(c).base < 0]
+    # The scoreboard counts the same closed round trips the money above sums,
+    # so a win always lands in the month its P&L does.
+    won = [e for e in closed if e.realized_pnl_base > 0]
+    lost = [e for e in closed if e.realized_pnl_base < 0]
     stats.wins, stats.losses = len(won), len(lost)
     # `Money.per` divides base and native by the same count, so an average can
-    # never be an exact numerator over a restated one. Gated against the
-    # contributing EPISODES' currencies rather than by re-gating campaign
-    # totals: a sum of already-gated figures cannot tell a native withheld for
-    # being mixed from one that was never there.
+    # never be an exact numerator over a restated one.
     gross_won = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for c in won for e in c
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in won
     )
     gross_lost = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for c in lost for e in c
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in lost
     )
     stats.avg_win = gross_won.per(len(won))
     stats.avg_loss = gross_lost.per(len(lost))
     stats.avg_pnl = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for c in decided for e in c
-    ).per(len(decided))
+        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in closed
+    ).per(len(closed))
     stats.profit_factor = gross_won.base / -gross_lost.base if gross_lost.base else None
     stats.largest_win = (
-        max((_campaign_pnl(c) for c in won), key=lambda m: m.base) if won else None
+        _outcome(max(won, key=lambda e: e.realized_pnl_base)) if won else None
     )
     stats.largest_loss = (
-        min((_campaign_pnl(c) for c in lost), key=lambda m: m.base) if lost else None
-    )
-    # The part of `net_pnl` whose position has not finished: episodes this period
-    # counted as closed that sit in a campaign still running. Taken from the SAME
-    # `units` the scoreboard uses, so the figure that explains the gap cannot
-    # disagree with the gap. Scoped and period-filtered exactly like `closed`
-    # above, because it is a subset of it -- the note it feeds claims "of this
-    # figure", and a differently-scoped subset could exceed its own total.
-    #
-    # Structurally zero under contract scoring, and correctly so: a unit of one
-    # episode is either closed (and fully decided) or open (and contributes no
-    # realised cash here), so there is no cash settled inside an unfinished
-    # outcome. The gap it explains is a consequence of grouping, and vanishes
-    # with it rather than needing to be suppressed.
-    stats.inflight_realized = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency)
-        for unit in units
-        if not all(e.is_closed for e in unit)
-        for e in unit
-        if e.is_closed and _in_period(close_of(e), period) and scope.has_episode(e)
+        _outcome(min(lost, key=lambda e: e.realized_pnl_base)) if lost else None
     )
     stats.net_liq_base, stats.net_liq_date = _net_liq_for(conn, period)
 
@@ -1280,11 +1072,6 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "fees": stats.fees.payload(),
         "closed_episodes": stats.closed_episodes,
         "open_episodes": stats.open_episodes,
-        # Sent with the figures it governs, not alongside them: the page labels
-        # the scoreboard from this, so a payload could not carry counts whose
-        # unit the reader has to infer from a control's state.
-        "scoring": stats.scoring,
-        "decided_campaigns": stats.decided_campaigns,
         "wins": stats.wins,
         "losses": stats.losses,
         "win_rate": stats.win_rate,
@@ -1294,7 +1081,6 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "profit_factor": stats.profit_factor,
         "largest_win": None if stats.largest_win is None else stats.largest_win.payload(),
         "largest_loss": None if stats.largest_loss is None else stats.largest_loss.payload(),
-        "inflight_realized": stats.inflight_realized.payload(),
         "open_premium": stats.open_premium.payload(),
         "open_commission": stats.open_commission.payload(),
         "net_liq_base": stats.net_liq_base,
@@ -1324,11 +1110,11 @@ def strategy_ranking(
     money here, and one lucky trade should not top the list over a strategy that
     earned more across twenty.
 
-    Positions, not contracts, whatever the scoreboard's unit: a strategy is a
-    property of a decision, and under contract scoring a strangle's two legs are
-    not two strategies. The money is the same either way -- every closed contract
-    sits in exactly one decided position -- except cash settled inside a position
-    still running, which belongs to no strategy's result yet.
+    Positions, not contracts, unlike the scoreboard: a strategy is a property of
+    a decision, and a strangle's two legs are not two strategies. The money is
+    the same either way -- every closed contract sits in exactly one position --
+    except cash settled inside a position still running, which belongs to no
+    strategy's result yet.
 
     `worst` is None when only one strategy decided anything: it would repeat
     `best`, and a tile saying the same strategy is both best and worst is

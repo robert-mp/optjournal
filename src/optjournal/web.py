@@ -146,8 +146,6 @@ from optjournal.serialize import (
 from optjournal.stats import (
     EQUITY_CATEGORY,
     EQUITY_TRADES,
-    POSITION_SCORING,
-    SCORINGS,
     annual_stats,
     available_months,
     campaigns_for,
@@ -218,7 +216,7 @@ DASHBOARD_TILES = (
     "net_pnl", "trades", "win_rate", "profit_factor",
     "wins", "losses", "avg_win", "avg_loss",
     "commissions", "avg_pnl", "gain", "open_premium",
-    "open_positions", "green_days", "red_days", "inflight",
+    "open_positions", "green_days", "red_days", "orders",
     "best_strategy", "worst_strategy", "largest_win", "largest_loss",
 )
 #: The visible count must be a multiple of this, because `.stats` runs 4, 2 and 1
@@ -227,7 +225,7 @@ DASHBOARD_TILES = (
 TILE_STEP = 4
 #: What the page shows when nothing is stored. A stored copy of it is stored as
 #: absence instead, so a later change to the default reaches every reader who
-#: never chose -- the rule `scoring`'s default already follows.
+#: never chose.
 TILE_DEFAULT = DASHBOARD_TILES[:12]
 
 
@@ -608,7 +606,6 @@ def build_state(
     month: str | None = None,
     trade_type: str | None = None,
     cost_scope: list[str] | None = None,
-    scoring: str | None = None,
     query_id_source: str | None = None,
     demo: bool = False,
     scheduled: bool = True,
@@ -637,19 +634,7 @@ def build_state(
     bar, so they stay pinned to the journal's home category. The invariant is
     that a tab's figures change only in response to a control that tab
     displays.
-
-    `scoring` is the exception that proves that rule rather than breaking it: it
-    reaches EVERY period block, Annual and monthly included, because the control
-    for it lives in the header beside the display currency and is therefore on
-    screen wherever its effect is. A unit of account applied to one tab and not
-    another would leave the Dashboard and the Annual table disagreeing about the
-    same month -- which is the defect `campaigns.py` was written to remove, not
-    one to reintroduce behind a toggle.
     """
-    # The stored unit applies when the request names none, so a choice made in the
-    # settings page survives a reload and a restart. An explicit request parameter
-    # still wins: that is the page's own hash, i.e. what this reader last clicked.
-    scoring = prefs.scoring(scoring)
     with open_journal(db_path) as conn:
         # RESOLVE ABANDONED RUNS FIRST, before anything reads `job_runs`.
         #
@@ -715,22 +700,11 @@ def build_state(
         # consumer was three times the queries buying nothing.
         orders = orders_data(conn, scope.order_ids, view_category)
         # The campaign linkage, built ONCE per report and handed to everything
-        # that counts a decision: the lifecycle cards, the scoreboard, and the
-        # open-position headline. One structure rather than three readings, which
-        # is the point -- the Dashboard used to count a roll as two wins while
-        # the Trades tab drew it as one card.
-        #
-        # Indexed against `report.episodes` verbatim, never a reordering of it: a
-        # campaign holds positions into that exact list, and `month_stats`
-        # resolves them the same way.
+        # that draws a position: the lifecycle cards and the open-position
+        # headline. Indexed against `report.episodes` verbatim, never a
+        # reordering of it: a campaign holds positions into that exact list.
         view_episodes = view_report.episodes
         view_campaigns = campaigns_for(conn, view_category, view_episodes)
-        # The Annual tab is unscoped and runs over the HOME category, so it needs
-        # its own linkage whenever the view has been switched to equities.
-        home_campaigns = (
-            view_campaigns if view_category == asset_category
-            else campaigns_for(conn, asset_category, report.episodes)
-        )
         state: dict[str, Any] = {
             "version": __version__,
             "generated_at": _now(),
@@ -756,13 +730,11 @@ def build_state(
             "trade_type_label": scope.label,
             "stats": stats_data(
                 month_stats(conn, selected, asset_category=view_category,
-                            scope=scope, report=view_report,
-                            campaign_list=view_campaigns, scoring=scoring)
+                            scope=scope, report=view_report)
             ),
             "all_time": stats_data(
                 month_stats(conn, None, asset_category=view_category,
-                            scope=scope, report=view_report,
-                            campaign_list=view_campaigns, scoring=scoring)
+                            scope=scope, report=view_report)
             ),
             "positions": positions_data(conn),
             "allocation": allocation_data(conn),
@@ -778,7 +750,8 @@ def build_state(
             "strategies": campaign_events(orders, view_campaigns),
             # ... and further linked into position lifecycles: the open and
             # the close of one position share an episode, so they are one
-            # card. The union is `campaigns.link`'s, shared with the scoreboard.
+            # card. The union is `campaigns.link`'s, shared with the
+            # open-position count.
             "lifecycles": position_groups(
                 orders,
                 episodes=view_episodes,
@@ -851,13 +824,13 @@ def build_state(
         state["annual"] = [
             stats_data(s) for s in annual_stats(
                 conn, asset_category=asset_category,
-                report=report, campaign_list=home_campaigns, scoring=scoring,
+                report=report,
             )
         ]
         state["monthly"] = [
             stats_data(s) for s in monthly_stats(
                 conn, asset_category=asset_category,
-                report=report, campaign_list=home_campaigns, scoring=scoring,
+                report=report,
             )
         ]
         # The Annual table's total row. Deliberately not `all_time`, which is the
@@ -865,8 +838,7 @@ def build_state(
         # year rows stayed whole while that total shrank, so the table stopped
         # adding up -- destroying the one reconciliation it exists to show.
         state["annual_total"] = stats_data(
-            month_stats(conn, None, asset_category=asset_category, report=report,
-                        campaign_list=home_campaigns, scoring=scoring)
+            month_stats(conn, None, asset_category=asset_category, report=report)
         )
         # Cohorts are the whole book by definition -- they exist to compare the
         # 0DTE subset against everything else, so scoping them to 0DTE would
@@ -942,7 +914,6 @@ def build_state(
         # flag, so the stored value is the only thing that can be in force and a
         # form offering to edit it can never be lying about taking effect.
         "confirm_query_id": None if demo else prefs.confirm_query_id(),
-        "scoring": state["stats"]["scoring"],
         # The reader's dashboard tiles, or null for the default arrangement.
         "tiles": prefs.tiles(),
         # Deliberately NOT a keyring lookup. `flex.read_token` reaches the OS
@@ -1367,7 +1338,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             try:
                 month = params.get("month")
                 trade_type = params.get("type")
-                scoring = params.get("scoring")
                 self._json(200, build_state(
                     db_path=self.cfg.db_path,
                     archive_dir=self.cfg.archive_dir,
@@ -1386,11 +1356,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     # rather than a delimiter this layer has to invent and the
                     # page has to match. parse_qs already hands us the list.
                     cost_scope=params.get("cost"),
-                    # Unvalidated here on purpose: `stats.scoring_or_default`
-                    # owns the vocabulary, and a second check in this layer is a
-                    # second place for the two to disagree about what a valid
-                    # unit is.
-                    scoring=scoring[0] if scoring else None,
                 ))
             except sqlite3.OperationalError as exc:
                 self._json(500, {"error": f"database not readable: {exc}"})
@@ -1808,18 +1773,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                              "message": f"{raw!r} is not a Flex query id: "
                                         "Client Portal shows it as digits."}
             changes["confirm_query_id"] = raw or None
-        if "scoring" in body:
-            raw = str(body.get("scoring") or "").strip()
-            if raw and raw not in SCORINGS:
-                return 400, {"ok": False, "kind": "scoring",
-                             "message": f"unknown scoreboard unit {raw!r}"}
-            # The DEFAULT is stored as absence, matching the hash and the wire:
-            # one spelling of "position" rather than two that can disagree.
-            changes["scoring"] = None if raw in ("", POSITION_SCORING) else raw
         if "tiles" in body:
             tiles = body.get("tiles")
             if tiles in (None, []):
-                # An explicit reset. Absence is the default, as for `scoring`.
+                # An explicit reset. Absence is the default.
                 changes["tiles"] = None
             else:
                 problem = _tiles_problem(tiles)
