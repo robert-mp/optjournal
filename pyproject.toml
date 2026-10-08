@@ -1,6 +1,6 @@
 [project]
 name = "optjournal"
-version = "0.3.0"
+version = "0.4.0"
 description = "Options trading journal backed by IBKR Flex Web Service"
 requires-python = ">=3.12"
 dependencies = [
