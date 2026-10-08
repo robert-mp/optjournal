@@ -718,7 +718,7 @@ def _matching_seconds(n: int) -> float:
 
     cards = [Campaign(episode_indices=(k,), conids=("1",),
                       order_ids=frozenset({str(10_000 + k)}), is_decided=False,
-                      closed_at=None, realized=None, commission=None,
+                      closed_at=None, realized=None,
                       anchor=str(10_000 + k), key=("ibkr", "U1", f"t:x{k}"),
                       parts={("ibkr", f"x{k}"): (False, f"2026-09-01 {k}")})
              for k in range(n)]

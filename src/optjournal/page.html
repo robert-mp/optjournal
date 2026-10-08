@@ -283,8 +283,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} query_id_source -- 'stored', 'override' or 'unset'.
  *   'override' means a --query-id flag or $OPTJOURNAL_QUERY_ID outranks the
  *   stored value, so the form must not offer to edit what would not take effect
- * @property {string} scoring -- the scoreboard unit in force, same value as
- *   stats.scoring; here so the settings form reads its own block
  * @property {string[]|null} tiles -- the dashboard tiles shown, in order; null is
  *   the default arrangement (settings.tiles, validated by web._settings_write)
  * @property {Object|null} token -- ALWAYS null on load. The keyring has been
@@ -426,25 +424,18 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} asset_category
  * @property {number} total_trades -- FILLS: how many executions, not outcomes
  * @property {number} orders
- * @property {Money} net_pnl -- options: closed round trips only, net of commission
- * @property {Money} commissions -- options: commission of round trips CLOSED here
+ * @property {Money} net_pnl -- what IBKR booked on the period's fills, net of
+ *   commission, a partial close included
+ * @property {Money} commissions -- billed on the period's fills
  * @property {Money} fees -- account-level, not attributable to the journal
- * @property {number} closed_episodes -- contract round trips closed here: the
- *   MONEY's unit, since net_pnl and commissions are attributed by it
+ * @property {number} closed_episodes -- contract round trips closed here, by the
+ *   trade date of the last closing fill: the scoreboard's unit, which wins,
+ *   losses and the averages count. The headline trade count for options
  * @property {number} open_episodes -- open CONTRACTS; a strangle is two
  * @property {number} open_positions -- open positions, grouping a multi-leg
  *   strategy into one. Attached by web.build_state, not month_stats: it needs
  *   the campaign grouping, which is built after the stats are
- * @property {string} scoring -- 'position' or 'contract': which unit the five
- *   figures below count. Read for LABELS, never to recompute -- the server has
- *   already counted in this unit, and a page that re-derived the other reading
- *   would be a second implementation of campaigns.py
- * @property {number} decided_campaigns -- the headline trade count for options,
- *   and the scoreboard's unit: under 'position', positions whose every contract
- *   is closed (a roll continues one, so this sits below closed_episodes while
- *   one is in flight); under 'contract', each closed round trip. Always equals
- *   wins + losses
- * @property {number} wins -- decided outcomes that netted up, in `scoring`'s unit
+ * @property {number} wins -- closed round trips that netted up
  * @property {number} losses
  * @property {number|null} win_rate -- null until anything was decided
  * @property {Money|null} avg_win -- null without wins; an average of no
@@ -458,11 +449,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   lifecycles (stats.strategy_ranking); null with nothing decided
  * @property {StrategyRank|null} worst_strategy -- null unless two or more
  *   strategies decided, since one would repeat best_strategy
- * @property {Money} inflight_realized -- the part of net_pnl that closed inside a
- *   position still running (a roll's near contract). In the money, out of the
- *   scoreboard; provenance, not a forecast, since it can fall
  * @property {Money} open_premium -- excluded from P&L until positions close
- * @property {Money} open_commission -- excluded the same way
  * @property {number|null} net_liq_base -- null until equity summaries exist
  * @property {string|null} net_liq_date
  * @property {number|null} gain_pct_of_net_liq
@@ -1225,8 +1212,9 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} episodes
  * @property {number} fills
  * @property {Money} proceeds
- * @property {Money|null} realized_pnl -- null until the lifecycle is closed
- * @property {Money|null} commission -- same rule
+ * @property {Money|null} realized_pnl what IBKR booked on the card's fills, net
+ *   of commission, a partial close included, as on the Dashboard and the
+ *   Calendar. Null until a leg closes something
  * @property {Array} events -- StrategyGroup rows
  * @property {string} replay_key -- index into State.replays
  */
@@ -1471,7 +1459,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *  One name per shape, deliberately: reusing one name for two shapes blinds
  *  the guard to both. Declared here, in the file being edited, in the same
  *  diff as the code that introduces the name.
- * @payload st:State s:Stats best:Stats alt:Stats x:Episode ep:Episode dy:Day
+ * @payload st:State s:Stats best:Stats x:Episode ep:Episode dy:Day
  * @payload se:Settings tok:TokenStatus pv:Provisional
  * @payload rk:StrategyRank
  * @payload pos:Position o:Order l:Leg h:History al:Allocation ar:AllocationRow
@@ -1509,8 +1497,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local JSON Object ages input mine qb wf was
  * @local when parts names raw err
  * @local COST_OPTIONS bits cost fees on wh
- * @local STATS_KEYS_REQUIRED missing state SCOPE_KEYS
- * @local SCORINGS qidsave cqidsave tokcheck toksave
+ * @local missing state SCOPE_KEYS
+ * @local qidsave cqidsave tokcheck toksave
  * @local WMETER WRING arc tin tout sb
  * @local events
  * @local COLLECT_BANNER c adv
@@ -1626,17 +1614,6 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      an HTTP request, so they must not ride along on every payload reload. Null
      until the Watchlist tab asks. */
   quotes:null,quotesAt:null,wqat:0,
-  /* The scoreboard's unit: null means "the server's default" (position), the
-     same convention `cost` uses, so the page carries no duplicate of a decision
-     that lives in stats.py and cannot drift from it.
-
-     IN the hash, and a SERVER round trip when it changes -- unlike the display
-     currency, which restates client-side. Wins and losses are counted from the
-     campaign linkage, so the other reading is not derivable from a payload
-     already summarised in one unit: asking the server is the only way to get it
-     without reimplementing campaigns.py here, which is exactly the duplication
-     that module exists to prevent. */
-  scoring:null,
   /* IV ranks, from the SAME reply as the quotes, and the whole reply rather than
      just its ranks: `{ranks, unranked, ranks_failed}`. The two lists are kept
      because they are what lets a dash say WHICH absence it is -- not fetched, not
@@ -1713,8 +1690,7 @@ const cash=(v,d)=>money(conv(v),DISP(),d);
    figure reading differently on two tabs is the defect this replaced. */
 /* One rule for every as-charged figure: show the charge when the reader is
    already in the currency it was charged in, else the restatement. Written
-   once because figures that share a sentence must share a basis -- "as charged
-   · $2.83 on open positions" is a contradiction if only one of them is.
+   once because figures that share a sentence must share a basis.
 
    `chargeOf` is the rule; `moneyOf` applies it to a Money-shaped payload key.
    Four near-identical wrappers (commissionOf, openCommissionOf, openPremiumOf,
@@ -2078,120 +2054,6 @@ function renderViewOptions(){
     b.onclick=()=>{S.ccy=b.dataset.ccy;draw();});
 }
 
-/* ------------------------------------------------ scoreboard unit toggle */
-/* The two units, first one default -- the same order `stats.SCORINGS` declares,
-   because applyHash and syncHash both treat element 0 as the value not worth
-   recording in a URL. */
-const SCORINGS=['position','contract'];
-/* The unit IN FORCE, which is the one the figures in hand were counted in: the
-   server applies the stored preference whenever a request names no unit, so
-   reading only S.scoring lit "Per position" over per-contract figures on a fresh
-   page with contract stored. S.scoring itself stays the unit the request
-   explicitly names (the hash's, or null for "the stored one"). Copying the
-   payload's unit into it made an inferred unit an explicit one: a rolled-back or
-   bookmarked contract then overrode a later change of the preference. */
-const SCORING=()=>((S.state||{}).stats||{}).scoring||S.scoring||SCORINGS[0];
-/* Whether the journal holds any position made of more than one contract. When
-   nothing is grouped the two readings are ARITHMETICALLY IDENTICAL, and a
-   toggle that visibly changes nothing reads as broken rather than as agreement
-   -- so it says so instead of offering a choice with no consequence.
-
-   Derived from the payload the same way the 0DTE and Equities buttons are:
-   closed_episodes exceeds decided_campaigns exactly when grouping merged
-   something. Read off `all_time`, never the selected month: a single month may
-   group nothing while the journal does, and the control is global. */
-function groupingMatters(){
-  const alt=(S.state||{}).all_time;
-  if(!alt) return false;
-  /* Under contract scoring the two are equal BY CONSTRUCTION, so this test
-     cannot see grouping in the payload it is looking at. The open book is the
-     other witness: a multi-contract position that has not closed yet is still
-     grouping the reader will meet. */
-  return SCORING()===SCORINGS[1]
-    ? true
-    : alt.closed_episodes!==alt.decided_campaigns
-      ||alt.open_episodes!==alt.open_positions;
-}
-function scoringLabel(unit){
-  return unit===SCORINGS[1]?'Per contract':'Per position';
-}
-function scoringTip(unit){
-  return unit===SCORINGS[1]
-    ? 'Score every contract round trip on its own: each leg of a strangle, and '
-      +'each leg of a roll, counts as its own win or loss. This is what a '
-      +'broker trade log shows, so it is the reading to use when reconciling '
-      +'against one.'
-    : 'Score the decision: a multi-leg structure and every roll of it count '
-      +'once, and the outcome is the sum of their contracts. A hedge leg cannot '
-      +'be a loss inside a winning position, and a loser cannot be rolled out '
-      +'and scratched into a win.';
-}
-/* The noun for one outcome, taken from the PAYLOAD's scoring rather than the
-   control's. The two are the same once a load settles, and differ for exactly
-   the moment that matters: a payload counted in the old unit must not be
-   labelled with the new one. Both helpers take the stats block for that reason,
-   so a caller cannot accidentally read the control instead.
-
-   `n` for the plural, because "1 decided positions" is the kind of detail that
-   makes a reader distrust every other figure on the card. */
-function unitWord(s,n){
-  const one=(s||{}).scoring===SCORINGS[1]?'contract round trip':'position';
-  return n===1?one:one+'s';
-}
-function unitNote(s){
-  return `decided ${unitWord(s,2)}`;
-}
-/* Rendered inside the cog panel rather than the header, and the header is why:
-   nine tabs, a theme chip, the currency pair and two icons already wrap onto a
-   second line, so a fourth control there cost more legibility than it bought. A
-   scoring unit is also a SET-ONCE preference -- unlike the display currency,
-   which a reader flips to check a figure against the broker -- and set-once
-   belongs behind the settings button.
-
-   What that costs, and how it is paid: the control is no longer on screen beside
-   the figures it governs, so a reader could forget which unit they are in. Every
-   surface therefore NAMES the unit in place -- the stat cards' notes via
-   `unitWord`, the Annual footnote, and `scoringBanner` below whenever the
-   reading is not the default. The rule the header placement was protecting was
-   never "the control must be visible", it was "the numbers must never be
-   unlabelled", and that one still holds. */
-function scoringRow(){
-  const matters=groupingMatters();
-  const row=SCORINGS.map(unit=>{
-    const on=unit===SCORING();
-    const tip=matters?scoringTip(unit)
-      :'Every position in this journal is a single contract, so both readings '
-       +'count the same outcomes and this changes nothing yet.';
-    return `<button data-scoring="${esc(unit)}" class="${on?'on':''}"
-      ${matters?'':'disabled'} title="${esc(tip)}"
-      >${esc(scoringLabel(unit))}</button>`;
-  }).join('');
-  /* Wrapped in a `.setrow` so the toggle sizes to its content like every other
-     control in this panel. Bare, `.ccytog` is a block-level flex container and
-     stretched the full width of the card -- two buttons on the left and a metre
-     of empty border to the right, which reads as a layout that broke rather than
-     as a segmented control. */
-  return `<h2 class="sub3 mt-5">Scoreboard</h2>
-    <div class="setrow"><div class="ccytog">${row}</div></div>
-    <div class="note">Which unit <b>W</b>, <b>L</b>, win rate and the averages
-      count, on every tab. ${esc(scoringTip(SCORING()))}${infoTip(
-      `The money never moves: net P&amp;L, commission and the fill counts are
-       identical under both readings, so the two differ only in how many outcomes
-       the same cash is divided into.`)}${matters?'':` Nothing in this journal is
-      grouped yet, so both readings currently agree.`}</div>`;
-}
-/* Said out loud wherever the figures are, and ONLY when the reading is not the
-   default. A per-contract scoreboard sitting under an unlabelled "Winning
-   Trades" card is the one way this feature can mislead now that its control
-   lives behind a button -- and the default needs no announcement, for the same
-   reason it is the one value the hash omits. */
-function scoringBanner(s){
-  return (s||{}).scoring===SCORINGS[1]
-    ? ` Scored <b>per contract round trip</b>: each leg of a spread and each leg
-       of a roll counts as its own win or loss.`
-    : '';
-}
-
 /* One sentence telling the reader which currency they are looking at, and
    whether it is IBKR's own figure or a restatement of it. */
 function ccyNote(){
@@ -2348,7 +2210,7 @@ const TILES=[
   ['commissions','Commissions'],['avg_pnl','Avg P&L / Trade'],
   ['gain','Gain % of Net Liq'],['open_premium','Open Premium'],
   ['open_positions','Open Positions'],['green_days','Green Days'],
-  ['red_days','Red Days'],['inflight','In-flight Realised'],
+  ['red_days','Red Days'],['orders','Orders'],
   ['best_strategy','Best Strategy'],['worst_strategy','Worst Strategy'],
   ['largest_win','Largest Win'],['largest_loss','Largest Loss'],
 ];
@@ -2422,46 +2284,14 @@ function dashboard(){
   const st=S.state, s=st.stats;
   const label=monthLabel(s.month);
   const opt=s.asset_category==='OPT';
-  /* Options P&L counts fully closed round trips only, landing on the close
-     date; premium on an open short is a liability, not profit. Stock P&L is
-     IBKR's per-fill realisation. The note under the card says which rule the
-     number obeys rather than letting two definitions share one label.
-
-     The in-flight clause names the one place this figure and the scoreboard
-     part company. A roll settles its near contract for real cash while the
-     DECISION carries on, so that money is in Net P&L (it left the broker, and
-     dropping it would stop this panel reconciling with the statement) and out
-     of the wins, losses and averages, which wait for the position to finish.
-     Without the clause the reader gets 2 decided positions beside a P&L holding
-     three positions' cash and nothing to explain it -- the question this note
-     exists to answer, asked out loud before it was written.
-
-     Says "closed inside a position still running", never "unrealised": the
-     figure can FALL, since rolling a winner into a loser leaves the finished
-     campaign worth less than this. It is provenance, not a forecast. */
-  const inflight=opt&&s.inflight_realized&&s.inflight_realized.base
-    ?` · ${moneyOf(s.inflight_realized)} of this closed inside a position still running`
-    :'';
-  const pnlNote=(opt?'closed round trips only, net of commission'
-               :'realised per fill, net of commission')+inflight;
   const nl=s.net_liq_base;
-  /* For options, the headline trade count is DECIDED POSITIONS -- the same
-     population the wins, losses and averages measure. Counting fills here
-     made a month claim trades it had no outcome for: open the position in
+  /* For options, the headline trade count is CLOSED CONTRACT ROUND TRIPS, the
+     same population the wins, losses and averages measure. Counting fills
+     here made a month claim trades it had no outcome for: open the position in
      July, close it in August, and July's card said "3 trades" while its P&L,
      wins and losses all correctly said the outcome was August's. A trade
      counts in the month it closed, full stop. Fills stay visible in the
-     sub-note as what they are -- activity, not trades.
-
-     The unit is whichever the reader chose, and the sub-note names it. Under
-     the default it is decided POSITIONS, not closed contract round trips, and
-     the two differ: a roll continues one position across two contracts, so the
-     episode count scored a single decision twice. The contract count stays in
-     the sub-note either way because it is the money's unit -- Net P&L and
-     Commissions below are attributed by it -- and a reader who adds up the P&L
-     needs to see it. Under contract scoring the two are equal, and the note
-     saying so twice is honest rather than redundant: it is the reconciliation
-     the reader came for. */
+     sub-note as what they are, activity rather than trades. */
   /* A KEYED REGISTRY, rendered in the order the reader chose. The keys are TILES'
      at the top of the script, where the chooser in Settings reads their labels;
      the figures are here because each needs the period's stats in scope.
@@ -2473,22 +2303,16 @@ function dashboard(){
      and a uniform grid is what makes an ORDER mean anything: with one tile
      spanning the first row, "put Win Rate first" had nowhere to go. */
   const R={
-    net_pnl:()=>statCard('Net P&L', moneyOf(s.net_pnl), pnlNote,
+    net_pnl:()=>statCard('Net P&L', moneyOf(s.net_pnl),
+      'realised per fill, net of commission',
       cls(s.net_pnl.base)+' '+(String(moneyOf(s.net_pnl)).length>10?'sm':''),
       'net_pnl'),
     trades:()=>opt
-      ? statCard('Trades', s.decided_campaigns,
-          `decided ${unitWord(s,s.decided_campaigns)}`
-          +` · ${s.closed_episodes} contract round trip(s)`
+      ? statCard('Trades', s.closed_episodes,
+          `closed contract round trip${s.closed_episodes===1?'':'s'}`
           +` · ${s.total_trades} fill(s), ${s.orders} order(s)`,'','trades')
       : statCard('Total Trades', s.total_trades,
           s.orders?`${s.orders} order(s)`:'','','trades'),
-    /* Commission rides the same attribution as the P&L it is already inside:
-       for options, the round trip's whole commission lands in its close month.
-       Fill-date commission here showed the same euros twice -- July displayed
-       the opening legs' cost, August's net P&L contained it again. Commission
-       on still-open positions is a sub-note, like open premium: real cash,
-       no outcome yet. */
     /* `Math.abs`, matching the Annual and Month tables. The same all-time
        figure read "−€26.25" here and "€26.25" there, so a reader checking one
        against the other had to know which sign convention each surface chose.
@@ -2501,10 +2325,7 @@ function dashboard(){
        number the page forgot to finish rather than as a deliberate neutral.
        A commission is never a gain, so there is no sign to consult. */
     commissions:()=>statCard('Commissions', chargeMo(s.commissions),
-      basisOf(s.commissions)
-      +(opt?` · closed round trips${s.open_commission.base?` · ${
-        chargeMo(s.open_commission)} on open positions`:''}`
-         :' · stated by IBKR'),
+      basisOf(s.commissions)+' · stated by IBKR',
       /* Same length rule as Net P&L above, not an unconditional `sm`. Fixed at
          19px this was the only card on the dashboard permanently smaller than
          its neighbours, which read as a different typeface rather than as a
@@ -2513,20 +2334,14 @@ function dashboard(){
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
-    /* The unit these four count is the reader's choice, so the note NAMES it
-       rather than asserting one. Under 'position' a roll is one decision and its
-       outcome is the sum of every contract in the chain, so a loser cannot be
-       rolled out and scratched into a win; under 'contract' each round trip
-       stands alone, which is what a broker log shows. Taken from the payload's
-       own `scoring`, never from `S.scoring`: the figures were counted by the
-       server, and labelling them from the control would let a stale payload be
-       described by a unit it was not counted in. */
-    wins:()=>statCard('Winning Trades', s.wins, unitNote(s), s.wins?'pos':'','wins'),
-    losses:()=>statCard('Losing Trades', s.losses, unitNote(s), s.losses?'neg':'','losses'),
+    wins:()=>statCard('Winning Trades', s.wins, 'closed contract round trips',
+      s.wins?'pos':'','wins'),
+    losses:()=>statCard('Losing Trades', s.losses, 'closed contract round trips',
+      s.losses?'neg':'','losses'),
     win_rate:()=>statCard('Win Rate', pct(s.win_rate),
-      s.decided_campaigns?`${s.decided_campaigns} decided ${unitWord(s,
-        s.decided_campaigns)}`:'nothing decided yet','','win_rate'),
-    avg_win:()=>statCard('Avg Win', moneyOf(s.avg_win), `per decided ${unitWord(s,1)}`,
+      s.closed_episodes?`${s.closed_episodes} closed contract round trip${
+        s.closed_episodes===1?'':'s'}`:'nothing closed yet','','win_rate'),
+    avg_win:()=>statCard('Avg Win', moneyOf(s.avg_win), 'per closed contract round trip',
       cls(s.avg_win?.base),'avg_win'),
     /* An em-dash on a card whose figure is genuinely absent reads as "this
        failed to load". `none yet` says the same thing as data: there have been
@@ -2535,11 +2350,11 @@ function dashboard(){
        still renders as the number it is, and the `—` remains for the case the
        payload truly has nothing to say. */
     avg_loss:()=>statCard('Avg Loss',
-      s.losses===0&&s.decided_campaigns>0?'<span class="nil">none yet</span>'
+      s.losses===0&&s.closed_episodes>0?'<span class="nil">none yet</span>'
         :moneyOf(s.avg_loss),
-      s.losses===0&&s.decided_campaigns>0
-        ?`${s.decided_campaigns} decided, none at a loss`
-        :`per decided ${unitWord(s,1)}`,
+      s.losses===0&&s.closed_episodes>0
+        ?`${s.closed_episodes} closed, none at a loss`
+        :'per closed contract round trip',
       cls(s.avg_loss?.base),'avg_loss'),
     gain:()=>nl!=null
       ? statCard('Gain % of Net Liq', pct(s.gain_pct_of_net_liq,2),
@@ -2556,16 +2371,12 @@ function dashboard(){
       return statCard('Profit Factor',
         pf!=null?num(pf,2)
           :s.wins&&!s.losses?'<span class="nil">no losses</span>':'—',
-        pf!=null?`gross won over gross lost · ${s.decided_campaigns} decided ${
-          unitWord(s,s.decided_campaigns)}`:s.wins&&!s.losses
-          ?`${s.wins} won, none lost`:'nothing decided yet',
+        pf!=null?`gross won over gross lost · ${s.closed_episodes} closed contract round trip${
+          s.closed_episodes===1?'':'s'}`:s.wins&&!s.losses
+          ?`${s.wins} won, none lost`:'nothing closed yet',
         pf==null?'':pf>1?'pos':pf<1?'neg':'','profit_factor');},
-    /* Over DECIDED units, scratches included, and not Net P&L over the count: Net
-       P&L also carries cash settled inside a position still running, which no
-       decided outcome earned. The server computes it from the same list the
-       wins and losses split. */
     avg_pnl:()=>statCard('Avg P&L / Trade', moneyOf(s.avg_pnl),
-      `per decided ${unitWord(s,1)}, scratches included`,
+      'per closed contract round trip, scratches included',
       cls(s.avg_pnl?.base),'avg_pnl'),
     /* The figure the header's pill also shows. A tile as well because a pill is
        fixed and a tile is chosen: a premium seller who wants it beside the win
@@ -2580,34 +2391,30 @@ function dashboard(){
       'days whose realised P&L closed above zero', s.green_days?'pos':'','green_days'),
     red_days:()=>statCard('Red Days', s.red_days,
       'days whose realised P&L closed below zero', s.red_days?'neg':'','red_days'),
-    /* Never "unrealised": see the in-flight clause on Net P&L above. This is cash
-       that settled, inside a decision that has not. */
-    inflight:()=>statCard('In-flight Realised', moneyOf(s.inflight_realized),
-      'in Net P&L, but inside a position still running', cls(s.inflight_realized.base),
-      'inflight'),
+    orders:()=>statCard('Orders', s.orders, 'orders filled', '','orders'),
     /* A strategy tile names a SHAPE and carries its money underneath, because the
        name is the answer and the sum is its evidence -- a tile reading only
        "Strangle" asks the reader to trust it. Summed, not averaged: see
        stats.strategy_ranking. Worst is absent rather than equal to best when one
        strategy decided everything, and says so. */
     best_strategy:()=>stratTile('Best Strategy', s.best_strategy, 'best_strategy',
-      'nothing decided yet'),
+      'nothing closed yet'),
     worst_strategy:()=>stratTile('Worst Strategy', s.worst_strategy, 'worst_strategy',
-      s.best_strategy?'only one strategy decided':'nothing decided yet'),
+      s.best_strategy?'only one strategy decided':'nothing closed yet'),
     largest_win:()=>statCard('Largest Win', moneyOf(s.largest_win),
-      `the best single decided ${unitWord(s,1)}`, cls(s.largest_win?.base),'largest_win'),
+      'the best single closed contract round trip', cls(s.largest_win?.base),'largest_win'),
     largest_loss:()=>statCard('Largest Loss',
-      s.losses===0&&s.decided_campaigns>0?'<span class="nil">none yet</span>'
+      s.losses===0&&s.closed_episodes>0?'<span class="nil">none yet</span>'
         :moneyOf(s.largest_loss),
-      s.losses===0&&s.decided_campaigns>0?`${s.decided_campaigns} decided, none at a loss`
-        :`the worst single decided ${unitWord(s,1)}`,
+      s.losses===0&&s.closed_episodes>0?`${s.closed_episodes} closed, none at a loss`
+        :'the worst single closed contract round trip',
       cls(s.largest_loss?.base),'largest_loss'),
   };
   function stratTile(k,rk,key,none){
     return rk
       ? statCard(k,`${esc(rk.label)}<span class="vsub ${cls(rk.pnl.base)}">${
           moneyOf(rk.pnl)}</span>`,
-          `${rk.decided} decided position(s), realised P&L summed`,'sm',key)
+          `${rk.decided} closed position(s), realised P&L summed`,'sm',key)
       : statCard(k,'—',none,'dim2',key);
   }
   const cards=tileKeys().map(k=>R[k]()).join('');
@@ -2621,15 +2428,10 @@ function dashboard(){
    * heading's `i`; the second was already said by every € on the page, and ccyNote
    * returns nothing in the base case now.
    *
-   * What is left in the `.sub` appears only when it is true: a restatement rate, a
-   * non-default scoring unit, unsettled fills. It is often empty, and that is the
-   * point -- an empty caption means there is nothing unusual about these figures,
-   * which is worth being able to see at a glance rather than having to read for.
-   *
-   * The round-trip reconciliation below follows the same split. Two counts that
-   * disagree is a fact on screen and has to be named or the figures look wrong, so
-   * the line stays; WHY they disagree is four sentences nobody re-reads on the
-   * ninth visit, so it moved behind an `i`.
+   * What is left in the `.sub` appears only when it is true: a restatement rate or
+   * unsettled fills. It is often empty, and that is the point. An empty caption
+   * means there is nothing unusual about these figures, which is worth being able
+   * to see at a glance rather than having to read for.
    *
    * NOTE ON PLACEMENT: this is a JS comment above the return, not an HTML comment
    * inside the template. An HTML comment there is shipped to the client for no
@@ -2639,12 +2441,12 @@ function dashboard(){
   return `${scopeNote()}
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Statistics${infoTip(
-      (opt?`Options P&amp;L counts fully closed round trips only, on the day they
-        closed — an open or partially closed position contributes nothing until it
-        is flat.`:`Stock P&amp;L is IBKR's per-fill realisation, net of commission.`)
+      `P&amp;L is IBKR's per-fill realisation, net of commission, on the day each
+        fill trades, so a partial close counts the day it fills. A round trip is a
+        win or a loss once it is flat.`
       +` <br><br>Scope: ${esc(s.asset_category)} trades and commission only.
         Account-level fees and other instruments are on the Costs tab.`)}</h2>
-      <div class="sub">${esc(ccyNote())}${scoringBanner(s)}${provisionalBanner()}</div></div>
+      <div class="sub">${esc(ccyNote())}${provisionalBanner()}</div></div>
       <div class="pills">
         ${S.type?`<span class="pill" title="Every trade-derived figure below is
           restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
@@ -2655,12 +2457,11 @@ function dashboard(){
           >open <b>${s.open_positions}</b></span>
         ${opt&&s.open_premium.base?`<span class="pill" title="Net premium sitting in
           positions that are still open — collected on shorts, paid on longs. Not
-          in Net P&L: premium is a liability until the position closes, and it
-          lands there, in full, on the day it does."
+          in Net P&L: premium is a liability until a fill closes the contract, and
+          each closing fill brings its share in on the day it trades."
           >open premium <b class="${cls(s.open_premium.base)}">${
           moneyOf(s.open_premium)}</b></span>`:''}
-        <span class="pill" title="Commission on ${esc(s.asset_category)} trades${
-          opt?', closed round trips only -- commission on open positions is on the Commissions card':''}.
+        <span class="pill" title="Commission on ${esc(s.asset_category)} trades.
           Commission carries an asset category, so this figure is genuinely
           scoped to this journal."
           >${esc(s.asset_category)} <b>${moneyOf(s.options_friction)}</b></span>
@@ -2668,23 +2469,12 @@ function dashboard(){
     <div class="stats">${cards}</div>
     ${s.closed_episodes===0?`<div class="note">Nothing has closed yet, so the
       outcome figures are empty rather than zero.${infoTip(
-      `Net P&amp;L, Win Rate, Avg Win and Avg Loss all wait for a round trip to
-       finish — an open or partially closed position contributes nothing.
+      `Win Rate, Avg Win and Avg Loss wait for a round trip to finish. Net P&amp;L
+       does not: a partial close counts the day it fills.
        <br><br>${s.open_premium.base?`The ${cash(s.open_premium.base)} net premium in
        the ${s.open_positions} open position(s) is not profit until they close.`
        :`The ${s.open_positions} open position(s) are under <b>Positions</b>.`}`
       )}</div>`:''}
-    ${opt&&s.closed_episodes!==s.decided_campaigns?`<div class="note">${
-      s.closed_episodes} contract round trips · ${s.decided_campaigns} decided
-      positions${infoTip(`These count different things and both are right.
-        <br><br>A roll closes one contract and opens the next, so a single decision
-        can span several round trips. The extra round trip(s) belong to a position
-        still in flight, or to one that finished in another month.
-        <br><br>Their P&amp;L is inside <b>Net P&amp;L</b> above, on the day it
-        landed — the cash left the broker, so dropping it would stop this panel
-        reconciling with the statement. The OUTCOME is scored where the position
-        finished, which is why wins plus losses equals the ${
-        s.decided_campaigns} decided rather than the ${s.closed_episodes}.`)}</div>`:''}
   </div>
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Performance</h2>
@@ -3029,8 +2819,8 @@ function calendar(){
   return `${scopeNote()}
   <div class="card">
     <div class="crow"><div><h2>${esc(monthLabel(month))}${infoTip(
-      `An options outcome lands, whole, on the day the round trip CLOSED — so a day
-       with only opening or partial-close fills shows the activity and a dash, not
+      `Each day carries the P&amp;L IBKR booked on its fills, a partial close
+       included. A day with only opening fills shows the activity and a dash, not
        money.`)}</h2>
       <div class="sub">Daily realised P&L.</div></div>
       <div class="pills">
@@ -3049,10 +2839,9 @@ function calendar(){
 
 function dayDetail(by){
   /* The clicked day's trades, from the leg data already in the payload --
-     no extra request. Legs are matched by their own fill date, so this shows
-     the day's ACTIVITY; the day cell's money remains close-attributed P&L,
-     and the two can legitimately differ (an opening day shows fills and a
-     dash). The panel says which day it describes rather than leaving the
+     no extra request. Legs are matched by their own fill date, the day the
+     cell's money is booked on, so an opening day shows its fills beside a
+     dash. The panel says which day it describes rather than leaving the
      reader to infer it from the highlight. */
   const key=S.calday;
   if(!key) return `<div class="note">Click a day with fills to see its trades.</div>`;
@@ -3639,22 +3428,21 @@ function trades(){
      grouping can never join two different contracts or split one. Below the
      lifecycle, each EVENT (the strategy-grouped orders from strategies.py)
      stays fully visible with its legs, so the order-level truth is intact.
-     Realised P&L and commission are episode-sourced and appear only once
-     the lifecycle is closed -- the same rule the Dashboard follows. */
+     Realised P&L is what IBKR booked on the card's fills, the Dashboard's and
+     the Calendar's rule. So an open card already carries a partial close and a
+     roll's closed leg, on the card and on the event holding the fill. */
   const lcs=S.state.lifecycles||[];
   if(!lcs.length) return `${scopeNote()}${orphanNotes()}<div class="card"><div class="empty">no option orders</div></div>`;
   return scopeNote()+orphanNotes()+lcs.map(lc=>{
     const evs=lc.events||[];
     const legs=evs.flatMap(g=>(g.orders||[]).flatMap(o=>o.legs||[]));
-    const nat=legs[0]?legs[0].currency:'';
     const openLc=lc.status==='open';
     const when=openLc?`opened ${esc((lc.opened_at||'').slice(0,10))} · still open`
       :`${esc((lc.opened_at||'').slice(0,10))} → ${esc((lc.closed_at||'').slice(0,10))}`;
     /* Unrealised for an open lifecycle comes from the position snapshot, summed
-       over the legs this lifecycle holds -- realised money does not exist until
-       the position is flat, the same rule the Dashboard and the stat cards
-       follow. Summed in base through `.base` because two legs can be quoted in
-       different currencies, which is what the Money gate exists to catch. */
+       over the contracts this lifecycle still holds. Summed in base through
+       `.base` because two legs can be quoted in different currencies, which is
+       what the Money gate exists to catch. */
     const rp=(S.state.replays||{})[lc.replay_key];
     const shown=S.replay===lc.replay_key;
     let uz=0; (S.state.positions||[]).forEach(pos=>{
@@ -3663,6 +3451,10 @@ function trades(){
     const score=openLc?['Unrealised',`<b class="${cls(uz)}">${cash(uz)}</b>`]
       :['Realised',`<b class="${cls(lc.realized_pnl?.base)}">${
         lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—'}</b>`];
+    const realised=statCard('Realised',
+      lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—',
+      openLc?'booked so far, net of commission':'net of commission',
+      'sm '+cls(lc.realized_pnl?.base));
     return `<div class="card">
       <div class="crow${rp?' rk':''}"${rp?` data-replay="${esc(lc.replay_key)}"
         role="button" tabindex="0" aria-expanded="${shown?'true':'false'}"`:''}><div><h2>${
@@ -3675,19 +3467,8 @@ function trades(){
           } <span class="caret${shown?' open':''}">▸</span></div>`:''}
       </div>
       ${shown&&rp?replayPanel(rp,score[0],score[1]):''}
-      <div class="stats c3">
-        ${statCard('Proceeds', moneyOf(lc.proceeds),
-          nat&&nat!==DISP()?`${money(legs.reduce((a,l)=>a+(l.proceeds||0),0),nat)} as filled`:'',
-          'sm '+cls(lc.proceeds.base))}
-        ${statCard('Comms & Fees',
-          lc.commission!=null?chargeMo(lc.commission):'—',
-          openLc?'lands with the outcome, on close':'all legs, whole lifecycle',
-          'sm '+cls(lc.commission?.base))}
-        ${statCard('Realised P&L',
-          lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—',
-          openLc?'nothing counts until the position is flat':'net of commission',
-          'sm '+cls(lc.realized_pnl?.base))}
-      </div>
+      ${openLc?`<div class="stats c2">${realised}${statCard('Unrealised',cash(uz),
+        'contracts still held, as last reported','sm '+cls(uz))}</div>`:realised}
       ${evs.map(g=>{
         const glegs=(g.orders||[]).flatMap(o=>o.legs||[]);
         /* Inside its own card, an event whose shape merely repeats the
@@ -3700,11 +3481,12 @@ function trades(){
            it needs the full name). */
         const evl=g.label===lc.label?'Opened'
           :g.label===lc.label+' close'?'Closed':g.label;
+        const closes=glegs.some(l=>String(l.open_close||'').toUpperCase().includes('C'));
         return `<div class="grp">
         <div class="gh"><span class="gl">${esc((g.first_fill_at||'').slice(0,10))} — ${
           esc(evl)} <span class="dim2 mono">order${(g.order_ids||[]).length>1?'s':''} ${
           esc((g.order_ids||[]).join(', '))}</span></span>
-          <span class="fig ${cls(g.proceeds.base)}">${moneyOf(g.proceeds)}</span></div>
+          ${closes?`<span class="fig ${cls(g.realized_pnl.base)}">${moneyOf(g.realized_pnl)}</span>`:''}</div>
         ${glegs.map(l=>legRow(l)).join('')}
       </div>`;}).join('')}
       ${legs.length>1?'':`<div class="note">One leg, so this is a single-leg
@@ -4214,8 +3996,8 @@ function portfolio(){
       `<b>Result</b> is the change in net liquidation that deposits do not explain.
        It is marked to market, so it moves with open positions as well as closed
        ones: a stock or an option that lost value this month counts here whether or
-       not it was sold. The Dashboard's P&amp;L counts closed trades only, so the two
-       differ whenever something is still open.
+       not it was sold. The Dashboard's P&amp;L counts only what IBKR realised on
+       fills, so the two differ whenever something is still open.
        <br><br><b>Cash, stock and options</b> are what each held on the month's last
        session, not gains. <b>Options</b> is the value of the open contracts: long
        ones are worth something to the account, short ones are owed back, so it is
@@ -4566,15 +4348,9 @@ function costAside(bc){
    heading, which no test and no glance catches.
 
    `wide` adds the avg pair to both the header and the row together, which is
-   what makes them impossible to disagree about.
-
-   `closed` and `decided` are both here, side by side, because they are two
-   units and the reader has to be able to reconcile them: `closed` counts
-   contract round trips (what net P&L is attributed by), `decided` counts
-   positions (what W, L and win rate are). `closed` is never below `decided`,
-   and a row where they differ is a row where a roll was in flight. */
+   what makes them impossible to disagree about. */
 const statsHead=(first,wide)=>`<tr><th>${first}</th><th class="n">fills</th>
-  <th class="n">orders</th><th class="n">closed</th><th class="n">decided</th>
+  <th class="n">orders</th><th class="n">closed</th>
   <th class="n">W</th>
   <th class="n">L</th><th class="n">win rate</th><th class="n">net P&amp;L</th>
   ${wide?`<th class="n">avg win</th><th class="n">avg loss</th>`:''}
@@ -4585,7 +4361,6 @@ function statsRow(s,{label,wide=false,klass=''}={}){ return `<tr${klass?` class=
   <td class="n">${s.total_trades}</td>
   <td class="n">${s.orders}</td>
   <td class="n">${s.closed_episodes}</td>
-  <td class="n">${s.decided_campaigns}</td>
   <td class="n pos">${s.wins}</td>
   <td class="n neg">${s.losses}</td>
   <td class="n">${pct(s.win_rate)}</td>
@@ -4608,11 +4383,6 @@ function annual(){
      of its own rows whenever the filter was on. */
   let best=yrs[0];
   yrs.forEach(s=>{if(s.net_pnl.base>best.net_pnl.base)best=s;});
-  /* The footnote's `decided` sentence names the unit the rows were counted in.
-     It asserted POSITIONS unconditionally, which under the per-contract reading
-     claimed the grouping the reader had just switched off -- the one mislabel
-     this toggle must not commit, and worst here, where the two counts sit in
-     adjacent columns and the note is what reconciles them. */
   const row=(s,klass)=>statsRow(s,{
     label:s.month==='ALL'?'all time':s.month, wide:true, klass:klass||''});
   return `<div class="card">
@@ -4620,22 +4390,12 @@ function annual(){
       `A round trip counts in the year it <b>closed</b>, the same rule the month
        selector uses — so a position opened in December and closed in January is a
        January outcome.
-       <br><br><b>Three units, narrowing left to right.</b>
-       <br><b>fills</b> counts executions: an order filled in two parts is two fills
-       but one outcome.
-       <br><b>closed</b> counts contract round trips, and is what <b>net P&amp;L</b>
-       is attributed by.
-       <br>${SCORING()===SCORINGS[1]
-        ? `<b>decided</b> counts the same round trips, each scored on its own: every
-           leg of a spread and every leg of a roll is its own W or L, which is what a
-           broker trade log shows. The two columns agree by construction — switch to
-           <b>Per position</b> to group a rolled or multi-leg position into one
-           outcome.`
-        : `<b>decided</b> counts POSITIONS, and is what W, L and win rate measure — a
-           roll closes one contract and opens the next, so one continuing decision
-           would otherwise be scored twice. <b>closed</b> is never below
-           <b>decided</b>, and a row where they differ is a row where a roll was in
-           flight or finished in another period.`}
+       <br><br><b>fills</b> counts executions: an order filled in two parts is two
+       fills but one outcome.
+       <br><b>closed</b> counts contract round trips, which W, L and win rate
+       measure: every leg of a spread and every leg of a roll is its own W or L,
+       which is what a broker trade log shows. <b>net P&amp;L</b> is what IBKR
+       booked on the year's fills.
        <br><br>A year that traded without deciding anything shows no rate rather
        than 0%.`)}</h2>
       <div class="sub">${esc(ccyNote())}</div></div>
@@ -5885,10 +5645,9 @@ function odteCohorts(){
        trading, not the win rate: a better win rate with a worse average is a losing
        strategy. That is why the rest of the book is shown beside it — a high 0DTE
        win rate means nothing on its own.
-       <br><br>Counted per contract ROUND TRIP here, not per position as in the
-       scoreboard above. A 0DTE cohort is defined by a contract's expiry and a
-       rolled position spans several, so it has no single DTE to sort it by. The two
-       win rates are different questions and need not match.`)}</h2>
+       <br><br>Counted per contract ROUND TRIP, the same unit as the scoreboard
+       above. A 0DTE cohort is defined by a contract's expiry, and a rolled position
+       spans several, so a position has no single DTE to sort it by.`)}</h2>
       <div class="sub">Contracts opened on their own expiry date, against everything
       else. Whole journal, whatever the month filter says. ${esc(ccyNote())}</div></div>
       <div class="pills"><span class="pill">0DTE <b>${od.cohort.episodes}</b></span>
@@ -6393,7 +6152,6 @@ function settingsPanel(){
      went.`
     )}</div>
 
-    ${scoringRow()}
     ${tileChooser()}
 
     <details class="adv mt-5" id="adv"${st.dev||S.advOpen?' open':''}>
@@ -6515,12 +6273,6 @@ function applyHash(){
   const cost=hs.getAll('cost').map(c=>c.toUpperCase())
     .filter(c=>COST_OPTIONS.some(([key])=>key===c));
   S.cost=cost.length?cost:null;
-  /* Validated against the two units the server knows, like the tab and the
-     theme: an unknown value would otherwise put a chip in an impossible state
-     while the server quietly served the default, so the control would disagree
-     with the figures beside it. */
-  const sco=(hs.get('scoring')||'').toLowerCase();
-  S.scoring=SCORINGS.includes(sco)?sco:null;
   /* THE CALCULATOR'S TYPED FIELDS RIDE IN THE HASH, like the tab and the filter,
      and for both of the reasons stated at the top of this section: a reload lands
      on the view you left, and a link carries it. The second one earns its keep
@@ -6566,10 +6318,6 @@ function syncHash(push){
      reads. `set` would keep only the last one and silently narrow a four-way
      selection to one on the next reload. */
   (S.cost||[]).forEach(c=>hs.append('cost',c));
-  /* Only an EXPLICIT unit. null already means "the stored preference", so an
-     explicit 'position' is a choice, not the default: dropping it let a reload or
-     back/forward under a stored 'contract' read per contract again. */
-  if(S.scoring) hs.set('scoring',S.scoring);
   /* Only what was TYPED, and only while it differs from the feed -- `draw()` heals
      a reading that has come back into agreement with the payload, so this writes
      an override and never a restatement of what the server already sent. The two
@@ -6751,28 +6499,6 @@ function draw(push){
      selected" is a real answer and shows an empty state, where null would silently
      restore the default and make the click look ignored. A reload costs a request
      because commission is summed server-side under the new predicate. */
-  /* The scoreboard unit, wired here rather than in `cog()` because the panel is
-     re-rendered by `draw()` like every other view and a handler attached during
-     render would be lost with the node.
-
-     `load()`, not `draw()`: the other reading is a different COUNT, and only the
-     server holds the campaign linkage that produces it. Deriving it here would
-     be a second implementation of campaigns.py in the page -- the exact
-     duplication that module exists to prevent. */
-  document.querySelectorAll('button[data-scoring]').forEach(b=>
-    b.onclick=async()=>{
-      const unit=b.dataset.scoring;
-      /* The default is stored as null, so the hash and the request omit it and
-         one spelling of "position" cannot disagree with the server's. */
-      S.scoring=unit===SCORINGS[0]?null:unit;
-      /* PERSISTED as well as applied, because this is a settings page: a control
-         in a panel labelled Settings that forgets on restart is the complaint
-         this panel exists to answer. The hash still carries it so a link works,
-         and `load()` below re-reads the stored value either way -- so a failed
-         save leaves the view and the file agreeing, not diverging. */
-      await save({scoring:unit});
-      load();
-    });
   /* The tile chooser edits a draft; nothing here reaches the server until Save.
      Every handler copies the draft, changes the copy, and redraws, so the list on
      screen is always a rendering of `S.tiledraft` and never a DOM the page has
@@ -7361,9 +7087,9 @@ function bindWatchlist(){
 
 /* One POST for every setting, returning the server's own reply rather than
    raising or banner-ing: each caller in the settings panel reports differently
-   (the query id writes into a field's own status span, the scoring toggle just
-   reloads), and a helper that decided that for them would make one of the two
-   wrong. A transport failure still answers the same SHAPE as a refusal, so no
+   (the query id writes into a field's own status span, the tile chooser raises a
+   note and reloads), and a helper that decided that for them would make one of
+   the two wrong. A transport failure still answers the same SHAPE as a refusal, so no
    caller has to distinguish "no reply" from "no". */
 async function save(body){
   try{
@@ -7477,28 +7203,17 @@ async function loadQuotes(announce){
   draw();
 }
 
-/* Keys this page reads off `stats` that a SERVER TOO OLD to send them would omit.
-   Deliberately a short hand-picked list rather than every Stats key: the point is
-   to catch a stale process, and one key per payload change is enough to do that.
+/* Keys on the STATE that a SERVER TOO OLD to send them would omit. The server
+   re-reads page.html on every request but loads its PYTHON at import, so a
+   process left running across a merge serves NEW markup against an OLD payload,
+   and the fix is a restart that nothing on screen would otherwise ask for.
    Held to the typedef by `test_web`, so a name here that stops existing fails a
    test rather than silently guarding nothing.
 
-   `decided_campaigns` and `inflight_realized` are the two most recent additions.
-   Both produced the exact failure this exists for: the server re-reads page.html
-   on every request but loads its PYTHON at import, so a process left running
-   across a merge serves NEW markup against an OLD payload. The Trades card read
-   `undefined` on a headline figure, which reads as data loss rather than as a
-   process that needs restarting -- and the fix is a restart, which nothing on
-   screen said. */
-const STATS_KEYS_REQUIRED=['decided_campaigns','inflight_realized','scoring'];
-
-/* The same guard one level up, for keys on the STATE rather than on `stats`.
-   Separate because the consequence is different in kind: a missing `stats` key
-   renders `undefined` in a cell, which is visible. A missing `journal` renders a
-   working-looking form whose Save posts to an endpoint the old process does not
-   have -- so the reader types a whole write-up, presses Save, and the only table
-   here that cannot be re-derived never receives it. Visible-but-wrong is a
-   papercut; invisible-and-lossy is why this list exists at all. */
+   A missing `journal` is the case worth a guard because it is invisible: it
+   renders a working-looking form whose Save posts to an endpoint the old process
+   does not have, so the reader types a whole write-up, presses Save, and the only
+   table here that cannot be re-derived never receives it. */
 const STATE_KEYS_REQUIRED=['journal'];
 
 /* Says so, in the banner that already exists for things the reader must act on.
@@ -7519,11 +7234,10 @@ function staleServerCheck(state){
       +'process: restart it with <code>optjournal serve</code>.','bad');
     return;
   }
-  const missing=STATS_KEYS_REQUIRED.filter(k=>!(k in s))
-    .concat(STATE_KEYS_REQUIRED.filter(k=>!(k in state)));
+  const missing=STATE_KEYS_REQUIRED.filter(k=>!(k in state));
   if(!missing.length) return;
-  note('This page is newer than the server process it is talking to, so some '
-    +'figures will read <b>undefined</b>. The server re-reads the page on every '
+  note('This page is newer than the server process it is talking to, so parts '
+    +'of it will not work. The server re-reads the page on every '
     +'request but loads its Python once, at startup — so restart it: '
     +'<code>optjournal serve</code>. '
     +`(missing: ${missing.map(esc).join(', ')})`,'bad');
@@ -7532,7 +7246,7 @@ function staleServerCheck(state){
 /* The query `/api/state` is asked with, from the view state. ONE function, read by
    load() and by the hashchange handler, so "which keys does the server see" has a
    single answer: the handler used to compare the type and the month only, so a
-   typed or back/forward change of `cost`, `scoring` or a `calday` in another month
+   typed or back/forward change of `cost` or a `calday` in another month
    redrew figures for the previous scope. */
 function stateQuery(){
   /* Not `q` -- that name is the FX quote everywhere else in this page, and one
@@ -7547,10 +7261,6 @@ function stateQuery(){
   /* Same repeated key on the wire as in the hash, so one vocabulary spans URL,
      request and payload -- `parse_qs` hands the server the list directly. */
   (S.cost||[]).forEach(c=>qs.append('cost',c));
-  /* Sent only when it is not the default, matching the hash: an omitted key and
-     'position' mean the same thing to the server, and one spelling of a default
-     is one fewer place for the page and stats.py to disagree. */
-  if(S.scoring) qs.set('scoring',S.scoring);
   return qs.toString();
 }
 
@@ -7585,7 +7295,7 @@ function pinDayMonth(){
  * its figures land, so the month is recorded here and the day stays what it is, a
  * selection within the payload that draw() drops when the payload holds no fills
  * for it. */
-const SCOPE_KEYS=['month','type','cost','scoring'];
+const SCOPE_KEYS=['month','type','cost'];
 let LOADED={};
 /* The banner the last failed read raised, as it stands in #msg, so the next good
    read can take it down. A `bad` note never dismisses itself, which is right for

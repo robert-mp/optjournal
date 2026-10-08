@@ -327,8 +327,8 @@ def position_groups(
       lifecycle rather than reviving the old card.
     * A roll shares an episode with the old lifecycle AND opens a new one --
       the union links the whole chain into one campaign card. That is the
-      intended reading of a roll: one continuing decision, with each episode's
-      P&L still landing in its own close month underneath.
+      intended reading of a roll: one continuing decision, with each fill's
+      P&L still landing on its own trade date underneath.
 
     Events whose orders map to no episode (nothing but snapshots, or an
     unmatched category) stay as singleton lifecycles.
@@ -339,6 +339,13 @@ def position_groups(
     every execution it draws, so a split `C;O` one counts in both of its cards:
     no total adds cards' fills up, and the ones that count executions across
     cards (the Dashboard's, the Calendar's) count each once.
+
+    Realised P&L is what IBKR booked on the card's fills, the money rule in
+    `stats.py`, so a partial close or a roll's closed leg shows on the open card
+    the day the Calendar books it, and on the event that holds the fill (each
+    event's own `realized_pnl`). None while no leg has closed anything. On a
+    decided card it equals `Campaign.realized`: the same fills, summed per
+    contract.
     """
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own
@@ -359,6 +366,9 @@ def position_groups(
         opening = members[0]
         camp = campaign_list[index] if linked else None
         eps = [episodes[i] for i in camp.episode_indices] if camp else []
+        # Down to the same leaf rows again, through every event's orders.
+        legs = [lg for ev in members for o in ev.get("orders", ())
+                for lg in o.get("legs", ())]
         out.append({
             "underlying": opening.get("underlying"),
             # The shape it was OPENED as names the position; later events
@@ -380,21 +390,11 @@ def position_groups(
             "links": [list(pair) for pair in camp.links] if camp else [],
             "episodes": len(eps),
             "fills": sum(e.get("fills") or 0 for e in members),
-            # Down to the same leaf rows again, through every event's orders.
-            "proceeds": Money.from_rows(
-                (lg for ev in members for o in ev.get("orders", ())
-                 for lg in o.get("legs", ())),
-                "proceeds",
-            ).payload(),
-            # Campaign-sourced, so these equal the Dashboard's accounting
-            # exactly -- populated only when the position is decided, same
-            # rule. Episodes carry the native and the currency, so the figure
-            # is exact wherever one currency closed the whole position.
+            "proceeds": Money.from_rows(legs, "proceeds").payload(),
             "realized_pnl": (
-                camp.realized.payload() if camp and camp.realized else None
-            ),
-            "commission": (
-                camp.commission.payload() if camp and camp.commission else None
+                Money.from_rows(legs, "realized_pnl").payload()
+                if any("C" in str(lg.get("open_close") or "").upper() for lg in legs)
+                else None
             ),
             "events": members,
         })

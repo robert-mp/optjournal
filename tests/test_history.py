@@ -567,9 +567,10 @@ def test_a_residual_position_is_not_flat():
 
     Found by mutation: replacing the epsilon with `abs(qty) < 0.5` -- so 0.4
     shares still held counts as flat -- passed all 579 tests. That defect books a
-    partially-closed lot as a completed round trip, which means its P&L counts in
-    the period and the remaining position disappears from the open book. Both
-    halves of "nothing counts until the position is flat" break at once, silently.
+    partially-closed lot as a completed round trip, which means it scores as a win
+    or a loss while shares are still held, and the remaining position disappears
+    from the open book. Both halves of "no outcome until the position is flat"
+    break at once, silently.
 
     The epsilon exists for float dust on FRACTIONAL lots (a dividend
     reinvestment buys 1.79 shares), so the test has to pin both sides: dust is

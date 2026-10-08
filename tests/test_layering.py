@@ -8,8 +8,8 @@ documented only in prose:
 * **The modelled-number quarantine.** Every figure the accounting layers report
   is broker-stated. `blackscholes.py` breaks that on purpose and is confined to
   the replay panel, so no headline number, calendar day or annual row can be
-  traced to a model. "Nothing counts until the position is flat" is worth little
-  if a modelled figure can reach the same card, and the only thing standing
+  traced to a model. "Every figure is what IBKR booked" is worth little if a
+  modelled figure can reach the same card, and the only thing standing
   between the two is which modules may import it.
 
 * **Imports point one way.** A cycle would not merely be untidy: this package is

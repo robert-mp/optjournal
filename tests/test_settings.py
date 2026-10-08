@@ -24,7 +24,7 @@ def test_an_absent_file_reads_as_no_preferences(tmp_path):
     """
     assert settings.read(tmp_path) == {}
     assert settings.query_id(root=tmp_path) is None
-    assert settings.scoring(root=tmp_path) is None
+    assert settings.tiles(root=tmp_path) is None
 
 
 @pytest.mark.parametrize("damage", [
@@ -49,37 +49,37 @@ def test_damage_reads_as_absence_rather_than_raising(tmp_path, damage):
 def test_writing_one_preference_leaves_the_others_alone(tmp_path):
     """`update` merges, and the settings page depends on it.
 
-    Saving the query id must not reset a scoreboard unit the form never asked
+    Saving the query id must not reset dashboard tiles the form never asked
     about. A replace-the-file implementation passes every single-key test and
     fails exactly here.
     """
     settings.update(tmp_path, query_id="1591754")
-    settings.update(tmp_path, scoring="contract")
-    assert settings.read(tmp_path) == {"query_id": "1591754", "scoring": "contract"}
+    settings.update(tmp_path, tiles=["net_pnl"])
+    assert settings.read(tmp_path) == {"query_id": "1591754", "tiles": ["net_pnl"]}
 
 
 def test_none_deletes_a_preference_rather_than_storing_a_null(tmp_path):
     """"Back to the default" is spelled `None`, and leaves no trace.
 
     Storing null would make every reader distinguish "chosen as empty" from
-    "never chosen", a distinction no caller wants: `scoring=None` means the page
+    "never chosen", a distinction no caller wants: `tiles=None` means the page
     is back on the default, which is exactly the state a fresh install is in.
     """
-    settings.update(tmp_path, query_id="1591754", scoring="contract")
-    settings.update(tmp_path, scoring=None)
+    settings.update(tmp_path, query_id="1591754", tiles=["net_pnl"])
+    settings.update(tmp_path, tiles=None)
     assert settings.read(tmp_path) == {"query_id": "1591754"}
-    assert "scoring" not in settings.path_for(tmp_path).read_text(encoding="utf-8")
+    assert "tiles" not in settings.path_for(tmp_path).read_text(encoding="utf-8")
 
 
 def test_an_unknown_key_is_refused_at_the_call_site(tmp_path):
     """A typo must fail loudly, not become a preference that never applies.
 
-    The failure a free-form settings dict invites is silent: `update(scorring=…)`
+    The failure a free-form settings dict invites is silent: `update(qurey_id=…)`
     writes a key nothing reads, the page keeps showing the default, and there is
     nothing to notice.
     """
     with pytest.raises(ValueError, match="not settings this journal stores"):
-        settings.update(tmp_path, scorring="contract")
+        settings.update(tmp_path, qurey_id="1591754")
     assert settings.read(tmp_path) == {}, "a refused write must store nothing"
 
 
@@ -256,7 +256,7 @@ def test_concurrent_saves_keep_every_value(tmp_path):
     can overlap. Each read-merge-write must see the other's result, and neither
     may fail on a staging file the other already renamed away."""
     values = {"query_id": "111111", "confirm_query_id": "222222",
-              "scoring": "contract", "tiles": ["net_pnl"]}
+              "tiles": ["net_pnl"], "dev": True}
     errors: list[BaseException] = []
     barrier = threading.Barrier(len(values))
 
@@ -285,20 +285,20 @@ def test_a_save_waits_for_another_process_holding_the_settings_lock(tmp_path):
     a thread stand in for the other process here."""
     with locked(settings.lock_path(tmp_path)):
         writer = threading.Thread(
-            target=lambda: settings.update(tmp_path, scoring="contract"))
+            target=lambda: settings.update(tmp_path, query_id="1591754"))
         writer.start()
         writer.join(0.3)
         assert writer.is_alive(), "the save did not wait for the lock holder"
         assert settings.read(tmp_path) == {}
     writer.join(5)
-    assert settings.read(tmp_path) == {"scoring": "contract"}
+    assert settings.read(tmp_path) == {"query_id": "1591754"}
 
 
 def test_a_byte_order_mark_does_not_hide_the_settings(tmp_path):
     """L23: Windows Notepad saves UTF-8 with a BOM. Reading that as damage would
     show every setting as unset, and the next save would then wipe them."""
     settings.path_for(tmp_path).write_text(
-        '﻿{"query_id": "1591754", "scoring": "contract"}', encoding="utf-8")
-    assert settings.read(tmp_path) == {"query_id": "1591754", "scoring": "contract"}
+        '﻿{"query_id": "1591754", "confirm_query_id": "1621016"}', encoding="utf-8")
+    assert settings.read(tmp_path) == {"query_id": "1591754", "confirm_query_id": "1621016"}
     settings.update(tmp_path, tiles=["net_pnl"])
     assert settings.read(tmp_path)["query_id"] == "1591754"

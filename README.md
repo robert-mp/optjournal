@@ -146,7 +146,6 @@ optjournal friction --month 2026-08       one month (or a year: 2026)
 | Flex token | OS keyring | `optjournal setup`, or Settings in the page |
 | Flex Query ID | `.optjournal.json` | `optjournal setup`, or Settings in the page |
 | Confirms Query ID | `.optjournal.json` | Settings in the page, or `$OPTJOURNAL_CONFIRM_QUERY_ID`. Optional |
-| Scoreboard unit | `.optjournal.json` | Settings in the page |
 | Database, archive, settings | the journal's home (below) | `--db` / `--archive`, `$OPTJOURNAL_HOME` |
 
 The query id also reads from `--query-id` and `$OPTJOURNAL_QUERY_ID`, in that
@@ -176,19 +175,19 @@ release notes are what the banner shows under **What's new**. A release whose
 code is not the version its tag names is refused, and so is one that would
 contain any journal file.
 
-## Wins and losses: two ways to count
+## Wins and losses
 
-The scoreboard counts outcomes in one of two units, switchable in Settings.
-**Per position** (the default) treats a multi-leg structure and every roll of it
-as one decision, so a hedge leg cannot be a loss inside a winning position and a
-loser cannot be rolled out and scratched into a win. **Per contract** scores each
-round trip on its own, which is what a broker trade log shows and therefore the
-reading to use when reconciling against one.
+Net P&L and commission are what IBKR booked on each fill, on the fill's trade
+date, so every month reconciles with the statement and a partial close counts
+the day it fills. The scoreboard counts each closed contract round trip as one
+outcome, in the month of its last closing fill. A round trip closed by two
+partial fills is one outcome, not two, and a contract still held is no outcome
+yet. Each leg of a strangle, and each leg of a roll, is its own win or loss,
+which is what a broker trade log shows, so the scoreboard reconciles against one
+directly.
 
-The money is identical either way — net P&L, commission and the fill counts are
-sums over the same round trips — so the two differ only in how many outcomes
-that same cash is divided into. On one real account the same 29 closed round
-trips read 14W/1L by position and 24W/5L by contract.
+The Trades tab groups those contracts into positions, so a roll or a multi-leg
+structure is one card there.
 
 ## Your data
 

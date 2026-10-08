@@ -28,8 +28,6 @@ from conftest import add_statement, connect_migrated
 
 from optjournal.money import Money
 from optjournal.stats import (
-    CONTRACT_SCORING,
-    POSITION_SCORING,
     Cohort,
     MonthStats,
     cohort_data,
@@ -179,7 +177,7 @@ def test_a_period_with_no_wins_reports_no_average_win_not_a_zero(conn):
     }
 
     # The two figures derived from the same populations follow the same rule:
-    # no decided unit, no average outcome; nothing lost, no profit factor. An
+    # nothing closed, no average outcome; nothing lost, no profit factor. An
     # all-wins month is the case that matters for the second -- the ratio is
     # infinite there, and a big finite number would read as a measurement.
     assert view["avg_pnl"] is None and view["profit_factor"] is None
@@ -229,13 +227,13 @@ def _leg(
 
 
 def _strangle(conn: sqlite3.Connection) -> None:
-    """A strangle sold and bought back: one decision, two contracts, split
+    """A strangle sold and bought back: one position, two contracts, split
     outcomes.
 
     Two conids on separate order ids filled in the SAME SECOND, which is how
-    every real multi-leg event in this journal arrives -- see `campaigns.py`. The
+    every real multi-leg event in this journal arrives (see `campaigns.py`). The
     put wins 400 and the call loses 100, so the position nets +300 while its legs
-    disagree, and that is exactly the case the two scorings read differently.
+    disagree.
     """
     _leg(conn, conid="1", order_id="10", at="2026-03-02 15:00:00",
          qty=-1, proceeds=500.0, pnl=None, put_call="P")
@@ -247,54 +245,29 @@ def _strangle(conn: sqlite3.Connection) -> None:
          qty=1, proceeds=-400.0, pnl=-100.0, put_call="C")
 
 
-def test_the_two_scorings_divide_the_same_money_into_different_outcomes(conn):
-    """The toggle's whole contract, on the case that motivates it.
+def test_a_strangle_scores_each_leg_as_its_own_outcome(conn):
+    """The scoreboard counts closed contract round trips, the money's own unit.
 
-    A strangle is ONE decision made of two contracts whose outcomes disagree.
-    Scored by position it is a single win; scored by contract it is a win and a
-    loss on the same trade. Both readings are defensible -- the second is what a
-    broker trade log shows -- so the journal offers both, and this pins the
-    invariant that makes offering both safe: the MONEY does not move. Net P&L,
-    commission and the fill count are identical, and only the number of outcomes
-    that cash is divided into changes.
-
-    Measured on the real journal, the same 29 closed round trips read 14W/1L by
-    position and 24W/5L by contract.
+    A strangle is one position made of two contracts whose outcomes disagree, so
+    it scores a win and a loss, which is what a broker trade log shows. The
+    count and the money read the same two round trips.
     """
     _strangle(conn)
-    by_position = month_stats(conn, "2026-03", base_currency="EUR")
-    by_contract = month_stats(
-        conn, "2026-03", base_currency="EUR", scoring=CONTRACT_SCORING
-    )
+    s = month_stats(conn, "2026-03", base_currency="EUR")
 
-    assert (by_position.wins, by_position.losses) == (1, 0), (
-        "a hedge leg cannot be a loss inside a winning position"
-    )
-    assert (by_contract.wins, by_contract.losses) == (1, 1), (
-        "scored per contract, the call leg is its own loss"
-    )
-    assert by_position.decided_campaigns == 1
-    assert by_contract.decided_campaigns == 2
-
-    # The invariant. Anything here moving would mean the toggle had become a
-    # second opinion about the account rather than a second way of counting it.
-    assert by_position.net_pnl.base == by_contract.net_pnl.base == 300.0
-    assert by_position.commissions.base == by_contract.commissions.base
-    assert by_position.total_trades == by_contract.total_trades == 4
-    assert by_position.closed_episodes == by_contract.closed_episodes == 2
+    assert (s.wins, s.losses) == (1, 1), "the call leg is its own loss"
+    assert s.closed_episodes == 2
+    assert s.net_pnl.base == 300.0
+    assert s.commissions.base == -4.0
+    assert s.total_trades == 4
 
 
-def test_contract_scoring_reports_no_in_flight_cash_because_it_groups_nothing(conn):
-    """`inflight_realized` explains a gap that only grouping can open.
+def test_a_closed_leg_is_decided_while_its_partner_is_still_open(conn):
+    """A round trip is an outcome the day it closes, whatever its position does.
 
-    It is the cash settled inside a position still running -- a roll's near leg.
-    Under contract scoring every closed round trip is its own finished outcome,
-    so the gap cannot exist and the figure is structurally zero. Asserted rather
-    than assumed, because a stale non-zero here would feed the Dashboard a note
-    claiming "of this figure, X closed inside a position still running" beside a
-    scoreboard where no position is still running.
+    The put is bought back and the call stays open, so the put's +400 is both in
+    Net P&L and a win, and nothing about the open call holds either back.
     """
-    # One leg closed, its partner still open: a position mid-flight.
     _leg(conn, conid="1", order_id="10", at="2026-03-02 15:00:00",
          qty=-1, proceeds=500.0, pnl=None, put_call="P")
     _leg(conn, conid="2", order_id="11", at="2026-03-02 15:00:00",
@@ -302,57 +275,12 @@ def test_contract_scoring_reports_no_in_flight_cash_because_it_groups_nothing(co
     _leg(conn, conid="1", order_id="12", at="2026-03-09 15:00:00",
          qty=1, proceeds=-100.0, pnl=400.0, put_call="P")
 
-    by_position = month_stats(conn, "2026-03", base_currency="EUR")
-    by_contract = month_stats(
-        conn, "2026-03", base_currency="EUR", scoring=CONTRACT_SCORING
-    )
-
-    assert by_position.inflight_realized.base == 400.0, (
-        "the closed leg's cash sits inside a position that has not finished"
-    )
-    assert by_position.decided_campaigns == 0, "the position is not decided yet"
-    assert by_contract.inflight_realized.base == 0.0
-    assert (by_contract.wins, by_contract.decided_campaigns) == (1, 1), (
+    s = month_stats(conn, "2026-03", base_currency="EUR")
+    assert s.net_pnl.base == 400.0
+    assert (s.wins, s.losses, s.closed_episodes) == (1, 0, 1), (
         "the closed round trip is a finished outcome on its own terms"
     )
-
-
-@pytest.mark.parametrize("given", ["positon", "", "POSITION", "leg", None])
-def test_an_unrecognised_scoring_heals_to_the_default(conn, given):
-    """A query string is user input, so an unknown unit must not reach the branch.
-
-    Healing rather than raising, because the value arrives from a URL a reader
-    can hand-edit and a 500 on a typo is a worse answer than the default view.
-    The healed value is CARRIED on the stats, which is what lets the page label
-    the figures with the unit they were actually counted in rather than the one
-    that was asked for.
-
-    'POSITION' heals too: the vocabulary is exact, and accepting a case variant
-    here would make the page's own comparisons against `SCORINGS` disagree with
-    the server about which chip is active.
-    """
-    _strangle(conn)
-    stats = month_stats(conn, "2026-03", base_currency="EUR", scoring=given)
-    assert stats.scoring == POSITION_SCORING
-    assert (stats.wins, stats.losses) == (1, 0), (
-        "an unknown unit must be counted as the default, not as the other one"
-    )
-    assert stats_data(stats)["scoring"] == POSITION_SCORING
-
-
-def test_the_scoring_travels_into_the_payload_for_the_page_to_label_with(conn):
-    """`stats_data` carries the unit beside the counts it governs.
-
-    The page reads this for its labels, never to recompute: 93% by position and
-    83% by contract are the same account, so a payload whose unit the reader has
-    to infer from a control's state is one a stale fetch can mislabel.
-    """
-    _strangle(conn)
-    view = stats_data(month_stats(
-        conn, "2026-03", base_currency="EUR", scoring=CONTRACT_SCORING
-    ))
-    assert view["scoring"] == CONTRACT_SCORING
-    assert (view["wins"], view["losses"], view["decided_campaigns"]) == (1, 1, 2)
+    assert s.open_episodes == 1
 
 
 def _lc(label, pnl, *, closed="2026-08-20", status="closed"):
@@ -436,10 +364,9 @@ def test_a_reversal_through_zero_scores_the_long_and_the_short_apart(conn):
     _leg(conn, conid="1", order_id="12", at="2026-10-05 10:00:00",
          qty=1, proceeds=-50.0, pnl=149.0, put_call="C")
     september, october = (month_stats(conn, m) for m in ("2026-09", "2026-10"))
-    assert (september.net_pnl.base, september.wins, september.decided_campaigns) == (
+    assert (september.net_pnl.base, september.wins, september.closed_episodes) == (
         198.0, 1, 1)
-    assert september.inflight_realized.base == 0.0
-    assert (october.net_pnl.base, october.wins, october.decided_campaigns) == (
+    assert (october.net_pnl.base, october.wins, october.closed_episodes) == (
         149.0, 1, 1)
 
 
@@ -457,7 +384,7 @@ def test_expirations_on_one_day_do_not_merge_unrelated_positions(conn):
     _leg(conn, conid="2", order_id="9002", at="2026-10-16 16:20:00", qty=-1,
          proceeds=0.0, pnl=-301.0, put_call="C", notes="Ep")
     s = month_stats(conn, None)
-    assert (s.decided_campaigns, s.wins, s.losses) == (2, 1, 1)
+    assert (s.closed_episodes, s.wins, s.losses) == (2, 1, 1)
     assert s.net_pnl.base == pytest.approx(-102.0), "the money never moved"
 
 
@@ -631,12 +558,17 @@ _LEG_SUMS = ("quantity", "proceeds", "proceeds_base", "commission",
 
 def _meet(conn, name: str):
     """Ingest one `_MEETINGS` case and read it the way `/api/state` does."""
+    return _ingest(conn, _MEETINGS[name])
+
+
+def _ingest(conn, fills):
+    """Ingest fills shaped as `_MEETINGS` and read them the way `/api/state` does."""
     from optjournal.history import build_history
     from optjournal.serialize import orders_data
     from optjournal.stats import campaigns_for
     from optjournal.strategies import campaign_events, position_groups
 
-    for conid, order_id, at, qty, proceeds, pnl, open_close, *right in _MEETINGS[name]:
+    for conid, order_id, at, qty, proceeds, pnl, open_close, *right in fills:
         _leg(conn, conid=conid, order_id=order_id, at=at, qty=qty,
              proceeds=proceeds, pnl=pnl, open_close=open_close,
              put_call=right[0] if right else "P")
@@ -692,14 +624,17 @@ def test_every_fill_is_drawn_once_across_the_cards_and_once_on_the_calendar(conn
     assert sorted(card["fills"] for card in cards) == sorted(took)
     executions = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
     assert sum(ev["fills"] for ev in events) == executions
-    stats = month_stats(conn, None, asset_category="OPT", report=report, campaign_list=camps)
+    stats = month_stats(conn, None, asset_category="OPT", report=report)
     assert stats.total_trades == executions
-    # And the Dashboard counts the outcomes the cards show.
-    decided = [card["realized_pnl"]["base"] for card in cards if card["realized_pnl"]]
-    assert (stats.wins, stats.losses) == (
-        sum(pnl > 0 for pnl in decided), sum(pnl < 0 for pnl in decided))
-    assert stats.net_pnl.base == pytest.approx(
-        sum(decided) + stats.inflight_realized.base)
+    # The Dashboard scores the closed round trips.
+    assert (stats.closed_episodes, stats.wins, stats.losses) == (
+        len(report.closed),
+        sum(e.realized_pnl_base > 0 for e in report.closed),
+        sum(e.realized_pnl_base < 0 for e in report.closed))
+    # And the money is what the cards show: each card carries what IBKR booked
+    # on its fills, whether or not the position is still running.
+    shown = [card["realized_pnl"]["base"] for card in cards if card["realized_pnl"]]
+    assert stats.net_pnl.base == pytest.approx(sum(shown))
 
 
 def _cards_read(cards) -> dict[str, tuple]:
@@ -809,6 +744,80 @@ def test_a_position_opened_by_the_far_half_of_a_split_counts_that_fill(conn):
                             campaign_list=campaigns_for(conn, "OPT", episodes))
     assert {(card["label"], card["status"]): card["fills"] for card in cards} == {
         ("Long put", "closed"): 2, ("Short put", "open"): 1}
+
+
+#: A short put rolled out and then partly bought back, as `_MEETINGS` fills. The
+#: near contract closes in two fills three seconds apart, the real GOOG roll's
+#: shape, and one of the two far puts the roll sold is bought back two days on.
+_ROLLED = [
+    ("1", "1001", "2026-09-24 10:00:00", -2, 600.0, None, "O"),
+    ("1", "1002", "2026-09-28 14:16:20", 1, -100.0, 100.0, "C"),
+    ("2", "1002", "2026-09-28 14:16:21", -2, 500.0, None, "O"),
+    ("1", "1002", "2026-09-28 14:16:23", 1, -100.0, 95.0, "C"),
+    ("2", "1003", "2026-09-30 11:00:00", 1, -150.0, 90.0, "C"),
+]
+
+
+def _realised(money) -> float | None:
+    return None if money is None else round(money["base"], 6)
+
+
+def _shown(event) -> float | None:
+    """An event's realised figure as its card header shows it: only where the
+    event holds a closing leg."""
+    closes = any("C" in str(leg["open_close"] or "").upper()
+                 for order in event["orders"] for leg in order["legs"])
+    return _realised(event["realized_pnl"]) if closes else None
+
+
+def test_a_partial_close_counts_on_its_card_its_event_and_its_day(conn):
+    """IBKR booked +90 on buying back one of the two far puts, and the open card,
+    the event holding that fill and its Calendar day all carry it beside the
+    roll's +195. The scoreboard does not: the near contract is flat and won, and
+    the far one is still held, so its +90 is money and not yet an outcome."""
+    from optjournal.stats import month_stats
+
+    report, _camps, _orders, (card,), _events = _ingest(conn, _ROLLED)
+    assert card["status"] == "open"
+    assert _realised(card["realized_pnl"]) == 285.0
+    assert [(e["label"], _shown(e)) for e in card["events"]] == [
+        ("Short put", None), ("Roll", 195.0), ("Short put close", 90.0)]
+    assert "commission" not in card
+    september = month_stats(conn, "2026-09", report=report)
+    assert {d.day: _realised(d.realized.payload()) for d in september.days} == {
+        "2026-09-24": 0.0, "2026-09-28": 195.0, "2026-09-30": 90.0}
+    assert _realised(september.net_pnl.payload()) == 285.0
+    assert (september.closed_episodes, september.wins, september.losses) == (1, 1, 0)
+    assert _realised(september.open_premium.payload()) == 260.0, (
+        "the far contract's 350 of premium less the 90 already in net P&L")
+
+
+def test_a_round_trip_that_nets_zero_is_neither_a_win_nor_a_loss(conn):
+    from optjournal.stats import month_stats
+
+    report, *_ = _ingest(conn, [
+        ("1", "1001", "2026-09-24 10:00:00", -1, 300.0, None, "O"),
+        ("1", "1002", "2026-09-25 10:00:00", 1, -300.0, 0.0, "C"),
+    ])
+    s = month_stats(conn, "2026-09", report=report)
+    assert (s.closed_episodes, s.wins, s.losses) == (1, 0, 0)
+
+
+def test_a_decided_cards_realised_is_its_campaigns(conn):
+    """Once every contract is closed the card's figure is `Campaign.realized`, the
+    one the strategy ranking reads, to the last key. The far contract scores its
+    whole +170 as one win the day it goes flat, while its money stays on the two
+    days IBKR booked it."""
+    from optjournal.stats import month_stats
+
+    report, (camp,), _orders, (card,), _events = _ingest(conn, _ROLLED + [
+        ("2", "1004", "2026-10-02 11:00:00", 1, -150.0, 80.0, "C")])
+    assert card["status"] == "closed"
+    assert card["realized_pnl"] == camp.realized.payload()
+    october = month_stats(conn, "2026-10", report=report)
+    assert _realised(october.net_pnl.payload()) == 80.0
+    assert (october.closed_episodes, october.wins, october.losses) == (1, 1, 0)
+    assert _realised(october.largest_win.payload()) == 170.0
 
 
 def _at_broker(conn, broker: str, fills) -> None:
@@ -950,15 +959,13 @@ def test_a_split_execution_is_listed_under_the_position_it_closed(conn):
     assert sorted(e["order_ids"] for e in events) == [["1000", "1001"], ["1002"]]
 
 
-def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):
+def test_under_the_0dte_scope_a_rolled_leg_is_decided_the_day_it_closes(conn):
     """`pnl/s_scope_inflight.py`: a 0DTE short put rolled at 15:55 into the next
     day's put, which is still open.
 
-    The scoreboard decided a unit by its IN-SCOPE episodes (only the 0DTE leg,
-    closed) while the in-flight figure read the whole campaign (still running),
-    so the same -302 was shown as a decided loss AND as cash inside a position
-    still running. Both now read the campaign the Trades tab draws: open until
-    its last leg closes, and its in-scope cash in flight until then.
+    The 0DTE leg is a closed round trip, so its -302 is a decided loss on the day
+    it lands in Net P&L. The far leg is not 0DTE, so closing it moves nothing
+    under the scope.
     """
     from optjournal.stats import odte_scope
 
@@ -971,16 +978,14 @@ def test_under_the_0dte_scope_a_running_roll_is_in_flight_not_decided(conn):
     scope = odte_scope(conn)
     s = month_stats(conn, "2026-09", scope=scope)
     assert s.net_pnl.base == -302.0
-    assert (s.decided_campaigns, s.losses) == (0, 0)
-    assert s.inflight_realized.base == -302.0
-    assert s.avg_pnl is None
+    assert (s.closed_episodes, s.losses) == (1, 1)
+    assert s.avg_pnl.base == -302.0
 
-    # The roll's far leg closes the next day: the decision is now finished, and
-    # under the scope its outcome is the in-scope cash, counted once.
     _leg(conn, conid="2", order_id="4", at="2026-09-11 15:00:00", qty=1,
          proceeds=-100.0, pnl=498.0, expiry="2026-09-11")
     s = month_stats(conn, "2026-09", scope=odte_scope(conn))
-    assert (s.decided_campaigns, s.losses, s.inflight_realized.base) == (1, 1, 0.0)
+    assert s.net_pnl.base == -302.0
+    assert (s.closed_episodes, s.losses) == (1, 1)
     assert s.avg_pnl.base == -302.0
 
 
@@ -1008,9 +1013,9 @@ def test_a_stock_outcome_lands_in_the_month_its_pnl_does(conn):
         )
     august, september = (month_stats(conn, m, asset_category="STK")
                          for m in ("2026-08", "2026-09"))
-    assert (august.net_pnl.base, august.decided_campaigns, august.wins) == (0.0, 0, 0)
-    assert (september.net_pnl.base, september.decided_campaigns,
-            september.wins, september.closed_episodes) == (11.88, 1, 1, 1)
+    assert (august.net_pnl.base, august.closed_episodes, august.wins) == (0.0, 0, 0)
+    assert (september.net_pnl.base, september.closed_episodes,
+            september.wins) == (11.88, 1, 1)
 
 
 def test_net_liquidation_is_every_accounts_newest_summary_summed(conn):

@@ -605,50 +605,30 @@ def test_contract_matches_the_payload_both_ways(state, widest_costs):
 def test_the_stale_server_guard_names_keys_that_exist(state):
     """The runtime guard must check keys the payload really has.
 
-    `STATS_KEYS_REQUIRED` is the page's own list of `stats` keys whose absence
+    `STATE_KEYS_REQUIRED` is the page's own list of state keys whose absence
     means the server process predates the markup. A name that stops existing --
     renamed, or dropped from the serializer -- would leave the guard passing
     unconditionally: it would look like protection while checking nothing, which
     is the same silent-no-op failure `test_every_mutant_pattern_still_matches`
     exists for.
 
-    Both directions matter, so this asserts the names are declared in the Stats
+    Both directions matter, so this asserts the names are declared in the State
     typedef AND present in a real payload.
     """
     js = _js()
-    match = re.search(r"const STATS_KEYS_REQUIRED=\[([^\]]*)\]", js)
+    shapes, _, _ = _parse_contract(js)
+    match = re.search(r"const STATE_KEYS_REQUIRED=\[([^\]]*)\]", js)
     assert match, "the stale-server guard's key list is gone"
     keys = re.findall(r"'([a-z_]+)'", match.group(1))
     assert keys, "the guard checks nothing, so it can never fire"
-
-    shapes, _, _ = _parse_contract(js)
-    undeclared = sorted(set(keys) - set(shapes["Stats"]))
+    undeclared = sorted(set(keys) - set(shapes["State"]))
     assert not undeclared, (
-        f"the guard watches {undeclared}, which the Stats typedef does not "
-        "declare -- so it guards a key that may not exist"
-    )
-    absent = sorted(k for k in keys if k not in state["stats"])
-    assert not absent, (
-        f"the guard watches {absent}, which a real payload does not contain -- "
-        "the banner would fire on every load"
-    )
-
-    # And the same both ways for the STATE-level list, which exists because a
-    # missing `journal` is worse than a cell reading `undefined`: the form still
-    # renders and Save posts to an endpoint the old process does not have, so a
-    # whole write-up goes nowhere and nothing says why.
-    top = re.search(r"const STATE_KEYS_REQUIRED=\[([^\]]*)\]", js)
-    assert top, "the state-level half of the stale-server guard is gone"
-    top_keys = re.findall(r"'([a-z_]+)'", top.group(1))
-    assert top_keys, "the state-level guard checks nothing, so it can never fire"
-    undeclared_top = sorted(set(top_keys) - set(shapes["State"]))
-    assert not undeclared_top, (
-        f"the guard watches State.{undeclared_top}, which the typedef does not "
+        f"the guard watches State.{undeclared}, which the typedef does not "
         "declare"
     )
-    absent_top = sorted(k for k in top_keys if k not in state)
-    assert not absent_top, (
-        f"the guard watches {absent_top}, absent from a real payload -- the "
+    absent = sorted(k for k in keys if k not in state)
+    assert not absent, (
+        f"the guard watches {absent}, absent from a real payload -- the "
         "banner would fire on every load"
     )
 
@@ -741,7 +721,7 @@ def test_stats_panel_keys_present(state):
     for key in (
         "total_trades", "orders", "net_pnl", "commissions", "fees",
         "wins", "losses", "win_rate", "avg_win", "avg_loss",
-        "closed_episodes", "open_episodes", "decided_campaigns",
+        "closed_episodes", "open_episodes",
         "green_days", "red_days", "days",
         "total_friction_base", "net_liq_base", "gain_pct_of_net_liq",
     ):
@@ -843,15 +823,22 @@ def test_a_fill_free_month_is_an_honest_zero_not_all_time(populated):
 
 
 def test_a_trade_counts_only_in_the_month_it_closed(populated):
-    """A round trip opened in one month and closed in the next belongs -- as a
-    trade, a win/loss and P&L -- to the close month alone. The open month gets
-    fills (activity) but no outcome. Verified against a real spanning episode
-    rather than asserted in the abstract, with an independent recount as the
-    oracle so other episodes in either month cannot mask a leak.
+    """A round trip opened in one month and closed in the next belongs, as a
+    trade and a win or loss, to the close month alone. The open month gets fills
+    (activity) and what IBKR booked on them, but no outcome. Verified against a
+    real spanning episode rather than asserted in the abstract, with an
+    independent recount as the oracle so other episodes in either month cannot
+    mask a leak.
     """
     conn = connect(populated)
     try:
         report = build_history(conn, asset_category="OPT")
+        booked = {
+            row[0]: (row[1], row[2]) for row in conn.execute(
+                "SELECT substr(trade_date, 1, 7), SUM(fifo_pnl_realized_base),"
+                " SUM(ib_commission_base) FROM trades WHERE asset_category = 'OPT'"
+                " GROUP BY 1")
+        }
     finally:
         conn.close()
     spanning = [
@@ -876,92 +863,28 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
     # The open month has the fills but only the outcomes that closed IN it.
     assert opened["total_trades"] > 0, "the opening fills are that month's activity"
     assert opened["closed_episodes"] == len(closed_in(open_month))
-    assert opened["net_pnl"]["base"] == pytest.approx(
-        sum(e.realized_pnl_base for e in closed_in(open_month))
-    ), "the spanning episode's outcome must not leak into the month that opened it"
-    # The scoreboard's own unit is the campaign, and it always accounts for
-    # itself. Against `closed_episodes` it need NOT agree: a roll closes one
-    # contract and opens another, so a month can close a contract whose decision
-    # finishes later. `closed_episodes` is never below it, which is the
-    # reconciliation the page prints when the two differ.
-    assert opened["wins"] + opened["losses"] == opened["decided_campaigns"]
-    assert opened["closed_episodes"] >= opened["decided_campaigns"]
-    # Commission rides the same rule: IBKR's episode P&L is already net of
-    # every leg's commission, so fill-date commission showed the same euros
-    # twice -- once in the open month's card, again inside the close month's
-    # net P&L. The open month reports only commission of trades closed in it.
-    assert opened["commissions"]["base"] == pytest.approx(
-        sum(e.commission_base for e in closed_in(open_month))
-    )
+    assert (opened["wins"], opened["losses"]) == (
+        sum(e.realized_pnl_base > 0 for e in closed_in(open_month)),
+        sum(e.realized_pnl_base < 0 for e in closed_in(open_month)))
+    # The money is what IBKR booked on each month's own fills: the opening fills'
+    # commission in the month that opened it, the buyback's P&L in the month
+    # that closed it.
+    for stats, month in ((opened, open_month), (closed, close_month)):
+        assert (stats["net_pnl"]["base"], stats["commissions"]["base"]) == (
+            pytest.approx(booked[month][0]), pytest.approx(booked[month][1])), month
 
     # The close month carries the outcome, spanning episode included.
     assert closed["closed_episodes"] == len(closed_in(close_month)) >= 1
-    assert closed["net_pnl"]["base"] == pytest.approx(
-        sum(e.realized_pnl_base for e in closed_in(close_month))
-    )
-    # ... and the round trip's WHOLE commission, opening legs included.
-    assert closed["commissions"]["base"] == pytest.approx(
-        sum(e.commission_base for e in closed_in(close_month))
-    )
 
 
-def test_inflight_realised_explains_the_gap_between_p_and_l_and_the_scoreboard(
-    populated,
-):
-    """The card's note, checked against an independent recount of the archive.
-
-    Net P&L sums contract round trips; the scoreboard counts decided positions. A
-    roll settles its near contract for real cash while the decision carries on, so
-    the two legitimately differ and `inflight_realized` is what the note uses to
-    say by how much. On the real archive that is the GOOG chain: rolled in August,
-    still open, its 420C leg already settled.
-
-    Recounted here from the episodes rather than compared against another payload
-    figure, so a bug that moved both in step would still fail. Three properties,
-    each a way the note could lie:
-
-    * it is a SUBSET of the P&L it qualifies ("of this figure"),
-    * it is exactly the closed episodes sitting in an unfinished position,
-    * it is zero when every position has finished, rather than merely small.
-    """
+def test_options_commission_reconciles_with_the_fills(populated):
+    """Monthly commissions sum to the all-time figure, and that is every option
+    fill's commission, still-open positions' opening fills included."""
     conn = connect(populated)
     try:
-        report = build_history(conn, asset_category="OPT")
-        campaigns = campaigns_for(conn, "OPT", report.episodes)
-    finally:
-        conn.close()
-
-    expected = 0.0
-    for campaign in campaigns:
-        episodes = [report.episodes[i] for i in campaign.episode_indices]
-        if all(e.is_closed for e in episodes):
-            continue
-        expected += sum(e.realized_pnl_base for e in episodes if e.is_closed)
-
-    stats = build_state(
-        db_path=populated, archive_dir=RAW_DIR, query_id=None
-    )["stats"]
-    got = stats["inflight_realized"]["base"]
-
-    assert got == pytest.approx(expected)
-    assert abs(got) <= abs(stats["net_pnl"]["base"]) + 1e-9, (
-        "the note says 'of this figure', so the part cannot exceed the whole"
-    )
-    if not expected:
-        pytest.skip("archive has no unfinished position holding settled cash")
-    # Strictness, so the assertions above cannot pass on an all-zero payload: the
-    # gap the note exists for is genuinely open on this archive.
-    assert stats["closed_episodes"] > stats["decided_campaigns"]
-
-
-def test_options_commission_reconciles_and_open_commission_is_separate(populated):
-    """Monthly commissions must sum to the closed-episodes total, with the
-    commission of still-open positions reported separately -- excluded for the
-    same reason open premium is excluded from P&L, visible for the same reason
-    the premium is: real cash, no outcome yet."""
-    conn = connect(populated)
-    try:
-        report = build_history(conn, asset_category="OPT")
+        billed = conn.execute(
+            "SELECT SUM(ib_commission_base) FROM trades WHERE asset_category = 'OPT'"
+        ).fetchone()[0]
     finally:
         conn.close()
     everything = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
@@ -971,15 +894,8 @@ def test_options_commission_reconciles_and_open_commission_is_separate(populated
         )["stats"]["commissions"]["base"]
         for m in everything["month_range"]
     )
-    closed_total = sum(e.commission_base for e in report.closed)
-    assert monthly_sum == pytest.approx(closed_total)
-    assert everything["stats"]["commissions"]["base"] == pytest.approx(closed_total)
-    open_total = sum(e.commission_base for e in report.open)
-    assert everything["stats"]["open_commission"]["base"] == pytest.approx(open_total)
-    if open_total:  # strictness: real data currently has open META shorts
-        assert everything["stats"]["commissions"]["base"] != pytest.approx(
-            closed_total + open_total
-        ), "open commission must not be folded into the headline figure"
+    assert monthly_sum == pytest.approx(billed)
+    assert everything["all_time"]["commissions"]["base"] == pytest.approx(billed)
 
 
 def test_calendar_day_drilldown_is_wired():
@@ -1069,25 +985,28 @@ def test_a_lifecycle_spans_open_and_close_and_matches_the_dashboard(populated):
     assert lc["opened_at"][:10] == ep.opened_at[:10]
     assert lc["closed_at"][:10] == ep.closed_at[:10]
     assert lc["realized_pnl"]["base"] == pytest.approx(ep.realized_pnl_base)
-    # An open lifecycle keeps the Dashboard's rule: nothing until flat.
-    for open_lc in (x for x in st["lifecycles"] if x["status"] == "open"):
-        assert open_lc["realized_pnl"] is None
+    # Every card keeps the Dashboard's rule, open ones too: each carries what
+    # IBKR booked on its fills, a partial close included, so the cards add up to
+    # the all-time Net P&L.
+    assert any(x["status"] == "open" and x["realized_pnl"] for x in st["lifecycles"]), (
+        "precondition: an open card has booked P&L")
+    assert sum(x["realized_pnl"]["base"] for x in st["lifecycles"]
+               if x["realized_pnl"]) == pytest.approx(st["all_time"]["net_pnl"]["base"])
 
 
-def test_dashboard_headline_counts_decided_positions_for_options():
+def test_dashboard_headline_counts_closed_round_trips_for_options():
     """'Total Trades' as a fill count let a month claim trades whose outcome
     belonged to a later month -- open in July, close in August, and July's card
     said '3 trades' while its P&L, wins and losses all correctly read zero. For
-    options the headline is DECIDED POSITIONS, the same population the wins,
-    losses and averages measure: an episode is per contract, so counting those
-    scored a roll as two trades for one decision. Fills and contract round trips
-    both survive in the sub-note, named as what they are."""
+    options the headline is CLOSED CONTRACT ROUND TRIPS, the same population the
+    P&L, wins, losses and averages measure. Fills survive in the sub-note, named
+    as what they are."""
     js = _js()
-    assert "statCard('Trades', s.decided_campaigns," in js
+    assert "statCard('Trades', s.closed_episodes," in js
     assert "fill(s), ${s.orders} order(s)" in js, "fills stay visible as activity"
-    assert "${s.closed_episodes} contract round trip(s)" in js, (
-        "the money's unit stays visible: net P&L is attributed by it, so a "
-        "reader adding up the P&L needs to see it"
+    assert "`closed contract round trip${s.closed_episodes===1?'':'s'}`" in js, (
+        "the headline names its unit, which is the money's: net P&L is "
+        "attributed by it"
     )
     # The fill-count headline remains only as the non-options branch.
     assert js.count("statCard('Total Trades', s.total_trades,") == 1
@@ -1861,6 +1780,7 @@ def _raw(base: str, request: bytes) -> tuple[int, dict]:
 def test_a_rebinding_page_can_neither_read_nor_write(tmp_path):
     """H5 end to end: the Host is checked before any route, GET or POST."""
     db = tmp_path / "j.db"
+    before = web.prefs.read()
     with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
         for request in (
             b"GET /api/state HTTP/1.1\r\nHost: attacker.example:8765\r\n"
@@ -1868,14 +1788,14 @@ def test_a_rebinding_page_can_neither_read_nor_write(tmp_path):
             b"GET / HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n",
             b"POST /api/settings HTTP/1.1\r\nHost: attacker.example\r\n"
             b"Content-Type: application/json\r\nContent-Length: 22\r\n"
-            b"Connection: close\r\n\r\n{\"scoring\":\"contract\"}",
+            b"Connection: close\r\n\r\n{\"query_id\":\"9999999\"}",
         ):
             status, reply = _raw(base, request)
             assert (status, reply["kind"]) == (403, "host"), request
         # The client every other test uses sends `Host: 127.0.0.1:<port>`.
         status, _state = _get(base, "/api/state")
     assert status == 200
-    assert web.prefs.read().get("scoring") is None, "a refused POST was stored"
+    assert web.prefs.read() == before, "a refused POST was stored"
 
 
 def test_the_origin_guard_runs_before_every_route_so_new_endpoints_inherit_it():
@@ -2233,7 +2153,7 @@ def test_a_redraw_hands_focus_back_to_the_control_that_had_it():
 
     Pinned over the source for that test's reason (no DOM under node); checked in a
     browser on the rail, sub-view, cost chip, market day, sort header, watchlist
-    row, month stepper, 0DTE toggles, journal button and scoring switch. The key is
+    row, month stepper, 0DTE toggles and journal button. The key is
     taken before ANY region is rewritten (the rail goes first) and answered after
     the body is written; an aria-label outranks the data attributes because the
     stepper's `data-month` moves with every step while its label does not.
@@ -3311,7 +3231,7 @@ def _run_hash_handler(steps: list[tuple[str, str]]) -> list[dict]:
     handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
     assert handler, "the hashchange handler moved"
     consts = [_page_const(name) for name in
-              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS")]
+              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "COST_OPTIONS")]
     return _node_run([
         f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
         "const location={hash:''}, window={}, calls=[];",
@@ -3331,15 +3251,13 @@ def _run_hash_handler(steps: list[tuple[str, str]]) -> list[dict]:
 
 
 def test_a_hash_change_the_server_would_answer_differently_refetches():
-    """M28: editing `cost`, `scoring` or a `calday` in the hash, typed or by the
-    back and forward buttons, redrew the payload already in hand, so the Costs
-    tab and the win rate stayed on the previous scope (82.8% against 71.9% on a
-    fresh load of the same URL). The handler compared the type and the month
-    only; it now compares the query load() would send.
+    """M28: editing `cost` or a `calday` in the hash, typed or by the back and
+    forward buttons, redrew the payload already in hand, so the Costs tab and the
+    Calendar stayed on the previous scope. The handler compared the type and the
+    month only; it now compares the query load() would send.
     """
     moves = _run_hash_handler([
         ("#tab=costs&cost=OPT", "#tab=costs&cost=STK"),
-        ("#month=all", "#month=all&scoring=contract"),
         ("#tab=calendar", "#tab=calendar&calday=2026-08-03"),
         ("#month=2026-09&type=odte", "#month=2026-09"),
         # Nothing the server reads moved, so no request is spent.
@@ -3348,7 +3266,7 @@ def test_a_hash_change_the_server_would_answer_differently_refetches():
         ("#month=2026-08&calday=2026-08-03", "#month=2026-08&calday=2026-08-04"),
     ])
     assert [m["call"] for m in moves] == [
-        "load", "load", "load", "load", "draw", "draw", "draw"]
+        "load", "load", "load", "draw", "draw", "draw"]
 
 
 def _hash_harness(script: list[str]) -> Any:
@@ -3367,7 +3285,7 @@ def _hash_harness(script: list[str]) -> Any:
     handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
     assert handler, "the hashchange handler moved"
     consts = [_page_const(name) for name in
-              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "SCORINGS", "COST_OPTIONS",
+              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "COST_OPTIONS",
                "SCOPE_KEYS")]
     return _node_run([
         f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
@@ -3428,23 +3346,6 @@ def test_the_wire_spelling_of_the_current_month_is_the_current_month():
     for path in ("fresh", "typed"):
         assert out[path] == {"shown": "2026-09", "hash": "", "asks": "month=current"}, (
             f"{path}: #month=current did not land on the current month: {out[path]}")
-
-
-def test_an_explicit_position_unit_stays_in_the_url():
-    """Review of round 3, pre-existing since aee8c81. syncHash left `scoring=position`
-    out of the URL as if it were the default, but null is the default (the stored
-    preference), so with `contract` stored a `#scoring=position` link lost its unit
-    at once and a reload or back/forward read per contract. An explicit unit is
-    kept, either way, and no unit is written when none was named."""
-    out = _hash_harness([
-        "const out={position:await fresh('#scoring=position'),",
-        "  contract:await fresh('#scoring=contract'), none:await fresh('')};",
-        "console.log(JSON.stringify(out));",
-    ])
-    assert out["position"]["hash"] == "#scoring=position", out["position"]
-    assert "scoring=position" in out["position"]["asks"], out["position"]
-    assert out["contract"]["hash"] == "#scoring=contract", out["contract"]
-    assert out["none"]["hash"] == "", out["none"]
 
 
 def test_a_linked_days_month_is_kept_when_the_same_link_is_followed_again():
@@ -3508,15 +3409,15 @@ def test_a_month_outside_the_account_heals_to_the_all_time_it_shows_on_both_path
     assert out["fresh"]["asks"] == ""
 
 
-def _load_harness(stored: str = "position", real_note: bool = False) -> list[str]:
+def _load_harness(real_note: bool = False) -> list[str]:
     """The page's real `stateQuery` and `load()` against a stand-in server.
 
-    The server answers the month it is asked for (current = 2026-09), scores by
-    the request's unit or else the stored one, and fails with 503 while `down`.
-    `draw` and the payload guard are stand-ins, and so is `note` unless
-    `real_note`, which runs the page's own against a stand-in `#msg` (`msg`).
+    The server answers the month it is asked for (current = 2026-09) and fails
+    with 503 while `down`. `draw` and the payload guard are stand-ins, and so is
+    `note` unless `real_note`, which runs the page's own against a stand-in
+    `#msg` (`msg`).
     """
-    consts = [_page_const(name) for name in ("SCORINGS", "SCOPE_KEYS")]
+    consts = [_page_const("SCOPE_KEYS")]
     banner = [
         "const msg={innerHTML:'',className:'',addEventListener(){}};",
         "msg.classList={contains:c=>msg.className.split(' ').includes(c),",
@@ -3527,20 +3428,20 @@ def _load_harness(stored: str = "position", real_note: bool = False) -> list[str
           if real_note else ["function note(){}"]),
     ]
     return [
-        "let S={month:null,type:null,cost:null,scoring:null,calday:null}, LOADED={};",
+        "let S={month:null,type:null,cost:null,calday:null}, LOADED={};",
         "let READ_NOTE=null;",
-        f"let stored={json.dumps(stored)}, down=false;",
+        "let down=false;",
         "async function fetch(url){",
         "  if(down) return {ok:false,status:503};",
         "  const qs=new URLSearchParams(url.split('?')[1]||'');",
         "  const m=qs.get('month');",
         "  return {ok:true,json:async()=>({month_range:['2026-09','2026-08','2026-01'],",
         "    months:['2026-09'],selected_month:m==='current'?'2026-09':m,trade_type:'all',",
-        "    stats:{scoring:qs.get('scoring')||stored}})};",
+        "    stats:{}})};",
         "}",
         *banner, "function staleServerCheck(){} function draw(){}",
         "function esc(s){return String(s);}",
-        *consts, _page_const("SCORING"),
+        *consts,
         *_page_fns("stateQuery", "pinDayMonth", "load"),
     ]
 
@@ -3592,7 +3493,7 @@ def test_a_month_named_only_by_the_linked_day_survives_the_day_and_a_failed_read
         "S.calday=null; S.month='2025-12'; down=true; await load();",
         "const rolledBack=stateQuery();",
         # A day in the current month keeps the default spelling of that month.
-        "down=false; S={month:null,type:null,cost:null,scoring:null,calday:'2026-09-18'};",
+        "down=false; S={month:null,type:null,cost:null,calday:'2026-09-18'};",
         "await load(); const current=S.month;",
         "console.log(JSON.stringify({landed,dayGone,rolledBack,current}));",
     ])
@@ -3604,85 +3505,9 @@ def test_a_month_named_only_by_the_linked_day_survives_the_day_and_a_failed_read
     assert out["current"] is None
 
 
-def _load_under(stored: str, steps: list[str]) -> list[dict]:
-    """The page's real `load()` against a stand-in server with a stored scoring unit.
-
-    Each step is `ok` (a good read) or `503`, optionally prefixed `pick:<unit>=`
-    to apply the scoring switch's own write first (S.scoring, as its handler sets
-    it, after a save that stored the unit), or `link:<unit>=` for a unit the URL
-    names (S.scoring, as applyHash sets it; nothing is stored). After each step:
-    the unit the control shows, the unit the figures on screen were counted in,
-    and the query the page would send next.
-    """
-    return _node_run([
-        *_load_harness(stored),
-        f"const steps={json.dumps(steps)}, out=[];",
-        "for(const step of steps){",
-        "  const [act,read]=step.includes('=')?step.split('='):[null,step];",
-        "  if(act){const [how,unit]=act.split(':');",
-        "    if(how==='pick'){S.scoring=unit===SCORINGS[0]?null:unit; stored=unit;}",
-        "    else S.scoring=unit;}",
-        "  down=read==='503'; await load();",
-        "  out.push({control:SCORING(),figures:S.state.stats.scoring,asks:stateQuery()});",
-        "}",
-        "console.log(JSON.stringify(out));",
-    ])
-
-
-def test_the_scoring_control_shows_the_unit_the_figures_were_counted_in():
-    """Reviewer finding B. The scoring switch saves the unit and then reads state;
-    the read restores the scope it had on a failure, so "Per contract" clicked
-    against a 503 put S.scoring back to null while the file now said contract. The
-    next good read sent no unit, the server applied the stored one, and the page
-    showed per-contract figures under a lit "Per position" chip, with
-    `groupingMatters` judging a contract payload as a position one (on the
-    reviewer's journal both buttons went disabled, and only a URL edit got out).
-    The root is older than that path: the chip never read `stats.scoring`, so a
-    fresh page with contract stored landed in the same state. Now every good read
-    sets the control from the unit the figures were counted in.
-    """
-    fresh = _load_under("contract", ["ok"])[0]
-    assert fresh["control"] == fresh["figures"] == "contract", fresh
-    picked = _load_under("position", ["ok", "pick:contract=503", "ok"])
-    assert picked[1]["control"] == picked[1]["figures"] == "position", (
-        "a failed read must leave the control on the figures still on screen")
-    assert picked[2]["control"] == picked[2]["figures"] == "contract", picked
-    back = _load_under("contract", ["ok", "pick:position=ok"])[1]
-    assert back["control"] == back["figures"] == "position", back
-
-
-def test_the_stored_scoring_unit_is_never_written_back_as_if_the_reader_chose_it():
-    """Follow-up review, findings 1 and 2. The fix above lit the switch by copying
-    the payload's unit into S.scoring, but on the wire an absent unit means "use
-    the stored one", and S.scoring is what the request sends. So the unit the
-    server INFERRED became one the page NAMED: with contract stored, the page wrote
-    `#scoring=contract`, and after "Per position" (saved) against a 503 the
-    rollback restored that explicit contract, the next read sent it, the server let
-    it win, and the page stayed per contract although the preference said position
-    (a reload too). And a link naming `#scoring=position` collapsed to null, so the
-    next unrelated control switched to the stored contract. The switch now reads
-    the payload's unit and S.scoring stays the unit the request explicitly named.
-    """
-    fresh = _load_under("contract", ["ok"])[0]
-    assert (fresh["control"], fresh["figures"], fresh["asks"]) == (
-        "contract", "contract", "month=current"), (
-        "the stored unit leaked into the request, or the switch does not show it")
-    rolled = _load_under("contract", ["ok", "pick:position=503", "ok"])
-    assert rolled[1]["control"] == rolled[1]["figures"] == "contract", (
-        "a failed read must leave the switch on the figures still on screen")
-    assert "scoring" not in rolled[1]["asks"], (
-        "the rollback restored an inferred unit as an explicit one")
-    assert rolled[2]["control"] == rolled[2]["figures"] == "position", (
-        f"the next good read kept the old stored unit over the new one: {rolled}")
-    linked = _load_under("contract", ["link:position=ok", "ok"])
-    assert [x["figures"] for x in linked] == ["position", "position"], (
-        f"a link's explicit unit gave way to the stored one on the next read: {linked}")
-    assert all(x["control"] == "position" for x in linked)
-
-
 def test_an_unknown_cost_key_in_the_hash_falls_back_to_the_default():
     """L42: `#cost=BOGUS` reached the server and rendered a scope with no chip lit.
-    Validated like the tab, the theme and the scoring unit: an unknown key is
+    Validated like the tab and the theme: an unknown key is
     dropped, and a hash naming no known key means the server's default (null).
     """
     moves = _run_hash_handler([
@@ -3934,18 +3759,11 @@ def test_commission_shows_the_charge_when_the_reader_is_in_that_currency():
     assert "money(Math.abs(nat),ccy):cash(Math.abs(base))" in js
     assert "cash(Math.abs(nat)" not in js
 
-    # BOTH commission figures route through the one rule. They share a sentence
-    # on the card -- "as charged - $2.83 on open positions" -- so one being a
-    # restatement while the other is a charge would be a contradiction in a
-    # single line of prose.
     # One entry point now, not a wrapper per figure: `moneyOf` applies the rule
     # to any Money-shaped key, so a new gated figure needs no new helper and
     # cannot arrive with a subtly different rule of its own.
     assert "constchargeMo=mo=>mo==null?cash(null):chargeOf(mo.native,mo.ccy,mo.base);" in js
-    card = _fn("dashboard").replace(" ", "").replace("\n", "")
-    assert "chargeMo(s.commissions)" in card and "chargeMo(s.open_commission)" in card
-    assert "cash(Math.abs(s.open_commission.base))" not in card, \
-        "the open-positions figure bypasses the shared rule"
+    assert "chargeMo(s.commissions)" in _fn("dashboard").replace(" ", "").replace("\n", "")
 
 
 def test_net_pnl_is_shown_as_realised_not_restated(state):
@@ -5161,7 +4979,7 @@ def test_every_control_has_a_visible_keyboard_focus_ring():
 #: given}. The dashboard's is a SET because the reader chooses how many tiles to
 #: show; the others are fixed. The divisibility check reads every count listed,
 #: and the dashboard's set is pinned against the page's own `TILE_STEP` below.
-STATS_GRIDS = {"": (4, 8, 12, 16, 20), "c3": (3,), "c2": (4,)}
+STATS_GRIDS = {"": (4, 8, 12, 16, 20), "c3": (3,), "c2": (4, 2)}
 
 #: Columns per modifier at each breakpoint, widest first. Read off the stylesheet
 #: by the test rather than trusted, so a retune cannot drift from this table.
@@ -5473,7 +5291,7 @@ def test_an_empty_loss_population_reads_as_a_fact_not_a_missing_number():
     closed still shows the em-dash it should.
     """
     body = _fn("dashboard")
-    assert "s.losses===0&&s.decided_campaigns>0" in body.replace(" ", ""), (
+    assert "s.losses===0&&s.closed_episodes>0" in body.replace(" ", ""), (
         "the empty-population case is gone, so Avg Loss shows a bare em-dash "
         "again when there are no losses"
     )
@@ -5883,14 +5701,14 @@ def test_a_slower_older_reply_does_not_land_over_a_newer_one():
     asked for back on screen, and `load()` resets the controls from the reply."""
     out = _node_run([
         f"import {{esc}} from '{_static('format.js')}';",
-        "const S={state:null,month:null,type:null,cost:null,scoring:null,calday:null};",
+        "const S={state:null,month:null,type:null,cost:null,calday:null};",
         "let draws=0; function note(){} function draw(){draws++;} function staleServerCheck(){}",
         "let release; const slow=new Promise(r=>{release=r;});",
         "const replies=[slow.then(()=>({stats:{},trade_type:'odte'})),",
         "  Promise.resolve({stats:{},trade_type:'all'})];",
         "let calls=0; const fetch=async()=>{const body=await replies[calls++];",
         "  return {ok:true,status:200,json:async()=>body};};",
-        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        _page_const("SCOPE_KEYS"), "let LOADED={}, READ_NOTE=null;",
         "const $=()=>({innerHTML:'',className:''});",
         *_page_fns("stateQuery", "pinDayMonth", "load"),
         "const older=load(); const newer=load(); await newer; release(); await older;",
@@ -5917,11 +5735,11 @@ def test_a_reload_keeps_the_token_status_already_in_hand():
     out = _node_run([
         f"import {{esc}} from '{_static('format.js')}';",
         "const S={state:{settings:{token:{ok:true,present:true,account:'me'}}},",
-        "  month:null,type:null,cost:null,scoring:null,calday:null};",
+        "  month:null,type:null,cost:null,calday:null};",
         "function note(){} function draw(){} function staleServerCheck(){}",
         "const fetch=async()=>({ok:true,status:200,json:async()=>(",
         "  {stats:{},settings:{token:null}})});",
-        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        _page_const("SCOPE_KEYS"), "let LOADED={}, READ_NOTE=null;",
         "const $=()=>({innerHTML:'',className:''});",
         *_page_fns("stateQuery", "pinDayMonth", "load"),
         "await load();",
@@ -5943,13 +5761,13 @@ def test_a_state_reply_that_cannot_be_read_still_hands_the_buttons_back(reply):
     """
     out = _node_run([
         f"import {{esc}} from '{_static('format.js')}';",
-        "const S={state:{stats:{}},month:null,type:null,cost:null,scoring:null,calday:null};",
+        "const S={state:{stats:{}},month:null,type:null,cost:null,calday:null};",
         "const notes=[]; let draws=0;",
         "function note(text,kind){notes.push(kind);}",
         "function draw(){draws++;}",
         "function staleServerCheck(){}",
         f"let fetch; {reply}",
-        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        _page_const("SCOPE_KEYS"), "let LOADED={}, READ_NOTE=null;",
         "const $=()=>({innerHTML:'',className:''});",
         *_page_fns("stateQuery", "pinDayMonth", "load"),
         "try{ await load(); }catch(e){ notes.push('threw'); }",
@@ -5974,31 +5792,29 @@ def test_a_failed_state_read_leaves_the_controls_over_the_figures_in_hand():
     payload = {"month_range": ["2026-08", "2026-09"], "trade_type": "all", "stats": {}}
     out = _node_run([
         f"import {{esc}} from '{_static('format.js')}';",
-        "const S={state:null,month:'2026-09',type:null,cost:['OPT'],scoring:null,"
-        "calday:null};",
+        "const S={state:null,month:'2026-09',type:null,cost:['OPT'],calday:null};",
         "const notes=[]; let draws=0;",
         "function note(text,kind){notes.push(kind);}",
         "function draw(){draws++;}",
         "function staleServerCheck(){}",
         f"const payload={json.dumps(payload)};",
         "let fetch=async()=>({ok:true,status:200,json:async()=>payload});",
-        _page_const("SCOPE_KEYS"), _page_const("SCORINGS"), "let LOADED={}, READ_NOTE=null;",
+        _page_const("SCOPE_KEYS"), "let LOADED={}, READ_NOTE=null;",
         "const $=()=>({innerHTML:'',className:''});",
         *_page_fns("stateQuery", "pinDayMonth", "load"),
         "await load();",
         # What the month stepper and the trade-type buttons do, then a read that fails.
-        "S.month='2026-08';S.type='equities';S.cost=['OPT','STK'];S.scoring='campaign';",
+        "S.month='2026-08';S.type='equities';S.cost=['OPT','STK'];",
         "fetch=async()=>({ok:false,status:503,json:async()=>({})});",
         "await load();",
         "console.log(JSON.stringify({month:S.month,type:S.type,cost:S.cost,",
-        "  scoring:S.scoring,query:stateQuery(),draws,notes}));",
+        "  query:stateQuery(),draws,notes}));",
     ])
     assert out["notes"] == ["bad"], "the banner no longer says the read failed"
     assert out["draws"] == 2, "a failed read must still redraw and hand the buttons back"
     assert out["month"] == "2026-09", "the header still names a month the figures are not for"
     assert out["type"] is None, "the view button still names a scope the figures are not for"
     assert out["cost"] == ["OPT"], "the cost chips still name a scope the figures are not for"
-    assert out["scoring"] is None, "the scoreboard unit still disagrees with its figures"
     # The URL is written from the same keys, so agreeing here is agreeing there.
     assert out["query"] == "month=2026-09&cost=OPT"
 
@@ -7817,8 +7633,8 @@ def test_the_web_api_cannot_turn_dev_mode_on(populated, monkeypatch):
 
     This server has no authentication, so a page open in another tab can POST
     here. `dev` gates developer-only surfaces, so if `/api/settings` accepted it
-    that page could flip it. `_settings_write` names `query_id` and `scoring` by
-    hand and writes nothing else, so `{dev:true}` is simply not a known setting --
+    that page could flip it. `_settings_write` names the query ids and the tiles
+    by hand and writes nothing else, so `{dev:true}` is simply not a known setting --
     and the state it renders stays `dev:false`.
 
     Asserted through a real server, and both ways: the write is refused AND the
@@ -8965,7 +8781,7 @@ def test_the_demos_settings_cannot_touch_the_real_journals_ids_or_token(
     so Save beside a blank field deleted the real ids (the scheduled sync then
     failed with "no query id") and a typed one replaced them. Refused now, and
     the token, which is the real journal's keyring entry, too. A preference that
-    is the demo's own (the scoreboard unit) still saves, without echoing the
+    is the demo's own (the dashboard tiles) still saves, without echoing the
     real ids back."""
     import keyring  # noqa: PLC0415 - local to this test
 
@@ -8981,13 +8797,14 @@ def test_the_demos_settings_cannot_touch_the_real_journals_ids_or_token(
         replies = [_post(base, "/api/settings", {"query_id": ""}),
                    _post(base, "/api/settings", {"confirm_query_id": "999"}),
                    _post(base, "/api/settings/token", {"token": "123456789012"})]
-        scoring = _post(base, "/api/settings", {"scoring": "contract"})
+        tiles = _post(base, "/api/settings",
+                      {"tiles": ["net_pnl", "trades", "win_rate", "profit_factor"]})
     assert [(status, reply["kind"]) for status, reply in replies] == [(400, "demo")] * 3
     assert (settings.query_id(), settings.confirm_query_id()) == ("4242424", "3334445")
     assert wrote == [], "the demo wrote the real journal's keyring entry"
-    assert scoring[0] == 200
-    assert "query_id" not in scoring[1]["stored"]
-    assert "confirm_query_id" not in scoring[1]["stored"]
+    assert tiles[0] == 200
+    assert "query_id" not in tiles[1]["stored"]
+    assert "confirm_query_id" not in tiles[1]["stored"]
 
 
 @pytest.mark.parametrize(("flag", "env", "source"), [
@@ -9066,13 +8883,13 @@ def test_a_tile_list_the_grid_cannot_hold_is_refused_with_its_reason(tiles, says
 
 def test_a_tile_list_the_grid_can_hold_is_accepted():
     assert web._tiles_problem(list(web.DASHBOARD_TILES)) is None, "every tile"
-    assert web._tiles_problem(["inflight", "red_days", "wins", "trades"]) is None
+    assert web._tiles_problem(["orders", "red_days", "wins", "trades"]) is None
 
 
 def test_the_settings_endpoint_stores_tiles_and_stores_the_default_as_absence(populated):
     """A chosen arrangement round-trips; the default and a reset both store nothing.
 
-    Absence for the default, as for `scoring`: a stored copy of today's default
+    Absence for the default: a stored copy of today's default
     would freeze it for this reader when the default later changes. A refused list
     must leave the stored one exactly as it was -- a 400 that half-applied would be
     a grid with a hole in it on the next load.
@@ -9389,19 +9206,28 @@ def test_the_theme_chip_drops_under_the_wordmark_when_the_row_cannot_hold_both()
         "the title row cannot wrap, so the chip overflows the header on a phone")
 
 
-def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state):
-    """The ranking reads the lifecycles; the tiles read month_stats. Both claim to
-    count decided positions' realised P&L, so over all time the decided cards must
-    sum to what Avg P&L per Trade implies -- or the Best Strategy tile is ranking a
-    different population from the tiles beside it. Recomputed, not pinned.
+def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state, populated):
+    """The ranking reads the lifecycles; the tiles read month_stats. Over all time
+    the decided cards, plus whatever closed inside a card still running, must sum
+    to what Avg P&L per Trade implies, or the Best Strategy tile is ranking
+    different money from the tiles beside it. Recomputed, not pinned.
     """
     at = state["all_time"]
-    if at["scoring"] != "position" or not at["decided_campaigns"]:
-        pytest.skip("needs decided positions under position scoring")
+    if not at["closed_episodes"]:
+        pytest.skip("needs closed round trips")
+    conn = connect(populated)
+    try:
+        report = build_history(conn, asset_category="OPT")
+        camps = campaigns_for(conn, "OPT", report.episodes)
+    finally:
+        conn.close()
+    running = sum(report.episodes[i].realized_pnl_base
+                  for c in camps if not c.is_decided
+                  for i in c.episode_indices if report.episodes[i].is_closed)
     decided = [lc for lc in state["lifecycles"]
                if lc["status"] == "closed" and lc["realized_pnl"]]
-    assert sum(lc["realized_pnl"]["base"] for lc in decided) == pytest.approx(
-        at["avg_pnl"]["base"] * at["decided_campaigns"])
+    assert sum(lc["realized_pnl"]["base"] for lc in decided) + running == pytest.approx(
+        at["avg_pnl"]["base"] * at["closed_episodes"])
     best = at["best_strategy"]
     assert best and best["pnl"]["base"] >= (at["worst_strategy"] or best)["pnl"]["base"]
     # And the largest outcomes bound the averages they were chosen from.

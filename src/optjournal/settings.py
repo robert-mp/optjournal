@@ -8,7 +8,7 @@ persisted here:
 * the LAYOUT (where the database and archive are) is policy, not preference,
   and lives in `config.py` as constants;
 * everything else is a CHOICE a person made once and should not have to make
-  again -- the Flex query id, the scoreboard's unit. That is this file.
+  again -- the Flex query id, the dashboard's tiles. That is this file.
 
 Why a file at all, when the query id already had two channels. `--query-id`
 serves one command and `OPTJOURNAL_QUERY_ID` serves a shell that exported it,
@@ -57,7 +57,6 @@ __all__ = [
     "query_id",
     "query_id_override",
     "query_id_source",
-    "scoring",
     "update",
 ]
 
@@ -74,7 +73,7 @@ FILENAME = ".optjournal.json"
 #: and writes nothing else. So the unauthenticated HTTP surface cannot turn dev
 #: mode on: it is set out-of-band, the way IAG's `is_admin` is a server decision
 #: the client can only read -- see `dev` below.
-_KEYS = frozenset({"query_id", "confirm_query_id", "scoring", "tiles", "dev"})
+_KEYS = frozenset({"query_id", "confirm_query_id", "tiles", "dev"})
 
 #: The environment channel for the dev flag. `OPTJOURNAL_DEV=1 optjournal serve`
 #: turns developer-only surfaces on for one session without touching the file.
@@ -130,7 +129,7 @@ def update(root: Path | None = None, **values: Any) -> dict[str, Any]:
 
     MERGES rather than replaces, so writing one preference cannot drop another
     -- a settings page that saves the query id must not silently reset the
-    scoreboard unit it was not asked about.
+    dashboard tiles it was not asked about.
 
     A `None` value DELETES its key, which is how "back to the default" is
     spelled. Storing null instead would make every reader distinguish "chosen
@@ -282,7 +281,7 @@ def dev(*, root: Path | None = None) -> bool:
     `query_id`: an exported-but-blank variable falls through to the file.
 
     NOT reachable through the web API, and that is the point rather than an
-    omission. `web._settings_write` writes only `query_id` and `scoring`, so a
+    omission. `web._settings_write` writes only the query ids and the tiles, so a
     page open in another tab cannot flip dev mode over the unauthenticated HTTP
     surface. The privileged flag is set out-of-band -- a shell export or the
     hand-editable file -- never by the untrusted caller, which is the line IAG
@@ -295,26 +294,12 @@ def dev(*, root: Path | None = None) -> bool:
     return _truthy(read(root).get("dev"))
 
 
-def scoring(explicit: str | None = None, *, root: Path | None = None) -> str | None:
-    """The stored scoreboard unit, or `explicit` when one was passed.
-
-    No environment step, unlike `query_id`: a scoring unit is a reading
-    preference set from the page, and nothing about a cron or a shell has an
-    opinion on it. Validation belongs to `stats.scoring_or_default`, which owns
-    the vocabulary -- this only answers what was stored.
-    """
-    if explicit and explicit.strip():
-        return explicit.strip()
-    stored = read(root).get("scoring")
-    return str(stored).strip() if stored else None
-
-
 def tiles(*, root: Path | None = None) -> list[str] | None:
     """The dashboard tiles the reader chose to show, in order, or None.
 
-    None is the default arrangement, stored as absence like `scoring`'s default,
-    so a change to the default reaches everyone who never chose. Anything but a
-    list of strings reads as None too: this fails open like `read`, and
+    None is the default arrangement, stored as absence, so a change to the
+    default reaches everyone who never chose. Anything but a list of strings
+    reads as None too: this fails open like `read`, and
     validation belongs to `web._settings_write`, which owns the vocabulary and
     refuses a bad list before it is ever stored. A hand-edited file that slips
     past it lands on the page, which checks again and falls back to the default.

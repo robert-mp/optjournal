@@ -156,6 +156,10 @@ class _Ep:
         self.realized_pnl = pnl
         self.commission = comm
         self.currency = "USD"
+        # Blank, as the hand-built orders carry no broker or account: the
+        # campaign finds an order by `(broker, order id)`.
+        self.broker = ""
+        self.account_id = ""
 
 
 def _camps(orders, episodes, trade_to_order=None):
@@ -201,13 +205,14 @@ def _lifecycles(orders, *, episodes, trade_to_order):
 
 def test_open_and_close_events_link_into_one_closed_lifecycle():
     """The naked-put case: sold in July, bought back in August -- one
-    position across its lifecycle, linked by the shared episode, with the
-    episode's own P&L (already net of commission) on the card."""
+    position across its lifecycle, linked by the shared episode, with what IBKR
+    booked on the buyback (already net of commission) on the card."""
     opening = _order("10", "2026-07-24 10:35:01",
                      [_leg(underlying_symbol="TSLA", strike=270.0)])
     closing = _order("11", "2026-08-03 09:55:23",
                      [_leg(underlying_symbol="TSLA", strike=270.0,
-                           buy_sell="BUY", open_close="C")])
+                           buy_sell="BUY", open_close="C",
+                           realized_pnl=778.40, realized_pnl_base=684.59)])
     ep = _Ep("C1", ["t1", "t2"], closed=True,
              closed_at="2026-08-03 09:55:23", pnl=684.59, comm=-3.62)
     lifecycles = _lifecycles(
@@ -220,19 +225,22 @@ def test_open_and_close_events_link_into_one_closed_lifecycle():
     assert lc["label"] == "Short put", "named by the shape it was OPENED as"
     assert (lc["opened_at"], lc["closed_at"]) == (
         "2026-07-24 10:35:01", "2026-08-03 09:55:23")
-    assert lc["realized_pnl"]["base"] == 684.59, "episode-sourced, not fill-summed"
+    assert lc["realized_pnl"] == {"base": 684.59, "native": 778.40, "ccy": "USD"}, (
+        "the closing fill's own figure, native and base")
     assert len(lc["events"]) == 2, "both events stay visible beneath"
 
 
-def test_an_open_lifecycle_reports_no_realised_pnl():
-    """Same rule as the Dashboard: nothing counts until the position is flat."""
+def test_an_open_lifecycle_with_nothing_closed_reports_no_realised_pnl():
+    """No leg has closed anything, so there is nothing realised: None, not a
+    zero that would read as a scratch. No commission figure either, since
+    realised P&L is already net of it."""
     opening = _order("10", "2026-08-03 11:11:19", [_leg()])
     ep = _Ep("C1", ["t1"], closed=False)
     (lc,) = _lifecycles([opening], episodes=[ep],
                         trade_to_order={"t1": "10"})
     assert lc["status"] == "open"
     assert lc["realized_pnl"] is None
-    assert lc["commission"] is None
+    assert "commission" not in lc
 
 
 def test_unrelated_contracts_never_share_a_lifecycle():
@@ -249,7 +257,8 @@ def test_a_roll_event_chains_lifecycles_into_one_campaign():
     episode with each side links the whole chain into one card."""
     opening = _order("10", "2026-07-24 10:00:00", [_leg()])
     roll = _order("11", "2026-08-20 10:00:00", [
-        _leg(buy_sell="BUY", open_close="C"),
+        _leg(buy_sell="BUY", open_close="C", realized_pnl=100.0,
+             realized_pnl_base=100.0),
         _leg(expiry="20261016", open_close="O"),
     ])
     eps = [
@@ -262,7 +271,7 @@ def test_a_roll_event_chains_lifecycles_into_one_campaign():
     assert len(got) == 1, "the campaign is one lifecycle"
     lc = got[0]
     assert lc["status"] == "open", "the rolled-into leg is still open"
-    assert lc["realized_pnl"] is None, "campaign not decided yet"
+    assert lc["realized_pnl"]["base"] == 100.0, "the closed near leg counts already"
     assert {e["label"] for e in lc["events"]} == {"Short put", "Roll"}
 
 

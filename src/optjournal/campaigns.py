@@ -1,28 +1,18 @@
 """Which episodes were one decision, and what that decision earned.
 
-An episode (`history.py`) is one round trip in ONE contract. That is the right
-unit for MONEY: it ties to the broker statement, and monthly rows sum to annual
-ones because each episode lands in exactly one close month. It is the wrong unit
-for a SCOREBOARD, and two verified cases show why:
-
-* A roll closes one expiry and opens the next. It ends episode A and starts
-  episode B, so one continuing decision scored as two closed trades and two
-  wins. Worse in the losing direction: roll a short put down 1200, scratch the
-  final leg at +50, and the episode unit reports one win and one loss (50%)
-  for a decision that lost 1150.
-* A put vertical is two conids with no roll involved. On `demo/journal.db` it
-  scored one win PLUS one loss on a single spread that netted +562.33.
-
-Measured on `demo/journal.db`: the episode unit gives 9 closed, 7 wins, 2
-losses, 77.8%; the campaign unit gives 7, 6, 1, 85.7%. Net P&L is 3695.08
-either way, which is the whole point. The money does not move, only the
-counting. `stats.py`'s module docstring states the money rule; this one states
-the outcome rule, and the two are deliberately different.
+An episode (`history.py`) is one round trip in ONE contract. Its realised P&L is
+the sum of its fills', each booked on its own trade date, which is what ties the
+money to the broker statement (`stats.py`), and it is also the unit the
+scoreboard counts. A campaign is the POSITION a trader thinks in: an opening
+trade plus every roll of it, or a spread's legs placed together. It is what the
+Trades tab draws as one card, what a journal write-up is filed under, what the
+open-position count and the strategy ranking count, and what the Review tab
+reviews.
 
 A campaign is DECIDED only when every episode in it is closed, because a roll
-is a continuation. Its outcome is the SUM of its episodes' realised P&L, which
-is what makes the losing-roll case above come out at -1150 rather than +50:
-counting only the final leg would let any loser be rolled into a win.
+is a continuation. Its outcome is the SUM of its episodes' realised P&L: roll a
+short put down 1200 and scratch the final leg at +50, and the position reads
+-1150, where its last leg alone would read +50.
 
 Two levels of linkage, and both are needed. Verified against the real journal,
 where every multi-leg event arrives as SEPARATE order ids filled in the same
@@ -32,22 +22,18 @@ second:
     2026-08-04 11:24:00  GOOG strangle  orders 1243007507, 1243007533
     2026-08-07 11:06:03  GOOG roll      orders 1247248833, 1247248883  (O, C)
 
-So order-id union alone finds nothing on real data: it reproduces the exact
-defect it was meant to remove. `cluster_orders` is what bridges that, and
-`strategy_groups`'s docstring has recorded the same fact since the first
-strangle. The consequence is honest and worth stating plainly: a win rate now
-depends on a 90-second heuristic, where before only a card layout did.
+So order-id union alone finds nothing on real data. `cluster_orders` is what
+bridges that, and `strategy_groups`'s docstring has recorded the same fact since
+the first strangle. The consequence is worth stating plainly: which fills share
+a card depends on a 90-second heuristic. No euro and no win depends on it, since
+the money and the scoreboard count episodes.
 
 Why a module of its own, rather than a helper inside `strategies.py`: the union
-rule has two consumers on opposite sides of the import graph. `strategies.py`
-draws the Trades tab's lifecycle cards, `stats.py` counts the scoreboard, and
-neither may import the other. The rule lived in `strategies.py` mixed in with
-order grouping, event labelling and Money aggregation, where the stats layer
-could not reach it, so the Dashboard counted a roll as two wins while the
-Trades tab drew it as one card. That is `notes.py`'s situation exactly: one
-rule, two readers that cannot see each other, the previous state being the rule
-written twice. This holds `money.py` and `notes.py`, both leaves, so any layer may hold it
-and every case below is testable against literals.
+rule has readers on both sides of the import graph. `strategies.py` draws the
+cards, and `stats.py` (`campaigns_for`) and `serialize.py` resolve positions for
+the open-position count and the journal, and neither layer may import the other.
+This holds `money.py` and `notes.py`, both leaves, so any layer may hold it and
+every case below is testable against literals.
 
 WHAT A WRITE-UP IS FILED UNDER. A journal row is keyed `(broker, account_id,
 anchor_order_id)`, and what it is filed under has to stay with the decision it
@@ -177,15 +163,14 @@ class Campaign:
     order_ids: frozenset[str]
     #: Every episode closed. A roll into a still-open position leaves this
     #: False, which is the entire behavioural change: the near leg's realised
-    #: P&L stays in its own close month while the decision stays undecided.
+    #: P&L stays on its own fills' days while the decision stays undecided.
     is_decided: bool
-    #: When the LAST episode closed, so the scoreboard credits the month the
+    #: When the LAST episode closed, so a position is dated by the month the
     #: decision finished. None while undecided.
     closed_at: str | None
-    #: Summed realised P&L, gated across currencies. None while undecided,
-    #: matching the lifecycle card and the Dashboard's own rule.
+    #: Summed realised P&L, gated across currencies. None while undecided. A
+    #: decided campaign's equals its Trades card's `realized_pnl`.
     realized: Money | None
-    commission: Money | None
     #: The hand-made links (`link`'s `links`) that joined episodes into this
     #: campaign, as stored. Empty for a campaign the window alone built, which is
     #: how the Trades tab knows which cards it may offer to unlink.
@@ -512,9 +497,6 @@ def link(
             # instead of labelling one figure with the other's currency.
             realized=Money.charged(
                 (e.realized_pnl_base, e.realized_pnl, e.currency) for e in eps
-            ) if decided else None,
-            commission=Money.charged(
-                (e.commission_base, e.commission, e.currency) for e in eps
             ) if decided else None,
             links=tuple(sorted(links_of_root.get(root, ()))),
             leg_parts={(order_id, conid): _leg_share(taken)

@@ -273,12 +273,12 @@ def _script() -> tuple[list[Order], list[Position], list[Cash]]:
             fills=(-1, -1, -1, -1, -1)),
     ]))
 
-    # 9. A PARTIAL close, still open at period end. Sold 3, bought back 1 --
-    #    IBKR realises the 1-lot immediately, but the position is not flat, so
-    #    a "closed trades only" P&L must show none of it. This is the case
-    #    that separates episode-based P&L from summing per-fill realisation:
-    #    every other scripted round trip closes fully, so without this one the
-    #    two rules agree everywhere and the distinction is untested.
+    # 9. A PARTIAL close, still open at period end. Sold 3, bought back 1:
+    #    IBKR realises the 1-lot on that fill, so Net P&L and the Calendar
+    #    count it that day, while the scoreboard waits for the contract to be
+    #    flat. Every other scripted round trip closes fully, so without this
+    #    one the money and the outcomes agree everywhere and the distinction
+    #    is untested.
     exp = d(2026, 4, 17)
     orders.append(Order(d(2026, 1, 8), label="partial: sold 3", legs=[
         Leg("SPY", exp, "P", Decimal("590"), -3, Decimal("7.20"), "O"),
@@ -290,9 +290,7 @@ def _script() -> tuple[list[Order], list[Position], list[Cash]]:
     ]))
 
     # 10. A stock round trip and a stock buy-and-hold, so the Equities view
-    #     has both an outcome and an open position. Stock P&L stays on IBKR's
-    #     per-fill realisation rule -- these pin that it survives the options
-    #     fix untouched.
+    #     has both an outcome and an open position.
     orders.append(Order(d(2025, 4, 8), label="stock: bought 20", legs=[
         Leg("NVDA", None, "", None, 20, Decimal("94.30"), "O", asset="STK"),
     ]))

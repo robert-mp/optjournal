@@ -77,8 +77,8 @@ expected-move band, the per-bar P&L on the scorecard, and the effective-delta
 series — each labelled as modelled, on a panel whose caption says so. `stats.py`,
 `analysis.py` and `serialize.py` never import it, so no headline number, no
 calendar day and no annual row can be traced back to a model. The journal's
-credibility rests on that separation: "nothing counts until the position is
-flat" is worth little if a modelled figure can reach the same card.
+credibility rests on that separation: "every figure is what IBKR booked" is
+worth little if a modelled figure can reach the same card.
 
 **The allowlist names a module that exists for pricing.** This layer lived in
 `bars.py` while that module owned both the modelled series and the manifest, the
@@ -365,67 +365,30 @@ Four invariants worth knowing before changing the UI:
   every selection, in their own block, labelled as attributable to nothing.
   Hiding them under a narrow scope would make a tab captioned "broker cost"
   quietly measure less than it claims.
-* **Options P&L counts fully closed round trips only, attributed to the
-  close date.** A partial close (sold 3, bought back 1) contributes
-  nothing until the position is flat, and premium collected on an open
-  short is a liability, not profit — it is shown separately as "open
-  premium". Other asset categories keep IBKR's per-fill realisation.
-  `Gain % of Net Liq` divides that P&L by the NAV from the statement's
+* **P&L and commission are what IBKR booked on each fill, on its trade
+  date, for every asset category.** A partial close (sold 3, bought back 1)
+  counts the day it fills, and every month's net P&L and commission
+  reconcile with the statement. Premium collected on a contract still held
+  is not profit until a fill closes it, and is shown separately as "open
+  premium". `Gain % of Net Liq` divides that P&L by the NAV from the statement's
   Equity Summary section (enable it on the Flex query template; the demo
   carries synthetic NAV rows).
-* **The money counts contracts; the scoreboard counts positions.** Three
-  units, narrowing: `fills` are executions, `closed` are contract round
-  trips (an *episode*, and what net P&L is attributed by), `decided` are
-  positions (a *campaign*, and what W/L/win rate measure). They differ
-  because a roll closes one contract and opens the next: on the episode
-  unit that scored one continuing decision as two closed trades and two
-  wins, and a two-conid put vertical as one win PLUS one loss on a spread
-  that netted +562.33. Measured on the demo: 9 closed / 7W / 2L / 77.8%
-  by contract against 7 / 6W / 1L / 85.7% by position, with net P&L
-  identical at 3695.08 — the money does not move, only the counting.
-  A campaign is decided only when every contract in it is closed, and its
-  outcome is the SUM of them, so a loser rolled out and scratched on its
-  final leg is still a loss. `wins + losses == decided` always; against
-  `closed` it need not, and both columns are on screen with a note
-  wherever they differ. See `campaigns.py`, which owns the rule.
+* **The scoreboard counts one unit, the contract round trip.** Three counts,
+  narrowing: `fills` are executions, `closed` are contract round trips (an
+  *episode*, dated by the trade date of its last closing fill), and W, L, win
+  rate and the averages score those same round trips. A round trip closed by
+  two partial fills is one outcome, not two, and a partial close is money but
+  not yet an outcome. A roll closes one contract and opens the next, so the
+  closed contract is a decided outcome on the day of the roll, and a
+  strangle's two legs are two outcomes, which is what a broker trade log
+  shows. Measured on the demo: 9 closed, 7W / 2L, 77.8%, net P&L 4054.25, of
+  which 359.18 is the partial close on a contract still held.
 
-  Two surfaces deliberately keep the contract unit and say so: `optjournal
-  history` (it lists episodes) and the 0DTE cohort card on the Dashboard (a
-  cohort is defined by a contract's expiry, and a rolled position spans
-  several).
-
-  `month_stats` builds its own linkage via `stats.campaigns_for` when a
-  caller passes none, so the corrected figures are the default and not an
-  opt-in. The `campaign_list=` argument is a COST optimisation only: the
-  Annual tab asks for a dozen months, two years and a total from one
-  report, and `_period_stats` builds the linkage once for all of them.
-  Passing nothing is always correct, just one query per period. It used to
-  fall back to one campaign per episode, which meant a forgotten keyword
-  silently produced the pre-campaign reading — a default that is wrong in
-  silence, and the reason most of the suite was measuring the old rule.
-
-  The two units part company in exactly one place, and the Net P&L card
-  names it: a roll settles its near contract for real cash while the
-  decision carries on, so that money is in the P&L and out of the
-  scoreboard. `inflight_realized` is how much — €270.47 on this account,
-  the GOOG 420C closed when the strangle was rolled — and the note reads
-  "of this closed inside a position still running". It is NOT netted out of
-  Net P&L: the cash left the broker and is on the tax return, so removing
-  it would stop the panel reconciling against the statement and break
-  monthly rows summing to annual ones. It is the third member of a family —
-  `open_premium` is cash collected with no outcome yet, `open_commission`
-  is cash paid with no outcome yet, this is cash *settled* with no outcome
-  yet. Provenance, never a forecast: it can fall, since rolling a winner
-  into a loser leaves the finished campaign worth less.
-
-  A toggle was considered and rejected. Every control on this page exists
-  because two readers want different DATA (`type` filters the population,
-  `ccy` restates it, the calendar filter has two axes because one could not
-  express "USD, every impact"). Nobody wants a Net P&L that IBKR never
-  reported, so the gap is a labelling problem, not a choice — and a
-  presentation toggle would have to live in the hash like `theme` and
-  `ccy`, which would let a shared link carry a non-broker-stated P&L with
-  nothing on screen saying which mode produced it.
+  Grouping contracts into positions (a *campaign*) is the Trades tab's view,
+  and `campaigns.py` owns it. The scoreboard does not count by it. The Best
+  and Worst Strategy tiles are the one exception, and their note says so: a
+  strategy is a property of a position, so they rank decided positions
+  (`stats.strategy_ranking`).
 * **The payload contract lives in the page, and the suite derives its
   guards from it.** `page.html` opens with `@typedef` blocks declaring
   every shape the page reads and a `@payload`/`@local` table saying which
@@ -441,15 +404,13 @@ Four invariants worth knowing before changing the UI:
   markup needs no restart), while the Python is loaded once at import. A
   server left running across a merge therefore serves NEW markup against an
   OLD payload, and a card reading `undefined` looks like data loss rather
-  than a process needing a restart. Happened twice while the campaign unit
-  was being built. `staleServerCheck` closes it: `STATS_KEYS_REQUIRED` names
-  the newest `stats` keys, and their absence raises the banner the page
-  already has for things the reader must act on, naming the missing keys and
-  the fix. Two tests hold the list to the typedef and to a real payload (a
-  guard watching a renamed key would pass unconditionally while protecting
-  nothing) and pin that it runs between the payload landing and the first
-  draw. Verified against a server serving current markup over a stale
-  payload: banner fires, cards still render, no console errors.
+  than a process needing a restart. `staleServerCheck` closes it: a payload
+  with no `stats` block, or missing a key `STATE_KEYS_REQUIRED` names, raises
+  the banner the page already has for things the reader must act on, naming
+  the missing keys and the fix. Two tests hold the list to the typedef and to
+  a real payload (a guard watching a renamed key would pass unconditionally
+  while protecting nothing) and pin that it runs between the payload landing
+  and the first draw.
 
 ## The demo's option bars are computed
 

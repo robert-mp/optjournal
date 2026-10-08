@@ -153,7 +153,7 @@ def test_a_roll_is_one_decision_and_is_undecided_until_the_last_leg_closes():
     """The whole behavioural change. A roll's order closes one contract and
     opens the next, so the two episodes are one campaign -- and it is not
     decided while the rolled-into leg is open, even though the near leg booked
-    real P&L. That P&L still belongs to its own close month; only the OUTCOME
+    real P&L. That P&L still lands on the days IBKR booked it; only the OUTCOME
     waits."""
     eps = [_Ep("A", ["t1", "t2"], pnl=585.82),
            _Ep("B", ["t3"], closed=False)]
