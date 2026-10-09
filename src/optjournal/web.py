@@ -707,6 +707,9 @@ def build_state(
         view_campaigns = campaigns_for(conn, view_category, view_episodes)
         state: dict[str, Any] = {
             "version": __version__,
+            # The code on disk is newer than the code this process runs, so every
+            # figure below may come from the old version. See `_CODE_MTIME`.
+            "restart_needed": _code_mtime() > _CODE_MTIME,
             "generated_at": _now(),
             # What `/api/pulse` is compared against: see `data_stamp`.
             "stamp": stamp,
@@ -2661,6 +2664,22 @@ def page_html() -> str:
     enough: reload the browser and the edit is there.
     """
     return PAGE_PATH.read_text(encoding="utf-8")
+
+
+#: The folder whose `*.py` files this process imported. The page is re-read per
+#: request (above) but the Python is not, so a server left running across a merge
+#: serves the new page against the old payload and nothing on screen says so.
+_PACKAGE = Path(__file__).resolve().parent
+
+
+def _code_mtime() -> float:
+    """The newest modification time among this package's own Python files."""
+    return max(p.stat().st_mtime for p in _PACKAGE.glob("*.py"))
+
+
+#: `_code_mtime()` when this module was imported. Newer on disk means the code
+#: changed under a running process, and only a restart loads it.
+_CODE_MTIME = _code_mtime()
 
 
 def companion_html() -> str:

@@ -202,6 +202,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
 
 /** @typedef {Object} State -- the /api/state payload (web.build_state)
  * @property {string} version
+ * @property {boolean} restart_needed -- the code on disk is newer than the code
+ *   this process loaded (web._CODE_MTIME), so the figures may be the old version's
  * @property {string} generated_at
  * @property {string} stamp -- moves when a run wrote data (web.data_stamp); the
  *   page reloads when `/api/pulse` answers a different one
@@ -7222,6 +7224,15 @@ const STATE_KEYS_REQUIRED=['journal'];
    numbers that DO arrive are correct, so the page renders and says which figures
    cannot be trusted and what to do about it. */
 function staleServerCheck(state){
+  /* First, because it is the server's own answer rather than an inference from
+     what it left out. A server from before `restart_needed` existed cannot say
+     so, which is what the two checks below are still for. */
+  if(state&&state.restart_needed){
+    note('Bitácora was updated while it was running, so the figures on this page '
+      +'may be from the old version. Close its window and open '
+      +'<b>Start optjournal</b> again.','bad');
+    return;
+  }
   const s=state&&state.stats;
   /* NO `stats` AT ALL was the one case this returned silently on, and it is the
      worst one. The guard exists to catch a page newer than its server, and it

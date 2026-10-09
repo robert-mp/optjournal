@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import re
 import shutil
 import socket
@@ -649,6 +650,48 @@ def test_the_stale_server_guard_runs_before_anything_renders(state):
     assert assign < check < drawn, (
         "the guard must run after the payload lands and before the first draw"
     )
+
+
+def test_a_server_says_when_its_code_changed_under_it(populated, tmp_path,
+                                                       monkeypatch):
+    """The page is re-read per request but the Python is loaded once, so a process
+    left running across a merge served the new page against the old payload, with
+    wrong P&L and no warning, for two days. The server compares its code on disk
+    against what it imported. A copy stands in for the package, so no real source
+    file is touched."""
+    module = tmp_path / "stats.py"
+    module.write_text("", encoding="utf-8")
+    monkeypatch.setattr(web, "_PACKAGE", tmp_path)
+    monkeypatch.setattr(web, "_CODE_MTIME", web._code_mtime())
+
+    def restart_needed() -> object:
+        return build_state(db_path=populated, archive_dir=RAW_DIR,
+                           query_id=None)["restart_needed"]
+
+    assert restart_needed() is False
+    later = module.stat().st_mtime + 60
+    os.utime(module, (later, later))
+    assert restart_needed() is True
+
+
+def test_the_restart_banner_is_drawn_from_the_payload():
+    """The page's own `staleServerCheck`, run under node: quiet on a current
+    server, and one 'bad' banner in the reader's words when the server says its
+    code changed under it."""
+    out = _node_run([
+        "const notes=[]; function note(text,kind){notes.push({text,kind});}",
+        "const esc=s=>String(s);",
+        _page_const("STATE_KEYS_REQUIRED"),
+        *_page_fns("staleServerCheck"),
+        "const current={stats:{},journal:{}};",
+        "staleServerCheck({...current,restart_needed:false});",
+        "const quiet=notes.length;",
+        "staleServerCheck({...current,restart_needed:true});",
+        "console.log(JSON.stringify({quiet,notes}));",
+    ])
+    assert out["quiet"] == 0, "a current server must draw no banner"
+    assert [n["kind"] for n in out["notes"]] == ["bad"]
+    assert "Start optjournal" in out["notes"][0]["text"]
 
 
 def test_every_js_property_read_resolves():
