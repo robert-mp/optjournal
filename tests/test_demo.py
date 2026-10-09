@@ -209,20 +209,17 @@ def test_profit_factor_and_average_outcome_reconcile_with_the_averages(conn):
     tiles sit beside Avg Win and Avg Loss, so a reader can check one against the
     others, and they must agree. Gross won is `avg_win * wins`; the ratio divides
     it by gross lost. The mean outcome includes scratches -- decided at exactly
-    zero, neither won nor lost -- which is why it divides by `closed_episodes`
+    zero, neither won nor lost -- which is why it divides by `closes`
     rather than by `wins + losses`, and why a scratch adds nothing to the sum.
     """
     s = month_stats(conn, period=None)
     assert s.avg_win is not None and s.avg_loss is not None and s.avg_pnl is not None
     won, lost = s.avg_win.base * s.wins, s.avg_loss.base * s.losses
     assert s.profit_factor == pytest.approx(won / -lost)
-    assert s.avg_pnl.base == pytest.approx((won + lost) / s.closed_episodes)
-    # Net P&L also holds what IBKR booked on a contract still held (the demo's
-    # partial close), which no outcome counts yet. Without it, Net P&L is the
-    # closed round trips' P&L, so the mean is that over their count.
-    held = sum(e.realized_pnl_base for e in build_history(conn, asset_category="OPT").open)
-    assert held, "the demo's partial close books P&L on a contract still held"
-    assert s.avg_pnl.base == pytest.approx((s.net_pnl.base - held) / s.closed_episodes)
+    assert s.avg_pnl.base == pytest.approx((won + lost) / s.closes)
+    # Every realising fill is a closing fill, the demo's partial close included,
+    # so the mean outcome is Net P&L over the closes.
+    assert s.avg_pnl.base == pytest.approx(s.net_pnl.base / s.closes)
 
 
 def test_a_month_with_wins_and_no_losses_has_no_profit_factor(conn):
@@ -237,14 +234,16 @@ def test_a_month_with_wins_and_no_losses_has_no_profit_factor(conn):
         assert s.avg_pnl is not None and s.avg_pnl.base > 0
 
 
-def test_the_scoreboard_counts_each_contract_round_trip(conn):
-    """The roll and the vertical, measured end to end through the real path.
+def test_the_scoreboard_counts_each_close(conn):
+    """The roll, the vertical and the partial buyback, end to end through the
+    real path.
 
-    The generator holds both on purpose: a SPY roll (Nov -> Dec, one order
-    closing 560P and opening 555P) and an NVDA put vertical whose two legs closed
-    at +1150.86 and -588.54. Counted per closed contract round trip that is 9
-    outcomes, 7 wins and 2 losses (77.8%): each leg of the roll and each leg of
-    the vertical is its own outcome, which is what a broker trade log shows.
+    The generator holds all three on purpose: a SPY roll (Nov -> Dec, one order
+    closing 560P and opening 555P), an NVDA put vertical whose two legs closed at
+    +1150.86 and -588.54, and 1 of 3 puts bought back while 2 stay open. Counted
+    per close that is 10 outcomes, 8 wins and 2 losses (80%). Each leg of the roll,
+    each leg of the vertical and the partial buyback is its own outcome, which is
+    what a broker trade log shows.
 
     The money is the same money the Trades tab draws: the cards' realised
     figures add up to Net P&L, the open card's partial close included, and every
@@ -254,8 +253,8 @@ def test_the_scoreboard_counts_each_contract_round_trip(conn):
     from optjournal.strategies import position_groups
 
     s = month_stats(conn, None)
-    assert (s.closed_episodes, s.wins, s.losses) == (9, 7, 2)
-    assert s.win_rate == pytest.approx(77.777, abs=1e-2)
+    assert (s.closes, s.wins, s.losses) == (10, 8, 2)
+    assert s.win_rate == pytest.approx(80.0)
 
     report = build_history(conn, asset_category="OPT")
     cards = position_groups(orders_data(conn), episodes=report.episodes,
@@ -277,11 +276,11 @@ def test_a_rolled_contract_scores_in_the_month_its_cash_lands(conn):
     nov = month_stats(conn, "2025-11")
     dec = month_stats(conn, "2025-12")
 
-    assert nov.closed_episodes == 1, "a contract really did close in November"
+    assert nov.closes == 1, "a contract really did close in November"
     assert nov.net_pnl.base == pytest.approx(585.82, abs=1e-2)
     assert (nov.wins, nov.losses) == (1, 0)
 
-    assert (dec.closed_episodes, dec.wins) == (1, 1)
+    assert (dec.closes, dec.wins) == (1, 1)
     assert dec.net_pnl.base == pytest.approx(1044.76, abs=1e-2), (
         "December's money is December's, not the whole chain's"
     )
@@ -356,7 +355,7 @@ def test_the_years_account_for_everything(conn):
     assert len(years) == 2, "the demo spans two calendar years"
 
     assert sum(y.total_trades for y in years) == everything.total_trades
-    assert sum(y.closed_episodes for y in years) == everything.closed_episodes
+    assert sum(y.closes for y in years) == everything.closes
     assert sum(y.wins for y in years) == everything.wins
     assert sum(y.losses for y in years) == everything.losses
     assert sum(y.net_pnl.base for y in years) == pytest.approx(
@@ -455,10 +454,10 @@ def test_a_year_crossing_round_trip_counts_in_the_year_it_closed(conn):
     conn.commit()
 
     after = {y.month: y for y in annual_stats(conn)}
-    assert after["2026"].closed_episodes == before["2026"].closed_episodes + 1, (
+    assert after["2026"].closes == before["2026"].closes + 1, (
         "a round trip closed in January must count as a January-year outcome"
     )
-    assert after["2025"].closed_episodes == before["2025"].closed_episodes, (
+    assert after["2025"].closes == before["2025"].closes, (
         "counting it in the entry year would double it across the two rows"
     )
     # The realised P&L follows the closing fill's own trade date, so the two
@@ -468,7 +467,7 @@ def test_a_year_crossing_round_trip_counts_in_the_year_it_closed(conn):
     )
     # And the reconciliation still holds with a boundary-crossing episode.
     everything = month_stats(conn, None)
-    assert sum(y.closed_episodes for y in after.values()) == everything.closed_episodes
+    assert sum(y.closes for y in after.values()) == everything.closes
 
 
 def test_odte_cohorts_partition_every_closed_round_trip(conn):
@@ -539,7 +538,7 @@ def test_scope_narrows_every_trade_derived_figure(conn):
     everything = month_stats(conn, None)
     only = month_stats(conn, None, scope=odte_scope(conn))
     assert 0 < only.total_trades < everything.total_trades
-    assert 0 < only.closed_episodes < everything.closed_episodes
+    assert 0 < only.closes < everything.closes
     assert only.orders < everything.orders
     assert abs(only.net_pnl.base) < abs(everything.net_pnl.base)
     assert abs(only.commissions.base) < abs(everything.commissions.base)
@@ -567,8 +566,8 @@ def test_the_default_scope_changes_nothing(conn):
     """ALL_TRADES must be a true no-op, not a filter that happens to pass all."""
     plain = month_stats(conn, None)
     explicit = month_stats(conn, None, scope=ALL_TRADES)
-    assert (plain.total_trades, plain.net_pnl.base, plain.closed_episodes) == (
-        explicit.total_trades, explicit.net_pnl.base, explicit.closed_episodes
+    assert (plain.total_trades, plain.net_pnl.base, plain.closes) == (
+        explicit.total_trades, explicit.net_pnl.base, explicit.closes
     )
     assert ALL_TRADES.trade_ids is None, "no id set to build when nothing is filtered"
     assert available_months(conn) == available_months(conn, "OPT", ALL_TRADES)
@@ -591,10 +590,24 @@ def test_the_months_account_for_everything(conn):
     everything = month_stats(conn, None)
     assert len(months) == 14, "the demo spans fourteen months with option fills"
     assert sum(m.total_trades for m in months) == everything.total_trades
-    assert sum(m.closed_episodes for m in months) == everything.closed_episodes
+    assert sum(m.closes for m in months) == everything.closes
     assert sum(m.net_pnl.base for m in months) == pytest.approx(
         everything.net_pnl.base, abs=1e-9
     )
+
+
+def test_the_closes_sum_to_net_pnl_in_every_period_and_scope(conn):
+    """Every realising fill is a closing fill, and each sits in exactly one close,
+    so the scoreboard and Net P&L read the same money. That holds for every month,
+    year and all time, under both scopes, the empty months included."""
+    from optjournal.stats import month_range
+
+    periods = [*month_range(conn), *(y.month for y in annual_stats(conn)), None]
+    for scope in (ALL_TRADES, odte_scope(conn)):
+        for period in periods:
+            s = month_stats(conn, period, scope=scope)
+            summed = s.avg_pnl.base * s.closes if s.avg_pnl else 0.0
+            assert summed == pytest.approx(s.net_pnl.base, abs=1e-9), (scope.key, period)
 
 
 def test_the_months_under_each_year_sum_to_that_year(conn):
@@ -607,7 +620,7 @@ def test_the_months_under_each_year_sum_to_that_year(conn):
     assert set(by_year) == set(years), "every month must sit under a listed year"
     for year, months in by_year.items():
         assert sum(m.total_trades for m in months) == years[year].total_trades, year
-        assert sum(m.closed_episodes for m in months) == years[year].closed_episodes
+        assert sum(m.closes for m in months) == years[year].closes
         assert sum(m.net_pnl.base for m in months) == pytest.approx(
             years[year].net_pnl.base, abs=1e-9
         ), year
@@ -619,7 +632,7 @@ def test_a_monthly_row_equals_what_the_month_selector_produces(conn):
         picked = month_stats(conn, row.month)
         assert row.total_trades == picked.total_trades, row.month
         assert row.net_pnl.base == pytest.approx(picked.net_pnl.base, abs=1e-9)
-        assert row.closed_episodes == picked.closed_episodes
+        assert row.closes == picked.closes
         assert row.win_rate == picked.win_rate
 
 
@@ -651,7 +664,7 @@ def test_the_scope_reaches_the_payload_end_to_end(demo, tmp_path):
     assert everything["odte"]["selectable"] is True
 
     assert scoped["stats"]["total_trades"] < everything["stats"]["total_trades"]
-    assert scoped["stats"]["closed_episodes"] == 1
+    assert scoped["stats"]["closes"] == 1
     assert len(scoped["orders"]) < len(everything["orders"])
     assert set(scoped["months"]) < set(everything["months"])
 
@@ -699,12 +712,12 @@ def test_every_month_reconciles_with_the_statement(conn):
         assert s.commissions.base == pytest.approx(commission, abs=1e-9), month
 
 
-def test_a_partial_close_is_money_on_its_day_and_no_outcome_until_flat(conn):
-    """The demo sells 3 puts and buys back 1: IBKR books realised P&L on that
-    fill, so its month and its Calendar day carry it, while the contract stays
-    open and so is neither a win nor a loss. The precondition first proves the
-    data really holds that case. Without it, this test would pass on an archive
-    where every close is total."""
+def test_a_partial_close_is_money_and_an_outcome_on_its_day(conn):
+    """The demo sells 3 puts and buys back 1. IBKR books realised P&L on that
+    fill, so its month and its Calendar day carry it, and it is a close, a win,
+    while the contract stays open. The precondition first proves the data really
+    holds that case. Without it, this test would pass on an archive where every
+    close is total."""
     from optjournal.stats import daily_series
 
     (partial,) = [e for e in build_history(conn, asset_category="OPT").open
@@ -712,7 +725,8 @@ def test_a_partial_close_is_money_on_its_day_and_no_outcome_until_flat(conn):
     month = month_stats(conn, "2026-02")
     assert month.total_trades == 1, "the buyback is the month's one fill"
     assert month.net_pnl.base == pytest.approx(partial.realized_pnl_base)
-    assert (month.closed_episodes, month.wins, month.losses) == (0, 0, 0)
+    assert (month.closes, month.wins, month.losses) == (1, 1, 0)
+    assert month.largest_win.base == pytest.approx(partial.realized_pnl_base)
     (day,) = daily_series(conn, "2026-02")
     assert (day.day, day.trades) == ("2026-02-11", 1)
     assert day.realized.base == pytest.approx(partial.realized_pnl_base)

@@ -246,24 +246,24 @@ def _strangle(conn: sqlite3.Connection) -> None:
 
 
 def test_a_strangle_scores_each_leg_as_its_own_outcome(conn):
-    """The scoreboard counts closed contract round trips, the money's own unit.
+    """The scoreboard counts closes, the money's own unit.
 
     A strangle is one position made of two contracts whose outcomes disagree, so
     it scores a win and a loss, which is what a broker trade log shows. The
-    count and the money read the same two round trips.
+    count and the money read the same two closes.
     """
     _strangle(conn)
     s = month_stats(conn, "2026-03", base_currency="EUR")
 
     assert (s.wins, s.losses) == (1, 1), "the call leg is its own loss"
-    assert s.closed_episodes == 2
+    assert s.closes == 2
     assert s.net_pnl.base == 300.0
     assert s.commissions.base == -4.0
     assert s.total_trades == 4
 
 
 def test_a_closed_leg_is_decided_while_its_partner_is_still_open(conn):
-    """A round trip is an outcome the day it closes, whatever its position does.
+    """A close is an outcome the day it fills, whatever its position does.
 
     The put is bought back and the call stays open, so the put's +400 is both in
     Net P&L and a win, and nothing about the open call holds either back.
@@ -277,10 +277,62 @@ def test_a_closed_leg_is_decided_while_its_partner_is_still_open(conn):
 
     s = month_stats(conn, "2026-03", base_currency="EUR")
     assert s.net_pnl.base == 400.0
-    assert (s.wins, s.losses, s.closed_episodes) == (1, 0, 1), (
-        "the closed round trip is a finished outcome on its own terms"
+    assert (s.wins, s.losses, s.closes) == (1, 0, 1), (
+        "the close is a finished outcome on its own terms"
     )
     assert s.open_episodes == 1
+
+
+def test_buying_back_part_of_a_contract_is_one_loss_on_its_day(conn):
+    """The QCOM buyback of 2026-10-08. Four puts were sold, then 2 bought back in
+    one order that filled as two executions, at a loss. IBKR booked the loss that
+    day and it was in October's P&L, while October showed no losing trade, because
+    the contract was still open. One order on one contract is one close, so it is one
+    loss, on its day, and the other 2 puts stay open."""
+    _leg(conn, conid="1", order_id="10", at="2026-09-14 12:51:29", qty=-4,
+         proceeds=2000.0, pnl=None)
+    _leg(conn, conid="1", order_id="11", at="2026-10-08 11:56:10", qty=1,
+         proceeds=-1030.0, pnl=-530.60)
+    _leg(conn, conid="1", order_id="11", at="2026-10-08 11:56:11", qty=1,
+         proceeds=-1030.0, pnl=-530.14)
+
+    s = month_stats(conn, "2026-10")
+    assert (s.closes, s.wins, s.losses) == (1, 0, 1), "two fills of one order"
+    assert s.largest_loss.base == pytest.approx(-1060.74)
+    assert s.avg_pnl.base * s.closes == pytest.approx(s.net_pnl.base)
+    assert s.open_episodes == 1, "the other 2 puts are still held"
+    assert [(d.day, d.trades) for d in s.days] == [("2026-10-08", 2)]
+
+
+def test_a_contract_closed_by_two_orders_is_two_closes(conn):
+    """Two decisions on one contract on one day, each its own win or loss."""
+    _leg(conn, conid="1", order_id="10", at="2026-03-02 10:00:00", qty=-2,
+         proceeds=600.0, pnl=None)
+    _leg(conn, conid="1", order_id="11", at="2026-03-09 10:00:00", qty=1,
+         proceeds=-100.0, pnl=200.0)
+    _leg(conn, conid="1", order_id="12", at="2026-03-09 15:00:00", qty=1,
+         proceeds=-400.0, pnl=-100.0)
+
+    s = month_stats(conn, "2026-03")
+    assert (s.closes, s.wins, s.losses) == (2, 1, 1)
+    assert (s.largest_win.base, s.largest_loss.base) == (200.0, -100.0)
+
+
+def test_an_order_working_overnight_closes_once_on_each_day(conn):
+    """A close is dated by the day IBKR books it, so one order filling across a
+    month end scores in each month the money lands in, and every month's closes
+    still sum to its Net P&L."""
+    _leg(conn, conid="1", order_id="10", at="2026-09-02 10:00:00", qty=-2,
+         proceeds=600.0, pnl=None)
+    _leg(conn, conid="1", order_id="11", at="2026-09-30 15:59:00", qty=1,
+         proceeds=-100.0, pnl=200.0)
+    _leg(conn, conid="1", order_id="11", at="2026-10-01 09:31:00", qty=1,
+         proceeds=-350.0, pnl=-50.0)
+
+    for month, expected in (("2026-09", (1, 1, 0)), ("2026-10", (1, 0, 1))):
+        s = month_stats(conn, month)
+        assert (s.closes, s.wins, s.losses) == expected, month
+        assert s.avg_pnl.base * s.closes == pytest.approx(s.net_pnl.base), month
 
 
 def _lc(label, pnl, *, closed="2026-08-20", status="closed"):
@@ -364,9 +416,9 @@ def test_a_reversal_through_zero_scores_the_long_and_the_short_apart(conn):
     _leg(conn, conid="1", order_id="12", at="2026-10-05 10:00:00",
          qty=1, proceeds=-50.0, pnl=149.0, put_call="C")
     september, october = (month_stats(conn, m) for m in ("2026-09", "2026-10"))
-    assert (september.net_pnl.base, september.wins, september.closed_episodes) == (
+    assert (september.net_pnl.base, september.wins, september.closes) == (
         198.0, 1, 1)
-    assert (october.net_pnl.base, october.wins, october.closed_episodes) == (
+    assert (october.net_pnl.base, october.wins, october.closes) == (
         149.0, 1, 1)
 
 
@@ -384,7 +436,7 @@ def test_expirations_on_one_day_do_not_merge_unrelated_positions(conn):
     _leg(conn, conid="2", order_id="9002", at="2026-10-16 16:20:00", qty=-1,
          proceeds=0.0, pnl=-301.0, put_call="C", notes="Ep")
     s = month_stats(conn, None)
-    assert (s.closed_episodes, s.wins, s.losses) == (2, 1, 1)
+    assert (s.closes, s.wins, s.losses) == (2, 1, 1)
     assert s.net_pnl.base == pytest.approx(-102.0), "the money never moved"
 
 
@@ -626,11 +678,13 @@ def test_every_fill_is_drawn_once_across_the_cards_and_once_on_the_calendar(conn
     assert sum(ev["fills"] for ev in events) == executions
     stats = month_stats(conn, None, asset_category="OPT", report=report)
     assert stats.total_trades == executions
-    # The Dashboard scores the closed round trips.
-    assert (stats.closed_episodes, stats.wins, stats.losses) == (
-        len(report.closed),
-        sum(e.realized_pnl_base > 0 for e in report.closed),
-        sum(e.realized_pnl_base < 0 for e in report.closed))
+    # The Dashboard scores closes, recounted here straight from the fills.
+    closes = [base for (base,) in conn.execute(
+        "SELECT SUM(COALESCE(fifo_pnl_realized_base, 0)) FROM trades"
+        " WHERE open_close LIKE '%C%'"
+        " GROUP BY broker, account_id, conid, ib_order_id, trade_date")]
+    assert (stats.closes, stats.wins, stats.losses) == (
+        len(closes), sum(c > 0 for c in closes), sum(c < 0 for c in closes))
     # And the money is what the cards show: each card carries what IBKR booked
     # on its fills, whether or not the position is still running.
     shown = [card["realized_pnl"]["base"] for card in cards if card["realized_pnl"]]
@@ -773,8 +827,8 @@ def _shown(event) -> float | None:
 def test_a_partial_close_counts_on_its_card_its_event_and_its_day(conn):
     """IBKR booked +90 on buying back one of the two far puts, and the open card,
     the event holding that fill and its Calendar day all carry it beside the
-    roll's +195. The scoreboard does not: the near contract is flat and won, and
-    the far one is still held, so its +90 is money and not yet an outcome."""
+    roll's +195. So does the scoreboard. The roll's two fills closing the near
+    contract are one close, the buyback of one far put is another, and both won."""
     from optjournal.stats import month_stats
 
     report, _camps, _orders, (card,), _events = _ingest(conn, _ROLLED)
@@ -787,12 +841,12 @@ def test_a_partial_close_counts_on_its_card_its_event_and_its_day(conn):
     assert {d.day: _realised(d.realized.payload()) for d in september.days} == {
         "2026-09-24": 0.0, "2026-09-28": 195.0, "2026-09-30": 90.0}
     assert _realised(september.net_pnl.payload()) == 285.0
-    assert (september.closed_episodes, september.wins, september.losses) == (1, 1, 0)
+    assert (september.closes, september.wins, september.losses) == (2, 2, 0)
     assert _realised(september.open_premium.payload()) == 260.0, (
         "the far contract's 350 of premium less the 90 already in net P&L")
 
 
-def test_a_round_trip_that_nets_zero_is_neither_a_win_nor_a_loss(conn):
+def test_a_close_that_nets_zero_is_neither_a_win_nor_a_loss(conn):
     from optjournal.stats import month_stats
 
     report, *_ = _ingest(conn, [
@@ -800,14 +854,14 @@ def test_a_round_trip_that_nets_zero_is_neither_a_win_nor_a_loss(conn):
         ("1", "1002", "2026-09-25 10:00:00", 1, -300.0, 0.0, "C"),
     ])
     s = month_stats(conn, "2026-09", report=report)
-    assert (s.closed_episodes, s.wins, s.losses) == (1, 0, 0)
+    assert (s.closes, s.wins, s.losses) == (1, 0, 0)
 
 
 def test_a_decided_cards_realised_is_its_campaigns(conn):
     """Once every contract is closed the card's figure is `Campaign.realized`, the
-    one the strategy ranking reads, to the last key. The far contract scores its
-    whole +170 as one win the day it goes flat, while its money stays on the two
-    days IBKR booked it."""
+    one the strategy ranking reads, to the last key. The scoreboard scores the far
+    contract's last buyback, +80, as October's one close. The card is a position,
+    and a close is what IBKR booked on one order's fills."""
     from optjournal.stats import month_stats
 
     report, (camp,), _orders, (card,), _events = _ingest(conn, _ROLLED + [
@@ -816,8 +870,8 @@ def test_a_decided_cards_realised_is_its_campaigns(conn):
     assert card["realized_pnl"] == camp.realized.payload()
     october = month_stats(conn, "2026-10", report=report)
     assert _realised(october.net_pnl.payload()) == 80.0
-    assert (october.closed_episodes, october.wins, october.losses) == (1, 1, 0)
-    assert _realised(october.largest_win.payload()) == 170.0
+    assert (october.closes, october.wins, october.losses) == (1, 1, 0)
+    assert _realised(october.largest_win.payload()) == 80.0
 
 
 def _at_broker(conn, broker: str, fills) -> None:
@@ -978,14 +1032,14 @@ def test_under_the_0dte_scope_a_rolled_leg_is_decided_the_day_it_closes(conn):
     scope = odte_scope(conn)
     s = month_stats(conn, "2026-09", scope=scope)
     assert s.net_pnl.base == -302.0
-    assert (s.closed_episodes, s.losses) == (1, 1)
+    assert (s.closes, s.losses) == (1, 1)
     assert s.avg_pnl.base == -302.0
 
     _leg(conn, conid="2", order_id="4", at="2026-09-11 15:00:00", qty=1,
          proceeds=-100.0, pnl=498.0, expiry="2026-09-11")
     s = month_stats(conn, "2026-09", scope=odte_scope(conn))
     assert s.net_pnl.base == -302.0
-    assert (s.closed_episodes, s.losses) == (1, 1)
+    assert (s.closes, s.losses) == (1, 1)
     assert s.avg_pnl.base == -302.0
 
 
@@ -1013,8 +1067,8 @@ def test_a_stock_outcome_lands_in_the_month_its_pnl_does(conn):
         )
     august, september = (month_stats(conn, m, asset_category="STK")
                          for m in ("2026-08", "2026-09"))
-    assert (august.net_pnl.base, august.closed_episodes, august.wins) == (0.0, 0, 0)
-    assert (september.net_pnl.base, september.closed_episodes,
+    assert (august.net_pnl.base, august.closes, august.wins) == (0.0, 0, 0)
+    assert (september.net_pnl.base, september.closes,
             september.wins) == (11.88, 1, 1)
 
 

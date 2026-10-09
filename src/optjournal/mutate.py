@@ -166,16 +166,16 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="scratch-is-no-win",
         module="stats.py",
-        find="    won = [e for e in closed if e.realized_pnl_base > 0]",
-        replace="    won = [e for e in closed if e.realized_pnl_base >= 0]",
-        breaks="a round trip that netted exactly zero would count as a win",
+        find="    won = [rows for rows in closes if Money.charged(rows).base > 0]",
+        replace="    won = [rows for rows in closes if Money.charged(rows).base >= 0]",
+        breaks="a close that netted exactly zero would count as a win",
     ),
     Mutant(
-        key="episode-attrib",
+        key="close-per-order",
         module="stats.py",
-        find="        if _in_period(close_of(e), period) and scope.has_episode(e)",
-        replace="        if _in_period(e.opened_at, period) and scope.has_episode(e)",
-        breaks="a round trip would count in the month it opened, not the month it closed",
+        find='                                row["ib_order_id"], _day_of(row["trade_date"])),',
+        replace='                                _day_of(row["trade_date"])),',
+        breaks="two orders closing one contract on one day would score as one close",
     ),
     Mutant(
         key="period-prefix",

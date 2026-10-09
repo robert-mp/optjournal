@@ -202,6 +202,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
 
 /** @typedef {Object} State -- the /api/state payload (web.build_state)
  * @property {string} version
+ * @property {boolean} restart_needed -- the code on disk is newer than the code
+ *   this process loaded (web._CODE_MTIME), so the figures may be the old version's
  * @property {string} generated_at
  * @property {string} stamp -- moves when a run wrote data (web.data_stamp); the
  *   page reloads when `/api/pulse` answers a different one
@@ -428,14 +430,15 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   commission, a partial close included
  * @property {Money} commissions -- billed on the period's fills
  * @property {Money} fees -- account-level, not attributable to the journal
- * @property {number} closed_episodes -- contract round trips closed here, by the
- *   trade date of the last closing fill: the scoreboard's unit, which wins,
- *   losses and the averages count. The headline trade count for options
+ * @property {number} closes -- one order's closing fills on one contract on one
+ *   trade day (stats.month_stats), a partial close included. The scoreboard's
+ *   unit, which wins, losses and the averages count, and whose results sum to
+ *   net_pnl. The headline trade count for options
  * @property {number} open_episodes -- open CONTRACTS; a strangle is two
  * @property {number} open_positions -- open positions, grouping a multi-leg
  *   strategy into one. Attached by web.build_state, not month_stats: it needs
  *   the campaign grouping, which is built after the stats are
- * @property {number} wins -- closed round trips that netted up
+ * @property {number} wins -- closes that netted up
  * @property {number} losses
  * @property {number|null} win_rate -- null until anything was decided
  * @property {Money|null} avg_win -- null without wins; an average of no
@@ -2285,8 +2288,8 @@ function dashboard(){
   const label=monthLabel(s.month);
   const opt=s.asset_category==='OPT';
   const nl=s.net_liq_base;
-  /* For options, the headline trade count is CLOSED CONTRACT ROUND TRIPS, the
-     same population the wins, losses and averages measure. Counting fills
+  /* For options, the headline trade count is CLOSES, the same population the
+     wins, losses and averages measure. Counting fills
      here made a month claim trades it had no outcome for: open the position in
      July, close it in August, and July's card said "3 trades" while its P&L,
      wins and losses all correctly said the outcome was August's. A trade
@@ -2308,8 +2311,8 @@ function dashboard(){
       cls(s.net_pnl.base)+' '+(String(moneyOf(s.net_pnl)).length>10?'sm':''),
       'net_pnl'),
     trades:()=>opt
-      ? statCard('Trades', s.closed_episodes,
-          `closed contract round trip${s.closed_episodes===1?'':'s'}`
+      ? statCard('Trades', s.closes,
+          `close${s.closes===1?'':'s'}`
           +` · ${s.total_trades} fill(s), ${s.orders} order(s)`,'','trades')
       : statCard('Total Trades', s.total_trades,
           s.orders?`${s.orders} order(s)`:'','','trades'),
@@ -2334,14 +2337,14 @@ function dashboard(){
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
-    wins:()=>statCard('Winning Trades', s.wins, 'closed contract round trips',
+    wins:()=>statCard('Winning Trades', s.wins, 'closes',
       s.wins?'pos':'','wins'),
-    losses:()=>statCard('Losing Trades', s.losses, 'closed contract round trips',
+    losses:()=>statCard('Losing Trades', s.losses, 'closes',
       s.losses?'neg':'','losses'),
     win_rate:()=>statCard('Win Rate', pct(s.win_rate),
-      s.closed_episodes?`${s.closed_episodes} closed contract round trip${
-        s.closed_episodes===1?'':'s'}`:'nothing closed yet','','win_rate'),
-    avg_win:()=>statCard('Avg Win', moneyOf(s.avg_win), 'per closed contract round trip',
+      s.closes?`${s.closes} close${s.closes===1?'':'s'}`:'nothing closed yet',
+      '','win_rate'),
+    avg_win:()=>statCard('Avg Win', moneyOf(s.avg_win), 'per close',
       cls(s.avg_win?.base),'avg_win'),
     /* An em-dash on a card whose figure is genuinely absent reads as "this
        failed to load". `none yet` says the same thing as data: there have been
@@ -2350,11 +2353,11 @@ function dashboard(){
        still renders as the number it is, and the `—` remains for the case the
        payload truly has nothing to say. */
     avg_loss:()=>statCard('Avg Loss',
-      s.losses===0&&s.closed_episodes>0?'<span class="nil">none yet</span>'
+      s.losses===0&&s.closes>0?'<span class="nil">none yet</span>'
         :moneyOf(s.avg_loss),
-      s.losses===0&&s.closed_episodes>0
-        ?`${s.closed_episodes} closed, none at a loss`
-        :'per closed contract round trip',
+      s.losses===0&&s.closes>0
+        ?`${s.closes} closed, none at a loss`
+        :'per close',
       cls(s.avg_loss?.base),'avg_loss'),
     gain:()=>nl!=null
       ? statCard('Gain % of Net Liq', pct(s.gain_pct_of_net_liq,2),
@@ -2371,12 +2374,12 @@ function dashboard(){
       return statCard('Profit Factor',
         pf!=null?num(pf,2)
           :s.wins&&!s.losses?'<span class="nil">no losses</span>':'—',
-        pf!=null?`gross won over gross lost · ${s.closed_episodes} closed contract round trip${
-          s.closed_episodes===1?'':'s'}`:s.wins&&!s.losses
+        pf!=null?`gross won over gross lost · ${s.closes} close${
+          s.closes===1?'':'s'}`:s.wins&&!s.losses
           ?`${s.wins} won, none lost`:'nothing closed yet',
         pf==null?'':pf>1?'pos':pf<1?'neg':'','profit_factor');},
     avg_pnl:()=>statCard('Avg P&L / Trade', moneyOf(s.avg_pnl),
-      'per closed contract round trip, scratches included',
+      'per close, scratches included',
       cls(s.avg_pnl?.base),'avg_pnl'),
     /* The figure the header's pill also shows. A tile as well because a pill is
        fixed and a tile is chosen: a premium seller who wants it beside the win
@@ -2402,12 +2405,12 @@ function dashboard(){
     worst_strategy:()=>stratTile('Worst Strategy', s.worst_strategy, 'worst_strategy',
       s.best_strategy?'only one strategy decided':'nothing closed yet'),
     largest_win:()=>statCard('Largest Win', moneyOf(s.largest_win),
-      'the best single closed contract round trip', cls(s.largest_win?.base),'largest_win'),
+      'the best single close', cls(s.largest_win?.base),'largest_win'),
     largest_loss:()=>statCard('Largest Loss',
-      s.losses===0&&s.closed_episodes>0?'<span class="nil">none yet</span>'
+      s.losses===0&&s.closes>0?'<span class="nil">none yet</span>'
         :moneyOf(s.largest_loss),
-      s.losses===0&&s.closed_episodes>0?`${s.closed_episodes} closed, none at a loss`
-        :'the worst single closed contract round trip',
+      s.losses===0&&s.closes>0?`${s.closes} closed, none at a loss`
+        :'the worst single close',
       cls(s.largest_loss?.base),'largest_loss'),
   };
   function stratTile(k,rk,key,none){
@@ -2442,8 +2445,10 @@ function dashboard(){
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Statistics${infoTip(
       `P&amp;L is IBKR's per-fill realisation, net of commission, on the day each
-        fill trades, so a partial close counts the day it fills. A round trip is a
-        win or a loss once it is flat.`
+        fill trades, so a partial close counts the day it fills.
+        <br><br>Wins and losses count <b>closes</b>. Each time you close all or part
+        of a contract counts once, and a close made of several fills of one order is
+        one close.`
       +` <br><br>Scope: ${esc(s.asset_category)} trades and commission only.
         Account-level fees and other instruments are on the Costs tab.`)}</h2>
       <div class="sub">${esc(ccyNote())}${provisionalBanner()}</div></div>
@@ -2467,10 +2472,10 @@ function dashboard(){
           >${esc(s.asset_category)} <b>${moneyOf(s.options_friction)}</b></span>
       </div></div>
     <div class="stats">${cards}</div>
-    ${s.closed_episodes===0?`<div class="note">Nothing has closed yet, so the
+    ${s.closes===0?`<div class="note">Nothing has closed yet, so the
       outcome figures are empty rather than zero.${infoTip(
-      `Win Rate, Avg Win and Avg Loss wait for a round trip to finish. Net P&amp;L
-       does not: a partial close counts the day it fills.
+      `Win Rate, Avg Win and Avg Loss wait for the first close, the day you close
+       all or part of a contract. Net P&amp;L starts that day too.
        <br><br>${s.open_premium.base?`The ${cash(s.open_premium.base)} net premium in
        the ${s.open_positions} open position(s) is not profit until they close.`
        :`The ${s.open_positions} open position(s) are under <b>Positions</b>.`}`
@@ -4350,7 +4355,7 @@ function costAside(bc){
    `wide` adds the avg pair to both the header and the row together, which is
    what makes them impossible to disagree about. */
 const statsHead=(first,wide)=>`<tr><th>${first}</th><th class="n">fills</th>
-  <th class="n">orders</th><th class="n">closed</th>
+  <th class="n">orders</th><th class="n">closes</th>
   <th class="n">W</th>
   <th class="n">L</th><th class="n">win rate</th><th class="n">net P&amp;L</th>
   ${wide?`<th class="n">avg win</th><th class="n">avg loss</th>`:''}
@@ -4360,7 +4365,7 @@ function statsRow(s,{label,wide=false,klass=''}={}){ return `<tr${klass?` class=
   <td class="mono">${esc(label)}</td>
   <td class="n">${s.total_trades}</td>
   <td class="n">${s.orders}</td>
-  <td class="n">${s.closed_episodes}</td>
+  <td class="n">${s.closes}</td>
   <td class="n pos">${s.wins}</td>
   <td class="n neg">${s.losses}</td>
   <td class="n">${pct(s.win_rate)}</td>
@@ -4387,15 +4392,16 @@ function annual(){
     label:s.month==='ALL'?'all time':s.month, wide:true, klass:klass||''});
   return `<div class="card">
     <div class="crow"><div><h2>Year by year${infoTip(
-      `A round trip counts in the year it <b>closed</b>, the same rule the month
-       selector uses — so a position opened in December and closed in January is a
-       January outcome.
+      `A close counts in the year IBKR booked it, the same rule the month selector
+       uses, so a position opened in December and closed in January is a January
+       outcome.
        <br><br><b>fills</b> counts executions: an order filled in two parts is two
        fills but one outcome.
-       <br><b>closed</b> counts contract round trips, which W, L and win rate
-       measure: every leg of a spread and every leg of a roll is its own W or L,
-       which is what a broker trade log shows. <b>net P&amp;L</b> is what IBKR
-       booked on the year's fills.
+       <br><b>closes</b> counts each time you closed all or part of a contract, and
+       a close made of several fills of one order is one close. W, L and win rate
+       measure closes, so every leg of a spread and every leg of a roll is its own
+       W or L, which is what a broker trade log shows. <b>net P&amp;L</b> is what
+       IBKR booked on the year's fills, and the year's closes sum to it.
        <br><br>A year that traded without deciding anything shows no rate rather
        than 0%.`)}</h2>
       <div class="sub">${esc(ccyNote())}</div></div>
@@ -7222,6 +7228,15 @@ const STATE_KEYS_REQUIRED=['journal'];
    numbers that DO arrive are correct, so the page renders and says which figures
    cannot be trusted and what to do about it. */
 function staleServerCheck(state){
+  /* First, because it is the server's own answer rather than an inference from
+     what it left out. A server from before `restart_needed` existed cannot say
+     so, which is what the two checks below are still for. */
+  if(state&&state.restart_needed){
+    note('Bitácora was updated while it was running, so the figures on this page '
+      +'may be from the old version. Close its window and open '
+      +'<b>Start optjournal</b> again.','bad');
+    return;
+  }
   const s=state&&state.stats;
   /* NO `stats` AT ALL was the one case this returned silently on, and it is the
      worst one. The guard exists to catch a page newer than its server, and it

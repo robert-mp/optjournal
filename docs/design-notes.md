@@ -373,16 +373,19 @@ Four invariants worth knowing before changing the UI:
   premium". `Gain % of Net Liq` divides that P&L by the NAV from the statement's
   Equity Summary section (enable it on the Flex query template; the demo
   carries synthetic NAV rows).
-* **The scoreboard counts one unit, the contract round trip.** Three counts,
-  narrowing: `fills` are executions, `closed` are contract round trips (an
-  *episode*, dated by the trade date of its last closing fill), and W, L, win
-  rate and the averages score those same round trips. A round trip closed by
-  two partial fills is one outcome, not two, and a partial close is money but
-  not yet an outcome. A roll closes one contract and opens the next, so the
-  closed contract is a decided outcome on the day of the roll, and a
-  strangle's two legs are two outcomes, which is what a broker trade log
-  shows. Measured on the demo: 9 closed, 7W / 2L, 77.8%, net P&L 4054.25, of
-  which 359.18 is the partial close on a contract still held.
+* **The scoreboard counts one unit, the close.** Three counts, narrowing:
+  `fills` are executions, `closes` are one order's closing fills on one
+  contract on one trade day (IBKR's `C`, its `C;O` reversal included), and W,
+  L, win rate and the averages score those same closes. Each time you close
+  all or part of a contract counts once, so buying back 2 of 4 puts is a win
+  or a loss that day while the other 2 stay open, and an order filled in two
+  parts is one close, not two. Every realising fill is a closing fill, so the
+  closes' results sum to net P&L for every period and scope. That is why the
+  trade day is part of a close, since an order still working overnight books
+  each day's fills on its own day. A roll closes one contract and opens the next,
+  so its closing leg is a close on the day of the roll, and a strangle bought
+  back is two closes, which is what a broker trade log shows. Measured on the
+  demo: 10 closes, 8W / 2L, 80.0%, net P&L 4054.25, which the closes sum to.
 
   Grouping contracts into positions (a *campaign*) is the Trades tab's view,
   and `campaigns.py` owns it. The scoreboard does not count by it. The Best
