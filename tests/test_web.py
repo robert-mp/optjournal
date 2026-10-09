@@ -764,7 +764,7 @@ def test_stats_panel_keys_present(state):
     for key in (
         "total_trades", "orders", "net_pnl", "commissions", "fees",
         "wins", "losses", "win_rate", "avg_win", "avg_loss",
-        "closed_episodes", "open_episodes",
+        "closes", "open_episodes",
         "green_days", "red_days", "days",
         "total_friction_base", "net_liq_base", "gain_pct_of_net_liq",
     ):
@@ -870,8 +870,8 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
     trade and a win or loss, to the close month alone. The open month gets fills
     (activity) and what IBKR booked on them, but no outcome. Verified against a
     real spanning episode rather than asserted in the abstract, with an
-    independent recount as the oracle so other episodes in either month cannot
-    mask a leak.
+    independent recount of the closes as the oracle so other trades in either
+    month cannot mask a leak.
     """
     conn = connect(populated)
     try:
@@ -882,6 +882,11 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
                 " SUM(ib_commission_base) FROM trades WHERE asset_category = 'OPT'"
                 " GROUP BY 1")
         }
+        closes = conn.execute(
+            "SELECT substr(trade_date, 1, 7) AS month,"
+            " SUM(COALESCE(fifo_pnl_realized_base, 0)) AS base FROM trades"
+            " WHERE asset_category = 'OPT' AND open_close LIKE '%C%'"
+            " GROUP BY broker, account_id, conid, ib_order_id, trade_date").fetchall()
     finally:
         conn.close()
     spanning = [
@@ -893,8 +898,8 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
     ep = spanning[0]
     open_month, close_month = ep.opened_at[:7], ep.closed_at[:7]
 
-    def closed_in(month: str) -> list:
-        return [e for e in report.closed if (e.closed_at or "")[:7] == month]
+    def closed_in(month: str) -> list[float]:
+        return [c["base"] for c in closes if c["month"] == month]
 
     opened = build_state(
         db_path=populated, archive_dir=RAW_DIR, query_id=None, month=open_month
@@ -905,10 +910,10 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
 
     # The open month has the fills but only the outcomes that closed IN it.
     assert opened["total_trades"] > 0, "the opening fills are that month's activity"
-    assert opened["closed_episodes"] == len(closed_in(open_month))
+    assert opened["closes"] == len(closed_in(open_month))
     assert (opened["wins"], opened["losses"]) == (
-        sum(e.realized_pnl_base > 0 for e in closed_in(open_month)),
-        sum(e.realized_pnl_base < 0 for e in closed_in(open_month)))
+        sum(c > 0 for c in closed_in(open_month)),
+        sum(c < 0 for c in closed_in(open_month)))
     # The money is what IBKR booked on each month's own fills: the opening fills'
     # commission in the month that opened it, the buyback's P&L in the month
     # that closed it.
@@ -917,7 +922,7 @@ def test_a_trade_counts_only_in_the_month_it_closed(populated):
             pytest.approx(booked[month][0]), pytest.approx(booked[month][1])), month
 
     # The close month carries the outcome, spanning episode included.
-    assert closed["closed_episodes"] == len(closed_in(close_month)) >= 1
+    assert closed["closes"] == len(closed_in(close_month)) >= 1
 
 
 def test_options_commission_reconciles_with_the_fills(populated):
@@ -1037,17 +1042,16 @@ def test_a_lifecycle_spans_open_and_close_and_matches_the_dashboard(populated):
                if x["realized_pnl"]) == pytest.approx(st["all_time"]["net_pnl"]["base"])
 
 
-def test_dashboard_headline_counts_closed_round_trips_for_options():
+def test_dashboard_headline_counts_closes_for_options():
     """'Total Trades' as a fill count let a month claim trades whose outcome
     belonged to a later month -- open in July, close in August, and July's card
     said '3 trades' while its P&L, wins and losses all correctly read zero. For
-    options the headline is CLOSED CONTRACT ROUND TRIPS, the same population the
-    P&L, wins, losses and averages measure. Fills survive in the sub-note, named
-    as what they are."""
+    options the headline is CLOSES, the same population the P&L, wins, losses and
+    averages measure. Fills survive in the sub-note, named as what they are."""
     js = _js()
-    assert "statCard('Trades', s.closed_episodes," in js
+    assert "statCard('Trades', s.closes," in js
     assert "fill(s), ${s.orders} order(s)" in js, "fills stay visible as activity"
-    assert "`closed contract round trip${s.closed_episodes===1?'':'s'}`" in js, (
+    assert "`close${s.closes===1?'':'s'}`" in js, (
         "the headline names its unit, which is the money's: net P&L is "
         "attributed by it"
     )
@@ -2918,7 +2922,7 @@ def test_annual_rows_reconcile_with_the_all_time_row(state):
     """
     years, everything = state["annual"], state["annual_total"]
     assert sum(y["total_trades"] for y in years) == everything["total_trades"]
-    assert sum(y["closed_episodes"] for y in years) == everything["closed_episodes"]
+    assert sum(y["closes"] for y in years) == everything["closes"]
     assert sum(y["net_pnl"]["base"] for y in years) == pytest.approx(
         everything["net_pnl"]["base"], abs=1e-9
     )
@@ -5334,7 +5338,7 @@ def test_an_empty_loss_population_reads_as_a_fact_not_a_missing_number():
     closed still shows the em-dash it should.
     """
     body = _fn("dashboard")
-    assert "s.losses===0&&s.closed_episodes>0" in body.replace(" ", ""), (
+    assert "s.losses===0&&s.closes>0" in body.replace(" ", ""), (
         "the empty-population case is gone, so Avg Loss shows a bare em-dash "
         "again when there are no losses"
     )
@@ -9251,13 +9255,13 @@ def test_the_theme_chip_drops_under_the_wordmark_when_the_row_cannot_hold_both()
 
 def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state, populated):
     """The ranking reads the lifecycles; the tiles read month_stats. Over all time
-    the decided cards, plus whatever closed inside a card still running, must sum
-    to what Avg P&L per Trade implies, or the Best Strategy tile is ranking
+    the decided cards, plus whatever IBKR booked inside a card still running, must
+    sum to what Avg P&L per Trade implies, or the Best Strategy tile is ranking
     different money from the tiles beside it. Recomputed, not pinned.
     """
     at = state["all_time"]
-    if not at["closed_episodes"]:
-        pytest.skip("needs closed round trips")
+    if not at["closes"]:
+        pytest.skip("needs closes")
     conn = connect(populated)
     try:
         report = build_history(conn, asset_category="OPT")
@@ -9265,12 +9269,11 @@ def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state, popul
     finally:
         conn.close()
     running = sum(report.episodes[i].realized_pnl_base
-                  for c in camps if not c.is_decided
-                  for i in c.episode_indices if report.episodes[i].is_closed)
+                  for c in camps if not c.is_decided for i in c.episode_indices)
     decided = [lc for lc in state["lifecycles"]
                if lc["status"] == "closed" and lc["realized_pnl"]]
     assert sum(lc["realized_pnl"]["base"] for lc in decided) + running == pytest.approx(
-        at["avg_pnl"]["base"] * at["closed_episodes"])
+        at["avg_pnl"]["base"] * at["closes"])
     best = at["best_strategy"]
     assert best and best["pnl"]["base"] >= (at["worst_strategy"] or best)["pnl"]["base"]
     # And the largest outcomes bound the averages they were chosen from.

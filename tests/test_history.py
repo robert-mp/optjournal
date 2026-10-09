@@ -854,8 +854,9 @@ def test_a_pre_archive_position_scaled_out_and_back_in_closes_once(conn):
     assert ep.contracts == 2
     from optjournal.stats import month_stats
     september = month_stats(conn, "2026-09", report=report)
-    assert (september.net_pnl.base, september.wins, september.open_episodes) == (
-        347.0, 1, 1), "the one open episode is OTHER, the snapshot-only row"
+    assert (september.net_pnl.base, september.open_episodes) == (347.0, 1), (
+        "the one open episode is OTHER, the snapshot-only row")
+    assert (september.closes, september.wins) == (2, 2), "two sales, two closes"
 
 
 def test_a_pre_archive_position_added_to_then_closed_is_one_round_trip(conn):

@@ -15,15 +15,19 @@ Two deliberate choices about what gets counted:
   statement's own. Premium collected on a contract still held is not P&L: IBKR
   realises none of it until a fill closes some of the contract.
 
-* **Win/loss counts closed contract round trips.** A round trip closed by two
-  partial fills is one outcome, not two, so counting fills would inflate both
-  the trade count and the win rate. It is decided on the trade date of its
-  last closing fill, the day its last P&L is booked, so a win lands in the
-  month its money finishes landing. A partial close is money, not yet an
-  outcome. A roll's closed contract is decided on the day of the roll, and a
-  strangle's two legs are two outcomes. Grouping contracts into positions is
-  the Trades tab's view (`campaigns.py`), and nothing here counts by it, so a
-  Trades card and the Dashboard can never disagree about a roll.
+* **Win/loss counts closes.** A close is one order's closing fills on one
+  contract on one trade day (IBKR's `C`, its `C;O` reversal included), and its
+  result is what IBKR booked on them. Each time you close all or part of a
+  contract counts once, so buying back 2 of 4 puts is a close, decided that
+  day, while the other 2 stay open. An order filled in two parts is one close,
+  not two, since counting fills would inflate both the trade count and the win
+  rate. The day is part of a close because it is the money's clock. IBKR books
+  each fill on its own trade date and every realising fill is a closing fill,
+  so the closes' results sum to Net P&L for every period and scope, an order
+  still working overnight included. A roll's closing leg is a close on the
+  day of the roll, and a strangle bought back is two. Grouping contracts into
+  positions is the Trades tab's view (`campaigns.py`), and nothing here counts
+  by it, so a Trades card and the Dashboard can never disagree about a roll.
 """
 
 from __future__ import annotations
@@ -138,8 +142,7 @@ def campaigns_for(
     order-id union alone links nothing at all -- see `campaigns.py`.
 
     What the Trades tab's cards, the journal and the open-position count read.
-    The scoreboard does not: it counts contract round trips (see the module
-    docstring).
+    The scoreboard does not, since it counts closes (see the module docstring).
 
     `episodes` must be the list the returned campaigns will be resolved against,
     because a `Campaign` holds INDICES into it.
@@ -327,23 +330,22 @@ class MonthStats:
     #: same charges.
     fees: Money = Money.restated(0.0)
 
-    #: Episode-derived, so a two-fill close counts once, in the period holding
-    #: the trade date of its last closing fill. The scoreboard's unit, not the
-    #: money's: a partial close books P&L in `net_pnl` while its contract stays
-    #: open, and adds nothing here until the contract is flat.
-    closed_episodes: int = 0
+    #: Closes: one order's closing fills on one contract on one trade day. A
+    #: partial close is one, so the scoreboard reads the fills `net_pnl` does and
+    #: its results sum to it.
+    closes: int = 0
     open_episodes: int = 0
-    #: Of `closed_episodes`, those that netted up and those that netted down.
-    #: A scratch is neither, so the two need not sum to it.
+    #: Of `closes`, those that netted up and those that netted down. A scratch is
+    #: neither, so the two need not sum to it.
     wins: int = 0
     losses: int = 0
     #: None -- not zero -- when nothing won or lost: an average of no outcomes
     #: is undefined, and zero would read as a break-even trade.
     avg_win: Money | None = None
     avg_loss: Money | None = None
-    #: The mean outcome over every closed round trip, wins, losses and scratches
+    #: The mean outcome over every close, wins, losses and scratches
     #: together -- the same name and meaning as `Cohort.avg_pnl`. None under the
-    #: rule above: nothing closed, no average.
+    #: rule above: no close, no average.
     avg_pnl: Money | None = None
     #: Gross won over gross lost, both in base. None when nothing was lost -- the
     #: ratio is then infinite, and a very large finite number would read as a
@@ -351,7 +353,7 @@ class MonthStats:
     #: same `won` and `lost` lists the averages divide, so it cannot disagree
     #: with the Avg Win and Avg Loss tiles beside it.
     profit_factor: float | None = None
-    #: The single best and worst closed round trips. None when nothing won or lost,
+    #: The single best and worst closes. None when nothing won or lost,
     #: under the averages' rule. Chosen from the same `won` and `lost` lists, so
     #: the largest win can never be smaller than Avg Win beside it.
     largest_win: Money | None = None
@@ -596,12 +598,6 @@ def available_years(
     rows = conn.execute(f"SELECT DISTINCT trade_date FROM trades {where}", params).fetchall()
     years = {d[:4] for d in (_day_of(r["trade_date"]) for r in rows) if d}
     return sorted(years, reverse=True)
-
-
-def _outcome(episode: Any) -> Money:
-    """One round trip's realised P&L, with its native where it has one."""
-    return Money.charged(
-        [(episode.realized_pnl_base, episode.realized_pnl, episode.currency)])
 
 
 def _period_stats(
@@ -878,10 +874,13 @@ def month_stats(
     #: of two, not a change in any reported figure.
     fill_commission: list[tuple[float | None, float | None, str | None]] = []
     fill_pnl: list[tuple[float | None, float | None, str | None]] = []
+    #: The scoreboard's unit, a CLOSE: the P&L rows of one order's closing fills
+    #: on one contract on one trade day. See the module docstring.
+    closing: dict[tuple[Any, ...], list[tuple[float | None, float | None, str | None]]] = {}
     for row in conn.execute(
-        f"SELECT trade_date, trade_id, ib_order_id, fifo_pnl_realized_base,"
-        f" fifo_pnl_realized, ib_commission_base, ib_commission, currency"
-        f" FROM trades {where}", params
+        f"SELECT broker, account_id, conid, open_close, trade_date, trade_id,"
+        f" ib_order_id, fifo_pnl_realized_base, fifo_pnl_realized,"
+        f" ib_commission_base, ib_commission, currency FROM trades {where}", params
     ):
         if not _in_period(row["trade_date"], period):
             continue
@@ -890,8 +889,12 @@ def month_stats(
         stats.total_trades += 1
         if row["ib_order_id"]:
             orders.add(str(row["ib_order_id"]))
-        fill_pnl.append((row["fifo_pnl_realized_base"],
-                         row["fifo_pnl_realized"], row["currency"]))
+        pnl = (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"], row["currency"])
+        fill_pnl.append(pnl)
+        if "C" in (row["open_close"] or "").upper():
+            closing.setdefault((row["broker"], row["account_id"], row["conid"],
+                                row["ib_order_id"], _day_of(row["trade_date"])),
+                               []).append(pnl)
         fill_commission.append((row["ib_commission_base"],
                                 row["ib_commission"], row["currency"]))
     stats.orders = len(orders)
@@ -917,23 +920,6 @@ def month_stats(
         report = build_history(
             conn, asset_category=asset_category, base_currency=base_currency
         )
-    # Attributed by close date, matching the monthly convention: an episode
-    # opened in December and closed in January is a January outcome, and so a
-    # 2026 one. Attributing by entry instead would make the annual rows stop
-    # summing to the monthly ones.
-    #
-    # By the money's clock, IBKR's trade date, so an outcome lands in the month
-    # its last P&L does: a Korean sale at 20:03 ET on 31 August is a 1 September
-    # trade, and on the ET stamp its win landed in August with its P&L in
-    # September.
-    def close_of(e: Any) -> str | None:
-        return e.closed_on or e.closed_at
-
-    closed = [
-        e for e in report.closed
-        if _in_period(close_of(e), period) and scope.has_episode(e)
-    ]
-    stats.closed_episodes = len(closed)
     stats.open_episodes = sum(1 for e in report.open if scope.has_episode(e))
     # Premium is cash received or paid in the contract's own currency, so it
     # takes the same treatment as commission: exact when one currency accounts
@@ -942,29 +928,26 @@ def month_stats(
         (e.proceeds_base - e.realized_pnl_base, e.proceeds - e.realized_pnl, e.currency)
         for e in report.open if scope.has_episode(e)
     )
-    won = [e for e in closed if e.realized_pnl_base > 0]
-    lost = [e for e in closed if e.realized_pnl_base < 0]
+    closes = list(closing.values())
+    won = [rows for rows in closes if Money.charged(rows).base > 0]
+    lost = [rows for rows in closes if Money.charged(rows).base < 0]
+
+    def gross(group: list[list[Any]]) -> Money:
+        # Charged from the fills, not summed from each close's gated `Money`, which
+        # cannot tell a native withheld for mixing from one that was never there.
+        return Money.charged(row for rows in group for row in rows)
+
+    stats.closes = len(closes)
     stats.wins, stats.losses = len(won), len(lost)
     # `Money.per` divides base and native by the same count, so an average can
     # never be an exact numerator over a restated one.
-    gross_won = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in won
-    )
-    gross_lost = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in lost
-    )
+    gross_won, gross_lost = gross(won), gross(lost)
     stats.avg_win = gross_won.per(len(won))
     stats.avg_loss = gross_lost.per(len(lost))
-    stats.avg_pnl = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in closed
-    ).per(len(closed))
+    stats.avg_pnl = gross(closes).per(len(closes))
     stats.profit_factor = gross_won.base / -gross_lost.base if gross_lost.base else None
-    stats.largest_win = (
-        _outcome(max(won, key=lambda e: e.realized_pnl_base)) if won else None
-    )
-    stats.largest_loss = (
-        _outcome(min(lost, key=lambda e: e.realized_pnl_base)) if lost else None
-    )
+    stats.largest_win = max(map(Money.charged, won), key=lambda m: m.base, default=None)
+    stats.largest_loss = min(map(Money.charged, lost), key=lambda m: m.base, default=None)
     stats.net_liq_base, stats.net_liq_date = _net_liq_for(conn, period)
 
     stats.days = daily_series(conn, period, asset_category, scope)
@@ -988,7 +971,7 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         # can exist, and the shape says so.
         "commissions": stats.commissions.payload(),
         "fees": stats.fees.payload(),
-        "closed_episodes": stats.closed_episodes,
+        "closes": stats.closes,
         "open_episodes": stats.open_episodes,
         "wins": stats.wins,
         "losses": stats.losses,
