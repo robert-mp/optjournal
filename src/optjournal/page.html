@@ -7248,9 +7248,7 @@ function staleServerCheck(state){
      missing the whole block -- which is the shape that then throws in `dashboard`
      on `s.month`. Quietest response to the loudest failure, exactly inverted. */
   if(!s){
-    note('The server\'s reply carries no <code>stats</code> block at all, so no tab '
-      +'can be drawn from it. This usually means the page is newer than the server '
-      +'process: restart it with <code>optjournal serve</code>.','bad');
+    note(restart,'bad');
     return;
   }
   if(STATE_KEYS_REQUIRED.every(k=>k in state)) return;
