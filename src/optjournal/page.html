@@ -1420,6 +1420,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
 /** @typedef {Object} Install -- the launcher's view of this install (web.build_state)
  * @property {string} home -- the folder holding the journal
  * @property {boolean} supervised -- started by the Start file, so it can restart itself
+ * @property {boolean} restartable -- `supervised`, sent only by a server that has
+ *   `/api/restart`, so the restart banner offers Restart now only there
  * @property {Array} previous -- paths of other downloads holding a journal; empty
  *   unless this journal is (install.previous_journals)
  */
@@ -1434,7 +1436,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} [error]
  */
 
-/** @typedef {Object} UpdateReply -- POST /api/update and /api/install/import
+/** @typedef {Object} UpdateReply -- POST /api/update, /api/install/import and /api/restart
  * @property {boolean} ok
  * @property {string} kind
  * @property {string} [message]
@@ -7238,7 +7240,14 @@ function staleServerCheck(state){
      what it left out. A server from before `restart_needed` existed cannot say
      so, which is what the two checks below are still for. */
   if(state&&state.restart_needed){
-    note(restart,'bad');
+    /* Offered only here. A server that cannot send `restart_needed` predates
+       `/api/restart` too, so the two checks below stay text alone. */
+    const ins=state.install||{};
+    note(restart+(ins.restartable
+      ?' <button class="btn" id="restartgo">Restart now</button>':''),'bad');
+    const b=ins.restartable&&$('#restartgo');
+    if(b) b.onclick=()=>bannerPost(b,'/api/restart',null,'Could not restart: ',
+      ()=>'Restarting. The page reloads by itself.');
     return;
   }
   const s=state&&state.stats;

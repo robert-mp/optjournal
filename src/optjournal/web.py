@@ -939,9 +939,13 @@ def build_state(
     state["provisional"] = provisional
     # What the launcher and the updater need the page to know. `previous` is
     # empty unless this journal is: see `install.previous_journals`.
+    supervised = bool(os.environ.get("OPTJOURNAL_SUPERVISED"))
     state["install"] = {
         "home": str(db_path.parent),
-        "supervised": bool(os.environ.get("OPTJOURNAL_SUPERVISED")),
+        "supervised": supervised,
+        # The same answer under a key only a server with `/api/restart` sends,
+        # so a page in front of an older one shows the restart banner's text alone.
+        "restartable": supervised,
         "previous": [str(p) for p in install.previous_journals(db_path.parent)],
     }
     state["sync"] = {
@@ -1196,8 +1200,9 @@ class ServeConfig:
     sync_lock: threading.Lock = field(default_factory=threading.Lock)
     #: Held by the one keyring write allowed at a time. See `_keyring_call`.
     keyring_busy: threading.Lock = field(default_factory=threading.Lock)
-    #: Set by an update or a journal import: `serve` stops and reports it, and
-    #: the launcher starts it again (see `cli.EXIT_RESTART`).
+    #: Set by an update, a journal import or the page's Restart now: `serve`
+    #: stops and reports it, and the launcher starts it again (see
+    #: `cli.EXIT_RESTART`).
     restart: threading.Event = field(default_factory=threading.Event)
     #: This server's scheduler, so a settings save can ask it to collect now
     #: (`_Handler._collect_now`). None with `--no-scheduler` and in the demo.
@@ -2162,6 +2167,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._restart_soon()
         return 202, {"ok": True, "kind": "restarting", "source": source}
 
+    def _restart(self) -> tuple[int, dict[str, Any]]:
+        """Restart onto the code on disk, for the restart banner's Restart now."""
+        if not os.environ.get("OPTJOURNAL_SUPERVISED"):
+            return 409, {"ok": False, "kind": "refused",
+                         "message": "this optjournal was not opened with its Start "
+                                    "file, so nothing would start it again. Stop it "
+                                    "and start it yourself."}
+        self._restart_soon()
+        return 202, {"ok": True, "kind": "restarting"}
+
     def _job_run(self) -> tuple[int, dict[str, Any]]:
         """Run one registered job now. The page's only write to the scheduler.
 
@@ -2329,6 +2344,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/install/import":
             self._json(*self._import_journal())
             return
+        if path == "/api/restart":
+            self._json(*self._restart())
+            return
         if path != "/api/sync":
             self._json(404, {"error": "not found"})
             return
@@ -2377,7 +2395,8 @@ def serve(
     """Serve the UI until interrupted. Loopback only, by construction.
 
     Returns True when it stopped for a restart (an update or a journal import
-    is waiting for the launcher), False when it was asked to stop.
+    is waiting for the launcher, or the page asked), False when it was asked to
+    stop.
 
     `scheduler=True` starts the 60-second reconciler in this process, which is what
     makes `serve` the application rather than a viewer. In-process for one measured
