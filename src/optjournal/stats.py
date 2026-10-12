@@ -193,16 +193,25 @@ def fx_quotes(conn: sqlite3.Connection, base: str) -> list[dict[str, Any]]:
     them at one stated rate, and the page labels it that way rather than letting
     the numbers look like IBKR's own.
 
-    The newest position snapshot is the only dated FX rate the statement gives
-    us. With no snapshot there are no quotes, and the page hides the toggle
-    rather than inventing a rate.
+    The rate is the newest one IBKR stated, from either of two places. Every
+    position snapshot row carries the rate for its report date, and every fill
+    the rate for its trade date. Fills count because a Flex query without Open
+    Positions, or an account that never held a USD position on a statement date,
+    has no snapshot rate at all, while each USD option fill still says what IBKR
+    converted it at. The two compare as days (`_day_of`), since snapshot dates
+    are compact and trade dates ISO. On the same day the snapshot wins, because
+    it is the rate IBKR valued the positions at, so restating them reproduces
+    IBKR's native figures. A fill marked `fx_rate_estimated` is skipped, because a
+    same-session confirm was converted at a live quote this journal fetched, not
+    at IBKR's rate. With no IBKR rate there are no quotes, and the page hides
+    the toggle rather than inventing one.
 
     Offered codes are restricted to currencies that appear on *option* trades.
     The snapshot table carries every currency the account holds anything in --
     after the equities re-ingest that meant SEK and KRW from stock positions --
     but this is an options journal, and restating its figures into a currency
-    no option ever traded in is noise, not information. The snapshot remains
-    the *rate* source; option trades define the *set*.
+    no option ever traded in is noise, not information. IBKR's rates are the
+    *rate* source; option trades define the *set*.
     """
     option_codes = {
         str(r["currency"] or "").upper()
@@ -210,26 +219,30 @@ def fx_quotes(conn: sqlite3.Connection, base: str) -> list[dict[str, Any]]:
             "SELECT DISTINCT currency FROM trades WHERE asset_category = 'OPT'"
         )
     }
-    rows = conn.execute(
-        "SELECT currency, fx_rate_to_base, report_date FROM position_snapshots"
-        " WHERE fx_rate_to_base IS NOT NULL AND fx_rate_to_base > 0"
-        " ORDER BY report_date DESC"
-    ).fetchall()
-    quotes: dict[str, dict[str, Any]] = {}
-    for row in rows:
+    newest: dict[str, tuple[str, bool, float]] = {}
+    for row in conn.execute(
+        "SELECT currency, fx_rate_to_base AS rate, report_date AS day,"
+        " 1 AS snapshot FROM position_snapshots WHERE fx_rate_to_base > 0"
+        " UNION ALL SELECT currency, fx_rate_to_base, trade_date, 0 FROM trades"
+        " WHERE fx_rate_to_base > 0 AND fx_rate_estimated = 0"
+    ):
         code = str(row["currency"] or "").upper()
-        if not code or code == base.upper() or code in quotes:
+        day = _day_of(row["day"])
+        if code not in option_codes or code == base.upper() or day is None:
             continue
-        if code not in option_codes:
-            continue
-        quotes[code] = {
+        candidate = (day, bool(row["snapshot"]), float(row["rate"]))
+        if code not in newest or candidate[:2] > newest[code][:2]:
+            newest[code] = candidate
+    return [
+        {
             "code": code,
             # Stored rate is native -> base, so invert for base -> native.
-            "per_base": 1.0 / float(row["fx_rate_to_base"]),
-            "as_of": str(row["report_date"] or ""),
-            "source": "position snapshot",
+            "per_base": 1.0 / rate,
+            "as_of": day,
+            "source": "position snapshot" if snapshot else "trade",
         }
-    return list(quotes.values())
+        for code, (day, snapshot, rate) in sorted(newest.items())
+    ]
 
 
 def first_activity(conn: sqlite3.Connection) -> str | None:

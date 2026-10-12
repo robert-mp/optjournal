@@ -300,16 +300,20 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="fx-rate-guard",
         module="stats.py",
-        find='        " WHERE fx_rate_to_base IS NOT NULL AND fx_rate_to_base > 0"',
-        replace='        " WHERE fx_rate_to_base IS NOT NULL"',
+        find='        " 1 AS snapshot FROM position_snapshots WHERE fx_rate_to_base > 0"\n'
+             '        " UNION ALL SELECT currency, fx_rate_to_base, trade_date, 0 FROM trades"\n'
+             '        " WHERE fx_rate_to_base > 0 AND fx_rate_estimated = 0"',
+        replace='        " 1 AS snapshot FROM position_snapshots"\n'
+                '        " UNION ALL SELECT currency, fx_rate_to_base, trade_date, 0 FROM trades"\n'
+                '        " WHERE fx_rate_estimated = 0"',
         breaks="a stored rate of zero would reach 1.0/rate and raise on page load, "
                "and a negative one would flip the sign of every restated total",
     ),
     Mutant(
         key="fx-self-quote",
         module="stats.py",
-        find="        if not code or code == base.upper() or code in quotes:",
-        replace="        if not code or code in quotes:",
+        find="        if code not in option_codes or code == base.upper() or day is None:",
+        replace="        if code not in option_codes or day is None:",
         breaks="the base currency would be offered as an alternative to itself, a "
                "no-op entry in the toggle that restates nothing",
     ),
