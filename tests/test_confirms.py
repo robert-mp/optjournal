@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import connect_migrated
+from conftest import LIVE_STATEMENTS, connect_migrated
 
 from optjournal.confirms import (
     CONFIRM_QUERY_TYPE,
@@ -27,7 +27,14 @@ from optjournal.confirms import (
     split_codes,
     statement_meta,
 )
-from optjournal.ingest import ingest_confirms, ingest_file
+from optjournal.ingest import (
+    ASSET_FILTER_ALL,
+    LedgerFill,
+    _contract_ledger,
+    fifo_realized,
+    ingest_confirms,
+    ingest_file,
+)
 
 #: One execution, with the account number and name redacted. Byte-shaped like the
 #: real thing: 82 attributes, `levelOfDetail="EXECUTION"`, and no `fxRateToBase`,
@@ -454,3 +461,85 @@ def test_re_ingesting_a_grown_confirm_refreshes_its_statement_row(tmp_path):
     row = conn.execute(
         "SELECT from_date, to_date, when_generated FROM statements").fetchone()
     assert tuple(row) == ("2026-09-24", "2026-09-25", "2026-09-25 15:30:00")
+
+
+# --------------------------------------------------------------------------
+# A same-session close's P&L, replayed FIFO from the fills on record.
+# --------------------------------------------------------------------------
+
+def _ledger(*fills: tuple[int, float, str]) -> list[LedgerFill]:
+    """One contract's fills, oldest first, numbered from 1: (quantity, cash, code)."""
+    return [LedgerFill(str(n), quantity, cash, code)
+            for n, (quantity, cash, code) in enumerate(fills, 1)]
+
+
+def test_a_close_realises_its_own_cash_and_the_lots():
+    """Sold for 199 net, bought back for 101 net: IBKR books 98."""
+    assert fifo_realized(_ledger((-1, 199.0, "O"), (1, -101.0, "C")), "2") == 98.0
+
+
+def test_a_partial_close_realises_only_the_units_it_closes():
+    fills = _ledger((-3, 597.0, "O"), (1, -101.0, "C"), (2, -202.0, "C"))
+    assert fifo_realized(fills, "2") == pytest.approx(98.0)
+    assert fifo_realized(fills, "3") == pytest.approx(196.0)
+
+
+def test_a_close_matches_the_oldest_lots_first():
+    """One unit opened at 300 and two at 200, bought back two at 100 and one at 50."""
+    fills = _ledger((-1, 300.0, "O"), (-2, 400.0, "O"),
+                    (2, -200.0, "C"), (1, -50.0, "C"))
+    assert fifo_realized(fills, "3") == pytest.approx((300 - 100) + (200 - 100))
+    assert fifo_realized(fills, "4") == pytest.approx(200 - 50)
+
+
+def test_both_sides_commissions_are_inside_the_figure():
+    """The GOOG 310P sold for 980 less 1.50, bought back for 240 less 1.393368."""
+    fills = _ledger((-2, 980.0 - 1.5, "O"), (2, -240.0 - 1.393368, "C"))
+    assert fifo_realized(fills, "2") == pytest.approx(737.106632)
+
+
+def test_a_reversal_realises_only_the_part_that_closes():
+    """Long one, sold three through zero: one unit closes, two open a short lot."""
+    fills = _ledger((1, -101.0, "O"), (-3, 597.0, "C;O"), (2, -202.0, "C"))
+    assert fifo_realized(fills, "2") == pytest.approx(199 - 101)
+    assert fifo_realized(fills, "3") == pytest.approx(2 * (199 - 101))
+
+
+def test_a_close_larger_than_the_lots_on_record_has_no_estimate():
+    """The rest was opened before the journal's records begin, at a price unknown here."""
+    assert fifo_realized(_ledger((-1, 199.0, "O"), (2, -202.0, "C")), "2") is None
+    assert fifo_realized(_ledger((1, -101.0, "C")), "1") is None
+
+
+def test_closing_a_lot_from_before_the_records_opens_nothing():
+    """Opened as a long, that leftover would absorb the next sell and misprice the close."""
+    fills = _ledger((1, -50.0, "C"), (-1, 199.0, "O"), (1, -101.0, "C"))
+    assert fifo_realized(fills, "3") == pytest.approx(98.0)
+
+
+@pytest.mark.skipif(not LIVE_STATEMENTS, reason="needs the optional live corpus")
+def test_the_replay_reproduces_every_settled_close_of_the_real_account(tmp_path):
+    """The standing check that the estimate follows IBKR's own rule.
+
+    Against the real archive because the demo statement cannot serve: its realised
+    figures are transcribed rather than derived, and most leave a commission out.
+    A close the replay cannot price is allowed, since that is the honest answer for
+    a lot opened before the archive. A priced one that misses by a cent is not.
+    """
+    conn = connect_migrated(tmp_path / "live.db")
+    for path in LIVE_STATEMENTS:
+        ingest_file(conn, path, assets=ASSET_FILTER_ALL)
+    priced, wrong = 0, []
+    for row in conn.execute(
+        "SELECT broker, account_id, conid, trade_id, fifo_pnl_realized FROM trades"
+        " WHERE open_close LIKE '%C%' AND fifo_pnl_realized IS NOT NULL"
+    ).fetchall():
+        ledger = _contract_ledger(conn, row["broker"], row["account_id"], row["conid"])
+        estimate = fifo_realized(ledger, row["trade_id"])
+        if estimate is None:
+            continue
+        priced += 1
+        if abs(estimate - row["fifo_pnl_realized"]) >= 0.005:
+            wrong.append((row["trade_id"], estimate, row["fifo_pnl_realized"]))
+    assert priced, "no settled close in the live corpus was priced at all"
+    assert not wrong, f"{len(wrong)} of {priced} closes disagree with IBKR, first: {wrong[:5]}"

@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from collections import deque
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -41,6 +42,8 @@ from optjournal.sources import source_for
 __all__ = [
     "ASSET_FILTER_ALL",
     "IngestResult",
+    "LedgerFill",
+    "fifo_realized",
     "ingest_confirms",
     "ingest_file",
 ]
@@ -382,6 +385,85 @@ def ingest_confirms(
                            base_currency=base_currency, broker=broker,
                            source_kind=CONFIRM_SOURCE, fx_rate_estimated=estimated)
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerFill:
+    """One fill as FIFO sees it.
+
+    `cash` is what the fill moved in the contract's currency, proceeds plus
+    commission, so a sell is positive and a buy negative.
+    """
+
+    trade_id: str
+    quantity: float
+    cash: float
+    open_close: str | None
+
+
+def fifo_realized(fills: Iterable[LedgerFill], trade_id: str) -> float | None:
+    """The native P&L IBKR books on one closing fill, replayed from the fills.
+
+    `fills` are one contract's fills in one account, oldest first. A fill's cash
+    is spread evenly over its units, and each unit that closes realises its own
+    cash plus that of the oldest open unit it matches. So both sides' commissions
+    are inside the figure, as they are inside IBKR's `fifoPnlRealized`, and the
+    live-corpus test in test_confirms.py holds the two equal to the cent.
+
+    Units left over after matching open a lot, except on a plain close (`C`
+    without `O`), whose leftover units close lots opened before the journal's
+    records begin. The target is None in that case, since those lots' prices are
+    unknown here, and None when it matches nothing at all.
+    """
+    lots: deque[list[float]] = deque()  # [units still open, cash per unit]
+    side = 0
+    for fill in fills:
+        units = abs(fill.quantity)
+        if not units:
+            continue
+        sign = 1 if fill.quantity > 0 else -1
+        per_unit = fill.cash / units
+        realized = 0.0
+        if sign == -side:
+            while units and lots:
+                lot = lots[0]
+                taken = min(units, lot[0])
+                realized += taken * (lot[1] + per_unit)
+                units -= taken
+                lot[0] -= taken
+                if not lot[0]:
+                    lots.popleft()
+        codes = (fill.open_close or "").upper().split(";")
+        plain_close = "C" in codes and "O" not in codes
+        if fill.trade_id == trade_id:
+            matched = units < abs(fill.quantity)
+            return realized if matched and not (plain_close and units) else None
+        if units and not plain_close:
+            lots.append([units, per_unit])
+            side = sign
+        elif not lots:
+            side = 0
+    return None
+
+
+def _contract_ledger(conn: sqlite3.Connection, broker: str, account_id: str,
+                     conid: str) -> list[LedgerFill]:
+    """Every stored fill of one contract in one account, in the order FIFO needs.
+
+    Ties on `date_time` break on the trade id as a number, because IBKR's ids are
+    monotonic but not all the same length, and as text `999999999` sorts after
+    `1000000000`.
+    """
+    return [
+        LedgerFill(row["trade_id"], row["quantity"], row["cash"], row["open_close"])
+        for row in conn.execute(
+            "SELECT trade_id, quantity, open_close,"
+            " COALESCE(proceeds, 0) + COALESCE(ib_commission, 0) AS cash"
+            " FROM trades WHERE broker = ? AND account_id = ? AND conid = ?"
+            " ORDER BY date_time, CAST(trade_id AS INTEGER), trade_id",
+            (broker, account_id, conid),
+        )
+    ]
 
 
 def _live_rate_for(base_currency: str) -> Any:
