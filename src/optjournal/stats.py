@@ -17,17 +17,19 @@ Two deliberate choices about what gets counted:
 
 * **Win/loss counts closes.** A close is one order's closing fills on one
   contract on one trade day (IBKR's `C`, its `C;O` reversal included), and its
-  result is what IBKR booked on them. Each time you close all or part of a
-  contract counts once, so buying back 2 of 4 puts is a close, decided that
-  day, while the other 2 stay open. An order filled in two parts is one close,
-  not two, since counting fills would inflate both the trade count and the win
-  rate. The day is part of a close because it is the money's clock. IBKR books
-  each fill on its own trade date and every realising fill is a closing fill,
-  so the closes' results sum to Net P&L for every period and scope, an order
-  still working overnight included. A roll's closing leg is a close on the
-  day of the roll, and a strangle bought back is two. Grouping contracts into
-  positions is the Trades tab's view (`campaigns.py`), and nothing here counts
-  by it, so a Trades card and the Dashboard can never disagree about a roll.
+  result is what IBKR booked on them. A close counts once IBKR has booked it,
+  so a fill closed this session counts when the next statement settles it.
+  Each time you close all or part of a contract counts once, so buying back 2
+  of 4 puts is a close, decided that day, while the other 2 stay open. An
+  order filled in two parts is one close, not two, since counting fills would
+  inflate both the trade count and the win rate. The day is part of a close
+  because it is the money's clock. IBKR books each fill on its own trade date
+  and every realising fill is a closing fill, so the closes' results sum to
+  Net P&L for every period and scope, an order still working overnight
+  included. A roll's closing leg is a close on the day of the roll, and a
+  strangle bought back is two. Grouping contracts into positions is the Trades
+  tab's view (`campaigns.py`), and nothing here counts by it, so a Trades card
+  and the Dashboard can never disagree about a roll.
 """
 
 from __future__ import annotations
@@ -904,7 +906,7 @@ def month_stats(
             orders.add(str(row["ib_order_id"]))
         pnl = (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"], row["currency"])
         fill_pnl.append(pnl)
-        if "C" in (row["open_close"] or "").upper():
+        if "C" in (row["open_close"] or "").upper() and row["fifo_pnl_realized"] is not None:
             closing.setdefault((row["broker"], row["account_id"], row["conid"],
                                 row["ib_order_id"], _day_of(row["trade_date"])),
                                []).append(pnl)
