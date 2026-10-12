@@ -1500,7 +1500,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local JSON Object ages input mine qb wf was
  * @local when parts names raw err
  * @local COST_OPTIONS bits cost fees on wh
- * @local missing state SCOPE_KEYS
+ * @local state SCOPE_KEYS
  * @local qidsave cqidsave tokcheck toksave
  * @local WMETER WRING arc tin tout sb
  * @local events
@@ -7219,8 +7219,11 @@ async function loadQuotes(announce){
    A missing `journal` is the case worth a guard because it is invisible: it
    renders a working-looking form whose Save posts to an endpoint the old process
    does not have, so the reader types a whole write-up, presses Save, and the only
-   table here that cannot be re-derived never receives it. */
-const STATE_KEYS_REQUIRED=['journal'];
+   table here that cannot be re-derived never receives it.
+
+   A missing `restart_needed` means the server is older than this page, too old
+   to say it is stale, so the absent key says it instead. */
+const STATE_KEYS_REQUIRED=['journal','restart_needed'];
 
 /* Says so, in the banner that already exists for things the reader must act on.
    Not a console warning (nobody has devtools open on their own journal) and not a
@@ -7228,13 +7231,14 @@ const STATE_KEYS_REQUIRED=['journal'];
    numbers that DO arrive are correct, so the page renders and says which figures
    cannot be trusted and what to do about it. */
 function staleServerCheck(state){
+  const restart='Bitácora was updated while it was running, so the figures on '
+    +'this page may be from the old version. Close its window and open '
+    +'<b>Start optjournal</b> again.';
   /* First, because it is the server's own answer rather than an inference from
      what it left out. A server from before `restart_needed` existed cannot say
      so, which is what the two checks below are still for. */
   if(state&&state.restart_needed){
-    note('Bitácora was updated while it was running, so the figures on this page '
-      +'may be from the old version. Close its window and open '
-      +'<b>Start optjournal</b> again.','bad');
+    note(restart,'bad');
     return;
   }
   const s=state&&state.stats;
@@ -7249,13 +7253,8 @@ function staleServerCheck(state){
       +'process: restart it with <code>optjournal serve</code>.','bad');
     return;
   }
-  const missing=STATE_KEYS_REQUIRED.filter(k=>!(k in state));
-  if(!missing.length) return;
-  note('This page is newer than the server process it is talking to, so parts '
-    +'of it will not work. The server re-reads the page on every '
-    +'request but loads its Python once, at startup — so restart it: '
-    +'<code>optjournal serve</code>. '
-    +`(missing: ${missing.map(esc).join(', ')})`,'bad');
+  if(STATE_KEYS_REQUIRED.every(k=>k in state)) return;
+  note(restart,'bad');
 }
 
 /* The query `/api/state` is asked with, from the view state. ONE function, read by

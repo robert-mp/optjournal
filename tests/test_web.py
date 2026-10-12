@@ -680,7 +680,6 @@ def test_the_restart_banner_is_drawn_from_the_payload():
     code changed under it."""
     out = _node_run([
         "const notes=[]; function note(text,kind){notes.push({text,kind});}",
-        "const esc=s=>String(s);",
         _page_const("STATE_KEYS_REQUIRED"),
         *_page_fns("staleServerCheck"),
         "const current={stats:{},journal:{}};",
