@@ -119,6 +119,17 @@ permissive superset or something that surfaces at the closed-lot level of detail
 that IBKR documents and no sample shows. Unresolved, and it does not change the
 ranking either way.
 
+**So the journal estimates it until the statement lands.** After each poll,
+`ingest_confirms` prices every same-session close by replaying its contract's
+stored fills FIFO (`ingest.fifo_realized`). Each fill's proceeds plus commission
+is spread per unit, and a closing unit realises its own cash plus that of the
+oldest open unit. That is IBKR's rule, and the live-corpus test in
+`tests/test_confirms.py` holds the replay to IBKR's `fifoPnlRealized` to the cent.
+The row is marked `trades.pnl_estimated` and the page says the P&L is estimated.
+The next day's supersede writes IBKR's figure and clears the mark. A close of
+lots opened before the archive cannot be priced, so it stays without a P&L and
+the page says so.
+
 ## Retention, and one file per day
 
 Four previous calendar years plus the current one, the same as any saved Flex

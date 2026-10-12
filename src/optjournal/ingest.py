@@ -86,6 +86,7 @@ _TRADE_COLUMNS: tuple[str, ...] = (
     "ib_commission", "ib_commission_base", "ib_commission_currency", "taxes",
     "fifo_pnl_realized", "fifo_pnl_realized_base", "mtm_pnl",
     "raw", "source_file", "first_seen_at", "source_kind", "fx_rate_estimated",
+    "pnl_estimated",
 )
 
 #: The three columns a supersede leaves alone.
@@ -325,7 +326,9 @@ def ingest_confirms(
     A confirm is FILLS ONLY. It carries no cash transactions, no position
     snapshot, no securities and no NAV, so this writes the provenance row and the
     trades and nothing else -- rather than calling `ingest_file`, which would ask
-    a confirm reader for five sections it does not have.
+    a confirm reader for five sections it does not have. It carries no realised
+    P&L either, so each same-session close then gets an estimate; see
+    `_estimate_same_session_closes`.
 
     IDEMPOTENT BY RANK, not by digest. `ingest_file` short-circuits on unchanged
     bytes; that is wrong here, because the useful case is the SAME query polled
@@ -384,7 +387,39 @@ def ingest_confirms(
             _ingest_trades(conn, fills, path.name, assets, result,
                            base_currency=base_currency, broker=broker,
                            source_kind=CONFIRM_SOURCE, fx_rate_estimated=estimated)
+        _estimate_same_session_closes(conn, broker)
     return result
+
+
+def _estimate_same_session_closes(conn: sqlite3.Connection, broker: str) -> None:
+    """Price every same-session close IBKR has not, from the fills on record.
+
+    The estimate is written where IBKR's figure goes, `fifo_pnl_realized` and its
+    base at the row's own rate, so every reader sums it unchanged, and
+    `pnl_estimated` marks it. The Activity Statement's supersede replaces all
+    three with IBKR's figures.
+
+    Over the whole journal rather than this payload, so a close written before
+    the fills it closes were on record is priced by the next poll that has them.
+    A close already priced is left alone, which keeps a re-poll free. One the
+    replay cannot price stays NULL, and the page says it has no P&L yet.
+    """
+    pending = conn.execute(
+        "SELECT account_id, conid, trade_id, fx_rate_to_base FROM trades"
+        " WHERE broker = ? AND source_kind = ? AND fifo_pnl_realized IS NULL"
+        " AND open_close LIKE '%C%'",
+        (broker, CONFIRM_SOURCE),
+    ).fetchall()
+    for row in pending:
+        ledger = _contract_ledger(conn, broker, row["account_id"], row["conid"])
+        native = fifo_realized(ledger, row["trade_id"])
+        if native is None:
+            continue
+        conn.execute(
+            "UPDATE trades SET fifo_pnl_realized = ?, fifo_pnl_realized_base = ?,"
+            " pnl_estimated = 1 WHERE broker = ? AND trade_id = ?",
+            (native, native * row["fx_rate_to_base"], broker, row["trade_id"]),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -627,6 +662,7 @@ def _ingest_trades(conn, fills, source_file: str, assets, result: IngestResult,
                 fill.mtm_pnl,
                 json.dumps(fill.raw, default=str, sort_keys=True),
                 source_file, _now(), source_kind, int(fx_rate_estimated),
+                0,  # pnl_estimated: what the broker sent, so a supersede clears it
             ),
         )
         if stored_rank is None:

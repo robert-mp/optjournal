@@ -14,6 +14,7 @@ silently walks back to what the fill looked like mid-session.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -543,3 +544,91 @@ def test_the_replay_reproduces_every_settled_close_of_the_real_account(tmp_path)
             wrong.append((row["trade_id"], estimate, row["fifo_pnl_realized"]))
     assert priced, "no settled close in the live corpus was priced at all"
     assert not wrong, f"{len(wrong)} of {priced} closes disagree with IBKR, first: {wrong[:5]}"
+
+
+# --------------------------------------------------------------------------
+# The estimate in the journal: written by the confirm, replaced by the statement.
+# --------------------------------------------------------------------------
+
+def _with(xml: str, **attrs: str) -> str:
+    """`xml` with each named attribute set. Each name must occur exactly once."""
+    for name, value in attrs.items():
+        xml, count = re.subn(rf'(?<=\s){name}="[^"]*"', f'{name}="{value}"', xml)
+        assert count == 1, name
+    return xml
+
+
+#: The GOOG 310P sold in ACTIVITY_XML, bought back the next session for 1.20.
+_BUYBACK = {"tradeID": "1592100001", "tradeDate": "20260925",
+            "dateTime": "20260925;143000", "buySell": "BUY", "quantity": "2",
+            "proceeds": "-240"}
+BUYBACK_CONFIRM_XML = _with(
+    CONFIRM_XML, **_BUYBACK, execID="0002920a.6ab5328c.02.01",
+    orderID="1290844395", price="1.2", amount="240", netCash="-241.393368", code="C")
+BUYBACK_ACTIVITY_XML = _with(
+    ACTIVITY_XML, **_BUYBACK, ibExecID="0002920a.6ab5328c.02.01",
+    transactionID="6712000000", ibOrderID="1290844395", tradePrice="1.2",
+    tradeMoney="240", ibCommission="-1.4", openCloseIndicator="C",
+    fifoPnlRealized="737.1", whenGenerated="20260926;050000")
+#: The sale's 980 less 1.50, plus the buyback's -240 less 1.393368.
+BUYBACK_ESTIMATE = 978.5 - 241.393368
+
+
+def _sold(tmp_path: Path):
+    """A journal holding the settled sale, and the buyback's confirm on disk."""
+    conn = connect_migrated(tmp_path / "j.db")
+    sale = tmp_path / "activity-20260925T050000Z.xml"
+    sale.write_text(ACTIVITY_XML, encoding="utf-8")
+    ingest_file(conn, sale)
+    confirm = tmp_path / "confirm-20260925.xml"
+    confirm.write_text(BUYBACK_CONFIRM_XML, encoding="utf-8")
+    return conn, confirm
+
+
+def _buyback(conn):
+    return conn.execute("SELECT * FROM trades WHERE trade_id = '1592100001'").fetchone()
+
+
+def test_a_same_session_close_is_priced_from_the_sale_it_closes(tmp_path):
+    conn, confirm = _sold(tmp_path)
+    ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
+    row = _buyback(conn)
+    assert row["pnl_estimated"] == 1
+    assert row["fifo_pnl_realized"] == pytest.approx(BUYBACK_ESTIMATE)
+    assert row["fifo_pnl_realized_base"] == pytest.approx(BUYBACK_ESTIMATE * 0.8795), (
+        "the base figure is not the native at the row's own rate")
+
+
+def test_re_polling_a_priced_close_changes_nothing(tmp_path):
+    conn, confirm = _sold(tmp_path)
+    ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
+    before = [tuple(r) for r in conn.execute("SELECT * FROM trades ORDER BY trade_id")]
+    again = ingest_confirms(conn, confirm, base_currency="EUR",
+                            rate_for=_fixed_rate(0.90))
+    assert (again.trades_inserted, again.trades_skipped_existing) == (0, 1)
+    assert [tuple(r) for r in conn.execute(
+        "SELECT * FROM trades ORDER BY trade_id")] == before
+
+
+def test_the_statement_replaces_the_estimate_with_ibkrs_own(tmp_path):
+    conn, confirm = _sold(tmp_path)
+    ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
+    assert _buyback(conn)["pnl_estimated"] == 1
+    settled = tmp_path / "activity-20260926T050000Z.xml"
+    settled.write_text(BUYBACK_ACTIVITY_XML, encoding="utf-8")
+    assert ingest_file(conn, settled).trades_superseded == 1
+    row = _buyback(conn)
+    assert (row["source_kind"], row["pnl_estimated"]) == ("activity", 0), (
+        "the settled row still claims an estimate")
+    assert row["fifo_pnl_realized"] == 737.1
+    assert row["fifo_pnl_realized_base"] == pytest.approx(737.1 * 0.87)
+
+
+def test_a_close_with_nothing_on_record_to_close_stays_unpriced(tmp_path):
+    """No sale in the journal, so the replay has no lot and the close has no P&L."""
+    conn = connect_migrated(tmp_path / "j.db")
+    confirm = tmp_path / "confirm-20260925.xml"
+    confirm.write_text(BUYBACK_CONFIRM_XML, encoding="utf-8")
+    ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
+    row = _buyback(conn)
+    assert (row["fifo_pnl_realized"], row["pnl_estimated"]) == (None, 0)
