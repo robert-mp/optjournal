@@ -694,6 +694,23 @@ def test_the_restart_banner_is_drawn_from_the_payload():
     assert "Start optjournal" in out["notes"][0]["text"]
 
 
+def test_a_server_too_old_to_send_restart_needed_gets_the_restart_banner():
+    """A 0.4.0 process left running under 0.4.1 code sends `stats` and `journal`
+    but no `restart_needed`, so it cannot say it is stale, and the Trades tile
+    read "undefined" under no banner. The missing key is the signal."""
+    out = _node_run([
+        "const notes=[]; function note(text,kind){notes.push({text,kind});}",
+        _page_const("STATE_KEYS_REQUIRED"),
+        *_page_fns("staleServerCheck"),
+        "staleServerCheck({stats:{},journal:{}});",
+        "console.log(JSON.stringify(notes));",
+    ])
+    assert [n["kind"] for n in out] == ["bad"], (
+        "a server older than the page must be flagged"
+    )
+    assert "Start optjournal" in out[0]["text"]
+
+
 def test_every_js_property_read_resolves():
     """Guard one: a read on a payload binding must be a key its declared
     shape carries. Catches a wrong KEY on a known binding -- `o.symbol` when
