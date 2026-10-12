@@ -29,6 +29,8 @@ Ablated: restoring the main-thread shape made a real `optjournal serve` sit aliv
 
 from __future__ import annotations
 
+import http.client
+import json
 import os
 import signal
 import socket
@@ -40,6 +42,7 @@ from pathlib import Path
 import pytest
 from conftest import ROOT, code_only, connect_migrated
 
+from optjournal.cli import EXIT_RESTART
 from optjournal.demo import write_demo_statement
 from optjournal.ingest import ingest_file
 
@@ -209,6 +212,52 @@ def test_the_port_is_released_so_a_respawn_can_bind(journal):
                 f"port {port} is still bound after a clean exit ({exc}), so "
                 "launchd's respawn fails Errno 48 and crash-loops"
             )
+
+
+def _post_restart(port: int) -> tuple[int, dict]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.request("POST", "/api/restart")
+        response = conn.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        conn.close()
+
+
+def test_restart_now_exits_with_the_code_the_launcher_starts_again_on(journal,
+                                                                     monkeypatch):
+    """The page's Restart now through a real `serve`: answered first, then the
+    exit `launcher/app.py` reads as "start me again"."""
+    monkeypatch.setenv("OPTJOURNAL_SUPERVISED", "1")
+    port = _free_port()
+    proc = _serve(journal, port)
+    try:
+        _wait_until_bound(proc, port)
+        assert _post_restart(port) == (202, {"ok": True, "kind": "restarting"})
+        output = proc.communicate(timeout=EXIT_BUDGET_S)[0]
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == EXIT_RESTART, output
+
+
+def test_restart_now_is_refused_where_nothing_would_start_serve_again(journal,
+                                                                     monkeypatch):
+    """Run by hand rather than by the launcher, a restart would only stop it."""
+    monkeypatch.delenv("OPTJOURNAL_SUPERVISED", raising=False)
+    port = _free_port()
+    proc = _serve(journal, port)
+    try:
+        _wait_until_bound(proc, port)
+        status, reply = _post_restart(port)
+        # Past `_restart_soon`'s half second and the stop poll after it.
+        time.sleep(1.5)
+        serving = proc.poll() is None
+    finally:
+        _stop(proc)
+        proc.communicate(timeout=EXIT_BUDGET_S)
+    assert (status, reply["kind"], serving) == (409, "refused", True)
+    assert proc.returncode == 0
 
 
 def test_the_scheduler_is_stopped_before_the_listener_goes_away(journal):

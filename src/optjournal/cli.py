@@ -114,7 +114,8 @@ EXIT_THROTTLED = 4
 #: skips, and not EXIT_THROTTLED ("try later"): every cron raises this one.
 EXIT_LOCKED = 5
 #: `serve` stopped so the launcher can start it again: an update or a journal
-#: import is waiting (see `launcher/app.py`). 75 is sysexits' EX_TEMPFAIL.
+#: import is waiting, or the page asked (see `launcher/app.py`). 75 is sysexits'
+#: EX_TEMPFAIL.
 EXIT_RESTART = 75
 
 EPILOG = """\

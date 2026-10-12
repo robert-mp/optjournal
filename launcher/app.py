@@ -11,7 +11,8 @@ The loop, once per start and again after every update:
 1. Swap in a staged release, if `optjournal.updates.stage` left a complete one.
 2. `optjournal prepare`: move a journal home (see `optjournal.install`).
 3. `optjournal serve`, until it exits. Exit code `RESTART` means "an update or
-   an import is waiting, start me again"; anything else ends the loop.
+   an import is waiting, or the page asked, start me again"; anything else ends
+   the loop.
 
 Both run as `uv run --frozen`, so a start never rewrites `uv.lock`.
 """

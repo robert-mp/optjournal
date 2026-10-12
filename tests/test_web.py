@@ -693,6 +693,62 @@ def test_the_restart_banner_is_drawn_from_the_payload():
     assert "Start optjournal" in out["notes"][0]["text"]
 
 
+@pytest.mark.parametrize("supervised", [True, False])
+def test_restartable_follows_the_launchers_variable(populated, monkeypatch, supervised):
+    """The page offers Restart now on `restartable`, so it must be true exactly
+    where `/api/restart` restarts rather than refuses."""
+    if supervised:
+        monkeypatch.setenv("OPTJOURNAL_SUPERVISED", "1")
+    else:
+        monkeypatch.delenv("OPTJOURNAL_SUPERVISED", raising=False)
+    install = build_state(db_path=populated, archive_dir=RAW_DIR,
+                          query_id=None)["install"]
+    assert install["restartable"] is supervised
+
+
+def test_restart_now_is_offered_only_by_a_server_that_has_it():
+    """The page's own `staleServerCheck` and `bannerPost`, run under node. The
+    button is drawn and posts `/api/restart` only when the server sends
+    `restartable`. A server without the key predates the endpoint, and so does
+    any server the two older-server checks catch, so those stay text alone."""
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "let notes=[], wired=[];",
+        "const fetched=[]; let restarts=0;",
+        "function note(text,kind){notes.push({text,kind});}",
+        "const $=sel=>{",
+        "  if(sel!=='#restartgo'||!notes.at(-1).text.includes('id=\"restartgo\"'))",
+        "    return null;",
+        "  const b={id:'restartgo',textContent:'Restart now',disabled:false,",
+        "    classList:{add(){},remove(){}}};",
+        "  wired.push(b); return b;};",
+        "async function fetch(path,opts){fetched.push([path,opts.method]);",
+        "  return {json:async()=>({ok:true,kind:'restarting'})};}",
+        "async function awaitRestart(){restarts++;}",
+        _page_const("STATE_KEYS_REQUIRED"),
+        *_page_fns("staleServerCheck", "bannerPost"),
+        "const drawn=state=>{notes=[]; wired=[]; staleServerCheck(state);",
+        "  return [notes.map(n=>n.kind).join(),",
+        "    notes[0].text.includes('Restart now'), wired.some(b=>b.onclick)];};",
+        "const stale={stats:{},journal:{},restart_needed:true};",
+        "const out={",
+        "  older:drawn({...stale,install:{supervised:true}}),",
+        "  unsupervised:drawn({...stale,install:{supervised:false,restartable:false}}),",
+        "  missing_keys:drawn({stats:{},install:{restartable:true}}),",
+        "  no_stats:drawn({journal:{},install:{restartable:true}}),",
+        "  restartable:drawn({...stale,install:{supervised:true,restartable:true}}),",
+        "};",
+        "await wired[0]?.onclick?.();",
+        "Object.assign(out,{fetched,restarts,last:notes.at(-1)});",
+        "console.log(JSON.stringify(out));",
+    ])
+    for case in ("older", "unsupervised", "missing_keys", "no_stats"):
+        assert out[case] == ["bad", False, False], case
+    assert out["restartable"] == ["bad", True, True]
+    assert (out["fetched"], out["restarts"]) == ([["/api/restart", "POST"]], 1)
+    assert out["last"]["kind"] == "ok"
+
+
 def test_a_server_too_old_to_send_restart_needed_gets_the_restart_banner():
     """A 0.4.0 process left running under 0.4.1 code sends `stats` and `journal`
     but no `restart_needed`, so it cannot say it is stale, and the Trades tile
