@@ -680,7 +680,6 @@ def test_the_restart_banner_is_drawn_from_the_payload():
     code changed under it."""
     out = _node_run([
         "const notes=[]; function note(text,kind){notes.push({text,kind});}",
-        "const esc=s=>String(s);",
         _page_const("STATE_KEYS_REQUIRED"),
         *_page_fns("staleServerCheck"),
         "const current={stats:{},journal:{}};",
@@ -692,6 +691,23 @@ def test_the_restart_banner_is_drawn_from_the_payload():
     assert out["quiet"] == 0, "a current server must draw no banner"
     assert [n["kind"] for n in out["notes"]] == ["bad"]
     assert "Start optjournal" in out["notes"][0]["text"]
+
+
+def test_a_server_too_old_to_send_restart_needed_gets_the_restart_banner():
+    """A 0.4.0 process left running under 0.4.1 code sends `stats` and `journal`
+    but no `restart_needed`, so it cannot say it is stale, and the Trades tile
+    read "undefined" under no banner. The missing key is the signal."""
+    out = _node_run([
+        "const notes=[]; function note(text,kind){notes.push({text,kind});}",
+        _page_const("STATE_KEYS_REQUIRED"),
+        *_page_fns("staleServerCheck"),
+        "staleServerCheck({stats:{},journal:{}});",
+        "console.log(JSON.stringify(notes));",
+    ])
+    assert [n["kind"] for n in out] == ["bad"], (
+        "a server older than the page must be flagged"
+    )
+    assert "Start optjournal" in out[0]["text"]
 
 
 def test_every_js_property_read_resolves():
