@@ -1647,7 +1647,7 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
 /* ---- display currency -------------------------------------------------
    Base is canonical: every *_base figure is IBKR's own conversion, performed
    at that row's own trade or snapshot date. Choosing another display currency
-   RESTATES those totals at a single snapshot rate, so it is a presentation
+   RESTATES those totals at a single rate, IBKR's newest, so it is a presentation
    choice rather than a reconciliation -- on this account the order-implied USD
    rate and the snapshot rate differ by 1.4%. The header names the rate in use.
 
@@ -1680,7 +1680,7 @@ const cash=(v,d)=>money(conv(v),DISP(),d);
    takes dollars for a US option, never euros. `commissions_base` is therefore
    an accounting translation, and restating it into a display currency sends a
    USD charge on a round trip through two different rates (its own trade-date
-   rate to EUR at ingest, then one snapshot rate back out), which does not
+   rate to EUR at ingest, then one display rate back out), which does not
    return: $6.9652 billed read $7.0021 on screen.
 
    So when the reader is already looking at the currency the commission was

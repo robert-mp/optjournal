@@ -45,15 +45,25 @@ def conn(tmp_path) -> sqlite3.Connection:
     return c
 
 
-def _option_trade(conn: sqlite3.Connection, *, trade_id: str, currency: str) -> None:
-    """One OPT fill, which is what puts a currency in the offerable set."""
+def _trade(
+    conn: sqlite3.Connection,
+    *,
+    trade_id: str,
+    currency: str,
+    rate: float,
+    day: str = "2026-03-02",
+    category: str = "OPT",
+    estimated: int = 0,
+) -> None:
+    """One fill. An OPT one puts its currency in the offerable set, and any one
+    carries IBKR's rate for its trade date unless `estimated` marks it ours."""
     conn.execute(
         "INSERT INTO trades (broker, trade_id, ib_exec_id, transaction_id,"
         " account_id, trade_date, asset_category, symbol, quantity, currency,"
-        " fx_rate_to_base, raw, source_file, first_seen_at)"
-        " VALUES ('IBKR',?,?,?,'U1','2026-03-02','OPT','SPY',1,?,1.0,'{}',"
+        " fx_rate_to_base, fx_rate_estimated, raw, source_file, first_seen_at)"
+        " VALUES ('IBKR',?,?,?,'U1',?,?,'SPY',1,?,?,?,'{}',"
         "'t.xml','2026-03-02T00:00:00Z')",
-        (trade_id, trade_id, trade_id, currency),
+        (trade_id, trade_id, trade_id, day, category, currency, rate, estimated),
     )
     conn.commit()
 
@@ -61,13 +71,7 @@ def _option_trade(conn: sqlite3.Connection, *, trade_id: str, currency: str) -> 
 def _snapshot(
     conn: sqlite3.Connection, *, currency: str, rate: float, day: str
 ) -> None:
-    """One position-snapshot row, the only dated FX rate the statement gives.
-
-    `fx_rate_to_base` is `NOT NULL` in the schema, so the query's
-    `IS NOT NULL` half of the guard is unreachable from real data and only the
-    `> 0` half is testable -- which is the half that matters, since it is the
-    one standing in front of a division.
-    """
+    """One position-snapshot row. `day` is IBKR's compact `20260302`, as stored."""
     conn.execute(
         "INSERT INTO position_snapshots (account_id, conid, symbol,"
         " asset_category, currency, fx_rate_to_base, report_date, position,"
@@ -78,33 +82,38 @@ def _snapshot(
     conn.commit()
 
 
-def test_a_snapshot_rate_of_zero_is_refused_rather_than_dividing(conn):
+def _quoted(conn: sqlite3.Connection) -> list[tuple[str, float, str, str]]:
+    return [(q["code"], q["per_base"], q["as_of"], q["source"])
+            for q in fx_quotes(conn, "EUR")]
+
+
+def test_a_rate_of_zero_is_refused_rather_than_dividing(conn):
     """The one arithmetic trap in `fx_quotes`, and nothing else pinned it.
 
     The stored rate is native -> base and the quote is its RECIPROCAL, so a rate
     of zero is not merely a bad datum -- it is a ZeroDivisionError on a page load.
     The query filters `> 0` for exactly that reason, and the filter is invisible
-    in every payload test because no real snapshot has ever carried one.
+    in every payload test because no real row has ever carried one.
 
     A negative rate is refused on the same clause. It would not raise; it would
     quote a currency at a negative rate and render every restated total with the
     sign flipped, which is the worse outcome of the two because it looks like a
     number.
     """
-    _option_trade(conn, trade_id="t1", currency="USD")
-    _snapshot(conn, currency="USD", rate=0.0, day="2026-03-02")
+    _trade(conn, trade_id="t1", currency="USD", rate=0.0)
+    _snapshot(conn, currency="USD", rate=0.0, day="20260302")
 
     assert fx_quotes(conn, "EUR") == [], (
         "a zero rate reached the reciprocal; the > 0 clause is what stops a "
         "page load dividing by it"
     )
 
-    _snapshot(conn, currency="USD", rate=-0.88, day="2026-03-03")
+    _snapshot(conn, currency="USD", rate=-0.88, day="20260303")
     assert fx_quotes(conn, "EUR") == [], "a negative rate would flip every total"
 
     # And the same currency quotes normally once a real rate arrives, so the
     # filter is rejecting the ROW rather than blacklisting the currency.
-    _snapshot(conn, currency="USD", rate=0.88, day="2026-03-04")
+    _snapshot(conn, currency="USD", rate=0.88, day="20260304")
     assert [q["code"] for q in fx_quotes(conn, "EUR")] == ["USD"]
 
 
@@ -116,16 +125,76 @@ def test_the_base_currency_is_never_offered_as_an_alternative(conn):
     guard is one clause in a loop, and no payload test covers it because the real
     journal's base currency has no snapshot row of its own.
     """
-    _option_trade(conn, trade_id="t1", currency="EUR")
-    _option_trade(conn, trade_id="t2", currency="USD")
-    _snapshot(conn, currency="EUR", rate=1.0, day="2026-03-02")
-    _snapshot(conn, currency="USD", rate=0.88, day="2026-03-02")
+    _trade(conn, trade_id="t1", currency="EUR", rate=1.0)
+    _trade(conn, trade_id="t2", currency="USD", rate=0.88)
+    _snapshot(conn, currency="EUR", rate=1.0, day="20260302")
+    _snapshot(conn, currency="USD", rate=0.88, day="20260302")
 
     codes = [q["code"] for q in fx_quotes(conn, "EUR")]
     assert codes == ["USD"], "the base currency offered to convert into itself"
 
     # Case-insensitively, because the column is not normalised on the way in.
     assert [q["code"] for q in fx_quotes(conn, "eur")] == ["USD"]
+
+
+def test_without_a_snapshot_the_newest_fill_states_the_rate(conn):
+    """A EUR account trading USD options had no currency switch at all.
+
+    Its Flex query had no Open Positions section, or it never held anything in
+    USD on a statement date, so no snapshot row carried a USD rate. Every fill
+    still carries the rate IBKR converted it at, and the newest one is as much
+    IBKR's own as a snapshot's. Inserted newest first, so "the last row read
+    wins" fails here.
+    """
+    _trade(conn, trade_id="t2", currency="USD", rate=0.88, day="2026-03-05")
+    _trade(conn, trade_id="t1", currency="USD", rate=0.86, day="2026-03-02")
+
+    assert _quoted(conn) == [("USD", 1.0 / 0.88, "2026-03-05", "trade")]
+
+
+def test_the_newest_rate_wins_whichever_source_states_it(conn):
+    """Snapshot dates are compact and trade dates ISO, so they compare as days.
+
+    Compared as raw strings, `20260304` sorts after every `2026-03-..`, and a
+    snapshot would outrank a newer fill however old it was. On the same day the
+    snapshot wins, because it is the rate IBKR valued the positions at.
+    """
+    _trade(conn, trade_id="t1", currency="USD", rate=0.86, day="2026-03-02")
+    _snapshot(conn, currency="USD", rate=0.87, day="20260304")
+    assert _quoted(conn) == [
+        ("USD", 1.0 / 0.87, "2026-03-04", "position snapshot")
+    ], "a newer snapshot lost to an older fill"
+
+    _trade(conn, trade_id="t2", currency="USD", rate=0.88, day="2026-03-05")
+    assert _quoted(conn) == [
+        ("USD", 1.0 / 0.88, "2026-03-05", "trade")
+    ], "an older snapshot outranked a newer fill"
+
+    _snapshot(conn, currency="USD", rate=0.89, day="20260305")
+    assert _quoted(conn) == [
+        ("USD", 1.0 / 0.89, "2026-03-05", "position snapshot")
+    ], "on the same day the snapshot did not win"
+
+
+def test_a_same_session_confirm_rate_is_not_ibkrs_and_is_skipped(conn):
+    """A Trade Confirmation carries no FX rate, so its fill is converted at a live
+    quote this journal fetched and marked `fx_rate_estimated`. Offering that as
+    the display rate would label our number as IBKR's."""
+    _trade(conn, trade_id="t1", currency="USD", rate=0.86, day="2026-03-02")
+    _trade(conn, trade_id="c1", currency="USD", rate=0.95, day="2026-03-03",
+           estimated=1)
+    assert _quoted(conn) == [("USD", 1.0 / 0.86, "2026-03-02", "trade")]
+
+    conn.execute("DELETE FROM trades WHERE trade_id = 't1'")
+    assert fx_quotes(conn, "EUR") == [], "an estimate alone is not IBKR's rate"
+
+
+def test_a_currency_only_stocks_trade_in_is_still_not_offered(conn):
+    """Any fill may state the rate, but option fills still define the set. SEK
+    has a rate from a stock fill and is still noise in an options journal."""
+    _trade(conn, trade_id="t1", currency="USD", rate=0.88)
+    _trade(conn, trade_id="s1", currency="SEK", rate=0.085, category="STK")
+    assert [q["code"] for q in fx_quotes(conn, "EUR")] == ["USD"]
 
 
 def test_a_cohort_with_no_episodes_reports_no_average_not_a_zero(conn):

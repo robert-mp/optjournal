@@ -2838,10 +2838,9 @@ def test_the_estimate_appears_only_when_conversions_are_selected(populated):
 def test_fx_offers_the_base_and_at_least_one_quote(state):
     """The toggle needs a base and something to switch to.
 
-    Quotes are whatever the snapshot holds, not a hardcoded list: an options-only
-    journal yields USD alone, while ingesting every asset class also surfaces the
-    KRW and SEK positions. Pinning this to exactly ["USD"] would encode the
-    narrower ingest as if it were the only one.
+    Quotes are whatever currencies the option trades and IBKR's rates cover, not
+    a hardcoded list. Pinning this to exactly ["USD"] would encode this one
+    journal's currencies as if they were the only ones.
     """
     fx = state["fx"]
     assert fx["base"] == state["stats"]["base_currency"]
@@ -2889,8 +2888,9 @@ def test_fx_quote_carries_its_provenance(state):
     assert quote["source"]
 
 
-def test_fx_has_no_quotes_without_a_snapshot(tmp_path):
-    """No dated rate means no toggle -- the page must not invent one."""
+def test_fx_has_no_quotes_without_an_ibkr_rate(tmp_path):
+    """No rate from IBKR, on a snapshot or a fill, means no toggle. The page must
+    not invent one."""
     db = tmp_path / "empty.db"
     conn = connect(db)
     migrate(conn)
