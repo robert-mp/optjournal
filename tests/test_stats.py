@@ -404,6 +404,33 @@ def test_an_order_working_overnight_closes_once_on_each_day(conn):
         assert s.avg_pnl.base * s.closes == pytest.approx(s.net_pnl.base), month
 
 
+def test_a_same_session_close_counts_once_ibkr_books_it(conn):
+    """The CRM and META buybacks of 2026-10-12. A Trade Confirmation carries no
+    realised P&L, so a put bought back this session has none until the next
+    statement settles it. Until then it is undecided rather than a scratch, so
+    the month's closes and the average over them leave it out. Net P&L, which it
+    added nothing to, is unchanged. Once IBKR books it, it counts."""
+    _leg(conn, conid="1", order_id="10", at="2026-10-01 10:00:00", qty=-1,
+         proceeds=500.0, pnl=None)
+    _leg(conn, conid="1", order_id="11", at="2026-10-05 10:00:00", qty=1,
+         proceeds=-300.0, pnl=200.0)
+    _leg(conn, conid="2", order_id="12", at="2026-10-02 10:00:00", qty=-1,
+         proceeds=400.0, pnl=None)
+    _leg(conn, conid="2", order_id="13", at="2026-10-12 09:37:01", qty=1,
+         proceeds=-450.0, pnl=None, open_close="C")
+    conn.execute("UPDATE trades SET source_kind = 'confirm' WHERE ib_order_id = '13'")
+
+    s = month_stats(conn, "2026-10")
+    assert (s.closes, s.wins, s.losses) == (1, 1, 0), "an unbooked close is not a scratch"
+    assert (s.net_pnl.base, s.avg_pnl.base) == (200.0, 200.0)
+
+    conn.execute("UPDATE trades SET source_kind = 'activity', fifo_pnl_realized = -52.0,"
+                 " fifo_pnl_realized_base = -52.0 WHERE ib_order_id = '13'")
+    s = month_stats(conn, "2026-10")
+    assert (s.closes, s.wins, s.losses) == (2, 1, 1), "the settled buyback is a loss"
+    assert (s.net_pnl.base, s.avg_pnl.base) == (148.0, 74.0)
+
+
 def _lc(label, pnl, *, closed="2026-08-20", status="closed"):
     return {"label": label, "status": status, "closed_at": closed,
             "realized_pnl": None if pnl is None else {"base": pnl, "native": None, "ccy": None}}
