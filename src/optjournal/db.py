@@ -47,7 +47,7 @@ __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 #: The broker a row came from. Defaulted rather than nullable, because every row
 #: already in a journal came from IBKR -- the only source this project has ever
@@ -130,6 +130,14 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # true of every row that existed before this column: they all came from an
     # Activity Statement.
     ("trades", "fx_rate_estimated", "INTEGER NOT NULL DEFAULT 0"),
+    # WHETHER `fifo_pnl_realized` ON THIS ROW CAME FROM THE BROKER OR FROM US.
+    #
+    # A Trade Confirmation carries no realised P&L, so a same-session close has
+    # none until the Activity Statement lands. `ingest.ingest_confirms` estimates
+    # it by replaying the contract's fills FIFO, the way IBKR books it, and marks
+    # the row here. The statement's supersede writes IBKR's figure and a 0.
+    # Defaulted to 0, which is true of every row that existed before this column.
+    ("trades", "pnl_estimated", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 #: Columns on `trades` that shipped `NOT NULL` and have to become optional.
@@ -203,6 +211,10 @@ CREATE TABLE IF NOT EXISTS trades (
   -- the columns the shipped DDL names, so a column that lives in the ALTER list
   -- alone is added and then silently dropped again by the next rebuild.
   fx_rate_estimated       INTEGER NOT NULL DEFAULT 0,
+  -- Whether the row's realised P&L is this journal's FIFO estimate of a
+  -- same-session close rather than IBKR's figure. Declared here for the same
+  -- reason as `fx_rate_estimated`.
+  pnl_estimated           INTEGER NOT NULL DEFAULT 0,
   -- Identity is per broker: two brokers may both number a fill 1.
   PRIMARY KEY (broker, trade_id)
 );
@@ -669,10 +681,11 @@ SELECT
   -- because one estimated fill makes the leg's base figures an estimate: these
   -- columns are SUMs, so a single unconverted row taints the total it lands in.
   MAX(fx_rate_estimated)                              AS fx_rate_estimated,
-  -- A leg whose fills came only from a Trade Confirmation has no realised P&L at
-  -- all -- IBKR does not send one until the statement -- so a zero here means
-  -- "not known yet" rather than "broke even". MIN, so a leg holding one settled
-  -- fill and one same-session fill reads as settled=0: the mix is not settled.
+  -- A leg whose fills came only from a Trade Confirmation has no realised P&L
+  -- from IBKR yet, at most the journal's estimate (`pnl_estimated`), so a zero
+  -- here means "not IBKR's yet" rather than "broke even". MIN, so a leg holding
+  -- one settled fill and one same-session fill reads as settled=0: the mix is
+  -- not settled.
   MIN(CASE WHEN source_kind = 'activity' THEN 1 ELSE 0 END) AS settled
 FROM trades
 GROUP BY broker, ib_order_id, conid;

@@ -459,7 +459,7 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "CostsTotals": costs["totals"] if costs else None,
         "FxRow": first(costs["fx"]) if costs else None,
         "Statement": first(state["statements"]),
-        # Always present and always three keys, even on a journal with no confirms
+        # Always present and always four keys, even on a journal with no confirms
         # -- so it anchors properly rather than needing an exemption. The counts
         # being zero is the steady state, not an absent shape.
         "Provisional": state["provisional"],
@@ -8659,12 +8659,13 @@ def test_both_hand_run_sync_paths_record_what_they_did():
 # --------------------------------------------------------------------------
 
 def test_the_payload_reports_how_much_of_the_journal_is_provisional(tmp_path):
-    """Two counts, because they are two different claims.
+    """Three counts, because they are three different claims.
 
     `fills` is what makes a base-currency TOTAL approximate; `unsettled` is what has
-    no realised P&L yet. A journal with a EUR confirm on a EUR account has the second
-    without the first, so collapsing them into one number would either overstate the
-    uncertainty or hide it.
+    only an estimated P&L. A journal with a EUR confirm on a EUR account has the
+    second without the first, so collapsing them into one number would either
+    overstate the uncertainty or hide it. `unpriced` is the confirm closes with no
+    P&L at all, and a settled close is never one of them.
     """
     from conftest import connect_migrated  # noqa: PLC0415
 
@@ -8676,15 +8677,16 @@ def test_the_payload_reports_how_much_of_the_journal_is_provisional(tmp_path):
         " VALUES ('ibkr','confirm-20260924.xml','d','U1','20260924','20260924',"
         " '20260924;1112','EUR','ALL','2026-09-24T12:00:00+00:00')"
     )
-    for trade_id, kind, estimated in (("1", "confirm", 1), ("2", "confirm", 0),
-                                      ("3", "activity", 0)):
+    for trade_id, kind, estimated, open_close in (
+        ("1", "confirm", 1, "O"), ("2", "confirm", 0, "C"), ("3", "activity", 0, "C"),
+    ):
         conn.execute(
             "INSERT INTO trades (broker, trade_id, account_id, trade_date,"
             " asset_category, symbol, quantity, currency, fx_rate_to_base, raw,"
-            " source_file, first_seen_at, source_kind, fx_rate_estimated)"
+            " source_file, first_seen_at, source_kind, fx_rate_estimated, open_close)"
             " VALUES ('ibkr',?,'U1','20260924','OPT','GOOG',1,'USD',0.88,'{}',"
-            " 'confirm-20260924.xml','2026-09-24T12:00:00+00:00',?,?)",
-            (trade_id, kind, estimated),
+            " 'confirm-20260924.xml','2026-09-24T12:00:00+00:00',?,?,?)",
+            (trade_id, kind, estimated, open_close),
         )
     conn.commit()
     conn.close()
@@ -8693,6 +8695,7 @@ def test_the_payload_reports_how_much_of_the_journal_is_provisional(tmp_path):
     pv = state["provisional"]
     assert pv["fills"] == 1, "the estimated-rate count is wrong"
     assert pv["unsettled"] == 2, "a base-currency confirm was not counted unsettled"
+    assert pv["unpriced"] == 1, "the unpriced count is not the confirm closes alone"
     # The confirm rows above are written in IBKR's compact form; opening the
     # journal rewrites them into the statement's ISO form (db._normalise_confirm_dates).
     assert pv["newest"] == "2026-09-24"
@@ -8706,7 +8709,8 @@ def test_a_settled_journal_reports_nothing_provisional(populated):
     a warning stops being read.
     """
     state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
-    assert state["provisional"] == {"fills": 0, "unsettled": 0, "newest": None}
+    assert state["provisional"] == {"fills": 0, "unsettled": 0, "unpriced": 0,
+                                    "newest": None}
 
 
 def test_the_stats_caption_warns_only_when_something_is_provisional():
@@ -9034,6 +9038,36 @@ def test_the_settings_endpoint_stores_tiles_and_stores_the_default_as_absence(po
         status, reset = _post(base, "/api/settings", {"tiles": None})
         assert (status, reset["ok"]) == (200, True)
         assert "tiles" not in reset["stored"], "a reset left a stored arrangement"
+
+
+def test_the_provisional_banner_says_the_pnl_is_estimated_until_the_statement():
+    """The page's own `provisionalBanner`, run under node.
+
+    Same-session P&L is the journal's FIFO estimate, so the banner says so and
+    names what replaces it. "No realised P&L yet" is kept for the closes the
+    estimate could not price, which are the only ones it is still true of.
+    """
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "let S={};",
+        *_page_fns("provisionalBanner"),
+        "const drawn=pv=>{S={state:{provisional:pv}}; return provisionalBanner()",
+        "  .replace(/<[^>]+>/g,'').replace(/\\s+/g,' ').trim();};",
+        "console.log(JSON.stringify({",
+        "  settled:drawn({fills:0,unsettled:0,unpriced:0,newest:null}),",
+        "  priced:drawn({fills:3,unsettled:3,unpriced:0,newest:'2026-10-12'}),",
+        "  unpriced:drawn({fills:0,unsettled:2,unpriced:1,newest:'20260924'}),",
+        "}));",
+    ])
+    assert out["settled"] == ""
+    assert out["priced"] == (
+        "3 same-session fill(s) (newest 2026-10-12). Their P&L is estimated from your"
+        " fills, and base-currency figures use a live FX rate. Tomorrow's statement"
+        " replaces both with IBKR's.")
+    assert out["unpriced"] == (
+        "2 same-session fill(s) (newest 2026-09-24). Their P&L is estimated from your"
+        " fills. Tomorrow's statement replaces it with IBKR's. No realised P&L yet for"
+        " 1 close(s), because the journal does not hold the fills they close.")
 
 
 def test_the_provisional_banner_dashes_ibkrs_date():

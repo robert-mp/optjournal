@@ -14,10 +14,11 @@ silently walks back to what the fill looked like mid-session.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
-from conftest import connect_migrated
+from conftest import LIVE_STATEMENTS, connect_migrated
 
 from optjournal.confirms import (
     CONFIRM_QUERY_TYPE,
@@ -27,7 +28,14 @@ from optjournal.confirms import (
     split_codes,
     statement_meta,
 )
-from optjournal.ingest import ingest_confirms, ingest_file
+from optjournal.ingest import (
+    ASSET_FILTER_ALL,
+    LedgerFill,
+    _contract_ledger,
+    fifo_realized,
+    ingest_confirms,
+    ingest_file,
+)
 
 #: One execution, with the account number and name redacted. Byte-shaped like the
 #: real thing: 82 attributes, `levelOfDetail="EXECUTION"`, and no `fxRateToBase`,
@@ -454,3 +462,173 @@ def test_re_ingesting_a_grown_confirm_refreshes_its_statement_row(tmp_path):
     row = conn.execute(
         "SELECT from_date, to_date, when_generated FROM statements").fetchone()
     assert tuple(row) == ("2026-09-24", "2026-09-25", "2026-09-25 15:30:00")
+
+
+# --------------------------------------------------------------------------
+# A same-session close's P&L, replayed FIFO from the fills on record.
+# --------------------------------------------------------------------------
+
+def _ledger(*fills: tuple[int, float, str]) -> list[LedgerFill]:
+    """One contract's fills, oldest first, numbered from 1: (quantity, cash, code)."""
+    return [LedgerFill(str(n), quantity, cash, code)
+            for n, (quantity, cash, code) in enumerate(fills, 1)]
+
+
+def test_a_close_realises_its_own_cash_and_the_lots():
+    """Sold for 199 net, bought back for 101 net: IBKR books 98."""
+    assert fifo_realized(_ledger((-1, 199.0, "O"), (1, -101.0, "C")), "2") == 98.0
+
+
+def test_a_partial_close_realises_only_the_units_it_closes():
+    fills = _ledger((-3, 597.0, "O"), (1, -101.0, "C"), (2, -202.0, "C"))
+    assert fifo_realized(fills, "2") == pytest.approx(98.0)
+    assert fifo_realized(fills, "3") == pytest.approx(196.0)
+
+
+def test_a_close_matches_the_oldest_lots_first():
+    """One unit opened at 300 and two at 200, bought back two at 100 and one at 50."""
+    fills = _ledger((-1, 300.0, "O"), (-2, 400.0, "O"),
+                    (2, -200.0, "C"), (1, -50.0, "C"))
+    assert fifo_realized(fills, "3") == pytest.approx((300 - 100) + (200 - 100))
+    assert fifo_realized(fills, "4") == pytest.approx(200 - 50)
+
+
+def test_both_sides_commissions_are_inside_the_figure():
+    """The GOOG 310P sold for 980 less 1.50, bought back for 240 less 1.393368."""
+    fills = _ledger((-2, 980.0 - 1.5, "O"), (2, -240.0 - 1.393368, "C"))
+    assert fifo_realized(fills, "2") == pytest.approx(737.106632)
+
+
+def test_a_reversal_realises_only_the_part_that_closes():
+    """Long one, sold three through zero: one unit closes, two open a short lot."""
+    fills = _ledger((1, -101.0, "O"), (-3, 597.0, "C;O"), (2, -202.0, "C"))
+    assert fifo_realized(fills, "2") == pytest.approx(199 - 101)
+    assert fifo_realized(fills, "3") == pytest.approx(2 * (199 - 101))
+
+
+def test_a_close_larger_than_the_lots_on_record_has_no_estimate():
+    """The rest was opened before the journal's records begin, at a price unknown here."""
+    assert fifo_realized(_ledger((-1, 199.0, "O"), (2, -202.0, "C")), "2") is None
+    assert fifo_realized(_ledger((1, -101.0, "C")), "1") is None
+
+
+def test_closing_a_lot_from_before_the_records_opens_nothing():
+    """Opened as a long, that leftover would absorb the next sell and misprice the close."""
+    fills = _ledger((1, -50.0, "C"), (-1, 199.0, "O"), (1, -101.0, "C"))
+    assert fifo_realized(fills, "3") == pytest.approx(98.0)
+
+
+@pytest.mark.skipif(not LIVE_STATEMENTS, reason="needs the optional live corpus")
+def test_the_replay_reproduces_every_settled_close_of_the_real_account(tmp_path):
+    """The standing check that the estimate follows IBKR's own rule.
+
+    Against the real archive because the demo statement cannot serve: its realised
+    figures are transcribed rather than derived, and most leave a commission out.
+    A close the replay cannot price is allowed, since that is the honest answer for
+    a lot opened before the archive. A priced one that misses by a cent is not.
+    """
+    conn = connect_migrated(tmp_path / "live.db")
+    for path in LIVE_STATEMENTS:
+        ingest_file(conn, path, assets=ASSET_FILTER_ALL)
+    priced, wrong = 0, []
+    for row in conn.execute(
+        "SELECT broker, account_id, conid, trade_id, fifo_pnl_realized FROM trades"
+        " WHERE open_close LIKE '%C%' AND fifo_pnl_realized IS NOT NULL"
+    ).fetchall():
+        ledger = _contract_ledger(conn, row["broker"], row["account_id"], row["conid"])
+        estimate = fifo_realized(ledger, row["trade_id"])
+        if estimate is None:
+            continue
+        priced += 1
+        if abs(estimate - row["fifo_pnl_realized"]) >= 0.005:
+            wrong.append((row["trade_id"], estimate, row["fifo_pnl_realized"]))
+    assert priced, "no settled close in the live corpus was priced at all"
+    assert not wrong, f"{len(wrong)} of {priced} closes disagree with IBKR, first: {wrong[:5]}"
+
+
+# --------------------------------------------------------------------------
+# The estimate in the journal: written by the confirm, replaced by the statement.
+# --------------------------------------------------------------------------
+
+def _with(xml: str, **attrs: str) -> str:
+    """`xml` with each named attribute set. Each name must occur exactly once."""
+    for name, value in attrs.items():
+        xml, count = re.subn(rf'(?<=\s){name}="[^"]*"', f'{name}="{value}"', xml)
+        assert count == 1, name
+    return xml
+
+
+#: The GOOG 310P sold in ACTIVITY_XML, bought back the next session for 1.20.
+_BUYBACK = {"tradeID": "1592100001", "tradeDate": "20260925",
+            "dateTime": "20260925;143000", "buySell": "BUY", "quantity": "2",
+            "proceeds": "-240"}
+BUYBACK_CONFIRM_XML = _with(
+    CONFIRM_XML, **_BUYBACK, execID="0002920a.6ab5328c.02.01",
+    orderID="1290844395", price="1.2", amount="240", netCash="-241.393368", code="C")
+BUYBACK_ACTIVITY_XML = _with(
+    ACTIVITY_XML, **_BUYBACK, ibExecID="0002920a.6ab5328c.02.01",
+    transactionID="6712000000", ibOrderID="1290844395", tradePrice="1.2",
+    tradeMoney="240", ibCommission="-1.4", openCloseIndicator="C",
+    fifoPnlRealized="737.1", whenGenerated="20260926;050000")
+#: The sale's 980 less 1.50, plus the buyback's -240 less 1.393368.
+BUYBACK_ESTIMATE = 978.5 - 241.393368
+
+
+def _sold(tmp_path: Path):
+    """A journal holding the settled sale, and the buyback's confirm on disk."""
+    conn = connect_migrated(tmp_path / "j.db")
+    sale = tmp_path / "activity-20260925T050000Z.xml"
+    sale.write_text(ACTIVITY_XML, encoding="utf-8")
+    ingest_file(conn, sale)
+    confirm = tmp_path / "confirm-20260925.xml"
+    confirm.write_text(BUYBACK_CONFIRM_XML, encoding="utf-8")
+    return conn, confirm
+
+
+def _buyback(conn):
+    return conn.execute("SELECT * FROM trades WHERE trade_id = '1592100001'").fetchone()
+
+
+def test_a_same_session_close_is_priced_from_the_sale_it_closes(tmp_path):
+    conn, confirm = _sold(tmp_path)
+    ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
+    row = _buyback(conn)
+    assert row["pnl_estimated"] == 1
+    assert row["fifo_pnl_realized"] == pytest.approx(BUYBACK_ESTIMATE)
+    assert row["fifo_pnl_realized_base"] == pytest.approx(BUYBACK_ESTIMATE * 0.8795), (
+        "the base figure is not the native at the row's own rate")
+
+
+def test_re_polling_a_priced_close_changes_nothing(tmp_path):
+    conn, confirm = _sold(tmp_path)
+    ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
+    before = [tuple(r) for r in conn.execute("SELECT * FROM trades ORDER BY trade_id")]
+    again = ingest_confirms(conn, confirm, base_currency="EUR",
+                            rate_for=_fixed_rate(0.90))
+    assert (again.trades_inserted, again.trades_skipped_existing) == (0, 1)
+    assert [tuple(r) for r in conn.execute(
+        "SELECT * FROM trades ORDER BY trade_id")] == before
+
+
+def test_the_statement_replaces_the_estimate_with_ibkrs_own(tmp_path):
+    conn, confirm = _sold(tmp_path)
+    ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
+    assert _buyback(conn)["pnl_estimated"] == 1
+    settled = tmp_path / "activity-20260926T050000Z.xml"
+    settled.write_text(BUYBACK_ACTIVITY_XML, encoding="utf-8")
+    assert ingest_file(conn, settled).trades_superseded == 1
+    row = _buyback(conn)
+    assert (row["source_kind"], row["pnl_estimated"]) == ("activity", 0), (
+        "the settled row still claims an estimate")
+    assert row["fifo_pnl_realized"] == 737.1
+    assert row["fifo_pnl_realized_base"] == pytest.approx(737.1 * 0.87)
+
+
+def test_a_close_with_nothing_on_record_to_close_stays_unpriced(tmp_path):
+    """No sale in the journal, so the replay has no lot and the close has no P&L."""
+    conn = connect_migrated(tmp_path / "j.db")
+    confirm = tmp_path / "confirm-20260925.xml"
+    confirm.write_text(BUYBACK_CONFIRM_XML, encoding="utf-8")
+    ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
+    row = _buyback(conn)
+    assert (row["fifo_pnl_realized"], row["pnl_estimated"]) == (None, 0)

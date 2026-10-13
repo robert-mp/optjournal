@@ -1025,11 +1025,12 @@ def _with_request_counts(
 def _provisional(conn: sqlite3.Connection) -> dict[str, Any]:
     """How much of this journal is same-session rather than settled.
 
-    Two counts, because they answer different questions. `fills` is how many rows
-    carry an ESTIMATED FX rate, which is what makes a base-currency total
+    Three counts, because they answer different questions. `fills` is how many
+    rows carry an ESTIMATED FX rate, which is what makes a base-currency total
     approximate. `unsettled` is how many came from a Trade Confirmation at all,
-    estimated or not -- a fill quoted in the base currency needs no conversion and
-    is still missing its realised P&L until the statement lands.
+    estimated rate or not, because their P&L is the journal's FIFO estimate until
+    the statement lands. `unpriced` is the closes among them that estimate could
+    not price, which have no realised P&L at all yet.
 
     Whole-journal rather than scoped to the current filter. A caption that appeared
     and vanished as the reader changed month would be read as a glitch, and the
@@ -1039,13 +1040,16 @@ def _provisional(conn: sqlite3.Connection) -> dict[str, Any]:
         "SELECT"
         " COALESCE(SUM(fx_rate_estimated), 0)                        AS fills,"
         " COALESCE(SUM(source_kind = ?), 0)                          AS unsettled,"
+        " COALESCE(SUM(source_kind = ? AND open_close LIKE '%C%'"
+        "              AND fifo_pnl_realized IS NULL), 0)            AS unpriced,"
         " MAX(trade_date)                                            AS newest"
         " FROM trades WHERE source_kind = ? OR fx_rate_estimated = 1",
-        (CONFIRM_SOURCE, CONFIRM_SOURCE),
+        (CONFIRM_SOURCE, CONFIRM_SOURCE, CONFIRM_SOURCE),
     ).fetchone()
     return {
         "fills": int(row["fills"] or 0) if row else 0,
         "unsettled": int(row["unsettled"] or 0) if row else 0,
+        "unpriced": int(row["unpriced"] or 0) if row else 0,
         "newest": str(row["newest"]) if row and row["newest"] else None,
     }
 

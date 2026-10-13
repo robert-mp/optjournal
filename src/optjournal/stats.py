@@ -17,8 +17,10 @@ Two deliberate choices about what gets counted:
 
 * **Win/loss counts closes.** A close is one order's closing fills on one
   contract on one trade day (IBKR's `C`, its `C;O` reversal included), and its
-  result is what IBKR booked on them. A close counts once IBKR has booked it,
-  so a fill closed this session counts when the next statement settles it.
+  result is what IBKR booked on them. A close counts once its P&L is known.
+  For a fill closed this session that is the journal's FIFO estimate
+  (`ingest.fifo_realized`) until the next statement books IBKR's own, and a
+  close the estimate cannot price counts when the statement settles it.
   Each time you close all or part of a contract counts once, so buying back 2
   of 4 puts is a close, decided that day, while the other 2 stay open. An
   order filled in two parts is one close, not two, since counting fills would
