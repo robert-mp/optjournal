@@ -272,8 +272,12 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} fills -- rows whose FX rate was ESTIMATED, so every
  *   base-currency total that sums them is approximate
  * @property {number} unsettled -- rows from a Trade Confirmation at all. A fill
- *   quoted in the base currency needs no conversion and is still missing its
- *   realised P&L until the Activity Statement lands, so this is the larger set
+ *   quoted in the base currency needs no conversion and its P&L is still the
+ *   journal's FIFO estimate until the Activity Statement lands, so this is the
+ *   larger set
+ * @property {number} unpriced
+ *   closes among them the estimate could not price, because the journal does not
+ *   hold the fills they close. They have no realised P&L at all yet
  * @property {string|null} newest -- the newest such trade date, for the caption
  */
 
@@ -5881,8 +5885,9 @@ function companionPost(){
    docs/design-notes.md, which quarantines modelled numbers so none can reach a
    card. Same-session fills are the sanctioned exception: a Trade Confirmation
    carries no FX rate, so their base-currency figures are converted at a live rate
-   fetched at ingest. The exception is only defensible if the page admits it, which
-   is what this is.
+   fetched at ingest. It carries no realised P&L either, so a close's is replayed
+   FIFO from the fills (ingest.fifo_realized). The exception is only defensible if
+   the page admits it, which is what this is.
 
    Silent when there is nothing provisional, which is the steady state: a journal
    whose confirms have all been superseded shows no banner at all. */
@@ -5895,15 +5900,16 @@ function provisionalBanner(){
   const iso=/^\d{8}$/.test(raw)
     ? `${raw.slice(0,4)}-${raw.slice(4,6)}-${raw.slice(6,8)}` : raw.slice(0,10);
   const day=iso?` (newest ${esc(iso)})`:'';
-  /* TWO COUNTS, and the wording follows whichever is the stronger claim. An
-     estimated rate makes the money approximate; an unsettled fill merely has no
-     realised P&L yet. Reporting only the second would understate it. */
-  return pv.fills
-    ? ` <b class="warn2">${pv.fills} same-session fill(s)${day}</b> —
-      base-currency figures are estimated at a live FX rate and no realised P&L
-      exists yet; tomorrow's statement restates them.`
-    : ` <b class="warn2">${pv.unsettled} same-session fill(s)${day}</b> —
-      no realised P&L exists for these yet; tomorrow's statement settles them.`;
+  /* Same-session P&L is the journal's FIFO estimate, and an estimated rate makes
+     the base figures approximate too. A close the estimate could not price has
+     no P&L at all, the stronger claim, so it is said on its own. */
+  const fx=pv.fills?', and base-currency figures use a live FX rate':'';
+  const unpriced=pv.unpriced
+    ? ` No realised P&L yet for ${pv.unpriced} close(s), because the journal does
+      not hold the fills they close.` : '';
+  return ` <b class="warn2">${pv.unsettled} same-session fill(s)${day}</b>.
+    Their P&L is estimated from your fills${fx}. Tomorrow's statement replaces
+    ${pv.fills?'both':'it'} with IBKR's.${unpriced}`;
 }
 
 /* The collection states worth interrupting the page for: the reader has to act
