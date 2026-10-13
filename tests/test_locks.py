@@ -367,7 +367,6 @@ def test_open_journal_rolls_back_a_failed_write(tmp_path):
     connection that outlives the failed write, which arrives with the scheduler.
     """
     import sqlite3
-    import time as _time
 
     from optjournal.db import connect, migrate, open_journal
 
@@ -380,18 +379,16 @@ def test_open_journal_rolls_back_a_failed_write(tmp_path):
         c.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('X','1')")
         raise RuntimeError("a handler blew up mid-write")
 
-    started = _time.perf_counter()
     other = connect(path)
+    # No wait at all: a transaction left open makes this write fail at once,
+    # where a timing bound flaked on a slow Windows runner (1.1s against 1.0s).
+    other.execute("PRAGMA busy_timeout = 0")
     try:
         other.execute(
             "INSERT OR IGNORE INTO watchlist (symbol, added_at) VALUES ('Y','2')")
         other.commit()
     except sqlite3.OperationalError as exc:  # pragma: no cover - the bug
         pytest.fail(f"the write lock was never released: {exc}")
-    elapsed = _time.perf_counter() - started
-    assert elapsed < 1.0, (
-        f"the next writer waited {elapsed:.1f}s, so a transaction was left open"
-    )
     rows = [r["symbol"] for r in other.execute("SELECT symbol FROM watchlist")]
     other.close()
     assert rows == ["Y"], "the uncommitted row survived a rollback"
