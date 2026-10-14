@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# scripts/release VERSION NOTES_FILE [BRANCH]
+# Publishes vVERSION once CI passes on main. See "Publishing an update" in README.md.
+set -euo pipefail
+
+die() { echo "release: $*" >&2; exit 1; }
+project_version() { awk -F'"' '/^\[/ { table = $0 } table == "[project]" && /^version *=/ { print $2 }'; }
+newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; }
+
+[ $# -eq 2 ] || [ $# -eq 3 ] || die "usage: scripts/release VERSION NOTES_FILE [BRANCH]"
+version=$1 notes=$2 branch=${3:-}
+again=$(printf '%q ' "$0" "$@")
+case $notes in /*) ;; *) notes=$PWD/$notes ;; esac
+
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION must look like 1.2.3, not $version"
+[ -s "$notes" ] || die "the notes file $notes is missing or empty"
+
+# Work in the primary checkout of the repository this script lives in, from any
+# directory, and even when called from a worktree, where a merge lands on the
+# wrong branch and pushes nothing.
+cd "$(dirname "${BASH_SOURCE[0]}")"
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+cd "$(dirname "$common")"
+on=$(git branch --show-current)
+[ "$on" = main ] || die "$PWD is on ${on:-a detached HEAD}, not main"
+[ -z "$(git status --porcelain --untracked-files=no)" ] || die "$PWD has uncommitted changes to tracked files"
+gh auth status >/dev/null 2>&1 || die "gh is not logged in; run gh auth login"
+if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+  die "v$version is already tagged on origin"
+fi
+
+git fetch -q origin
+# The version main is about to fast-forward to, read before anything moves.
+if git merge-base --is-ancestor HEAD origin/main; then tip=origin/main
+elif git merge-base --is-ancestor origin/main HEAD; then tip=HEAD
+else die "main and origin/main have diverged"
+fi
+current=$(git show "$tip:pyproject.toml" | project_version)
+[ "$current" = "$version" ] || newer "$version" "$current" \
+  || die "$version is not newer than $current, the version on main"
+if [ -n "$branch" ]; then
+  git rev-parse -q --verify "$branch^{commit}" >/dev/null || die "there is no branch $branch"
+  git merge-base --is-ancestor "$tip" "$branch" || git merge-base --is-ancestor "$branch" "$tip" \
+    || die "$branch is not a fast-forward of main"
+fi
+
+git merge -q --ff-only origin/main
+if [ -n "$branch" ]; then git merge -q --ff-only "$branch"; fi
+
+if [ "$(project_version < pyproject.toml)" != "$version" ]; then
+  sed -i.bak "/^\[project\]/,/^\[/ s/^version *=.*/version = \"$version\"/" pyproject.toml
+  rm pyproject.toml.bak
+  if [ "$(git diff --numstat pyproject.toml | cut -f1,2)" != "$(printf '1\t1')" ]; then
+    git checkout -q pyproject.toml
+    die "setting the version did not change exactly one line of pyproject.toml"
+  fi
+  uv lock || { git checkout -q pyproject.toml uv.lock; die "uv lock failed; pyproject.toml is restored"; }
+  git commit -q -m "chore(release): $version" pyproject.toml uv.lock
+fi
+git push -q origin main
+sha=$(git rev-parse HEAD)
+
+echo "Waiting for CI on $sha"
+run=
+for _ in {1..36}; do
+  run=$(gh run list --branch main --commit "$sha" --workflow quality.yml \
+    --json databaseId --jq '.[0].databaseId // empty') || run=
+  [ -n "$run" ] && break
+  sleep 5
+done
+[ -n "$run" ] || die "no CI run for $sha appeared in 3 minutes; run this command again later"
+
+if ! gh run watch "$run" --exit-status; then
+  url=$(gh run view "$run" --json url --jq .url || true)
+  cat >&2 <<EOF
+release: CI did not pass on $sha, so nothing was published.
+See $url
+If the failure was flaky, rerun the failed jobs, then this same command:
+  gh run rerun $run --failed
+  $again
+EOF
+  exit 1
+fi
+
+gh release create "v$version" --target "$sha" --title "$version" --notes-file "$notes"

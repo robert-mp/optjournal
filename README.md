@@ -177,19 +177,37 @@ Otherwise it is the per-user folder, which is where a download's journal lives.
 
 ## Publishing an update
 
-Friends on a downloaded ZIP update from GitHub Releases, not from `main`, so you
-choose when they get a version:
+Friends on a downloaded ZIP update from GitHub Releases, not from `main`, so a
+version reaches them only when you publish it. One command publishes it, and only
+for a commit whose CI passed on `main`:
 
-1. Bump `version` in `pyproject.toml` (the one place it is written), run `uv lock`,
-   and commit both files, then push. `uv.lock` records the version too, and the
-   test suite fails on a commit whose lock does not match its `pyproject.toml`.
-2. Publish a release tagged with that version:
-   `gh release create v0.2.0 --title "0.2.0" --notes "What changed"`.
+1. Write the release notes to a file. They are what the banner shows under
+   **What's new**.
+2. Run `scripts/release VERSION NOTES [BRANCH]`, for example
+   `scripts/release 0.4.5 ~/notes.md feat/x`. Log `gh` in first (`gh auth login`).
 
-Their page offers it on its next start (it checks at most every six hours). The
-release notes are what the banner shows under **What's new**. A release whose
-code is not the version its tag names is refused, and so is one that would
-contain any journal file.
+It always works in the main checkout, even when you run it from a worktree. It
+refuses, changing nothing, unless that checkout is on `main` with no changes to
+tracked files. VERSION must be untagged, and newer than the version on `main`
+unless you are resuming as below. BRANCH must fast-forward `main`. Then it
+fast-forwards `main` to `origin/main` and to BRANCH. It sets the version in
+`pyproject.toml`, runs `uv lock`, commits both as `chore(release): VERSION` and
+pushes `main`. It waits for that commit's `quality` run on Ubuntu and Windows.
+Only if the run passes does it publish `vVERSION`, at that same commit.
+
+Your own copy runs from this checkout, so it gets the merged code before CI
+finishes, and keeps it if CI fails.
+
+If CI fails, the script publishes nothing and prints the run's link. For a flaky
+failure, rerun the failed jobs with `gh run rerun RUN_ID --failed`, then run the
+same `scripts/release` command again. It finds the version already bumped and
+pushed, so it goes straight to waiting for CI. For a real failure, commit the fix
+to `main`, or to a branch on top of it that you pass as BRANCH, and run the
+command again.
+
+Their page offers it on its next start (it checks at most every six hours). A
+release whose code is not the version its tag names is refused, and so is one
+that would contain any journal file.
 
 ## Wins and losses
 
