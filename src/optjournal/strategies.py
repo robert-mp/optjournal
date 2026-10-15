@@ -309,6 +309,7 @@ def position_groups(
     *,
     episodes: list[Any],
     campaign_list: list[campaigns.Campaign],
+    marks: Mapping[str, Row | None] | None = None,
 ) -> list[Row]:
     """Strategy events linked into position lifecycles, newest first.
 
@@ -346,6 +347,10 @@ def position_groups(
     event's own `realized_pnl`). None while no leg has closed anything. On a
     decided card it equals `Campaign.realized`: the same fills, summed per
     contract.
+
+    Unrealised P&L is the newest statement's mark on each contract still held:
+    `marks` maps a conid to that position row's `unrealized`, or to None where the
+    row carried no figure. See `_unrealized` for why it is all or nothing.
     """
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own
@@ -396,7 +401,26 @@ def position_groups(
                 if any("C" in str(lg.get("open_close") or "").upper() for lg in legs)
                 else None
             ),
+            "unrealized": (
+                _unrealized([str(e.conid) for e in eps if not e.is_closed], marks or {})
+                if camp and not camp.is_decided else None
+            ),
             "events": members,
         })
     out.sort(key=lambda p: str(p["opened_at"] or ""), reverse=True)
     return out
+
+
+def _unrealized(held: list[str], marks: Mapping[str, Row | None]) -> Row | None:
+    """The summed mark on the contracts still held, or None unless each has one.
+
+    All or nothing because a position opened since the newest statement has no
+    row in it: summing the legs that do have one would print a partial figure as
+    the position's, and a position with no row at all would read as flat, €0.00,
+    when the journal simply has no price for it yet.
+    """
+    known = [mark for mark in (marks.get(conid) for conid in held) if mark is not None]
+    if not held or len(known) < len(held):
+        return None
+    return Money.charged(
+        (mark["base"], mark["native"], mark["ccy"]) for mark in known).payload()

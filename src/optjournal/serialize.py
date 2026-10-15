@@ -251,10 +251,32 @@ def positions_data(conn: sqlite3.Connection) -> list[Row]:
         row["value"] = Money.at_rate(row.get("position_value"), rate, ccy).payload()
         row["cost_basis"] = Money.at_rate(
             row.get("cost_basis_money"), rate, ccy).payload()
-        row["unrealized"] = Money.at_rate(
-            row.get("fifo_pnl_unrealized"), rate, ccy).payload()
+        row["unrealized"] = _unrealized_money(row)
         out.append(row)
     return out
+
+
+def _unrealized_money(row: Any) -> Row | None:
+    """A snapshot row's unrealised P&L, or None when the statement carried no
+    figure: `Money.at_rate`'s zero would read as a position at break-even."""
+    if row["fifo_pnl_unrealized"] is None:
+        return None
+    return Money.at_rate(
+        row["fifo_pnl_unrealized"], row["fx_rate_to_base"], row["currency"]).payload()
+
+
+def position_marks(conn: sqlite3.Connection, asset_category: str) -> dict[str, Row | None]:
+    """Each contract on the category's current book, by conid, to its unrealised
+    P&L: what a Trades card sums over the contracts it still holds
+    (`strategies._unrealized`). By category because the cards are, so a stock
+    position under Equities is marked from the stock book."""
+    return {
+        str(r["conid"]): _unrealized_money(r)
+        for r in conn.execute(
+            "SELECT conid, fifo_pnl_unrealized, fx_rate_to_base, currency"
+            f" FROM position_snapshots p{book_join_sql(asset_category)}"
+            " WHERE p.asset_category = ?", (asset_category,))
+    }
 
 def allocation_data(conn: sqlite3.Connection) -> Row:
     """What the account holds, by holding, as a share of net liquidation.

@@ -459,3 +459,46 @@ def test_the_count_follows_the_scope_it_is_given():
     camps = _camps([order], episodes)
     assert position_count(camps, episodes) == 1, "the control"
     assert position_count(camps, episodes, in_scope=lambda e: False) == 0
+
+
+def test_an_open_card_has_no_unrealised_figure_until_every_held_leg_is_marked():
+    """A position opened since the newest statement has no row in it, and the
+    card summed the rows it found: "Unrealised €0.00" on a strangle sold that
+    morning, which reads as break-even. A partial sum is the same lie on one leg,
+    so the figure is the whole sum or nothing. Zero stays a reading.
+    """
+    put = _order("1", "2026-10-14 10:38:17", [_leg(underlying_symbol="CRWD")])
+    call = _order("2", "2026-10-14 10:38:17",
+                  [_leg(underlying_symbol="CRWD", put_call="C", strike=600.0)])
+    orders = [put, call]
+    eps = [_Ep("P1", ["t1"]), _Ep("C1", ["t2"])]
+    camps = _camps(orders, eps)
+
+    def unrealised(marks):
+        (card,) = position_groups(orders, episodes=eps, campaign_list=camps,
+                                  marks=marks)
+        return card["unrealized"]
+
+    put_mark = {"base": -90.0, "native": -100.0, "ccy": "USD"}
+    call_mark = {"base": 45.0, "native": 50.0, "ccy": "USD"}
+    flat = {"base": 0.0, "native": 0.0, "ccy": "USD"}
+    assert unrealised({}) is None, "no mark at all was summed to a figure"
+    assert unrealised({"P1": put_mark}) is None, "one leg's mark stood for both"
+    assert unrealised({"P1": put_mark, "C1": None}) is None, (
+        "a row with no figure was read as zero")
+    assert unrealised({"P1": put_mark, "C1": call_mark}) == {
+        "base": -45.0, "native": -50.0, "ccy": "USD"}
+    assert unrealised({"P1": flat, "C1": flat})["base"] == 0.0
+
+
+def test_a_closed_card_carries_no_unrealised_figure():
+    """Nothing is held, so there is nothing to mark, whatever the snapshot says."""
+    opening = _order("10", "2026-07-24 10:35:01", [_leg(underlying_symbol="TSLA")])
+    closing = _order("11", "2026-08-03 09:55:23",
+                     [_leg(underlying_symbol="TSLA", buy_sell="BUY", open_close="C")])
+    eps = [_Ep("P1", ["t1", "t2"], closed=True, closed_at="2026-08-03 09:55:23")]
+    (card,) = position_groups(
+        [opening, closing], episodes=eps,
+        campaign_list=_camps([opening, closing], eps),
+        marks={"P1": {"base": 1.0, "native": 1.0, "ccy": "USD"}})
+    assert card["status"] == "closed" and card["unrealized"] is None

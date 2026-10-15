@@ -550,7 +550,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} fifo_pnl_unrealized -- raw column; read `unrealized` instead
  * @property {Money} value -- market value, native and base
  * @property {Money} cost_basis -- falls back to the open episode's basis
- * @property {Money} unrealized -- no base column exists; derived at the row rate
+ * @property {Money|null} unrealized -- no base column exists; derived at the row
+ *   rate. Null when the statement carried no figure, which is not a zero
  * @property {string} side
  * @property {string|null} open_date_time
  * @property {string} currency
@@ -1222,6 +1223,9 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Money|null} realized_pnl what IBKR booked on the card's fills, net
  *   of commission, a partial close included, as on the Dashboard and the
  *   Calendar. Null until a leg closes something
+ * @property {Money|null} unrealized -- the contracts still held, as the newest
+ *   statement marked them (strategies._unrealized). Null on a closed card, and
+ *   when any held contract has no mark, which is a position opened since
  * @property {Array} events -- StrategyGroup rows
  * @property {string} replay_key -- index into State.replays
  */
@@ -2903,6 +2907,9 @@ function legRow(l,extra=''){
       <span class="kchip kstrike fig">${strike(l.strike)}</span>${
       K?`<span class="kchip ${K==='P'?'put':'call'}">${esc(K)}</span>`:''}`
     :'';
+  /* The last figure is the cash the fill moved, signed but in the text colour:
+     green and red mean P&L on this page, and a sold put's premium in green
+     beside "Realised —" read as a profit. */
   return `<div class="leg${extra?' ctx':''}">
     <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
     <span class="kchips"><span class="mono">${esc(l.underlying_symbol||l.symbol||'')}</span>${
@@ -2911,7 +2918,8 @@ function legRow(l,extra=''){
     <span class="fig dim">×${Math.abs(l.quantity)}</span>
     <span class="fig" title="fill price, always in the contract's own currency"
       >${money(l.avg_price,l.currency)}</span>
-    <span class="fig ${cls(l.money.proceeds.base)}">${moneyOf(l.money.proceeds)}</span>
+    <span class="fig" title="cash in or out on the fill: premium, not profit">${
+      amountOf(l.money.proceeds)>0?'+':''}${moneyOf(l.money.proceeds)}</span>
   </div>`;
 }
 /* ------------------------------------------------ replay */
@@ -3431,6 +3439,11 @@ function replayPanel(rp,label,valueHtml){
      states the figure the broker billed.`)}</div></div>`;
 }
 
+/* An open position the newest statement holds no mark for: opened since it, as a
+   rule. Said rather than summed to €0.00, which would read as break-even. */
+const NO_PRICE='no price yet';
+const NO_PRICE_WHY='The newest statement has no price for a contract this position '
+  +'holds, usually because it opened after that statement. The next one prices it.';
 function trades(){
   /* One card per POSITION LIFECYCLE: a short put opened in July and bought
      back in August is one position with two events, not two unrelated
@@ -3450,16 +3463,10 @@ function trades(){
     const openLc=lc.status==='open';
     const when=openLc?`opened ${esc((lc.opened_at||'').slice(0,10))} · still open`
       :`${esc((lc.opened_at||'').slice(0,10))} → ${esc((lc.closed_at||'').slice(0,10))}`;
-    /* Unrealised for an open lifecycle comes from the position snapshot, summed
-       over the contracts this lifecycle still holds. Summed in base through
-       `.base` because two legs can be quoted in different currencies, which is
-       what the Money gate exists to catch. */
     const rp=(S.state.replays||{})[lc.replay_key];
     const shown=S.replay===lc.replay_key;
-    let uz=0; (S.state.positions||[]).forEach(pos=>{
-      if((lc.conids||[]).map(String).includes(String(pos.conid)))
-        uz+=(pos.unrealized.base||0);});
-    const score=openLc?['Unrealised',`<b class="${cls(uz)}">${cash(uz)}</b>`]
+    const uz=lc.unrealized;
+    const score=openLc?['Unrealised',`<b class="${cls(uz?.base)}">${moneyOf(uz)}</b>`]
       :['Realised',`<b class="${cls(lc.realized_pnl?.base)}">${
         lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—'}</b>`];
     const realised=statCard('Realised',
@@ -3478,8 +3485,10 @@ function trades(){
           } <span class="caret${shown?' open':''}">▸</span></div>`:''}
       </div>
       ${shown&&rp?replayPanel(rp,score[0],score[1]):''}
-      ${openLc?`<div class="stats c2">${realised}${statCard('Unrealised',cash(uz),
-        'contracts still held, as last reported','sm '+cls(uz))}</div>`:realised}
+      ${openLc?`<div class="stats c2">${realised}${statCard('Unrealised',
+        uz?moneyOf(uz):`—<span class="wcap"> ${NO_PRICE}</span>`,
+        uz?'contracts still held, as last reported':NO_PRICE_WHY,
+        'sm '+cls(uz?.base))}</div>`:realised}
       ${evs.map(g=>{
         const glegs=(g.orders||[]).flatMap(o=>o.legs||[]);
         /* Inside its own card, an event whose shape merely repeats the
@@ -3872,12 +3881,12 @@ function positions(){
     <td class="n">${money(pos.mark_price,pos.currency)}</td>
     <td class="n">${moneyOf(pos.value)}</td>
     <td class="n">${moneyOf(pos.cost_basis)}</td>
-    <td class="n ${cls(pos.unrealized.base)}">${moneyOf(pos.unrealized)}</td>
+    <td class="n ${cls(pos.unrealized?.base)}">${moneyOf(pos.unrealized)}</td>
     <td class="dim">${esc(pos.currency)}</td>
     <td class="dim2">${ep.snapshot_only?'snapshot only':ep.entry_outside_window?'partial':'complete'}</td>
   </tr>${shown?`<tr class="rpanel"><td colspan="9">${
     replayPanel((S.state.replays||{})[key],'Unrealised',
-      `<b class="${cls(pos.unrealized.base)}">${moneyOf(pos.unrealized)}</b>`)}</td></tr>`:''}`;};
+      `<b class="${cls(pos.unrealized?.base)}">${moneyOf(pos.unrealized)}</b>`)}</td></tr>`:''}`;};
   const grpRow=bkt=>{
     /* Not `b` -- that name is the DOM button binding elsewhere in this page,
        and one name for two shapes blinds the payload guard to both. */

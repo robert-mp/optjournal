@@ -2651,6 +2651,61 @@ def test_the_basis_comes_from_the_position_row_and_needs_no_fallback(populated):
         assert pos["cost_basis"]["native"] == basis_of[str(pos["conid"])]
 
 
+def test_a_position_the_statement_did_not_mark_has_no_unrealised_figure(populated):
+    """A snapshot row with no unrealised P&L read as €0.00, a position at break-even,
+    because `Money.at_rate(None)` is a zero. It is null now, on the row and on the
+    Trades card that holds the contract, while the rows that carry one are kept."""
+    from optjournal.db import connect
+
+    before = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    held = {str(c) for lc in before["lifecycles"] if lc["status"] == "open"
+            for c in lc["conids"]}
+    conid = next(str(pos["conid"]) for pos in before["positions"]
+                 if str(pos["conid"]) in held)
+    card = next(lc for lc in before["lifecycles"]
+                if lc["status"] == "open" and conid in map(str, lc["conids"]))
+    # Against the Positions tab's own rows, which reach the snapshot by another
+    # path (`current_option_positions`), so a wrong book in the marks shows here.
+    rows = [pos["unrealized"]["base"] for pos in before["positions"]
+            if str(pos["conid"]) in map(str, card["conids"])]
+    assert card["unrealized"]["base"] == pytest.approx(sum(rows)), (
+        "the card does not carry what the Positions tab shows for its contracts")
+    conn = connect(populated)
+    conn.execute("UPDATE position_snapshots SET fifo_pnl_unrealized = NULL"
+                 " WHERE conid = ?", (conid,))
+    conn.commit()
+    conn.close()
+    state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    marks = {str(pos["conid"]): pos["unrealized"] for pos in state["positions"]}
+    assert marks.pop(conid) is None, "a missing mark is still sent as a zero"
+    assert marks and all(mark is not None for mark in marks.values())
+    holding = [lc for lc in state["lifecycles"]
+               if lc["status"] == "open" and conid in map(str, lc["conids"])]
+    assert holding and all(lc["unrealized"] is None for lc in holding), (
+        "the card holding the unmarked contract still sums a figure")
+
+
+def test_a_stock_card_is_marked_from_the_stock_book(populated):
+    """Under Equities the cards are stock positions, and their unrealised figure was
+    summed from the OPTION book, which never holds them: every one read €0.00. Each
+    card is marked from its own category's book now, so it carries the newest
+    stock snapshot's figure for its contract."""
+    conn = connect(populated)
+    newest = {str(r["conid"]): r["fifo_pnl_unrealized"] for r in conn.execute(
+        "SELECT conid, fifo_pnl_unrealized FROM position_snapshots p"
+        " WHERE asset_category = 'STK' AND report_date ="
+        " (SELECT MAX(report_date) FROM position_snapshots WHERE asset_category = 'STK')")}
+    conn.close()
+    state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None,
+                        trade_type="equities")
+    held = [lc for lc in state["lifecycles"] if lc["status"] == "open"
+            and len(lc["conids"]) == 1 and str(lc["conids"][0]) in newest]
+    assert held, "the fixture holds no open stock position on its book"
+    for lc in held:
+        assert lc["unrealized"]["native"] == pytest.approx(
+            newest[str(lc["conids"][0])]), lc["underlying"]
+
+
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "127.0.0.2"])
 def test_loopback_addresses_accepted(host):
     from optjournal.web import _is_loopback
@@ -3750,6 +3805,38 @@ def test_header_cluster_right_aligns_and_groups_its_icons():
     # no CSS left in here for a marker string to collide with.
     icons = page_html().split('class="hdr-icons"')[1].split("</div>")[0]
     assert 'id="sync"' in icons and 'id="cog"' in icons
+
+
+def _page_stmt(name: str) -> str:
+    """One top-level `const` of the page, however many lines its expression runs."""
+    found = re.search(rf"^const {name}=.*?;$", _code_only(_js()), re.M | re.S)
+    assert found, f"no top-level const {name} in the page"
+    return found.group(0)
+
+
+def test_a_fill_row_shows_its_cash_flow_signed_and_without_the_pnl_colours():
+    """An STO row read "+€380.07" in green beside "Realised —": premium received
+    looked like profit. A fill's cash flow keeps its sign and the text colour;
+    green and red are left to P&L."""
+    out = _node_run([
+        f"import {{esc,money,cls,strike,dayLabel}} from '{_static('format.js')}';",
+        # The base currency on screen, no restatement: `cash` is `money` in EUR.
+        "const DISP=()=>'EUR', conv=v=>v==null?null:Number(v);",
+        "const cash=(v,d)=>money(conv(v),DISP(),d);",
+        *(_page_stmt(n) for n in ("isNativeCharge", "moneyOf", "amountOf")),
+        _fn("actClass"), *_page_fns("actLabel", "legRow"),
+        "const leg=(bs,oc,base)=>({buy_sell:bs,open_close:oc,underlying_symbol:'CRWD',",
+        "  strike:220,expiry:'2026-11-20',put_call:'P',quantity:-1,avg_price:4.23,",
+        "  currency:'USD',money:{proceeds:{base,native:null,ccy:null}}});",
+        "const flow=html=>html.match(/<span ([^>]*)>([^<]*)<\\/span>\\s*<\\/div>$/);",
+        "const [,sold,soldText]=flow(legRow(leg('SELL','O',380.07)).trim());",
+        "const [,bought,boughtText]=flow(legRow(leg('BUY','C',-537.88)).trim());",
+        "console.log(JSON.stringify({sold,soldText,bought,boughtText}));",
+    ])
+    assert (out["soldText"], out["boughtText"]) == ("+€380.07", "−€537.88")
+    for attrs in (out["sold"], out["bought"]):
+        assert not re.search(r"\b(pos|neg)\b", attrs), (
+            f"a fill's cash flow is coloured as P&L: {attrs}")
 
 
 def test_the_drilldown_leg_row_gets_a_sixth_grid_column():
