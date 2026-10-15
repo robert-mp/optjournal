@@ -1515,7 +1515,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local rails sessions sigma
  * @local body others pair pick said m r err Date
  * @local WHIST bars hb cur wf3
- * @local CSS document box fk node back typed hn live
+ * @local CSS document box fk node typed hn live
  */
 
 const $=s=>document.querySelector(s);
@@ -4966,7 +4966,7 @@ function watchFilters(){
   return `<div class="filters wf">
     <div><div class="flabel">search</div>
       <form id="waddf" class="wsrch"><input id="wsearch" value="${esc(S.wsearch||'')}"
-        maxlength="24" autocomplete="off" spellcheck="false"
+        maxlength="24" autocomplete="off" spellcheck="false" data-bound
         placeholder="${esc(named?'Symbol or company…'
           :'Symbol… (company names arrive with a refresh)')}">
         <button class="btn wplus" type="submit" title="Watch the symbol you typed"
@@ -5398,7 +5398,7 @@ function odte(){
   const field=(key,id,label,typed,feed,day)=>`<div class="zfield">
     <label class="zk" for="${id}">${esc(label)}</label>
     <input id="${id}" class="tin zin" inputmode="decimal" maxlength="12"
-      autocomplete="off" spellcheck="false" data-zread="${key}"
+      autocomplete="off" spellcheck="false" data-zread="${key}" data-bound
       aria-describedby="${id}from" value="${esc(zread(key))}">
     <div class="wcap" id="${id}from">${typed==null
       ?(oc.fresh?`the feed's reading, ${esc(day)}`:'no current reading: type one')
@@ -5420,7 +5420,7 @@ function odte(){
           :'Enter a sold level first'}">⧉</button>
     </div>
     <input id="z${side}" class="tin zin" inputmode="decimal" maxlength="12"
-      autocomplete="off" spellcheck="false" data-zread="${side}"
+      autocomplete="off" spellcheck="false" data-zread="${side}" data-bound
       placeholder="Enter sold ${side} level" value="${esc(zread(side))}">
     <div class="zreads">
       <div class="zread"><div class="zk">Points from SPX</div>
@@ -5739,22 +5739,13 @@ const zread=key=>{
  * derived from a number the reader can see in full. */
 const zfeed=value=>value==null?'':Number(value).toFixed(2);
 
-/* Set one field's state AND the live node, then redraw.
- *
- * The node matters, and this is the one non-obvious thing about the calculator's
- * wiring. `preserveInputs` carries every field's text across the render by reading
- * the DOM first and writing it back after -- which is what makes typing survive a
- * whole-body re-render -- so a handler that changed only the STATE would have its
- * new value rendered into the markup and then immediately overwritten by the stale
- * text still sitting in the old input. Setting both keeps the two agreeing at the
- * only moment the preserver looks. */
+/* Set one field's state, then redraw. The fields are `data-bound`, so the render
+   writes the value and the preserver leaves it there (see `preserveInputs`). */
 function zfill(key,value){
   if(key==='spx') S.zspx=value;
   else if(key==='vix') S.zvix=value;
   else if(key==='call') S.zcall=value;
   else S.zput=value;
-  const el=$('#z'+key);
-  if(el) el.value=value==null?zread(key):value;
   draw();
 }
 
@@ -6768,7 +6759,14 @@ function pressable(el,fn){
  * new symbol's heading -- and pressing Save would then have written it there. A
  * field may name what it is editing, and a restore across subjects is refused
  * rather than reconciled. Generic, like the rest of this helper: nothing here knows
- * the watchlist exists. */
+ * the watchlist exists.
+ *
+ * `data-bound` is the opposite case. A bound field renders its value from state
+ * that its own input handler writes on every keystroke, so the new markup already
+ * holds what was typed, and putting the old text back can only be wrong: the 0DTE
+ * readings came up empty on every load, because the first render ran before the
+ * feed answered and its empty text was restored over the reading the next render
+ * wrote. A bound field gets its focus and caret back, never its old value. */
 function preserveInputs(){
   const keep={};
   document.querySelectorAll('#body input,#body textarea,#body select').forEach(el=>{
@@ -6791,7 +6789,7 @@ function restoreInputs(keep){
     const el=document.getElementById(id); if(!el) return;
     const was=keep[id];
     if((el.dataset.subject||'')!==was.subject) return;
-    el.value=was.value;
+    if(!('bound' in el.dataset)) el.value=was.value;
     /* A checkbox's state is `checked`, not its value: the replay's "stop on
        events" came back ticked after every redraw. */
     if(el.type==='checkbox') el.checked=was.checked;
@@ -7015,12 +7013,10 @@ function bindMarketFetch(){
 function bindWatchlist(){
   /* The search box's `+` watches what was typed: the field is the one place a
      symbol is entered, IAG's shape.
-     On success the box AND the filter are cleared, together and before the
-     reload: `preserveInputs` used to put the typed symbol back over the empty
-     render, so the box kept the text while the filter it names was off. On a
-     refusal (`BRK B`) both come back and the box is live again, so one character
-     can be corrected; it used to stay disabled for good. Focus stays in the box
-     either way, ready for the next symbol. */
+     On success the box AND the filter are cleared, together, as the write
+     starts. On a refusal (`BRK B`) both come back and the box is live again, so
+     one character can be corrected; it used to stay disabled for good. Focus
+     stays in the box either way, ready for the next symbol. */
   const wf=$('#waddf');
   if(wf) wf.onsubmit=async ev=>{
     ev.preventDefault();
@@ -7030,7 +7026,6 @@ function bindWatchlist(){
     const added=await watchWrite({symbol:symbol,action:'add'});
     if(!added){
       S.wsearch=typed;
-      const back=$('#wsearch'); if(back) back.value=typed;
       draw();
     }
     const box=$('#wsearch');
@@ -7073,11 +7068,8 @@ function bindWatchlist(){
     b.onclick=()=>{const t=b.dataset.wtier, cur=S.wtier||'';
       S.wtier=(cur.includes(t)?cur.replace(t,''):cur+t).split('').sort().join('');
       draw();});
-  /* Clearing empties the DOM field too: `preserveInputs` would otherwise put the
-     typed search back over the freshly rendered empty value. */
   document.querySelectorAll('[data-wclear]').forEach(b=>
-    b.onclick=()=>{if(sb) sb.value='';
-      S.wsearch='';S.wbx=null;S.wivr=null;S.wearn=null;S.wtier='';draw();});
+    b.onclick=()=>{S.wsearch='';S.wbx=null;S.wivr=null;S.wearn=null;S.wtier='';draw();});
   /* Typed single fields (the earnings date): the form names its column. */
   document.querySelectorAll('form[data-wsave]').forEach(wf=>
     wf.onsubmit=async ev=>{

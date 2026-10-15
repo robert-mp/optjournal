@@ -6359,8 +6359,8 @@ def _submit_watch_search(typed: str, accepted: bool) -> dict:
     """Submit the Watchlist search box through the page's own `bindWatchlist`.
 
     `watchWrite` is the stand-in: it answers `accepted`, and records what the box
-    and the filter held at the moment of the write, which is what the reload a
-    success triggers renders from.
+    and the filter held at the moment of the write. The box is `data-bound`, so a
+    render writes the filter into it, and the stand-in `draw` does the same.
     """
     return _node_run([
         "const S={wsearch:" + json.dumps(typed) + "}; let seen=null, draws=0;",
@@ -6369,7 +6369,7 @@ def _submit_watch_search(typed: str, accepted: bool) -> dict:
         "const form={};",
         "const $=sel=>sel==='#waddf'?form:sel==='#wsearch'?input:null;",
         "const document={querySelectorAll:()=>[]};",
-        "function draw(){draws++;}",
+        "function draw(){draws++; input.value=S.wsearch;}",
         "async function loadQuotes(){}",
         "async function watchWrite(body){seen={body,value:input.value,",
         "  filter:S.wsearch,disabled:input.disabled};" + (
@@ -6976,14 +6976,17 @@ def test_a_filter_matching_nothing_says_which_control_is_hiding_the_rows():
         "the drawer can render from a row the filter is hiding"
     )
     assert "S.wsym=null" not in _fn("watchRows"), "the filter must not clear the choice"
-    # Clearing empties the FIELD as well as the state. Caught in a browser: without
-    # it, `preserveInputs` restored "nvidnvidzzz" over the freshly rendered empty box,
-    # so the table showed every row while the search box described a filter that was
-    # no longer applied.
+    # Clearing empties the FIELD as well as the state. Caught in a browser: the
+    # preserver restored "nvidnvidzzz" over the freshly rendered empty box, so the
+    # table showed every row while the search box described a filter that was no
+    # longer applied. The box is bound to `S.wsearch`, so the render's empty value
+    # is the one that stays.
     bind = _fn("bindWatchlist").replace(" ", "").replace("\n", "")
-    assert "if(sb)sb.value='';S.wsearch=''" in bind, (
-        "Clear filters leaves the reader's text in the search box, which then "
-        "describes a filter that is not applied"
+    assert "S.wsearch='';S.wbx=null" in bind, "Clear filters leaves the search on"
+    search = _fn("watchFilters")
+    assert "data-bound" in search[search.index('id="wsearch"'):].split(">", 1)[0], (
+        "the search box is not bound to its filter, so the preserver puts the old "
+        "text back over a cleared search"
     )
 
 
@@ -9150,22 +9153,65 @@ def test_typing_a_reading_redraws_and_the_caret_survives():
     assert "setSelectionRange" in binder, "the caret jumps on a masked keystroke"
 
 
-def test_a_programmatic_fill_writes_the_node_as_well_as_the_state():
-    """The trap `zfill` exists for, pinned so it cannot be quietly undone.
+def _redraw(before: list[dict], after: list[dict], focused: str | None = None) -> dict:
+    """The page's own `preserveInputs` and `restoreInputs` across one render.
 
-    `restoreInputs` writes the PRE-render text back into every field it finds by
-    id, unconditionally. A handler that set only `S.zcall` would therefore render
-    the dropped strike into the markup and have it overwritten a line later by the
-    stale value still in the old input -- so dragging a strike into a pad would
-    look like nothing happened. Setting the live node too is what keeps the two
-    agreeing at the only moment the preserver looks.
+    `before` is the fields on screen and `after` the fields the new markup holds,
+    each `{id, value, bound}`. Returns each field's value, focus and caret once the
+    preserver has run, which is what the reader sees.
     """
-    fill = _fn("zfill")
-    assert "el.value=" in fill.replace(" ", ""), (
-        "zfill no longer writes the field, so restoreInputs will revert every "
-        "drag, double-click and reset"
-    )
-    assert "draw()" in fill
+    return _node_run([
+        "const node=f=>({id:f.id,value:f.value,type:'text',checked:false,",
+        "  dataset:f.bound?{bound:''}:{},selectionStart:f.caret??f.value.length,",
+        "  selectionEnd:f.caret??f.value.length,",
+        "  focus(){document.activeElement=this;},",
+        "  setSelectionRange(a,b){this.selectionStart=a;this.selectionEnd=b;}});",
+        f"let nodes={json.dumps(before)}.map(node);",
+        "const document={activeElement:null,querySelectorAll:()=>nodes,",
+        "  getElementById:id=>nodes.find(n=>n.id===id)||null};",
+        f"document.activeElement=document.getElementById({json.dumps(focused)});",
+        *_page_fns("preserveInputs", "restoreInputs"),
+        "const keep=preserveInputs();",
+        f"nodes={json.dumps(after)}.map(node); document.activeElement=null;",
+        "restoreInputs(keep);",
+        "console.log(JSON.stringify(Object.fromEntries(nodes.map(n=>[n.id,",
+        "  {value:n.value,focused:document.activeElement===n,caret:n.selectionStart}]))));",
+    ])
+
+
+def test_a_feed_reading_that_lands_after_the_first_render_is_what_the_field_shows():
+    """The 0DTE readings rendered EMPTY on every fresh load while the ladder below
+    them was drawn from the feed: the attribute said 7718.94 and the field showed
+    nothing. The first render runs before the feed answers ("Checking the
+    feed..."), so the field is empty, and the preserver then wrote that empty text
+    back over the reading the next render put in the markup. Seen again on a live
+    VIX: the field held the payload's 17.52 while the ladder used the 17.60 the
+    refresh brought.
+
+    A reading field renders from state its own handler writes on every keystroke,
+    so it is `data-bound`, and the preserver carries only its focus and caret.
+    Text typed into an unbound field is still carried as before.
+    """
+    for tag in re.findall(r"<input[^>]*data-zread[^>]*>", _fn("odte")):
+        assert "data-bound" in tag, f"a 0DTE reading is not bound to its state: {tag}"
+    shown = _redraw(
+        before=[{"id": "zvix", "value": "17.52", "bound": True},
+                {"id": "wadd", "value": "AAP"}],
+        after=[{"id": "zvix", "value": "17.60", "bound": True},
+               {"id": "wadd", "value": ""}])
+    assert shown["zvix"]["value"] == "17.60", (
+        "the reading the new render carries was overwritten by the old text")
+    assert shown["wadd"]["value"] == "AAP", "typing in an ordinary field was lost"
+
+
+def test_a_bound_field_keeps_its_focus_and_caret_across_a_redraw():
+    """Typing a reading redraws on every keystroke, so the caret must survive it:
+    masking out a stray character shortens the value, and a caret that jumped to
+    the end would make editing the middle of a number impossible."""
+    shown = _redraw(
+        before=[{"id": "zspx", "value": "7718.9", "bound": True, "caret": 3}],
+        after=[{"id": "zspx", "value": "7718.9", "bound": True}], focused="zspx")
+    assert shown["zspx"] == {"value": "7718.9", "focused": True, "caret": 3}
 
 
 def test_the_companion_window_is_reused_and_kept_in_step():
