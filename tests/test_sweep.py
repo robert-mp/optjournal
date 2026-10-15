@@ -301,18 +301,20 @@ _CLOSED_OK = (
 _CLOSED_UNCAPTIONED = _closed_card("Short put", "Opened", "Short put close")
 
 _DRILL_PAYLOAD = {"stats": {"days": [{"day": "2026-08-04", "trades": 2}]}}
+_DRILL_HEAD = ('<div class="gh"><span class="gl">4 Aug · 2 fills</span>'
+               '<button class="linkish" data-calday-clear="1">clear</button></div>')
 _DRILL_OK = (
     '<div class="day g clk selected" data-calday="2026-08-04"></div>'
-    '<h3>2026-08-04 — 2 fill(s)</h3><div class="leg ctx"></div><div class="leg ctx"></div>'
+    + _DRILL_HEAD + '<div class="leg ctx"></div><div class="leg ctx"></div>'
 )
 #: The panel rendered but no cell shows as chosen, so the grid gives no clue
 #: which day is open below it.
-_DRILL_NO_SELECTION = '<h3>2026-08-04 — 2 fill(s)</h3><div class="leg ctx"></div>'
+_DRILL_NO_SELECTION = _DRILL_HEAD + '<div class="leg ctx"></div>'
 #: The bug fixed that morning: drill-down legs rendered without `.ctx`, losing
 #: the contract and strategy columns that are the panel's entire purpose.
 _DRILL_PLAIN_LEGS = (
     '<div class="day g clk selected" data-calday="2026-08-04"></div>'
-    '<h3>2026-08-04 — 2 fill(s)</h3><div class="leg"></div><div class="leg ctx"></div>'
+    + _DRILL_HEAD + '<div class="leg"></div><div class="leg ctx"></div>'
 )
 
 _MONEY_OK = {"stats": {"commissions": {"base": 1.0, "native": 1.1, "ccy": "USD"},
@@ -513,7 +515,7 @@ def test_drilldown_heals_a_day_that_has_no_fills():
     assert sweep.check_drilldown_renders_from_url(healed).status == PASS
 
     lying = page(tab="calendar", calday="1999-01-01",
-                 body="<h3>1999-01-01 — 3 fill(s)</h3>", payload=_DRILL_PAYLOAD)
+                 body=_DRILL_HEAD, payload=_DRILL_PAYLOAD)
     assert sweep.check_drilldown_renders_from_url(lying).status == FAIL
 
 

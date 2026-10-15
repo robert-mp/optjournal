@@ -12,6 +12,7 @@ import {
   monthLabel,
   num,
   pct,
+  plural,
   strike,
 } from "../../src/optjournal/static/format.js";
 
@@ -140,4 +141,13 @@ test("date labels are short and unambiguous", () => {
   assert.equal(monthLabel("2026-08"), "Aug 2026");
   assert.equal(dayLabel("2026-08-07", false), "7 Aug");
   assert.equal(dayLabel("2026-08-07", true), "7 Aug '26");
+  assert.equal(dayLabel("20261013", false), "13 Oct", "a statement's compact date");
+  assert.equal(dayLabel("2026-10-14 09:30:00", true), "14 Oct '26", "a timestamp's day");
+  assert.equal(dayLabel("latest", false), "latest", "anything else passes through");
+});
+
+test("a count carries its noun in the right number", () => {
+  assert.equal(plural(1, "fill"), "1 fill");
+  assert.equal(plural(0, "fill"), "0 fills");
+  assert.equal(plural(3, "entry", "entries"), "3 entries");
 });

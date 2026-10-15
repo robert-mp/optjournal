@@ -141,10 +141,16 @@ export function monthLabel(month) {
   return `${MONTHS[Number(number) - 1]} ${year}`;
 }
 
+/** "7 Aug", or "7 Aug '26" with the year. Reads an ISO day, the head of a
+ * timestamp, or a statement's compact 20260807. */
 export function dayLabel(iso, withYear) {
-  const [year, month, day] = String(iso || "").split("-");
-  if (!year || !month || !day) return String(iso || "");
+  const parts = /^(\d{4})-?(\d{2})-?(\d{2})/.exec(String(iso || ""));
+  if (!parts) return String(iso || "");
+  const [, year, month, day] = parts;
   return `${Number(day)} ${MONTHS[Number(month) - 1]}${
     withYear ? ` '${year.slice(2)}` : ""
   }`;
 }
+
+/** "1 fill", "3 fills": a count with its noun, singular or plural. */
+export const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;

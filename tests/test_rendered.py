@@ -322,6 +322,34 @@ def test_the_dashboard_states_its_net_pnl_once(served, tmp_path, monkeypatch):
     assert "Zero days to expiration" in seen["odte"][1]
 
 
+def test_every_tab_writes_dates_and_counts_the_way_a_reader_does(
+        served, tmp_path, monkeypatch):
+    """ISO and compact dates leaked onto almost every tab ("From the 20261013
+    snapshot", "2025-04-04 → 2026-10-14", "newest 2026-10-14"), the option book
+    named contracts by their OSI symbol ("QQQ 261030P00735000"), and counts read
+    "2 fill(s)". Dates now read "14 Oct" (the year only when it is not this one),
+    a contract reads as its leg does, and a count takes its noun's number."""
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    from optjournal import serialize  # noqa: PLC0415 - the server's own binding
+    monkeypatch.setattr(serialize, "fetch_bars", lambda *a, **k: [])
+    leaks = {}
+    for tab in sweep.TABS:
+        dom = browser.dump_dom(f"{served}/#tab={tab}", tmp_path / f"dates-{tab}")
+        if dom is None:
+            pytest.skip("no browser produced a DOM (environment, not the page)")
+        # What is on screen and what a tooltip says; the footer's path aside.
+        text = re.sub(r"\S+\.db\b", "", " ".join(
+            [browser.rendered_text(dom),
+             *re.findall(r'title="([^"]*)"', browser.markup(dom))]))
+        found = (re.findall(r"\b\d{4}-\d{2}-\d{2}\b|\b20\d{6}\b", text)
+                 + re.findall(r"\w\(s\)", text)
+                 + re.findall(r"\b[A-Z]{1,5} +\d{6}[CP]\d{8}\b", text))
+        if found:
+            leaks[tab] = found
+    assert not leaks, f"machine dates, OSI symbols or (s) plurals on screen: {leaks}"
+
+
 def test_the_dashboard_renders_the_tiles_the_reader_stored(served, tmp_path):
     """The chosen arrangement, in its order -- and the default when what is
     stored cannot be drawn.

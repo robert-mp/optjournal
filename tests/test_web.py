@@ -340,6 +340,9 @@ def test_contract_parser_is_correct():
 #: HTTP call per watched symbol.
 _UNSAMPLED = frozenset({
     "ChartPoint", "Bucket", "SyncResponse",
+    # Page-side: the fields `contractChips` reads off a Leg or a Position row,
+    # both of which are sampled.
+    "Contract",
     # `JField` is page-side, like `Bucket`: the journal form's own field table,
     # never sent by the server. `JournalWrite` is the `/api/journal` reply, off
     # the state payload like every other write reply here. `LinkWrite` is the
@@ -1125,7 +1128,8 @@ def test_dashboard_headline_counts_closes_for_options():
         "the headline names its unit, which is the money's: net P&L is "
         "attributed by it"
     )
-    assert "fill(s), ${s.orders} order(s)" in js, "fills stay visible as activity"
+    assert "plural(s.total_trades,'fill')}, ${plural(s.orders,'order')}" in js, (
+        "fills stay visible as activity")
     # The fill-count headline remains only as the non-options branch.
     assert js.count("statCard('Total Trades', s.total_trades,") == 1
 
@@ -3837,7 +3841,7 @@ def test_a_fill_row_shows_its_cash_flow_signed_and_without_the_pnl_colours():
         "const DISP=()=>'EUR', conv=v=>v==null?null:Number(v);",
         "const cash=(v,d)=>money(conv(v),DISP(),d);",
         *(_page_stmt(n) for n in ("isNativeCharge", "moneyOf", "amountOf")),
-        _fn("actClass"), *_page_fns("actLabel", "legRow"),
+        _fn("actClass"), *_page_fns("actLabel", "contractChips", "legRow"),
         "const leg=(bs,oc,base)=>({buy_sell:bs,open_close:oc,underlying_symbol:'CRWD',",
         "  strike:220,expiry:'2026-11-20',put_call:'P',quantity:-1,avg_price:4.23,",
         "  currency:'USD',money:{proceeds:{base,native:null,ccy:null}}});",
@@ -4142,9 +4146,9 @@ def test_strike_keeps_a_half_and_stays_bare_when_whole():
     ).read_text(encoding="utf-8")
     assert "export function strike" in source, "the strike helper is gone"
     assert "Number.isInteger(amount)" in source
-    leg = _fn("legRow").replace(" ", "")
-    assert "${strike(l.strike)}" in leg, "legRow still formats the strike inline"
-    assert "num(l.strike,0)" not in leg, "the rounding call survives"
+    leg = _fn("contractChips").replace(" ", "")
+    assert "${strike(ctr.strike)}" in leg, "a contract no longer formats its strike"
+    assert "num(ctr.strike,0)" not in leg, "the rounding call survives"
 
 
 def test_a_leg_falls_back_to_its_own_symbol_for_display():
@@ -4152,8 +4156,8 @@ def test_a_leg_falls_back_to_its_own_symbol_for_display():
     not blank the contract cell -- it rendered as empty space beside a real
     position on the synthetic journal.
     """
-    leg = _fn("legRow").replace(" ", "")
-    assert "esc(l.underlying_symbol||l.symbol||'')" in leg
+    leg = _fn("contractChips").replace(" ", "")
+    assert "esc(ctr.underlying_symbol||ctr.symbol||'')" in leg
 
 
 def test_proceeds_and_friction_follow_the_same_charge_rule_as_commission():
@@ -6722,7 +6726,7 @@ def test_the_held_marker_is_rendered_and_says_what_it_means():
     # The sentence, and the fact that it is spent. `wselwhy` is an arrow const, so it
     # is read out of the whole script like `wrankwhy` above.
     js = _code_only(_js())
-    assert "you hold" in js and "option position(s) on it" in js, (
+    assert "you hold" in js and "plural(n,'option position')} on it" in js, (
         "the held marker's title no longer says what the mark means, and the glyph is "
         "aria-hidden -- so the row states a fact only in pixels"
     )
@@ -7039,7 +7043,7 @@ def test_a_filter_matching_nothing_says_which_control_is_hiding_the_rows():
     different situations.
     """
     said = _fn("wnorows")
-    assert "watched symbol(s) are hidden by" in said
+    assert "plural(total,'watched symbol')} are hidden by" in said
     active = _fn("wactive")
     for control in ("the search box", "the BXTRENDER filter", "the IV rank filter",
                     "the EARNINGS filter"):
@@ -7787,7 +7791,7 @@ def _trades_rows(lifecycles: list[dict], **view: Any) -> list[list[str]]:
         "function scopeNote(){return '';} function orphanNotes(){return '';}",
         f"const S=Object.assign({{topen:new Set(),state:{{lifecycles:{json.dumps(lifecycles)}}}}},",
         f"  {json.dumps(state)});",
-        *_page_fns("tradeDay", "tradeDates", "heldFor", "trades"),
+        *_page_fns("shortDay", "tradeDates", "heldFor", "trades"),
         "const html=trades();",
         "const rows=[...html.matchAll(/<tr class=\"rk[^>]*>([\\s\\S]*?)<\\/tr>/g)]",
         "  .map(m=>[...m[1].matchAll(/<td[^>]*>([\\s\\S]*?)<\\/td>/g)]",
@@ -7865,7 +7869,8 @@ def test_a_trades_card_says_what_happened_and_keeps_the_order_ids_for_a_tooltip(
                                   "etday")),
         "function journalRow(){return '';}",
         "const S={state:{replays:{}},replay:null};",
-        _fn("actClass"), *_page_fns("actLabel", "legRow", "tradeDay", "tradeCard"),
+        _fn("actClass"), *_page_fns("actLabel", "contractChips", "legRow", "shortDay",
+                                    "tradeCard"),
         f"const html=tradeCard({json.dumps(lc)});",
         "console.log(JSON.stringify({html,",
         "  text:html.replace(/<[^>]+>/g,' ').replace(/\\s+/g,' ').trim()}));",
@@ -7881,7 +7886,7 @@ def test_a_note_no_card_claims_is_drawn_on_the_trades_tab():
     with every reader-typed value escaped, whether or not any card is drawn."""
     src = _fn("orphanNotes")
     assert "(S.state.journal||{}).orphans" in src
-    for value in ("esc(je.underlying", "esc(je.opened_on?tradeDay(je.opened_on)",
+    for value in ("esc(je.underlying", "esc(je.opened_on?shortDay(je.opened_on)",
                   "esc(je.anchor)", "esc(je[jf.name])"):
         assert value in src, f"{value} is not escaped"
     assert _fn("trades").count("orphanNotes()") == 2, (
@@ -9243,9 +9248,11 @@ def test_the_provisional_banner_says_the_pnl_is_estimated_until_the_statement():
     estimate could not price, which are the only ones it is still true of.
     """
     out = _node_run([
-        f"import {{esc}} from '{_static('format.js')}';",
+        f"import {{esc,dayLabel,plural}} from '{_static('format.js')}';",
+        "Date.now=()=>Date.parse('2026-10-15T15:00:00Z');",
+        *(_page_stmt(n) for n in ("MKT", "etday")),
         "let S={};",
-        *_page_fns("provisionalBanner"),
+        *_page_fns("shortDay", "provisionalBanner"),
         "const drawn=pv=>{S={state:{provisional:pv}}; return provisionalBanner()",
         "  .replace(/<[^>]+>/g,'').replace(/\\s+/g,' ').trim();};",
         "console.log(JSON.stringify({",
@@ -9256,25 +9263,13 @@ def test_the_provisional_banner_says_the_pnl_is_estimated_until_the_statement():
     ])
     assert out["settled"] == ""
     assert out["priced"] == (
-        "3 same-session fill(s) (newest 2026-10-12). Their P&L is estimated from your"
+        "3 same-session fills (newest 12 Oct). Their P&L is estimated from your"
         " fills, and base-currency figures use a live FX rate. Tomorrow's statement"
         " replaces both with IBKR's.")
     assert out["unpriced"] == (
-        "2 same-session fill(s) (newest 2026-09-24). Their P&L is estimated from your"
+        "2 same-session fills (newest 24 Sep). Their P&L is estimated from your"
         " fills. Tomorrow's statement replaces it with IBKR's. No realised P&L yet for"
-        " 1 close(s), because the journal does not hold the fills they close.")
-
-
-def test_the_provisional_banner_dashes_ibkrs_date():
-    """IBKR sends `20260924`; every other date on this page is dashed.
-
-    A caption mixing the two spellings reads like a leaked internal field, which is
-    exactly the impression a provisional-data warning must not give.
-    """
-    banner = _fn("provisionalBanner")
-    assert "raw.slice(0,4)" in banner and "raw.slice(4,6)" in banner, (
-        "the banner renders IBKR's compact date without reformatting it"
-    )
+        " 1 close, because the journal does not hold the fills they close.")
 
 
 # --------------------------------------------------------------------------

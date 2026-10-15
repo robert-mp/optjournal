@@ -166,8 +166,8 @@ import {
 import {PRICE_TIERS, alertState, bxDirection, bxStrong, earningsSoon, histBars,
   meterKnob,
   priceTier, ringArc, ringPoint, shownPrice} from '/static/watch.js';
-import {cls, compact, dayLabel, dp, esc, level, money, monthLabel, num, pct, strike,
-  sym}
+import {cls, compact, dayLabel, dp, esc, level, money, monthLabel, num, pct, plural,
+  strike, sym}
   from '/static/format.js';
 import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
   from '/static/market.js';
@@ -1465,6 +1465,15 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} n
  */
 
+/** @typedef {Object} Contract -- page-side: what names a contract on a Leg or a
+ *  Position row, for `contractChips`
+ * @property {string|null} underlying_symbol
+ * @property {string} symbol
+ * @property {string|null} put_call
+ * @property {number|null} strike
+ * @property {string|null} expiry -- ISO on a Leg, IBKR's compact form on a Position
+ */
+
 /** @typedef {Object} Bucket -- page-side: a Lifecycle paired with its Position rows
  * @property {Lifecycle|null} lc -- null for the Ungrouped bucket
  * @property {Array} rows
@@ -1487,6 +1496,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload oc:OdteContext oe:SessionEvent
  * @payload zr:StrikeRow zl:ScratchLine zs:Scratch zm:Move
  * @payload res:SyncResponse sync:Sync pt:ChartPoint bkt:Bucket rp:Replay sk:Strike
+ * @payload ctr:Contract
  * @payload e:Annotation
  * @payload mk:Market d:MarketDay mev:MarketEvent mf:MarketFacet
  * @payload w:Watch wo:WatchOption wa:Watch wb:Watch
@@ -1501,7 +1511,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload pd0:PortfolioDay pdn:PortfolioDay
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
  * @local leaves PERIOD_TABS TYPE_TABS pop quotes steps TILES
- * @local TSHOW found day
+ * @local TSHOW found
  * @local draft dr order known tilesave tilereset Array
  * @local JFIELDS entered closed options STATE_KEYS_REQUIRED
  * @local cells days buckets evs glegs lcs mons month
@@ -1511,7 +1521,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local chosen ws opts thin px
  * @local shownByDay next picked plan u
  * @local JSON Object ages input mine qb wf was
- * @local when parts names raw err
+ * @local when parts names err
  * @local COST_OPTIONS bits cost fees on wh
  * @local state SCOPE_KEYS
  * @local qidsave cqidsave tokcheck toksave
@@ -1953,7 +1963,7 @@ function ccyControl(){
     const on=qo.code===DISP();
     const tip=qo.per_base
       ? `Totals restated from ${base} at ${num(qo.per_base,4)} ${qo.code} per `
-        +`${base} (${qo.source} ${qo.as_of}). Contract prices stay in their own currency.`
+        +`${base} (${qo.source} ${shortDay(qo.as_of)}). Contract prices stay in their own currency.`
       : `${base} is the account base currency — IBKR's own conversions, unrestated.`;
     return `<button data-ccy="${esc(qo.code)}" class="${on?'on':''}"
       title="${esc(tip)}">${esc(sym(qo.code)||'')}${esc(qo.code)}</button>`;
@@ -1962,7 +1972,7 @@ function ccyControl(){
   return `<div><div class="flabel">Currency</div><div id="ccywrap">
     <div class="ccytog">${row}</div>${q
     ? `<div class="ccynote">restated at ${esc(num(q.per_base,4))}
-       ${esc(q.code)}/${esc(base)} · ${esc(q.as_of)}</div>`
+       ${esc(q.code)}/${esc(base)} · ${esc(shortDay(q.as_of))}</div>`
     : ''}</div></div>`;
 }
 
@@ -2087,7 +2097,7 @@ function ccyNote(){
      say, so it says it. */
   return q
     ? `Totals restated from ${base} into ${q.code} at ${num(q.per_base,4)} `
-      +`(${q.source} ${q.as_of}); IBKR's own figures are in ${base}.`
+      +`(${q.source} ${shortDay(q.as_of)}); IBKR's own figures are in ${base}.`
     : '';
 }
 
@@ -2119,9 +2129,9 @@ function equitiesSelectable(){
 function equitiesNote(){
   const n=(S.state.asset_counts||{}).STK;
   return n
-    ? `Show the ${n} stock fill(s) instead of options. Stocks are a different `
-      +`asset category, not a subset — Dashboard, Calendar and Trades switch to `
-      +`STK; other tabs stay on options.`
+    ? `Show the ${plural(n,'stock fill')} instead of options. Stocks are a different `
+      +`asset category, not a subset: Dashboard, Calendar and Trades switch to `
+      +`STK, and other tabs stay on options.`
     : 'No stock trades in the journal. If some exist in the archive, run '
       +'`optjournal ingest` to fold them in.';
 }
@@ -2324,9 +2334,9 @@ function dashboard(){
       'net_pnl'),
     trades:()=>opt
       ? statCard('Closes', s.closes,
-          `${s.total_trades} fill(s), ${s.orders} order(s)`,'','trades')
+          `${plural(s.total_trades,'fill')}, ${plural(s.orders,'order')}`,'','trades')
       : statCard('Total Trades', s.total_trades,
-          s.orders?`${s.orders} order(s)`:'','','trades'),
+          s.orders?plural(s.orders,'order'):'','','trades'),
     /* `Math.abs`, matching the Annual and Month tables. The same all-time
        figure read "−€26.25" here and "€26.25" there, so a reader checking one
        against the other had to know which sign convention each surface chose.
@@ -2372,7 +2382,8 @@ function dashboard(){
       cls(s.avg_loss?.base),'avg_loss'),
     gain:()=>nl!=null
       ? statCard('Gain % of Net Liq', pct(s.gain_pct_of_net_liq,2),
-          `NAV ${cash(nl)} · ${s.net_liq_date||''}`, cls(s.gain_pct_of_net_liq,2),'gain')
+          `NAV ${cash(nl)}${s.net_liq_date?` · ${shortDay(s.net_liq_date)}`:''}`,
+          cls(s.gain_pct_of_net_liq,2),'gain')
       : statCard('Gain % of Net Liq', '—',
           'enable Equity Summary on the Flex query', 'dim2','gain'),
     /* The ratio is tinted by which side of 1 it falls, not by `cls()`: it is not a
@@ -2396,7 +2407,7 @@ function dashboard(){
       'collected on shorts, paid on longs · not in Net P&L until it closes',
       cls(s.open_premium.base),'open_premium'),
     open_positions:()=>statCard('Open Positions', s.open_positions,
-      `${s.open_episodes} open contract(s), a multi-leg strategy counted once`,
+      `${plural(s.open_episodes,'open contract')}, a multi-leg strategy counted once`,
       '','open_positions'),
     green_days:()=>statCard('Green Days', s.green_days,
       'days whose realised P&L closed above zero', s.green_days?'pos':'','green_days'),
@@ -2425,7 +2436,7 @@ function dashboard(){
     return rk
       ? statCard(k,`${esc(rk.label)}<span class="vsub ${cls(rk.pnl.base)}">${
           moneyOf(rk.pnl)}</span>`,
-          `${rk.decided} closed position(s), realised P&L summed`,'sm',key)
+          `${plural(rk.decided,'closed position')}, realised P&L summed`,'sm',key)
       : statCard(k,'—',none,'dim2',key);
   }
   const cards=tileKeys().map(k=>R[k]()).join('');
@@ -2464,9 +2475,9 @@ function dashboard(){
         ${S.type?`<span class="pill" title="Every trade-derived figure below is
           restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
         ${tileKeys().includes('open_positions')?'':`<span class="pill" title="Open
-          positions, with a multi-leg strategy counted once. ${s.open_episodes} open
-          contract(s) across ${s.open_positions} position(s), grouped the way
-          Holdings groups them."
+          positions, with a multi-leg strategy counted once: ${
+          plural(s.open_episodes,'open contract')} across ${
+          plural(s.open_positions,'position')}, grouped the way Holdings groups them."
           >open <b>${s.open_positions}</b></span>`}
       </div></div>
     <div class="stats">${cards}</div>
@@ -2475,8 +2486,9 @@ function dashboard(){
       `Win Rate, Avg Win and Avg Loss wait for the first close, the day you close
        all or part of a contract. Net P&amp;L starts that day too.
        <br><br>${s.open_premium.base?`The ${cash(s.open_premium.base)} net premium in
-       the ${s.open_positions} open position(s) is not profit until they close.`
-       :`The ${s.open_positions} open position(s) are under <b>Holdings</b>.`}`
+       ${plural(s.open_positions,'open position')} is not profit until ${
+       s.open_positions===1?'it closes':'they close'}.`
+       :`The open position${s.open_positions===1?' is':'s are'} under <b>Holdings</b>.`}`
       )}</div>`:''}
   </div>
   <div class="card">
@@ -2560,14 +2572,15 @@ function collection(){
         intraday series could have been checked."
         >bars <b>nothing to check</b></span>`
     : au.missing.length
-    ? `<span class="pill" title="${au.missing.length} of ${au.witnesses} open
-        contract(s) have no hourly bars for ${esc(au.day)}. An option's intraday
+    ? `<span class="pill" title="${au.missing.length} of ${plural(au.witnesses,'open contract')}
+        have no hourly bars for ${esc(shortDay(au.day))}. An option's intraday
         series exists only while its own session runs, so this cannot be
         backfilled later."
         >bars <b class="neg">${au.missing.length} missed</b> of ${au.witnesses}</span>`
-    : `<span class="pill" title="All ${au.witnesses} open contract(s) have hourly
-        bars for ${esc(au.day)} — the session was captured."
-        >bars <b class="pos">${au.witnesses}/${au.witnesses}</b> · ${esc(au.day)}</span>`;
+    : `<span class="pill" title="${au.witnesses===1?'The open contract has'
+        :`All ${au.witnesses} open contracts have`} hourly bars for ${
+        esc(shortDay(au.day))}, so the session was captured."
+        >bars <b class="pos">${au.witnesses}/${au.witnesses}</b> · ${esc(shortDay(au.day))}</span>`;
 
   /* One row per registered job. `last_status` is rendered as itself rather than
      collapsed to a colour: `nothing` (a legitimately empty run) and `ok` are both
@@ -2700,7 +2713,7 @@ function chart(days){
      stylesheet, which is why the whole chart sat out the theme swap. */
   const dots=pts.map((pt,i)=>`<circle class="cdot ${pt.y<0?'neg':'pos'}"
      cx="${sx(i).toFixed(1)}" cy="${sy(pt.y).toFixed(1)}" r="3.5"
-     ><title>${esc(dayLabel(pt.x,true))} — cum ${cash(pt.y)} (${pt.n} fill(s))</title></circle>`).join('');
+     ><title>${esc(dayLabel(pt.x,true))} · total ${cash(pt.y)} (${plural(pt.n,'fill')})</title></circle>`).join('');
   /* The year appears only when the span crosses one, decided from the data rather
      than always shown or always hidden: on a two-week chart "'26" twice is noise,
      and on one running from December into January its absence makes the axis lie
@@ -2855,7 +2868,7 @@ function dayDetail(by){
   if(!rows.length) return `<div class="note">No leg detail for ${esc(key)} —
     fills exist but their orders are outside the current filter.</div>`;
   return `<div class="grp mt-3">
-    <div class="gh"><span class="gl">${esc(key)} — ${rows.length} fill(s)</span>
+    <div class="gh"><span class="gl">${esc(shortDay(key))} · ${plural(rows.length,'fill')}</span>
       <button class="linkish" data-calday-clear="1">clear</button></div>
     ${rows.map(({g,l})=>legRow(l,
       `<span class="dim lbl-sm">${esc(g.label)}</span>`)).join('')}
@@ -2871,6 +2884,22 @@ function actLabel(l){
   if(bs==='BUY')  return oc==='O'?'BTO':'BTC';
   return oc||'—';
 }
+/* THE CONTRACT AS CELLS, on a fill's leg and on a Holdings row: expiry, strike,
+   right, each in its own chip, the reference app's shape. Run together as
+   `NVDA 140P 2026-03-20` the three read
+   as one token, and the part a reader scans for -- which strike, which month --
+   sat mid-string. Two departures, both on purpose. The expiry keeps its year,
+   because a LEAP two years out would otherwise read as this year's. And the
+   quantity stays in its own column rather than joining the chips: it is already
+   beside the BTO/STO badge, and a second copy is a second place to disagree.
+   A stock leg has no strike or expiry, so it gets the symbol and no chips. */
+function contractChips(ctr){
+  const K=(ctr.put_call||'').toUpperCase();
+  return `<span class="kchips"><span class="mono">${esc(ctr.underlying_symbol||ctr.symbol||'')}</span>${
+    ctr.strike!=null&&ctr.expiry?`<span class="kchip">${esc(dayLabel(ctr.expiry,true))}</span>
+      <span class="kchip kstrike fig">${strike(ctr.strike)}</span>${
+      K?`<span class="kchip ${K==='P'?'put':'call'}">${esc(K)}</span>`:''}`:''}</span>`;
+}
 function legRow(l,extra=''){
   /* One fill line, shared by the Trades cards and the calendar drill-down --
      the same leg must read identically wherever it appears, and this line
@@ -2878,27 +2907,12 @@ function legRow(l,extra=''){
      drill-down wedges the strategy label between contract and quantity,
      because there the leg appears outside its strategy card; the Trades
      card, already under its strategy header, passes nothing. */
-  /* THE CONTRACT AS CELLS: expiry, strike, right, each in its own chip, the
-     reference app's shape. Run together as `NVDA 140P 2026-03-20` the three read
-     as one token, and the part a reader scans for -- which strike, which month --
-     sat mid-string. Two departures, both on purpose. The expiry keeps its year,
-     because a LEAP two years out would otherwise read as this year's. And the
-     quantity stays in its own column rather than joining the chips: it is already
-     beside the BTO/STO badge, and a second copy is a second place to disagree.
-     A stock leg has no strike or expiry, so it gets the symbol and no chips. */
-  const K=(l.put_call||'').toUpperCase();
-  const chips=l.strike!=null&&l.expiry
-    ?`<span class="kchip">${esc(dayLabel(l.expiry,true))}</span>
-      <span class="kchip kstrike fig">${strike(l.strike)}</span>${
-      K?`<span class="kchip ${K==='P'?'put':'call'}">${esc(K)}</span>`:''}`
-    :'';
   /* The last figure is the cash the fill moved, signed but in the text colour:
      green and red mean P&L on this page, and a sold put's premium in green
      beside "Realised —" read as a profit. */
   return `<div class="leg${extra?' ctx':''}">
     <span class="act ${actClass(l.buy_sell)}">${esc(actLabel(l))}</span>
-    <span class="kchips"><span class="mono">${esc(l.underlying_symbol||l.symbol||'')}</span>${
-      chips}</span>
+    ${contractChips(l)}
     ${extra}
     <span class="fig dim">×${Math.abs(l.quantity)}</span>
     <span class="fig" title="fill price, always in the contract's own currency"
@@ -2926,6 +2940,10 @@ const rstamp=(ts,size)=>new Date(ts*1000).toLocaleString(undefined,
 /* The bar's calendar day at the exchange, for finding session boundaries.
    'en-CA' because it yields YYYY-MM-DD, so string equality is date equality. */
 const etday=ts=>new Date(ts*1000).toLocaleDateString('en-CA',{timeZone:MKT});
+/* A date as the page writes one: "14 Oct" this year, "4 Apr '25" before. */
+function shortDay(iso){
+  return dayLabel(iso,String(iso||'').slice(0,4)!==etday(Date.now()/1000).slice(0,4));
+}
 
 /* Geometry of the panel currently on screen, so the scrubber can move a clip
    rect and a crosshair without re-rendering the page. Only ONE panel is ever
@@ -3431,14 +3449,9 @@ const NO_PRICE_WHY='The newest statement has no price for a contract this positi
   +'holds, usually because it opened after that statement. The next one prices it.';
 /* The Trades list's three views, [S.tshow, label]. */
 const TSHOW=[['all','All'],['open','Open'],['closed','Closed']];
-/* A Trades date in the page's short style: "14 Oct" this year, "4 Apr '25" before. */
-function tradeDay(iso){
-  const day=String(iso||'').slice(0,10);
-  return dayLabel(day,day.slice(0,4)!==etday(Date.now()/1000).slice(0,4));
-}
 function tradeDates(lc){
-  if(lc.status==='open') return 'since '+tradeDay(lc.opened_at);
-  const from=tradeDay(lc.opened_at), to=tradeDay(lc.closed_at);
+  if(lc.status==='open') return 'since '+shortDay(lc.opened_at);
+  const from=shortDay(lc.opened_at), to=shortDay(lc.closed_at);
   return from===to?from:`${from} to ${to}`;
 }
 /* Calendar days from the first fill to the last close, or to today while open:
@@ -3542,7 +3555,7 @@ function tradeCard(lc){
       const ids=g.order_ids||[];
       return `<div class="grp">
       <div class="gh"><span class="gl" title="${esc(`order${ids.length>1?'s':''} ${
-        ids.join(', ')}`)}">${esc(tradeDay(g.first_fill_at))} — ${esc(evl)}</span>
+        ids.join(', ')}`)}">${esc(shortDay(g.first_fill_at))} — ${esc(evl)}</span>
         ${closes?`<span class="fig ${cls(g.realized_pnl.base)}">${moneyOf(g.realized_pnl)}</span>`:''}</div>
       ${glegs.map(l=>legRow(l)).join('')}
     </div>`;}).join('')}
@@ -3610,7 +3623,7 @@ function orphanNotes(){
        longer names a card below. Nothing was deleted.`)}</h2>
       <div class="sub">${rows.length} entr${rows.length===1?'y':'ies'}, kept as written.</div></div></div>
     ${rows.map(je=>`<div class="note"><b>${esc(je.underlying||'?')}</b>
-      <span class="dim2 mono">opened ${esc(je.opened_on?tradeDay(je.opened_on):'?')}
+      <span class="dim2 mono">opened ${esc(je.opened_on?shortDay(je.opened_on):'?')}
         · ${String(je.anchor).startsWith('t:')?'fill '+esc(String(je.anchor).slice(2))
           :'order '+esc(je.anchor)}</span>
       ${JFIELDS.filter(jf=>je[jf.name]!=null&&String(je[jf.name])!=='').map(jf=>
@@ -3665,7 +3678,7 @@ function journalRow(lc){
   const others=rollCandidates(lc), shownl=S.lnk===a;
   return `<div class="jrow">
     <div class="jsum">${badge}${joins}${je&&je.updated_at?`<span class="dim2"
-      >last written ${esc(tradeDay(etday(Date.parse(je.updated_at)/1000)))}</span>`:''}</div>
+      >last written ${esc(shortDay(etday(Date.parse(je.updated_at)/1000)))}</span>`:''}</div>
     <div class="jbtns">${others.length?`<button class="jbtn" data-lopen="${esc(a)}">${
       shownl?'cancel':'link a roll'}</button>`:''}
     <button class="jbtn" data-jopen="${esc(a)}">${
@@ -3689,7 +3702,7 @@ function linkForm(lc,others){
     <span class="dim">This position continues</span>
     <select id="lk-pick" data-subject="${esc(lc.anchor)}">${others.map(olc=>
       `<option value="${esc(olc.anchor)}">${esc(olc.label)} · opened ${
-        esc(tradeDay(olc.opened_at))} · ${esc(olc.status)}</option>`).join('')}
+        esc(shortDay(olc.opened_at))} · ${esc(olc.status)}</option>`).join('')}
     </select>
     <button class="jsave" data-lsave="${esc(lc.anchor)}">Link</button>
   </div>`;
@@ -3944,8 +3957,7 @@ function positions(){
        would take the row out of the table for a screen reader, and a row that
        opens a panel beneath it is what `aria-expanded` on a row already says. */
     return `<tr${key?` class="rk" data-replay="${esc(key)}" tabindex="0"
-      aria-expanded="${shown?'true':'false'}"`:''}><td class="mono">${
-      esc(pos.symbol)}</td>
+      aria-expanded="${shown?'true':'false'}"`:''}><td>${contractChips(pos)}</td>
     <td class="side ${String(pos.side).toLowerCase()==='short'?'sell':'buy'}">${esc(pos.side)}</td>
     <td class="n ${cls(pos.position)}">${pos.position}</td>
     <td class="n">${money(pos.mark_price,pos.currency)}</td>
@@ -3960,8 +3972,8 @@ function positions(){
   const grpRow=bkt=>{
     /* Not `b` -- that name is the DOM button binding elsewhere in this page,
        and one name for two shapes blinds the payload guard to both. */
-    const label=bkt.lc?`${bkt.lc.underlying||''} — ${bkt.lc.label}, opened ${
-      String(bkt.lc.opened_at||'').slice(0,10)}`:'Ungrouped — no opening fills in the archive';
+    const label=bkt.lc?`${bkt.lc.underlying||''} · ${bkt.lc.label}, opened ${
+      shortDay(bkt.lc.opened_at)}`:'Ungrouped (no opening fill in the archive)';
     let uv=0; bkt.rows.forEach(pos=>uv+=(pos.value.base||0));
     /* The subtotal sums `value`, so it sits in the `value` column. It used to
        ride a colspan=8 label and land in column 9 -- under `record` -- four
@@ -3984,7 +3996,7 @@ function positions(){
       `A position snapshot is the only cost-basis source for anything opened before
        the archive starts, which is why this panel is dated rather than live.
        <br><br>Rows are grouped by the strategy each position was opened as.`)}</h2>
-      <div class="sub">From the ${esc((ps[0]&&ps[0].report_date)||'latest')} snapshot.</div></div>
+      <div class="sub">From the ${esc(ps[0]?shortDay(ps[0].report_date):'latest')} snapshot.</div></div>
       <div class="pills"><span class="pill">book value
         <b class="${cls(val)}">${cash(val)}</b></span></div></div>
     ${ps.length?`<table><thead><tr><th>contract</th><th>side</th><th class="n">qty</th>
@@ -4019,7 +4031,7 @@ function allocationCard(){
       `Each stock, and the underlying each option is written on, as a share of net
        liquidation. A short option is money the account owes back, so its share is
        negative. The rows and cash sum to net liquidation.`)}</h2>
-      <div class="sub">From the ${esc(al.as_of||'latest')} snapshot.</div></div>
+      <div class="sub">From the ${esc(al.as_of?shortDay(al.as_of):'latest')} snapshot.</div></div>
       ${al.nav!=null?`<div class="pills"><span class="pill">net liquidation
         <b>${cash(al.nav)}</b></span></div>`:''}</div>
     <table class="alloc"><thead><tr><th>holding</th><th class="n">stock</th>
@@ -4073,9 +4085,9 @@ function portfolio(){
       <div class="sub">${esc(dayLabel(ptot.start,true))} to
         ${esc(dayLabel(ptot.end,true))}, in ${esc(DISP())}.</div></div></div>
     <div class="stats c3">
-      ${statCard('Net liquidation',cash(ptot.nav),`As reported for ${ptot.end}.`)}
+      ${statCard('Net liquidation',cash(ptot.nav),`As reported for ${shortDay(ptot.end)}.`)}
       ${statCard('Put in',cash(ptot.put_in),
-        `${cash(ptot.start_nav)} on ${ptot.start}, plus ${cash(ptot.deposits)} deposited since.`)}
+        `${cash(ptot.start_nav)} on ${shortDay(ptot.start)}, plus ${cash(ptot.deposits)} deposited since.`)}
       ${statCard('Market result',cash(ptot.gain),
         'Net liquidation less the money put in.',cls(ptot.gain))}
     </div>
@@ -4265,7 +4277,7 @@ function costs(){
       published rate, so the figure shown is the midpoint of
       ${cash(F.total_low_base)}–${cash(F.total_high_base)}.</span>i</span>`:''}</h2>
       <div class="sub">${esc(costPeriod(bc))} ·
-        ${CT.fills} fill(s) · ${esc(costScopeLabel(bc.scope))} · ${esc(ccyNote())}</div></div>
+        ${plural(CT.fills,'fill')} · ${esc(costScopeLabel(bc.scope))} · ${esc(ccyNote())}</div></div>
       <div class="pills">
         <span class="pill tipped" tabindex="0">charged <b>${
           cash(F.stated.base)}</b><span class="tip">What IBKR billed, summed from
@@ -4273,7 +4285,7 @@ function costs(){
         ${F.is_estimated?`<span class="pill tipped" tabindex="0">estimated <b>${
           cash(est)}</b><span class="tip">The AutoFX rate markup on ${
           num(CT.autofx.notional_base,0)} ${esc(BASE())} converted across ${
-          CT.autofx.conversions} auto-conversion(s). IBKR publishes ${
+          plural(CT.autofx.conversions,'auto-conversion')}. IBKR publishes ${
           CT.autofx.bps} bps and describes it as typical and at its discretion; a
           year of this account's conversions implied ${CT.autofx.measured_bps} bps.
           Shown here as the midpoint of ${cash(F.estimated_low_base)}–${
@@ -4298,7 +4310,7 @@ function costs(){
    real, so the caption has to say which of the two it is. */
 function costPeriod(bc){
   return bc.from_date&&bc.to_date
-    ? `${bc.from_date} → ${bc.to_date}`
+    ? `${shortDay(bc.from_date)} to ${shortDay(bc.to_date)}`
     : 'no trades in this selection';
 }
 /* Names the scope in the same vocabulary the chips use, from the payload's own
@@ -4339,8 +4351,8 @@ function costCategories(bc){
             be commission per euro -- not a rate anyone charges.</span></span>`
           :chargeFig(cc.per_unit,4)}</td>`:''}</tr>`).join('')}
     </tbody></table>
-    ${bc.totals.credit_fills?`<div class="note">${bc.totals.credit_fills} fill(s)
-      carried a commission CREDIT, netted off rather than added — IBKR issues one
+    ${bc.totals.credit_fills?`<div class="note">${plural(bc.totals.credit_fills,'fill')}
+      carried a commission CREDIT, netted off rather than added. IBKR issues one
       when it adjusts a per-order minimum across a split order.</div>`:''}
   </div>`;
 }
@@ -4655,18 +4667,18 @@ function market(){
         job fetches them by itself, or press <b>Refresh</b> above.</div>`
     : evs.length===0
     ? `<div class="empty">no events match this filter.
-        ${hidden} of ${mk.total_events||0} stored event(s) are hidden — widen a row
+        ${hidden} of ${plural(mk.total_events||0,'stored event')} are hidden. Widen a row
         above, or press <b>All ${mk.total_events||0}</b>.</div>`
     : `<div class="empty">no events on this day under the current filter.</div>`;
 
   return `<div class="card">
     <div class="crow"><h3>Economic Calendar</h3>
-      <span class="pill">${esc(mk.from_day)} – ${esc(mk.to_day)}</span>
+      <span class="pill">${esc(shortDay(mk.from_day))} to ${esc(shortDay(mk.to_day))}</span>
       <button id="mkfetch" class="btn sm">Refresh</button></div>
     ${filters}
     <div class="cal mkweek">${cells}</div>
-    ${sel?`<div class="crow mksel"><h3>${esc(sel)}</h3>
-      <span class="dim">${chosen.length} event(s)${
+    ${sel?`<div class="crow mksel"><h3>${esc(shortDay(sel))}</h3>
+      <span class="dim">${plural(chosen.length,'event')}${
         hidden?` · ${hidden} hidden by the filter`:''}</span></div>${rows}`
       :empty}
     <div class="dim mkattr">impact is ${esc(mk.impact_source)}'s assessment, not
@@ -4842,7 +4854,7 @@ const WDIR={up:'↑',down:'↓',flat:'→'};
 function wprice(px,w){
   if(px.price==null) return wdash(`no close stored for ${w.symbol} yet: the `
     +`daily price job fills it in`);
-  const stamped=w.closes_through?`stored close from ${w.closes_through}`
+  const stamped=w.closes_through?`stored close from ${shortDay(w.closes_through)}`
     :'stored close';
   return num(px.price,2)+(px.live?'':`<span class="dim wstale" title="${
     esc(stamped)}; press Refresh prices for a quote">*</span>`);
@@ -4902,10 +4914,10 @@ const wearn=w=>{
   if(!w.earnings_date) return wdash(`no earnings date: a fund has none, and for a `
     +`company the feed has not answered yet`);
   const days=w.earnings_in_days;
-  const when=days==null?esc(w.earnings_date):days<0?'past':days===0?'today':days+'d';
+  const when=days==null?esc(shortDay(w.earnings_date)):days<0?'past':days===0?'today':days+'d';
   /* A tilde marks an estimate, so a guessed date never reads as a known one. */
   return `<span class="${w.earnings_source==='estimated'?'dim':''}" title="${esc(
-    `${w.earnings_date}, ${wearnWhose(w)}`)}">${w.earnings_source==='estimated'
+    `${shortDay(w.earnings_date)}, ${wearnWhose(w)}`)}">${w.earnings_source==='estimated'
     ?'~':''}${when}</span>`;
 };
 
@@ -4937,7 +4949,7 @@ const wselwhy=(w,name)=>{
   const what=name||w.symbol;
   if(!w.held) return what;
   const n=(w.options||[]).length;
-  return `${what}; you hold ${n} option position(s) on it`;
+  return `${what}; you hold ${plural(n,'option position')} on it`;
 };
 
 /* Whether a company NAME exists to search against yet.
@@ -5008,7 +5020,7 @@ function wactive(){
 function wnorows(){
   const total=(S.state.watchlist||[]).length;
   const on=wactive();
-  return `nothing matches: all ${total} watched symbol(s) are hidden by `
+  return `nothing matches: all ${plural(total,'watched symbol')} are hidden by `
     +`${on.join(' and ')||'the filter row'}`;
 }
 
@@ -5295,7 +5307,7 @@ function watchDetail(w){
     ${kv('weekly',w.bx_weekly==null?wdash(`${w.weeks} of ${BX_SETTLED} ISO weeks stored`)
       :`<span class="${cls(w.bx_weekly,1)}">${num(w.bx_weekly,1)}</span>`,
       w.bx_weekly_week==null?'no closes stored yet, so there is no week to read'
-        :`${w.bx_weekly_week}, ${w.bx_weekly_sessions||0} session(s) of a full week's `
+        :`${w.bx_weekly_week}, ${plural(w.bx_weekly_sessions||0,'session')} of a full week's `
           +`five: the newest week is usually partial, and a figure over it repaints `
           +`as its sessions land`)}`);
 
@@ -5304,9 +5316,10 @@ function watchDetail(w){
       ${kv('ivr · iv rank, 1y',ivr?num(ivr.rank,1):wdash(ivrWhy(w.symbol)),
         ivr?`implied vol is ${num(ivr.iv30,1)}%, ${num(ivr.rank,1)}% of the way from `
           +`this year's low, ${num(ivr.low,1)}%, to its high, ${num(ivr.high,1)}%. `
-          +`${IVR_SOURCE}, as of ${ivr.as_of}`:ivrWhy(w.symbol))}
+          +`${IVR_SOURCE}, as of ${`${shortDay(ivr.as_of)} ${
+            String(ivr.as_of).slice(11,16)}`.trim()}`:ivrWhy(w.symbol))}
       ${kv('realised vol',w.realised_vol==null
-        ?wdash(`${w.closes} session(s) stored; six closes is the fewest a standard `
+        ?wdash(`${plural(w.closes,'session')} stored; six closes is the fewest a standard `
           +`deviation is worth reporting over`)
         :num(w.realised_vol,1)+'%',
         'annualised from the stored daily closes: what the stock DID, where IV '
@@ -5326,10 +5339,10 @@ function watchDetail(w){
   const opts=(w.options||[]).map(wo=>
     `<div class="mono wpos">${wo.quantity>0?'+':''}${wo.quantity} ${
       wo.strike!=null?strike(wo.strike):''}${wo.put_call||''}${wo.expiry?
-      ` <span class="dim">${esc(wo.expiry)}</span>`:''}</div>`).join('');
+      ` <span class="dim">${esc(dayLabel(wo.expiry,true))}</span>`:''}</div>`).join('');
   const mine=sec('yours',
     `${kv('earnings',w.earnings_date?`${w.earnings_source==='estimated'?'~':''}${
-      esc(w.earnings_date)}${w.earnings_in_days==null?''
+      esc(shortDay(w.earnings_date))}${w.earnings_in_days==null?''
       :` <span class="dim">${esc(w.earnings_in_days<0?'past'
         :w.earnings_in_days===0?'today':'in '+w.earnings_in_days+'d')}</span>`}`
       :wdash(`no earnings date for ${w.symbol}`),
@@ -5488,9 +5501,9 @@ function odte(){
       autocomplete="off" spellcheck="false" data-zread="${key}" data-bound
       aria-describedby="${id}from" value="${esc(zread(key))}">
     <div class="wcap" id="${id}from">${typed==null
-      ?(oc.fresh?`the feed's reading, ${esc(day)}`:'no current reading: type one')
+      ?(oc.fresh?`the feed's reading, ${esc(shortDay(day))}`:'no current reading: type one')
       :feed==null?'typed; there is no feed reading to go back to yet'
-      :`typed — the feed read <b>${level(feed)}</b> on ${esc(day)}
+      :`typed; the feed read <b>${level(feed)}</b> on ${esc(shortDay(day))}
         <button class="zlink" data-zreset="${key}">use it</button>`}</div>
   </div>`;
 
@@ -5575,7 +5588,7 @@ function odte(){
       <b>Trades</b> with the <b>0DTE</b> filter, and how they did against the rest of
       the book is below the ladder.</span>i</span></h2>
       <div class="sub">Where a same-day move lands${oc.today?` for <b>${
-      esc(oc.today)}</b>`:''}, strike by strike. Index levels, not ${
+      esc(shortDay(oc.today))}</b>`:''}, strike by strike. Index levels, not ${
       esc(BASE())}.</div></div></div>
     ${none?'':events.length?`<div class="zevents">${events.map(oe=>`<span
       class="zevent" title="${ZTIER[oe.tier-1]} — the journal's ranking; the feed grades it
@@ -5601,7 +5614,7 @@ function odte(){
       shown.</b> ${esc(oc.stale_reason||'')}.${S.zerr?` The refresh failed:
       ${esc(S.zerr)}.`:''} Type a live reading into either field, or
       <button class="zlink" data-zretry>check again</button>.</div>`
-    :`<div class="wcap zstat">S&amp;P close from <b>${esc(oc.spx_date)}</b> ·
+    :`<div class="wcap zstat">S&amp;P close from <b>${esc(shortDay(oc.spx_date))}</b> ·
       VIX ${oc.live?'live, ':''}as of <b>${esc(etTime(oc.vix_fetched_at))}</b>${
       S.zbusy?' · checking…':''}</div>`}
     <div class="zfeed">
@@ -5628,8 +5641,8 @@ function odte(){
         below is a percentage of the level resolved to the nearest listed <b>$5</b>
         strike, so a strike's <b>Move %</b> is the distance to the CONTRACT and
         reads a little either side of the rail that produced it.${stale? ` The VIX
-        is from ${esc(oc.vix_date)} while the S&amp;P close is
-        ${esc(oc.spx_date)}; the next fetch aligns them.`:''}</span>i</span>`
+        is from ${esc(shortDay(oc.vix_date))} while the S&amp;P close is
+        ${esc(shortDay(oc.spx_date))}; the next fetch aligns them.`:''}</span>i</span>`
       /* An instruction, not an explanation, so it stays on screen: there is no
          figure to hide it behind and nothing on the tab works until it is
          followed. */
@@ -5960,20 +5973,15 @@ function companionPost(){
 function provisionalBanner(){
   const pv=(S.state&&S.state.provisional)||{};
   if(!pv.unsettled) return '';
-  /* IBKR sends `20260924`; every other date on this page is dashed, and a caption
-     mixing the two spellings reads like a leaked internal field. */
-  const raw=String(pv.newest||'');
-  const iso=/^\d{8}$/.test(raw)
-    ? `${raw.slice(0,4)}-${raw.slice(4,6)}-${raw.slice(6,8)}` : raw.slice(0,10);
-  const day=iso?` (newest ${esc(iso)})`:'';
+  const day=pv.newest?` (newest ${esc(shortDay(pv.newest))})`:'';
   /* Same-session P&L is the journal's FIFO estimate, and an estimated rate makes
      the base figures approximate too. A close the estimate could not price has
      no P&L at all, the stronger claim, so it is said on its own. */
   const fx=pv.fills?', and base-currency figures use a live FX rate':'';
   const unpriced=pv.unpriced
-    ? ` No realised P&L yet for ${pv.unpriced} close(s), because the journal does
+    ? ` No realised P&L yet for ${plural(pv.unpriced,'close')}, because the journal does
       not hold the fills they close.` : '';
-  return ` <b class="warn2">${pv.unsettled} same-session fill(s)${day}</b>.
+  return ` <b class="warn2">${plural(pv.unsettled,'same-session fill')}${day}</b>.
     Their P&L is estimated from your fills${fx}. Tomorrow's statement replaces
     ${pv.fills?'both':'it'} with IBKR's.${unpriced}`;
 }
@@ -6248,11 +6256,12 @@ function settingsPanel(){
           (${st.sync.cooldown_remaining_s}s remaining)</td></tr>
         <tr><td class="dim">generated</td><td class="mono">${esc(st.generated_at)}</td></tr>
       </tbody></table>
-      <h2 class="sub3 mt-5">Archive — ${(st.statements||[]).length} statement(s)</h2>
+      <h2 class="sub3 mt-5">Archive · ${plural((st.statements||[]).length,'statement')}</h2>
       <table><thead><tr><th>file</th><th>period</th><th class="n">bytes</th>
         <th>ingested</th><th>assets</th></tr></thead><tbody>
         ${(st.statements||[]).map(stm=>`<tr><td class="mono">${esc(stm.file)}</td>
-          <td class="dim">${esc(stm.from_date||'?')} → ${esc(stm.to_date||'?')}</td>
+          <td class="dim">${esc(stm.from_date?shortDay(stm.from_date):'?')} to ${
+            esc(stm.to_date?shortDay(stm.to_date):'?')}</td>
           <td class="n">${(stm.bytes||0).toLocaleString()}</td>
           <td class="${stm.ingested?'pos':'dim2'}">${stm.ingested?'yes':'no'}</td>
           <td class="dim">${esc(stm.asset_filter||'-')}</td></tr>`).join('')}
@@ -6765,7 +6774,7 @@ function draw(push){
      a signal rather than hiding it. Off for a friend, so the footer reads
      exactly as before. */
   $('#foot').innerHTML=`optjournal ${esc(st.version)} · ${esc(st.db)}`
-    +`${cn.through?` · statements through ${esc(cn.through)}`:''}`
+    +`${cn.through?` · statements through ${esc(shortDay(cn.through))}`:''}`
     +` · <span id="fresh">${esc(freshNote())}</span> · loopback only, `
     +`no authentication${st.dev?' · <b class="devtag">dev mode</b>':''}`;
   /* `st.sync||{}`, the same idiom as `(S.state.scheduler||{}).jobs` elsewhere, and
@@ -7076,7 +7085,7 @@ function bindMarketFetch(){
       if(mres.kind==='throttled') note('Calendar: '+esc(mres.message||'rate limited')
         +' — nothing lost, the same week is served later.','warn');
       else if(!mres.ok) note('Calendar refresh failed: '+esc(mres.message||''),'bad');
-      else note(`Calendar refreshed — <b>${mres.stored}</b> of ${mres.fetched} event(s) stored.`,'ok');
+      else note(`Calendar refreshed: <b>${mres.stored}</b> of ${plural(mres.fetched,'event')} stored.`,'ok');
     }catch(e){note('Calendar refresh failed: '+esc(e),'bad');}
     await load();
   };
@@ -7474,7 +7483,7 @@ $('#sync').onclick=async()=>{
     if(res.kind==='cooldown') note(esc(res.message),'warn');
     else if(!res.ok) note(esc(res.message||'Sync failed'),'bad');
     else if(res.new_trades||res.new_cash)
-      note(`Synced — <b>${res.new_trades}</b> new trade(s), <b>${res.new_cash}</b> new cash row(s).`,'ok');
+      note(`Synced: ${plural(res.new_trades,'new trade')}, ${plural(res.new_cash,'new cash row')}.`,'ok');
     else note('Synced. Nothing new'+(res.reused_archive
       ?' — payload identical to the last statement, so no duplicate was archived.':'.'),'ok');
     if(res.warnings&&res.warnings.length) note(esc(res.warnings.join(' · ')),'warn');

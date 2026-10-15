@@ -720,13 +720,16 @@ def check_drilldown_renders_from_url(p: Page) -> Verdict:
     if not p.calday:
         return skip("not a drill-down page")
     days = [d.get("day") for d in ((p.payload.get("stats") or {}).get("days") or [])]
+    # The panel is the one place with a clear button; its caption is page prose
+    # ("4 Aug · 2 fills"), so the check keys on the control.
+    panel = "data-calday-clear" in p.markup
     if p.calday not in days:
         # A stale or invented day must heal away rather than render an empty
         # panel claiming that date had fills.
-        if re.search(re.escape(p.calday) + r"\s*—\s*\d+\s*fill", p.markup):
+        if panel:
             return bad(f"stale calday={p.calday} rendered a panel for a day with no fills")
         return ok()
-    if not re.search(re.escape(p.calday) + r"\s*—\s*\d+\s*fill", p.text):
+    if not panel:
         return bad(f"calday={p.calday} in the URL but no drill-down panel rendered")
     selected = p.markup.count(" selected")
     if selected != 1:
@@ -742,7 +745,7 @@ def check_drilldown_legs_have_context(p: Page) -> Verdict:
     """
     if not p.calday:
         return skip("not a drill-down page")
-    panel = re.search(r'fill\(s\)(.*)$', p.markup, re.S)
+    panel = re.search(r'data-calday-clear(.*)$', p.markup, re.S)
     if not panel:
         return skip("no drill-down panel on this page")
     legs = re.findall(r'<div class="leg([^"]*)"', panel.group(1))
