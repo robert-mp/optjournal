@@ -279,8 +279,8 @@ def _closed_card(label: str, *captions: str) -> str:
     """A closed position's row and opened card, in the markup shape `trades()`
     renders."""
     events = "".join(
-        f'<div class="grp"><div class="gh"><span class="gl">2026-08-31 — {c} '
-        f'<span class="dim2 mono">order 1</span></span></div>'
+        f'<div class="grp"><div class="gh"><span class="gl" title="order 1">31 Aug — {c}'
+        f'</span></div>'
         f'<div class="leg"><span class="act">BTC</span></div></div>'
         for c in captions)
     return (f'<tr class="rk on" data-topen="lc:1@2026-08-01" tabindex="0">'

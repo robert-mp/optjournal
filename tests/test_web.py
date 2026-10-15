@@ -7845,12 +7845,45 @@ def test_the_trades_list_filters_by_status_and_symbol():
         ["No open position matches “GOOG”."]]
 
 
+def test_a_trades_card_says_what_happened_and_keeps_the_order_ids_for_a_tooltip():
+    """Every card carried IBKR's order ids in its event lines, ISO dates, and on a
+    single leg the same 25-word paragraph explaining what a strategy is. The line
+    reads "14 Oct — Opened"; the ids are in its tooltip, and the paragraph is gone."""
+    leg = {"buy_sell": "SELL", "open_close": "O", "underlying_symbol": "CRWD",
+           "strike": 220, "expiry": "2026-11-20", "put_call": "P", "quantity": -1,
+           "avg_price": 4.23, "currency": "USD",
+           "money": {"proceeds": {"base": 380.07, "native": None, "ccy": None}}}
+    lc = {"underlying": "CRWD", "label": "Short put", "status": "open",
+          "opened_at": "2026-10-14 10:38:17", "replay_key": "lc:1@2026-10-14",
+          "realized_pnl": None, "unrealized": None,
+          "events": [{"label": "Short put", "first_fill_at": "2026-10-14 10:38:17",
+                      "order_ids": ["1310361346"], "orders": [{"legs": [leg]}]}]}
+    out = _node_run([
+        f"import {{esc,money,cls,strike,dayLabel}} from '{_static('format.js')}';",
+        "Date.now=()=>Date.parse('2026-10-15T15:00:00Z');",
+        "const DISP=()=>'EUR', conv=v=>v==null?null:Number(v);",
+        "const cash=(v,d)=>money(conv(v),DISP(),d);",
+        *(_page_stmt(n) for n in ("isNativeCharge", "moneyOf", "amountOf", "MKT",
+                                  "etday")),
+        "function journalRow(){return '';}",
+        "const S={state:{replays:{}},replay:null};",
+        _fn("actClass"), *_page_fns("actLabel", "legRow", "tradeDay", "tradeCard"),
+        f"const html=tradeCard({json.dumps(lc)});",
+        "console.log(JSON.stringify({html,",
+        "  text:html.replace(/<[^>]+>/g,' ').replace(/\\s+/g,' ').trim()}));",
+    ])
+    assert re.search(r'<span class="gl" title="order 1310361346">14 Oct — Opened</span>',
+                     out["html"]), out["html"]
+    assert "1310361346" not in out["text"], "an order id is still in the visible text"
+    assert "single-leg" not in out["text"]
+
+
 def test_a_note_no_card_claims_is_drawn_on_the_trades_tab():
     """`serialize.journal_data` lists orphaned entries; the Trades tab draws them,
     with every reader-typed value escaped, whether or not any card is drawn."""
     src = _fn("orphanNotes")
     assert "(S.state.journal||{}).orphans" in src
-    for value in ("esc(je.underlying", "esc(String(je.opened_on",
+    for value in ("esc(je.underlying", "esc(je.opened_on?tradeDay(je.opened_on)",
                   "esc(je.anchor)", "esc(je[jf.name])"):
         assert value in src, f"{value} is not escaped"
     assert _fn("trades").count("orphanNotes()") == 2, (
