@@ -1103,8 +1103,7 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
    tab's grid is not touched. */
 .cal.mkweek{grid-template-columns:repeat(7,minmax(0,1fr))}
 .mktoday{border-color:var(--accentedge)}
-/* A day listed ahead of the calendar feed (see `ahead.py`): dashed, and the
-   card's attribution line says what the dash means. */
+/* A day listed ahead of the calendar feed (see `ahead.py`). */
 .mkahead{border-style:dashed;border-color:var(--line2)}
 .mkahead.mktoday{border-color:var(--accentedge)}
 .mkdots{display:flex;flex-direction:column;gap:var(--s1);margin-top:var(--s2)}

@@ -70,7 +70,7 @@ from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 from optjournal import __version__, install, journal, replay, updates
 from optjournal import earnings as earnings_mod
 from optjournal import settings as prefs
-from optjournal.ahead import refresh_calendar
+from optjournal.ahead import WEEKS_SHOWN, refresh_calendar
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.bars import fetch_watch_bars
@@ -767,9 +767,8 @@ def build_state(
             # `market` job does (and Refresh, by hand), because the feed rate
             # limits (429 with a retry-after) and a tab reload is not a reason to
             # spend a request against it.
-            # This week, then next: the Market tab steps between them.
             "market": [market_data(conn, now=datetime.now(UTC), week=week)
-                       for week in (0, 1)],
+                       for week in range(WEEKS_SHOWN)],
             # Prices and realised vol from bars already stored, so this
             # spends nothing. The daily `bars_daily` job is what fills them in.
             "watchlist": watchlist_data(conn),
@@ -1547,7 +1546,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return parsed if isinstance(parsed, dict) else {}
 
     def _market_fetch(self) -> tuple[int, dict[str, Any]]:
-        """Refresh the calendar from the feed. No IBKR request, no lock.
+        """Refresh the calendar and the days ahead of it. No IBKR request, no lock.
 
         Deliberately NOT behind the sync lock: that lock exists to stop two IBKR
         fetches racing on the archive, and this touches neither. It does hit a
@@ -1557,8 +1556,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """
         with open_journal(self.cfg.db_path) as conn:
             done = refresh_calendar(conn, now=datetime.now(UTC))
-        # The days ahead are refreshed whatever ForexFactory answered, so their
-        # count and failure ride on every reply rather than only a good one.
         ahead = ({"ahead": 0, "ahead_error": str(done.ahead)}
                  if isinstance(done.ahead, EventFetchError)
                  else {"ahead": done.ahead.stored, "ahead_error": None})

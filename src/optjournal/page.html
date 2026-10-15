@@ -232,8 +232,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Array} lifecycles -- Lifecycle rows: strategies linked by episode
  * @property {History} history
  * @property {Array} statements -- Statement rows, the archive inventory
- * @property {Array} market -- Market rows, this week then next: the economic
- *   calendar a week at a time (serialize.market_data)
+ * @property {Array} market -- Market rows, this week and the two after it: the
+ *   economic calendar a week at a time (serialize.market_data)
  * @property {Array} watchlist -- Watch rows (serialize.watchlist_data)
  * @property {Scheduler} scheduler -- what the jobs did, and whether the loop is
  *   alive (serialize.jobs_data). Two separate questions: see the typedef
@@ -1619,9 +1619,9 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      Not in the hash, for the same reason as marketday: a link to "the calendar"
      means the week, not one reading of it. */
   mkcountries:null,mkimpacts:null,
-  /* Which week the Market tab shows, as an index into `State.market`: 0 for this
-     week, 1 for next. IN the hash, unlike marketday: a link to the calendar
-     means a week, and "next week's calendar" is a week worth sending. */
+  /* Which week the Market tab shows, as an index into `State.market` and
+     MKWEEK_LABEL: 0 for this week. IN the hash, unlike marketday: a link to the
+     calendar means a week, and "next week's calendar" is a week worth sending. */
   mkweek:0,
   /* Which watched symbol the detail pane is showing. IN the hash, unlike
      marketday and for the opposite reason: the market strip always has a
@@ -4626,13 +4626,14 @@ function monthlyTable(){
 }
 
 /* ------------------------------------------------ 0DTE */
-/* The week on screen: `S.mkweek` into `State.market`, this week when the hash
-   names a week the payload does not hold. */
+/* This week when the hash names a week the payload does not hold. */
 function marketWeek(){
   const weeks=(S.state&&S.state.market)||[];
   return weeks[S.mkweek]||weeks[0]||null;
 }
-/* Market Awareness: this week and next, and what lands on each day.
+const MKWEEK_LABEL=['This week','Next week','Week after next'];
+const MKWEEK_KEY=['','next','after-next'];
+/* Market Awareness: this week and the two after it, and what lands on each day.
  *
  * Read-only. The page never fetches the calendar -- `optjournal market --fetch`
  * does, from the nightly cron, because the feed rate limits (429 with a
@@ -4730,8 +4731,7 @@ function market(){
       </div>${figs?`<div class="dim mkfig">${figs}</div>`:''}</div>`;
   }).join('');
 
-  /* A day listed ahead says so where its rows are read, and why its grades are
-     not the feed's. "Nothing released" for a day still to come only: today has
+  /* "Nothing on it is released yet" for a day still to come only: today has
      released some of its rows by the afternoon, and a listed day is in the past
      only when the feed stopped serving weeks. */
   const aheadNote=(mk.week||[]).some(d=>d.day===sel&&d.ahead)?`<div class="note">Listed ahead by
@@ -4739,7 +4739,11 @@ function market(){
     day yet.${sel>mk.today?' Nothing on it is released yet.':''} The grades are
     this journal's, as ${esc(mk.ahead_source)} publishes none, and
     ${esc(mk.impact_source)}'s listing replaces these rows when it arrives.</div>`:'';
-  const anyAhead=(mk.week||[]).some(d=>d.ahead);
+  /* Whose rows these are, said only of rows that exist: a journal that has
+     fetched nothing yet has every day dashed and nothing listed. */
+  const listed=(mk.events||[]).some(mev=>mev.source===mk.ahead_source);
+  const anyAhead=listed&&(mk.week||[]).some(d=>d.ahead);
+  const allAhead=listed&&(mk.week||[]).every(d=>d.ahead);
 
   /* How many rows the filter is holding back, so the reader knows the calendar is
      narrowed rather than quiet. */
@@ -4774,7 +4778,7 @@ function market(){
      nothing at all. Conflating any two is how a working calendar reads as
      broken -- which is what the old single message did. */
   const empty=(mk.total_events||0)===0
-    ? `<div class="empty">no events stored for ${S.mkweek?'next':'this'} week yet.
+    ? `<div class="empty">no events stored for ${MKWEEK_LABEL[S.mkweek].toLowerCase()} yet.
         The daily calendar job fetches them by itself, or press <b>Refresh</b>
         above.</div>`
     : evs.length===0
@@ -4783,17 +4787,15 @@ function market(){
         above, or press <b>All ${mk.total_events||0}</b>.</div>`
     : `<div class="empty">no events on this day under the current filter.</div>`;
 
-  /* The month stepper's shape, for a week. Two weeks are held, so the ends are
-     disabled rather than wrapping round. */
   return `<div class="card">
     <div class="crow"><h3>Economic Calendar</h3>
       <div class="pstep">
         <button data-mkweek="${S.mkweek-1}" ${S.mkweek<=0?'disabled':''}
-          title="This week" aria-label="Previous week">‹</button>
-        <span class="plabel">${S.mkweek?'Next week':'This week'} ·
+          title="${MKWEEK_LABEL[S.mkweek-1]||''}" aria-label="Previous week">‹</button>
+        <span class="plabel">${MKWEEK_LABEL[S.mkweek]} ·
           ${esc(shortDay(mk.from_day))} to ${esc(shortDay(mk.to_day))}</span>
         <button data-mkweek="${S.mkweek+1}" ${S.mkweek>=weeks-1?'disabled':''}
-          title="Next week" aria-label="Next week">›</button>
+          title="${MKWEEK_LABEL[S.mkweek+1]||''}" aria-label="Next week">›</button>
       </div>
       <button id="mkfetch" class="btn sm">Refresh</button></div>
     ${filters}
@@ -4802,10 +4804,13 @@ function market(){
       <span class="dim">${plural(chosen.length,'event')}${
         hidden?` · ${hidden} hidden by the filter`:''}</span></div>${aheadNote}${rows}`
       :empty}
-    <div class="dim mkattr">impact is ${esc(mk.impact_source)}'s assessment, not
-      this journal's${anyAhead?`. ${esc(mk.impact_source)} has not published the
-      dashed days yet, so their rows are listed ahead by ${esc(mk.ahead_source)}
-      and graded by this journal`:''} · times in ${esc(mk.zone)}</div>
+    <div class="dim mkattr">${allAhead?`every day here is listed ahead by
+      ${esc(mk.ahead_source)}, as ${esc(mk.impact_source)} has not published this
+      week yet, and impact is this journal's grade`
+      :`impact is ${esc(mk.impact_source)}'s assessment, not this journal's${anyAhead
+      ?`, except on the dashed days, which ${esc(mk.impact_source)} has not
+      published yet: their rows are listed ahead by ${esc(mk.ahead_source)} and
+      graded by this journal`:''}`} · times in ${esc(mk.zone)}</div>
   </div>`;
 }
 
@@ -6470,7 +6475,7 @@ function applyHash(){
      Validated in draw() against the payload rather than here, for calday's
      reason -- applyHash runs before the state it would check exists. */
   S.wsym=(hs.get('wsym')||'').toUpperCase()||null;
-  S.mkweek=hs.get('week')==='next'?1:0;
+  S.mkweek=Math.max(0,MKWEEK_KEY.indexOf(hs.get('week')||''));
   /* Validated against the registry, like the tab: an unknown id would otherwise
      put an unstyled `data-theme` on <html>, where the attribute matches no block
      and the page silently falls back to `:root` while the chip claims the bogus
@@ -6525,7 +6530,7 @@ function syncHash(push){
      the rule the theme and the display currency already follow for their
      defaults, and it also stops a re-sort from rewriting the address bar. */
   if(S.wsym) hs.set('wsym',S.wsym);
-  if(S.mkweek) hs.set('week','next');
+  if(S.mkweek) hs.set('week',MKWEEK_KEY[S.mkweek]);
   /* Leather is what `:root` already carries, so recording it would put a key in
      every URL to say "the default" -- the same rule the display currency follows
      for the account base. */
@@ -7212,11 +7217,11 @@ function bindMarketFetch(){
     try{
       const r=await fetch('/api/market/fetch',{method:'POST'});
       const mres=await r.json();
-      /* The days ahead are refreshed whatever the feed answered, so each reply
-         reports them; a failure there leaves the previous listing standing. */
+      /* The days ahead are refreshed whatever the feed answered, so every branch
+         reports them. */
       const ahead=mres.ahead_error?` The days ahead were not refreshed, so the
         earlier listing stands: ${esc(mres.ahead_error)}.`
-        :` ${plural(mres.ahead||0,'event')} listed ahead.`;
+        :mres.ahead==null?'':` ${plural(mres.ahead,'event')} listed ahead.`;
       if(mres.kind==='throttled') note('Calendar: '+esc(mres.message||'rate limited')
         +'. Nothing is lost, the same week is served later.'+ahead,'warn');
       else if(!mres.ok) note('Calendar refresh failed: '+esc(mres.message||'')+ahead,'bad');

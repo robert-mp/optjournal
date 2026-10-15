@@ -850,14 +850,14 @@ def market_data(
     """The economic calendar as the Market tab draws it: a week, and its events.
 
     `week` counts Mondays on from the current one, so 1 is next week. The page
-    gets this week and next as two of these, each with its own filter vocabulary
-    and counts, because a chip that counts two weeks while the strip shows one
-    would state a cost the reader cannot see.
+    gets one of these for each of `ahead.WEEKS_SHOWN` weeks, each with its own
+    filter vocabulary and counts, because a chip that counts two weeks while the
+    strip shows one would state a cost the reader cannot see.
 
     Two shapes rather than one list, because the page needs both and deriving the
     week strip in JavaScript would put a second calendar in a second language.
-    `week` is always seven days even when empty -- a strip with gaps in it would
-    read as missing data rather than as a quiet Tuesday.
+    The returned `week` strip is always seven days even when empty -- a strip with
+    gaps in it would read as missing data rather than as a quiet Tuesday.
 
     The week is Monday-anchored (`weekday()`), which is what the mockup shows and
     what an economic calendar means by a week; `days` extends the EVENT list past
@@ -930,8 +930,8 @@ def market_data(
             #: which a precomputed per-filter count could, and did.
             "events": by_day.get(day, 0),
             "today": day == today,
-            #: ForexFactory has not served this day's week, so what the day
-            #: holds is `ahead`'s listing, a quiet day included: `ahead`'s rule.
+            #: ForexFactory has not served this day's week, so the day holds
+            #: `ahead`'s listing, a quiet day included.
             "ahead": week_of((monday + timedelta(days=offset)).date()) not in served,
         })
 
@@ -1125,9 +1125,8 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
         }
         for r in rows
     ]
-    # Whether those rows are `ahead`'s listing rather than ForexFactory's, which
-    # changes whose grade `impact` is: a session after the current week, read on
-    # a Friday evening or a weekend.
+    # A session after the current week (a Friday evening or a weekend) holds
+    # `ahead`'s listing, whose `impact` is this journal's grade.
     events_ahead = any(r["source"] == AHEAD_SOURCE for r in rows)
 
     # FRESHNESS, judged against the clock rather than assumed from the rows. A

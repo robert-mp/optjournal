@@ -564,13 +564,14 @@ MUTANTS: tuple[Mutant, ...] = (
         breaks="a lagging account's held positions would be read at another "
                "account's newer date, so a position still open reads as CLOSED",
     ),
-    # The listing ahead (`ahead.py`). Each is a calendar that renders well-formed
-    # and is wrong, which is the shape nothing on the page would report.
+    # The listing ahead (`ahead.py`) and the weeks it fills. Each is a calendar
+    # that renders well-formed and is wrong, which is the shape nothing on the
+    # page would report.
     Mutant(
         key="ahead-calibrate",
         module="ahead.py",
-        find="        placing = calibrate(_get(probe), requested=probe,",
-        replace="        placing = MEASURED or calibrate(_get(probe), requested=probe,",
+        find="        placing = calibrate(_get(wednesday), requested=wednesday,",
+        replace="        placing = MEASURED or calibrate(_get(wednesday), requested=wednesday,",
         breaks="the day Nasdaq fixes its dates, every release listed ahead would be "
                "filed a day early, next week's claims on the Wednesday",
     ),
@@ -581,6 +582,14 @@ MUTANTS: tuple[Mutant, ...] = (
         replace="for clock in (-4,))",
         breaks="if Nasdaq's clock follows New York onto UTC-5 on 1 Nov, nothing "
                "would line up and the days ahead would stop refreshing all winter",
+    ),
+    Mutant(
+        key="ahead-reach",
+        module="ahead.py",
+        find="if _unlisted(reply)), len(days))",
+        replace="if False), len(days))",
+        breaks="a Monday that asks one day past Nasdaq's reach would fail the whole "
+               "listing, so next week and the week after stop refreshing",
     ),
     Mutant(
         key="ahead-overlap",

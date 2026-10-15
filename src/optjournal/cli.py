@@ -640,6 +640,7 @@ def cmd_market(args) -> int:
             # command's exit for ForexFactory's week.
             if isinstance(done.ahead, EventFetchError):
                 print(f"calendar ahead failed: {done.ahead}", file=sys.stderr)
+                result["ahead_error"] = str(done.ahead)
             else:
                 result["ahead"] = done.ahead.stored
                 lines.append(f"ahead {done.ahead.stored} listed by {AHEAD}")
@@ -654,7 +655,8 @@ def cmd_market(args) -> int:
                 return EXIT_ERROR
             result["fetched"] = done.fetched
             result["stored"] = done.stored
-            lines.insert(0, f"calendar {done.fetched} event(s) -> {done.stored} stored")
+            noun = "event" if done.fetched == 1 else "events"
+            lines.insert(0, f"calendar {done.fetched} {noun} -> {done.stored} stored")
 
         now = datetime.now(UTC)
         start = int(now.timestamp())

@@ -166,7 +166,7 @@ function tier(title, impact) {
 /* The feed's verb for a speech, which is how a speaker's surname is found. */
 const SPEAKS = /\bspeaks\b/i;
 
-/* A central banker with a microphone: an FOMC member or the Chair, speaking.
+/* A central banker with a microphone: anyone at the Fed, speaking.
  * Matched on the feed's own titles, "FOMC Member Barkin Speaks" and "Fed Chair
  * Powell Speaks", which are the same kind of event, and on the listing ahead's
  * (`ahead.py`), which also writes "Fed Waller Speaks" and "Fed Governor Cook

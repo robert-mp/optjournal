@@ -3466,7 +3466,8 @@ def _run_hash_handler(steps: list[tuple[str, str]]) -> list[dict]:
     handler = re.search(r"^window\.onhashchange=\(\)=>\{.*?\n\};", js, re.S | re.M)
     assert handler, "the hashchange handler moved"
     consts = [_page_const(name) for name in
-              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "COST_OPTIONS")]
+              ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "COST_OPTIONS",
+               "MKWEEK_KEY")]
     return _node_run([
         f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
         "const location={hash:''}, window={}, calls=[];",
@@ -3521,7 +3522,7 @@ def _hash_harness(script: list[str]) -> Any:
     assert handler, "the hashchange handler moved"
     consts = [_page_const(name) for name in
               ("TABS", "HASH_TABS", "THEMES", "THEME_IDS", "COST_OPTIONS",
-               "SCOPE_KEYS")]
+               "SCOPE_KEYS", "MKWEEK_KEY")]
     return _node_run([
         f"import {{sanitizeLevel}} from '{_static('zdte.js')}';",
         "const location={hash:'',pathname:'/'}, window={};",
@@ -3562,6 +3563,21 @@ def _draw_heals() -> str:
     draw = _code_only(_fn("draw"))
     start = draw.index("if(S.calday&&S.state&&")
     return draw[start:draw.index("if(S.replay&&S.state&&", start)]
+
+
+def test_a_market_week_is_written_to_the_hash_and_read_back():
+    """Each step of the Market tab's week stepper is a link: draw() writes the week
+    into the hash, and applyHash reads the same week back from it."""
+    out = _hash_harness([
+        "await fresh('#tab=market'); const out={};",
+        "for(const w of [1,2,0]){S.mkweek=w; draw(); out[w]=drawn.hash;}",
+        "for(const w of [1,2]){S={}; location.hash=out[w]; applyHash();",
+        "  out['read'+w]=S.mkweek;}",
+        "console.log(JSON.stringify(out));",
+    ])
+    assert (out["1"], out["2"], out["0"]) == (
+        "#tab=market&week=next", "#tab=market&week=after-next", "#tab=market"), out
+    assert (out["read1"], out["read2"]) == (1, 2), out
 
 
 def test_the_wire_spelling_of_the_current_month_is_the_current_month():

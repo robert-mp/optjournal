@@ -15,18 +15,20 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sqlite3
 import urllib.error
 import urllib.request
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from conftest import connect_migrated
+from conftest import ROOT, connect_migrated
 
 from optjournal import ahead, jobs
 from optjournal.ahead import MEASURED, SOURCE, Placing, parse_day, refresh_ahead
 from optjournal.bars import upsert_bars
 from optjournal.clock import MARKET_TZ
+from optjournal.db import connect
 from optjournal.events import (
     DEFAULT_COUNTRIES,
     DEFAULT_IMPACTS,
@@ -59,7 +61,6 @@ FF_WEEK = [
     _ff("2026-10-15T08:30:00", "USD", "High", "Retail Sales m/m"),
     _ff("2026-10-17T10:15:00", "All", "Low", "IMF Meetings"),
 ]
-#: The week after, once ForexFactory serves it.
 FF_NEXT = [
     _ff("2026-10-20T10:00:00", "USD", "Low", "NAHB Housing Market Index"),
     _ff("2026-10-22T08:30:00", "USD", "Medium", "Unemployment Claims"),
@@ -78,6 +79,13 @@ def _reply(rows: list[dict], code: int = 200) -> dict:
             "message": None, "status": {"rCode": code}}
 
 
+#: The live reply to `date=2026-11-07`, asked on 2026-10-15.
+UNLISTED = {"data": None, "message": None, "status": {
+    "rCode": 200, "bCodeMessage": [
+        {"code": 1002, "errorMessage": "Economic Events Calendar: No record found."}],
+    "developerMessage": None}}
+
+
 #: What really happens on each New York day, in Nasdaq's words.
 TRUTH = {
     date(2026, 10, 13): [_row("10:00", "Existing Home Sales"),
@@ -92,6 +100,7 @@ TRUTH = {
     date(2026, 10, 22): [_row("08:30", "Initial Jobless Claims")],
     date(2026, 10, 23): [_row("10:00", "Michigan Consumer Sentiment",
                               consensus="46.3", previous="48.1")],
+    date(2026, 10, 28): [_row("14:00", "Fed Interest Rate Decision", consensus="3.75%")],
 }
 
 
@@ -100,19 +109,24 @@ class Nasdaq:
 
     `shift=-1` is what it does today, measured. `hours` moves every timed row,
     which is what switching the `gmt` field to real GMT would look like. `down`
-    refuses every request, `fail_on` only the one for that `date`.
+    refuses every request, `fail_on` only the one for that `date`, and a `date`
+    after `reach` answers "No record found" as the live endpoint does.
     """
 
     def __init__(self, shift: int = -1, *, hours: int = 0, truth: dict | None = None,
-                 down: bool = False, fail_on: date | None = None) -> None:
+                 down: bool = False, fail_on: date | None = None,
+                 reach: date | None = None) -> None:
         self.shift, self.hours, self.down, self.fail_on = shift, hours, down, fail_on
         self.truth = TRUTH if truth is None else truth
+        self.reach = reach
         self.asked: list[date] = []
 
     def __call__(self, day: date, **_kw) -> dict:
         self.asked.append(day)
         if self.down or day == self.fail_on:
             raise EventFetchError(f"Nasdaq's calendar for {day}: URLError: down")
+        if self.reach and day > self.reach:
+            return UNLISTED
         rows = []
         for row in self.truth.get(day + timedelta(days=self.shift), []):
             if ":" in row["gmt"]:
@@ -145,11 +159,12 @@ def _days(first: date, last: date) -> set[date]:
     return {first + timedelta(days=n) for n in range((last - first).days + 1)}
 
 
-NEXT_WEEK = {
+LISTED = {
     ("2026-10-18", "22:00", "CNY", "GDP"),
     ("2026-10-20", "10:00", "USD", "NAHB Housing Market Index"),
     ("2026-10-22", "08:30", "USD", "Initial Jobless Claims"),
     ("2026-10-23", "10:00", "USD", "Michigan Consumer Sentiment"),
+    ("2026-10-28", "14:00", "USD", "Fed Interest Rate Decision"),
 }
 
 
@@ -158,8 +173,8 @@ NEXT_WEEK = {
 
 def test_todays_quirk_is_measured_and_each_day_asked_for_a_day_late(conn, monkeypatch):
     """The calibration day is the Wednesday ForexFactory served; every other
-    request is a day the Market tab shows that ForexFactory does not: Sun 18 to
-    Sun 25, asked for as 19 to 26 because Nasdaq answers a day late."""
+    request is a day the Market tab shows that ForexFactory does not: Sun 18 Oct
+    to Sun 1 Nov, asked for as 19 Oct to 2 Nov because Nasdaq answers a day late."""
     nasdaq = Nasdaq(shift=-1)
     monkeypatch.setattr(ahead, "_get", nasdaq)
 
@@ -167,15 +182,15 @@ def test_todays_quirk_is_measured_and_each_day_asked_for_a_day_late(conn, monkey
 
     assert listed.placing == Placing(shift=-1, clock=-4)
     assert nasdaq.asked[0] == date(2026, 10, 14), "calibrated on the served Wednesday"
-    assert set(nasdaq.asked[1:]) == _days(date(2026, 10, 19), date(2026, 10, 26))
-    assert len(nasdaq.asked) == 9, "one request per day, and one to calibrate"
-    assert _listed(conn) == NEXT_WEEK
-    assert (listed.stored, listed.days) == (4, 8)
+    assert set(nasdaq.asked[1:]) == _days(date(2026, 10, 19), date(2026, 11, 2))
+    assert len(nasdaq.asked) == 16, "one request per day, and one to calibrate"
+    assert _listed(conn) == LISTED
+    assert (listed.stored, listed.days) == (5, 15)
 
 
 def test_a_fix_on_nasdaqs_side_is_followed_rather_than_assumed(conn, monkeypatch):
     """The day Nasdaq answers `date=D` with D's own events, the same refresh asks
-    for 18 to 25 and files every release on the day it happens. Assuming the
+    for 18 Oct to 1 Nov and files every release on the day it happens. Assuming the
     measured shift would file next week's jobless claims on the Wednesday."""
     nasdaq = Nasdaq(shift=0)
     monkeypatch.setattr(ahead, "_get", nasdaq)
@@ -183,8 +198,8 @@ def test_a_fix_on_nasdaqs_side_is_followed_rather_than_assumed(conn, monkeypatch
     listed = refresh_ahead(conn, now=THURSDAY)
 
     assert listed.placing.shift == 0
-    assert set(nasdaq.asked[1:]) == _days(date(2026, 10, 18), date(2026, 10, 25))
-    assert _listed(conn) == NEXT_WEEK
+    assert set(nasdaq.asked[1:]) == _days(date(2026, 10, 18), date(2026, 11, 1))
+    assert _listed(conn) == LISTED
 
 
 def test_a_clock_that_no_longer_lines_up_is_refused_and_writes_nothing(
@@ -201,7 +216,7 @@ def test_a_clock_that_no_longer_lines_up_is_refused_and_writes_nothing(
         refresh_ahead(conn, now=THURSDAY)
 
     assert moved.asked == [date(2026, 10, 14)], "nothing asked past the calibration"
-    assert _listed(conn) == NEXT_WEEK
+    assert _listed(conn) == LISTED
 
 
 #: ForexFactory's week of Sun 1 Nov, the first on New York's winter clock.
@@ -238,6 +253,21 @@ def test_a_winter_week_is_filed_at_new_york_time_on_either_clock(
     }
 
 
+def test_a_row_an_hour_before_its_listed_day_is_replaced_with_that_day(
+        tmp_path, monkeypatch):
+    """On UTC-4 in winter, Nasdaq lists Tokyo's 23:30 New York release under the
+    next day at 00:30. When it moves to 00:50, the 23:30 row goes: the day's
+    replace reaches back the hour its clock is ahead of New York's."""
+    db = connect_migrated(tmp_path / "winter.db")
+    thursday = datetime(2026, 11, 12, 15, 0, tzinfo=UTC)
+    for at in ("00:30", "00:50"):
+        truth = {date(2026, 11, 12): [_row(at, "Machinery Orders", country="Japan")]}
+        monkeypatch.setattr(ahead, "_get", Nasdaq(truth=truth))
+        refresh_ahead(db, now=thursday)
+
+    assert _listed(db) == {("2026-11-11", "23:50", "JPY", "Machinery Orders")}
+
+
 def test_with_no_forexfactory_week_the_measured_shift_stands(tmp_path, monkeypatch):
     """A journal whose calendar feed never answered has nothing to calibrate
     against, so it asks no calibration request and lists from today."""
@@ -248,17 +278,19 @@ def test_with_no_forexfactory_week_the_measured_shift_stands(tmp_path, monkeypat
     listed = refresh_ahead(conn, now=THURSDAY)
 
     assert listed.placing == MEASURED
-    assert set(nasdaq.asked) == _days(date(2026, 10, 16), date(2026, 10, 26))
+    assert set(nasdaq.asked) == _days(date(2026, 10, 16), date(2026, 11, 2))
     assert ("2026-10-15", "08:30", "USD", "PPI") in _listed(conn)
 
 
 # ------------------------------------------------------------ the overlap rule
 
 
-def test_forexfactory_takes_a_week_over_even_when_nasdaq_is_down(conn, monkeypatch):
+def test_forexfactory_takes_a_week_over_even_when_nasdaq_is_down(
+        conn, tmp_path, monkeypatch):
     """Once ForexFactory serves the week of Sun 18, its rows are the week's only
-    rows. The Nasdaq rows go first, so an unreachable Nasdaq cannot leave
-    Thursday's claims listed twice."""
+    rows. The Nasdaq rows go first and are committed, so an unreachable Nasdaq
+    cannot leave Thursday's claims listed twice, read through a connection of its
+    own as the page's next load would."""
     monkeypatch.setattr(ahead, "_get", Nasdaq())
     refresh_ahead(conn, now=THURSDAY)
     store_events(conn, parse_events(FF_NEXT))
@@ -267,8 +299,10 @@ def test_forexfactory_takes_a_week_over_even_when_nasdaq_is_down(conn, monkeypat
     with pytest.raises(EventFetchError):
         refresh_ahead(conn, now=MONDAY)
 
-    assert _listed(conn) == set(), "a week ForexFactory serves kept Nasdaq's rows"
-    week = market_data(conn, now=MONDAY)
+    seen = connect(tmp_path / "ahead.db")
+    assert _listed(seen) == {row for row in LISTED if row[0] > "2026-10-24"}, (
+        "a week ForexFactory serves kept Nasdaq's rows, or a later week lost its own")
+    week = market_data(seen, now=MONDAY)
     claims = [e for e in week["events"] if "Claims" in e["title"]]
     assert [(e["source"], e["day"]) for e in claims] == [("forexfactory", "2026-10-22")]
     assert [d["day"] for d in week["week"] if d["ahead"]] == ["2026-10-25"], (
@@ -276,8 +310,8 @@ def test_forexfactory_takes_a_week_over_even_when_nasdaq_is_down(conn, monkeypat
 
 
 def test_nasdaq_fills_only_the_days_forexfactory_has_not_served(conn, monkeypatch):
-    """With the week of Sun 18 served, Monday's refresh asks for Sun 25 to
-    Sun 1 Nov and nothing inside the served week."""
+    """With the week of Sun 18 served, Monday's refresh asks for Sun 25 Oct to
+    Sun 8 Nov and nothing inside the served week."""
     store_events(conn, parse_events(FF_NEXT))
     nasdaq = Nasdaq()
     monkeypatch.setattr(ahead, "_get", nasdaq)
@@ -285,8 +319,40 @@ def test_nasdaq_fills_only_the_days_forexfactory_has_not_served(conn, monkeypatc
     listed = refresh_ahead(conn, now=MONDAY)
 
     assert nasdaq.asked[0] == date(2026, 10, 21), "the newest served Wednesday"
-    assert set(nasdaq.asked[1:]) == _days(date(2026, 10, 26), date(2026, 11, 2))
-    assert listed.days == 8
+    assert set(nasdaq.asked[1:]) == _days(date(2026, 10, 26), date(2026, 11, 9))
+    assert listed.days == 15
+
+
+def test_a_week_forexfactory_serves_mid_refresh_gets_no_nasdaq_row(
+        conn, tmp_path, monkeypatch):
+    """The job and the page's Refresh can overlap. When the other stores
+    ForexFactory's week of Sun 18 while this one waits on Nasdaq, the rows this
+    one fetched for that week are not written beside ForexFactory's."""
+    nasdaq = Nasdaq()
+
+    def meanwhile(day: date, **kw) -> dict:
+        if day == date(2026, 10, 19):
+            other = connect(tmp_path / "ahead.db")
+            store_events(other, parse_events(FF_NEXT))
+            other.close()
+        return nasdaq(day, **kw)
+
+    monkeypatch.setattr(ahead, "_get", meanwhile)
+    refresh_ahead(conn, now=THURSDAY)
+
+    assert _listed(conn) == {row for row in LISTED if row[0] > "2026-10-24"}
+
+
+def test_the_listing_ends_where_nasdaqs_reach_does(conn, monkeypatch):
+    """Nasdaq answers "No record found" for a day past its listing's reach, which
+    a Monday's refresh can ask for. The days before it are listed, the FOMC among
+    them, and the refresh does not fail on the tail."""
+    monkeypatch.setattr(ahead, "_get", Nasdaq(reach=date(2026, 10, 30)))
+
+    listed = refresh_ahead(conn, now=THURSDAY)
+
+    assert listed.days == 12, "18 to 29 Oct, asked for as 19 to 30"
+    assert _listed(conn) == LISTED
 
 
 def test_a_refresh_replaces_each_days_listing_whole(conn, monkeypatch):
@@ -295,7 +361,7 @@ def test_a_refresh_replaces_each_days_listing_whole(conn, monkeypatch):
     monkeypatch.setattr(ahead, "_get", Nasdaq())
     refresh_ahead(conn, now=THURSDAY)
     refresh_ahead(conn, now=THURSDAY)
-    assert _listed(conn) == NEXT_WEEK
+    assert _listed(conn) == LISTED
 
     moved = dict(TRUTH)
     moved[date(2026, 10, 23)] = [_row("10:30", "Michigan Consumer Sentiment")]
@@ -331,9 +397,9 @@ def test_every_way_a_request_fails_is_an_event_fetch_error(
         conn, monkeypatch, broken_http, failure):
     """Each is what Nasdaq or the link really does: an HTTP error, no route, a
     stall, an HTML error page, HTTP 200 carrying a refusal in `rCode` or no data
-    at all, and a body broken off mid-way. The last is
-    `http.client.HTTPException`, not an `OSError`, which is the one `earnings`
-    does not name. The listing already held stands through every one."""
+    at all, a body broken off mid-way (an `http.client.HTTPException`, not an
+    `OSError`), and a hang-up. The listing already held stands through every
+    one."""
     real_get = ahead._get
     monkeypatch.setattr(ahead, "_get", Nasdaq())
     refresh_ahead(conn, now=THURSDAY)
@@ -354,12 +420,12 @@ def test_every_way_a_request_fails_is_an_event_fetch_error(
 
     with pytest.raises(EventFetchError):
         refresh_ahead(conn, now=THURSDAY)
-    assert _listed(conn) == NEXT_WEEK
+    assert _listed(conn) == LISTED
 
 
 def test_one_day_failing_after_calibration_writes_no_day(conn, monkeypatch):
-    """Calibration answered and seven days did, one did not: no day is replaced,
-    not even the seven, so the listing never mixes two refreshes."""
+    """Calibration answered and every day but one did: no day is replaced, not
+    even those that answered, so the listing never mixes two refreshes."""
     monkeypatch.setattr(ahead, "_get", Nasdaq())
     refresh_ahead(conn, now=THURSDAY)
     emptied = {day: rows for day, rows in TRUTH.items() if day < date(2026, 10, 18)}
@@ -367,7 +433,7 @@ def test_one_day_failing_after_calibration_writes_no_day(conn, monkeypatch):
 
     with pytest.raises(EventFetchError):
         refresh_ahead(conn, now=THURSDAY)
-    assert _listed(conn) == NEXT_WEEK
+    assert _listed(conn) == LISTED
 
 
 def _outage():
@@ -380,7 +446,7 @@ def _throttled():
 
 @pytest.mark.parametrize(("feed", "nasdaq", "status", "says"), [
     (lambda: parse_events(FF_WEEK), Nasdaq(down=True), "ok", "ahead failed"),
-    (_outage, Nasdaq(), "failed", "HTTP 500; 4 ahead from nasdaq over 8 days"),
+    (_outage, Nasdaq(), "failed", "HTTP 500; 5 ahead from nasdaq over 15 days"),
     (_throttled, Nasdaq(), "nothing", "rate limited"),
 ], ids=["nasdaq-down", "forexfactory-down", "forexfactory-throttled"])
 def test_the_market_job_is_judged_on_forexfactory_and_lists_ahead_anyway(
@@ -398,7 +464,7 @@ def test_the_market_job_is_judged_on_forexfactory_and_lists_ahead_anyway(
 
     assert outcome.status == status
     assert says in outcome.detail
-    assert _listed(conn) == (set() if nasdaq.down else NEXT_WEEK)
+    assert _listed(conn) == (set() if nasdaq.down else LISTED)
 
 
 def test_the_cli_fetch_lists_ahead_and_keeps_its_exit_code(conn, tmp_path, monkeypatch):
@@ -412,16 +478,21 @@ def test_the_cli_fetch_lists_ahead_and_keeps_its_exit_code(conn, tmp_path, monke
     monkeypatch.setattr(ahead, "_get", Nasdaq())
 
     assert cli.main(["market", "--fetch", "--db", str(db)]) == cli.EXIT_THROTTLED
-    assert _listed(conn) == NEXT_WEEK
+    assert _listed(conn) == LISTED
     run = conn.execute("SELECT status, detail FROM job_runs WHERE job = 'market'"
                        " ORDER BY id DESC").fetchone()
-    assert run["status"] == "nothing" and "4 ahead" in run["detail"]
+    assert run["status"] == "nothing" and "5 ahead" in run["detail"]
 
 
-class _Frozen(datetime):
-    @classmethod
-    def now(cls, tz=None):
-        return THURSDAY if tz is None else THURSDAY.astimezone(tz)
+def _frozen(at: datetime) -> type[datetime]:
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at if tz is None else at.astimezone(tz)
+    return Frozen
+
+
+_Frozen = _frozen(THURSDAY)
 
 
 # -------------------------------------------------------- reading Nasdaq's rows
@@ -483,9 +554,10 @@ def test_a_reply_is_filed_the_way_forexfactory_files_its_own():
     assert events[0].raw["requested"] == "2026-10-15"
 
 
-def test_a_time_it_cannot_read_raises_rather_than_dropping_the_row():
+@pytest.mark.parametrize("gmt", ["Tentative", "24:00"])
+def test_a_time_it_cannot_read_raises_rather_than_dropping_the_row(gmt):
     with pytest.raises(EventFetchError, match="unreadable time"):
-        parse_day(_reply([_row("Tentative", "CPI")]), day=date(2026, 10, 14),
+        parse_day(_reply([_row(gmt, "CPI")]), day=date(2026, 10, 14),
                   requested=date(2026, 10, 15))
 
 
@@ -495,8 +567,9 @@ def test_a_time_it_cannot_read_raises_rather_than_dropping_the_row():
 def test_next_week_is_its_own_page_of_the_calendar(conn, monkeypatch):
     """`week=1` is Mon 19 to Sun 25 with its own vocabulary and counts, and every
     day of it is marked as listed ahead, the quiet ones too: ForexFactory has
-    served none of it. The 18th starts ForexFactory's next week, so it is the one
-    day marked on this week's page."""
+    served none of it. `week=2` reaches the FOMC decision on Wed 28. The 18th
+    starts ForexFactory's next week, so it is the one day marked on this week's
+    page."""
     monkeypatch.setattr(ahead, "_get", Nasdaq())
     refresh_ahead(conn, now=THURSDAY)
 
@@ -513,15 +586,20 @@ def test_next_week_is_its_own_page_of_the_calendar(conn, monkeypatch):
     assert [f["value"] for f in nxt["countries"]] == ["USD"]
     assert nxt["ahead_source"] == SOURCE
 
+    after = market_data(conn, now=THURSDAY, week=2)
+    assert (after["from_day"], after["to_day"]) == ("2026-10-26", "2026-11-01")
+    assert [(e["day"], e["title"], e["impact"]) for e in after["events"]] == [
+        ("2026-10-28", "Fed Interest Rate Decision", "High")]
+
     this = market_data(conn, now=THURSDAY)
     assert [d["day"] for d in this["week"] if d["ahead"]] == ["2026-10-18"]
     assert {e["source"] for e in this["events"]} == {"forexfactory", SOURCE}
 
 
 def test_an_untimed_monday_release_is_counted_on_its_own_week_only(conn, monkeypatch):
-    """Nasdaq stamps a holiday 00:00, which is the instant one Market week ends
-    and the next begins. New Zealand's Labour Day on Mon 26 is next week's row,
-    and this week's chips, totals and hidden count must not include it."""
+    """A holiday is filed at 00:00, the instant one Market week ends and the next
+    begins. New Zealand's Labour Day on Mon 26 is next week's row, and this
+    week's chips, totals and hidden count must not include it."""
     store_events(conn, parse_events(FF_NEXT))
     truth = dict(TRUTH)
     truth[date(2026, 10, 26)] = [
@@ -537,10 +615,11 @@ def test_an_untimed_monday_release_is_counted_on_its_own_week_only(conn, monkeyp
         ("2026-10-26", "Holiday")]
 
 
-def test_the_0dte_chips_read_mondays_listing_on_a_friday_evening(conn, monkeypatch):
+def test_the_0dte_chips_read_mondays_listing_on_a_friday_evening(
+        conn, tmp_path, monkeypatch):
     """After Friday's settle the calculator is drawn for Monday, a day
     ForexFactory has not served. Its chips are Nasdaq's rows, and the payload
-    says so, because their grade is then this journal's."""
+    and the chip's own title say so, because their grade is then this journal's."""
     truth = dict(TRUTH)
     truth[date(2026, 10, 19)] = [_row("10:00", "ISM Manufacturing PMI")]
     monkeypatch.setattr(ahead, "_get", Nasdaq(truth=truth))
@@ -551,17 +630,24 @@ def test_the_0dte_chips_read_mondays_listing_on_a_friday_evening(conn, monkeypat
                                      .timestamp()), open=close, high=close, low=close,
                               close=close, volume=0)])
 
-    ctx = odte_context_data(conn, now=datetime(2026, 10, 16, 21, 30, tzinfo=UTC))
+    evening = datetime(2026, 10, 16, 21, 30, tzinfo=UTC)
+
+    ctx = odte_context_data(conn, now=evening)
 
     assert ctx is not None and ctx["today"] == "2026-10-19"
     assert [e["title"] for e in ctx["events_today"]] == ["ISM Manufacturing PMI"]
     assert ctx["events_ahead"] is True
+    from optjournal import web
+    monkeypatch.setattr(web, "refresh_odte_bars", lambda _conn, *, now: None)
+    _text, markup = _render(tmp_path / "ahead.db", tmp_path, monkeypatch, "#tab=odte",
+                            now=evening)
+    assert "Listed ahead of the feed, so the journal grades it" in markup
 
 
 @pytest.mark.parametrize(("feed", "nasdaq", "code", "listed", "error"), [
-    (lambda: parse_events(FF_WEEK), Nasdaq(), 200, 4, None),
+    (lambda: parse_events(FF_WEEK), Nasdaq(), 200, 5, None),
     (lambda: parse_events(FF_WEEK), Nasdaq(down=True), 200, 0, "down"),
-    (_throttled, Nasdaq(), 429, 4, None),
+    (_throttled, Nasdaq(), 429, 5, None),
 ], ids=["both", "nasdaq-down", "forexfactory-throttled"])
 def test_refresh_on_the_page_lists_the_days_ahead_too(
         conn, tmp_path, monkeypatch, feed, nasdaq, code, listed, error):
@@ -585,16 +671,28 @@ def test_refresh_on_the_page_lists_the_days_ahead_too(
     assert (reply["ahead_error"] is None) == (error is None)
     if error:
         assert error in reply["ahead_error"]
-    assert _listed(conn) == (set() if nasdaq.down else NEXT_WEEK)
+    assert _listed(conn) == (set() if nasdaq.down else LISTED)
 
 
-def _render(db, tmp_path, monkeypatch, fragment: str) -> tuple[str, str]:
-    """The page at `fragment`, executed in a browser, served on Thursday 15 Oct."""
+def test_the_page_names_every_week_the_journal_lists():
+    """The stepper's labels and hash words are the page's, the number of weeks is
+    `ahead.WEEKS_SHOWN`: a week more there would read "undefined" on the stepper
+    and could not be linked."""
+    page = (ROOT / "src" / "optjournal" / "page.html").read_text(encoding="utf-8")
+    for name in ("MKWEEK_LABEL", "MKWEEK_KEY"):
+        found = re.search(rf"^const {name}=(\[.*?\]);$", page, re.M)
+        assert found, f"no top-level const {name} in the page"
+        assert len(json.loads(found[1].replace("'", '"'))) == ahead.WEEKS_SHOWN, name
+
+
+def _render(db, tmp_path, monkeypatch, fragment: str,
+            now: datetime = THURSDAY) -> tuple[str, str]:
+    """The page at `fragment`, executed in a browser, served at `now`."""
     from optjournal import browser, web
 
     if not browser.browsers():
         pytest.skip("no Chrome/Chromium on this machine")
-    monkeypatch.setattr(web, "datetime", _Frozen)
+    monkeypatch.setattr(web, "datetime", _frozen(now))
     with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
         dom = browser.dump_dom(f"{base}/{fragment}", tmp_path / "chrome")
     if dom is None:
@@ -606,7 +704,9 @@ def test_the_market_tab_opens_on_next_week_from_its_link(conn, tmp_path, monkeyp
     """`#tab=market&week=next` over ForexFactory's week and Nasdaq's listing of the
     next, executed in a browser: the stepper names the week in the page's date
     style, its seven days are dashed, the open day is a listed one and says whose
-    listing and whose grades these are, and its rows are on screen."""
+    listing and whose grades these are, and its rows are on screen. This week's
+    attribution names the dashed days only, and the week after next reaches the
+    FOMC with its step forward closed."""
     monkeypatch.setattr(ahead, "_get", Nasdaq())
     refresh_ahead(conn, now=THURSDAY)
 
@@ -618,7 +718,20 @@ def test_the_market_tab_opens_on_next_week_from_its_link(conn, tmp_path, monkeyp
     assert "22 Oct" in text and "Initial Jobless Claims" in text
     assert ("Listed ahead by nasdaq, since forexfactory has not published this day "
             "yet. Nothing on it is released yet.") in text
-    assert "forexfactory has not published the dashed days yet" in text
+    assert ("every day here is listed ahead by nasdaq, as forexfactory has not "
+            "published this week yet, and impact is this journal's grade") in text
+
+    text, _markup = _render(tmp_path / "ahead.db", tmp_path, monkeypatch, "#tab=market")
+    assert "This week · 12 Oct to 18 Oct" in text
+    assert ("impact is forexfactory's assessment, not this journal's, except on the "
+            "dashed days, which forexfactory has not published yet") in text
+
+    text, _markup = _render(tmp_path / "ahead.db", tmp_path, monkeypatch,
+                            "#tab=market&week=after-next")
+    assert "Week after next · 26 Oct to 1 Nov" in text
+    assert "28 Oct" in text and "Fed Interest Rate Decision" in text
+    assert re.search(r'data-mkweek="3"[^>]*\bdisabled\b', _markup), (
+        "the last week's step forward is open")
 
 
 def test_a_listed_day_that_is_today_does_not_claim_nothing_is_out(

@@ -446,14 +446,7 @@ def _bars(conn: sqlite3.Connection, _ctx: Context, *, live: bool) -> Outcome:
 
 
 def _market(conn: sqlite3.Connection, _ctx: Context) -> Outcome:
-    """Refresh the economic calendar, and the days ahead of it.
-
-    `EventRateLimited` is `nothing`, NOT `failed`: the feed pushed back, nothing
-    was lost, and the same week is served later. Counting that as a failure would
-    accumulate `consecutive_failures` for a working system and eventually back
-    off a job that was never broken. `ahead.Refreshed.status` holds that rule,
-    and why the days ahead never change it.
-    """
+    """Refresh the economic calendar, and the days ahead of it."""
     done = refresh_calendar(conn, now=datetime.now(UTC))
     return Outcome(done.status, done.detail, done.stored, done.fetched)
 

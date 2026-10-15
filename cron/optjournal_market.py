@@ -74,8 +74,8 @@ EXIT_ERROR = 1
 EXIT_THROTTLED = 4
 
 #: Generous against the feed's 20s HTTP timeout, then the days ahead from Nasdaq
-#: at three rounds of 15s at worst (the calibration, then eight days four at a
-#: time), plus SQLite writes.
+#: at four rounds of 15s at worst (the calibration, then up to 21 days eight at a
+#: time while ForexFactory has not served this week), plus SQLite writes.
 TIMEOUT_S = 120
 
 

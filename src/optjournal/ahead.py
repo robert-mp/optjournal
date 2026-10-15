@@ -1,4 +1,4 @@
-"""Next week's economic calendar, from Nasdaq, until ForexFactory serves that week.
+"""The days ahead of ForexFactory's week, from Nasdaq, until ForexFactory serves them.
 
 ForexFactory is the calendar (see `events`) and it serves the current week only:
 `ff_calendar_nextweek.json` answers 404. Nasdaq's keyless
@@ -35,10 +35,9 @@ journal's. The patterns name Nasdaq's own titles and give each release the grade
 ForexFactory gave the same release in the weeks stored since August, so the
 default filter (`events.DEFAULT_IMPACTS`) keeps CPI, PPI, the jobs report, the
 FOMC, PCE, GDP, retail sales and ISM. The 0DTE tab's tiers were the first
-candidate and do not fit: they are written against ForexFactory's titles, and on
-Nasdaq's they rank five "Philly Fed" sub-indexes above the headline
-"Philadelphia Fed Manufacturing Index" and every "CPI Index, n.s.a." variant level
-with CPI itself.
+candidate and do not fit: they are deliberately loose, so on Nasdaq's titles they
+put five "Philly Fed" sub-indexes level with the headline "Philadelphia Fed
+Manufacturing Index" and every "CPI Index, n.s.a." variant level with CPI itself.
 
 COUNTRIES ARE ForexFactory's. Nasdaq lists twenty countries by name; the ones
 ForexFactory covers map to its currency codes, so the Market tab's country filter
@@ -76,6 +75,7 @@ from optjournal.events import (
 __all__ = [
     "MEASURED",
     "SOURCE",
+    "WEEKS_SHOWN",
     "Ahead",
     "Placing",
     "Refreshed",
@@ -110,14 +110,16 @@ class Placing(NamedTuple):
     clock: int
 
 
-#: Measured, and used only when there is no ForexFactory week to calibrate against.
+#: As measured on 2026-10-15. Stands when there is no ForexFactory week to
+#: calibrate against, and wins `calibrate`'s ties.
 MEASURED = Placing(shift=-1, clock=-4)
 _PLACINGS = tuple(Placing(shift, clock) for shift in (-1, 0, 1) for clock in (-4, -5))
 
-#: The pages the Market tab can show: this week and next, Monday-anchored.
-_WEEKS_SHOWN = 2
-#: Requests in flight at once. See `refresh_ahead`.
-_PARALLEL = 4
+#: The pages the Market tab can show, Monday-anchored: this week and the two after
+#: it. Within Nasdaq's reach, which on 2026-10-15 answered `date=` up to 22 days on
+#: and "No record found" past that (see `_unlisted`), so a Monday asks for 21.
+WEEKS_SHOWN = 3
+_PARALLEL = 8
 
 #: Nasdaq's country -> ForexFactory's currency, and the adjective ForexFactory
 #: puts before a euro member's release ("German Prelim CPI m/m").
@@ -155,7 +157,7 @@ _MEDIUM = re.compile("|".join([
     r"president trump speaks$",
 ]), re.I)
 
-_CLOCK = re.compile(r"(\d{2}):(\d{2})")
+_CLOCK = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 #: Nasdaq's two untimed spellings: a market holiday, and a release with no hour.
 _UNTIMED = ("All Day", "24H")
 
@@ -192,27 +194,37 @@ def covered_weeks(conn: sqlite3.Connection) -> set[date]:
     return {week_of(_day(row[0])) for row in rows}
 
 
-def _rows(payload: object) -> list[dict]:
+def _rows(payload: object, requested: date) -> list[dict]:
     """A reply's rows, or a refusal. Nasdaq answers HTTP 200 either way, so its
-    own `status.rCode` decides, the rule `earnings.parse_earnings` follows."""
+    own `status.rCode` decides."""
     if not isinstance(payload, dict):
-        raise EventFetchError("Nasdaq's calendar reply was not an object")
+        raise EventFetchError(f"Nasdaq's calendar for {requested} was not an object")
     status = payload.get("status")
     code = str(status.get("rCode")) if isinstance(status, dict) else None
     if code != "200":
-        raise EventFetchError(f"Nasdaq's calendar answered rCode {code}")
+        raise EventFetchError(f"Nasdaq's calendar for {requested} answered rCode {code}")
     data = payload.get("data")
     if not isinstance(data, dict):
-        raise EventFetchError("Nasdaq's calendar reply carried no data")
+        raise EventFetchError(f"Nasdaq's calendar for {requested} carried no data")
     rows = data.get("rows")
     if rows is None:
         return []
     if not isinstance(rows, list):
-        raise EventFetchError("Nasdaq's calendar rows were not a list")
+        raise EventFetchError(f"Nasdaq's calendar rows for {requested} were not a list")
     for row in rows:
         if not isinstance(row, dict) or {"gmt", "country", "eventName"} - set(row):
             raise EventFetchError(f"Nasdaq calendar row not understood: {row!r}")
     return rows
+
+
+def _unlisted(payload: object) -> bool:
+    """Whether a reply is Nasdaq's "No record found": code 1002 and no data, its
+    answer for a day past the reach of its listing."""
+    if not isinstance(payload, dict) or payload.get("data") is not None:
+        return False
+    status = payload.get("status")
+    notes = status.get("bCodeMessage") if isinstance(status, dict) else None
+    return any(isinstance(n, dict) and n.get("code") == 1002 for n in notes or ())
 
 
 def _text(value: object) -> str | None:
@@ -232,7 +244,7 @@ def parse_day(
     """
     events: list[MarketEvent] = []
     seen: dict[tuple[int, str, str], int] = {}
-    for row in _rows(payload):
+    for row in _rows(payload, requested):
         country = str(row["country"])
         if country not in _COUNTRIES:
             continue
@@ -343,7 +355,8 @@ def refresh_ahead(conn: sqlite3.Connection, *, now: datetime) -> Ahead:
     has answered, so a failure leaves the previous listing standing.
 
     The days are asked for `_PARALLEL` at a time because the page's Refresh waits
-    on this: one at a time took 18.6s for eight days, measured.
+    on this. Each request takes two to three seconds, so fifteen days took 13.0s
+    four at a time and 6.2s eight at a time, measured on 2026-10-15.
     """
     covered = covered_weeks(conn)
     stale = [row[0] for row in conn.execute(
@@ -353,28 +366,34 @@ def refresh_ahead(conn: sqlite3.Connection, *, now: datetime) -> Ahead:
                      [(SOURCE, event_id) for event_id in stale])
     conn.commit()
 
-    # Never empty: the last day shown is a Sunday that starts a week
-    # ForexFactory cannot have served yet.
+    # Never empty: ForexFactory serves the current week only, so the last Sunday
+    # shown starts a week it cannot have served.
     today = now.astimezone(MARKET_TZ).date()
     monday = today - timedelta(days=today.weekday())
-    days = [day for day in (monday + timedelta(days=n) for n in range(7 * _WEEKS_SHOWN))
+    days = [day for day in (monday + timedelta(days=n) for n in range(7 * WEEKS_SHOWN))
             if day >= today and week_of(day) not in covered]
 
     placing = MEASURED
     if covered:
-        probe = max(covered) + timedelta(days=3)          # that week's Wednesday
+        wednesday = max(covered) + timedelta(days=3)
         held = conn.execute(
             "SELECT starts_at, country, title FROM market_events WHERE source = ?"
             " AND starts_at >= ? AND starts_at < ?",
-            (FOREXFACTORY, _midnight(probe - timedelta(days=1)),
-             _midnight(probe + timedelta(days=2))),
+            (FOREXFACTORY, _midnight(wednesday - timedelta(days=1)),
+             _midnight(wednesday + timedelta(days=2))),
         ).fetchall()
-        placing = calibrate(_get(probe), requested=probe,
+        placing = calibrate(_get(wednesday), requested=wednesday,
                             held=[(r[0], r[1], r[2]) for r in held])
 
     asked = [day - timedelta(days=placing.shift) for day in days]
     with ThreadPoolExecutor(max_workers=_PARALLEL) as pool:
         replies = list(pool.map(_get, asked))
+    # The days past Nasdaq's reach are the tail, so the listing ends where they
+    # begin rather than failing on them.
+    reached = next((n for n, reply in enumerate(replies) if _unlisted(reply)), len(days))
+    if not reached:
+        raise EventFetchError(f"Nasdaq's calendar lists no day from {days[0]} on")
+    days, asked, replies = days[:reached], asked[:reached], replies[:reached]
     listed = [event for day, on, reply in zip(days, asked, replies, strict=True)
               for event in parse_day(reply, day=day, requested=on, clock=placing.clock)]
 
@@ -406,25 +425,25 @@ def refresh_ahead(conn: sqlite3.Connection, *, now: datetime) -> Ahead:
 
 @dataclass(frozen=True, slots=True)
 class Refreshed:
-    """One refresh of both feeds, for the three callers that run one: the `market`
-    job, the page's Refresh and `optjournal market --fetch`. Each turns it into
-    its own shape (a ledger row, an HTTP reply, an exit code), so the order of the
-    two feeds and what each failure means are decided here once.
+    """One refresh of both feeds. Its callers turn it into a ledger row, an HTTP
+    reply or an exit code, so the order of the two feeds and what each failure
+    means are decided here once.
     """
 
     fetched: int
     stored: int
-    #: ForexFactory's failure, None when its week was stored. `EventRateLimited`
-    #: is a back-off rather than a fault.
+    #: ForexFactory's failure, None when its week was stored.
     error: EventFetchError | None
-    #: The days ahead, or why they were not refreshed.
     ahead: Ahead | EventFetchError
 
     @property
     def status(self) -> str:
         """The ledger's word, and ForexFactory's alone. Its week is the history,
         and the days ahead are rewritten on every run, so counting them would
-        call almost every run `ok`, a rate-limited one included."""
+        call almost every run `ok`, a rate-limited one included. A back-off is
+        `nothing`, not `failed`: nothing was lost, and a failure would accumulate
+        `consecutive_failures` for a working system and back off a job that was
+        never broken."""
         if self.error is None:
             return "ok" if self.stored else "nothing"
         return "nothing" if isinstance(self.error, EventRateLimited) else "failed"
