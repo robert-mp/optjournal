@@ -46,6 +46,7 @@ from optjournal.serialize import (
     statements_data,
     watchlist_data,
 )
+from optjournal.stats import month_stats
 from optjournal.trend import MIN_SETTLED, PARAMS_CAPTION
 from optjournal.vol import RANK_BANDS_SOURCE, RANK_MIDPOINT, RANK_MIN_WINDOWS
 
@@ -77,10 +78,12 @@ def test_orders_render_over_the_real_payload(conn):
 
 
 def test_history_renders_both_tables_over_the_real_payload(conn):
-    data = history_data(build_history(conn))
+    report = build_history(conn)
+    data = history_data(report, month_stats(conn, None, report=report))
     out = render_history(data)
     assert "Position history" in out
     assert "Closed" in out and "Open" in out
+    assert "All time, as on the Dashboard" in out
     assert "{" not in out
 
 

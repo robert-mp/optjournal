@@ -290,6 +290,35 @@ def test_the_0dte_tab_works_on_typed_readings_before_any_index_bar(
     assert "Not available yet" in browser.rendered_text(dom), "the note went missing"
 
 
+def test_the_dashboard_states_its_net_pnl_once(served, tmp_path, monkeypatch):
+    """Net P&L sat in the header, in the first tile and in the chart's corner,
+    and two pills repeated the Open Premium and Commissions tiles. The
+    whole-journal 0DTE comparison sat under a month it ignored. The tile keeps
+    the figure, the header keeps it where no tile does (Calendar), and the
+    comparison is on the 0DTE tab."""
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    from optjournal import serialize  # noqa: PLC0415 - the server's own binding
+    monkeypatch.setattr(serialize, "fetch_bars", lambda *a, **k: [])
+    seen = {}
+    for tab in ("dashboard", "calendar", "odte"):
+        dom = browser.dump_dom(f"{served}/#tab={tab}", tmp_path / f"once-{tab}")
+        if dom is None:
+            pytest.skip("no browser produced a DOM (environment, not the page)")
+        seen[tab] = (browser.markup(dom), browser.rendered_text(dom))
+    dash, dash_text = seen["dashboard"]
+    assert 'class="pfig"' not in dash, "the header repeats the first tile"
+    assert 'class="pfig"' in seen["calendar"][0], "Calendar lost its period figure"
+    perf = dash.split("Performance</h2>", 1)[1].split('<svg class="chart"', 1)[0]
+    assert "€" not in perf and "$" not in perf, f"a figure is back in the chart's corner: {perf}"
+    pills = [re.sub(r"<[^>]+>", "", pill).strip() for pill in
+             re.findall(r'<span class="pill"[^>]*>(.*?)</span>', dash, re.S)]
+    assert not [p for p in pills if p.startswith(("open premium", "OPT"))], pills
+    assert any(p.startswith("open ") for p in pills), "no tile shows the open count"
+    assert "Zero days to expiration" not in dash_text
+    assert "Zero days to expiration" in seen["odte"][1]
+
+
 def test_the_dashboard_renders_the_tiles_the_reader_stored(served, tmp_path):
     """The chosen arrangement, in its order -- and the default when what is
     stored cannot be drawn.

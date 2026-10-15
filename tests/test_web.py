@@ -3047,10 +3047,9 @@ def test_restating_positions_reproduces_ibkrs_own_native_figures(state):
 def test_annual_and_odte_are_in_the_payload(state):
     """Both tabs were disabled with hardcoded reasons; now they have data."""
     assert state["annual"], "the Annual tab renders from this"
-    assert set(state["odte"]) == {
-        "cohort", "rest", "unknown_dte", "selectable", "context", "history"}
+    assert set(state["odte"]) == {"cohort", "rest", "selectable", "context", "history"}
     # A cohort in isolation says nothing, so the comparison set must be present.
-    assert state["odte"]["rest"]["episodes"] >= 0
+    assert state["odte"]["rest"]["closes"] >= 0
 
 
 def test_annual_rows_reconcile_with_the_all_time_row(state):
@@ -4177,9 +4176,8 @@ def test_proceeds_and_friction_follow_the_same_charge_rule_as_commission():
     assert "constmoneyOf=mo=>mo==null?cash(null):isNativeCharge(mo.native,mo.ccy)" in js, \
         "moneyOf no longer asks the shared as-charged rule"
     card = _fn("dashboard").replace(" ", "").replace("\n", "")
-    assert "moneyOf(s.open_premium)" in card and "moneyOf(s.options_friction)" in card
-    assert "cash(s.open_premium.base)}</b>" not in card, "pill bypasses the rule"
-    assert "cash(s.options_friction.base)" not in card, "pill bypasses the rule"
+    assert "moneyOf(s.open_premium)" in card
+    assert "cash(s.open_premium.base)}</b>" not in card, "tile bypasses the rule"
     assert "moneyOf(l.money.proceeds)" in _fn("legRow").replace(" ", "")
 
 

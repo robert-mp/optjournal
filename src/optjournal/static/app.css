@@ -890,19 +890,6 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
 .adv>summary:hover{color:var(--fg)}
 .adv[open]>summary{color:var(--fg)}
 
-/* A PANEL-HEADER figure: the total a card's contents add up to, stated beside its
-   title -- the Performance card's net P&L, the watchlist detail's last price.
-   Figure-sized, so it reads as a number rather than as part of the heading.
-
-   The comment here used to say "deliberately larger than every other number on the
-   page", and that was false when it was written: this was 22px against 25px for an
-   ordinary `.stat .v` and 34px for `.hero .fig`, so it was the third largest of six
-   sizes doing the work of two roles. Stating the role instead of a ranking is what
-   keeps it true -- the page's actual headline is the header's period figure,
-   `.ppl`, and nothing else should claim to be the biggest thing on a page it
-   cannot see. */
-.big{font-size:var(--t7);font-weight:var(--w-fig);font-family:var(--fig);
-  font-variant-numeric:tabular-nums}
 /* The two smaller inline labels beside a lifecycle heading. */
 .lbl-sm{font-size:var(--t1)}
 .pill.gap{margin-left:var(--s3);font-size:var(--t1)}

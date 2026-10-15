@@ -346,8 +346,9 @@ Four invariants worth knowing before changing the UI:
 
   It binds in the other direction too, and that is the one the header makes
   easy to forget: a control a tab displays must move that tab's numbers. The
-  month stepper and the Net P&L beside it therefore render only on Dashboard
-  and Calendar. Trades lists every position whatever the month, so there the
+  month stepper therefore renders only on Dashboard and Calendar, and the Net
+  P&L beside it only where no tile states it: on the Dashboard its Net P&L tile
+  does. Trades lists every position whatever the month, so there the
   stepper looked like a filter and was not one. The view-options panel offers
   the trade type only on the three tabs it drives. The
   display currency restates every money tab, so it is offered on all of them,

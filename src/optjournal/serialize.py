@@ -65,7 +65,13 @@ from optjournal.journal import entries as journal_entries
 from optjournal.marketdata import BarFetchError, fetch_bars
 from optjournal.money import FILL_MONEY_FIELDS, Money
 from optjournal.sections import raw_sections
-from optjournal.stats import EQUITY_CATEGORY, _day_of, campaigns_for, first_activity
+from optjournal.stats import (
+    EQUITY_CATEGORY,
+    MonthStats,
+    _day_of,
+    campaigns_for,
+    first_activity,
+)
 from optjournal.trend import bucket, bxtrender_short
 from optjournal.vol import (
     expected_move,
@@ -741,8 +747,13 @@ def _friction_payload(friction: Friction) -> Row:
     }
 
 
-def history_data(report: HistoryReport) -> Row:
-    """Closed-position history as a JSON-safe structure."""
+def history_data(report: HistoryReport, totals: MonthStats) -> Row:
+    """Closed-position history as a JSON-safe structure.
+
+    `totals` is `month_stats` over the report's own category and all time, so
+    the scoreboard under the episode list is the Dashboard's: a partial close on
+    a position still open counts, which a sum over the closed episodes misses.
+    """
     def one(e) -> Row:
         return {
             "symbol": e.symbol,
@@ -792,13 +803,12 @@ def history_data(report: HistoryReport) -> Row:
         "closed": [one(e) for e in report.closed],
         "open": [one(e) for e in report.open],
         "totals": {
-            "closed_episodes": len(report.closed),
-            "open_episodes": len(report.open),
-            "realized_base": _num(report.total_realized_base),
-            "commission_base": _num(report.total_commission_base),
-            "wins": report.wins,
-            "losses": report.losses,
-            "win_rate": report.win_rate,
+            "net_pnl": totals.net_pnl.payload(),
+            "commissions": totals.commissions.payload(),
+            "closes": totals.closes,
+            "wins": totals.wins,
+            "losses": totals.losses,
+            "win_rate": totals.win_rate,
         },
     }
 

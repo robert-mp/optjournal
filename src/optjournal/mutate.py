@@ -318,14 +318,6 @@ MUTANTS: tuple[Mutant, ...] = (
                "no-op entry in the toggle that restates nothing",
     ),
     Mutant(
-        key="cohort-avg-zero",
-        module="stats.py",
-        find='        "avg_pnl": None if c.avg_pnl is None else c.avg_pnl.payload(),',
-        replace='        "avg_pnl": (c.avg_pnl or Money(base=0.0)).payload(),',
-        breaks="an empty cohort would report its average outcome as break-even "
-               "rather than as absent",
-    ),
-    Mutant(
         key="stats-avg-zero",
         module="stats.py",
         find='        "avg_win": None if stats.avg_win is None else stats.avg_win.payload(),',

@@ -47,7 +47,6 @@ from optjournal.money import Money, win_rate
 
 __all__ = [
     "ALL_TRADES",
-    "Cohort",
     "DayPnl",
     "EQUITY_CATEGORY",
     "EQUITY_TRADES",
@@ -361,8 +360,7 @@ class MonthStats:
     avg_win: Money | None = None
     avg_loss: Money | None = None
     #: The mean outcome over every close, wins, losses and scratches
-    #: together -- the same name and meaning as `Cohort.avg_pnl`. None under the
-    #: rule above: no close, no average.
+    #: together. None under the rule above: no close, no average.
     avg_pnl: Money | None = None
     #: Gross won over gross lost, both in base. None when nothing was lost -- the
     #: ratio is then infinite, and a very large finite number would read as a
@@ -531,9 +529,8 @@ def odte_scope(
 
     Includes open episodes as well as closed ones. An open 0DTE position is odd
     but reachable -- a statement cut on expiry day, before the contract died --
-    and a scope that filters the journal should not hide a position the
-    Positions tab would still show. `odte_cohorts` stays closed-only because
-    comparing outcomes needs outcomes.
+    and a scope that filters the journal should not hide a position Holdings
+    would still show.
     """
     if report is None:
         report = build_history(
@@ -694,93 +691,48 @@ def monthly_stats(
     )
 
 
-@dataclass(slots=True)
-class Cohort:
-    """Outcome summary for a subset of closed episodes."""
-
-    label: str
-    episodes: int = 0
-    wins: int = 0
-    losses: int = 0
-    net_pnl: Money = Money.restated(0.0)
-    commission_base: float = 0.0
-    contracts: int = 0
-
-    @property
-    def win_rate(self) -> float | None:
-        """See `money.win_rate`: None when nothing was decided, not zero."""
-        return win_rate(self.wins, self.losses)
-
-    @property
-    def avg_pnl(self) -> Money | None:
-        """Mean outcome per round trip, wins and losses together.
-
-        The figure that answers "is this cohort worth trading": a high win
-        rate with a worse average is a losing strategy, and the two numbers
-        only mean something side by side.
-        """
-        return self.net_pnl.per(self.episodes)
-
-
-def _cohort(label: str, episodes: list[Any]) -> Cohort:
-    c = Cohort(label=label)
-    for e in episodes:
-        c.episodes += 1
-        c.commission_base += abs(e.commission_base)
-        c.contracts += e.contracts
-        if e.realized_pnl_base > 0:
-            c.wins += 1
-        elif e.realized_pnl_base < 0:
-            c.losses += 1
-    # Built once rather than advanced per episode: a frozen figure cannot have
-    # its amount moved without its currency coming along.
-    c.net_pnl = Money.charged(
-        (e.realized_pnl_base, e.realized_pnl, e.currency) for e in episodes
-    )
-    return c
-
-
 def odte_cohorts(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
     base_currency: str = "EUR",
     report: Any = None,
-) -> tuple[Cohort, Cohort, int]:
-    """0DTE round trips against everything else, plus the unclassifiable count.
+) -> tuple[MonthStats, MonthStats]:
+    """0DTE against everything else, over the whole journal.
 
-    Returned as a pair because a 0DTE win rate in isolation says nothing --
-    the question is always whether same-day expiries did better or worse than
-    the rest of the book, and that needs both sides on screen.
+    A pair because a 0DTE win rate in isolation says nothing: the question is
+    whether same-day expiries did better or worse than the rest of the book.
 
-    The third value counts closed episodes whose DTE cannot be determined,
-    which is anything without an expiry. Reported rather than silently folded
-    into "not 0DTE": a stock has no DTE, and claiming it was not a 0DTE trade
-    is a different statement from admitting the question does not apply.
+    Each side is `month_stats` over a scope, so it counts closes, P&L and
+    commission by the Dashboard's rule, and the two add up to its all-time
+    figures. They used to sum closed round trips, which dropped a partial close
+    on a position still open: the 8 Oct QCOM buyback, -1,060.74, was in the
+    Dashboard and in neither side here.
     """
     if report is None:
         report = build_history(
             conn, asset_category=asset_category, base_currency=base_currency
         )
-    odte = [e for e in report.closed if e.is_odte is True]
-    rest = [e for e in report.closed if e.is_odte is False]
-    unknown = sum(1 for e in report.closed if e.is_odte is None)
-    return _cohort("0DTE", odte), _cohort("Everything else", rest), unknown
+    odte = odte_scope(conn, asset_category=asset_category,
+                      base_currency=base_currency, report=report)
+    where, params = _category_where(asset_category)
+    every = frozenset(str(r["trade_id"]) for r in conn.execute(
+        f"SELECT trade_id FROM trades {where}", params))
+    rest = TradeScope(key="rest", label="Everything else",
+                      trade_ids=every - (odte.trade_ids or frozenset()))
+
+    def side(scope: TradeScope) -> MonthStats:
+        return month_stats(conn, None, asset_category=asset_category,
+                           base_currency=base_currency, scope=scope, report=report)
+
+    return side(odte), side(rest)
 
 
-def cohort_data(c: Cohort) -> dict[str, Any]:
-    """JSON-safe view, including the computed properties `asdict` would drop."""
-    return {
-        "label": c.label,
-        "episodes": c.episodes,
-        "wins": c.wins,
-        "losses": c.losses,
-        "win_rate": c.win_rate,
-        "net_pnl": c.net_pnl.payload(),
-        "avg_pnl": None if c.avg_pnl is None else c.avg_pnl.payload(),
-        "commission_base": c.commission_base,
-        "contracts": c.contracts,
-    }
+def cohort_data(stats: MonthStats) -> dict[str, Any]:
+    """The figures a cohort box shows, as `stats_data` states them."""
+    view = stats_data(stats)
+    return {key: view[key] for key in (
+        "closes", "total_trades", "wins", "losses", "win_rate", "net_pnl", "avg_pnl")}
 
 
 def daily_series(

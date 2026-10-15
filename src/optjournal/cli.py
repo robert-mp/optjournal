@@ -99,6 +99,7 @@ from optjournal.serialize import (
     summary_data,
     watchlist_data,
 )
+from optjournal.stats import month_stats
 from optjournal.sync import sync_journal
 
 EXIT_OK = 0
@@ -487,7 +488,9 @@ def cmd_history(args) -> int:
     scope = None if args.assets.strip().upper() == "ALL" else args.assets.strip().upper()
     with open_journal(args.db) as conn:
         report = build_history(conn, asset_category=scope)
-    data = history_data(report)
+        totals = month_stats(conn, None, asset_category=scope,
+                             base_currency=report.base_currency, report=report)
+    data = history_data(report, totals)
     _emit(data, render_history(data), args.json)
     return EXIT_OK if report.episodes else EXIT_NO_DATA
 

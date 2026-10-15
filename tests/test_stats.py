@@ -26,13 +26,13 @@ import sqlite3
 import pytest
 from conftest import add_statement, connect_migrated
 
+from optjournal.cli import main
 from optjournal.money import Money
 from optjournal.stats import (
-    Cohort,
     MonthStats,
-    cohort_data,
     fx_quotes,
     month_stats,
+    odte_cohorts,
     stats_data,
 )
 
@@ -197,28 +197,65 @@ def test_a_currency_only_stocks_trade_in_is_still_not_offered(conn):
     assert [q["code"] for q in fx_quotes(conn, "EUR")] == ["USD"]
 
 
-def test_a_cohort_with_no_episodes_reports_no_average_not_a_zero(conn):
-    """`avg_pnl` is None for an empty cohort, and the view must carry that.
-
-    `Money.per` returns None on a zero denominator rather than dividing, so the
-    honest reading of "no round trips yet" is "no average". Flattening it to a
-    zero payload states that the average outcome was break-even, which is a
-    measurement, and the 0DTE cohort is empty on this account for months at a
-    time -- so the wrong shape is the common one, not the edge case.
-    """
-    empty = Cohort(label="0DTE")
-    assert empty.avg_pnl is None, "an empty cohort cannot have an average"
-    assert cohort_data(empty)["avg_pnl"] is None, (
-        "a zero payload here claims the average outcome was break-even"
+def _fill(conn: sqlite3.Connection, trade_id: str, *, conid: str, day: str,
+          expiry: str, qty: int, open_close: str, realized: float = 0.0) -> None:
+    """One option fill, its own order, at a 1.0 rate."""
+    conn.execute(
+        "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
+        " account_id, trade_date, date_time, asset_category, symbol, conid,"
+        " underlying_symbol, put_call, strike, expiry, open_close, quantity,"
+        " trade_price, currency, fx_rate_to_base, proceeds, proceeds_base,"
+        " ib_commission, ib_commission_base, fifo_pnl_realized,"
+        " fifo_pnl_realized_base, raw, source_file, first_seen_at)"
+        " VALUES (?,?,?,?,'U1',?,?,'OPT',?,?,'SPY','P',500,?,?,?,1.0,'USD',1.0,"
+        " ?,?,-1.0,-1.0,?,?,'{}','t.xml','now')",
+        (trade_id, trade_id, trade_id, f"o{trade_id}", day, f"{day} 10:00:00",
+         f"SPY {conid}", conid, expiry, open_close, qty, -qty * 100.0, -qty * 100.0,
+         realized, realized),
     )
 
-    # Non-empty still carries the figure, so the None is about the denominator
-    # and not about the key being dropped.
-    decided = Cohort(label="0DTE", episodes=2, wins=1, losses=1,
-                     net_pnl=Money.restated(100.0))
-    assert cohort_data(decided)["avg_pnl"] == {
-        "base": 50.0, "native": None, "ccy": None
-    }
+
+@pytest.fixture()
+def book(conn) -> sqlite3.Connection:
+    """A 0DTE round trip that won, a put closed for a profit, and a put sold two
+    and bought back one at a loss, so its position is still open."""
+    _fill(conn, "z1", conid="Z", day="2026-03-02", expiry="20260302", qty=-1,
+          open_close="O")
+    _fill(conn, "z2", conid="Z", day="2026-03-02", expiry="20260302", qty=1,
+          open_close="C", realized=50.0)
+    _fill(conn, "q1", conid="Q", day="2026-03-02", expiry="20260417", qty=-1,
+          open_close="O")
+    _fill(conn, "q2", conid="Q", day="2026-03-04", expiry="20260417", qty=1,
+          open_close="C", realized=30.0)
+    _fill(conn, "p1", conid="P", day="2026-03-02", expiry="20260417", qty=-2,
+          open_close="O")
+    _fill(conn, "p2", conid="P", day="2026-03-05", expiry="20260417", qty=1,
+          open_close="C", realized=-100.0)
+    conn.commit()
+    return conn
+
+
+def test_the_0dte_cohorts_add_up_to_the_dashboard_and_keep_a_partial_close(book):
+    """Both sides count closes by the Dashboard's rule. They summed closed round
+    trips, so a buyback on a position still open was on the Dashboard and in
+    neither side: the 8 Oct QCOM put, -1,060.74, on the real journal."""
+    odte, rest = odte_cohorts(book)
+    everything = month_stats(book, None)
+    assert (odte.closes, odte.wins, odte.losses, odte.net_pnl.base) == (1, 1, 0, 50.0)
+    assert (rest.closes, rest.wins, rest.losses, rest.net_pnl.base) == (2, 1, 1, -70.0)
+    for figure in ("closes", "wins", "losses", "total_trades"):
+        assert getattr(odte, figure) + getattr(rest, figure) == getattr(everything, figure)
+    assert odte.net_pnl.base + rest.net_pnl.base == pytest.approx(everything.net_pnl.base)
+
+
+def test_the_history_scoreboard_is_the_dashboards(book, tmp_path, capsys):
+    """`optjournal history` summed its closed rows, so the open put's buyback
+    was missing from its total and its loss from the count."""
+    assert main(["history", "--db", str(tmp_path / "stats.db")]) == 0
+    out = capsys.readouterr().out
+    assert "All time, as on the Dashboard" in out
+    assert "closes 3, won 2, lost 1" in out
+    assert "-20.00" in out, out
 
 
 def test_a_period_with_no_wins_reports_no_average_win_not_a_zero(conn):

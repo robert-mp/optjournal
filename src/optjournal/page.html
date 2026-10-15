@@ -96,8 +96,9 @@
       <div class="title">Bitácora <button class="edition" id="edition"
         title="Switch theme">Leather Edition</button></div>
     </div>
-    <!-- The period and its result: a month stepper and the Net P&L it selects.
-         Empty on every tab it does not drive, and that is the invariant in
+    <!-- The period and its result: a month stepper and the Net P&L it selects
+         (on the Dashboard, its Net P&L tile states the figure instead). Empty on
+         every tab it does not drive, and that is the invariant in
          docs/design-notes.md rather than a layout choice -- a tab's numbers move
          only with a control that tab displays, so a stepper on Holdings would be
          a control that changes nothing on screen. Filled by `renderPeriod`. -->
@@ -1072,8 +1073,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
 
 /** @typedef {Object} OdteBlock -- 0DTE cohort comparison (stats.odte_cohorts)
  * @property {Cohort} cohort
- * @property {Cohort} rest
- * @property {number} unknown_dte
+ * @property {Cohort} rest -- every other fill, so the two add up to the journal
  * @property {boolean} selectable -- whether the 0DTE filter is offerable at all
  * @property {OdteContext|null} context -- the calculator's opening reading, null
  *   until a `bars` fetch has landed the S&P and VIX closes
@@ -1182,16 +1182,15 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} decided -- how many decided positions that sum covers
  */
 
-/** @typedef {Object} Cohort
- * @property {string} label
- * @property {number} episodes
+/** @typedef {Object} Cohort -- one side of the 0DTE comparison, counted by the
+ *  Dashboard's rule (stats.cohort_data over month_stats)
+ * @property {number} closes
+ * @property {number} total_trades -- fills
  * @property {number} wins
  * @property {number} losses
  * @property {number|null} win_rate
  * @property {Money} net_pnl
- * @property {Money|null} avg_pnl -- null with no episodes
- * @property {number} commission_base
- * @property {number} contracts
+ * @property {Money|null} avg_pnl -- per close; null with no closes
  */
 
 /** @typedef {Object} StrategyGroup -- orders placed as one strategy (strategies.strategy_groups)
@@ -2016,7 +2015,9 @@ function renderPeriod(){
   const has=cur==='all'||(S.state.months||[]).includes(cur);
   const label=cur==='all'?'All time':monthLabel(cur);
   const tipFor=m=>m==='all'?'All time':monthLabel(m);
-  const s=S.state.stats;
+  /* Not on the Dashboard while a tile there states it: the same figure three
+     times on one screen reads as three figures. */
+  const s=S.tab==='dashboard'&&tileKeys().includes('net_pnl')?null:S.state.stats;
   el.innerHTML=`<div class="pstep">
       <button data-month="${prev??''}" ${prev===null?'disabled':''}
         title="${prev===null?'account start':esc(tipFor(prev))}"
@@ -2147,10 +2148,8 @@ function scopeNote(){
     )}</div>`;
 }
 function odteFilterNote(){
-  const od=S.state.odte;
   return odteSelectable()
-    ? `Restrict this view to the ${od.cohort.episodes} round trip(s) opened on `
-      +`their own expiry date.`
+    ? 'Restrict this view to contracts opened on their own expiry date.'
     : 'Nothing in the archive was opened on its own expiry date.';
 }
 
@@ -2314,12 +2313,10 @@ function dashboard(){
      at the top of the script, where the chooser in Settings reads their labels;
      the figures are here because each needs the period's stats in scope.
 
-     Net P&L is first by default and no longer spans the row. It used to be
-     `.stat.lead`, full-width, because the tab otherwise had no headline -- the one
-     figure it exists to report was findable only by reading its label. The
-     header's period figure is that headline now, so the tile can be a peer again,
-     and a uniform grid is what makes an ORDER mean anything: with one tile
-     spanning the first row, "put Win Rate first" had nowhere to go. */
+     Net P&L is first by default and is a peer of the others, not a full-width
+     lead: a uniform grid is what makes an ORDER mean anything, and with one tile
+     spanning the first row, "put Win Rate first" had nowhere to go. While it is
+     shown, the header leaves its period figure out on this tab. */
   const R={
     net_pnl:()=>statCard('Net P&L', moneyOf(s.net_pnl),
       'realised per fill, net of commission',
@@ -2396,9 +2393,6 @@ function dashboard(){
     avg_pnl:()=>statCard('Avg P&L / Trade', moneyOf(s.avg_pnl),
       'per close, scratches included',
       cls(s.avg_pnl?.base),'avg_pnl'),
-    /* The figure the header's pill also shows. A tile as well because a pill is
-       fixed and a tile is chosen: a premium seller who wants it beside the win
-       rate can have it there, and one who does not can hide it. */
     open_premium:()=>statCard('Open Premium', moneyOf(s.open_premium),
       'collected on shorts, paid on longs · not in Net P&L until it closes',
       cls(s.open_premium.base),'open_premium'),
@@ -2470,21 +2464,11 @@ function dashboard(){
       <div class="pills">
         ${S.type?`<span class="pill" title="Every trade-derived figure below is
           restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
-        <span class="pill" title="Open positions, with a multi-leg strategy
-          counted once. ${s.open_episodes} open contract(s) across ${
-          s.open_positions} position(s) — Holdings groups the same book
-          the same way."
-          >open <b>${s.open_positions}</b></span>
-        ${opt&&s.open_premium.base?`<span class="pill" title="Net premium sitting in
-          positions that are still open — collected on shorts, paid on longs. Not
-          in Net P&L: premium is a liability until a fill closes the contract, and
-          each closing fill brings its share in on the day it trades."
-          >open premium <b class="${cls(s.open_premium.base)}">${
-          moneyOf(s.open_premium)}</b></span>`:''}
-        <span class="pill" title="Commission on ${esc(s.asset_category)} trades.
-          Commission carries an asset category, so this figure is genuinely
-          scoped to this journal."
-          >${esc(s.asset_category)} <b>${moneyOf(s.options_friction)}</b></span>
+        ${tileKeys().includes('open_positions')?'':`<span class="pill" title="Open
+          positions, with a multi-leg strategy counted once. ${s.open_episodes} open
+          contract(s) across ${s.open_positions} position(s), grouped the way
+          Holdings groups them."
+          >open <b>${s.open_positions}</b></span>`}
       </div></div>
     <div class="stats">${cards}</div>
     ${s.closes===0?`<div class="note">Nothing has closed yet, so the
@@ -2498,13 +2482,10 @@ function dashboard(){
   </div>
   <div class="card">
     <div class="crow"><div><h2>${esc(label)} Performance</h2>
-      <div class="sub">Cumulative realised P&L with daily fill count.</div></div>
-      <div class="v big ${cls(s.net_pnl.base)}"
-        >${moneyOf(s.net_pnl)}</div>
-    </div>
+      <div class="sub">Realised P&amp;L added up day by day, one dot per day with a
+        fill.</div></div></div>
     ${chart(s.days)}
-  </div>
-  ${odteCohorts()}`;
+  </div>`;
 }
 
 /* ------------------------------------------------ collection details
@@ -5591,9 +5572,9 @@ function odte(){
       Rails inside the expected move exist on a high-VIX day and are collapsed, not
       dropped — <b>Show more strikes</b> has them. Double-click or drag a strike
       into a scratch pad to read it as a sold level; the coloured line in the ladder
-      is where that level falls. Round-trip history for trades opened on their
-      expiry date is under <b>Trades</b> with the <b>0DTE</b> filter, and the cohort
-      comparison is on the <b>Dashboard</b>.</span>i</span></h2>
+      is where that level falls. Positions opened on their expiry date are under
+      <b>Trades</b> with the <b>0DTE</b> filter, and how they did against the rest of
+      the book is below the ladder.</span>i</span></h2>
       <div class="sub">Where a same-day move lands${oc.today?` for <b>${
       esc(oc.today)}</b>`:''}, strike by strike. Index levels, not ${
       esc(BASE())}.</div></div></div>
@@ -5674,7 +5655,8 @@ function odte(){
     :`<div class="empty">no ladder yet — both readings above have to be
       numbers</div>`}
     ${zscore(od.history)}
-  </div>`;
+  </div>
+  ${odteCohorts()}`;
 }
 
 /* HOW OFTEN EACH RAIL ACTUALLY HELD, which is the one thing the ladder above
@@ -5724,61 +5706,48 @@ function zscore(history){
   </div>`;
 }
 
-/* 0DTE against the rest of the book, on the DASHBOARD rather than on its own tab.
- *
- * It was the top of the 0DTE tab until the calculator took that tab over, and the
- * move is the honest place for it: this is a scoreboard reading -- the same
- * question the cards above it answer, asked of one cohort -- while the calculator
- * is a pre-open instrument that shares only the acronym. The round-trip LIST that
- * travelled with it is gone rather than moved: Trades with the 0DTE filter is that
- * list, re-summed server-side, so keeping a second copy here meant two renderings
- * of one query that could disagree about what the filter means.
+/* 0DTE against the rest of the book, under the calculator. It sat on the
+ * Dashboard, whose figures follow the month while these cover the whole journal.
+ * Both sides count closes by the Dashboard's rule and add up to its all-time
+ * figures (stats.odte_cohorts). The position list is Trades with the 0DTE filter.
  */
 function odteCohorts(){
   const od=S.state.odte;
-  if(!od) return '';
-  const closedTotal=od.cohort.episodes+od.rest.episodes+od.unknown_dte;
-  /* Nothing closed at all means there is no cohort to compare, and two all-zero
-     blocks are noise. Silent rather than empty: this card is a comparison, and a
-     journal with no closed round trip has not made one yet. */
-  if(!closedTotal) return '';
+  if(!od||!(od.cohort.closes+od.rest.closes)) return '';
   /* A cohort of one against a cohort of eight will always show a difference in win
      rate, and it means nothing. Flagged rather than hidden, because the numbers are
      real and worth showing -- what is not real is the comparison. Ten is a
      judgement call, stated as such on screen: a defensible threshold would need a
      significance test this tool has no business claiming to run. */
-  const thin=Math.min(od.cohort.episodes,od.rest.episodes)<10;
-  const block=co=>`<div class="card">
-    <h2 class="sub2">${esc(co.label)}</h2>
+  const thin=Math.min(od.cohort.closes,od.rest.closes)<10;
+  const block=(label,co)=>`<div class="card">
+    <h2 class="sub2">${esc(label)}</h2>
     <div class="stats c2">
-      ${statCard('Round trips',co.episodes,`${co.contracts} contracts`,'sm')}
+      ${statCard('Closes',co.closes,
+        `${co.total_trades} fill${co.total_trades===1?'':'s'}`,'sm')}
       ${statCard('Win rate',pct(co.win_rate),`${co.wins}W / ${co.losses}L`,'sm')}
       ${statCard('Net P&L',moneyOf(co.net_pnl),'realised, net of commission',
         'sm '+cls(co.net_pnl.base))}
-      ${statCard('Avg per trip',co.avg_pnl==null?'—':moneyOf(co.avg_pnl),
+      ${statCard('Avg per close',co.avg_pnl==null?'—':moneyOf(co.avg_pnl),
         'wins and losses together','sm '+cls(co.avg_pnl?.base))}
     </div></div>`;
   return `<div class="card">
     <div class="crow"><div><h2>Zero days to expiration${infoTip(
-      `<b>Avg per trip</b> is the figure that decides whether the cohort is worth
+      `<b>Avg per close</b> is the figure that decides whether the cohort is worth
        trading, not the win rate: a better win rate with a worse average is a losing
-       strategy. That is why the rest of the book is shown beside it — a high 0DTE
+       strategy. That is why the rest of the book is shown beside it. A high 0DTE
        win rate means nothing on its own.
-       <br><br>Counted per contract ROUND TRIP, the same unit as the scoreboard
-       above. A 0DTE cohort is defined by a contract's expiry, and a rolled position
-       spans several, so a position has no single DTE to sort it by.`)}</h2>
+       <br><br>Counted in closes, as on the Dashboard: each time you close all or
+       part of a contract counts once. A contract opened on its own expiry date is
+       0DTE, and every other fill is the rest, so the two sides add up to the
+       Dashboard's all-time figures.`)}</h2>
       <div class="sub">Contracts opened on their own expiry date, against everything
-      else. Whole journal, whatever the month filter says. ${esc(ccyNote())}</div></div>
-      <div class="pills"><span class="pill">0DTE <b>${od.cohort.episodes}</b></span>
-        <span class="pill dim">rest of book <b>${od.rest.episodes}</b></span></div></div>
-    ${thin?`<div class="note"><b>Too few round trips to conclude anything.</b>
-      ${od.cohort.episodes} 0DTE against ${od.rest.episodes} other.${infoTip(
+      else, over the whole journal. ${esc(ccyNote())}</div></div></div>
+    ${thin?`<div class="note"><b>Too few closes to conclude anything.</b>
+      ${od.cohort.closes} 0DTE against ${od.rest.closes} other.${infoTip(
       `A difference in win rate across samples this small is noise, not evidence.
        The threshold is a rule of thumb, not a significance test.`)}</div>`:''}
-    <div class="duo">${block(od.cohort)}${block(od.rest)}</div>
-    ${od.unknown_dte?`<div class="note">${od.unknown_dte} closed round trip(s) carry no
-      expiry, so their DTE is unknown rather than non-zero. They are excluded from both
-      columns above.</div>`:''}
+    <div class="duo">${block('0DTE',od.cohort)}${block('Everything else',od.rest)}</div>
   </div>`;
 }
 

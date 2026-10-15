@@ -706,6 +706,9 @@ def build_state(
         # reordering of it: a campaign holds positions into that exact list.
         view_episodes = view_report.episodes
         view_campaigns = campaigns_for(conn, view_category, view_episodes)
+        # The home category, all time, unfiltered: the Annual table's total row
+        # and the history's scoreboard.
+        whole = month_stats(conn, None, asset_category=asset_category, report=report)
         state: dict[str, Any] = {
             "version": __version__,
             # The code on disk is newer than the code this process runs, so every
@@ -762,7 +765,7 @@ def build_state(
                 campaign_list=view_campaigns,
                 marks=position_marks(conn, view_category),
             ),
-            "history": history_data(report),
+            "history": history_data(report, whole),
             "statements": statements_data(archive_dir, conn),
             # Read-only: a page load never fetches the calendar. The daily
             # `market` job does (and Refresh, by hand), because the feed rate
@@ -849,15 +852,11 @@ def build_state(
         # Dashboard's figure and therefore scoped: under an active filter the
         # year rows stayed whole while that total shrank, so the table stopped
         # adding up -- destroying the one reconciliation it exists to show.
-        state["annual_total"] = stats_data(
-            month_stats(conn, None, asset_category=asset_category, report=report)
-        )
+        state["annual_total"] = stats_data(whole)
         # Cohorts are the whole book by definition -- they exist to compare the
         # 0DTE subset against everything else, so scoping them to 0DTE would
         # leave nothing on the other side of the comparison.
-        odte, rest, unknown_dte = odte_cohorts(
-            conn, asset_category=asset_category, report=report
-        )
+        odte, rest = odte_cohorts(conn, asset_category=asset_category, report=report)
         # Inside the connection block, unlike where it is ASSIGNED below: the
         # journal closes before the settings and sync blocks are built, and reading
         # a closed connection there raised `Cannot operate on a closed database`
@@ -868,10 +867,9 @@ def build_state(
         state["odte"] = {
             "cohort": cohort_data(odte),
             "rest": cohort_data(rest),
-            "unknown_dte": unknown_dte,
             # Whether the filter is offerable at all, derived rather than
             # asserted in the page.
-            "selectable": odte.episodes > 0,
+            "selectable": odte.total_trades > 0,
             # The pre-open planner: the day's expected range from the S&P close
             # and the VIX, both read from stored bars. None until a `bars` fetch
             # has landed them, and the page draws that absence as "run bars"

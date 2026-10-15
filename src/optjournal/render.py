@@ -251,21 +251,6 @@ def render_history(data: Row) -> str:
                 align="<<<>>>><",
             )
         )
-        t = data["totals"]
-        rate = f"{t['win_rate']:.0f}%" if t["win_rate"] is not None else "-"
-        out.append("")
-        out.append(f"  realized total ({cur}){_money(t['realized_base']):>18}")
-        out.append(f"  commission paid ({cur}){_money(t['commission_base']):>17}")
-        out.append(f"  win / loss{t['wins']:>21} / {t['losses']}   win rate {rate}")
-        out.append("  realized P&L is already net of commission, so the two")
-        out.append("  lines above must not be added together.")
-        # This report lists EPISODES, so its win rate counts contracts, and the
-        # dashboard's counts positions. A roll closes one contract and opens the
-        # next, so the two figures legitimately differ and a reader comparing
-        # them needs to know which is which rather than suspecting one is stale.
-        out.append("  counted per contract round trip, the rows above. The")
-        out.append("  dashboard counts POSITIONS, where a roll is one decision")
-        out.append("  rather than two, so its win rate differs by design.")
     else:
         out.append("  (none)")
 
@@ -295,6 +280,23 @@ def render_history(data: Row) -> str:
         )
     else:
         out.append("  (none)")
+
+    # The Dashboard's all-time figures rather than a sum of the rows above: a
+    # partial close on a position still open is in them and in no closed row.
+    # The Dashboard shows one category at a time, so under ALL it is the same
+    # rule over every category, which no Dashboard view sums.
+    t = data["totals"]
+    rate = f"{t['win_rate']:.0f}%" if t["win_rate"] is not None else "-"
+    out.append("")
+    out.append("All time, every category, by the Dashboard's rule" if scope == "ALL"
+               else "All time, as on the Dashboard")
+    out.append(f"  net P&L ({cur}){_base(t['net_pnl']):>25}")
+    out.append(f"  commission paid ({cur}){abs(t['commissions']['base']):>17,.2f}")
+    out.append(f"  closes {t['closes']}, won {t['wins']}, lost {t['losses']}, "
+               f"win rate {rate}")
+    out.append("  P&L is IBKR's per fill and already net of commission, so the")
+    out.append("  two lines above must not be added together. A close is one")
+    out.append("  order closing all or part of a contract on one day.")
 
     if data["partial_record"]:
         out.append("")

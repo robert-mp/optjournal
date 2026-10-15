@@ -71,6 +71,11 @@ def add_trade(
     )
 
 
+def _closed_pnl(report) -> float:
+    """What the closed episodes realised, in base."""
+    return sum(e.realized_pnl_base for e in report.closed)
+
+
 def add_snapshot(conn, conid: str, *, position: int, symbol: str = "OPT1",
                  date: str = "2026-12-31", asset: str = "OPT",
                  cost_basis: float | None = None, account_id: str = "U1",
@@ -383,7 +388,7 @@ def test_an_option_missing_from_the_newest_book_is_flat(conn):
     report = build_history(conn)
     (leap,) = report.episodes
     assert leap.status == "CLOSED"
-    assert report.total_realized_base == 1500.0
+    assert _closed_pnl(report) == 1500.0
     assert report.snapshot_date == "20260916"
     assert _current_option_conids(conn) == set()
 
@@ -671,27 +676,13 @@ def test_realized_is_not_double_counted_with_commission(conn):
     ep = report.episodes[0]
     assert ep.net_of_commission is True
     assert ep.realized_pnl == 96.0
-    assert report.total_realized_base == 96.0
-    assert report.total_commission_base == pytest.approx(4.0)
-
-
-def test_win_rate(conn):
-    add_trade(conn, "1", conid="A", open_close="O", qty=1)
-    add_trade(conn, "2", conid="A", open_close="C", qty=-1,
-              date="2026-03-05", realized=10.0)
-    add_trade(conn, "3", conid="B", open_close="O", qty=1)
-    add_trade(conn, "4", conid="B", open_close="C", qty=-1,
-              date="2026-03-05", realized=-4.0)
-    report = build_history(conn)
-    assert (report.wins, report.losses) == (1, 1)
-    assert report.win_rate == pytest.approx(50.0)
+    assert ep.commission_base == pytest.approx(-4.0)
 
 
 def test_empty_database_yields_empty_report(conn):
     report = build_history(conn)
     assert report.episodes == []
     assert report.snapshot_date is None
-    assert report.win_rate is None
 
 
 # ----------------------------------------------- end-to-end against real data
@@ -785,8 +776,7 @@ def test_reentry_keeps_realized_pnl_in_the_total(conn):
     add_snapshot(conn, "C1", position=-3)
 
     report = build_history(conn)
-    assert report.total_realized_base == 500.0
-    assert report.wins == 1
+    assert _closed_pnl(report) == 500.0
 
 
 def test_reentry_does_not_double_count_the_contract(conn):
@@ -818,7 +808,7 @@ def test_prewindow_close_absent_from_snapshot_is_closed(conn):
     report = build_history(conn)
     assert len(report.episodes) == 1
     assert report.episodes[0].is_closed
-    assert report.total_realized_base == 50.0
+    assert _closed_pnl(report) == 50.0
 
 
 # --- the pre-archive quantity, from the snapshot --------------------------------
@@ -942,8 +932,7 @@ def test_a_share_split_after_a_closed_round_trip_keeps_it_closed(conn):
     report = build_history(conn, asset_category="STK")
     assert [(e.status, e.net_qty, e.realized_pnl) for e in report.episodes] == [
         ("CLOSED", 0, 600.0), ("OPEN", 200, 0.0)]
-    assert report.total_realized_base == 600.0
-    assert (report.wins, report.losses, report.win_rate) == (1, 0, 100.0)
+    assert _closed_pnl(report) == 600.0
 
 
 def test_shares_transferred_in_after_a_closed_round_trip_keep_it_closed(conn):
@@ -967,7 +956,7 @@ def test_shares_transferred_out_after_a_closed_round_trip_keep_it_closed(conn):
     assert [(e.status, e.net_qty, e.entry_outside_window)
             for e in report.episodes] == [
         ("CLOSED", 0, False), ("OPEN", 200, False)]
-    assert report.total_realized_base == 600.0
+    assert _closed_pnl(report) == 600.0
 
 
 def test_a_gap_present_on_every_snapshot_date_is_still_a_pre_archive_holding(conn):

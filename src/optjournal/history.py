@@ -46,7 +46,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from optjournal.money import win_rate
 from optjournal.notes import split_notes
 
 __all__ = [
@@ -273,27 +272,6 @@ class HistoryReport:
     @property
     def open(self) -> list[Episode]:
         return [e for e in self.episodes if not e.is_closed]
-
-    @property
-    def total_realized_base(self) -> float:
-        return sum(e.realized_pnl_base for e in self.closed)
-
-    @property
-    def total_commission_base(self) -> float:
-        return sum(abs(e.commission_base) for e in self.closed)
-
-    @property
-    def wins(self) -> int:
-        return sum(1 for e in self.closed if e.realized_pnl_base > 0)
-
-    @property
-    def losses(self) -> int:
-        return sum(1 for e in self.closed if e.realized_pnl_base < 0)
-
-    @property
-    def win_rate(self) -> float | None:
-        """See `money.win_rate`: None when nothing was decided, not zero."""
-        return win_rate(self.wins, self.losses)
 
 
 #: Currency conversions are never position round trips. IBKR emits no

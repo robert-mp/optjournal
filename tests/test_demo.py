@@ -470,22 +470,23 @@ def test_a_year_crossing_round_trip_counts_in_the_year_it_closed(conn):
     assert sum(y.closes for y in after.values()) == everything.closes
 
 
-def test_odte_cohorts_partition_every_closed_round_trip(conn):
+def test_odte_cohorts_partition_the_whole_journal(conn):
     """Nothing may be counted twice or fall between the two columns."""
-    odte, rest, unknown = odte_cohorts(conn)
-    closed = len(build_history(conn, asset_category="OPT").closed)
-    assert odte.episodes + rest.episodes + unknown == closed
-    assert unknown == 0, "every option in the demo carries an expiry"
+    odte, rest = odte_cohorts(conn)
+    everything = month_stats(conn, None)
+    assert odte.closes + rest.closes == everything.closes
+    assert odte.total_trades + rest.total_trades == everything.total_trades
+    assert odte.net_pnl.base + rest.net_pnl.base == pytest.approx(everything.net_pnl.base)
 
 
-def test_the_demo_has_exactly_one_odte_round_trip(conn):
+def test_the_demo_has_exactly_one_odte_close(conn):
     """The path that was unreachable: the ODTE tab had no trade to show."""
-    odte, rest, _ = odte_cohorts(conn)
-    assert odte.episodes == 1
-    assert rest.episodes > 1, "a cohort of one needs something to compare against"
+    odte, rest = odte_cohorts(conn)
+    assert odte.closes == 1
+    assert rest.closes > 1, "a cohort of one needs something to compare against"
     assert odte.win_rate is not None
     assert odte.avg_pnl.base == pytest.approx(odte.net_pnl.base, abs=1e-9), (
-        "one round trip, so the average is the total"
+        "one close, so the average is the total"
     )
 
 
