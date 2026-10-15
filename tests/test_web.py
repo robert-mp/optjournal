@@ -7682,6 +7682,25 @@ def test_an_over_long_entry_is_refused_rather_than_read_as_empty(populated):
     )
 
 
+def test_a_tap_writes_the_exit_trigger_alone_and_leaves_the_rest(populated):
+    """The one-tap row posts `exit_trigger` and nothing else. The endpoint stores
+    it as an entry of its own, a later tap changes it, and the full form's text
+    saved afterwards keeps it."""
+    anchor, _account = _an_anchor(populated)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, tapped = _post(base, "/api/journal", {"anchor": anchor, "exit_trigger": "target"})
+        assert status == 200 and tapped["entry"]["exit_trigger"] == "target", tapped
+        shows = [tapped["entry"][k] for k in ("broker", "account_id", "anchor")]
+        _post(base, "/api/journal", {"anchor": anchor, "shows": shows, "exit_trigger": "time"})
+        _post(base, "/api/journal", {"anchor": anchor, "shows": shows, "lessons": "early"})
+        _, state = _get(base, "/api/state")
+    from optjournal.journal import FIELDS  # noqa: PLC0415
+    entry = state["journal"]["entries"][anchor]
+    assert (entry["exit_trigger"], entry["lessons"]) == ("time", "early")
+    assert all(entry[k] is None for k in FIELDS
+               if k not in ("exit_trigger", "lessons")), entry
+
+
 def test_a_refused_journal_entry_says_nothing_was_saved_once(populated):
     """L46: the page appended "Nothing was saved, and your text is still on
     screen." to the server's reason, and the size refusal's reason already said
@@ -7701,10 +7720,10 @@ def test_a_refused_journal_entry_says_nothing_was_saved_once(populated):
             "const b={dataset:{jsave:'1'},disabled:false,",
             "  classList:{add(){},remove(){}}};",
             "const document={querySelectorAll:sel=>sel==='[data-jsave]'?[b]:[]};",
-            "const $=()=>({value:''}); const S={state:{}};",
+            "const $=()=>({value:''}); const S={state:{},jdraft:{}};",
             f"const fetch=async()=>({{json:async()=>({json.dumps(reply)})}});",
             _page_const("JFIELDS"), _page_const("JENTRY"),
-            *_page_fns("bindJournal"),
+            *_page_fns("bindJournal", "postJournal"),
             "bindJournal(); await b.onclick();",
             "console.log(JSON.stringify(notes));",
         ])
@@ -7936,29 +7955,120 @@ def test_a_note_no_card_claims_is_drawn_on_the_trades_tab():
         "drawn on both the empty and the populated Trades tab")
 
 
+def _journal_page(lines: list[str], entries: dict, draft: dict | None = None) -> Any:
+    """The page's journal layer under node, over `entries` by anchor."""
+    from optjournal.journal import TRIGGERS  # noqa: PLC0415
+    triggers = [{"key": k, "label": v} for k, v in TRIGGERS.items()]
+    return _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const infoTip=()=>''; function note(){} function draw(){}",
+        "async function load(){loads++;}",
+        "let loads=0, posted=[];",
+        # The server's reply: the entry as stored, or null once nothing is left.
+        "const fetch=async(_url,init)=>{const body=JSON.parse(init.body); posted.push(body);",
+        "  const {anchor,shows,...values}=body, was=S.state.journal.entries[anchor]||{};",
+        "  const entry={...was,...values};",
+        "  return {json:async()=>({ok:true,entry:Object.entries(entry).some(([k,v])=>",
+        "    !['broker','account_id','anchor'].includes(k)&&v)?entry:null})};};",
+        f"const S={{state:{{journal:{{entries:{json.dumps(entries)},",
+        f"  triggers:{json.dumps(triggers)}}},lifecycles:[]}},jrnl:null,lnk:null,",
+        f"  jdraft:{json.dumps(draft or {})}}};",
+        _page_const("JENTRY"), _page_const("JTRIGGERS"), _page_const("JADHERE"),
+        _page_const("JFIELDS"), _page_stmt("JTAP"),
+        *_page_fns("jcount", "journalRow", "triggerTaps", "rollCandidates", "linkForm",
+                   "jvalue", "jdirty", "jfield", "journalForm", "bindJournal",
+                   "postJournal"),
+        *lines,
+    ])
+
+
+def test_a_closed_card_says_why_it_came_off_in_one_tap():
+    """0 of 33 closed positions were written up: the form is heavy for the one
+    answer the review counts. A closed card offers the exit triggers as a row of
+    chips in place of "not written up"; a tap posts that one field, the chosen
+    chip is pressed, and tapping it again clears it, judged on what the tap stored
+    rather than on the state from before it. An open card is unchanged."""
+    from optjournal.journal import TRIGGERS  # noqa: PLC0415
+    entry = {"broker": "ibkr", "account_id": "U1", "anchor": "7", "exit_trigger": "time"}
+    out = _journal_page([
+        "const closed={anchor:'7',status:'closed',underlying:'GOOG',links:[]};",
+        "const open={anchor:'8',status:'open',underlying:'GOOG',links:[]};",
+        "const html=journalRow(closed), other=journalRow(open);",
+        "const chip=key=>({dataset:{jtrig:key,anchor:'7'}});",
+        "const chips={time:chip('time'),target:chip('target')};",
+        "const document={querySelectorAll:sel=>sel==='[data-jtrig]'?Object.values(chips):[]};",
+        "bindJournal(); await chips.target.onclick(); await chips.target.onclick();",
+        "console.log(JSON.stringify({html,other,posted,loads}));",
+    ], {"7": entry})
+    pressed = re.findall(r'data-jtrig="(\w+)"[^>]*class="on" aria-pressed="true"', out["html"])
+    assert pressed == ["time"], out["html"]
+    assert re.findall(r'data-jtrig="(\w+)"', out["html"]) == list(TRIGGERS)
+    assert "Why it came off:" in out["html"] and "not written up" not in out["html"]
+    assert "not written up" in out["other"] and "data-jtrig" not in out["other"]
+    # The tap writes the trigger alone, against the row the card shows; the
+    # second tap is on the chip the first one chose, so it clears.
+    assert out["posted"] == [
+        {"anchor": "7", "shows": ["ibkr", "U1", "7"], "exit_trigger": "target"},
+        {"anchor": "7", "shows": ["ibkr", "U1", "7"], "exit_trigger": ""},
+    ]
+    assert out["loads"] == 2
+
+
+def test_an_unsaved_write_up_is_kept_until_it_is_saved_or_discarded():
+    """Typing into the write-up and then switching tabs, or opening another
+    card's editor, dropped the text without a word: it lived only in the form.
+    It is kept in page state as it is typed, so the editor draws it again when it
+    reopens and the card can tell it is unsaved."""
+    out = _journal_page([
+        "const lessons={dataset:{subject:'7'},id:'j-lessons',value:'took it at half'};",
+        "const document={querySelectorAll:sel=>sel==='.jform [data-subject]'?[lessons]:[]};",
+        "const dirty0=jdirty('7');",
+        "bindJournal(); lessons.oninput();",
+        "S.jrnl='7';",
+        "const form=journalRow({anchor:'7',status:'closed',underlying:'GOOG',links:[]});",
+        "console.log(JSON.stringify({dirty0,dirty:jdirty('7'),draft:S.jdraft,form}));",
+    ], {"7": {"broker": "ibkr", "account_id": "U1", "anchor": "7", "lessons": "first"}})
+    assert out["draft"] == {"7": {"lessons": "took it at half"}}
+    assert (out["dirty0"], out["dirty"]) == (False, True)
+    box = re.search(r'<textarea id="j-lessons"[^>]*>([^<]*)</textarea>', out["form"])
+    assert box and box.group(1) == "took it at half", out["form"]
+    assert "data-bound" in box.group(0), "the preserver would put the old text back"
+
+
 def test_a_failed_journal_save_keeps_the_text_on_screen():
     """The one write on this page whose input cannot be recovered.
 
     A watchlist note refused is a note retyped from what is still on screen; a
     journal entry refused after the form closed is writing gone. So neither the
-    network failure nor the server refusal closes the editor or reloads, and both
-    say the text is still there -- while success closes it, because the act is
-    finished and the badge now says what landed.
+    network failure nor the server refusal closes the editor, drops the draft or
+    reloads, and both say the text is still there, while success closes it,
+    clears the draft and reloads, because the act is finished and the badge now
+    says what landed.
     """
-    src = _fn("bindJournal")
-    fail = src.index("Could not save")
-    refused = src.index("was refused")
-    closed = src.index("S.jrnl=null")
-    assert fail < refused < closed, (
-        "the editor is closed before the failure branches, so a refused save "
-        "discards the writing it refused"
-    )
-    assert src.count("still on screen") == 2, (
-        "one of the two failure paths does not tell the reader their text survived"
-    )
-    assert "await load()" in src[closed:], (
-        "the reload must follow the success, or the badge never updates"
-    )
+    def save(fetch: str) -> dict:
+        return _node_run([
+            f"import {{esc}} from '{_static('format.js')}';",
+            "const notes=[]; function note(text){notes.push(text);}",
+            "let loads=0; async function load(){loads++;}",
+            "const b={dataset:{jsave:'7'},disabled:false,classList:{add(){},remove(){}}};",
+            "const document={querySelectorAll:sel=>sel==='[data-jsave]'?[b]:[]};",
+            "const $=()=>({value:'kept'});",
+            "const S={state:{},jrnl:'7',jdraft:{'7':{lessons:'kept'}}};",
+            f"const fetch={fetch};",
+            _page_const("JFIELDS"), _page_const("JENTRY"),
+            *_page_fns("bindJournal", "postJournal"),
+            "bindJournal(); await b.onclick();",
+            "console.log(JSON.stringify({open:S.jrnl,draft:S.jdraft['7']||null,loads,notes}));",
+        ])
+
+    for fetch in ("async()=>{throw new Error('offline');}",
+                  "async()=>({json:async()=>({ok:false,message:'refused'})})"):
+        failed = save(fetch)
+        assert (failed["open"], failed["draft"], failed["loads"]) == (
+            "7", {"lessons": "kept"}, 0), failed
+        assert len(failed["notes"]) == 1 and "still on screen" in failed["notes"][0], failed
+    done = save("async()=>({json:async()=>({ok:true,entry:{}})})")
+    assert (done["open"], done["draft"], done["loads"]) == (None, None, 1), done
 
 
 def test_every_journal_field_is_one_element_with_an_id():

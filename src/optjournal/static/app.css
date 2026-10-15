@@ -1855,6 +1855,11 @@ stop.gneg{stop-color:var(--bad)}
 .jrow{display:flex;align-items:center;justify-content:space-between;gap:var(--s5);
   margin-top:var(--s6);padding-top:var(--s5);border-top:1px solid var(--line)}
 .jsum{display:flex;align-items:baseline;gap:var(--s4);flex-wrap:wrap}
+/* The one-tap exit trigger on a closed card: the `.seg` pick-one shape, at the
+   size of the buttons beside it. */
+.jtap{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;font-size:var(--t2)}
+.jtap .seg{flex-wrap:wrap}
+.jtap .seg button{font-size:var(--t2);padding:var(--s2) var(--s4)}
 .pill.ok{background:var(--okfill2);color:var(--ok);border-color:var(--okfill2)}
 .pill.dim{color:var(--dim2)}
 .jbtn{font:inherit;font-size:var(--t2);padding:var(--s3) var(--s5);border-radius:var(--r2);

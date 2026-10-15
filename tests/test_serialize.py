@@ -892,6 +892,21 @@ def test_the_review_lists_only_used_triggers_in_the_journals_order():
     assert (stop["count"], stop["wins"], stop["pnl"]) == (2, 1, -2.0)
 
 
+def test_the_review_counts_every_closed_position_by_its_trigger():
+    """One tap on a closed card gives it a trigger and no words, so the trigger
+    rows and the unanswered ones add up to the closed positions, and a tap alone
+    counts as reviewed but not as written up, as the card's badge reads it."""
+    from optjournal.serialize import journal_review  # noqa: PLC0415
+
+    cards = [_card("1", 10.0), _card("2", -5.0), _card("3", 7.0)]
+    entries = {"1": {"exit_trigger": "target"},
+               "2": {"exit_trigger": "max_loss", "lessons": "sized too big"}}
+    rv = journal_review(cards, entries)
+    assert (rv["written"], rv["reviewed"]) == (1, 2)
+    assert rv["untriggered"] == {"count": 1, "wins": 1, "pnl": 7.0}
+    assert sum(t["count"] for t in rv["triggers"]) + rv["untriggered"]["count"] == rv["closed"]
+
+
 # ------------------------------------------------------ 0DTE freshness
 
 _ET = ZoneInfo("America/New_York")

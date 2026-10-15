@@ -1249,6 +1249,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Object} adherence -- {target, invalidation}, each {yes, no, na} counts
  * @property {Object} plan -- {held, broken, unreviewed}, each a Tally
  * @property {Array} triggers -- TriggerTally, in journal.TRIGGERS order, used ones only
+ * @property {Tally} untriggered -- the closed cards no review gave a trigger, so
+ *   the trigger rows and this add up to `closed`
  */
 
 /** @typedef {Object} Tally -- a group of closed cards and what they earned
@@ -1582,6 +1584,11 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      which looks like the writing was lost. A link to "that trade" is `replay`,
      which is in the hash and shows what happened. */
   jrnl:null,
+  /* The editor's unsaved text, by anchor and then field, written as the reader
+     types. Here rather than only in the form, so switching tabs or opening another
+     card's editor keeps it and reopening shows it. A save clears it, and so does
+     closing the card and agreeing to discard it. */
+  jdraft:{},
   /* Which card's roll-link picker is open, by anchor. Not in the hash for the
      `jrnl` reason: it is an unfinished act, not a view. */
   lnk:null,
@@ -3500,10 +3507,7 @@ function trades(){
   const found=lcs.filter(match);
   const inView=(lc,k)=>k==='all'||lc.status===k;
   const since=lc=>String((lc.status==='open'?lc.opened_at:lc.closed_at)||'');
-  /* A row whose write-up is open stays whatever the filter says: the editor holds
-     the only copy of what was typed, and a row filtered away takes it along. */
-  const rows=lcs.filter(lc=>match(lc)&&inView(lc,S.tshow)
-    ||!!lc.anchor&&lc.anchor===S.jrnl).sort((lc,olc)=>
+  const rows=lcs.filter(lc=>match(lc)&&inView(lc,S.tshow)).sort((lc,olc)=>
     (olc.status==='open')-(lc.status==='open')||since(olc).localeCompare(since(lc)));
   const row=lc=>{
     const open=S.topen.has(lc.replay_key), openLc=lc.status==='open', uz=lc.unrealized;
@@ -3591,8 +3595,9 @@ function bindTrades(){
       if(!S.topen.has(key)){S.topen.add(key);draw();return;}
       const lc=(S.state.lifecycles||[]).find(olc=>olc.replay_key===key);
       const a=lc&&lc.anchor;
-      if(a&&S.jrnl===a&&jdirty(a)
+      if(a&&jdirty(a)
          &&!confirm('Close this card? Its write-up has text that is not saved.')) return;
+      if(a) delete S.jdraft[a];
       S.topen.delete(key);
       if(S.replay===key) S.replay=null;
       if(a&&S.jrnl===a) S.jrnl=null;
@@ -3673,11 +3678,15 @@ const JFIELDS=[
   {name:'close_note',at:'close',label:'Closing notes',kind:'text',hint:''},
 ];
 
-/* Whether the open editor holds text the server does not. */
+/* A field as the editor shows it: the reader's unsaved text, else what is stored. */
+function jvalue(a,name){
+  const d=(S.jdraft[a]||{})[name], je=JENTRY(a);
+  return d!=null?d:(je&&je[name]!=null?String(je[name]):'');
+}
+/* Whether the editor holds text the server does not. */
 function jdirty(a){
   const je=JENTRY(a);
-  return JFIELDS.some(jf=>{const el=$('#j-'+jf.name);
-    return !!el&&el.value!==(je&&je[jf.name]!=null?String(je[jf.name]):'');});
+  return JFIELDS.some(jf=>jvalue(a,jf.name)!==(je&&je[jf.name]!=null?String(je[jf.name]):''));
 }
 
 /* The badge on a card, and the button that opens the editor. Three states, not
@@ -3689,7 +3698,12 @@ function journalRow(lc){
   if(!a) return `<div class="note">No opening fills on record for this position,
     only a snapshot, so there is no order to attach a journal entry to.</div>`;
   const je=JENTRY(a), n=jcount(je), shownj=S.jrnl===a;
-  const badge=n?`<span class="pill ok">written up <b>${n}</b></span>`
+  /* A closed card asks the one question the review counts, a tap to answer, and
+     its badge counts what was written besides. */
+  const closed=lc.status==='closed', noted=closed&&je&&je.exit_trigger?n-1:n;
+  const badge=closed?`${triggerTaps(a,je)}${noted?`<span class="pill ok">written up <b>${
+      noted}</b></span>`:''}`
+    :n?`<span class="pill ok">written up <b>${n}</b></span>`
     :`<span class="pill dim">not written up</span>`;
   const joins=(lc.links||[]).map(pair=>`<span class="pill">joined by hand
     <button class="lunlink" data-lunlink="${esc(pair.join('|'))}"
@@ -3701,8 +3715,22 @@ function journalRow(lc){
     <div class="jbtns">${others.length?`<button class="jbtn" data-lopen="${esc(a)}">${
       shownl?'cancel':'link a roll'}</button>`:''}
     <button class="jbtn" data-jopen="${esc(a)}">${
-      shownj?'close':(n?'edit the write-up':'write this up')}</button></div>
-  </div>${shownl?linkForm(lc,others):''}${shownj?journalForm(lc,je):''}`;
+      shownj?'close':(noted?'edit the write-up':'write this up')}</button></div>
+  </div>${shownl?linkForm(lc,others):''}${shownj?journalForm(lc):''}`;
+}
+
+/* The exit triggers as one row of chips, the chosen one pressed. A tap saves it,
+   tapping it again clears it, and the full form shows the same field. */
+const JTAP={target:'target',time:'time',max_loss:'max loss',tested:'tested',
+  external:'external news',assigned:'assigned or expired',other:'other'};
+function triggerTaps(a,je){
+  const now=je&&je.exit_trigger;
+  return `<span class="jtap"><span class="dim">Why it came off:</span>
+    <span class="seg" role="group" aria-label="Why it came off">${JTRIGGERS().map(trg=>
+      `<button data-jtrig="${esc(trg.key)}" data-anchor="${esc(a)}"
+        class="${now===trg.key?'on':''}" aria-pressed="${now===trg.key}"
+        title="${esc(trg.label)}">${esc(JTAP[trg.key]||trg.label)}</button>`).join('')}
+    </span></span>`;
 }
 
 /* The other cards this one could continue: same underlying, and journalled
@@ -3734,10 +3762,10 @@ function linkForm(lc,others){
    then file it there. `restoreInputs` refuses a restore across subjects, which is
    the same mechanism `#wearn` needed when selecting another watched symbol carried
    the previous symbol's typed date across. */
-function jfield(jf,je,anchor){
-  const v=(je&&je[jf.name]!=null)?String(je[jf.name]):'';
+function jfield(jf,anchor){
+  const v=jvalue(anchor,jf.name);
   const id='j-'+jf.name;
-  const subj=` data-subject="${esc(anchor)}"`;
+  const subj=` data-subject="${esc(anchor)}" data-bound`;
   const hint=jf.hint?`<span class="jh">${esc(jf.hint)}</span>`:'';
   /* A SELECT and not three radios, for a reason that outranks the nicer layout:
      `preserveInputs` is keyed by `id`, and radios sharing one `name` have no id
@@ -3765,18 +3793,18 @@ function jfield(jf,je,anchor){
    are always shown -- hiding the review until a lifecycle closes would hide the
    plan's own review from anyone reading an old trade -- but the captions say
    which moment each belongs to. */
-function journalForm(lc,je){
+function journalForm(lc){
   const entered=JFIELDS.filter(jf=>jf.at==='entry');
   const closed=JFIELDS.filter(jf=>jf.at==='close');
   return `<div class="jform">
     <div class="jsec"><h3>At entry</h3>
       <div class="jsub">Written before the outcome is known, which is what makes it
         worth reading afterwards.</div>
-      ${entered.map(jf=>jfield(jf,je,lc.anchor)).join('')}</div>
+      ${entered.map(jf=>jfield(jf,lc.anchor)).join('')}</div>
     <div class="jsec"><h3>At the close</h3>
       <div class="jsub">The review. Whether the plan was followed is a different
         question from whether the trade won.</div>
-      ${closed.map(jf=>jfield(jf,je,lc.anchor)).join('')}</div>
+      ${closed.map(jf=>jfield(jf,lc.anchor)).join('')}</div>
   </div>
   <div class="jact">
     <button class="jsave" data-jsave="${esc(lc.anchor)}">Save</button>
@@ -3785,11 +3813,6 @@ function journalForm(lc,je){
   </div>`;
 }
 
-/* Reads every field and posts them ALL, which is safe only because the server
-   merges on key presence rather than replacing the row: an empty box here means
-   "clear this", which is exactly what a reader deleting a sentence intends. The
-   two are the same act from the form's side, and the server's rule is what keeps
-   the entry form and the review from erasing each other across separate opens. */
 async function postLink(body){
   let lkres;
   try{
@@ -3824,47 +3847,76 @@ function bindJournal(){
   document.querySelectorAll('[data-jopen]').forEach(b=>
     b.onclick=()=>{const a=b.dataset.jopen;
       S.jrnl=S.jrnl===a?null:a; draw();});
+  document.querySelectorAll('.jform [data-subject]').forEach(el=>
+    el.oninput=()=>{(S.jdraft[el.dataset.subject]||=({}))[el.id.slice(2)]=el.value;});
   document.querySelectorAll('[data-jsave]').forEach(b=>
     b.onclick=async()=>{
       const anchor=b.dataset.jsave;
-      /* `shows` is the row this card shows, by its own key. The server edits
-         that row in place, and refuses the write where it is no longer this
-         card's, which a statement since this page loaded can do. */
-      const je=JENTRY(anchor);
-      const body={anchor,shows:je?[je.broker,je.account_id,je.anchor]:null};
       /* Every field is one element with an id -- textarea or select -- so this
-         reads them all the same way. That uniformity is the point: it is what lets
-         `preserveInputs` protect the whole form with one selector. */
+         reads them all the same way. */
+      const values={};
       JFIELDS.forEach(jf=>{
         const el=$('#j-'+jf.name);
-        body[jf.name]=el?el.value:'';
+        values[jf.name]=el?el.value:'';
       });
       b.disabled=true; b.classList.add('busy');
-      let jnres;
-      try{
-        const r=await fetch('/api/journal',{method:'POST',
-          headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-        jnres=await r.json();
-      }catch(err){
-        b.disabled=false; b.classList.remove('busy');
-        note('Could not save: '+esc(err)+' — your text is still on screen.','bad');
-        return;
-      }
-      if(!jnres.ok){
-        b.disabled=false; b.classList.remove('busy');
-        /* The server's reason, then what did NOT happen, said once: the size
-           refusal already says nothing was saved, and the banner said it twice. */
-        const why=jnres.message||'the journal write was refused';
-        note(esc(why)+(why.toLowerCase().includes('nothing was saved')?' Your'
-          :' Nothing was saved, and your')+' text is still on screen.','bad');
-        return;
-      }
+      const jnres=await postJournal(anchor,values,'Your text is still on screen.');
+      if(!jnres){b.disabled=false; b.classList.remove('busy'); return;}
       /* Closed on success, because the reader has finished the act. Reopening is
          one click and the badge above it now says what landed. */
       S.jrnl=null;
-      note(jnres.entry?'Written up.':'Entry deleted — every field was empty.','ok');
+      delete S.jdraft[anchor];
+      note(jnres.entry?'Written up.':'Entry deleted: every field was empty.','ok');
       await load();
     });
+  document.querySelectorAll('[data-jtrig]').forEach(b=>
+    b.onclick=async()=>{
+      const anchor=b.dataset.anchor, je=JENTRY(anchor);
+      const trigger=je&&je.exit_trigger===b.dataset.jtrig?'':b.dataset.jtrig;
+      const taps=on=>document.querySelectorAll('[data-jtrig]').forEach(el=>el.disabled=!on);
+      taps(false);
+      const jnres=await postJournal(anchor,{exit_trigger:trigger},'');
+      if(!jnres){taps(true); return;}
+      /* Drawn from the reply at once, so the chips and an open form agree with
+         what was stored before the reload lands: a Save or a second tap in
+         between would otherwise act on the old trigger. */
+      const entries=S.state.journal.entries;
+      if(jnres.entry) entries[anchor]=jnres.entry; else delete entries[anchor];
+      if(S.jdraft[anchor]) delete S.jdraft[anchor].exit_trigger;
+      draw();
+      await load();
+    });
+}
+
+/* One write to /api/journal, its refusal said once. Save posts every field and a
+   tap posts one, both safe because the server merges on key presence: a field
+   left out is left alone, and an empty one is cleared, which is what a reader
+   deleting a sentence intends. `shows` is the row this card shows, by its own
+   key: the server edits that row in place, and refuses the write where it is no
+   longer this card's, which a statement since this page loaded can do. `kept`
+   says what a failure leaves on screen. Answers the server's reply when the
+   write landed, else null. */
+async function postJournal(anchor,values,kept){
+  const je=JENTRY(anchor);
+  const body={anchor,shows:je?[je.broker,je.account_id,je.anchor]:null,...values};
+  let jnres;
+  try{
+    const r=await fetch('/api/journal',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    jnres=await r.json();
+  }catch(err){
+    note(`Could not save: ${esc(err)}.${kept?' '+kept:''}`,'bad');
+    return null;
+  }
+  if(!jnres.ok){
+    /* The server's reason, then what did NOT happen, said once: the size refusal
+       already says nothing was saved. */
+    const why=jnres.message||'the journal write was refused';
+    note(`${esc(why)}${why.toLowerCase().includes('nothing was saved')?''
+      :' Nothing was saved.'}${kept?' '+kept:''}`,'bad');
+    return null;
+  }
+  return jnres;
 }
 
 /* ------------------------------------------------ journal review */
@@ -3894,11 +3946,20 @@ function review(){
         <span class="pill">with a plan <b>${rv.planned}</b></span>
         <span class="pill">reviewed <b>${rv.reviewed}</b></span></div></div>
     ${rv.reviewed?'':`<div class="empty">Nothing reviewed yet. Open a closed
-      position on the Trades tab and write it up: whether the plan held, and
-      what took it off.</div>`}
+      position on the Trades tab and tap why it came off, or write it up.</div>`}
   </div>`;
-  if(!rv.reviewed) return coverage;
-  const plan=`<div class="card">
+  /* First, because a tap on a closed card answers it: how often each reason took
+     a position off, with the ones not answered yet, so the rows add up. */
+  const triggers=rv.triggers.length?`<div class="card">
+    <div class="crow"><div><h2>Why they came off</h2>
+      <div class="sub">The exit trigger each closed position was given.</div></div></div>
+    <table>${head('trigger')}<tbody>
+      ${rv.triggers.map(tt=>row(tt.label,tt)).join('')}
+      ${rv.untriggered.count?row('Not answered yet',rv.untriggered):''}</tbody></table>
+  </div>`:'';
+  /* Only once a plan was answered: before that it is one row of every position
+     under "Not reviewed", which says nothing. */
+  const plan=rv.plan.held.count+rv.plan.broken.count?`<div class="card">
     <div class="crow"><div><h2>Did the plan hold${infoTip(
       `Held: neither half answered no, and at least one answered yes. Broken:
        either half answered no. A position with no answer is not reviewed, which is
@@ -3908,14 +3969,8 @@ function review(){
     <table>${head('plan')}<tbody>
       ${row('Plan held',rv.plan.held)}${row('Plan broken',rv.plan.broken)}
       ${row('Not reviewed',rv.plan.unreviewed)}</tbody></table>
-  </div>`;
-  const triggers=rv.triggers.length?`<div class="card">
-    <div class="crow"><div><h2>What took them off</h2>
-      <div class="sub">The exit trigger each review named.</div></div></div>
-    <table>${head('trigger')}<tbody>
-      ${rv.triggers.map(tt=>row(tt.label,tt)).join('')}</tbody></table>
   </div>`:'';
-  return coverage+plan+triggers;
+  return coverage+triggers+plan;
 }
 
 /* ------------------------------------------------ positions */

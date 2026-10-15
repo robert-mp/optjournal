@@ -403,7 +403,7 @@ def test_one_order_in_two_categories_files_neither(tmp_path):
 def test_one_click_opens_one_editor(tmp_path):
     """The two GTC cards shared an anchor, so opening one card's editor opened
     both, with two `#j-entry_note` boxes, and Save read the first card's."""
-    from test_web import _node_run, _page_const, _page_fns, _static
+    from test_web import _node_run, _page_const, _page_fns, _page_stmt, _static
 
     db = _journal(tmp_path, [*_GTC, *_REFILL])
     with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
@@ -411,12 +411,13 @@ def test_one_click_opens_one_editor(tmp_path):
     second = next(lc for lc in state["lifecycles"] if lc["status"] == "open")
     drawn = _node_run([
         f"import {{esc}} from '{_static('format.js')}';",
-        f"const S={{state:{json.dumps(state)},jrnl:{json.dumps(second['anchor'])},lnk:null}};",
+        f"const S={{state:{json.dumps(state)},jrnl:{json.dumps(second['anchor'])},lnk:null,",
+        "  jdraft:{}};",
         "const infoTip=()=>'';",
         _page_const("JENTRY"), _page_const("JTRIGGERS"), _page_const("JADHERE"),
-        _page_const("JFIELDS"),
-        *_page_fns("jcount", "journalRow", "rollCandidates", "linkForm", "jfield",
-                   "journalForm"),
+        _page_const("JFIELDS"), _page_stmt("JTAP"),
+        *_page_fns("jcount", "journalRow", "triggerTaps", "rollCandidates", "linkForm",
+                   "jvalue", "jfield", "journalForm"),
         "console.log(JSON.stringify(S.state.lifecycles.map(lc=>",
         "  (journalRow(lc).match(/id=\"j-entry_note\"/g)||[]).length)));",
     ])
@@ -435,12 +436,12 @@ def test_the_page_says_which_row_the_card_shows_when_it_saves():
         "const b={dataset:{jsave:'50'},disabled:false,classList:{add(){},remove(){}}};",
         "const document={querySelectorAll:sel=>sel==='[data-jsave]'?[b]:[]};",
         "const $=()=>({value:''});",
-        f"const S={{state:{{journal:{{entries:{{'50':{json.dumps(entry)}}}}}}}}};",
+        f"const S={{jdraft:{{}},state:{{journal:{{entries:{{'50':{json.dumps(entry)}}}}}}}}};",
         "let body=null;",
         "const fetch=async(_url,init)=>{body=JSON.parse(init.body);",
         "  return {json:async()=>({ok:true,entry:null})};};",
         _page_const("JFIELDS"), _page_const("JENTRY"),
-        *_page_fns("bindJournal"),
+        *_page_fns("bindJournal", "postJournal"),
         "bindJournal(); await b.onclick();",
         "console.log(JSON.stringify([body.anchor, body.shows]));",
     ])

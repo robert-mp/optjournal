@@ -1848,7 +1848,10 @@ def journal_review(lifecycles: list[Row], entries: dict[str, Row]) -> Row:
     # a card's anchor is unique (`journal_shown`).
     for lc in closed:
         je = entries.get(str(lc["anchor"])) or {}
-        if any(v not in (None, "") for k, v in je.items() if k in JOURNAL_FIELDS):
+        # Words, not the one-tap trigger, which `reviewed` counts: the card's
+        # badge reads the same way.
+        if any(v not in (None, "") for k, v in je.items()
+               if k in JOURNAL_FIELDS and k != "exit_trigger"):
             written.append(lc)
         if je.get("plan_target") or je.get("plan_invalidation"):
             planned.append(lc)
@@ -1864,8 +1867,7 @@ def journal_review(lifecycles: list[Row], entries: dict[str, Row]) -> Row:
             held.append(lc)
         else:
             unreviewed.append(lc)
-        if je.get("exit_trigger"):
-            by_trigger.setdefault(str(je["exit_trigger"]), []).append(lc)
+        by_trigger.setdefault(str(je.get("exit_trigger") or ""), []).append(lc)
     return {
         "closed": len(closed),
         "written": len(written),
@@ -1881,6 +1883,8 @@ def journal_review(lifecycles: list[Row], entries: dict[str, Row]) -> Row:
             {"key": key, "label": label, **tally(by_trigger[key])}
             for key, label in JOURNAL_TRIGGERS.items() if key in by_trigger
         ],
+        # The rest, so the trigger rows and this one add up to `closed`.
+        "untriggered": tally(by_trigger.get("", [])),
     }
 
 

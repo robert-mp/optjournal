@@ -395,6 +395,38 @@ def test_an_estimated_close_is_marked_where_its_pnl_shows(tmp_path):
         f"the row, the card's Realised and the event line: {estimated['trades']}")
 
 
+def test_one_tap_shows_in_the_journal_review(tmp_path):
+    """The review counted triggers only below a plan table that, with no plan
+    answered, was every position under "Not reviewed". A tapped trigger now
+    leads the review, with the positions not answered yet beside it, and the plan
+    table waits for a plan answer."""
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    conn = connect_migrated(tmp_path / "demo.db")
+    ingest_file(conn, statement)
+    conn.close()
+    with web.serve_ephemeral(db_path=tmp_path / "demo.db",
+                             archive_dir=statement.parent) as base:
+        with urllib.request.urlopen(base + "/api/state") as res:
+            closed = [lc for lc in json.load(res)["lifecycles"]
+                      if lc["status"] == "closed" and lc["anchor"]]
+        request = urllib.request.Request(
+            base + "/api/journal", method="POST",
+            data=json.dumps({"anchor": closed[0]["anchor"], "exit_trigger": "time"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request) as res:
+            assert json.load(res)["ok"]
+        dom = browser.dump_dom(f"{base}/#tab=review", tmp_path / "review")
+    if dom is None:
+        pytest.skip("no browser produced a DOM (environment, not the page)")
+    text = re.sub(r"\s+", " ", browser.rendered_text(dom))
+    assert "Why they came off" in text
+    assert re.search(r"Time-based \(approaching expiry\) 1 ", text), text
+    assert f"Not answered yet {len(closed) - 1} " in text, text
+    assert "Did the plan hold" not in text
+
+
 def test_the_dashboard_renders_the_tiles_the_reader_stored(served, tmp_path):
     """The chosen arrangement, in its order -- and the default when what is
     stored cannot be drawn.
