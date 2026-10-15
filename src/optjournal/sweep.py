@@ -783,7 +783,7 @@ CHECKS: tuple[Check, ...] = (
 # The matrix
 # ---------------------------------------------------------------------------
 
-TABS = ("dashboard", "calendar", "trades", "positions", "costs", "annual", "portfolio",
+TABS = ("dashboard", "calendar", "trades", "portfolio", "positions", "annual", "costs",
         "review", "odte", "market", "watchlist")
 
 

@@ -99,7 +99,7 @@
     <!-- The period and its result: a month stepper and the Net P&L it selects.
          Empty on every tab it does not drive, and that is the invariant in
          docs/design-notes.md rather than a layout choice -- a tab's numbers move
-         only with a control that tab displays, so a stepper on Positions would be
+         only with a control that tab displays, so a stepper on Holdings would be
          a control that changes nothing on screen. Filled by `renderPeriod`. -->
     <div class="period" id="period"></div>
     <div class="hdr-actions">
@@ -1755,21 +1755,20 @@ const basisOf=m=>isNative(m)?'as charged'
    it fed, HASH_TABS' filter over it and `.tab:disabled` all went together; a
    mechanism kept "in case" is a mechanism nobody has tested.
 
-   THIS LIST IS STILL THE NINE LEAVES, and that is what makes the rail below a
-   cheap change rather than a routing rewrite. `views` dispatches on these keys,
-   `HASH_TABS` validates the URL against them and `sweep.TABS` mirrors them, so
-   folding nine views into seven destinations left every `#tab=costs` link
-   resolving and every one of the nine renders still visited by the browser
-   sweep. A second registry naming the destinations was the smaller change than
-   teaching this one to be a tree. */
+   THIS LIST IS THE LEAVES, and that is what makes the rail below a cheap change
+   rather than a routing rewrite. `views` dispatches on these keys, `HASH_TABS`
+   validates the URL against them and `sweep.TABS` mirrors them, so regrouping
+   the views under the rail leaves every `#tab=` link resolving and every render
+   still visited by the browser sweep. A key is a URL, so a leaf keeps its key
+   when its label changes: Holdings is still `#tab=positions`. */
 const TABS=[
   ['dashboard','Dashboard'],
   ['calendar','Calendar'],
   ['trades','Trades'],
-  ['positions','Positions'],
-  ['costs','Costs'],
-  ['annual','Annual'],
   ['portfolio','Portfolio'],
+  ['positions','Holdings'],
+  ['annual','Annual'],
+  ['costs','Costs'],
   ['review','Journal'],
   ['odte','0DTE'],
   ['market','Market'],
@@ -1778,31 +1777,30 @@ const TABS=[
 
 /* ------------------------------------------------ the rail
 
-   [id, label, leaves]. Seven destinations, two of which carry more than one leaf:
-   Trades holds the book closed and open, Analysis holds the two whole-history
-   aggregates. Those are the two pairs that answer one question between them,
-   which is the test a fold has to pass -- Calendar and Annual are both time
-   views and were NOT folded, because "this month day by day" and "every year
-   side by side" are two questions, not one asked twice.
-
-   Seven is what fits a vertical rail. Nine items read as a list to be scanned;
-   seven with two of them grouped reads as a shape to be learned, which is the
-   whole point of moving the navigation off the header's second row.
+   [id, label, leaves]. Eight destinations, two of which carry more than one leaf,
+   because each pair answers one question between them. Portfolio is what the
+   account is worth and what it holds: the value over time, then the holdings
+   that make it up. Analysis is the look back over the whole journal: the years
+   side by side, what the broker cost, and the write-ups. Trades is the
+   positions you traded, open and closed, on its own. Calendar and Annual are
+   both time views and were NOT folded, because "this month day by day" and
+   "every year side by side" are two questions, not one asked twice.
 
    The icons sit in their own table rather than a fourth slot here, so this stays
    a list a reader can check against the rail in front of them. */
 const RAIL=[
   ['dashboard','Dashboard',['dashboard']],
   ['calendar','Calendar',['calendar']],
-  ['trades','Trades',['trades','positions']],
-  ['analysis','Analysis',['costs','annual','portfolio','review']],
+  ['trades','Trades',['trades']],
+  ['portfolio','Portfolio',['portfolio','positions']],
+  ['analysis','Analysis',['annual','costs','review']],
   ['odte','0DTE',['odte']],
   ['market','Market',['market']],
   ['watchlist','Watchlist',['watchlist']],
 ];
 
 /* Path data on a 24x24 grid, stroked and unfilled, drawn from the same two
-   primitives throughout (a box and a rule) so seven glyphs read as one set.
+   primitives throughout (a box and a rule) so the glyphs read as one set.
    Deliberately NOT a <symbol> + <use> sprite: `<use>` clones into a shadow tree
    that only inherited properties cross, so the glyphs take their colour by
    inheritance either way, and a sprite would buy nothing while adding a second
@@ -1813,6 +1811,7 @@ const RAIL_ICONS={
   dashboard:'M4 4h6v6H4z M14 4h6v6h-6z M4 14h6v6H4z M14 14h6v6h-6z',
   calendar:'M4 6h16v14H4z M4 11h16 M9 3v4 M15 3v4',
   trades:'M4 9h13 M14 6l3 3-3 3 M20 15H7 M10 12l-3 3 3 3',
+  portfolio:'M3 8h18v12H3z M9 8V5h6v3 M3 13h18',
   analysis:'M4 20h16 M7 20v-5 M12 20V8 M17 20v-9',
   odte:'M6 3h12v18H6z M9 7h6 M9 11h1 M14 11h1 M9 15h1 M14 15h1',
   market:'M4 9h16v11H4z M3 9l2-5h14l2 5 M9 20v-6h6v6',
@@ -1847,7 +1846,7 @@ function renderRail(){
    `.seg` rather than a second row of tabs, because that shape already means "pick
    one" everywhere else on this page and a reader should not have to learn that
    two controls with different silhouettes do the same thing. Empty string, not a
-   hidden element, for the five destinations that have one leaf: a control that is
+   hidden element, for a destination with one leaf: a control that is
    always there and sometimes inert is a control a reader has to test. */
 function subnav(){
   const leaves=RAIL_OF(S.tab)[2];
@@ -1977,7 +1976,7 @@ function ccyControl(){
    docs/design-notes.md -- a tab's numbers move only with a control it displays --
    read in the direction it is easy to forget: a control it displays must move
    its numbers. Trades lists every position whatever the month, so it shows the
-   trade type and not the stepper; Positions ignores both, so it gets neither. */
+   trade type and not the stepper; Holdings ignores both, so it gets neither. */
 const PERIOD_TABS=['dashboard','calendar'];
 const TYPE_TABS=['dashboard','calendar','trades'];
 const TYPE_LABEL={'':'Options',equities:'Equities',odte:'0DTE'};
@@ -2136,11 +2135,11 @@ function scopeNote(){
   if(!S.type) return '';
   if(S.type==='equities')
     return `<div class="note"><b>Equities.</b> Dashboard, Calendar and Trades show
-      STK activity; Positions, Costs, Annual and 0DTE stay on options.${infoTip(
+      STK activity; Holdings, Costs, Annual and 0DTE stay on options.${infoTip(
       `STK is a different asset category, not a subset of the options journal.
        <br><br>Stock P&amp;L uses IBKR's per-fill realisation: each lot sold is
        realised when it is sold.`)}</div>`;
-  return `<div class="note"><b>${esc(S.state.trade_type_label)} only.</b> Positions,
+  return `<div class="note"><b>${esc(S.state.trade_type_label)} only.</b> Holdings,
     Costs, Annual and 0DTE are unaffected.${infoTip(
     `Fills, orders, P&amp;L, commission, win rate and the daily series are all
      restricted to this subset.
@@ -2473,7 +2472,7 @@ function dashboard(){
           restricted to this subset.">filter <b>${esc(st.trade_type_label)}</b></span>`:''}
         <span class="pill" title="Open positions, with a multi-leg strategy
           counted once. ${s.open_episodes} open contract(s) across ${
-          s.open_positions} position(s) — the Positions tab groups the same book
+          s.open_positions} position(s) — Holdings groups the same book
           the same way."
           >open <b>${s.open_positions}</b></span>
         ${opt&&s.open_premium.base?`<span class="pill" title="Net premium sitting in
@@ -2494,7 +2493,7 @@ function dashboard(){
        all or part of a contract. Net P&amp;L starts that day too.
        <br><br>${s.open_premium.base?`The ${cash(s.open_premium.base)} net premium in
        the ${s.open_positions} open position(s) is not profit until they close.`
-       :`The ${s.open_positions} open position(s) are under <b>Positions</b>.`}`
+       :`The ${s.open_positions} open position(s) are under <b>Holdings</b>.`}`
       )}</div>`:''}
   </div>
   <div class="card">

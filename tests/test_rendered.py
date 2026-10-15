@@ -225,6 +225,44 @@ def test_every_drill_down_is_a_keyboard_stop(served, tmp_path):
         f"nothing to check, so this proved nothing: {found}")
 
 
+def _rail(markup: str) -> tuple[list[str], str, list[tuple[str, bool]]]:
+    """The rail's labels, the one marked current, and the sub-view buttons with
+    whether each is pressed."""
+    nav = re.search(r'<nav class="rail"[^>]*>(.*?)</nav>', markup, re.S).group(1)
+    items = re.findall(r'<button class="tab( on)?"[^>]*>.*?</span>([^<]*)</button>', nav, re.S)
+    sub = re.search(r'<div class="seg subnav">(.*?)</div>', markup, re.S)
+    leaves = re.findall(r'<button data-tab="[^"]*" class="(on)?"\s*>([^<]*)</button>',
+                        sub.group(1)) if sub else []
+    return ([label.strip() for _, label in items],
+            next(label.strip() for on, label in items if on),
+            [(label, bool(on)) for on, label in leaves])
+
+
+def test_the_rail_groups_the_holdings_under_portfolio_and_old_links_still_land(
+        served, tmp_path):
+    """Trades stands alone, Portfolio holds the account value then its holdings,
+    and Analysis leads with the years. The leaves keep their keys, so a link to
+    `#tab=positions` or `#tab=costs` written before the regrouping opens the
+    same view, now under its new destination."""
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    seen = {}
+    for leaf in ("trades", "positions", "portfolio", "costs", "review"):
+        dom = browser.dump_dom(f"{served}/#tab={leaf}", tmp_path / f"rail-{leaf}")
+        if dom is None:
+            pytest.skip("no browser produced a DOM (environment, not the page)")
+        seen[leaf] = _rail(browser.markup(dom))
+    rail = ["Dashboard", "Calendar", "Trades", "Portfolio", "Analysis", "0DTE",
+            "Market", "Watchlist"]
+    assert seen["trades"] == (rail, "Trades", []), seen["trades"]
+    assert seen["positions"][1:] == ("Portfolio", [("Portfolio", False), ("Holdings", True)])
+    assert seen["portfolio"][1:] == ("Portfolio", [("Portfolio", True), ("Holdings", False)])
+    assert seen["costs"][1:] == (
+        "Analysis", [("Annual", False), ("Costs", True), ("Journal", False)])
+    assert seen["review"][1:] == (
+        "Analysis", [("Annual", False), ("Costs", False), ("Journal", True)])
+
+
 def test_the_0dte_tab_works_on_typed_readings_before_any_index_bar(
         served, tmp_path, monkeypatch):
     """L45: with no S&P or VIX bars stored (this demo journal has none), the tab

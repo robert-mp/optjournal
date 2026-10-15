@@ -341,7 +341,7 @@ Four invariants worth knowing before changing the UI:
   displays.** The month drives Dashboard and Calendar (`PERIOD_TABS` in
   `page.html`); the trade type drives those two and Trades (`TYPE_TABS`), and
   nothing else. "0DTE" is a fill-level scope within options; "Equities"
-  switches the asset category those three tabs run over. Positions, Annual and
+  switches the asset category those three tabs run over. Holdings, Annual and
   0DTE stay pinned to options.
 
   It binds in the other direction too, and that is the one the header makes
@@ -514,7 +514,7 @@ added after a paragraph landed one line below its `*/`, which silently killed
 `.stats`'s `grid-template-columns` while every string-searching assertion still
 passed, because the bytes were all present.
 
-**Known limitation.** The wide tables on Positions, Costs and Annual overflow the
+**Known limitation.** The wide tables on Holdings, Costs and Annual overflow the
 page below roughly 700px. It predates this work and is untouched by it: those rules
 convert to identical values (`th` padding `0 10px 8px`, `table` 13px). Containing it
 means a horizontal scroll container, and the obvious one-line version
@@ -614,7 +614,7 @@ column past the viewport. `minmax(0,1fr)` lets the column shrink and pushes the
 overflow down to whatever is actually wide. The watchlist form had the same bug in
 its own grid.
 
-**Tables scroll in place below 1180px.** Positions, Costs and Annual carry 8 to 10
+**Tables scroll in place below 1180px.** Holdings, Costs and Annual carry 8 to 10
 nowrap columns. Each `table` becomes its own `overflow-x:auto` block rather than
 the card, because a scrolling card would clip the tooltips that deliberately hang
 out of it. The watchlist and ladder tables are excluded; each already sits in its

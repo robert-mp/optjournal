@@ -59,7 +59,7 @@ The journal reads six sections of the query. Turn each one on, and tick
 |---|---|
 | Account Information | The account's base currency. Without it a statement is refused, unless Net Asset Value (NAV) in Base is on. |
 | Trades | Every fill. P&L, commissions, wins and losses, the calendar and the Trades tab all come from it. The currencies your options trade in, with IBKR's rate on each fill, also give the page its currency switch. |
-| Open Positions | What you hold on each statement date, for the Positions tab and your holdings. Without it the Positions tab is empty, and a position opened before your oldest statement reads as closed. |
+| Open Positions | What you hold on each statement date, for Holdings under Portfolio. Without it Holdings is empty, and a position opened before your oldest statement reads as closed. |
 | Cash Transactions | Fees, dividends, withholding tax and deposits, for the Costs tab and the Portfolio tab. |
 | Net Asset Value (NAV) in Base (named Equity Summary in Base in the statement file) | Your account value each day, for Gain % of Net Liq, the Portfolio tab and each holding's share of the account. |
 | Financial Instrument Information | Contract details. They identify the stock behind an option you hold but have no fill for, so that stock's price chart still loads. |
