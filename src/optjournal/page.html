@@ -2218,13 +2218,13 @@ function statCard(k,v,note,klass,tile){
    them divides leaves an empty cell -- the orphan app.css records as most of what
    once read as unpolished here. So a multiple of four shown: the chooser enforces it
    and `web._settings_write` refuses anything else. Twelve by default: the nine
-   this tab always had, plus Profit Factor, Avg P&L per Trade and Open Premium. */
+   this tab always had, plus Profit Factor, Avg P&L per Close and Open Premium. */
 const TILES=[
-  ['net_pnl','Net P&L'],['trades','Trades'],['win_rate','Win Rate'],
+  ['net_pnl','Net P&L'],['trades','Closes'],['win_rate','Win Rate'],
   ['profit_factor','Profit Factor'],
-  ['wins','Winning Trades'],['losses','Losing Trades'],['avg_win','Avg Win'],
+  ['wins','Winning Closes'],['losses','Losing Closes'],['avg_win','Avg Win'],
   ['avg_loss','Avg Loss'],
-  ['commissions','Commissions'],['avg_pnl','Avg P&L / Trade'],
+  ['commissions','Commissions'],['avg_pnl','Avg P&L / Close'],
   ['gain','Gain % of Net Liq'],['open_premium','Open Premium'],
   ['open_positions','Open Positions'],['green_days','Green Days'],
   ['red_days','Red Days'],['orders','Orders'],
@@ -2323,9 +2323,8 @@ function dashboard(){
       cls(s.net_pnl.base)+' '+(String(moneyOf(s.net_pnl)).length>10?'sm':''),
       'net_pnl'),
     trades:()=>opt
-      ? statCard('Trades', s.closes,
-          `close${s.closes===1?'':'s'}`
-          +` · ${s.total_trades} fill(s), ${s.orders} order(s)`,'','trades')
+      ? statCard('Closes', s.closes,
+          `${s.total_trades} fill(s), ${s.orders} order(s)`,'','trades')
       : statCard('Total Trades', s.total_trades,
           s.orders?`${s.orders} order(s)`:'','','trades'),
     /* `Math.abs`, matching the Annual and Month tables. The same all-time
@@ -2349,9 +2348,9 @@ function dashboard(){
     /* No account-level Fees card here by request: market-data and custody
        charges carry no asset category and are not options information. The
        Costs tab remains the place that itemises them. */
-    wins:()=>statCard('Winning Trades', s.wins, 'closes',
+    wins:()=>statCard('Winning Closes', s.wins, 'closed at a profit',
       s.wins?'pos':'','wins'),
-    losses:()=>statCard('Losing Trades', s.losses, 'closes',
+    losses:()=>statCard('Losing Closes', s.losses, 'closed at a loss',
       s.losses?'neg':'','losses'),
     win_rate:()=>statCard('Win Rate', pct(s.win_rate),
       s.closes?`${s.closes} close${s.closes===1?'':'s'}`:'nothing closed yet',
@@ -2390,7 +2389,7 @@ function dashboard(){
           s.closes===1?'':'s'}`:s.wins&&!s.losses
           ?`${s.wins} won, none lost`:'nothing closed yet',
         pf==null?'':pf>1?'pos':pf<1?'neg':'','profit_factor');},
-    avg_pnl:()=>statCard('Avg P&L / Trade', moneyOf(s.avg_pnl),
+    avg_pnl:()=>statCard('Avg P&L / Close', moneyOf(s.avg_pnl),
       'per close, scratches included',
       cls(s.avg_pnl?.base),'avg_pnl'),
     open_premium:()=>statCard('Open Premium', moneyOf(s.open_premium),

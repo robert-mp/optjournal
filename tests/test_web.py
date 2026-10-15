@@ -1121,12 +1121,11 @@ def test_dashboard_headline_counts_closes_for_options():
     options the headline is CLOSES, the same population the P&L, wins, losses and
     averages measure. Fills survive in the sub-note, named as what they are."""
     js = _js()
-    assert "statCard('Trades', s.closes," in js
-    assert "fill(s), ${s.orders} order(s)" in js, "fills stay visible as activity"
-    assert "`close${s.closes===1?'':'s'}`" in js, (
+    assert "statCard('Closes', s.closes," in js, (
         "the headline names its unit, which is the money's: net P&L is "
         "attributed by it"
     )
+    assert "fill(s), ${s.orders} order(s)" in js, "fills stay visible as activity"
     # The fill-count headline remains only as the non-options branch.
     assert js.count("statCard('Total Trades', s.total_trades,") == 1
 

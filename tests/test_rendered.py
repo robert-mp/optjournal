@@ -119,9 +119,12 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     assert not re.search(r"\b(undefined|NaN)\b", text), "a binding rendered as junk"
     assert "[object Object]" not in text
 
-    # The stat-card grid actually populated.
-    assert "Trades" in text
-    assert "Commissions" in text
+    # The stat-card grid actually populated, in the Annual table's unit: a tile
+    # counting closes says closes.
+    for tile in ("Closes", "Winning Closes", "Losing Closes", "L / Close",
+                 "Commissions"):
+        assert tile in text, f"no {tile} tile"
+    assert "Winning Trades" not in text and "L / Trade" not in text
 
     # The header dateline, which SHIPS EMPTY in the markup and is filled by JS.
     # That is precisely the shape source analysis cannot check: a renderKicker
