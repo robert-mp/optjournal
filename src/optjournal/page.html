@@ -473,6 +473,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} day
  * @property {number} trades
  * @property {Money} realized
+ * @property {boolean} pnl_estimated -- `realized` holds a close the journal priced
+ *   from the fills, until the next statement replaces it
  */
 
 /** @typedef {Object} Allocation -- what the account holds, by name, against net
@@ -582,12 +584,16 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   figures are approximate. MAX over the legs: one tainted fill taints the sum
  * @property {number} settled -- 0 when any fill is still same-session only, which
  *   also means its realised P&L is not known rather than zero
+ * @property {number} pnl_estimated -- 1 when a close here was priced by the journal
+ *   from the fills rather than by IBKR; MAX over the legs, like fx_rate_estimated
  */
 
 /** @typedef {Object} Leg -- one contract's fills within an order
  * @property {number} fx_rate_estimated -- 1 when a fill here had its FX rate
  *   estimated rather than stated by the broker; see Order.fx_rate_estimated
  * @property {number} settled -- 0 while any fill is same-session only
+ * @property {number} pnl_estimated -- 1 when a fill here was priced by the journal;
+ *   see Order.pnl_estimated
  * @property {string} broker -- see Order.broker; the leg is grouped per broker too
  * @property {string} ib_order_id
  * @property {string} conid
@@ -1202,6 +1208,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Money} proceeds
  * @property {Money} commission
  * @property {Money} realized_pnl
+ * @property {boolean} pnl_estimated -- realized_pnl holds a close the journal priced
  * @property {Array} orders -- the member Order rows, fully visible
  */
 
@@ -1228,6 +1235,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Money|null} unrealized -- the contracts still held, as the newest
  *   statement marked them (strategies._unrealized). Null on a closed card, and
  *   when any held contract has no mark, which is a position opened since
+ * @property {boolean} pnl_estimated -- realized_pnl holds a close the journal priced
  * @property {Array} events -- StrategyGroup rows
  * @property {string} replay_key -- index into State.replays
  */
@@ -2761,6 +2769,12 @@ function chart(days){
     ${dots}${labels}</svg>`;
 }
 
+/* Same-session P&L, priced by the journal from the fills: marked wherever it is
+   shown, since it reads as final otherwise (trades.pnl_estimated). The mark goes
+   before the figure's own element, whose "+" is a `::before`. */
+const EST_WHY="Estimated from your fills; tomorrow's statement replaces it.";
+const estMark=on=>on?`<span class="approx" title="${EST_WHY}">≈</span>`:'';
+
 /* ------------------------------------------------ calendar */
 function calendar(){
   const s=S.state.stats;
@@ -2815,11 +2829,13 @@ function calendar(){
     /* BOTH forms of the figure, and the stylesheet shows one: the amount where it
        fits, `compact` on a phone, where "−€1,729.42" was clipped to "−€1,7". The
        label is what a screen reader hears either way, and it has the exact one. */
-    const fig=k?`<span class="dplw">${moneyOf(dy.realized)}</span><span class="dpln">${
-      compact(amountOf(dy.realized))}</span>`:'—';
+    const est=estMark(dy&&dy.pnl_estimated);
+    const fig=k?`<span class="dplw">${est}${moneyOf(dy.realized)}</span><span class="dpln">${
+      est}${compact(amountOf(dy.realized))}</span>`:'—';
     cells.push(`<div class="day ${k}${dy?' clk':''}${sel}"${dy?` data-calday="${key}"
       role="button" tabindex="0" aria-pressed="${sel?'true':'false'}" aria-label="${
-      esc(`${dayLabel(key)}: ${fills}${k?', '+moneyOf(dy.realized):''}`)}"`:''}>
+      esc(`${dayLabel(key)}: ${fills}${k?', '+moneyOf(dy.realized):''}${
+        k&&dy.pnl_estimated?', estimated':''}`)}"`:''}>
       <div class="top"><span class="dnum">${d}</span>
         <span class="dct">${fills}</span></div>
       <div class="dpl ${dy&&!k?'dim':''}">${dy?fig:'<span class="dim2">—</span>'}</div>
@@ -2865,7 +2881,7 @@ function dayDetail(by){
     if(String(l.first_fill_at||'').slice(0,10)===key)
       rows.push({g,o,l});
   })));
-  if(!rows.length) return `<div class="note">No leg detail for ${esc(key)} —
+  if(!rows.length) return `<div class="note">No leg detail for ${esc(shortDay(key))}:
     fills exist but their orders are outside the current filter.</div>`;
   return `<div class="grp mt-3">
     <div class="gh"><span class="gl">${esc(shortDay(key))} · ${plural(rows.length,'fill')}</span>
@@ -3498,7 +3514,8 @@ function trades(){
       <td>${openLc?'<span class="pill">OPEN</span>':'<span class="pill dim">CLOSED</span>'}</td>
       <td>${esc(tradeDates(lc))}</td>
       <td class="n">${esc(heldFor(lc))}</td>
-      <td class="n ${cls(lc.realized_pnl?.base)}">${moneyOf(lc.realized_pnl)}</td>
+      <td class="n">${estMark(lc.pnl_estimated)}<span class="${cls(lc.realized_pnl?.base)}">${
+        moneyOf(lc.realized_pnl)}</span></td>
       <td class="n ${cls(uz&&uz.base)}"${openLc&&!uz?` title="${esc(NO_PRICE_WHY)}"`:''}>${
         !openLc?'':uz?moneyOf(uz):`— <span class="dim2">${NO_PRICE}</span>`}</td>
     </tr>${open?`<tr class="tdrawer"><td colspan="7">${tradeCard(lc)}</td></tr>`:''}`;
@@ -3533,7 +3550,8 @@ function tradeCard(lc){
   const shown=S.replay===lc.replay_key;
   const uz=lc.unrealized;
   const score=lc.status==='open'?['Unrealised',`<b class="${cls(uz&&uz.base)}">${moneyOf(uz)}</b>`]
-    :['Realised',`<b class="${cls(lc.realized_pnl?.base)}">${moneyOf(lc.realized_pnl)}</b>`];
+    :['Realised',`${estMark(lc.pnl_estimated)}<b class="${cls(lc.realized_pnl?.base)}">${
+      moneyOf(lc.realized_pnl)}</b>`];
   return `${rp?`<div class="tbar"><button class="jbtn" data-replay="${esc(lc.replay_key)}"
       aria-expanded="${shown}">${shown?'hide replay':'replay'}</button></div>`:''}
     ${shown&&rp?replayPanel(rp,score[0],score[1]):''}
@@ -3556,7 +3574,8 @@ function tradeCard(lc){
       return `<div class="grp">
       <div class="gh"><span class="gl" title="${esc(`order${ids.length>1?'s':''} ${
         ids.join(', ')}`)}">${esc(shortDay(g.first_fill_at))} — ${esc(evl)}</span>
-        ${closes?`<span class="fig ${cls(g.realized_pnl.base)}">${moneyOf(g.realized_pnl)}</span>`:''}</div>
+        ${closes?`<span>${estMark(g.pnl_estimated)}<span class="fig ${cls(g.realized_pnl.base)}">${
+          moneyOf(g.realized_pnl)}</span></span>`:''}</div>
       ${glegs.map(l=>legRow(l)).join('')}
     </div>`;}).join('')}
     ${journalRow(lc)}`;

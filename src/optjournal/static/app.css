@@ -441,6 +441,9 @@ html,body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;
    from the figure it is qualifying. `--warnfg` is the token every warning surface
    already uses, so this inherits each theme's contrast check for free. */
 .warn2{color:var(--warnfg)}
+/* The "≈" before a same-session figure the journal estimated: the banner's colour,
+   so the mark and the caption that explains it read as one thing. */
+.approx{color:var(--warnfg);cursor:help;margin-right:.15em}
 .pos.signed::before{content:"+"}
 /* `width:100%` is load-bearing now that this is a grid item. `margin:0 auto` in the
    inline axis OVERRIDES a grid item's default stretch -- auto margins absorb the

@@ -160,6 +160,9 @@ def _event(members: list[Row]) -> Row:
         # exact figure, and re-gating an already-gated order total cannot
         # tell a withheld native from an absent one.
         **{f: Money.from_rows(legs, f).payload() for f in FILL_MONEY_FIELDS},
+        # Whether `realized_pnl` holds a close the journal priced from the fills,
+        # which the next statement replaces with IBKR's.
+        "pnl_estimated": any(leg.get("pnl_estimated") for leg in legs),
         "orders": members,
     }
 
@@ -401,6 +404,7 @@ def position_groups(
                 if any("C" in str(lg.get("open_close") or "").upper() for lg in legs)
                 else None
             ),
+            "pnl_estimated": any(ev["pnl_estimated"] for ev in members),
             "unrealized": (
                 _unrealized([str(e.conid) for e in eps if not e.is_closed], marks or {})
                 if camp and not camp.is_decided else None

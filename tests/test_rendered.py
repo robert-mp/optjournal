@@ -350,6 +350,51 @@ def test_every_tab_writes_dates_and_counts_the_way_a_reader_does(
     assert not leaks, f"machine dates, OSI symbols or (s) plurals on screen: {leaks}"
 
 
+def test_an_estimated_close_is_marked_where_its_pnl_shows(tmp_path):
+    """Same-session P&L priced from the fills was flagged only in the Dashboard's
+    banner; the Calendar day, the Trades row, the card's Realised and the event
+    line showed it as final. Each now carries a "≈" whose tooltip says the
+    statement replaces it, and a journal with no estimate shows none."""
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    conn = connect_migrated(tmp_path / "demo.db")
+    ingest_file(conn, statement)
+    conn.commit()
+
+    def marks(base: str, card: dict, month: str, profile: str) -> dict[str, list[str]]:
+        seen = {}
+        for name, hash_ in (("calendar", f"tab=calendar&month={month}"),
+                            ("trades", f"tab=trades&replay={card['replay_key']}")):
+            dom = browser.dump_dom(f"{base}/#{hash_}", tmp_path / f"{profile}-{name}")
+            if dom is None:
+                pytest.skip("no browser produced a DOM (environment, not the page)")
+            seen[name] = re.findall(r'<span class="approx" title="([^"]*)">≈</span>',
+                                    browser.markup(dom))
+        return seen
+
+    with web.serve_ephemeral(db_path=tmp_path / "demo.db",
+                             archive_dir=statement.parent) as base:
+        with urllib.request.urlopen(base + "/api/state?month=all") as res:
+            card = next(lc for lc in json.load(res)["lifecycles"]
+                        if lc["status"] == "closed" and lc["replay_key"])
+        leg = next(leg for ev in card["events"] for o in ev["orders"] for leg in o["legs"]
+                   if "C" in leg["open_close"])
+        month = leg["first_fill_at"][:7]
+        settled = marks(base, card, month, "settled")
+        conn.execute("UPDATE trades SET pnl_estimated = 1 WHERE ib_order_id = ?"
+                     " AND conid = ?", (leg["ib_order_id"], leg["conid"]))
+        conn.commit()
+        estimated = marks(base, card, month, "estimated")
+    conn.close()
+    assert settled == {"calendar": [], "trades": []}, settled
+    why = "Estimated from your fills; tomorrow's statement replaces it."
+    # Both of the calendar cell's forms, the wide figure and the phone's compact one.
+    assert estimated["calendar"] == [why, why], estimated
+    assert estimated["trades"] == [why, why, why], (
+        f"the row, the card's Realised and the event line: {estimated['trades']}")
+
+
 def test_the_dashboard_renders_the_tiles_the_reader_stored(served, tmp_path):
     """The chosen arrangement, in its order -- and the default when what is
     stored cannot be drawn.

@@ -300,6 +300,9 @@ class DayPnl:
     #: fill with the currency it settled in, so a day whose trades all settled
     #: in one currency has an exact figure, not only a translation.
     realized: Money = Money.restated(0.0)
+    #: Whether `realized` holds a close the journal priced from the fills, which
+    #: the next statement replaces with IBKR's figure.
+    pnl_estimated: bool = False
 
     @property
     def is_green(self) -> bool:
@@ -751,9 +754,10 @@ def daily_series(
     # Rows rather than running totals because a `Money` is frozen: each day's
     # figure is built once, from every fill that contributed.
     ledger: dict[str, list[tuple[float | None, float | None, str | None]]] = {}
+    estimated: set[str] = set()
     for row in conn.execute(
         f"SELECT trade_date, trade_id, fifo_pnl_realized_base, fifo_pnl_realized,"
-        f" currency FROM trades {where}", params
+        f" currency, pnl_estimated FROM trades {where}", params
     ):
         day = _day_of(row["trade_date"])
         if day is None or not _in_period(row["trade_date"], period):
@@ -763,8 +767,11 @@ def daily_series(
         ledger.setdefault(day, []).append(
             (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"], row["currency"])
         )
+        if row["pnl_estimated"]:
+            estimated.add(day)
     return [
-        DayPnl(day=day, trades=len(rows), realized=Money.charged(rows))
+        DayPnl(day=day, trades=len(rows), realized=Money.charged(rows),
+               pnl_estimated=day in estimated)
         for day, rows in sorted(ledger.items())
     ]
 
@@ -961,7 +968,8 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "green_days": stats.green_days,
         "red_days": stats.red_days,
         "days": [
-            {"day": d.day, "trades": d.trades, "realized": d.realized.payload()}
+            {"day": d.day, "trades": d.trades, "realized": d.realized.payload(),
+             "pnl_estimated": d.pnl_estimated}
             for d in stats.days
         ],
     }

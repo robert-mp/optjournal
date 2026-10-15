@@ -924,6 +924,48 @@ def test_the_browsable_range_survives_a_compact_ibkr_date(conn):
     assert months[-1] == "2025-01"
 
 
+def test_an_estimated_close_is_flagged_on_its_day_its_event_and_its_card(populated):
+    """P&L the journal priced from the fills (`pnl_estimated`) read as final on
+    the Calendar and on Trades: only the Dashboard's banner said otherwise. The
+    day, the event holding the fill and its card now carry the flag, and nothing
+    else does."""
+    conn = connect(populated)
+    fill = conn.execute(
+        "SELECT broker, trade_id, trade_date, ib_order_id, conid FROM trades"
+        " WHERE asset_category = 'OPT' AND open_close LIKE '%C%'"
+        " AND fifo_pnl_realized IS NOT NULL ORDER BY trade_date DESC LIMIT 1").fetchone()
+    conn.execute("UPDATE trades SET pnl_estimated = 1 WHERE broker = ? AND trade_id = ?",
+                 (fill["broker"], fill["trade_id"]))
+    conn.commit()
+    conn.close()
+    st = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+
+    day = str(fill["trade_date"]).replace("-", "")
+    assert [d["day"].replace("-", "") for d in st["all_time"]["days"]
+            if d["pnl_estimated"]] == [day]
+
+    def holds(event) -> bool:
+        return any(str(o["ib_order_id"]) == str(fill["ib_order_id"])
+                   and str(leg["conid"]) == str(fill["conid"])
+                   for o in event["orders"] for leg in o["legs"])
+
+    events = [e for lc in st["lifecycles"] for e in lc["events"]]
+    assert [holds(e) for e in events if e["pnl_estimated"]] == [True]
+    assert [any(map(holds, lc["events"])) for lc in st["lifecycles"]
+            if lc["pnl_estimated"]] == [True]
+
+
+def test_the_estimate_mark_has_a_class_of_its_own():
+    """The mark first used `.est`, which already named the Costs headline's
+    estimate (`.hero .fig.est`), so its rule turned that whole figure amber with
+    a help cursor. The mark's class is now used by the mark alone."""
+    js = _code_only(_js())
+    mark = re.search(r'const estMark=.*?class="([\w-]+)"', js).group(1)
+    assert len(re.findall(rf'[" ]{mark}[" ]', js)) == 1, f"{mark} is used outside the mark"
+    rules = [sel.strip() for sel, _body in _css_rules() if re.search(rf"\.{mark}\b", sel)]
+    assert rules == [f".{mark}"], rules
+
+
 def test_a_fill_free_month_is_an_honest_zero_not_all_time(populated):
     """Selecting an in-range month with no option fills must not silently show
     the all-time figures -- that was the 'month selector does nothing' bug."""
@@ -7787,7 +7829,8 @@ def _trades_rows(lifecycles: list[dict], **view: Any) -> list[list[str]]:
         "const DISP=()=>'EUR', conv=v=>v==null?null:Number(v);",
         "const cash=(v,d)=>money(conv(v),DISP(),d);",
         *(_page_stmt(n) for n in ("isNativeCharge", "moneyOf", "MKT", "etday",
-                                  "NO_PRICE", "NO_PRICE_WHY", "TSHOW")),
+                                  "NO_PRICE", "NO_PRICE_WHY", "TSHOW", "EST_WHY",
+                                  "estMark")),
         "function scopeNote(){return '';} function orphanNotes(){return '';}",
         f"const S=Object.assign({{topen:new Set(),state:{{lifecycles:{json.dumps(lifecycles)}}}}},",
         f"  {json.dumps(state)});",

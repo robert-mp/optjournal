@@ -681,6 +681,9 @@ SELECT
   -- because one estimated fill makes the leg's base figures an estimate: these
   -- columns are SUMs, so a single unconverted row taints the total it lands in.
   MAX(fx_rate_estimated)                              AS fx_rate_estimated,
+  -- Same rule for the P&L: one fill the journal priced itself makes the leg's
+  -- realised figure an estimate until the statement replaces it.
+  MAX(pnl_estimated)                                  AS pnl_estimated,
   -- A leg whose fills came only from a Trade Confirmation has no realised P&L
   -- from IBKR yet, at most the journal's estimate (`pnl_estimated`), so a zero
   -- here means "not IBKR's yet" rather than "broke even". MIN, so a leg holding
@@ -715,6 +718,7 @@ SELECT
   -- Carried up from the legs, same rule: one estimated leg makes the order's
   -- totals estimated, and one unsettled leg makes the order unsettled.
   MAX(fx_rate_estimated)         AS fx_rate_estimated,
+  MAX(pnl_estimated)             AS pnl_estimated,
   MIN(settled)                   AS settled
 FROM trade_legs
 GROUP BY broker, ib_order_id;
