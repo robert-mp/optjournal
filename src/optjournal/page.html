@@ -881,12 +881,15 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *  How long this log has been kept, which is the one thing the header's top slot
  *  can say that no other surface does. Carries no position count on purpose: an
  *  episode is per contract, so a strangle would read as two bets and contradict
- *  the Positions tab. `logbookLine` names underlyings off `State.positions`
- *  instead -- see `strategies.open_position_count` for why the count is the trap.
+ *  the Positions tab. It names underlyings instead -- see
+ *  `campaigns.position_count` for why the count is the trap.
  * @property {string|null} opened -- ISO day of first activity, a fill or a cash
  *   row. Null on a journal where nothing has happened yet
  * @property {number|null} day -- which day of the log today is, counting the
  *   opening day as 1. Null exactly when `opened` is
+ * @property {Array} carrying -- the underlyings of the open option positions,
+ *   nearest expiry first (campaigns.open_underlyings). From the campaigns the
+ *   Trades rows are drawn from, whatever the trade type
  */
 
 /** @typedef {Object} Pulse -- GET /api/pulse (web.pulse_state), once a minute
@@ -1903,10 +1906,12 @@ function nextTheme(){
 
    `CARRYING` names UNDERLYINGS, not contracts and not a count. A strangle is
    two contracts on one name, so "6" here would have contradicted the Positions
-   tab's three cards -- the exact disagreement `open_position_count` was written
-   to end. Names sidestep the question: two legs on GOOG are one GOOG either
-   way. Read from `state.positions`, the same snapshot rows the Positions tab
-   renders, so the header cannot drift from the tab. */
+   tab's three cards -- the exact disagreement `campaigns.position_count` was
+   written to end. Names sidestep the question: two legs on GOOG are one GOOG either
+   way. The server reads them off the campaigns the Trades tab's open rows come
+   from. They used to come from the statement's position snapshot, which cannot
+   hold a position opened since: CRWD and MRVL, sold on 14 Oct, were open on
+   Trades and missing here. */
 const KICKER_NAMES=4;
 function logbookLine(){
   const st=S.state||{}, lb=st.logbook||{};
@@ -1918,13 +1923,7 @@ function logbookLine(){
     const[y,m,d]=String(lb.opened).split('-');
     if(y&&m&&d) parts.push('since '+dayLabel(lb.opened)+' '+y);
   }
-  /* Distinct, in first-appearance order. `positions_data` sorts its rows by
-     expiry then strike, so the name holding the nearest expiry lands first and
-     the soonest thing to need a decision leads the line. A Set preserves
-     insertion order, which is what makes that free rather than a second sort. */
-  const names=[...new Set((st.positions||[])
-    .map(pos=>pos.underlying_symbol||pos.symbol||'')
-    .filter(Boolean))];
+  const names=lb.carrying||[];
   /* Truncated rather than allowed to wrap under the title: this is a 10.5px
      letterspaced line in a fixed header, and a book of a dozen names would
      push the title down the page. The overflow is counted, not silently
@@ -5118,9 +5117,16 @@ function watchFilters(){
  *
  * The symbol cell holds a real `<button>` for the keyboard; the ROW carries
  * `data-wsel` and the one handler, so a click anywhere in it toggles the drawer and
- * the button's click bubbles to that same handler exactly once. */
+ * the button's click bubbles to that same handler exactly once.
+ *
+ * The IV rank column is drawn only once some symbol has a rank. Ranks are never
+ * stored: `/api/quotes` asks CBOE for them when the tab opens, two requests per
+ * symbol, about ten seconds for eleven, and until that reply lands (or if every
+ * request fails) the column was a column of dashes. The drawer still says which
+ * absence a symbol has. */
 function watchTable(rows,open){
   const qs=S.quotes||{};
+  const ranked=(S.state.watchlist||[]).some(w=>ivrOf(w.symbol)), cols=ranked?7:6;
   const[col,dir]=String(S.wsort||'symbol:asc').split(':');
   const asc=dir!=='desc';
   const th=(key,label,hint,klass)=>`<th class="${klass}" aria-sort="${
@@ -5149,17 +5155,17 @@ function watchTable(rows,open){
           +`the reading is a warm-up figure and its sign can be wrong. The daily `
           +`price job adds one each session`)
         :num(w.bx_daily,1)}</td>
-      <td class="n">${(()=>{const ir=ivrOf(w.symbol);
-        return ir?num(ir.rank,1):wdash(ivrWhy(w.symbol));})()}</td>
+      ${ranked?`<td class="n">${(()=>{const ir=ivrOf(w.symbol);
+        return ir?num(ir.rank,1):wdash(ivrWhy(w.symbol));})()}</td>`:''}
       <td class="n">${wearn(w)}</td>
       <td class="center"><span class="wbell${bell?' '+bell:''}" title="${esc(
         bell==='hit'?`${w.symbol} has crossed your alert`
         :bell==='set'?`alert set${w.alert_above!=null?`, above ${num(w.alert_above,2)}`
           :''}${w.alert_below!=null?`, below ${num(w.alert_below,2)}`:''}`
         :'no alert: open the row to set one')}">${wicon('bell')}</span></td>
-    </tr>${on?`<tr class="wdrawer"><td colspan="7">${watchDetail(w)}</td></tr>`:''}`;
+    </tr>${on?`<tr class="wdrawer"><td colspan="${cols}">${watchDetail(w)}</td></tr>`:''}`;
   }).join('');
-  const none=`<tr><td colspan="7" class="empty">${esc(wnorows())}
+  const none=`<tr><td colspan="${cols}" class="empty">${esc(wnorows())}
     <button class="btn sm" data-wclear="1">Clear filters</button></td></tr>`;
   return `<table class="wtab"><thead><tr>
     ${th('symbol','symbol','the ticker, and the company name once a quote has '
@@ -5169,12 +5175,13 @@ function watchTable(rows,open){
     ${plain('bxtrender','the daily short arm over the last five sessions, newest '
       +'on the right: up is positive, down negative, and a lighter bar is one '
       +'moving back toward zero. '+PARAMS_CAPTION,'whist')}
-    ${th('bxtrender','daily','the daily short arm at the newest close','n')}
-    ${th('ivr','ivr','IV rank, 1y: where implied vol sits between this symbol\'s '
+    ${th('bxtrender','bx daily','B-Xtrender\'s daily short arm at the newest close: '
+      +'a momentum reading around zero, not a price change','n')}
+    ${ranked?th('ivr','ivr','IV rank, 1y: where implied vol sits between this symbol\'s '
       +'own yearly low and high, 0 to 100. In the drawer, '
       +'realised vol is what the stock DID; IVR is what the '
       +'market CHARGES for what it might do. '
-      +IVR_SOURCE,'n')}
+      +IVR_SOURCE,'n'):''}
     ${th('earn','earnings','days to the earnings date: '
       +'earnings dates are ones you recorded, not fetched ones, '
       +'since nothing this journal reaches publishes one','n')}

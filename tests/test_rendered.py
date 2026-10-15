@@ -35,7 +35,7 @@ from optjournal.bars import upsert_bars
 from optjournal.clock import epoch_et
 from optjournal.demo import _UNDERLYING_CONID, write_demo_statement
 from optjournal.ingest import ingest_file
-from optjournal.marketdata import Bar
+from optjournal.marketdata import Bar, BarFetchError
 
 
 @pytest.fixture(scope="module")
@@ -139,7 +139,7 @@ def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     )
     # The open book, named by UNDERLYING. A count here would contradict the
     # Positions tab for a multi-leg position, which is why the line names symbols.
-    names = {p["underlying_symbol"] or p["symbol"] for p in payload["positions"]}
+    names = set(payload["logbook"]["carrying"])
     if names:
         assert "carrying" in line.lower(), f"{line!r} omits the open book"
         assert any(n in line for n in names), (
@@ -364,3 +364,46 @@ def test_a_replay_card_seeks_to_the_frame_that_reveals_its_fill(replayed, tmp_pa
             "reveal clip still hides it there")
         assert seek == 0 or dot > xs[seek - 1] + 0.05, (
             f"the fill at {raw_ts} was already on screen a frame before its card")
+
+
+def test_the_watchlist_draws_an_iv_rank_column_only_once_a_rank_is_in(
+        tmp_path, monkeypatch):
+    """The IVR column was a column of dashes for the ten seconds CBOE takes to
+    answer for eleven symbols, and for good when every request failed: ranks are
+    fetched when the tab opens and never stored. It is drawn once a rank is in.
+    The daily reading beside it is labelled "bx daily", since a bare "daily" over
+    -39.0 reads as a percentage change.
+    """
+    if not browser.browsers():
+        pytest.skip("no Chrome/Chromium on this machine")
+    from optjournal import iv  # noqa: PLC0415 - the server's own binding
+    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
+    conn = connect_migrated(tmp_path / "demo.db")
+    ingest_file(conn, statement)
+    conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('AMD', '2026-10-01')")
+    conn.commit()
+    conn.close()
+
+    def headers(profile: str) -> list[str]:
+        dom = browser.dump_dom(f"{base}/#tab=watchlist", tmp_path / profile)
+        if dom is None:
+            pytest.skip("no browser produced a DOM (environment, not the page)")
+        markup = browser.markup(dom)
+        return [re.sub(r"<[^>]+>|[⇅↑↓]", "", cell).strip() for cell in
+                re.findall(r'<th[^>]*>(.*?)</th>', markup.split('class="wtab"')[1], re.S)]
+
+    def no_quote(symbol: str):
+        raise BarFetchError("offline")
+
+    monkeypatch.setattr(web, "fetch_quote", no_quote)
+    with web.serve_ephemeral(db_path=tmp_path / "demo.db",
+                             archive_dir=statement.parent) as base:
+        monkeypatch.setattr(web, "fetch_iv_rank", lambda symbol: None)
+        unranked = headers("unranked")
+        monkeypatch.setattr(web, "fetch_iv_rank", lambda symbol: iv.IvRank(
+            symbol=symbol, iv30=40.0, low=20.0, high=60.0, rank=50.0,
+            as_of="2026-10-15 10:00:00"))
+        ranked = headers("ranked")
+    assert "bx daily" in unranked and "daily" not in unranked
+    assert "ivr" not in unranked, f"a column with no rank in it was drawn: {unranked}"
+    assert "ivr" in ranked, f"a ranked watchlist lost its IV rank column: {ranked}"

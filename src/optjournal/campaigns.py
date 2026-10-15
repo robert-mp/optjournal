@@ -618,6 +618,29 @@ def first_taken(share: Mapping[str, Any]) -> tuple[str, bool]:
             str(share.get("open_close") or "").upper() != "C")
 
 
+def open_underlyings(campaigns: Sequence[Campaign], episodes: Sequence[Any]) -> list[str]:
+    """The names the open positions are written on, each once, nearest expiry first.
+
+    What the header's dateline says the journal is carrying. Read off the
+    campaigns the Trades tab draws its open rows from, so a position opened since
+    the newest statement is named the day its fill lands, which the statement's
+    position snapshot cannot do. Underlyings rather than contracts or a count, for
+    `position_count`'s reason: a strangle is one QQQ either way. The soonest expiry
+    leads because that position needs a decision first.
+    """
+    soonest: dict[str, str] = {}
+    for campaign in campaigns:
+        for index in campaign.episode_indices:
+            episode = episodes[index]
+            if episode.is_closed:
+                continue
+            name = episode.underlying_symbol or episode.symbol
+            expiry = str(episode.expiry or "")
+            if name not in soonest or expiry < soonest[name]:
+                soonest[name] = expiry
+    return sorted(soonest, key=lambda name: (soonest[name] or "9", name))
+
+
 def position_count(
     campaigns: Sequence[Campaign],
     episodes: Sequence[Any],

@@ -20,6 +20,7 @@ from optjournal.campaigns import (
     cluster_orders,
     link,
     named,
+    open_underlyings,
     position_count,
 )
 
@@ -641,3 +642,24 @@ def test_a_long_window_chain_costs_its_length_not_its_square():
     run rather than timed: three times the chain is about three times the work."""
     small, large = _link_lines(50), _link_lines(150)
     assert large < 4 * small, (small, large)
+
+
+def test_the_header_names_each_open_underlying_once_nearest_expiry_first():
+    """The dateline said "carrying QQQ QCOM CRM TSLA" off the newest statement's
+    snapshot, while Trades showed CRWD and MRVL open too: both were sold after
+    that statement. Read off the campaigns, a position is named once its fill is
+    in, a strangle is one name, a closed one is none, and the soonest expiry
+    leads."""
+    def ep(conid, under, expiry, trade, closed=False):
+        e = _Ep(conid, [trade], closed=closed)
+        e.underlying_symbol, e.symbol, e.expiry = under, conid, expiry
+        return e
+
+    eps = [ep("T1", "TSLA", "2027-06-17", "t1"),
+           ep("Q1", "QQQ", "2026-10-30", "t2"), ep("Q2", "QQQ", "2026-11-20", "t3"),
+           ep("C1", "CRWD", "2026-11-20", "t4"),
+           ep("M1", "META", "2026-10-16", "t5", closed=True)]
+    camps = link(eps, order_groups=[("a",), ("b", "c"), ("d",), ("e",)],
+                 order_of_trade={"t1": "a", "t2": "b", "t3": "c", "t4": "d",
+                                 "t5": "e"})
+    assert open_underlyings(camps, eps) == ["QQQ", "CRWD", "TSLA"]

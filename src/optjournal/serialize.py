@@ -1771,12 +1771,11 @@ def logbook_data(conn: sqlite3.Connection, *, today: date) -> Row:
     is day 1 and not day 0. A log's first page is page one.
 
     No count of open positions travels with it, deliberately. An episode is per
-    CONTRACT, so a strangle is two of them -- `strategies.open_position_count`
-    exists precisely because a naive tally read a two-leg strangle as two bets
-    and disagreed with the Positions tab on screen. The page derives the header's
-    names from `state.positions`, the same snapshot rows that tab renders, so the
-    two cannot drift apart. What is period-invariant and unambiguous travels
-    here; what needs grouping is left to the layer that already groups it.
+    CONTRACT, so a strangle is two of them -- `campaigns.position_count` exists
+    precisely because a naive tally read a two-leg strangle as two bets and
+    disagreed with the Positions tab on screen. The header names underlyings
+    instead, and `build_state` adds them as `carrying`, since they need the
+    campaign grouping this function does not build.
     """
     opened = first_activity(conn)
     if not opened:

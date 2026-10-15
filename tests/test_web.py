@@ -2769,8 +2769,20 @@ def test_build_state_survives_an_empty_database(tmp_path):
     # to be the Nth of. Null rather than 1: the header drops the dateline
     # entirely, which is honest, where "log day 1" would date a log that was
     # never opened.
-    assert state["logbook"] == {"opened": None, "day": None}
+    assert state["logbook"] == {"opened": None, "day": None, "carrying": []}
     json.dumps(state)
+
+
+def test_the_header_carries_what_the_trades_tab_shows_open(populated):
+    """One source for both, so a position on Trades is in the header too, and the
+    header does not follow the trade type onto tabs it does not reach."""
+    state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    shown = {lc["underlying"] for lc in state["lifecycles"]
+             if lc["status"] == "open" and lc["anchor"]}
+    assert shown and set(state["logbook"]["carrying"]) == shown
+    stocks = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None,
+                         trade_type="equities")
+    assert stocks["logbook"]["carrying"] == state["logbook"]["carrying"]
 
 
 def test_the_logbook_dates_from_first_activity_counting_inclusively(populated):
@@ -5539,31 +5551,18 @@ def test_the_kicker_carries_no_hardcoded_line():
     )
 
 
-def test_the_kicker_names_underlyings_rather_than_counting_contracts():
-    """A count here would contradict the Positions tab.
-
-    An episode is per CONTRACT, so a strangle is two of them against one card on
-    Positions -- the disagreement `strategies.open_position_count` exists to end.
-    The header sidesteps it by naming UNDERLYINGS: two legs on GOOG are one GOOG
-    however they are grouped. This pins that it reads `underlying_symbol` from
-    the same snapshot rows that tab renders, and that it de-duplicates them.
-    """
+def test_the_kicker_names_what_the_server_says_is_carried():
+    """A count here would contradict the Positions tab, so the header names
+    UNDERLYINGS, each once (`campaigns.open_underlyings`, tested where it lives).
+    It used to derive them from the snapshot rows, which miss a position opened
+    since the newest statement; this pins that the page reads the payload's list
+    rather than rebuilding one from `state.positions`."""
     body = code_only(page_html())
     line = re.search(r"function logbookLine\(\)\{(.*?)\n\}", body, re.S)
     assert line, "logbookLine is gone"
     src = line.group(1)
-    assert "underlying_symbol" in src, (
-        "the kicker no longer names underlyings, so a two-leg strangle can read "
-        "as two positions and disagree with the Positions tab"
-    )
-    assert "new Set(" in src, (
-        "the names are no longer de-duplicated, so both legs of a strangle print "
-        "the same symbol twice"
-    )
-    assert "state.positions" in src.replace("st.", "state."), (
-        "the names come from somewhere other than the snapshot rows the "
-        "Positions tab renders, so the two surfaces can drift"
-    )
+    assert "lb.carrying" in src, "the header no longer reads what is carried"
+    assert "positions" not in src, "the header names the snapshot's book again"
 
 
 # --------------------------------------------------------------------------
@@ -7052,7 +7051,9 @@ def test_a_filter_matching_nothing_says_which_control_is_hiding_the_rows():
     assert 'the search box ("${needle}")' in active
     # The table's colspan row, with the way out beside it.
     table = _fn("watchTable").replace(" ", "").replace("\n", "")
-    assert 'colspan="7"' in table, "the empty row does not span the seven columns"
+    assert "cols=ranked?7:6" in table
+    assert '<tdcolspan="${cols}"class="empty">' in table, (
+        "the empty row does not span the table's columns")
     assert "esc(wnorows())" in table and "data-wclear" in table
     assert "${body||none}" in table, (
         "the empty row is not rendered in place of an empty body, so the table shows "

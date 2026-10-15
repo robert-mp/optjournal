@@ -73,7 +73,7 @@ from optjournal import settings as prefs
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.bars import fetch_watch_bars
-from optjournal.campaigns import position_count
+from optjournal.campaigns import open_underlyings, position_count
 from optjournal.clock import MARKET_TZ, parse_day
 from optjournal.costs import CostScope, build_costs
 from optjournal.db import (
@@ -806,6 +806,13 @@ def build_state(
         )
         for block in ("stats", "all_time"):
             state[block]["open_positions"] = open_positions
+        # The header's open book, over the HOME category's campaigns whatever the
+        # trade type, because the dateline is a fact about the journal and shows on
+        # tabs the trade type does not reach. Only Equities builds other ones.
+        state["logbook"]["carrying"] = open_underlyings(
+            view_campaigns if view_category == asset_category
+            else campaigns_for(conn, asset_category, report.episodes),
+            report.episodes)
         # The strategy ranking, for the same reason as open_positions: it reads
         # the lifecycles, which carry each position's opening shape, and those are
         # built here rather than inside month_stats. Unlike open_positions it IS
