@@ -564,6 +564,85 @@ MUTANTS: tuple[Mutant, ...] = (
         breaks="a lagging account's held positions would be read at another "
                "account's newer date, so a position still open reads as CLOSED",
     ),
+    # The listing ahead (`ahead.py`). Each is a calendar that renders well-formed
+    # and is wrong, which is the shape nothing on the page would report.
+    Mutant(
+        key="ahead-calibrate",
+        module="ahead.py",
+        find="        shift = calibrate(_get(probe), requested=probe,",
+        replace="        shift = MEASURED_SHIFT or calibrate(_get(probe), requested=probe,",
+        breaks="the day Nasdaq fixes its dates, every release listed ahead would be "
+               "filed a day early, next week's claims on the Wednesday",
+    ),
+    Mutant(
+        key="ahead-overlap",
+        module="ahead.py",
+        find="        if week_of(_day(row[1])) in covered]",
+        replace="        if False]",
+        breaks="a week ForexFactory serves would keep Nasdaq's rows beside its "
+               "own, so every release that week is listed twice",
+    ),
+    Mutant(
+        key="ahead-replace",
+        module="ahead.py",
+        find='            "DELETE FROM market_events WHERE source = ? AND starts_at >= ?"',
+        replace='            "DELETE FROM market_events WHERE 0 AND source = ? AND starts_at >= ?"',
+        breaks="a release Nasdaq moves would stay listed at its old time as well "
+               "as its new one",
+    ),
+    Mutant(
+        key="ahead-truncated",
+        module="ahead.py",
+        find="    except (urllib.error.URLError, OSError, ValueError,\n"
+             "            http.client.HTTPException) as exc:",
+        replace="    except (urllib.error.URLError, OSError, ValueError) as exc:",
+        breaks="a reply broken off mid-way would escape as a traceback rather than "
+               "a fetch error, and fail the whole calendar job",
+    ),
+    Mutant(
+        key="ahead-grade",
+        module="ahead.py",
+        find='    if _HIGH.search(title):\n        return "High"',
+        replace='    if False:\n        return "High"',
+        breaks="next week's CPI, payrolls and FOMC would be graded Low, so the "
+               "Market tab's default filter hides the prints that move a US book",
+    ),
+    Mutant(
+        key="ahead-on-outage",
+        module="ahead.py",
+        find="    ahead: Ahead | EventFetchError\n    try:\n"
+             "        ahead = refresh_ahead(conn, now=now)",
+        replace="    ahead: Ahead | EventFetchError\n    try:\n        if error:\n"
+                "            raise error\n        ahead = refresh_ahead(conn, now=now)",
+        breaks="while ForexFactory is down or backing off, the days ahead would not "
+               "be refreshed either, which is when they are most worth having",
+    ),
+    Mutant(
+        key="calendar-status",
+        module="ahead.py",
+        find='        if self.error is None:\n'
+             '            return "ok" if self.stored else "nothing"',
+        replace='        if self.error is None or not isinstance(self.ahead, EventFetchError):\n'
+                '            return "ok" if self.stored or self.ahead else "nothing"',
+        breaks="a rate-limited calendar run would read ok because the days ahead "
+               "were rewritten, and a ForexFactory outage would never read failed",
+    ),
+    Mutant(
+        key="events-window",
+        module="events.py",
+        find='    where = ["starts_at >= ? AND starts_at < ?"]',
+        replace='    where = ["starts_at BETWEEN ? AND ?"]',
+        breaks="a holiday on the Monday after a Market week would be counted on both "
+               "weeks' pages, in chips and totals the strip cannot show",
+    ),
+    Mutant(
+        key="market-week",
+        module="serialize.py",
+        find="weekday() - 7 * week))",
+        replace="weekday()))",
+        breaks="stepping to next week would show this week again under next "
+               "week's label",
+    ),
 )
 
 

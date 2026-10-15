@@ -134,9 +134,13 @@ const TIERS = [
     // Employment Change" and would otherwise be read as the payrolls report.
     "\\bCPI\\b", "\\bPCE\\b", "^\\s*Non-Farm Employment", "Unemployment Rate",
     "Fed Chair(man|woman)? \\w+ Speaks", "Payrolls Revision",
+    // The listing ahead's (`ahead.py`) spelling of the payrolls report, anchored
+    // for ADP's reason: Nasdaq also lists "Private Nonfarm Payrolls".
+    "^\\s*Nonfarm Payrolls",
   ].join("|"), "i")],
   [2, new RegExp([
-    "Unemployment Claims", "Retail Sales", "\\bPPI\\b", "\\bGDP\\b",
+    "Unemployment Claims", "Initial Jobless Claims", "Retail Sales", "\\bPPI\\b",
+    "\\bGDP\\b", "Michigan Consumer Sentiment", "Philadelphia Fed Manufacturing",
     "ISM (Manufacturing|Services) PMI", "Consumer Confidence",
     "UoM (Consumer Sentiment|Inflation Expectations)", "ADP Non-Farm",
     "JOLTS", "Average Hourly Earnings", "Durable Goods", "Philly Fed",
@@ -164,8 +168,10 @@ const SPEAKS = /\bspeaks\b/i;
 
 /* A central banker with a microphone: an FOMC member or the Chair, speaking.
  * Matched on the feed's own titles, "FOMC Member Barkin Speaks" and "Fed Chair
- * Powell Speaks", which are the same kind of event. Applied only AFTER the country
- * filter, so an MPC or SNB speaker never reaches it.
+ * Powell Speaks", which are the same kind of event, and on the listing ahead's
+ * (`ahead.py`), which also writes "Fed Waller Speaks" and "Fed Governor Cook
+ * Speaks". Applied only AFTER the country filter, so an MPC or SNB speaker never
+ * reaches it.
  *
  * DELIBERATELY NARROW, in two directions. "FOMC Statement", "FOMC Press
  * Conference" and a rate decision do not match, and must not: those are the day's
@@ -173,7 +179,7 @@ const SPEAKS = /\bspeaks\b/i;
  * only release that reprices the whole curve. And a speaker who is not at the Fed
  * does not match either: "President Trump Speaks" merged into the group once and
  * captioned it "Fed speakers (Trump, +3)". Those rows keep their own chip. */
-const FED_SPEAKER = /\b(FOMC Member|Fed Chair(man|woman)?)\b.*\bspeaks\b/i;
+const FED_SPEAKER = /\b(FOMC Member|Fed)\b.*\bspeaks\b/i;
 
 /* "FOMC Member Barkin Speaks" -> "Barkin". The surname is what a reader
  * recognises, and the feed's phrasing is stable enough to take the word before

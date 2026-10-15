@@ -41,8 +41,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from optjournal import settings as prefs
+from optjournal.ahead import refresh_calendar
 from optjournal.bars import backfill_bars
-from optjournal.events import EventFetchError, EventRateLimited, fetch_events, store_events
 from optjournal.flex import (
     FETCH_COOLDOWN_S,
     FetchCooldown,
@@ -446,22 +446,16 @@ def _bars(conn: sqlite3.Connection, _ctx: Context, *, live: bool) -> Outcome:
 
 
 def _market(conn: sqlite3.Connection, _ctx: Context) -> Outcome:
-    """Refresh the economic calendar.
+    """Refresh the economic calendar, and the days ahead of it.
 
     `EventRateLimited` is `nothing`, NOT `failed`: the feed pushed back, nothing
     was lost, and the same week is served later. Counting that as a failure would
     accumulate `consecutive_failures` for a working system and eventually back
-    off a job that was never broken.
+    off a job that was never broken. `ahead.Refreshed.status` holds that rule,
+    and why the days ahead never change it.
     """
-    try:
-        events = fetch_events()
-    except EventRateLimited as exc:
-        return Outcome("nothing", f"rate limited: {exc}")
-    except EventFetchError as exc:
-        return Outcome("failed", str(exc)[:400])
-    stored = store_events(conn, events)
-    return Outcome("ok" if stored else "nothing",
-                   f"{len(events)} fetched, {stored} stored", stored, len(events))
+    done = refresh_calendar(conn, now=datetime.now(UTC))
+    return Outcome(done.status, done.detail, done.stored, done.fetched)
 
 
 def _sync(conn: sqlite3.Connection, ctx: Context) -> Outcome:

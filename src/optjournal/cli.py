@@ -24,6 +24,8 @@ from typing import Any
 from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 
 from optjournal import __version__, browser, install, logs, settings
+from optjournal.ahead import SOURCE as AHEAD
+from optjournal.ahead import refresh_calendar
 from optjournal.analysis import analyse, format_report
 from optjournal.archive import newest_statement, prune_archive
 from optjournal.bars import (
@@ -49,8 +51,6 @@ from optjournal.events import (
     EventFetchError,
     EventRateLimited,
     default_scope,
-    fetch_events,
-    store_events,
     upcoming,
 )
 from optjournal.flex import (
@@ -633,33 +633,28 @@ def cmd_market(args) -> int:
         lines: list[str] = []
 
         if args.fetch:
-            try:
-                fetched_events = fetch_events()
-            except EventRateLimited as exc:
+            done = refresh_calendar(conn, now=datetime.now(UTC))
+            record_run(conn, "market", status=done.status, detail=done.detail,
+                       done=done.stored, total=done.fetched)
+            # The days ahead get no exit code of their own: the cron reads this
+            # command's exit for ForexFactory's week.
+            if isinstance(done.ahead, EventFetchError):
+                print(f"calendar ahead failed: {done.ahead}", file=sys.stderr)
+            else:
+                result["ahead"] = done.ahead.stored
+                lines.append(f"ahead {done.ahead.stored} listed by {AHEAD}")
+            if isinstance(done.error, EventRateLimited):
                 # EXIT_THROTTLED, not EXIT_ERROR: the same distinction the IBKR
                 # path draws, so a nightly cron stays silent on a back-off and
                 # alerts only on something that actually changed.
-                print(f"calendar: {exc}", file=sys.stderr)
-                # `nothing`, not `failed`: the feed pushed back, nothing was lost,
-                # and the same week is served later. A ledger that called this a
-                # failure would accumulate consecutive_failures for a working
-                # system.
-                record_run(conn, "market", status="nothing",
-                           detail=f"rate limited: {exc}")
+                print(f"calendar: {done.error}", file=sys.stderr)
                 return EXIT_THROTTLED
-            except EventFetchError as exc:
-                print(f"calendar fetch failed: {exc}", file=sys.stderr)
-                record_run(conn, "market", status="failed", detail=str(exc)[:400])
+            if done.error is not None:
+                print(f"calendar fetch failed: {done.error}", file=sys.stderr)
                 return EXIT_ERROR
-            stored = store_events(conn, fetched_events)
-            result["fetched"] = len(fetched_events)
-            result["stored"] = stored
-            lines.append(
-                f"calendar {len(fetched_events)} event(s) -> {stored} stored"
-            )
-            record_run(conn, "market", status="ok" if stored else "nothing",
-                       detail=f"{len(fetched_events)} fetched, {stored} stored",
-                       done=stored, total=len(fetched_events))
+            result["fetched"] = done.fetched
+            result["stored"] = done.stored
+            lines.insert(0, f"calendar {done.fetched} event(s) -> {done.stored} stored")
 
         now = datetime.now(UTC)
         start = int(now.timestamp())
@@ -692,7 +687,9 @@ def cmd_market(args) -> int:
             + (f"   [{figures}]" if figures else "")
         )
     if events:
-        lines.append("\n  impact is the feed's assessment, not this journal's")
+        lines.append("\n  impact is the feed's assessment, not this journal's"
+                     + (f", except rows listed ahead by {AHEAD}, which this journal"
+                        " graded" if any(e["source"] == AHEAD for e in events) else ""))
 
     _emit(result, "\n".join(lines), args.json)
     return EXIT_OK
@@ -1610,8 +1607,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("market", parents=[common, database],
                        help="economic calendar: fetch this week, or show what is stored")
     p.add_argument("--fetch", action="store_true",
-                   help="pull this week from the feed and store it; without this, "
-                        "reads only what the journal already holds")
+                   help="pull this week from the feed, and the days after it from "
+                        "Nasdaq, and store them; without this, reads only what the "
+                        "journal already holds")
     p.add_argument("--days", type=int, default=7, metavar="N",
                    help="window to show, from today (default: 7)")
     p.add_argument("--all", dest="all_events", action="store_true",

@@ -29,8 +29,8 @@ from typing import Any
 import pytest
 from conftest import RAW_DIR, ROOT, code_only
 
+from optjournal import ahead, web
 from optjournal import replay as replay_mod
-from optjournal import web
 from optjournal.clock import epoch_et
 from optjournal.config import (
     DEFAULT_ARCHIVE,
@@ -466,19 +466,21 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         # -- so it anchors properly rather than needing an exemption. The counts
         # being zero is the steady state, not an absent shape.
         "Provisional": state["provisional"],
-        "Market": state["market"],
+        # This week, which the fixture's events fall in; next week has the
+        # same shape and is read through the same binding.
+        "Market": state["market"][0],
         # The strip is always seven days, so [0] is always real. The event list
         # is empty until the calendar has been fetched, which is why the sampler
         # tolerates None here -- but the fixture DOES store events (see the
         # `market` fixture), so in practice this anchors a real row.
-        "MarketDay": first(state["market"]["week"]),
-        "MarketEvent": first(state["market"]["events"]),
+        "MarketDay": first(state["market"][0]["week"]),
+        "MarketEvent": first(state["market"][0]["events"]),
         # One filter chip. Sampled from `impacts` rather than `countries` because
         # both axes carry the SAME shape, and the impact axis is the one whose
         # order is asserted elsewhere -- so a drift in either is caught here once.
         # Non-empty for the same reason MarketEvent is: the fixture stores events,
         # and a facet list is built from what those events carry.
-        "MarketFacet": first(state["market"]["impacts"]),
+        "MarketFacet": first(state["market"][0]["impacts"]),
         "Watch": first(state["watchlist"]),
         # A watched symbol that actually HOLDS an option, so WatchOption is
         # anchored to a real row. Sampling the first watch row would anchor it to
@@ -7441,7 +7443,7 @@ def test_an_unexpected_error_is_a_json_500_on_both_verbs(tmp_path, monkeypatch):
 
     monkeypatch.setattr(web, "fetch_quote", boom)
     monkeypatch.setattr(web, "fetch_iv_rank", boom)
-    monkeypatch.setattr(web, "fetch_events", boom)
+    monkeypatch.setattr(ahead, "fetch_events", boom)
     db = tmp_path / "j.db"
     with open_journal(db) as conn:
         conn.execute("INSERT INTO watchlist (symbol, added_at) VALUES ('AMD', 'x')")

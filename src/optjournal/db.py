@@ -439,6 +439,8 @@ CREATE TABLE IF NOT EXISTS market_events (
   title        TEXT    NOT NULL,
   -- The FEED's judgement of importance, not the journal's. Stored verbatim so
   -- the page can attribute it rather than presenting it as our own assessment.
+  -- The one exception is source 'nasdaq' (ahead.py): that feed grades nothing,
+  -- so its rows carry this journal's grade and the page labels them so.
   impact       TEXT    NOT NULL,
   forecast     TEXT,
   previous     TEXT,

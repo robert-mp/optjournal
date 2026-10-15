@@ -26,6 +26,8 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from optjournal.ahead import SOURCE as AHEAD_SOURCE
+from optjournal.ahead import covered_weeks, week_of
 from optjournal.analysis import CostReport
 from optjournal.bars import (
     audit_perishable,
@@ -843,9 +845,14 @@ def statements_data(
 
 
 def market_data(
-    conn: sqlite3.Connection, *, now: datetime, days: int = 7
+    conn: sqlite3.Connection, *, now: datetime, days: int = 7, week: int = 0
 ) -> Row:
     """The economic calendar as the Market tab draws it: a week, and its events.
+
+    `week` counts Mondays on from the current one, so 1 is next week. The page
+    gets this week and next as two of these, each with its own filter vocabulary
+    and counts, because a chip that counts two weeks while the strip shows one
+    would state a cost the reader cannot see.
 
     Two shapes rather than one list, because the page needs both and deriving the
     week strip in JavaScript would put a second calendar in a second language.
@@ -882,7 +889,7 @@ def market_data(
     """
     monday = (now.astimezone(MARKET_TZ)
               .replace(hour=0, minute=0, second=0, microsecond=0)
-              - timedelta(days=now.astimezone(MARKET_TZ).weekday()))
+              - timedelta(days=now.astimezone(MARKET_TZ).weekday() - 7 * week))
     strip_end = monday + timedelta(days=7)
     # The event list runs from the strip's start to whichever is later, so a
     # `days` beyond this week still returns its events.
@@ -908,12 +915,13 @@ def market_data(
     by_day: dict[str, int] = {}
     for event in events:
         by_day[event["day"]] = by_day.get(event["day"], 0) + 1
+    served = covered_weeks(conn)
 
     today = now.astimezone(MARKET_TZ).date().isoformat()
-    week = []
+    strip = []
     for offset in range(7):
         day = (monday + timedelta(days=offset)).date().isoformat()
-        week.append({
+        strip.append({
             "day": day,
             "label": (monday + timedelta(days=offset)).strftime("%a"),
             "dom": (monday + timedelta(days=offset)).day,
@@ -922,6 +930,9 @@ def market_data(
             #: which a precomputed per-filter count could, and did.
             "events": by_day.get(day, 0),
             "today": day == today,
+            #: ForexFactory has not served this day's week, so what the day
+            #: holds is `ahead`'s listing, a quiet day included: `ahead`'s rule.
+            "ahead": week_of((monday + timedelta(days=offset)).date()) not in served,
         })
 
     #: The axis vocabularies, each ordered for the buttons that render them and
@@ -951,14 +962,16 @@ def market_data(
     ]
 
     return {
-        "week": week,
+        "week": strip,
         "events": events,
-        "from_day": week[0]["day"],
-        "to_day": week[-1]["day"],
+        "from_day": strip[0]["day"],
+        "to_day": strip[-1]["day"],
         "today": today,
         #: Whose judgement `impact` is. The page shows this rather than implying
         #: the journal graded the event itself.
         "impact_source": SOURCE,
+        #: Who lists the `ahead` days. Their `impact` is this journal's grade.
+        "ahead_source": AHEAD_SOURCE,
         "zone": str(MARKET_TZ),
         "countries": countries,
         "impacts": impacts,
@@ -1112,6 +1125,10 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
         }
         for r in rows
     ]
+    # Whether those rows are `ahead`'s listing rather than ForexFactory's, which
+    # changes whose grade `impact` is: a session after the current week, read on
+    # a Friday evening or a weekend.
+    events_ahead = any(r["source"] == AHEAD_SOURCE for r in rows)
 
     # FRESHNESS, judged against the clock rather than assumed from the rows. A
     # stored close is only the prior close if it was fetched after the last
@@ -1146,6 +1163,7 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
         "fresh": not problems,
         "stale_reason": reason[:1].upper() + reason[1:] if reason else None,
         "events_today": events,
+        "events_ahead": events_ahead,
         "today": session.isoformat(),
     }
 

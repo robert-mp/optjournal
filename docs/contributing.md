@@ -73,6 +73,13 @@ being filed as Low, because a silently downgraded event is a calendar that
 looks right. And `event_id` is ours: ForexFactory supplies none, so it hashes
 `(starts_at, country, title)`, verified distinct across a real week's 99 rows.
 
+The second feed arrived as `ahead.py`, and it did not earn the Protocol: it is a
+stand-in for the days ForexFactory has not served, asked one day at a time,
+calibrated against ForexFactory's own rows and replaced day by day, so the two
+share the table and the `MarketEvent` shape and nothing else. It also has no
+`impact` to store. Its grade is this journal's, written against Nasdaq's titles,
+and the page labels it as the journal's rather than as the feed's.
+
 **A new broker**: a class satisfying `StatementSource` (a `broker` name, a
 `base_currency(path)` and a `statements(path)` yielding `NormalisedFill`s), plus
 one entry in `sources.SOURCES`. That is the whole additive part — `ingest` writes

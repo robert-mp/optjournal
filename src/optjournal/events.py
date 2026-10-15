@@ -18,7 +18,8 @@ ONE WEEK ONLY, verified rather than assumed: `ff_calendar_nextweek`,
 `_thismonth` and `_lastweek` all 404. Two consequences.
 
 * No forward view beyond the current week, so a "next FOMC in 12 days" card
-  cannot be built from this feed.
+  cannot be built from this feed. `ahead.py` lists the days after it from
+  Nasdaq until this feed serves them.
 * The TABLE is the history. Rows persist rather than being replaced per fetch, so
   weekly fetches accumulate a past calendar the feed itself will not serve. That
   is why `store_events` corrects in place instead of deleting the week first.
@@ -311,7 +312,11 @@ def upcoming(
     countries: tuple[str, ...] = (),
     impacts: tuple[str, ...] = (),
 ) -> list[dict]:
-    """Stored events in `[start, end]`, oldest first.
+    """Stored events in `[start, end)`, oldest first.
+
+    Half-open, so a window ending at a midnight leaves that midnight's events to
+    the next window. Closed, an untimed release (a holiday, stamped 00:00) on the
+    Monday after a Market week was counted on both weeks' pages.
 
     Filtering is the caller's to state rather than this function's to assume: the
     Market tab defaults to `DEFAULT_COUNTRIES` / `DEFAULT_IMPACTS`, but the table
@@ -319,7 +324,7 @@ def upcoming(
     means no filter, the same convention `ingest.ASSET_FILTER_ALL` uses -- and the
     same one the web view's two filter axes use for an empty selection.
     """
-    where = ["starts_at BETWEEN ? AND ?"]
+    where = ["starts_at >= ? AND starts_at < ?"]
     params: list[object] = [start, end]
     if countries:
         where.append(f"country IN ({','.join('?' * len(countries))})")

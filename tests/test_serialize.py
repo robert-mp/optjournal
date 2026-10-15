@@ -429,7 +429,8 @@ def test_the_calculator_pairs_the_latest_index_closes_with_the_days_events(conn)
     assert ctx["spx_date"] == "2026-08-28" and ctx["vix_date"] == "2026-08-28"
     assert set(ctx) == {
         "spx_prev_close", "spx_date", "vix", "vix_date", "events_today", "today",
-        "spx_fetched_at", "vix_fetched_at", "live", "fresh", "stale_reason",
+        "events_ahead", "spx_fetched_at", "vix_fetched_at", "live", "fresh",
+        "stale_reason",
     }, "a derived level in the payload is a second copy of the ladder"
 
 

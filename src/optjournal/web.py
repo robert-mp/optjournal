@@ -70,6 +70,7 @@ from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 from optjournal import __version__, install, journal, replay, updates
 from optjournal import earnings as earnings_mod
 from optjournal import settings as prefs
+from optjournal.ahead import refresh_calendar
 from optjournal.analysis import analyse
 from optjournal.archive import newest_statement
 from optjournal.bars import fetch_watch_bars
@@ -82,12 +83,7 @@ from optjournal.db import (
     connect,
     open_journal,
 )
-from optjournal.events import (
-    EventFetchError,
-    EventRateLimited,
-    fetch_events,
-    store_events,
-)
+from optjournal.events import EventFetchError, EventRateLimited
 from optjournal.flex import (
     FETCH_COOLDOWN_S,
     TOKEN_MAX_LEN,
@@ -771,7 +767,9 @@ def build_state(
             # `market` job does (and Refresh, by hand), because the feed rate
             # limits (429 with a retry-after) and a tab reload is not a reason to
             # spend a request against it.
-            "market": market_data(conn, now=datetime.now(UTC)),
+            # This week, then next: the Market tab steps between them.
+            "market": [market_data(conn, now=datetime.now(UTC), week=week)
+                       for week in (0, 1)],
             # Prices and realised vol from bars already stored, so this
             # spends nothing. The daily `bars_daily` job is what fills them in.
             "watchlist": watchlist_data(conn),
@@ -1557,16 +1555,21 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         so rather than reporting a failure -- nothing is lost, the same week is
         served tomorrow.
         """
-        try:
-            events = fetch_events()
-        except EventRateLimited as exc:
-            return 429, {"ok": False, "kind": "throttled", "message": str(exc)}
-        except EventFetchError as exc:
-            return 502, {"ok": False, "kind": "feed", "message": str(exc)}
         with open_journal(self.cfg.db_path) as conn:
-            stored = store_events(conn, events)
-        return 200, {"ok": True, "kind": "market", "fetched": len(events),
-                     "stored": stored}
+            done = refresh_calendar(conn, now=datetime.now(UTC))
+        # The days ahead are refreshed whatever ForexFactory answered, so their
+        # count and failure ride on every reply rather than only a good one.
+        ahead = ({"ahead": 0, "ahead_error": str(done.ahead)}
+                 if isinstance(done.ahead, EventFetchError)
+                 else {"ahead": done.ahead.stored, "ahead_error": None})
+        if isinstance(done.error, EventRateLimited):
+            return 429, {"ok": False, "kind": "throttled",
+                         "message": str(done.error), **ahead}
+        if done.error is not None:
+            return 502, {"ok": False, "kind": "feed", "message": str(done.error),
+                         **ahead}
+        return 200, {"ok": True, "kind": "market", "fetched": done.fetched,
+                     "stored": done.stored, **ahead}
 
     def _effective_query_id(self) -> str | None:
         """The id a sync would actually use, resolved per request.

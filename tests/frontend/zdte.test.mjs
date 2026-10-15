@@ -403,6 +403,35 @@ test("only the Fed's speakers are merged, and nobody else's podium is", () => {
   assert.deepEqual(shown.map((row) => row.count), [2, 1, 1]);
 });
 
+test("the listing ahead's Fed speakers fold into the same group", () => {
+  /* Nasdaq names a Fed speaker three ways in one week ("FOMC Member Barkin
+     Speaks", "Fed Waller Speaks", "Fed Governor Cook Speaks"), and the rows reach
+     this strip on a Friday evening, before the feed has served Monday. Unmerged,
+     the three were three of the four chips. */
+  const { shown } = sessionEvents([
+    { at: "09:05", country: "USD", title: "FOMC Member Barkin Speaks", impact: "Low" },
+    { at: "10:00", country: "USD", title: "Fed Waller Speaks", impact: "Low" },
+    { at: "15:30", country: "USD", title: "Fed Governor Cook Speaks", impact: "Low" },
+    { at: "10:00", country: "USD", title: "ISM Manufacturing PMI", impact: "High" },
+  ]);
+  assert.deepEqual(shown.map((row) => row.title),
+    ["ISM Manufacturing PMI", "Fed speakers (Barkin, +2)"]);
+  assert.deepEqual(shown.map((row) => row.count), [1, 3]);
+});
+
+test("the listing ahead's titles rank as the feed's own do", () => {
+  /* Nasdaq spells the payrolls report, the claims print, sentiment and the Philly
+     Fed survey its own way; without these they ranked a tier below the feed's
+     rows for the same releases. */
+  const tierOf = (title) =>
+    sessionEvents([{ at: "08:30", country: "USD", title, impact: "Medium" }]).shown[0].tier;
+  assert.equal(tierOf("Nonfarm Payrolls"), tierOf("Non-Farm Employment Change"));
+  assert.equal(tierOf("Private Nonfarm Payrolls"), 3);
+  assert.equal(tierOf("Initial Jobless Claims"), tierOf("Unemployment Claims"));
+  assert.equal(tierOf("Michigan Consumer Sentiment"), 2);
+  assert.equal(tierOf("Philadelphia Fed Manufacturing Index"), 2);
+});
+
 test("ADP is a second-tier print, not the payrolls report", () => {
   /* "ADP Non-Farm Employment Change" contains the payrolls title, and the first
      tier was tried first, so a private estimate outranked everything in the week. */
