@@ -73,8 +73,9 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_THROTTLED = 4
 
-#: Generous against a 20s HTTP timeout plus SQLite writes. The feed answers in
-#: well under a second when it answers at all.
+#: Generous against the feed's 20s HTTP timeout, then the days ahead from Nasdaq
+#: at three rounds of 15s at worst (the calibration, then eight days four at a
+#: time), plus SQLite writes.
 TIMEOUT_S = 120
 
 
@@ -141,5 +142,8 @@ def refresh(ctx) -> None:
     if len(upcoming) > 8:
         lines.append(f"…and {len(upcoming) - 8} more")
     lines.append("")
-    lines.append("impact is the feed's assessment · `optjournal market` for the week.")
+    ahead = any(event.get("source") == "nasdaq" for event in upcoming)
+    lines.append("impact is the feed's assessment"
+                 + (", or this journal's for a row listed ahead by nasdaq" if ahead else "")
+                 + " · `optjournal market` for the week.")
     raise Report("\n".join(lines))

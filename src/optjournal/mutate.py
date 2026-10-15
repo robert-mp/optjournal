@@ -569,10 +569,18 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="ahead-calibrate",
         module="ahead.py",
-        find="        shift = calibrate(_get(probe), requested=probe,",
-        replace="        shift = MEASURED_SHIFT or calibrate(_get(probe), requested=probe,",
+        find="        placing = calibrate(_get(probe), requested=probe,",
+        replace="        placing = MEASURED or calibrate(_get(probe), requested=probe,",
         breaks="the day Nasdaq fixes its dates, every release listed ahead would be "
                "filed a day early, next week's claims on the Wednesday",
+    ),
+    Mutant(
+        key="ahead-clock",
+        module="ahead.py",
+        find="for clock in (-4, -5))",
+        replace="for clock in (-4,))",
+        breaks="if Nasdaq's clock follows New York onto UTC-5 on 1 Nov, nothing "
+               "would line up and the days ahead would stop refreshing all winter",
     ),
     Mutant(
         key="ahead-overlap",
@@ -585,8 +593,8 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="ahead-replace",
         module="ahead.py",
-        find='            "DELETE FROM market_events WHERE source = ? AND starts_at >= ?"',
-        replace='            "DELETE FROM market_events WHERE 0 AND source = ? AND starts_at >= ?"',
+        find='"DELETE FROM market_events WHERE source = ? AND starts_at >= ?"',
+        replace='"DELETE FROM market_events WHERE 0 AND source = ? AND starts_at >= ?"',
         breaks="a release Nasdaq moves would stay listed at its old time as well "
                "as its new one",
     ),

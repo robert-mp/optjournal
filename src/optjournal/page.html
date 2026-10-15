@@ -5714,8 +5714,8 @@ function odte(){
       esc(shortDay(oc.today))}</b>`:''}, strike by strike. Index levels, not ${
       esc(BASE())}.</div></div></div>
     ${none?'':events.length?`<div class="zevents">${events.map(oe=>`<span
-      class="zevent" title="${ZTIER[oe.tier-1]} — the journal's ranking; ${oc.events_ahead
-        ?'listed ahead of the feed, and the journal grades it':'the feed grades it'}
+      class="zevent" title="${ZTIER[oe.tier-1]}, by the journal's ranking. ${oc.events_ahead
+        ?'Listed ahead of the feed, so the journal grades it':'The feed grades it'}
         ${esc(oe.impact)}${oe.count>1?`, the highest of the ${oe.count} releases
         this chip merges`:''}. ${oe.count>1?'First at':'At'} ${esc(oe.at)} in the
         market zone."><span class="mkimp ${oe.tier===1?'hi':oe.tier===2?'md':'lo'}"
@@ -7218,7 +7218,7 @@ function bindMarketFetch(){
         earlier listing stands: ${esc(mres.ahead_error)}.`
         :` ${plural(mres.ahead||0,'event')} listed ahead.`;
       if(mres.kind==='throttled') note('Calendar: '+esc(mres.message||'rate limited')
-        +' — nothing lost, the same week is served later.'+ahead,'warn');
+        +'. Nothing is lost, the same week is served later.'+ahead,'warn');
       else if(!mres.ok) note('Calendar refresh failed: '+esc(mres.message||'')+ahead,'bad');
       else note(`Calendar refreshed: <b>${mres.stored}</b> of ${plural(mres.fetched,'event')}
         stored.${ahead}`,mres.ahead_error?'warn':'ok');

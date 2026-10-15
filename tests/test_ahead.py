@@ -24,7 +24,7 @@ import pytest
 from conftest import connect_migrated
 
 from optjournal import ahead, jobs
-from optjournal.ahead import MEASURED_SHIFT, SOURCE, parse_day, refresh_ahead
+from optjournal.ahead import MEASURED, SOURCE, Placing, parse_day, refresh_ahead
 from optjournal.bars import upsert_bars
 from optjournal.clock import MARKET_TZ
 from optjournal.events import (
@@ -43,8 +43,8 @@ THURSDAY = datetime(2026, 10, 15, 15, 0, tzinfo=UTC)
 MONDAY = datetime(2026, 10, 19, 15, 0, tzinfo=UTC)
 
 
-def _ff(stamp: str, country: str, impact: str, title: str) -> dict:
-    return {"title": title, "country": country, "date": f"{stamp}-04:00",
+def _ff(stamp: str, country: str, impact: str, title: str, zone: str = "-04:00") -> dict:
+    return {"title": title, "country": country, "date": f"{stamp}{zone}",
             "impact": impact, "forecast": "", "previous": ""}
 
 
@@ -165,7 +165,7 @@ def test_todays_quirk_is_measured_and_each_day_asked_for_a_day_late(conn, monkey
 
     listed = refresh_ahead(conn, now=THURSDAY)
 
-    assert listed.shift == -1
+    assert listed.placing == Placing(shift=-1, clock=-4)
     assert nasdaq.asked[0] == date(2026, 10, 14), "calibrated on the served Wednesday"
     assert set(nasdaq.asked[1:]) == _days(date(2026, 10, 19), date(2026, 10, 26))
     assert len(nasdaq.asked) == 9, "one request per day, and one to calibrate"
@@ -182,7 +182,7 @@ def test_a_fix_on_nasdaqs_side_is_followed_rather_than_assumed(conn, monkeypatch
 
     listed = refresh_ahead(conn, now=THURSDAY)
 
-    assert listed.shift == 0
+    assert listed.placing.shift == 0
     assert set(nasdaq.asked[1:]) == _days(date(2026, 10, 18), date(2026, 10, 25))
     assert _listed(conn) == NEXT_WEEK
 
@@ -204,16 +204,50 @@ def test_a_clock_that_no_longer_lines_up_is_refused_and_writes_nothing(
     assert _listed(conn) == NEXT_WEEK
 
 
+#: ForexFactory's week of Sun 1 Nov, the first on New York's winter clock.
+FF_WINTER = [
+    _ff("2026-11-03T10:00:00", "USD", "Medium", "JOLTS Job Openings", "-05:00"),
+    _ff("2026-11-03T10:00:00", "USD", "Low", "Factory Orders m/m", "-05:00"),
+]
+#: The day the probe answers with and the next week, at New York's winter times.
+WINTER = {
+    date(2026, 11, 3): [_row("10:00", "JOLTS Job Openings"),
+                        _row("10:00", "Factory Orders")],
+    date(2026, 11, 11): [_row("All Day", "United States - Veterans Day")],
+    date(2026, 11, 12): [_row("08:30", "Initial Jobless Claims")],
+}
+
+
+@pytest.mark.parametrize("clock", [-4, -5], ids=["utc-4-all-year", "follows-new-york"])
+def test_a_winter_week_is_filed_at_new_york_time_on_either_clock(
+        conn, monkeypatch, clock):
+    """Every winter date asked on 15 Oct read on UTC-4, the claims an hour late
+    at 09:30, and once New York is on UTC-5 Nasdaq may follow it instead. Either
+    way the probe on ForexFactory's Wednesday finds the clock: the claims are
+    filed at 08:30, and Veterans Day on its own day rather than at 23:00 the
+    evening before."""
+    store_events(conn, parse_events(FF_WINTER))
+    monkeypatch.setattr(ahead, "_get", Nasdaq(truth=WINTER, hours=clock + 5))
+
+    listed = refresh_ahead(conn, now=datetime(2026, 11, 5, 16, 0, tzinfo=UTC))
+
+    assert listed.placing == Placing(shift=-1, clock=clock)
+    assert _listed(conn) == {
+        ("2026-11-11", "00:00", "USD", "United States - Veterans Day"),
+        ("2026-11-12", "08:30", "USD", "Initial Jobless Claims"),
+    }
+
+
 def test_with_no_forexfactory_week_the_measured_shift_stands(tmp_path, monkeypatch):
     """A journal whose calendar feed never answered has nothing to calibrate
     against, so it asks no calibration request and lists from today."""
     conn = connect_migrated(tmp_path / "empty.db")
-    nasdaq = Nasdaq(shift=MEASURED_SHIFT)
+    nasdaq = Nasdaq(shift=MEASURED.shift)
     monkeypatch.setattr(ahead, "_get", nasdaq)
 
     listed = refresh_ahead(conn, now=THURSDAY)
 
-    assert listed.shift == MEASURED_SHIFT
+    assert listed.placing == MEASURED
     assert set(nasdaq.asked) == _days(date(2026, 10, 16), date(2026, 10, 26))
     assert ("2026-10-15", "08:30", "USD", "PPI") in _listed(conn)
 
