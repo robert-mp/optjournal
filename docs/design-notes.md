@@ -338,15 +338,18 @@ Four invariants worth knowing before changing the UI:
   and where each figure gets one.
 
 * **A tab's numbers change only in response to a control that tab
-  displays.** The month and the trade type drive Dashboard, Calendar and
-  Trades (`PERIOD_TABS` in `page.html`) and nothing else. "0DTE" is a
-  fill-level scope within options; "Equities" switches the asset category
-  those three tabs run over. Positions, Annual and 0DTE stay pinned to options.
+  displays.** The month drives Dashboard and Calendar (`PERIOD_TABS` in
+  `page.html`); the trade type drives those two and Trades (`TYPE_TABS`), and
+  nothing else. "0DTE" is a fill-level scope within options; "Equities"
+  switches the asset category those three tabs run over. Positions, Annual and
+  0DTE stay pinned to options.
 
   It binds in the other direction too, and that is the one the header makes
   easy to forget: a control a tab displays must move that tab's numbers. The
-  month stepper and the Net P&L beside it therefore render only on those three
-  tabs, and the view-options panel offers the trade type only there. The
+  month stepper and the Net P&L beside it therefore render only on Dashboard
+  and Calendar. Trades lists every position whatever the month, so there the
+  stepper looked like a filter and was not one. The view-options panel offers
+  the trade type only on the three tabs it drives. The
   display currency restates every money tab, so it is offered on all of them,
   and the panel's button reads out the choices in force ("Options · €EUR") so
   none of them is hidden while the panel is closed.

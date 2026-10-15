@@ -3279,17 +3279,20 @@ def test_the_period_controls_appear_only_on_the_tabs_they_drive():
     Moving the month and the trade type into the header made it tempting to show
     them on every tab, the way the reference app does. But Positions, Costs,
     Annual and 0DTE ignore both, so there they would be controls that move
-    nothing on screen. One list names the three tabs they drive, and both
-    renderers read it rather than each carrying its own.
+    nothing on screen. Trades lists every position whatever the month, so its
+    stepper and month Net P&L looked like a filter on a list spanning July to
+    October and were not one: it keeps the trade type and loses the month. One
+    list per control names the tabs it drives, and the renderers read those.
     """
     js = _js()
-    assert "const PERIOD_TABS=['dashboard','calendar','trades'];" in js
+    assert "const PERIOD_TABS=['dashboard','calendar'];" in js
+    assert "const TYPE_TABS=['dashboard','calendar','trades'];" in js
     assert "if(!PERIOD_TABS.includes(S.tab)" in _fn("renderPeriod")
     view = _fn("renderViewOptions")
-    assert "const onPeriod=PERIOD_TABS.includes(S.tab);" in view
+    assert "const onType=TYPE_TABS.includes(S.tab);" in view
     # The trade type is offered only where it applies; the currency, which
     # restates every money tab, is offered everywhere it has somewhere to go.
-    assert re.search(r"onPeriod\?`<div><div class=\"flabel\">Trade type", view)
+    assert re.search(r"onType\?`<div><div class=\"flabel\">Trade type", view)
     assert "+ccy" in view
 
 
@@ -7769,6 +7772,77 @@ def test_a_decision_with_no_anchor_says_so_instead_of_offering_a_button():
     assert src.index("only a snapshot") < opens, (
         "the guard must return before the button is rendered"
     )
+
+
+def _trades_rows(lifecycles: list[dict], **view: Any) -> list[list[str]]:
+    """The page's own `trades()` over `lifecycles`, on 15 Oct 2026, as the text of
+    each position row's cells, or the empty row's sentence when no row matches.
+    `view` sets the list's state (`tshow`, `tsearch`)."""
+    state = {"tshow": "all", "tsearch": "", **view}
+    out = _node_run([
+        f"import {{esc,money,cls,dayLabel}} from '{_static('format.js')}';",
+        "Date.now=()=>Date.parse('2026-10-15T15:00:00Z');",
+        "const DISP=()=>'EUR', conv=v=>v==null?null:Number(v);",
+        "const cash=(v,d)=>money(conv(v),DISP(),d);",
+        *(_page_stmt(n) for n in ("isNativeCharge", "moneyOf", "MKT", "etday",
+                                  "NO_PRICE", "NO_PRICE_WHY", "TSHOW")),
+        "function scopeNote(){return '';} function orphanNotes(){return '';}",
+        f"const S=Object.assign({{topen:new Set(),state:{{lifecycles:{json.dumps(lifecycles)}}}}},",
+        f"  {json.dumps(state)});",
+        *_page_fns("tradeDay", "tradeDates", "heldFor", "trades"),
+        "const html=trades();",
+        "const rows=[...html.matchAll(/<tr class=\"rk[^>]*>([\\s\\S]*?)<\\/tr>/g)]",
+        "  .map(m=>[...m[1].matchAll(/<td[^>]*>([\\s\\S]*?)<\\/td>/g)]",
+        "    .map(c=>c[1].replace(/<[^>]+>/g,'').replace(/\\s+/g,' ').trim()));",
+        "const none=html.match(/<td colspan=\"7\" class=\"empty\">([\\s\\S]*?)<button/);",
+        "console.log(JSON.stringify(none?[[none[1].replace(/\\s+/g,' ').trim()]]:rows));",
+    ])
+    return out
+
+
+def _lc(sym: str, status: str, opened: str, closed: str | None = None,
+        unrealized: dict | None = None) -> dict:
+    money = {"base": 100.0, "native": None, "ccy": None}
+    return {"underlying": sym, "label": "Short put", "status": status,
+            "opened_at": opened + " 10:00:00",
+            "closed_at": closed and closed + " 15:00:00",
+            "realized_pnl": money if status == "closed" else None,
+            "unrealized": unrealized, "replay_key": f"lc:{sym}@{opened}", "events": []}
+
+
+_BOOK = [
+    _lc("GOOG", "closed", "2026-09-24", "2026-10-09"),
+    _lc("CRWD", "open", "2026-10-14"),
+    _lc("SPX", "closed", "2026-09-28", "2026-09-28"),
+    _lc("TSLA", "open", "2025-04-04", unrealized={"base": -50.0, "native": None, "ccy": None}),
+    _lc("META", "closed", "2026-09-25", "2026-10-12"),
+]
+
+
+def test_the_trades_list_is_one_row_per_position_open_ones_first():
+    """39 fully drawn cards ran to 21,700 pixels, in open-date order, so a position
+    closed yesterday sat among July's. One row each now: open positions first,
+    newest opened first, then closed ones by their close. The dates use the page's
+    short style, with the year only off this year, and the days held count like
+    `Episode.holding_days`. An open position with no mark says so."""
+    rows = _trades_rows(_BOOK)
+    assert [(r[0].lstrip("▸ "), r[2]) for r in rows] == [
+        ("CRWD", "OPEN"), ("TSLA", "OPEN"),
+        ("META", "CLOSED"), ("GOOG", "CLOSED"), ("SPX", "CLOSED")]
+    by = {r[0].lstrip("▸ "): r for r in rows}
+    assert by["CRWD"][3:] == ["since 14 Oct", "1 day", "—", "— no price yet"]
+    assert by["TSLA"][3:5] == ["since 4 Apr '25", "559 days"]
+    assert by["GOOG"][3:] == ["24 Sep to 9 Oct", "15 days", "€100.00", ""]
+    assert by["SPX"][3:5] == ["28 Sep", "same day"]
+
+
+def test_the_trades_list_filters_by_status_and_symbol():
+    """All, Open or Closed, and a symbol search, together."""
+    names = lambda rows: [r[0].lstrip("▸ ") for r in rows]  # noqa: E731
+    assert names(_trades_rows(_BOOK, tshow="closed")) == ["META", "GOOG", "SPX"]
+    assert names(_trades_rows(_BOOK, tshow="open", tsearch=" crw ")) == ["CRWD"]
+    assert _trades_rows(_BOOK, tshow="open", tsearch="goog") == [
+        ["No open position matches “GOOG”."]]
 
 
 def test_a_note_no_card_claims_is_drawn_on_the_trades_tab():

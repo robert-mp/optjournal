@@ -904,7 +904,6 @@ select{width:100%;font:inherit;padding:var(--s3) var(--s5);border-radius:var(--r
 .big{font-size:var(--t7);font-weight:var(--w-fig);font-family:var(--fig);
   font-variant-numeric:tabular-nums}
 /* The two smaller inline labels beside a lifecycle heading. */
-.lbl{font-size:var(--t4);font-weight:var(--w-label)}
 .lbl-sm{font-size:var(--t1)}
 .pill.gap{margin-left:var(--s3);font-size:var(--t1)}
 /* Two cards side by side, each taking half the row: the 0DTE panel's pair. */
@@ -1513,11 +1512,10 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
   .wselb .dim{display:none}}
 /* Replay drill-down. The panel is the chart's home rather than a table cell:
    reading a strike against a price scale needs a y-axis, and an axis needs
-   room. Clicking the card header opens it, the same act as clicking a calendar
-   day -- one drill-down grammar, not two. */
+   room. A Positions row or a Trades card's replay button opens it, and a Trades
+   row opens its card, the same act as clicking a calendar day -- one drill-down
+   grammar, not two. */
 .rk{cursor:pointer}
-.rk:hover .rhint{color:var(--fg)}
-.rhint{font-size:var(--t1);color:var(--dim2);white-space:nowrap}
 .caret{display:inline-block;transition:transform .12s ease}
 .caret.open{transform:rotate(90deg)}
 .replay{margin-top:var(--s6);padding:var(--s6) var(--s4);border-radius:var(--r3);
@@ -1719,6 +1717,15 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .day.g .dct,.day.r .dct{color:var(--onfill)}
 
 /* ---- legs / strategy ---- */
+/* The Trades list: one row per position, its card in a drawer beneath it, the
+   Watchlist's shape. A row stays on one line so each column reads straight down. */
+.tlist{margin-top:var(--s5)}
+.tlist td{white-space:nowrap}
+.tlist tbody tr.rk:hover{background:var(--bg2)}
+.tlist tbody tr.on{background:linear-gradient(160deg,var(--seg1),var(--seg2))}
+.tlist tbody tr.tdrawer>td{white-space:normal;padding:0 var(--s5) var(--s6);
+  background:var(--bg2);border-bottom:1px solid var(--line)}
+.tbar{display:flex;justify-content:flex-end;padding-top:var(--s5)}
 .grp{margin-top:var(--s5);border:1px solid var(--line);border-radius:var(--r2);overflow:hidden}
 .grp .gh{display:flex;justify-content:space-between;align-items:center;gap:var(--s5);
   padding:var(--s3) var(--s5);background:var(--panel2);font-size:var(--t2);

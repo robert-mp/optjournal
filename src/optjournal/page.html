@@ -1477,7 +1477,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload rk:StrategyRank
  * @payload pos:Position o:Order l:Leg h:History al:Allocation ar:AllocationRow
  * @payload stm:Statement fx:FxBlock q:FxQuote qo:FxQuote
- * @payload mo:Money
+ * @payload mo:Money uz:Money
  * @payload bc:BrokerCosts CT:CostTotals F:FrictionTotals A:AutoFx ch:Charge
  * @payload csc:CostSelection cc:CategoryCost fxr:FxPairCost fee:FeeGroup
  * @payload whr:Withholding
@@ -1498,7 +1498,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload pf:Portfolio pday:PortfolioDay pmo:PortfolioMonth ptot:PortfolioTotal
  * @payload pd0:PortfolioDay pdn:PortfolioDay
  * @local Math S TABS RAIL THEMES b m r el location window qs hs ids
- * @local leaves PERIOD_TABS pop quotes steps TILES
+ * @local leaves PERIOD_TABS TYPE_TABS pop quotes steps TILES
+ * @local TSHOW found day
  * @local draft dr order known tilesave tilereset Array
  * @local JFIELDS entered closed options STATE_KEYS_REQUIRED
  * @local cells days buckets evs glegs lcs legs mons month
@@ -1622,6 +1623,11 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
      reader believes was measured. The empty-state prose names whichever control is
      doing it. */
   wsearch:'',wbx:null,wivr:null,wearn:null,wtier:'',
+  /* The Trades list: which positions it shows ('all', 'open' or 'closed'), the
+     symbol search, and the rows opened into their cards, by `replay_key`. None of
+     them is in the hash, for the watchlist filters' reason, but a replay named in
+     the hash opens its row, so a link to a replay still lands on it. */
+  tshow:'all',tsearch:'',topen:new Set(),
   /* Live quotes, keyed by symbol, and the server clock when they were asked for.
      NOT part of `state`: they come from their own endpoint because each one costs
      an HTTP request, so they must not ride along on every payload reload. Null
@@ -1965,15 +1971,16 @@ function ccyControl(){
 
 /* ------------------------------------------------ the period and view options
 
-   The three tabs whose figures the month and the trade type move. Named once,
-   because two things key on it: the period stepper appears only here, and the
-   view-options panel offers the trade type only here. Everywhere else those
-   controls would change nothing on screen, which is the invariant in
+   The tabs whose figures the month moves, and the ones the trade type moves.
+   Named once each, because the period stepper appears only on the first and the
+   view-options panel offers the trade type only on the second. Everywhere else
+   those controls would change nothing on screen, which is the invariant in
    docs/design-notes.md -- a tab's numbers move only with a control it displays --
    read in the direction it is easy to forget: a control it displays must move
-   its numbers. `trades` is the leaf, not the destination; Positions shares the
-   rail item and ignores both controls, so it gets neither. */
-const PERIOD_TABS=['dashboard','calendar','trades'];
+   its numbers. Trades lists every position whatever the month, so it shows the
+   trade type and not the stepper; Positions ignores both, so it gets neither. */
+const PERIOD_TABS=['dashboard','calendar'];
+const TYPE_TABS=['dashboard','calendar','trades'];
 const TYPE_LABEL={'':'Options',equities:'Equities',odte:'0DTE'};
 
 /* THE MONTH STEPPER. It replaces the month dropdown and the calendar's own
@@ -2037,10 +2044,10 @@ function renderViewOptions(){
      this read `S.state.asset_category` off null and threw. `renderPeriod` has
      always had this guard; this function shipped without it. */
   if(!S.state){btn.innerHTML='';pop.innerHTML='';return;}
-  const onPeriod=PERIOD_TABS.includes(S.tab);
+  const onType=TYPE_TABS.includes(S.tab);
   const ccy=ccyControl();
   const parts=[];
-  if(onPeriod) parts.push(TYPE_LABEL[S.type||'']);
+  if(onType) parts.push(TYPE_LABEL[S.type||'']);
   if(ccy) parts.push(`${sym(DISP())||''}${DISP()}`);
   if(!parts.length){
     btn.innerHTML=''; pop.innerHTML='';
@@ -2049,7 +2056,7 @@ function renderViewOptions(){
   }
   btn.innerHTML=`<button class="btn vbtn" popovertarget="vpop"
     title="View options">${esc(parts.join(' · '))} ▾</button>`;
-  pop.innerHTML=(onPeriod?`<div><div class="flabel">Trade type</div>
+  pop.innerHTML=(onType?`<div><div class="flabel">Trade type</div>
       <div class="seg">
         <button data-type="" class="${S.type?'':'on'}"
           title="Every ${esc(S.state.asset_category)} trade in the journal."
@@ -2061,7 +2068,7 @@ function renderViewOptions(){
           ${odteSelectable()?'':'disabled'} title="${esc(odteFilterNote())}">0DTE</button>
       </div></div>`:'')
     +ccy
-    +(onPeriod?`<div><div class="flabel">Account</div>
+    +(onType?`<div><div class="flabel">Account</div>
       <div class="vacct">${esc(accountLabel())}</div></div>`:'');
   pop.querySelectorAll('button[data-ccy]').forEach(b=>
     b.onclick=()=>{S.ccy=b.dataset.ccy;draw();});
@@ -2120,7 +2127,7 @@ function equitiesNote(){
       +'`optjournal ingest` to fold them in.';
 }
 /* Rendered at the head of exactly the tabs the trade type drives -- Dashboard,
-   Calendar and Trades, PERIOD_TABS -- and more necessary than it was, now that the
+   Calendar and Trades, TYPE_TABS -- and more necessary than it was, now that the
    control itself sits in a panel that is usually closed. A filter that silently changes
    every number is the same failure as a total that silently spans a wider
    scope than its label, and fees genuinely do not narrow, so naming which
@@ -3444,77 +3451,152 @@ function replayPanel(rp,label,valueHtml){
 const NO_PRICE='no price yet';
 const NO_PRICE_WHY='The newest statement has no price for a contract this position '
   +'holds, usually because it opened after that statement. The next one prices it.';
+/* The Trades list's three views, [S.tshow, label]. */
+const TSHOW=[['all','All'],['open','Open'],['closed','Closed']];
+/* A Trades date in the page's short style: "14 Oct" this year, "4 Apr '25" before. */
+function tradeDay(iso){
+  const day=String(iso||'').slice(0,10);
+  return dayLabel(day,day.slice(0,4)!==etday(Date.now()/1000).slice(0,4));
+}
+function tradeDates(lc){
+  if(lc.status==='open') return 'since '+tradeDay(lc.opened_at);
+  const from=tradeDay(lc.opened_at), to=tradeDay(lc.closed_at);
+  return from===to?from:`${from} to ${to}`;
+}
+/* Calendar days from the first fill to the last close, or to today while open:
+   the count `Episode.holding_days` keeps, so a day trade is "same day". */
+function heldFor(lc){
+  const from=String(lc.opened_at||'').slice(0,10);
+  const to=lc.status==='open'?etday(Date.now()/1000):String(lc.closed_at||'').slice(0,10);
+  const days=Math.round((Date.parse(to)-Date.parse(from))/86400000);
+  return !Number.isFinite(days)?'':days===0?'same day':days===1?'1 day':`${days} days`;
+}
+
 function trades(){
-  /* One card per POSITION LIFECYCLE: a short put opened in July and bought
+  /* One row per POSITION LIFECYCLE: a short put opened in July and bought
      back in August is one position with two events, not two unrelated
      trades. The linkage is the episode layer's, not a display heuristic --
      the open and the close share a FIFO episode keyed by conid, so the
-     grouping can never join two different contracts or split one. Below the
-     lifecycle, each EVENT (the strategy-grouped orders from strategies.py)
-     stays fully visible with its legs, so the order-level truth is intact.
-     Realised P&L is what IBKR booked on the card's fills, the Dashboard's and
-     the Calendar's rule. So an open card already carries a partial close and a
-     roll's closed leg, on the card and on the event holding the fill. */
+     grouping can never join two different contracts or split one. Realised
+     P&L is what IBKR booked on the position's fills, the Dashboard's and the
+     Calendar's rule, so an open row already carries a partial close and a
+     roll's closed leg.
+
+     A row opens into the position's card, the Watchlist's drawer shape. Every
+     card drawn at once ran to 21,700 pixels on a journal of 39 positions, which
+     nobody scans. Open positions lead, newest first, then closed ones by their
+     close, and the search narrows by symbol. */
   const lcs=S.state.lifecycles||[];
   if(!lcs.length) return `${scopeNote()}${orphanNotes()}<div class="card"><div class="empty">no option orders</div></div>`;
-  return scopeNote()+orphanNotes()+lcs.map(lc=>{
-    const evs=lc.events||[];
-    const legs=evs.flatMap(g=>(g.orders||[]).flatMap(o=>o.legs||[]));
-    const openLc=lc.status==='open';
-    const when=openLc?`opened ${esc((lc.opened_at||'').slice(0,10))} · still open`
-      :`${esc((lc.opened_at||'').slice(0,10))} → ${esc((lc.closed_at||'').slice(0,10))}`;
-    const rp=(S.state.replays||{})[lc.replay_key];
-    const shown=S.replay===lc.replay_key;
-    const uz=lc.unrealized;
-    const score=openLc?['Unrealised',`<b class="${cls(uz?.base)}">${moneyOf(uz)}</b>`]
-      :['Realised',`<b class="${cls(lc.realized_pnl?.base)}">${
-        lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—'}</b>`];
-    const realised=statCard('Realised',
-      lc.realized_pnl!=null?moneyOf(lc.realized_pnl):'—',
-      openLc?'booked so far, net of commission':'net of commission',
-      'sm '+cls(lc.realized_pnl?.base));
-    return `<div class="card">
-      <div class="crow${rp?' rk':''}"${rp?` data-replay="${esc(lc.replay_key)}"
-        role="button" tabindex="0" aria-expanded="${shown?'true':'false'}"`:''}><div><h2>${
-        esc(lc.underlying||'?')}
-        <span class="dim lbl">${esc(lc.label)}</span>
-        <span class="pill gap"
-          >${openLc?'OPEN':'CLOSED'}</span></h2>
-        <div class="sub mono">${when} · ${lc.fills} fill(s) · ${evs.length} event(s)</div></div>
-        ${rp?`<div class="rhint">${shown?'hide replay':'replay'
-          } <span class="caret${shown?' open':''}">▸</span></div>`:''}
-      </div>
-      ${shown&&rp?replayPanel(rp,score[0],score[1]):''}
-      ${openLc?`<div class="stats c2">${realised}${statCard('Unrealised',
-        uz?moneyOf(uz):`—<span class="wcap"> ${NO_PRICE}</span>`,
-        uz?'contracts still held, as last reported':NO_PRICE_WHY,
-        'sm '+cls(uz?.base))}</div>`:realised}
-      ${evs.map(g=>{
-        const glegs=(g.orders||[]).flatMap(o=>o.legs||[]);
-        /* Inside its own card, an event whose shape merely repeats the
-           card's is noise: a "Short put" lifecycle does not need its events
-           captioned "Short put" and "Short put close" -- those are "Opened"
-           and "Closed" here. An event that carries NEW information (a Roll,
-           a different shape added to a campaign) keeps its full name. Pure
-           presentation: g.label itself is unchanged everywhere else the
-           payload is read (the calendar drill-down has no card context, so
-           it needs the full name). */
-        const evl=g.label===lc.label?'Opened'
-          :g.label===lc.label+' close'?'Closed':g.label;
-        const closes=glegs.some(l=>String(l.open_close||'').toUpperCase().includes('C'));
-        return `<div class="grp">
-        <div class="gh"><span class="gl">${esc((g.first_fill_at||'').slice(0,10))} — ${
-          esc(evl)} <span class="dim2 mono">order${(g.order_ids||[]).length>1?'s':''} ${
-          esc((g.order_ids||[]).join(', '))}</span></span>
-          ${closes?`<span class="fig ${cls(g.realized_pnl.base)}">${moneyOf(g.realized_pnl)}</span>`:''}</div>
-        ${glegs.map(l=>legRow(l)).join('')}
-      </div>`;}).join('')}
-      ${legs.length>1?'':`<div class="note">One leg, so this is a single-leg
-        position rather than a strategy. Legs placed together on one underlying
-        group into a named strategy the day it happens.</div>`}
-      ${journalRow(lc)}
-    </div>`;
-  }).join('');
+  const q=S.tsearch.trim().toUpperCase();
+  const match=lc=>String(lc.underlying||'').toUpperCase().includes(q);
+  const found=lcs.filter(match);
+  const inView=(lc,k)=>k==='all'||lc.status===k;
+  const since=lc=>String((lc.status==='open'?lc.opened_at:lc.closed_at)||'');
+  /* A row whose write-up is open stays whatever the filter says: the editor holds
+     the only copy of what was typed, and a row filtered away takes it along. */
+  const rows=lcs.filter(lc=>match(lc)&&inView(lc,S.tshow)
+    ||!!lc.anchor&&lc.anchor===S.jrnl).sort((lc,olc)=>
+    (olc.status==='open')-(lc.status==='open')||since(olc).localeCompare(since(lc)));
+  const row=lc=>{
+    const open=S.topen.has(lc.replay_key), openLc=lc.status==='open', uz=lc.unrealized;
+    return `<tr class="rk${open?' on':''}" data-topen="${esc(lc.replay_key)}" tabindex="0"
+        aria-expanded="${open}">
+      <td><span class="caret${open?' open':''}">▸</span> <b>${esc(lc.underlying||'?')}</b></td>
+      <td class="dim">${esc(lc.label)}</td>
+      <td>${openLc?'<span class="pill">OPEN</span>':'<span class="pill dim">CLOSED</span>'}</td>
+      <td>${esc(tradeDates(lc))}</td>
+      <td class="n">${esc(heldFor(lc))}</td>
+      <td class="n ${cls(lc.realized_pnl?.base)}">${moneyOf(lc.realized_pnl)}</td>
+      <td class="n ${cls(uz&&uz.base)}"${openLc&&!uz?` title="${esc(NO_PRICE_WHY)}"`:''}>${
+        !openLc?'':uz?moneyOf(uz):`— <span class="dim2">${NO_PRICE}</span>`}</td>
+    </tr>${open?`<tr class="tdrawer"><td colspan="7">${tradeCard(lc)}</td></tr>`:''}`;
+  };
+  const none=`<tr><td colspan="7" class="empty">No ${S.tshow==='all'?'':S.tshow+' '
+    }position${q?` matches “${esc(q)}”`:''}. <button class="btn sm" data-tclear
+    >Show all</button></td></tr>`;
+  return scopeNote()+orphanNotes()+`<div class="card">
+    <div class="crow"><div class="seg" role="group" aria-label="Which positions">${
+      TSHOW.map(([k,label])=>`<button data-tshow="${k}" class="${S.tshow===k?'on':''}"
+        aria-pressed="${S.tshow===k}">${label} <b>${
+        found.filter(lc=>inView(lc,k)).length}</b></button>`).join('')}</div>
+      <input id="tsearch" class="tin" value="${esc(S.tsearch)}" maxlength="12"
+        autocomplete="off" spellcheck="false" data-bound placeholder="Symbol"
+        aria-label="Find a symbol"></div>
+    <table class="tlist"><thead><tr><th>Position</th><th>Strategy</th><th>Status</th>
+      <th>Dates</th><th class="n">Held</th>
+      <th class="n" title="${esc('What IBKR booked on the position\'s fills, net of '
+        +'commission. On an open position, what is booked so far.')}">Realised</th>
+      <th class="n" title="${esc('The contracts still held, as the newest statement '
+        +'marked them.')}">Unrealised</th>
+    </tr></thead><tbody>${rows.map(row).join('')||none}</tbody></table>
+  </div>`;
+}
+
+/* The card a row opens: the replay, each EVENT (the strategy-grouped orders from
+   strategies.py) with its legs, so the order-level truth is intact, and the
+   write-up. The row above it carries the figures and the dates. */
+function tradeCard(lc){
+  const evs=lc.events||[];
+  const legs=evs.flatMap(g=>(g.orders||[]).flatMap(o=>o.legs||[]));
+  const rp=(S.state.replays||{})[lc.replay_key];
+  const shown=S.replay===lc.replay_key;
+  const uz=lc.unrealized;
+  const score=lc.status==='open'?['Unrealised',`<b class="${cls(uz&&uz.base)}">${moneyOf(uz)}</b>`]
+    :['Realised',`<b class="${cls(lc.realized_pnl?.base)}">${moneyOf(lc.realized_pnl)}</b>`];
+  return `${rp?`<div class="tbar"><button class="jbtn" data-replay="${esc(lc.replay_key)}"
+      aria-expanded="${shown}">${shown?'hide replay':'replay'}</button></div>`:''}
+    ${shown&&rp?replayPanel(rp,score[0],score[1]):''}
+    ${evs.map(g=>{
+      const glegs=(g.orders||[]).flatMap(o=>o.legs||[]);
+      /* Inside its own card, an event whose shape merely repeats the
+         card's is noise: a "Short put" lifecycle does not need its events
+         captioned "Short put" and "Short put close" -- those are "Opened"
+         and "Closed" here. An event that carries NEW information (a Roll,
+         a different shape added to a campaign) keeps its full name. Pure
+         presentation: g.label itself is unchanged everywhere else the
+         payload is read (the calendar drill-down has no card context, so
+         it needs the full name). */
+      const evl=g.label===lc.label?'Opened'
+        :g.label===lc.label+' close'?'Closed':g.label;
+      const closes=glegs.some(l=>String(l.open_close||'').toUpperCase().includes('C'));
+      return `<div class="grp">
+      <div class="gh"><span class="gl">${esc((g.first_fill_at||'').slice(0,10))} — ${
+        esc(evl)} <span class="dim2 mono">order${(g.order_ids||[]).length>1?'s':''} ${
+        esc((g.order_ids||[]).join(', '))}</span></span>
+        ${closes?`<span class="fig ${cls(g.realized_pnl.base)}">${moneyOf(g.realized_pnl)}</span>`:''}</div>
+      ${glegs.map(l=>legRow(l)).join('')}
+    </div>`;}).join('')}
+    ${legs.length>1?'':`<div class="note">One leg, so this is a single-leg
+      position rather than a strategy. Legs placed together on one underlying
+      group into a named strategy the day it happens.</div>`}
+    ${journalRow(lc)}`;
+}
+
+/* The list's controls and its rows. Closing a row closes what it held: its
+   replay, and an editor or link form left open inside it, which the next render
+   would drop with the card anyway. */
+function bindTrades(){
+  document.querySelectorAll('[data-topen]').forEach(el=>
+    pressable(el,()=>{
+      const key=el.dataset.topen;
+      if(!S.topen.has(key)){S.topen.add(key);draw();return;}
+      const lc=(S.state.lifecycles||[]).find(olc=>olc.replay_key===key);
+      const a=lc&&lc.anchor;
+      if(a&&S.jrnl===a&&jdirty(a)
+         &&!confirm('Close this card? Its write-up has text that is not saved.')) return;
+      S.topen.delete(key);
+      if(S.replay===key) S.replay=null;
+      if(a&&S.jrnl===a) S.jrnl=null;
+      if(a&&S.lnk===a) S.lnk=null;
+      draw();
+    }));
+  document.querySelectorAll('[data-tshow]').forEach(b=>
+    b.onclick=()=>{S.tshow=b.dataset.tshow;draw();});
+  document.querySelectorAll('[data-tclear]').forEach(b=>
+    b.onclick=()=>{S.tshow='all';S.tsearch='';draw();});
+  const sb=$('#tsearch');
+  if(sb) sb.oninput=()=>{S.tsearch=sb.value;draw();};
 }
 
 /* ------------------------------------------------ the journal layer */
@@ -3582,6 +3664,13 @@ const JFIELDS=[
   {name:'lessons',at:'close',label:'Key lessons',kind:'text',hint:''},
   {name:'close_note',at:'close',label:'Closing notes',kind:'text',hint:''},
 ];
+
+/* Whether the open editor holds text the server does not. */
+function jdirty(a){
+  const je=JENTRY(a);
+  return JFIELDS.some(jf=>{const el=$('#j-'+jf.name);
+    return !!el&&el.value!==(je&&je[jf.name]!=null?String(je[jf.name]):'');});
+}
 
 /* The badge on a card, and the button that opens the editor. Three states, not
    two: a decision with no anchor cannot be journalled at all, and saying so is
@@ -3707,6 +3796,11 @@ async function postLink(body){
   S.lnk=null;
   note(body.unlink?'Link removed.':'Linked. The two cards are now one position.','ok');
   await load();
+  /* A card that gained or lost contracts has a new key, so it is opened again
+     rather than folding shut under the reader. */
+  (S.state.lifecycles||[]).forEach(lc=>{
+    if(lc.anchor===body.anchor||lc.anchor===body.joins) S.topen.add(lc.replay_key);});
+  draw();
 }
 
 function bindJournal(){
@@ -3870,7 +3964,7 @@ function positions(){
   const row=pos=>{const ep=open.find(x=>x.conid===pos.conid)||{};
     const key=rkeyOf(pos);
     const shown=key&&S.replay===key&&owner[key]===String(pos.conid);
-    /* A tab stop and Enter/Space, like a Trades card's header. No button role: it
+    /* A tab stop and Enter/Space, like a Trades row. No button role: it
        would take the row out of the table for a screen reader, and a row that
        opens a panel beneath it is what `aria-expanded` on a row already says. */
     return `<tr${key?` class="rk" data-replay="${esc(key)}" tabindex="0"
@@ -6264,6 +6358,7 @@ function applyHash(){
      nothing in this one, and applyHash runs before the state it would check. */
   S.calday=hs.get('calday')||null;
   S.replay=hs.get('replay')||null;
+  if(S.replay) S.topen.add(S.replay);
   /* Upper-cased, because that is how `_watchlist_write` stores a symbol and how
      the payload sends it back: `#wsym=dell` from a hand-typed URL would otherwise
      match no row and heal away, silently losing a link that was almost right.
@@ -6494,6 +6589,7 @@ function draw(push){
       S.replay=S.replay===k?null:k;draw();}));
   bindReplayControls(replaying!==null&&replaying===S.replay);
   bindJournal();
+  bindTrades();
   /* Opening the 0DTE tab checks the feed at once; the timer keeps it current. */
   zdue();
   document.querySelectorAll('[data-calday-clear]').forEach(el=>

@@ -276,14 +276,17 @@ _SIDE_OK = '<td class="side buy">Long</td><td class="side sell">Short</td>'
 _SIDE_UNSTYLABLE = '<td class="side">Long</td>'
 
 def _closed_card(label: str, *captions: str) -> str:
-    """A closed lifecycle card in the markup shape `trades()` renders."""
+    """A closed position's row and opened card, in the markup shape `trades()`
+    renders."""
     events = "".join(
         f'<div class="grp"><div class="gh"><span class="gl">2026-08-31 — {c} '
         f'<span class="dim2 mono">order 1</span></span></div>'
         f'<div class="leg"><span class="act">BTC</span></div></div>'
         for c in captions)
-    return (f'<div class="card"><h2>AAPL <span class="dim lbl">{label}</span></h2>'
-            f'<span class="pill">CLOSED</span>{events}</div>')
+    return (f'<tr class="rk on" data-topen="lc:1@2026-08-01" tabindex="0">'
+            f'<td><b>AAPL</b></td><td class="dim">{label}</td>'
+            f'<td><span class="pill dim">CLOSED</span></td></tr>'
+            f'<tr class="tdrawer"><td colspan="7">{events}</td></tr>')
 
 
 #: Two correct closed cards. The second is the case the check first got wrong: a

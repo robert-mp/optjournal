@@ -475,6 +475,30 @@ def _replay(conn, legs: list[dict], *, closed: str | None = None) -> dict:
     return next(iter(state["replays"].values()))
 
 
+def test_two_trades_on_one_contract_on_one_day_get_a_replay_each(conn):
+    """A 0DTE bought and sold twice at one strike on one day is two cards, and
+    they shared one key: the first card replayed the second trade."""
+    from optjournal.replay import attach
+
+    def card(anchor, at, closed):
+        leg = _leg("C1", 7000.0, "P", "2026-10-14", at, -1, 2.0)
+        return {"conids": ["C1"], "opened_at": at, "closed_at": closed,
+                "underlying": "SPX", "label": "Short put", "status": "closed",
+                "anchor": anchor,
+                "events": [{"first_fill_at": at, "label": "e",
+                            "orders": [{"legs": [leg]}]}]}
+
+    state = {"lifecycles": [card("3", "2026-10-14 13:00:00", "2026-10-14 14:00:00"),
+                            card("1", "2026-10-14 10:00:00", "2026-10-14 11:00:00")],
+             "positions": []}
+    attach(conn, state)
+    keys = [lc["replay_key"] for lc in state["lifecycles"]]
+    assert len(set(keys)) == 2, keys
+    assert keys[0] == "lc:C1@2026-10-14", "a key that never collided moved"
+    assert [state["replays"][k]["opened_at"] for k in keys] == [
+        "2026-10-14 13:00:00", "2026-10-14 10:00:00"]
+
+
 def _half(band: list[list[float]]) -> dict[int, float]:
     """Each band row's half-width by stamp. The band is rounded to four places,
     which is why the comparisons below allow 1e-4."""

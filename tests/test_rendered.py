@@ -203,13 +203,15 @@ def test_every_drill_down_is_a_keyboard_stop(served, tmp_path):
     opened on click only. No tab stop and no role, so Tab walked past every one
     of them and the drill-downs were out of reach without a mouse; the Market
     strip's days were the one surface that had both. Rendered, so the check sees
-    the markup the reader's browser builds rather than a template.
+    the markup the reader's browser builds rather than a template. A Trades row
+    opens its card, and like a Positions row it is a table row, so it takes no
+    button role.
     """
     if not browser.browsers():
         pytest.skip("no Chrome/Chromium on this machine")
     found = {}
     for tab, attr in (("calendar&month=all", "data-calday"),
-                      ("trades", "data-replay"), ("positions", "data-replay")):
+                      ("trades", "data-topen"), ("positions", "data-replay")):
         dom = browser.dump_dom(f"{served}/#tab={tab}", tmp_path / f"kbd-{tab[:5]}")
         if dom is None:
             pytest.skip("no browser produced a DOM (environment, not the page)")
@@ -217,7 +219,7 @@ def test_every_drill_down_is_a_keyboard_stop(served, tmp_path):
         found[tab] = len(tags)
         for tag in tags:
             assert 'tabindex="0"' in tag, f"{tab}: not a tab stop: {tag}"
-            if tab != "positions":
+            if tab.startswith("calendar"):
                 assert 'role="button"' in tag, f"{tab}: no button role: {tag}"
     assert found["calendar&month=all"] and found["trades"], (
         f"nothing to check, so this proved nothing: {found}")

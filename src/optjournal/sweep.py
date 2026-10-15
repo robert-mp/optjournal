@@ -479,13 +479,15 @@ def check_closing_events_are_captioned(p: Page) -> Verdict:
     """
     if p.tab not in ("trades", "odte"):
         return skip("no lifecycle cards on this tab")
-    cards = re.findall(r'<div class="card"[^>]*>(.*?)(?=<div class="card"|$)', p.markup, re.S)
+    # A position is its row and, when opened, the card in the drawer beneath it.
+    cards = re.findall(r'<tr class="rk[^"]*" data-topen=(.*?)(?=<tr class="rk|</tbody>|$)',
+                       p.markup, re.S)
     seen = 0
     for card in cards:
         if "CLOSED" not in card:
             continue
-        label = re.search(r'<span class="dim lbl">([^<]*)</span>', card)
-        captions = re.findall(r'<span class="gl">[^<]*?— ([^<]*?)\s*<span', card)
+        label = re.search(r'<td class="dim">([^<]*)</td>', card)
+        captions = re.findall(r'<span class="gl"[^>]*>[^<]*?— ([^<]*?)\s*<', card)
         if not label or not captions:
             continue
         seen += 1
@@ -855,9 +857,13 @@ def sweep_journal(
         # One invented key proves the healing branch, the same shape as the
         # invented calday above.
         replays = payload.get("replays") or {}
-        lc_keys = [k for k in replays if k.startswith("lc:")]
+        # One open card and one closed: a Trades page opens only the card its
+        # replay names, and the caption check reads closed cards.
+        lc_keys = [next((lc["replay_key"] for lc in payload.get("lifecycles") or []
+                         if lc.get("status") == status and lc.get("replay_key") in replays),
+                        None) for status in ("open", "closed")]
         pos_keys = [k for k in replays if k.startswith("pos:")]
-        coords += [("trades", None, None, None, k) for k in lc_keys[:2]]
+        coords += [("trades", None, None, None, k) for k in lc_keys if k]
         coords += [("positions", None, None, None, k) for k in pos_keys[:1]]
         coords += [("trades", None, None, None, "lc:nosuchconid@1999-01-01")]
 

@@ -906,6 +906,12 @@ def attach(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
         conids = [str(c) for c in (lifecycle.get("conids") or [])]
         opened, closed = lifecycle.get("opened_at"), lifecycle.get("closed_at")
         key = "lc:" + "-".join(conids) + "@" + str(opened or "")[:10]
+        # Two cards on the same contracts opened the same day, an SPX 0DTE bought
+        # and sold twice at one strike, shared a key: the second chart replaced the
+        # first, and the Trades tab opened both rows as one. Only a collision
+        # carries the anchor, so every other key, and every link to one, holds.
+        if key in replays:
+            key += "~" + str(lifecycle.get("anchor") or len(replays))
         legs = [
             leg
             for event in (lifecycle.get("events") or [])
