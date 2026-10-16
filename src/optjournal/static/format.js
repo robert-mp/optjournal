@@ -100,6 +100,28 @@ export function cls(value, digits) {
   return amount > 0 ? "pos signed" : "neg signed";
 }
 
+/** Money added up by `money.py`'s rule: the base always adds, and the native
+ * stands only while one currency accounts for every part. A part with no native
+ * and a nonzero base already spans currencies, so the total does too; one with
+ * neither (a day of opening fills only) has nothing to add. */
+export function sumMoney(parts) {
+  let base = 0;
+  let native = 0;
+  let ccy = null;
+  let mixed = false;
+  for (const mo of parts) {
+    base += mo.base;
+    if (mo.ccy == null) {
+      mixed ||= mo.base !== 0;
+      continue;
+    }
+    mixed ||= ccy != null && mo.ccy !== ccy;
+    ccy = mo.ccy;
+    native += mo.native;
+  }
+  return mixed || ccy == null ? { base, native: null, ccy: null } : { base, native, ccy };
+}
+
 /** An index level or a listed strike, UNGROUPED: 7706.03, never 7,706.03.
  *
  * Its own formatter rather than `num`, and the difference is one separator that

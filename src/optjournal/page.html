@@ -167,7 +167,7 @@ import {PRICE_TIERS, alertState, bxDirection, bxStrong, earningsSoon, histBars,
   meterKnob,
   priceTier, ringArc, ringPoint, shownPrice} from '/static/watch.js';
 import {cls, compact, dayLabel, dp, esc, level, money, monthLabel, num, pct, plural,
-  strike, sym}
+  strike, sumMoney, sym}
   from '/static/format.js';
 import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
   from '/static/market.js';
@@ -1486,6 +1486,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} x
  * @property {number} y
  * @property {number} n
+ * @property {Money} total -- the running total at this point, which `y` plots
  */
 
 /** @typedef {Object} Contract -- page-side: what names a contract on a Leg or a
@@ -2689,7 +2690,12 @@ function chart(days){
      PL leaves room for a tick label carrying a currency symbol as well as
      digits; at 54px "€4,138" collided with the plot area. */
   const W=1400,H=230,PL=76,PR=18,PT=16,PB=28;
-  let run=0; const pts=days.map(dy=>({x:dy.day,y:(run+=dy.realized.base),n:dy.trades}));
+  /* Each point's running total is a Money, so its tooltip prints by the rule the
+     day cells use; the line is drawn from its base. */
+  const pts=days.map((dy,i)=>{
+    const mo=sumMoney(days.slice(0,i+1).map(dy=>dy.realized));
+    return {x:dy.day,y:mo.base,n:dy.trades,total:mo};
+  });
   const ys=pts.map(pt=>pt.y).concat([0]);
   let lo=Math.min(...ys), hi=Math.max(...ys);
   if(lo===hi){lo-=1;hi+=1;}
@@ -2746,7 +2752,7 @@ function chart(days){
      stylesheet, which is why the whole chart sat out the theme swap. */
   const dots=pts.map((pt,i)=>`<circle class="cdot ${pt.y<0?'neg':'pos'}"
      cx="${sx(i).toFixed(1)}" cy="${sy(pt.y).toFixed(1)}" r="3.5"
-     ><title>${esc(dayLabel(pt.x,true))} · total ${cash(pt.y)} (${plural(pt.n,'fill')})</title></circle>`).join('');
+     ><title>${esc(dayLabel(pt.x,true))} · total ${moneyOf(pt.total)} (${plural(pt.n,'fill')})</title></circle>`).join('');
   /* The year appears only when the span crosses one, decided from the data rather
      than always shown or always hidden: on a two-week chart "'26" twice is noise,
      and on one running from December into January its absence makes the axis lie
@@ -2832,7 +2838,9 @@ function calendar(){
      and for a specific month it reproduces s.green_days/s.red_days exactly,
      because the grid then holds every day the period has. */
   const shown=(s.days||[]).filter(dy=>dy.day.slice(0,7)===month);
-  let total=0; shown.forEach(dy=>total+=dy.realized.base);
+  /* A Money printed as the cells are: under the display currency the trades were
+     charged in, two +$100 days total $200, not their base restated. */
+  const total=sumMoney(shown.map(dy=>dy.realized));
   const greenDays=shown.filter(dy=>dy.realized.base>0).length;
   const redDays=shown.filter(dy=>dy.realized.base<0).length;
 
@@ -2878,7 +2886,7 @@ function calendar(){
        money.`)}</h2>
       <div class="sub">Daily realised P&L.</div></div>
       <div class="pills">
-        <span class="pill">Month P/L <b class="${cls(total)}">${cash(total)}</b></span>
+        <span class="pill">Month P/L <b class="${cls(amountOf(total))}">${moneyOf(total)}</b></span>
         <span class="pill">Green days <b>${greenDays}</b></span>
         <span class="pill">Red days <b>${redDays}</b></span>
       </div></div>

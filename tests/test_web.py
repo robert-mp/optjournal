@@ -1131,6 +1131,36 @@ def test_a_calendar_day_lists_the_legs_booked_on_it(tmp_path):
     assert "<leg S1>" not in first + second
 
 
+def test_the_month_and_the_running_total_add_up_what_the_days_show():
+    """With a EUR base and the USD switch on, each +$100 day read "$100.00" (its
+    native, by `moneyOf`) and the Month P/L pill read "$201.25": it summed the
+    days' base and restated it at the display rate. The chart's dot tooltip did the
+    same. Both through the page's own `calendar` and `chart`, in USD.
+    """
+    out = _node_run([
+        f"import {{esc,money,cls,compact,dayLabel,monthLabel,plural,sumMoney}} "
+        f"from '{_static('format.js')}';",
+        f"import {{niceTicks}} from '{_static('replay.js')}';",
+        "const DISP=()=>'USD', conv=v=>v==null?null:Number(v)*1.0125,",
+        "  unconv=v=>v==null?null:Number(v)/1.0125;",
+        "const cash=(v,d)=>money(conv(v),DISP(),d);",
+        *(_page_stmt(n) for n in ("isNativeCharge", "moneyOf", "amountOf", "EST_WHY",
+                                  "estMark")),
+        "function scopeNote(){return '';} function infoTip(){return '';}",
+        "function dayDetail(){return '';}",
+        "const day=d=>({day:d,trades:1,pnl_estimated:false,",
+        "  realized:{base:99.3827,native:100,ccy:'USD'}});",
+        "const days=[day('2026-09-01'),day('2026-09-02')];",
+        "const S={calday:null,state:{stats:{month:'2026-09',days},month_range:['2026-09']}};",
+        *_page_fns("calendar", "chart"),
+        "const pill=calendar().match(/Month P\\/L <b[^>]*>([^<]*)</)[1];",
+        "const tips=[...chart(days).matchAll(/<title>([^<]*)<\\/title>/g)].map(t=>t[1]);",
+        "console.log(JSON.stringify({pill,last:tips.at(-1)}));",
+    ])
+    assert out["pill"] == "$200.00", out
+    assert "total $200.00" in out["last"], out
+
+
 def test_a_drill_down_opens_from_the_keyboard():
     """M31, the handler half (test_rendered checks the tab stops): a calendar day
     and a replay row answered a click and nothing else. They now go through
