@@ -1151,9 +1151,11 @@ def test_a_read_never_returns_an_answer_asked_for_before_it_began(monkeypatch):
     import time
 
     store = {"someone": "OLD-TOKEN-1111"}
+    looked_up = threading.Event()
 
     def slow(service, account):
         value = store[account]                # looked up at once...
+        looked_up.set()
         time.sleep(0.3)                       # ...answered 0.3s later
         return value
 
@@ -1163,7 +1165,9 @@ def test_a_read_never_returns_an_answer_asked_for_before_it_began(monkeypatch):
     earlier = threading.Thread(
         target=lambda: first.setdefault("token", flex.read_token("someone")))
     earlier.start()
-    time.sleep(0.05)
+    # On the event, not a sleep: a Windows runner once took longer than 50ms to
+    # start the thread, so the "earlier" read looked up the NEW token.
+    assert looked_up.wait(5), "premise: the earlier read reached the keyring"
     store["someone"] = "NEW-TOKEN-2222"       # written by another process
     try:
         assert flex.read_token("someone") == "NEW-TOKEN-2222"
@@ -1172,11 +1176,14 @@ def test_a_read_never_returns_an_answer_asked_for_before_it_began(monkeypatch):
     assert first["token"] == "OLD-TOKEN-1111"
 
 
-def _slow(seconds: float, store: dict[str, str]):
-    """A `get_password` that answers every call, `seconds` after it is asked."""
+def _slow(seconds: float, store: dict[str, str], asked: threading.Event | None = None):
+    """A `get_password` that answers every call, `seconds` after it is asked, and
+    sets `asked` when a call arrives."""
     import time
 
     def get_password(service, account):
+        if asked is not None:
+            asked.set()
         time.sleep(seconds)
         return store.get(account)
 
@@ -1188,12 +1195,13 @@ def test_a_read_behind_a_slow_answer_says_the_keychain_is_slow(monkeypatch):
     out of time against a keychain that answers every call. It said "waiting
     for you to unlock it", which nothing was; it says the keychain is slow and
     how long the read before it took."""
-    import time
 
-    monkeypatch.setattr(flex.keyring, "get_password", _slow(0.3, {"someone": "tok"}))
+    asked = threading.Event()
+    monkeypatch.setattr(flex.keyring, "get_password",
+                        _slow(0.3, {"someone": "tok"}, asked))
     first = threading.Thread(target=lambda: flex.read_token("someone", timeout_s=2.0))
     first.start()
-    time.sleep(0.05)
+    assert asked.wait(5), "premise: the first read is in the keyring"
     try:
         with pytest.raises(flex.TokenUnreadable) as caught:
             flex.read_token("someone", timeout_s=0.4)
