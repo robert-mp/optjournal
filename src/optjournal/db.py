@@ -671,6 +671,11 @@ SELECT
   COUNT(*)                                            AS fills,
   MIN(date_time)                                      AS first_fill_at,
   MAX(date_time)                                      AS last_fill_at,
+  -- IBKR's trade dates, which a day's P&L is booked on. Not the date of
+  -- `first_fill_at`: an evening fill is booked on the next session, and an
+  -- order can fill over more than one day.
+  MIN(trade_date)                                     AS trade_date,
+  MAX(trade_date)                                     AS last_trade_date,
   SUM(quantity)                                       AS quantity,
   SUM(ABS(quantity) * trade_price) / SUM(ABS(quantity)) AS avg_price,
   SUM(proceeds)                                       AS proceeds,

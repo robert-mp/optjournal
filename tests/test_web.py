@@ -1080,6 +1080,57 @@ def test_calendar_day_drilldown_is_wired():
     assert "load()" not in handler, "day selection must not spend a request"
 
 
+def test_a_calendar_day_lists_the_legs_booked_on_it(tmp_path):
+    """The cells are keyed by IBKR's trade date and the day detail matched the date
+    of a leg's first fill, so an evening fill (SPCX: traded 11 Jun 20:25, booked
+    12 Jun) and the second day of an order filled over two showed "No leg detail",
+    and the header counted legs as fills. The view's trade dates, through the
+    page's own `dayDetail`.
+    """
+    from conftest import add_statement, connect_migrated  # noqa: PLC0415
+
+    from optjournal.serialize import orders_data  # noqa: PLC0415
+
+    conn = connect_migrated(tmp_path / "journal.db")
+    add_statement(conn)
+    for tid, order, cat, conid, day, at in (
+        ("1", "100", "STK", "S1", "2026-06-12", "2026-06-11 20:25:00"),
+        ("2", "100", "STK", "S1", "2026-06-12", "2026-06-12 09:31:00"),
+        ("3", "200", "STK", "S2", "2026-06-15", "2026-06-15 15:59:00"),
+        ("4", "200", "STK", "S2", "2026-06-16", "2026-06-16 09:30:00"),
+    ):
+        conn.execute(
+            "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
+            " account_id, trade_date, date_time, asset_category, symbol, conid,"
+            " underlying_symbol, open_close, quantity, currency, fx_rate_to_base,"
+            " raw, source_file, first_seen_at) VALUES (?,?,?,?,'U1',?,?,?,?,?,"
+            " NULL,'O',1,'USD',1.0,'{}','t.xml','now')",
+            (tid, tid, tid, order, day, at, cat, conid, conid),
+        )
+    orders = orders_data(conn, asset_category="STK")
+    conn.close()
+    legs = {lg["conid"]: lg for o in orders for lg in o["legs"]}
+    assert (legs["S1"]["trade_date"], legs["S1"]["last_trade_date"]) == (
+        "2026-06-12", "2026-06-12")
+    assert (legs["S2"]["trade_date"], legs["S2"]["last_trade_date"]) == (
+        "2026-06-15", "2026-06-16")
+
+    out = _node_run([
+        f"import {{esc,plural}} from '{_static('format.js')}';",
+        "const shortDay=d=>d; function legRow(l){return `<leg ${l.conid}>`;}",
+        "const S={calday:null,state:{strategies:"
+        + json.dumps([{"label": "x", "orders": orders}]) + "}};",
+        "const days=['2026-06-12','2026-06-15','2026-06-16'];",
+        *_page_fns("dayDetail"),
+        "const by=Object.fromEntries(days.map(d=>[d,{}]));",
+        "console.log(JSON.stringify(days.map(d=>{S.calday=d; return dayDetail(by);})));",
+    ])
+    overnight, first, second = out
+    assert "<leg S1>" in overnight and "2026-06-12 · 2 fills" in overnight, overnight
+    assert "<leg S2>" in first and "<leg S2>" in second, (first, second)
+    assert "<leg S1>" not in first + second
+
+
 def test_a_drill_down_opens_from_the_keyboard():
     """M31, the handler half (test_rendered checks the tab stops): a calendar day
     and a replay row answered a click and nothing else. They now go through

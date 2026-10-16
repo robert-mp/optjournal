@@ -612,6 +612,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} fills
  * @property {string} first_fill_at
  * @property {string} last_fill_at
+ * @property {string} trade_date -- IBKR's, of the first fill; a calendar day's key
+ * @property {string} last_trade_date
  * @property {number} quantity
  * @property {number} avg_price -- always in the contract's own currency
  * Raw leaf columns. Kept because every level above re-aggregates them; read
@@ -2891,23 +2893,23 @@ function calendar(){
 
 function dayDetail(by){
   /* The clicked day's trades, from the leg data already in the payload --
-     no extra request. Legs are matched by their own fill date, the day the
+     no extra request. Legs are matched on IBKR's trade dates, the ones the
      cell's money is booked on, so an opening day shows its fills beside a
-     dash. The panel says which day it describes rather than leaving the
-     reader to infer it from the highlight. */
+     dash, and an evening fill is on the next session's day as its money is.
+     The panel says which day it describes rather than leaving the reader to
+     infer it from the highlight. */
   const key=S.calday;
   if(!key) return `<div class="note">Click a day with fills to see its trades.</div>`;
   if(!by[key]){S.calday=null;return '';} /* heal: selection from another month */
   const groups=S.state.strategies||[];
   const rows=[];
   groups.forEach(g=>(g.orders||[]).forEach(o=>(o.legs||[]).forEach(l=>{
-    if(String(l.first_fill_at||'').slice(0,10)===key)
-      rows.push({g,o,l});
+    if(l.trade_date<=key&&key<=l.last_trade_date) rows.push({g,o,l});
   })));
-  if(!rows.length) return `<div class="note">No leg detail for ${esc(shortDay(key))}:
-    fills exist but their orders are outside the current filter.</div>`;
+  if(!rows.length) return `<div class="note">No trades to list for ${esc(shortDay(key))}.</div>`;
+  const fills=rows.reduce((n,{l})=>n+l.fills,0);
   return `<div class="grp mt-3">
-    <div class="gh"><span class="gl">${esc(shortDay(key))} · ${plural(rows.length,'fill')}</span>
+    <div class="gh"><span class="gl">${esc(shortDay(key))} · ${plural(fills,'fill')}</span>
       <button class="linkish" data-calday-clear="1">clear</button></div>
     ${rows.map(({g,l})=>legRow(l,
       `<span class="dim lbl-sm">${esc(g.label)}</span>`)).join('')}
