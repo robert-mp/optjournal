@@ -480,8 +480,10 @@ def _history(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     after the first sync (`Catchup.ONCE`), or by hand from Settings.
 
     `ok` when anything was fetched, even if a later chunk was refused: the years
-    that landed are real, and the refusal is named in the detail. `failed` only
-    when the first chunk was refused, because then nothing happened.
+    that landed are real, and the refusal is named in the detail. `failed` when
+    the first chunk was refused, because then nothing happened, and whenever the
+    stop clears by itself (IBKR's "try again shortly"), so the years still owed
+    are asked again `ONCE_RETRY_S` later rather than never.
     """
     query_id = prefs.query_id(ctx.query_id)       # per run: see `Context`
     if not query_id:
@@ -496,6 +498,8 @@ def _history(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     except (TokenMissing, TokenRejected) as exc:
         return _credentials(exc)
     fetched, planned = len(result["fetched"]), result["planned"]
+    if result["retryable"]:
+        return Outcome("failed", result["summary"], fetched, planned, transient=True)
     if fetched:
         return Outcome("ok", result["summary"], fetched, planned)
     return Outcome("failed" if result["stopped"] else "nothing",

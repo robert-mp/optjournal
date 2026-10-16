@@ -38,7 +38,7 @@ from py_ibkr import FlexError
 
 from optjournal.archive import account_opened
 from optjournal.clock import MARKET_TZ
-from optjournal.flex import FETCH_LOCK_WAIT_S, fetch
+from optjournal.flex import FETCH_LOCK_WAIT_S, FlexBusy, FlexUnreachable, fetch
 from optjournal.ingest import DEFAULT_ASSET_FILTER, ingest_file
 from optjournal.locks import LockTimeout
 
@@ -381,16 +381,19 @@ def import_history(
     a chunk for a different period can, and the reader confirmed the request
     count before starting. The lock is still taken per fetch.
 
-    STOPS AT THE FIRST REFUSED CHUNK rather than skipping it. Older chunks would
-    meet the same refusal (retention, an account younger than its statement
-    claims) and each would spend a request to learn it. Credentials are not a
-    stop but a raise: no chunk can succeed without them, and the job maps them
+    STOPS AT THE FIRST CHUNK THAT FAILS rather than skipping it. Older chunks
+    would meet the same refusal (retention, an account younger than its statement
+    claims) and each would spend a request to learn it. `retryable` says the stop
+    clears by itself (IBKR busy or unreachable, another fetch holding the lock),
+    so the job tries the rest again later; a refusal is final. Credentials are not
+    a stop but a raise: no chunk can succeed without them, and the job maps them
     to `failed` the way it does for the daily sync.
     """
     started = _now()
     plan = history_plan(conn, archive_dir)
     fetched: list[str] = []
     stopped: str | None = None
+    retryable = False
     for i, (fd, td) in enumerate(plan):
         if i:
             sleep(pause_s)
@@ -398,17 +401,22 @@ def import_history(
         try:
             result = fetch(query_id, archive_dir=archive_dir,
                            from_date=fd, to_date=td, force=True)
+        except (FlexBusy, FlexUnreachable) as exc:
+            stopped, retryable = f"{fd} to {td} not answered: {exc}", True
+            log.warning("history import stopped: %s", stopped)
+            break
         except FlexError as exc:
             stopped = f"{fd} to {td} refused: {exc}"
             log.warning("history import stopped: %s", stopped)
             break
         except LockTimeout as exc:
             # Before any chunk, nothing was asked, so it stays the caller's busy.
-            # After one, a stop like a refusal: the chunks already fetched spent
-            # their requests and are ingested, which "busy, nothing asked" denies.
+            # After one, a stop to retry: the chunks already fetched spent their
+            # requests and are ingested, which "busy, nothing asked" denies.
             if not fetched:
                 raise
             stopped = f"{fd} to {td} not asked: another fetch is running ({exc})"
+            retryable = True
             log.warning("history import stopped: %s", stopped)
             break
         ingest_file(conn, result.raw_path, assets=assets)
@@ -436,6 +444,7 @@ def import_history(
         "planned": len(plan),
         "fetched": fetched,
         "stopped": stopped,
+        "retryable": retryable,
         "new_trades": new_trades,
         "new_cash": new_cash,
         "snapshot": None if snapshot is None else snapshot.name,

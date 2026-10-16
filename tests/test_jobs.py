@@ -536,6 +536,73 @@ def test_the_scheduler_runs_the_history_import_once_and_then_never_again(
     assert mod.reconcile(conn, ctx=ctx, now=sunday + timedelta(days=6)) == []
 
 
+@pytest.mark.parametrize(("stop", "retried"), [
+    ("busy", True), ("unreachable", True), ("lock", True), ("refused", False),
+])
+def test_a_history_import_stopped_by_a_passing_error_is_tried_again_and_a_refusal_is_not(
+    conn, ctx, clock, monkeypatch, stop, retried
+):
+    """The journal's own run 907: the first of four chunks landed, IBKR answered
+    the fourth with 1019 ("try again shortly"), and the run recorded `ok`, so the
+    import was done for good with a year still owed. A stop that clears by itself
+    is a failed run the schedule tries again a day later; a refusal is final once
+    years have landed."""
+    from datetime import UTC, datetime
+    from functools import partial
+
+    from conftest import RAW_DIR, add_statement
+    from py_ibkr import FlexError
+
+    from optjournal import jobs as mod
+    from optjournal import sync
+    from optjournal.archive import newest_statement
+    from optjournal.flex import FlexBusy, FlexUnreachable
+    from optjournal.locks import LockTimeout
+
+    raised = {
+        "busy": FlexBusy("IBKR could not answer just now (error 1019)", "1019"),
+        "unreachable": FlexUnreachable("URL Error: nodename nor servname provided"),
+        "lock": LockTimeout("raw/.fetch.lock held by another fetch"),
+        "refused": FlexError("Flex API Error 1003: Statement is not available."),
+    }[stop]
+
+    class _Fetched:
+        raw_path = newest_statement(RAW_DIR)
+
+    asked: list[str] = []
+
+    def fetch(*_a, from_date, **_k):
+        asked.append(from_date)
+        if len(asked) % 2 == 0:
+            raise raised
+        return _Fetched()
+
+    monkeypatch.setattr(sync, "history_plan", lambda *_a, **_k: [
+        ("20240802", "20250801"), ("20230804", "20240802")])
+    monkeypatch.setattr(sync, "fetch", fetch)
+    monkeypatch.setattr(sync, "_snapshot", lambda _conn: None)
+    monkeypatch.setattr(mod, "import_history",
+                        partial(sync.import_history, sleep=lambda _s: None))
+    monkeypatch.setattr(mod, "JOBS", (mod.job_by_name("history"),))
+    add_statement(conn, source_file="activity-20261002.xml")
+    conn.commit()
+
+    sunday = datetime(2026, 10, 4, 15, 0, tzinfo=UTC)
+    clock["t"] = sunday
+    assert mod.reconcile(conn, ctx=ctx, now=sunday) == ["history"]
+    run = conn.execute("SELECT status, done, total FROM job_runs").fetchone()
+    assert (run["done"], run["total"]) == (1, 2), "the year that landed is counted"
+    assert run["status"] == ("failed" if retried else "ok")
+
+    later = sunday + timedelta(seconds=mod.ONCE_RETRY_S - 60)
+    assert mod.reconcile(conn, ctx=ctx, now=later) == [], "retried inside a day"
+    next_day = sunday + timedelta(seconds=mod.ONCE_RETRY_S + 60)
+    assert mod.reconcile(conn, ctx=ctx, now=next_day) == (
+        ["history"] if retried else []), (
+        "a year IBKR only asked us to wait for was never asked again" if retried
+        else "a refusal was asked again")
+
+
 def test_a_catchup_window_is_bounded_and_only_ever_offers_the_latest_instant():
     """A week, so a laptop shut for days collects on its first tick, and never a
     backlog: only the most recent instant is ever offered.
@@ -1279,7 +1346,8 @@ def test_a_query_id_saved_while_serving_reaches_the_next_run(
         handed.append(query_id)
         if job == "sync":
             return {"changed": False, "summary": "stub", "new_trades": 0}
-        return {"fetched": [], "planned": 0, "stopped": None, "summary": "stub"}
+        return {"fetched": [], "planned": 0, "stopped": None, "retryable": False,
+                "summary": "stub"}
 
     monkeypatch.setattr(jobs, "sync_journal", shared_path)
     monkeypatch.setattr(jobs, "import_history", shared_path)
@@ -2808,15 +2876,18 @@ def test_the_history_import_is_never_due():
     ({"fetched": ["a"], "planned": 3, "stopped": "refused"}, "ok"),
     ({"fetched": [], "planned": 3, "stopped": "refused"}, "failed"),
     ({"fetched": [], "planned": 0, "stopped": None}, "nothing"),
+    # But a stop that clears by itself leaves the rest to ask again.
+    ({"fetched": ["a"], "planned": 3, "stopped": "busy", "retryable": True}, "failed"),
 ])
 def test_the_history_outcome_names_what_happened(reply, status, monkeypatch, tmp_path):
     from optjournal import jobs
 
     monkeypatch.setattr(jobs, "import_history",
-                        lambda **_k: {**reply, "summary": "s"})
+                        lambda **_k: {"retryable": False, **reply, "summary": "s"})
     ctx = jobs.Context(archive_dir=tmp_path, db_path=tmp_path / "j.db", query_id="1")
     outcome = jobs._history(None, ctx)
     assert outcome.status == status
+    assert outcome.transient is bool(reply.get("retryable"))
     assert (outcome.done, outcome.total) == (len(reply["fetched"]), reply["planned"])
 
 
