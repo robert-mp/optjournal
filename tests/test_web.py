@@ -6632,6 +6632,41 @@ def test_a_refusal_ends_the_saved_that_was_being_held():
         "the claim it was making")
 
 
+#: How the stand-in `/api/quotes` answers: never, or with a refused connection.
+#: A failure stops after 50 asks, so a page that loops ends with a count to read.
+_QUOTE_REPLIES = {
+    "pending": "return new Promise(()=>{});",
+    "failing": "if(asks>50) return new Promise(()=>{});"
+               " throw new TypeError('Failed to fetch');",
+}
+
+
+@pytest.mark.parametrize("reply", sorted(_QUOTE_REPLIES))
+def test_opening_the_watchlist_asks_for_quotes_once(reply):
+    """Each ask costs the server three requests per symbol, and the latch was the
+    REPLY's stamp: one open plus three redraws sent four asks while the first was
+    out, and a failing ask redrew, found no stamp and asked again with no pause,
+    146 times in 200ms. The page's own `quotesDue` and `loadQuotes`, with `draw`
+    standing in as the trigger line the real one runs, and Refresh pressed during
+    the ask.
+    """
+    assert "if(quotesDue()) loadQuotes(false);" in _fn("draw")
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const S={tab:'watchlist',state:{watchlist:[{symbol:'SPY'}]},wqat:0,",
+        "  quoting:false};",
+        "let asks=0; const $=()=>null; function note(){} async function load(){}",
+        f"async function fetch(){{asks++; {_QUOTE_REPLIES[reply]}}}",
+        *_page_fns("quotesDue", "loadQuotes"),
+        "function draw(){if(quotesDue()) loadQuotes(false);}",
+        "for(let i=0;i<4;i++) draw();",
+        "loadQuotes(true);",
+        "await new Promise(r=>setTimeout(r,50));",
+        "console.log(JSON.stringify({asks}));",
+    ])
+    assert out["asks"] == 1, out
+
+
 def test_a_refused_stop_watching_hands_its_button_back():
     """The same failure one button over: "stop watching" disabled itself and a
     refusal (any `!ok` reply, `busy` or `database` included) draws nothing, so

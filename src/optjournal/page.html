@@ -1673,8 +1673,9 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
   /* Live quotes, keyed by symbol, and the server clock when they were asked for.
      NOT part of `state`: they come from their own endpoint because each one costs
      an HTTP request, so they must not ride along on every payload reload. Null
-     until the Watchlist tab asks. */
-  quotes:null,quotesAt:null,wqat:0,
+     until the Watchlist tab asks. `wqat` is when the last ask STARTED and
+     `quoting` is true while one is out; see quotesDue. */
+  quotes:null,quotesAt:null,wqat:0,quoting:false,
   /* IV ranks, from the SAME reply as the quotes, and the whole reply rather than
      just its ranks: `{ranks, unranked, ranks_failed}`. The two lists are kept
      because they are what lets a dash say WHICH absence it is -- not fetched, not
@@ -5921,12 +5922,18 @@ function zdue(){
      &&Date.now()-S.zat>=60000) zrefresh();
 }
 setInterval(zdue,15000);
-/* The watchlist's quotes go stale the same way: a tab left open read "quotes 5h
-   ago". Refetched every five minutes while the tab is open and visible, which is
-   two requests per symbol, so no faster. */
+/* Quotes for an open Watchlist: on its first view, so the tab is useful without
+   a click, and every five minutes while it stays open and visible, since a tab
+   left open read "quotes 5h ago". Each ask costs the server three requests per
+   symbol, so no faster, and the five minutes run from when an ask STARTS: the
+   redraws an ask causes, and one that failed, ask nothing more. Refresh is the
+   way to ask sooner. */
+function quotesDue(){
+  return S.tab==='watchlist'&&S.state&&(S.state.watchlist||[]).length
+    &&Date.now()-S.wqat>=5*60000;
+}
 setInterval(()=>{
-  if(S.tab==='watchlist'&&S.state&&document.visibilityState==='visible'
-     &&(S.state.watchlist||[]).length&&Date.now()-(S.wqat||0)>=5*60000) loadQuotes(false);
+  if(document.visibilityState==='visible'&&quotesDue()) loadQuotes(false);
 },30000);
 document.addEventListener('visibilitychange',zdue);
 
@@ -6919,11 +6926,7 @@ function draw(push){
   companionPost();
   bindJobRuns();
   bindAppBanners();
-  /* First view of the Watchlist fetches quotes once, so the tab is useful without
-     a click -- and NOT on any later redraw, because each quote is an HTTP request
-     and a redraw happens on every toggle, filter and edit. `quotesAt` is the
-     latch; Refresh is the way to ask again. */
-  if(S.tab==='watchlist'&&!S.quotesAt&&(S.state.watchlist||[]).length) loadQuotes(false);
+  if(quotesDue()) loadQuotes(false);
   const st=S.state, cn=st.collection||{};
   /* innerHTML rather than textContent because dev mode adds a marked pill, so
      the dynamic pieces are escaped. A visible, always-on marker on purpose: a
@@ -7438,11 +7441,15 @@ async function watchWrite(body,said){
  * `announce` is false for the implicit refresh after an edit: a toast saying
  * "prices updated" when you only removed a symbol is noise. */
 async function loadQuotes(announce){
+  /* One ask at a time: Refresh, the timer and a new watch can each start one,
+     and a redraw hands Refresh back while an ask is still out. */
+  if(S.quoting) return;
+  S.quoting=true; S.wqat=Date.now();
   const b=$('#wquote'); if(b){b.disabled=true;b.classList.add('busy');}
   try{
     const r=await fetch('/api/quotes');
     const qres=await r.json();
-    S.quotes=qres.quotes||{}; S.quotesAt=qres.asked_at||null; S.wqat=Date.now();
+    S.quotes=qres.quotes||{}; S.quotesAt=qres.asked_at||null;
     /* Set even when `ranks` is empty, because the OBJECT is the signal: null means
        never asked and `{}` means asked-and-nothing-came-back, and only the second
        one lets the IV rank chips enable themselves honestly. */
@@ -7456,6 +7463,7 @@ async function loadQuotes(announce){
         +' — the request failed, not the symbol.','warn');
     else if(announce) note('Prices updated.','ok');
   }catch(e){note('Quote fetch failed: '+esc(e),'bad');}
+  finally{S.quoting=false;}
   draw();
 }
 
