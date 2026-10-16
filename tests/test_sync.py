@@ -624,6 +624,7 @@ def test_import_history_counts_only_what_its_own_statements_brought(
     """A confirm poll that lands a fill while a chunk is being fetched is the
     confirm job's, not the import's: no "1 new trade" and no snapshot for it."""
     from test_confirms import CONFIRM_XML
+
     from optjournal import ingest  # noqa: PLC0415 - local to this test
     from optjournal.db import connect  # noqa: PLC0415 - local to this test
 
