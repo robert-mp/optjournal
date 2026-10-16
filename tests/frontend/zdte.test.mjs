@@ -192,6 +192,26 @@ test("the input mask keeps digits and one decimal point", () => {
   assert.equal(sanitizeLevel(null), "");
 });
 
+test("a decimal comma is a decimal point, and a thousands separator is dropped", () => {
+  /* The mask runs on every keystroke and rewrites the field, so each reading is
+     checked pasted whole and typed one character at a time. */
+  const typed = (text) => [...text].reduce((field, ch) => sanitizeLevel(field + ch), "");
+  for (const [text, level] of [
+    ["18,5", "18.5"],
+    ["7706,03", "7706.03"],
+    ["7.706,03", "7706.03"],
+    ["7,706.03", "7706.03"],
+    ["1.234.567,89", "1234567.89"],
+    ["1,234,567.89", "1234567.89"],
+    ["7706.03.", "7706.03"],
+  ]) {
+    assert.equal(sanitizeLevel(text), level, `pasted ${text}`);
+    assert.equal(typed(text), level, `typed ${text}`);
+  }
+  /* The finding's own reading: a VIX of 18,5 is a 1.16% move, not 11.56%. */
+  assert.equal(expectedMove(SPX, sanitizeLevel("18,5")).pct.toFixed(2), "1.16");
+});
+
 test("a level resolves to the listed strike nearest it", () => {
   assert.equal(strikeNear(7781.5009), 7780);
   assert.equal(strikeNear(7783.09), 7785);

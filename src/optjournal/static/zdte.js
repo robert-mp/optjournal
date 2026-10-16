@@ -357,9 +357,18 @@ export function parseNumber(text) {
  * Applied on every keystroke rather than validated on blur, because the ladder is
  * recomputed as you type -- a stray letter has to be refused at the moment it
  * would otherwise blank the table, not once the field is left.
+ *
+ * A comma is a decimal point too: the page prints levels in the reader's locale
+ * ("7706,03", "7.706,03") and a phone's decimal keypad offers one. A separator
+ * with exactly three digits before the next separator groups thousands and is
+ * dropped, so "7,706.03" and "7.706,03" read alike, typed or pasted. The first
+ * separator left is the point; any after it are dropped.
  */
 export function sanitizeLevel(text) {
-  const cleaned = String(text ?? "").replace(/[^\d.]/g, "");
+  const cleaned = String(text ?? "")
+    .replace(/[^\d.,]/g, "")
+    .replace(/[.,](?=\d{3}[.,])/g, "")
+    .replace(/,/g, ".");
   const dot = cleaned.indexOf(".");
   return dot === -1
     ? cleaned
