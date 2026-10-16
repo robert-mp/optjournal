@@ -3189,6 +3189,45 @@ def test_waiting_out_the_fetch_lock_is_busy_for_the_confirm_poll_too(
     ).fetchone()[0] == jobs.FAILURE_BACKOFF, "the runner's busy run lifted the backoff"
 
 
+def test_a_confirm_poll_converts_at_one_live_rate_per_currency(
+    conn, ctx, monkeypatch, tmp_path
+):
+    """The job's own path, with no rate injected: a confirm carries no FX rate,
+    so `ingest._live_rate_for` fetches one per currency, every base figure is
+    converted at it, and the row is marked estimated."""
+    from conftest import add_statement
+    from test_confirms import CONFIRM_XML
+
+    from optjournal import jobs, marketdata
+    from optjournal.flex import ConfirmFetch
+    from optjournal.marketdata import Quote
+
+    confirm = tmp_path / "confirm-20260924.xml"
+    confirm.write_text(CONFIRM_XML, encoding="utf-8")
+    quoted: list[str] = []
+
+    def fetch_quote(symbol, **_k):
+        quoted.append(symbol)
+        return Quote(symbol=symbol, price=0.8795, at=1790244000,
+                     previous_close=None, currency="EUR")
+
+    monkeypatch.setattr(jobs.prefs, "confirm_query_id", lambda *a, **k: "1621016")
+    monkeypatch.setattr(jobs, "fetch_confirms", lambda *_a, **_k: ConfirmFetch(
+        raw_path=confirm, raw_bytes=confirm.stat().st_size))
+    monkeypatch.setattr(marketdata, "fetch_quote", fetch_quote)
+    add_statement(conn)                                       # an EUR account
+    conn.commit()
+
+    jobs.run_job(conn, "confirm", ctx=ctx)
+    run = conn.execute("SELECT status, done, total FROM job_runs").fetchone()
+    assert (run["status"], run["done"], run["total"]) == ("ok", 1, 1)
+    assert quoted == ["USDEUR=X"], "not one live rate per currency"
+    fill = conn.execute(
+        "SELECT fx_rate_to_base, proceeds_base, ib_commission_base,"
+        " fx_rate_estimated FROM trades WHERE trade_id = '1592002840'").fetchone()
+    assert tuple(fill) == pytest.approx((0.8795, 980 * 0.8795, -1.393368 * 0.8795, 1))
+
+
 @pytest.mark.parametrize("error", ["busy", "unreachable"])
 def test_a_confirm_poll_ibkr_could_not_answer_is_a_passing_failure_not_a_crash(
     conn, ctx, monkeypatch, error
