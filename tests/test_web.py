@@ -10519,6 +10519,38 @@ def test_a_banner_button_is_handed_back_after_any_failure(button, label, failure
         assert out["notes"] == ["bad"], "the failure was not reported"
 
 
+@pytest.mark.parametrize(("replies", "reload_on"), [
+    # A job running: the old server answers for seconds after it agreed.
+    (["0.5.1"] * 5 + [None] * 3 + ["0.5.2"], 8),
+    # A restart quicker than one poll: no failure is ever seen.
+    (["0.5.1", "0.5.1", "0.5.2"], 3),
+    # Restart now and Use this journal keep the version.
+    (["0.5.1", None, "0.5.1"], 2),
+    # The old server never went: taken as done after twenty seconds.
+    (["0.5.1"] * 30, 21),
+])
+def test_after_a_restart_the_page_reloads_onto_the_new_server(replies, reload_on):
+    """The page reloaded on the first reply after three seconds, and while a job
+    ran the old server was still answering, so it reloaded onto the old process
+    and then went dead under the reader. The page's own `awaitRestart` against a
+    stand-in server: each poll gets the next reply, a version or a refused
+    connection (None), and the reload must land on the poll named here.
+    """
+    out = _node_run([
+        f"const replies={json.dumps(replies)}; let polls=0, reloaded=null;",
+        "const setTimeout=f=>f();",
+        "const location={reload(){reloaded=polls-1;}};",
+        "function note(){}",
+        "async function fetch(){const v=replies[Math.min(polls++,replies.length-1)];",
+        "  if(v===null) throw new TypeError('Failed to fetch');",
+        "  return {ok:true,json:async()=>({current:v})};}",
+        *_page_fns("awaitRestart"),
+        "await awaitRestart();",
+        "console.log(JSON.stringify({reloaded,polls}));",
+    ])
+    assert out["reloaded"] == reload_on, out
+
+
 @pytest.mark.parametrize("first", ["state", "update"])
 def test_a_journal_the_server_cannot_read_still_offers_the_update(first):
     """A release whose migration fails on one friend's journal answers every

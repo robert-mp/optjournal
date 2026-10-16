@@ -6197,17 +6197,30 @@ async function keepPlace(redraw){
     window.scrollBy(0,now.getBoundingClientRect().top-top);
 }
 
-/* After a restart is asked for, wait for the server to come back, then reload
-   onto the new code. The first start after an update installs dependencies,
-   so the wait is generous. */
+/* After a restart is asked for, wait for the old server to go, then for the new
+   one to answer, then reload onto it. The old one keeps answering until a running
+   job lets its scheduler stop, up to about ten seconds, and a reload in that
+   window landed on a process about to exit. Gone is a poll that fails, or one
+   that names another version (a restart quicker than a poll); after twenty
+   seconds of neither, the restart is taken as done. The first start after an
+   update installs dependencies, so the wait for it to answer is generous. */
 async function awaitRestart(){
-  await new Promise(r=>setTimeout(r,3000));
-  for(let i=0;i<180;i++){
+  const pause=()=>new Promise(r=>setTimeout(r,1000));
+  const ask=async()=>{
     try{
       const r=await fetch('/api/update',{cache:'no-store'});
-      if(r.ok){location.reload(); return;}
-    }catch(e){/* still restarting */}
-    await new Promise(r=>setTimeout(r,1000));
+      return r.ok?await r.json():null;
+    }catch(e){return null;}
+  };
+  const was=await ask();
+  for(let i=0;was&&i<20;i++){
+    await pause();
+    const upd=await ask();
+    if(!upd||upd.current!==was.current) break;
+  }
+  for(let i=0;i<180;i++){
+    if(await ask()){location.reload(); return;}
+    await pause();
   }
   note('optjournal has not come back. Close its window and open the Start file '
     +'again.','bad');
