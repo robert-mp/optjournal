@@ -188,19 +188,22 @@ def occ_symbol(symbol: str) -> str:
 #: whose 0DTE planner is built on it.
 #:
 #: EVERY ENTRY WAS PROBED against the live endpoint rather than inferred from the
-#: ticker's shape: `^GSPC`, `^VIX`, `^NDX`, `^RUT`, `^XSP` and `^DJI` all return
-#: daily bars, `SPX` and `SPX.INDX` do not. `^SPX` also resolves and is
+#: ticker's shape: `^GSPC`, `^VIX`, `^NDX`, `^RUT` and `^XSP` all return daily
+#: bars, `SPX` and `SPX.INDX` do not. `^SPX` also resolves and is
 #: byte-identical to `^GSPC` over 32 sessions -- open, high, low, close and
 #: volume -- so the choice between them is consistency, not correctness, and
 #: `^GSPC` is the spelling `bars.CONTEXT_SYMBOLS` already stores.
 #:
 #: `XSP` is a mapping, not an alias: the mini-SPX is a different instrument at a
 #: tenth of the index (measured: 770.60 against 7706.03 the same session), and it
-#: gets its own series.
+#: gets its own series. `DJX` has no entry for the same reason: it is the Dow at a
+#: hundredth, and `^DJI` charted 46,000 beside a 460 strike. `^DJX` exists but
+#: held only the day's bar (measured 2026-10-16), and the bare root answers an
+#: empty series, which is true.
 #:
 #: Matched on the WHOLE symbol, so an option on one of these roots is untouched:
 #: `SPX   261120C07000000` is not `SPX`. A stock ticker colliding with an index
-#: root would be mistranslated here, which is why this is an explicit list of six
+#: root would be mistranslated here, which is why this is an explicit list of five
 #: rather than a rule about leading carets.
 INDEX_SYMBOLS = {
     "SPX": "^GSPC",
@@ -208,7 +211,6 @@ INDEX_SYMBOLS = {
     "NDX": "^NDX",
     "RUT": "^RUT",
     "XSP": "^XSP",
-    "DJX": "^DJI",
 }
 
 

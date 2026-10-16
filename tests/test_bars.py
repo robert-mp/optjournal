@@ -1338,6 +1338,10 @@ def test_an_index_root_is_translated_to_the_sources_spelling():
     assert source_symbol("SPX") == "^GSPC"
     assert source_symbol("XSP") == "^XSP", "the mini-SPX is its own instrument"
     assert source_symbol("VIX") == "^VIX"
+    assert source_symbol("DJX") == "DJX", (
+        "^DJI is the Dow itself, a hundred times DJX: it charted 46,000 beside a "
+        "460 strike"
+    )
     # An option on an index root keeps its OCC spelling: the padding goes, the
     # translation does not apply, because `SPX   261120C07000000` is not `SPX`.
     assert source_symbol("SPX   261120C07000000") == "SPX261120C07000000"
