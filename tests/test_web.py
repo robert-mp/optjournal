@@ -3772,7 +3772,7 @@ def _load_harness(real_note: bool = False) -> list[str]:
         "    months:['2026-09'],selected_month:m==='current'?'2026-09':m,trade_type:'all',",
         "    stats:{}})};",
         "}",
-        *banner, "function staleServerCheck(){} function draw(){} function bareBanners(){}",
+        *banner, "function staleServerCheck(){} function draw(){}",
         "function esc(s){return String(s);}",
         *consts,
         *_page_fns("stateQuery", "pinDayMonth", "load"),
@@ -10723,6 +10723,8 @@ def test_a_journal_the_server_cannot_read_still_offers_the_update(first):
     update that would fix it was never drawn, because `checkUpdate` waited for a
     payload and the failed load drew nothing. Both replies land here through the
     page's own `load` and `checkUpdate`, in either order, and the button posts.
+    The gear and the edition chip redraw, and a redraw over no payload erased the
+    banner for "This tab could not be rendered" (seen in Chromium): it keeps it.
     """
     out = _node_run([
         f"import {{esc}} from '{_static('format.js')}';",
@@ -10734,18 +10736,18 @@ def test_a_journal_the_server_cannot_read_still_offers_the_update(first):
         "    ?(upd=upd||{id:'updgo',textContent:'Update to 0.5.2',disabled:false,",
         "      classList:{add(){},remove(){}}}):null;",
         "function note(text){msg.innerHTML=text;}",
-        "function draw(){throw new Error('drew a page with no payload');}",
-        "async function awaitRestart(){}",
+        "async function awaitRestart(){} async function keepPlace(f){await f();}",
         "async function fetch(path,opts){",
         "  if(opts&&opts.method==='POST'){posted.push(path);",
         "    return {json:async()=>({ok:false,message:'refused'})};}",
         "  if(path.startsWith('/api/state')) return {ok:false,status:500};",
         "  return {ok:true,json:async()=>({current:'0.5.1',latest:'0.5.2',",
         "    available:true,cannot_apply:null})};}",
-        *_page_fns("stateQuery", "load", "checkUpdate", "bareBanners", "appBanners",
-                   "bindAppBanners", "bannerPost"),
+        *_page_fns("stateQuery", "load", "checkUpdate", "draw", "bareBanners",
+                   "appBanners", "bindAppBanners", "bannerPost"),
         "await (" + ("load" if first == "state" else "checkUpdate") + ")();",
         "await (" + ("checkUpdate" if first == "state" else "load") + ")();",
+        "S.showCog=true; draw();",
         "const shown=body.innerHTML.includes('Update to 0.5.2');",
         "await $('#updgo')?.onclick?.();",
         "console.log(JSON.stringify({shown,posted,msg:msg.innerHTML}));",

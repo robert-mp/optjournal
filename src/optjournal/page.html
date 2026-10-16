@@ -6194,13 +6194,12 @@ async function checkUpdate(){
     const r=await fetch('/api/update');
     S.update=await r.json();
   }catch(e){S.update=null;}
-  if(!S.state){bareBanners(); return;}
   await keepPlace(draw);
 }
 
-/* The banners with no payload in hand: the first read is still in flight, or it
-   failed. A release whose migration fails on this journal answers every read with
-   a 500, and the update that fixes it must still be offered, which it can be:
+/* What draw() draws with no payload in hand: the first read is still in flight,
+   or it failed. A release whose migration fails on this journal answers every read
+   with a 500, and the update that fixes it must still be offered, which it can be:
    POST /api/update never opens the journal. Only the update banner can show here,
    since the other two read the payload. */
 function bareBanners(){
@@ -6611,6 +6610,7 @@ function syncHash(push){
 
 /* ------------------------------------------------ shell */
 function draw(push){
+  if(!S.state) return bareBanners();
   /* A currency the account has no quote for falls back to base on display
      (DISP does that); clearing it makes the hash heal to match. Healed here
      rather than in load() because a hash edit is a same-document navigation
@@ -7614,8 +7614,8 @@ async function load(){
     READ_NOTE=$('#msg').innerHTML;
     /* Over figures that did not move, with the controls that produced them: the
        banner says the read failed, and nothing else claims otherwise. */
-    if(S.state){Object.assign(S,LOADED);draw();}
-    else bareBanners();
+    if(S.state) Object.assign(S,LOADED);
+    draw();
     return;
   }
   /* Before the payload guard, whose own banner this must not take down. */
