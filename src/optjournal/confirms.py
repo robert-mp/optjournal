@@ -40,7 +40,7 @@ from typing import Any
 
 from py_ibkr.flex.utils import parse_date, parse_datetime
 
-from optjournal.fills import NormalisedFill, StatementMeta
+from optjournal.fills import NormalisedFill, StatementMeta, exact_quantity
 
 __all__ = [
     "CONFIRM_QUERY_TYPE",
@@ -126,15 +126,6 @@ def _number(attrs: dict[str, str], name: str) -> float | None:
         return float(raw)
     except ValueError:
         return None
-
-
-def _quantity(attrs: dict[str, str], name: str) -> int | float | None:
-    """Integers exact, fractions lossless -- `db.py`'s quantity note applies."""
-    value = _number(attrs, name)
-    if value is None:
-        return None
-    nearest = int(round(value))
-    return nearest if abs(value - nearest) < 1e-9 else value
 
 
 def split_codes(code: str | None) -> tuple[str | None, str | None]:
@@ -253,7 +244,7 @@ def _fill(attrs: dict[str, str], account_id: str, rate_for: Any) -> NormalisedFi
         open_close=open_close,
         notes=notes,
         level_of_detail=_text(attrs, "levelOfDetail"),
-        quantity=_quantity(attrs, "quantity"),
+        quantity=exact_quantity(_number(attrs, "quantity")),
         trade_price=_number(attrs, "price"),
         currency=currency,
         fx_rate_to_base=rate_for(currency),

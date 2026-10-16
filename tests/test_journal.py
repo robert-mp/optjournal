@@ -77,7 +77,7 @@ def test_clearing_a_field_is_distinguishable_from_not_touching_it(db):
 
 
 def test_whitespace_only_text_is_stored_as_absent(db):
-    """One rule for absence, so `is_empty` cannot depend on which surface wrote.
+    """One rule for absence, so an empty entry cannot depend on which surface wrote.
 
     A textarea a reader tabbed through posts a newline, and a row holding "\\n"
     would count as journalled while saying nothing.

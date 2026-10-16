@@ -1362,7 +1362,6 @@ def cmd_confirms(args) -> int:
         "query_id": query_id,
         "archive": result.raw_path.name,
         "raw_bytes": result.raw_bytes,
-        "reused_archive": result.is_duplicate,
         "new_trades": ingested.trades_inserted,
         "updated_trades": ingested.trades_superseded,
         "already_known": ingested.trades_skipped_existing,
