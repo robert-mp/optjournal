@@ -20,7 +20,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from conftest import LIVE_RAW_DIR, ROOT, add_statement, connect_migrated
+from conftest import LIVE_RAW_DIR, add_statement, connect_migrated
 
 from optjournal.demo import (
     FROM_DATE,
@@ -137,9 +137,12 @@ def test_refuses_to_touch_real_data_wherever_it_sits(tmp_path):
     with pytest.raises(ValueError, match="real statement"):
         assert_not_real(elsewhere)
 
-    # A copy of the real DATABASE, likewise.
+    # A database holding that statement, likewise. Ingested from the copy rather
+    # than copied from the live journal, which no test may read.
     db_copy = tmp_path / "restored.db"
-    shutil.copy(ROOT / "journal.db", db_copy)
+    conn = connect_migrated(db_copy)
+    ingest_file(conn, elsewhere / real_statements[0].name)
+    conn.close()
     with pytest.raises(ValueError, match="real account"):
         assert_not_real(tmp_path / "fresh", db_copy)
 
