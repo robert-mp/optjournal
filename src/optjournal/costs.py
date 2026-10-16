@@ -207,9 +207,6 @@ class CostScope:
             return "", ()
         return " AND ".join(parts), tuple(params)
 
-    def covers(self, category: str | None) -> bool:
-        return not self.categories or str(category or "").upper() in self.categories
-
 
 # --- stated costs ------------------------------------------------------------
 

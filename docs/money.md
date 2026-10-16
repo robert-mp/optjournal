@@ -76,7 +76,7 @@ broker_costs.totals.attributable      (scope: options only)
 One case the ledger deliberately cannot express: the AutoFX rate markup has a
 base and **no** billing currency, because IBKR never itemised it in one. An
 empty ledger with a non-zero base is therefore an *estimate*, distinct from
-`is_free` (nothing charged at all), and `costs.Friction` keeps the two apart as
+nothing charged at all (a zero base), and `costs.Friction` keeps the two apart as
 a type rather than as a caption.
 
 ## Six constructors, six provenances

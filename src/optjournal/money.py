@@ -194,11 +194,6 @@ class Money:
             for row in rows
         )
 
-    @property
-    def is_exact(self) -> bool:
-        """Whether an as-charged figure is available."""
-        return self.native is not None
-
     def __abs__(self) -> Money:
         """Magnitude, carrying the currency with it.
 
@@ -268,7 +263,8 @@ class Charge:
     #: cost of nothing is a fact.
     base: float = 0.0
     #: Amount billed per currency, non-zero entries only. Empty when nothing was
-    #: charged, which is different from an unknown charge -- see `is_free`.
+    #: charged, and also for an ESTIMATED cost, which has a base and no billing
+    #: currency: the AutoFX markup, which IBKR never itemised in one.
     by_ccy: Mapping[str, float] = field(default_factory=dict)
 
     @classmethod
@@ -297,16 +293,6 @@ class Charge:
         reimplemented, so the two can never disagree.
         """
         return Money.gated(self.base, dict(self.by_ccy))
-
-    @property
-    def is_free(self) -> bool:
-        """Whether nothing was charged at all.
-
-        Distinct from an empty ledger with a non-zero base, which is how an
-        *estimated* cost arrives: the AutoFX markup has a base and no billing
-        currency, because IBKR never itemised it in one. See `Money.restated`.
-        """
-        return not self.base and not self.by_ccy
 
     def __add__(self, other: Charge) -> Charge:
         """Sum two charges, merging their ledgers.

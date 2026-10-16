@@ -255,10 +255,9 @@ def test_a_mixed_scope_keeps_every_charge_and_withholds_only_the_single_figure(c
     r = build_costs(conn, scope=CostScope.of(["OPT", "STK"]))
     assert r.attributable.by_ccy == {"USD": pytest.approx(2.00),
                                      "SEK": pytest.approx(10.00)}
-    assert not r.attributable.money.is_exact
+    assert r.attributable.money.native is None
     # And a single-currency scope still answers exactly.
     opt = build_costs(conn, scope=CostScope.of(["OPT"]))
-    assert opt.attributable.money.is_exact
     assert opt.attributable.money.native == pytest.approx(2.00)
 
 

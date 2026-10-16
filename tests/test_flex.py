@@ -13,7 +13,7 @@ from py_ibkr import Trade
 
 from optjournal import flex
 from optjournal.flex import load
-from optjournal.sections import MODELLED_SECTIONS, raw_sections, section_tags
+from optjournal.sections import MODELLED_SECTIONS, raw_sections, statement_blocks
 
 # `requestID` is an artefact of the Flex request itself, not trade data, and
 # py_ibkr deliberately omits it. Anything else appearing here is real drift.
@@ -128,7 +128,8 @@ def test_field_drift(statement: Path):
 def test_section_drift(statement: Path):
     """Fail if the statement gains a section we neither model nor shim."""
     known = MODELLED_SECTIONS | KNOWN_UNMODELLED_SECTIONS
-    unexpected = [t for t in section_tags(statement) if t not in known]
+    tags = {child.tag for stmt in statement_blocks(statement) for child in stmt}
+    unexpected = sorted(tags - known)
     assert not unexpected, f"unhandled statement sections: {unexpected}"
 
 

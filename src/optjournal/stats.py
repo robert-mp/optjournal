@@ -89,18 +89,6 @@ def _in_period(value: str | None, period: str | None) -> bool:
     return day is not None and day.startswith(period)
 
 
-def _month_of(value: str | None) -> str | None:
-    """YYYY-MM from a stored date, tolerating both ISO and IBKR compact forms."""
-    if not value:
-        return None
-    text = str(value).strip().replace("/", "-")
-    if len(text) >= 7 and text[4] == "-":
-        return text[:7]
-    if len(text) >= 6 and text[:6].isdigit():
-        return f"{text[:4]}-{text[4:6]}"
-    return None
-
-
 def _day_of(value: str | None) -> str | None:
     if not value:
         return None
@@ -604,14 +592,9 @@ def available_months(
     rows = conn.execute(
         f"SELECT DISTINCT trade_date, trade_id FROM trades {where}", params
     ).fetchall()
-    months = {
-        m
-        for m in (
-            _month_of(r["trade_date"]) for r in rows if scope.has_trade(r["trade_id"])
-        )
-        if m
-    }
-    return sorted(months, reverse=True)
+    months = {(_day_of(r["trade_date"]) or "")[:7]
+              for r in rows if scope.has_trade(r["trade_id"])}
+    return sorted(months - {""}, reverse=True)
 
 
 def available_years(

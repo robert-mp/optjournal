@@ -20,7 +20,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-__all__ = ["MODELLED_SECTIONS", "raw_sections", "section_tags", "stated_base_currency",
+__all__ = ["MODELLED_SECTIONS", "raw_sections", "stated_base_currency",
            "statement_blocks"]
 
 #: Statement child elements py_ibkr turns into typed models.
@@ -53,14 +53,6 @@ def stated_base_currency(statements: list[ET.Element]) -> str | None:
                     if code:
                         return code
     return None
-
-
-def section_tags(path: Path) -> list[str]:
-    """Every section tag present in the file's statements, in document order."""
-    tags: list[str] = []
-    for stmt in statement_blocks(path):
-        tags += [child.tag for child in stmt if child.tag not in tags]
-    return tags
 
 
 def raw_sections(path: Path) -> dict[str, list[dict[str, str]]]:

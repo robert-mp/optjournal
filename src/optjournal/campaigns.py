@@ -225,20 +225,6 @@ class Campaign:
     leg_parts: Mapping[tuple[str, str], Mapping[str, Any]] = field(
         default_factory=dict, hash=False)
 
-    @property
-    def brokers(self) -> frozenset[str]:
-        """The brokers whose fills it holds; one, in all but a hand-made case."""
-        return frozenset(broker for broker, _oid in self.orders)
-
-    @property
-    def is_win(self) -> bool:
-        """Decided and up. Judged on `base`, the only figure always present."""
-        return self.realized is not None and self.realized.base > 0
-
-    @property
-    def is_loss(self) -> bool:
-        return self.realized is not None and self.realized.base < 0
-
 
 def cluster_orders(
     items: Iterable[tuple[str, Any, Any]],

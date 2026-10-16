@@ -55,10 +55,10 @@ def test_gated_withholds_rather_than_reporting_part_of_a_total():
     approximation of all of it, because only the second is labelled.
     """
     exact = Money.gated(-6.07, {"USD": -6.97})
-    assert (exact.native, exact.currency, exact.is_exact) == (-6.97, "USD", True)
+    assert (exact.native, exact.currency) == (-6.97, "USD")
 
     mixed = Money.gated(-6.07, {"USD": -4.46, "SEK": -208.41})
-    assert (mixed.native, mixed.currency, mixed.is_exact) == (None, None, False)
+    assert (mixed.native, mixed.currency) == (None, None)
     # The base figure survives: it is the complete one.
     assert mixed.base == -6.07
 
@@ -68,7 +68,7 @@ def test_restated_is_a_statement_about_the_data_not_a_gap():
     as a line item in any currency. `restated` says so; it is not a figure
     whose native half someone forgot to fill in."""
     friction = Money.restated(9.16)
-    assert (friction.base, friction.native, friction.is_exact) == (9.16, None, False)
+    assert (friction.base, friction.native) == (9.16, None)
 
 
 def test_charged_accumulates_and_gates_in_one_pass():
@@ -84,7 +84,7 @@ def test_charged_accumulates_and_gates_in_one_pass():
 
     spanning = Money.charged([(-3.00, -3.50, "USD"), (-3.07, -20.0, "SEK")])
     assert spanning.base == pytest.approx(-6.07)
-    assert not spanning.is_exact
+    assert spanning.native is None
 
     # A row carrying base but no native (or no currency) is still counted in
     # base and ignored by the gate.
@@ -180,7 +180,6 @@ def test_a_single_currency_charge_still_answers_as_money():
     surface against another finds two different figures for one cost."""
     c = Charge.of([(15.16, 17.46, "USD")])
     assert c.money == Money(base=15.16, native=17.46, currency="USD")
-    assert c.money.is_exact
 
 
 def test_a_mixed_charge_withholds_the_single_figure_but_not_the_ledger():
@@ -190,7 +189,7 @@ def test_a_mixed_charge_withholds_the_single_figure_but_not_the_ledger():
     fallback can never disagree with the rest of the payload.
     """
     c = Charge.of([(15.16, 17.46, "USD"), (18.90, 208.41, "SEK")])
-    assert not c.money.is_exact
+    assert c.money.native is None
     assert c.money.base == pytest.approx(34.06)
     assert c.by_ccy == {"USD": 17.46, "SEK": 208.41}
 
@@ -215,7 +214,7 @@ def test_a_zero_amount_currency_is_not_a_currency():
     """
     c = Charge.of([(15.16, 17.46, "USD"), (0.0, 0.0, "EUR")])
     assert c.by_ccy == {"USD": 17.46}
-    assert c.money.is_exact
+    assert c.money.native == 17.46
 
 
 def test_nothing_charged_is_distinct_from_an_estimated_cost():
@@ -225,10 +224,9 @@ def test_nothing_charged_is_distinct_from_an_estimated_cost():
     non-zero base is a cost IBKR never itemised in any currency -- the rate
     markup -- and it must never render as an as-charged figure.
     """
-    assert Charge.of([]).is_free
+    assert Charge.of([]) == Charge(base=0.0, by_ccy={})
     estimated = Charge(base=12.83)
-    assert not estimated.is_free
-    assert not estimated.money.is_exact
+    assert estimated.money == Money.restated(12.83)
     assert estimated.by_ccy == {}
 
 
