@@ -86,7 +86,12 @@ __all__ = [
 #: reason.
 IVR_HIGH = 30.0
 
-_QUOTE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{symbol}.json"
+#: The quote WITHOUT the option chain. `options/{symbol}.json` carries the same
+#: fields plus every contract, none of which is read: DELL measured 1.68 MB with
+#: 3,796 contracts against 528 bytes here, and iv30 matched on DELL (62.33) and
+#: AAPL (26.411) fetched together on 2026-10-16. A symbol CBOE does not carry is
+#: a 403 on both.
+_QUOTE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/{symbol}.json"
 _HIST_URL = (
     "https://cdn.cboe.com/api/global/delayed_quotes/historical_data/{symbol}.json"
 )
@@ -182,12 +187,12 @@ def parse_iv30(payload: Any, *, symbol: str) -> tuple[float | None, str | None]:
     Separate from the fetch for `parse_chart`'s reason: the suite exercises it
     against a captured fixture and never touches the network.
 
-    A ZERO iv30 IS TREATED AS ABSENT. Measured in the live reply: 224 of DELL's
-    3138 contracts carry `iv` exactly 0.0, which is the endpoint's way of saying it
-    has no volatility for that instrument rather than a claim that volatility is
-    nil. The same convention has to hold for the underlying's iv30, because a rank
-    computed from a zero would place the symbol at the very bottom of its year on
-    the strength of a missing number.
+    A ZERO iv30 IS TREATED AS ABSENT. Measured in CBOE's option chain: 224 of
+    DELL's 3138 contracts carry `iv` exactly 0.0, which is the endpoint's way of
+    saying it has no volatility for that instrument rather than a claim that
+    volatility is nil. The same convention has to hold for the underlying's iv30,
+    because a rank computed from a zero would place the symbol at the very bottom
+    of its year on the strength of a missing number.
     """
     data = _data(payload, symbol=symbol, what="quote")
     iv30 = _number(data.get("iv30"))

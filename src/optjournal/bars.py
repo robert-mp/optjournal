@@ -65,6 +65,7 @@ __all__ = [
     "close_series",
     "ReplaySeries",
     "replay_bars",
+    "underlying_conids",
     "upsert_bars",
     "watch_closes",
     "weekly_closes",
@@ -74,6 +75,9 @@ __all__ = [
 #: two because a session pad has to survive a weekend: two trading days before
 #: a Monday open is the previous Thursday.
 PAD_DAYS = 4
+
+#: Days after a window's end past which its stored bars are final. See `_settled`.
+SETTLED_DAYS = 7
 
 #: Above this many calendar days a window is charted daily rather than hourly.
 #: Roughly four trading weeks: a 5-8 day hold wants hourly (21-42 points),
@@ -283,7 +287,26 @@ def _bar_size_for(start: int, end: int, *, kind: str) -> str:
     return "1h" if span_days <= HOURLY_LIMIT_DAYS else "1d"
 
 
-def _underlying_conids(conn: sqlite3.Connection) -> dict[str, str]:
+def _fetched_window(
+    opened: int | None, closed: int | None, moment: datetime
+) -> tuple[int, int]:
+    """The window the manifest fetches for one holding: padded, never past tomorrow.
+
+    `replay_bars` sizes its grid from this same window. Sized from the bare hold,
+    a 33 to 39 day hold chose hourly where the manifest had fetched daily.
+    """
+    ceiling = int((moment + timedelta(days=1)).timestamp())
+    pad = PAD_DAYS * 86400
+    # No opening fill in the archive: ask wide and let the source truncate
+    # to the contract's real listed life. Guessing an open date from the
+    # cost basis would match several sessions and state a fact we lack.
+    start = (opened - pad) if opened is not None else int(
+        (moment - timedelta(days=SNAPSHOT_FLOOR_DAYS)).timestamp())
+    end = min((closed + pad) if closed is not None else ceiling, ceiling)
+    return start, end
+
+
+def underlying_conids(conn: sqlite3.Connection) -> dict[str, str]:
     """Underlying symbol -> IBKR conid, from anywhere the journal states it.
 
     The LEAP has no trade row, so its underlying id has to come from another
@@ -322,10 +345,8 @@ def bars_manifest(
     """
     moment = now or datetime.now(UTC)
     ceiling = int((moment + timedelta(days=1)).timestamp())
-    pad = PAD_DAYS * 86400
-    floor_start = int((moment - timedelta(days=SNAPSHOT_FLOOR_DAYS)).timestamp())
 
-    underlyings = _underlying_conids(conn)
+    underlyings = underlying_conids(conn)
     merged: dict[tuple[str, str], BarRequest] = {}
 
     def add(
@@ -377,13 +398,8 @@ def bars_manifest(
 
     report = build_history(conn, asset_category="OPT")
     for episode in report.episodes:
-        opened = _epoch(episode.opened_at)
-        closed = _epoch(episode.closed_at)
-        # No opening fill in the archive: ask wide and let the source truncate
-        # to the contract's real listed life. Guessing an open date from the
-        # cost basis would match several sessions and state a fact we lack.
-        start = (opened - pad) if opened is not None else floor_start
-        end = min((closed + pad) if closed is not None else ceiling, ceiling)
+        start, end = _fetched_window(
+            _epoch(episode.opened_at), _epoch(episode.closed_at), moment)
         if end <= start:
             continue
         open_ = not episode.is_closed
@@ -496,8 +512,12 @@ def backfill_bars(
     the market-hours poll. See :func:`bars_manifest`.
     """
     moment = now or datetime.now(UTC)
-    requests = bars_manifest(conn, now=moment, perishable_only=perishable_only)
     cutoff = int(moment.timestamp())
+    requests = [
+        request
+        for request in bars_manifest(conn, now=moment, perishable_only=perishable_only)
+        if not _settled(conn, request, cutoff)
+    ]
     written = skipped = 0
     failures: list[str] = []
     for request in requests:
@@ -536,6 +556,24 @@ def backfill_bars(
     )
 
 
+def _settled(conn: sqlite3.Connection, request: BarRequest, cutoff: int) -> bool:
+    """Whether a window ended over `SETTLED_DAYS` ago and is stored from its start.
+
+    From its START, not merely somewhere inside: an older statement ingested later
+    widens a window backwards, and a check for any row would never fetch the new
+    part. A week of slack covers the pad, a weekend and a holiday.
+    """
+    slack = SETTLED_DAYS * 86400
+    if request.end > cutoff - slack:
+        return False
+    first = conn.execute(
+        "SELECT MIN(ts) FROM price_bars WHERE conid = ? AND bar_size = ?"
+        " AND ts BETWEEN ? AND ?",
+        (request.conid, request.bar_size, request.start, request.end),
+    ).fetchone()[0]
+    return first is not None and first <= request.start + slack
+
+
 @dataclass(frozen=True, slots=True)
 class SessionAudit:
     """Whether one session's perishable bars actually landed.
@@ -553,7 +591,8 @@ class SessionAudit:
     market_traded: bool
     #: Contracts that were asked for AND have hourly bars for the day.
     covered: tuple[str, ...]
-    #: Contracts that were asked for and have none. The reportable set.
+    #: Contracts that were asked for, traded that day (a daily close says so) and
+    #: have no hourly bars for it. The reportable set.
     missing: tuple[str, ...]
 
     @property
@@ -579,7 +618,7 @@ def market_traded_on(conn: sqlite3.Connection, day: str) -> bool:
     happened. No bars for anyone means the market was shut; bars for the
     underlying but none for an option means collection failed.
     """
-    conids = set(_underlying_conids(conn).values())
+    conids = set(underlying_conids(conn).values())
     if not conids:
         return False
     placeholders = ", ".join("?" for _ in conids)
@@ -642,6 +681,13 @@ def audit_perishable(
     unexamined. The reverse case is handled -- a contract opened after the
     session cannot have bars for it, and counting that as missing would alarm
     every time a position was opened.
+
+    So is a strike that did not trade that session. With no daily close for the
+    day there were no hourly bars to collect, and calling it lost was a red alarm
+    over QCOM 261120P00175000 on a day every live poll answered empty. The daily
+    series is a fair witness here: `market_traded_on` needs the underlying's
+    hourly bars for the day, which only the daily job fetches, and the same run
+    asks for every open option's daily window.
     """
     audited = day or last_traded_day(conn, now=now)
     if audited is None:
@@ -676,7 +722,12 @@ def audit_perishable(
             (request.conid,),
         ).fetchall()
         found = any(et_day(int(row["ts"])) == audited for row in stamps)
-        (covered if found else missing).append(request.symbol)
+        had_trades = found or any(
+            et_day(int(row["ts"])) == audited for row in conn.execute(
+                "SELECT ts FROM price_bars WHERE conid = ? AND bar_size = '1d'"
+                " AND close IS NOT NULL", (request.conid,)))
+        if had_trades:
+            (covered if found else missing).append(request.symbol)
     return SessionAudit(
         day=audited, market_traded=traded,
         covered=tuple(sorted(covered)), missing=tuple(sorted(missing)),
@@ -895,6 +946,7 @@ def replay_bars(
     conn: sqlite3.Connection,
     symbol: str,
     *,
+    conids: dict[str, str],
     opened_at: str | None,
     closed_at: str | None,
     now: datetime | None = None,
@@ -911,13 +963,15 @@ def replay_bars(
     The size actually drawn is returned so the panel can say which it is: a
     reader comparing two charts must not have to guess whether a flat stretch is
     a quiet week or a coarser grid.
+
+    ``conids`` is `underlying_conids`, read once by the caller: per call it
+    rescanned the trades table for every card on every page load.
     """
-    conids = _underlying_conids(conn)
     conid = conids.get(str(symbol or "").strip())
     if not conid:
         return ReplaySeries(conid=None, bar_size=None)
     moment = now or datetime.now(UTC)
-    start = _epoch(opened_at)
+    opened = start = _epoch(opened_at)
     # A journal stamp truncates to its date, so a closing day's epoch is that
     # day's MIDNIGHT -- every bar of the session the trade closed in sorts after
     # it. Harmless while the window was padded by whole days; it would have cut
@@ -938,7 +992,7 @@ def replay_bars(
     # holidays, and reading more rows from a local SQLite table is free.
     pad = _READ_PAD_DAYS * 86400
     lo, hi = max(0, start - pad), end + pad
-    preferred = _bar_size_for(start or lo, end, kind="underlying")
+    preferred = _bar_size_for(*_fetched_window(opened, closed, moment), kind="underlying")
     for size in (preferred, "1d" if preferred == "1h" else "1h"):
         points = close_series(conn, conid, bar_size=size, start=lo, end=hi)
         if points:
@@ -973,7 +1027,7 @@ def fetch_watch_bars(
     """
     name = symbol.strip().upper()
     moment = now or datetime.now(UTC)
-    conid = _underlying_conids(conn).get(name) or f"watch:{name}"
+    conid = underlying_conids(conn).get(name) or f"watch:{name}"
     start = int((moment - timedelta(days=WATCH_LOOKBACK_DAYS)).timestamp())
     try:
         bars = (fetch or fetch_bars)(name, bar_size="1d", start=start,

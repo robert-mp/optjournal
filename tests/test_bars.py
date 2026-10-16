@@ -28,6 +28,7 @@ from optjournal.bars import (
     close_series,
     last_traded_day,
     replay_bars,
+    underlying_conids,
     upsert_bars,
     watch_closes,
     weekly_closes,
@@ -561,6 +562,10 @@ def test_a_series_clips_to_the_window_inclusively(conn):
     assert got == [(200, 2.0), (300, 3.0)]
 
 
+def _replay(conn, symbol, **window):
+    return replay_bars(conn, symbol, conids=underlying_conids(conn), **window)
+
+
 def test_replay_picks_the_granularity_the_backfill_stored(conn):
     """The chart must ask for what the manifest wrote. Both use _bar_size_for,
     so a short trade gets hourly and a long one daily by construction rather
@@ -570,7 +575,7 @@ def test_replay_picks_the_granularity_the_backfill_stored(conn):
                   underlying="AAA", ucid="U1", date="2026-01-05", trade_id="o1")
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1h", source="yahoo",
                 bars=[_bar(_ts("2026-01-06"), 50.0), _bar(_ts("2026-01-07"), 51.0)])
-    got = replay_bars(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
+    got = _replay(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
     assert got.bar_size == "1h"
     assert got.conid == "U1"
     assert [c for _, c in got.points] == [50.0, 51.0]
@@ -584,7 +589,7 @@ def test_replay_falls_back_to_a_coarser_series_rather_than_drawing_nothing(conn)
                   underlying="AAA", ucid="U1", date="2026-01-05", trade_id="o1")
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
                 bars=[_bar(_ts("2026-01-06"), 50.0)])
-    got = replay_bars(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
+    got = _replay(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
     assert got.bar_size == "1d", "hourly was empty, so daily should be drawn"
     assert got.points
 
@@ -601,7 +606,7 @@ def test_replay_of_a_snapshot_only_contract_draws_every_bar_held(conn):
         " raw, updated_at) "
         "VALUES ('OPTX', 'AAA  270101C00700000', 'AAA', 'U1', '{}', 'now')"
     )
-    got = replay_bars(conn, "AAA", opened_at=None, closed_at=None)
+    got = _replay(conn, "AAA", opened_at=None, closed_at=None)
     assert [c for _, c in got.points] == [10.0, 20.0]
 
 
@@ -612,7 +617,7 @@ def test_replay_of_an_unknown_symbol_is_empty_not_invented(conn):
     replay, so the unresolved case has to answer the same three questions the
     populated one does rather than be absent.
     """
-    got = replay_bars(conn, "NOPE", opened_at="2026-01-05", closed_at="2026-01-12")
+    got = _replay(conn, "NOPE", opened_at="2026-01-05", closed_at="2026-01-12")
     assert (got.conid, got.bar_size, got.points) == (None, None, [])
 
 
@@ -627,7 +632,7 @@ def test_context_is_counted_in_bars_not_calendar_days(conn):
     bars = [_bar(_ts("2026-01-01") + n * DAY, 100.0 + n) for n in range(40)]
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d",
                 source="yahoo", bars=bars)
-    got = replay_bars(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
+    got = _replay(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
     kept = [ts for ts, _ in got.points]
     before = [ts for ts in kept if ts < _ts("2026-01-12")]
     inside = [ts for ts in kept
@@ -661,7 +666,7 @@ def test_context_scales_with_the_window_it_pads(conn):
                 source="yahoo", bars=bars)
 
     def shape(opened: str, closed: str) -> tuple[int, int]:
-        got = replay_bars(conn, "BBB", opened_at=opened, closed_at=closed)
+        got = _replay(conn, "BBB", opened_at=opened, closed_at=closed)
         lo, hi = _ts(opened), _ts(closed) + DAY - 1
         kept = [ts for ts, _ in got.points]
         inside = sum(1 for ts in kept if lo <= ts <= hi)
@@ -703,10 +708,38 @@ def test_the_closing_session_belongs_to_the_trade(conn):
             _bar(close_day + 16 * 3600, 103.0)]
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d",
                 source="yahoo", bars=bars)
-    got = replay_bars(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
+    got = _replay(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
     inside = [ts for ts, _ in got.points
               if _ts("2026-01-12") <= ts <= close_day + DAY - 1]
     assert len(inside) == 4, "the closing session's bars were treated as context"
+
+
+@pytest.mark.parametrize("opened, closed", [
+    ("2026-07-01", "2026-08-05"),   # closed after 35 days
+    ("2026-06-28", None),           # open, 39 days old at _NOW
+])
+def test_replay_draws_the_grid_the_backfill_fetched(conn, opened, closed):
+    """The manifest pads a window 4 days each side before choosing hourly or
+    daily, so these holds are fetched daily. Sized from the bare hold, the chart
+    chose hourly and drew only what a shorter trade on the same name left: TSLA
+    opened 1 Jul and closed 5 Aug drew 98 hourly bars from 20 Jul, its first 13
+    sessions missing.
+    """
+    _option_trade(conn, conid="OPT1", symbol="AAA  261016P00100000",
+                  underlying="AAA", ucid="U1", date=opened, trade_id="o1")
+    if closed:
+        _option_trade(conn, conid="OPT1", symbol="AAA  261016P00100000",
+                      underlying="AAA", ucid="U1", date=closed, trade_id="c1",
+                      open_close="C", quantity=1)
+    fetched = {r.bar_size for r in bars_manifest(conn, now=_NOW) if r.conid == "U1"}
+    assert fetched == {"1d"}
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(_ts("2026-06-20") + n * DAY, 100.0 + n) for n in range(50)])
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1h", source="yahoo",
+                bars=[_bar(_ts("2026-07-20") + 14 * 3600 + n * DAY, 1.0) for n in range(15)])
+    got = _replay(conn, "AAA", opened_at=opened, closed_at=closed, now=_NOW)
+    assert got.bar_size in fetched
+    assert any(ts == _ts(opened) for ts, _ in got.points), "the opening session is drawn"
 
 
 def test_a_snapshot_only_window_is_not_trimmed(conn):
@@ -721,7 +754,7 @@ def test_a_snapshot_only_window_is_not_trimmed(conn):
         " raw, updated_at) "
         "VALUES ('OPTY', 'AAA  270101C00700000', 'AAA', 'U1', '{}', 'now')"
     )
-    got = replay_bars(conn, "AAA", opened_at=None, closed_at=None)
+    got = _replay(conn, "AAA", opened_at=None, closed_at=None)
     assert len(got.points) == 30
 
 
@@ -1038,6 +1071,47 @@ def test_backfill_treats_a_past_option_404_as_unavailable(conn):
     assert outcome.written >= 1, "the unavailable option abandoned its underlying"
 
 
+def test_a_window_long_closed_and_already_stored_is_not_asked_again(conn):
+    """A session's bars do not change once it has long closed, and the daily job
+    asked for every window the book ever implied, every day: 77 of 120 requests
+    were for windows that ended over a week before, ~21 s a run, growing with
+    every contract traded. A window whose stored rows do not reach its start is
+    still asked: an older statement ingested later widens it backwards.
+    """
+    for trade_id, day, open_close, quantity in (
+        ("open", "2026-01-05", "O", -1),
+        ("close", "2026-01-06", "C", 1),
+    ):
+        _option_trade(conn, conid="C1", symbol="AAA  260109P00100000",
+                      underlying="AAA", ucid="U1", date=day, trade_id=trade_id,
+                      open_close=open_close, quantity=quantity)
+    asked: list[tuple[str, str]] = []
+
+    def fetch(symbol, *, bar_size, start, end, source):
+        asked.append((symbol, bar_size))
+        return [_bar(start + DAY)]
+
+    def run() -> set[tuple[str, str]]:
+        asked.clear()
+        backfill_bars(conn, fetch=fetch, now=datetime(2026, 2, 1, tzinfo=UTC))
+        return set(asked)
+
+    first = run()
+    assert {("AAA  260109P00100000", "1d"), ("AAA", "1h"), ("AAA", "1d")} <= first
+    context = first - {("AAA  260109P00100000", "1d"), ("AAA", "1h"), ("AAA", "1d")}
+    assert context, "the context symbols' windows reach today"
+    assert run() == context, "a window that reaches this week is still asked"
+
+    for trade_id, day, open_close, quantity in (
+        ("old-open", "2025-11-03", "O", -1),
+        ("old-close", "2025-11-04", "C", 1),
+    ):
+        _option_trade(conn, conid="C0", symbol="AAA  251107P00100000",
+                      underlying="AAA", ucid="U1", date=day, trade_id=trade_id,
+                      open_close=open_close, quantity=quantity)
+    assert run() == context | {("AAA  251107P00100000", "1d"), ("AAA", "1h"), ("AAA", "1d")}
+
+
 def test_backfill_keeps_a_current_option_404_loud(conn):
     """A live contract missing from the source may be malformed or an outage."""
     _option_trade(
@@ -1124,11 +1198,29 @@ def test_a_traded_day_with_no_option_bars_is_reported(conn):
     """
     _open_short_option(conn)
     _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    # The strike traded that session: its daily close says so.
+    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-05",
+                  bar_size="1d", hours=(14,))
     audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
     assert audited.market_traded, "the underlying's own bars say it traded"
     assert not audited.ok
     assert audited.missing == ("AAA  271001P00100000",)
     assert not audited.covered
+
+
+def test_a_strike_that_did_not_trade_is_not_reported_missing(conn):
+    """No daily close for the session means the strike did not trade in it, so
+    there were no bars to collect: QCOM 261120P00175000 was "1 missed of 3",
+    "cannot be backfilled later", on a day every live poll answered empty.
+    """
+    _open_short_option(conn)
+    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-04",
+                  bar_size="1d", hours=(14,))
+    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
+    assert audited.market_traded
+    assert audited.ok, "a strike that never traded was counted as lost bars"
+    assert not audited.missing and not audited.covered
 
 
 def test_a_covered_session_is_silent(conn):
@@ -1200,6 +1292,8 @@ def test_a_bar_from_a_neighbouring_session_does_not_count_as_coverage(conn):
     _open_short_option(conn)
     _session_bars(conn, "UAAA", "AAA", "2026-08-05")
     _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-04")
+    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-05",
+                  bar_size="1d", hours=(14,))
     audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
     assert not audited.ok, "yesterday's bars were counted as today's"
     assert audited.missing == ("AAA  271001P00100000",)
@@ -1226,6 +1320,8 @@ def test_the_audit_exit_codes_separate_all_three_outcomes(tmp_path, capsys):
     assert main(argv) == 3, "an un-backfilled journal is not a lost session"
 
     _session_bars(conn, "UAAA", "AAA", yesterday)
+    _session_bars(conn, "C1", "AAA  271001P00100000", yesterday,
+                  bar_size="1d", hours=(14,))
     conn.commit()
     assert main(argv) == 1, "a traded day with no option bars must report"
     assert "MISSING" in capsys.readouterr().out
@@ -1264,6 +1360,10 @@ def test_an_index_root_is_translated_to_the_sources_spelling():
     assert source_symbol("SPX") == "^GSPC"
     assert source_symbol("XSP") == "^XSP", "the mini-SPX is its own instrument"
     assert source_symbol("VIX") == "^VIX"
+    assert source_symbol("DJX") == "DJX", (
+        "^DJI is the Dow itself, a hundred times DJX: it charted 46,000 beside a "
+        "460 strike"
+    )
     # An option on an index root keeps its OCC spelling: the padding goes, the
     # translation does not apply, because `SPX   261120C07000000` is not `SPX`.
     assert source_symbol("SPX   261120C07000000") == "SPX261120C07000000"

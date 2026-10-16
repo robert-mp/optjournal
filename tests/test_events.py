@@ -13,6 +13,7 @@ twice, and an event whose past disappears when the feed moves on.
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 
 import pytest
 from conftest import connect_migrated
@@ -171,6 +172,24 @@ def test_a_refetch_corrects_a_revised_forecast_without_duplicating(conn):
         ("Non-Farm Employment Change",),
     ).fetchone()
     assert got["forecast"] == "80K", "the revision was not applied"
+
+
+def test_a_retimed_event_replaces_its_old_row(conn):
+    """ForexFactory re-times a released event to the minute, and the id hashes the
+    instant, so the old row stayed beside the new one: "ADP Weekly Employment
+    Change" stood at 08:14, 08:15 and 08:16 on one morning, and the copy of the
+    journal held 46 such twins. The batch is the truth for the span it covers.
+    """
+    store_events(conn, parse_events(FEED))
+    retimed = [dict(row, date="2026-08-03T10:01:00-04:00")
+               if row["title"].startswith("ISM") else row for row in FEED]
+    store_events(conn, parse_events(retimed))
+    got = conn.execute(
+        "SELECT starts_at FROM market_events WHERE title LIKE 'ISM%'").fetchall()
+    assert [row["starts_at"] for row in got] == [
+        int(datetime(2026, 8, 3, 14, 1, tzinfo=UTC).timestamp())]
+    total = conn.execute("SELECT COUNT(*) AS n FROM market_events").fetchone()["n"]
+    assert total == len(FEED)
 
 
 def test_stored_events_outlive_the_week_the_feed_serves(conn):

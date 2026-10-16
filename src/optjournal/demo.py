@@ -992,8 +992,6 @@ def write_demo_bars(conn) -> int:
                 price = bs_price(
                     spot, float(strike), years, _session_vol(base_vol, day), right
                 )
-                if price is None:
-                    continue
                 close = round(max(0.01, price), 2)
             # Stamped at midnight ET, which is where the price source puts an
             # option's daily bar -- and the reason clock.et_day exists. Emitting

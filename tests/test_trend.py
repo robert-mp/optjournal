@@ -35,8 +35,6 @@ from optjournal.trend import (
     BX_OVERBOUGHT,
     BX_OVERSOLD,
     CENTRE,
-    LONG_L1,
-    LONG_L2,
     MIN_CLOSES,
     MIN_SETTLED,
     PARAMS_CAPTION,
@@ -44,7 +42,6 @@ from optjournal.trend import (
     SHORT_L2,
     SHORT_L3,
     bucket,
-    bxtrender_long,
     bxtrender_short,
     ema,
     rsi,
@@ -76,9 +73,7 @@ WARM_UP = [
     100.0 - 0.5 * t + 3.0 * math.sin(2 * math.pi * t / 24.0) for t in range(400)
 ]
 
-#: Strictly falling, 40 sessions. Any strictly falling series pegs the long arm at
-#: exactly -50.0 the moment it can be computed at all, which is the measurement
-#: `MIN_SETTLED` exists for.
+#: Strictly falling, 40 sessions: past the arithmetic floor and short of the gate.
 FALLING = [200.0 - t for t in range(40)]
 
 
@@ -104,12 +99,6 @@ def raw_short(oldest_first: list[float]) -> float | None:
     offset = len(fast) - len(slow)
     difference = [f - s for f, s in zip(fast[offset:], slow, strict=True)]
     series = rsi(difference, SHORT_L3)
-    return series[-1] - CENTRE if series else None
-
-
-def raw_long(oldest_first: list[float]) -> float | None:
-    """The long arm with no gate, for the same reason as `raw_short`."""
-    series = rsi(ema(oldest_first, LONG_L1), LONG_L2)
     return series[-1] - CENTRE if series else None
 
 
@@ -160,11 +149,6 @@ def test_the_short_arm_matches_a_hand_computed_vector():
     assert got != pytest.approx(wilder_vs_ema, abs=1e-6), (
         "Wilder's smoothing and an EMA of the same period must not coincide"
     )
-
-    # The long arm on the same rising series is pegged at the top, which is a real
-    # reading rather than a warm-up artefact: an EMA(20) of a ramp rises at every
-    # single step, so there are no down moves for Wilder's average to hold.
-    assert bxtrender_long(newest_first(ALTERNATING)) == pytest.approx(50.0)
 
 
 def test_the_rsi_reads_the_ema_difference_not_the_price():
@@ -300,57 +284,34 @@ def test_reading_the_closes_backwards_flips_the_sign():
 
     `ALTERNATING` makes the failure exact rather than approximate: read the wrong
     way round it is the same magnitude with the opposite sign, +1.7241 against
-    -1.7241, because the two-cycle is symmetric. On the long arm the same
-    reversal turns a series pegged at +50.0 into one pegged at -50.0, the two
-    strongest opposite readings the indicator can produce.
+    -1.7241, because the two-cycle is symmetric.
     """
     forwards = bxtrender_short(newest_first(ALTERNATING))
     backwards = bxtrender_short(ALTERNATING)          # deliberately wrong order
     assert forwards == pytest.approx(-backwards, abs=1e-9)
     assert forwards > 0 > backwards
 
-    assert bxtrender_long(newest_first(ALTERNATING)) == pytest.approx(50.0)
-    assert bxtrender_long(ALTERNATING) == pytest.approx(-50.0)
-
 
 # --- the gate -----------------------------------------------------------------
 
 
-def test_fewer_than_the_floor_returns_none_rather_than_a_pegged_extreme():
-    """Below the settled window the answer is None, and this is what it hides.
+def test_fewer_than_the_gate_returns_none_rather_than_a_warm_up_reading():
+    """Below the settled window the answer is None, never a warm-up figure.
 
     Two constants, two jobs. `MIN_CLOSES` is where the arithmetic first produces
     anything (an SMA-seeded EMA(20) over n closes yields n-19 values, and Wilder's
-    RSI(15) needs 16 of them, so 35), and `MIN_SETTLED` is where the answer is
-    worth showing. A single number would have answered the second question with
-    the first.
-
-    What it hides is measured here rather than described: on any strictly falling
-    series the long arm reports **exactly -50.0000** as soon as it can be computed
-    at all, because a 16-value EMA(20) is still falling out of its own seed, so
-    every change is a down move, Wilder's average of up moves is zero and the RSI
-    is zero. That is the strongest signal anything on this page can render, from
-    35 closes, with nothing wrong with the arithmetic. On TSLA's real closes it
-    reads -50.0000 from 35 closes through 43.
-
-    So the gated functions must answer None at 36 closes -- not the pegged value,
-    and not 0.0, which would be a claim that the indicator is neutral.
+    RSI(5) needs 6 of them, so 25), and `MIN_SETTLED` is where the answer is worth
+    showing: inside the warm-up the SIGN flips on every symbol measured (see
+    `MIN_SETTLED`), and the sign is the indicator's primary published state. So
+    the gated function must answer None one past the floor, not a value and not
+    0.0, which would be a claim that the indicator is neutral.
 
     The behavioural assertions come FIRST and the relationship between the two
     constants comes last, deliberately: `mutate.py`'s `bx-gate` collapses the gate
-    onto the floor, and a test that reported that as "35 is not less than 35" would
+    onto the floor, and a test that reported that as "25 is not less than 25" would
     be catching a mutant on an inequality rather than on what a reader would see.
     """
-    # The gate refuses a warm-up window, in the arm whose warm-up value is the
-    # loudest. 36 closes is one past the arithmetic floor, and the honest answer
-    # there is nothing at all.
-    assert bxtrender_long(newest_first(FALLING[: MIN_CLOSES + 1])) is None
     assert bxtrender_short(newest_first(FALLING[: MIN_CLOSES + 1])) is None
-    assert bxtrender_long(newest_first(FALLING[: MIN_CLOSES - 1])) is None
-
-    # And this is what it refused to publish: the pegged extreme, well-formed.
-    assert raw_long(FALLING[:MIN_CLOSES]) == -50.0
-    assert raw_long(FALLING[: MIN_CLOSES + 1]) == -50.0
 
     # 45 sessions is the state five of the six real watched symbols were in when
     # this was written, so it is the common case rather than an edge.
@@ -368,9 +329,8 @@ def test_fewer_than_the_floor_returns_none_rather_than_a_pegged_extreme():
 
     # The arithmetic floor is where it says it is: one value at MIN_CLOSES, none
     # below it. This is what makes MIN_CLOSES a measurement rather than a comment.
-    assert len(rsi(ema(FALLING[:MIN_CLOSES], LONG_L1), LONG_L2)) == 1
-    assert rsi(ema(FALLING[: MIN_CLOSES - 1], LONG_L1), LONG_L2) == []
-    assert raw_long(FALLING[: MIN_CLOSES - 1]) is None
+    assert raw_short(FALLING[:MIN_CLOSES]) is not None
+    assert raw_short(FALLING[: MIN_CLOSES - 1]) is None
     assert MIN_CLOSES < MIN_SETTLED, "the floor cannot be the gate"
 
 

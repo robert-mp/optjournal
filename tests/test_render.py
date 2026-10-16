@@ -369,9 +369,9 @@ def test_the_earnings_column_prints_the_typed_date_and_a_dash_for_none(watched):
     )
 
     prose = _prose(out)
-    assert "earnings is a date YOU recorded, not a fetched one" in prose
-    assert "none recorded rather than none due" in prose, (
-        "a blank earnings cell means nothing recorded, never nothing due, and the "
+    assert "earnings is the date you recorded, else the one Nasdaq lists" in prose
+    assert "A dash means neither is stored" in prose, (
+        "a blank earnings cell means nothing stored, never nothing due, and the "
         "report is the only place that distinction can be stated"
     )
 
@@ -393,6 +393,28 @@ def test_a_past_earnings_date_says_so_rather_than_counting_backwards(watched):
     assert "2026-08-27 past" in nvda, f"a past date rendered as a countdown:\n{nvda}"
     assert "-7" not in nvda
     assert "recorded and now past: NVDA (2026-08-27)" in _prose(out)
+
+
+def test_a_fetched_earnings_date_is_printed_and_an_estimate_is_marked(watched):
+    """The report read `earnings_on`, the typed date only. A date fetched from
+    Nasdaq printed a dash under a footnote saying no source publishes one, and a
+    fetched date gone by was listed as "(None)". Zacks' estimate is marked "~" as
+    the page marks it.
+    """
+    watched.execute("UPDATE watchlist SET earnings_next = '2026-08-20',"
+                    " earnings_confirmed = 0 WHERE symbol = 'PLTR'")
+    watched.commit()
+
+    def pltr(now: datetime) -> str:
+        out = render_watchlist(watchlist_data(watched, now=now))
+        assert "(None)" not in out
+        return next(line for line in out.splitlines() if line.strip().startswith("PLTR"))
+
+    assert "~2026-08-20 7d" in pltr(_NOW)
+    assert "~2026-08-20 past" in pltr(datetime(2026, 9, 3, 12, tzinfo=MARKET_TZ))
+    watched.execute("UPDATE watchlist SET earnings_confirmed = 1 WHERE symbol = 'PLTR'")
+    watched.commit()
+    assert " 2026-08-20 7d" in pltr(_NOW), "an announced date is not marked"
 
 
 def test_the_table_says_what_its_two_ranked_numbers_mean(watched):

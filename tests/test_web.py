@@ -10311,6 +10311,77 @@ def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, 
     assert reply["earnings_failed"] == []
 
 
+def _watching(tmp_path, *symbols: str) -> Path:
+    """Watched symbols whose earnings were checked just now, so only quotes and
+    ranks are asked."""
+    from datetime import UTC, datetime  # noqa: PLC0415 - local helper
+
+    db = tmp_path / "j.db"
+    with open_journal(db) as conn:
+        conn.executemany("INSERT INTO watchlist (symbol, added_at, earnings_checked_at)"
+                         " VALUES (?, 'x', ?)",
+                         [(s, datetime.now(UTC).isoformat()) for s in symbols])
+        conn.commit()
+    return db
+
+
+def test_the_quotes_are_asked_together_and_a_failure_stays_its_symbols(
+        tmp_path, monkeypatch):
+    """One after another, eleven symbols took 10 to 20 s. Each fetch here waits
+    for the other two, so asked in turn the first breaks the barrier after five
+    seconds and the route answers 500. One symbol's failure still blanks only its
+    own row."""
+    import threading  # noqa: PLC0415 - local to this test
+
+    from optjournal.marketdata import BarFetchError, Quote  # noqa: PLC0415
+
+    together = threading.Barrier(3, timeout=5)
+
+    def quote(symbol, **_):
+        together.wait()
+        if symbol == "BBB":
+            raise BarFetchError("BBB quote: down")
+        return Quote(symbol=symbol, price=10.0, at=1, previous_close=9.0,
+                     currency="USD", name=None)
+
+    monkeypatch.setattr(web, "fetch_quote", quote)
+    monkeypatch.setattr(web, "fetch_iv_rank", lambda symbol, **_: None)
+    db = _watching(tmp_path, "AAA", "BBB", "CCC")
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        status, reply = _get(base, "/api/quotes")
+    assert status == 200, reply
+    assert sorted(reply["quotes"]) == ["AAA", "CCC"]
+    assert reply["failed"] == ["BBB"]
+
+
+def test_an_iv_rank_is_kept_a_quarter_hour_and_a_failure_is_asked_again(
+        tmp_path, monkeypatch):
+    """Every five-minute refresh downloaded each symbol's CBOE quote and year
+    again, for figures that are delayed and whose bounds move once a day."""
+    from optjournal.iv import IvFetchError, IvRank  # noqa: PLC0415
+
+    asked: list[str] = []
+
+    def rank(symbol, **_):
+        asked.append(symbol)
+        if symbol == "BAD":
+            raise IvFetchError("BAD quote: HTTP 500")
+        return IvRank(symbol=symbol, iv30=40.0, low=20.0, high=60.0, rank=50.0,
+                      as_of="2026-10-16 10:00:00")
+
+    _offline_quotes(monkeypatch)
+    monkeypatch.setattr(web, "fetch_iv_rank", rank)
+    db = _watching(tmp_path, "AMD", "BAD")
+    with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
+        _get(base, "/api/quotes")
+        _, second = _get(base, "/api/quotes")
+        assert sorted(asked) == ["AMD", "BAD", "BAD"], "the rank was asked again"
+        assert (second["ranks"]["AMD"]["rank"], second["ranks_failed"]) == (50.0, ["BAD"])
+        monkeypatch.setattr(web, "IV_RANK_MAX_AGE_S", 0)
+        _get(base, "/api/quotes")
+    assert asked.count("AMD") == 2, "a rank past its age is asked again"
+
+
 def _stale_earnings_row(db: Path) -> None:
     """One watched symbol with a fetched date whose check is days old."""
     with open_journal(db) as conn:

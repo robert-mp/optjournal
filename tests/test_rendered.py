@@ -571,6 +571,8 @@ def test_the_watchlist_draws_an_iv_rank_column_only_once_a_rank_is_in(
         raise BarFetchError("offline")
 
     monkeypatch.setattr(web, "fetch_quote", no_quote)
+    # Both loads ask CBOE: the second must not reuse the first's "not carried".
+    monkeypatch.setattr(web, "IV_RANK_MAX_AGE_S", 0)
     with web.serve_ephemeral(db_path=tmp_path / "demo.db",
                              archive_dir=statement.parent) as base:
         monkeypatch.setattr(web, "fetch_iv_rank", lambda symbol: None)

@@ -844,6 +844,16 @@ def in_session(now: datetime) -> bool:
             < et.replace(hour=SETTLE_H, minute=SETTLE_M, second=0, microsecond=0))
 
 
+def _unsettled_day(now: datetime) -> str | None:
+    """Today's ET day until its settle, while its daily bar still moves; else None.
+
+    One rule for every reader of a settled daily close: the 0DTE calculator, its
+    scoring and the watchlist.
+    """
+    today = now.astimezone(MARKET_TZ).date().isoformat()
+    return None if last_settle(now).date().isoformat() == today else today
+
+
 def _fetched_at(conn: sqlite3.Connection, conid: str) -> datetime | None:
     """When the newest fetch of one index's daily series landed."""
     row = conn.execute(
@@ -898,12 +908,11 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
     if not spx or not vix:
         return None
 
-    today = now.astimezone(MARKET_TZ).date().isoformat()
     # The last close from a SETTLED session. Today's bar is excluded only until
     # the settle: after 16:15 ET it is final, and it is the prior close for the
     # next session -- excluding it all evening planned tomorrow off yesterday.
     settle = last_settle(now)
-    open_day = None if settle.date().isoformat() == today else today
+    open_day = _unsettled_day(now)
     settled = [(ts, close) for ts, close in spx if et_day(ts) != open_day]
     if not settled:
         return None
@@ -1035,8 +1044,11 @@ def odte_scoring_data(conn: sqlite3.Connection, *, now: datetime) -> list[Row]:
     2026-09-24 carries VIX 16.33 against the 15.67 the tab was read at on the same
     close -- so `railScores` says so rather than implying the two are one thing.
 
-    TODAY IS EXCLUDED. Its close is still moving, and scoring a band against a
-    price that has not settled would report a hit that the afternoon can take back.
+    TODAY IS EXCLUDED UNTIL ITS SETTLE, by the calculator's rule. Before it, its
+    close is still moving, and scoring a band against a price that has not settled
+    would report a hit that the afternoon can take back. After it, the calculator
+    plans off that close, and leaving it unscored all evening put the two a
+    session apart.
 
     SO IS A PAIR ACROSS A HOLE. The index series is fetched over a 60-day window,
     so a journal left unopened for longer stores June and then August, and the
@@ -1052,11 +1064,11 @@ def odte_scoring_data(conn: sqlite3.Connection, *, now: datetime) -> list[Row]:
     if not spx or not vix:
         return []
 
-    today = now.astimezone(MARKET_TZ).date().isoformat()
+    open_day = _unsettled_day(now)
     # Keyed by trading day rather than by timestamp, because the two series are
     # not stamped alike even when they come from one provider -- see `clock.et_day`.
     vix_by_day = {et_day(ts): close for ts, close in vix}
-    sessions = [(et_day(ts), close) for ts, close in spx if et_day(ts) != today]
+    sessions = [(et_day(ts), close) for ts, close in spx if et_day(ts) != open_day]
 
     rows: list[Row] = []
     # Sliding pairs, so the shorter tail is the point rather than a mismatch: the
@@ -1171,13 +1183,12 @@ def watchlist_data(
     session cap governs the daily figures only. Both still come off one
     deduplicated series, which is why the weekly reader is built on the daily one.
 
-    TWO OF THE ROW'S FACTS ARE TYPED, not measured: `note` and `earnings_on`. They
-    are the only ones stored on the watchlist table, because they are the only ones
-    with nowhere else to come from -- nothing this repo can reach publishes an
-    earnings date (see `db.py`'s column comment for what was probed). So the row
-    carries the date VERBATIM, and `earnings_in_days` beside it is derived here on
-    every read rather than stored; the surfaces label the pair as recorded rather
-    than fetched, which is the whole reason the column is honest.
+    TWO OF THE ROW'S FACTS ARE TYPED, not measured: `note` and `earnings_on`. The
+    earnings date can also be FETCHED (`earnings_next`, Nasdaq's from Zacks, see
+    `earnings`), and `earnings_date` is the one in force, the typed one winning.
+    `earnings_source` says whose it is, so no surface prints Zacks' estimate as a
+    date, and `earnings_in_days` beside it is derived here on every read rather
+    than stored.
 
     `now` exists so a countdown can be asserted without asserting the calendar. It
     is optional rather than required because every caller wants the same answer --
@@ -1193,7 +1204,11 @@ def watchlist_data(
     ).fetchall()
     # One ET day for the whole payload, so two rows of one response cannot land on
     # opposite sides of midnight and report countdowns a day apart.
-    today = date.fromisoformat(et_day(int((now or datetime.now(UTC)).timestamp())))
+    moment = now or datetime.now(UTC)
+    today = date.fromisoformat(et_day(int(moment.timestamp())))
+    # A session in progress is not yet a close. Adding a symbol mid-session stores
+    # today's moving bar, and the row read it as the stored close from today.
+    moving = _unsettled_day(moment)
 
     held: dict[str, list[Row]] = {}
     for position in conn.execute(
@@ -1212,7 +1227,8 @@ def watchlist_data(
     out: list[Row] = []
     for row in rows:
         symbol = str(row["symbol"]).upper()
-        series = watch_closes(conn, symbol, sessions=history)
+        series = [s for s in watch_closes(conn, symbol, sessions=history + 1)
+                  if s[0] != moving][:history]
         closes = [close for _, close in series]
         # The vol's own slice, taken here rather than by reading less: the whole
         # series is what says how much history exists, and `closes` reports that.

@@ -1,9 +1,8 @@
 """The IV rank leaf: the formula, the clamp, and the two answers that are not errors.
 
 Every fixture here is a REDUCED capture of a real CBOE reply, taken while writing
-`iv.py` on 2026-08-13. Reduced rather than invented, and reduced rather than whole:
-DELL's quote reply carries 3138 contracts and 1.4MB, none of which the parser reads,
-so the fixture keeps the fields under test and the shape around them.
+`iv.py` on 2026-08-13. Reduced rather than invented: the fixture keeps the fields
+under test and the shape around them.
 
 Nothing here touches the network. The two fetch tests monkeypatch `urlopen`, which
 is `test_events.py`'s idiom for the same job.
@@ -29,8 +28,8 @@ from optjournal.iv import (
 )
 
 # DELL's delayed-quotes reply, reduced. `iv30` and the top-level `timestamp` are
-# what the parser reads; `current_price` and one contract stay so the fixture still
-# looks like what arrives.
+# what the parser reads; `current_price` stays so the fixture still looks like what
+# arrives.
 QUOTE = {
     "timestamp": "2026-08-13 16:50:25",
     "symbol": "DELL",
@@ -39,7 +38,6 @@ QUOTE = {
         "current_price": 496.21,
         "iv30": 83.625,
         "iv30_change": -1.851,
-        "options": [{"option": "DELL260814C00205000", "iv": 0.0, "delta": 0.9999}],
     },
 }
 
@@ -286,7 +284,7 @@ def test_a_whole_fetch_assembles_the_rank_and_carries_every_term_of_it(monkeypat
     # Two paths, and the quote is asked for first: it is the request that can make
     # the second one unnecessary, when iv30 is absent.
     assert len(calls) == 2
-    assert "delayed_quotes/options/DELL.json" in calls[0]
+    assert "delayed_quotes/quotes/DELL.json" in calls[0], "the quote without its chain"
     assert "historical_data/DELL.json" in calls[1]
 
 

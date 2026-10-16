@@ -500,21 +500,23 @@ def render_watchlist(rows: list[dict]) -> str:
         return "-" if value is None else f"{value:+.1f}"
 
     def earnings(row: dict) -> str:
-        """The recorded date, with the derived countdown in the same cell.
+        """The date in force, with the derived countdown in the same cell.
 
         Both, never one: the date alone makes the reader do the arithmetic, and the
         countdown alone is a bare number in a table whose every other figure is
-        measured off stored closes. The pair says "this is the day you typed, and
-        this is how far off it is".
+        measured off stored closes. Zacks' estimate is marked "~", as the page
+        marks it, so a guess from past reporting dates never reads as a date.
 
         A past date says so in words rather than printing a negative day count.
         `-13d` in a column of countdowns reads as a countdown that ran backwards; a
         recorded date that has gone by is a stale note to yourself, and the footnote
         below names those symbols so it can be replaced.
         """
-        when = row["earnings_on"]
+        when = row["earnings_date"]
         if not when:
             return "-"
+        if row["earnings_source"] == "estimated":
+            when = f"~{when}"
         days = row["earnings_in_days"]
         if days is None:
             # A stored value `clock.parse_day` refuses, which only a hand-edited
@@ -543,9 +545,6 @@ def render_watchlist(rows: list[dict]) -> str:
             signed(row["bx_daily"]),
             signed(row["bx_weekly"]),
             _money(row["expected_move_5d"]),
-            # The one typed cell, sitting between the derived figures and the
-            # journal's own context -- which is what it is: neither measured nor
-            # fetched.
             earnings(row),
             # The context a broker screen cannot give: what YOU hold against it.
             ", ".join(
@@ -599,16 +598,16 @@ def render_watchlist(rows: list[dict]) -> str:
         _wrapped(f"bx is {PARAMS_CAPTION}; the weekly arm reads ISO weeks, "
                  f"Monday start"),
         # Unconditional, like the two above it, and for the same reason: the column
-        # needs its provenance stated whether it holds a date or a dash. A blank
-        # earnings cell in a table of measured figures reads as "nothing scheduled",
-        # and what it means is "nothing recorded" -- the countdown is the only
-        # column here whose input is the reader.
+        # needs its provenance stated whether it holds a date or a dash, and it is
+        # the only column here that is not measured off stored closes.
         _wrapped(
-            "earnings is a date YOU recorded, not a fetched one: no source this "
-            "journal reaches publishes an earnings date, so a dash means none "
-            "recorded rather than none due. `optjournal watch NVDA --earnings "
-            "2026-08-27` records one; the days beside it are counted from the ET "
-            "trading day on every run and never stored"
+            "earnings is the date you recorded, else the one Nasdaq lists from "
+            "Zacks, fetched when the Watchlist tab refreshes; ~ marks Zacks' "
+            "estimate from past reporting dates rather than a date the company "
+            "announced. A dash means neither is stored: a fund has none. "
+            "`optjournal watch NVDA --earnings 2026-08-27` records one, which "
+            "wins; the days beside it are counted from the ET trading day on "
+            "every run and never stored"
         ),
     ]
     thin = [r["symbol"] for r in rows if r["realised_vol"] is None]
@@ -652,13 +651,15 @@ def render_watchlist(rows: list[dict]) -> str:
             f"no rvr yet for {', '.join(unranked)}: a min-max position needs"
             f" enough windows for its low and its high to be bounds"
         ))
-    # A date that has gone by, named. The cell says "past" in three characters,
-    # which cannot say what to do about it: the date STANDS until the reader records
-    # the next one, so the report that shows it is where the replacement belongs.
+    # A recorded date that has gone by, named. The cell says "past" in three
+    # characters, which cannot say what to do about it: the date STANDS until the
+    # reader records the next one, so the report that shows it is where the
+    # replacement belongs. A fetched date is replaced by the next fetch instead.
     stale = [
-        f"{r['symbol']} ({r['earnings_on']})"
+        f"{r['symbol']} ({r['earnings_date']})"
         for r in rows
-        if r["earnings_in_days"] is not None and r["earnings_in_days"] < 0
+        if r["earnings_source"] == "typed"
+        and r["earnings_in_days"] is not None and r["earnings_in_days"] < 0
     ]
     if stale:
         out.append(_wrapped(
