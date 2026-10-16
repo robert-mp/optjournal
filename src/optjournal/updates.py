@@ -91,6 +91,10 @@ def _version_key(version: str) -> tuple[int, ...] | None:
         return None
 
 
+def _newer(version: str, than: str) -> bool:
+    return (_version_key(version) or ()) > (_version_key(than) or ())
+
+
 def current_version(root: Path = ROOT) -> str:
     """The version of the code on disk, from `pyproject.toml`.
 
@@ -158,8 +162,7 @@ def check(*, root: Path = ROOT, force: bool = False) -> dict[str, object]:
     except (URLError, OSError, UpdateRefused, ValueError, KeyError) as exc:
         reply["error"] = f"could not check for updates: {exc}"
     else:
-        newer = (_version_key(release.version) or ()) > (_version_key(current) or ())
-        reply.update(latest=release.version, available=newer,
+        reply.update(latest=release.version, available=_newer(release.version, current),
                      notes=release.notes, url=release.page_url)
     _last = (now, reply)
     return dict(reply)
@@ -187,12 +190,19 @@ def _members(archive: zipfile.ZipFile) -> tuple[str, list[zipfile.ZipInfo]]:
 def stage(release: Release, *, root: Path = ROOT) -> Path:
     """Download, verify and unpack `release` into `root/STAGING`. Returns it.
 
-    Verifies that the archive is optjournal at the version the release claims,
-    and that it names no journal data. Nothing outside `STAGING` is written.
+    Verifies that the release is newer than the code on disk, that the archive
+    is optjournal at the version the release claims, and that it names no
+    journal data. Nothing outside `STAGING` is written.
     """
     reason = cannot_apply(root)
     if reason:
         raise UpdateRefused(reason)
+    # A banner left open across an update asks again, and GitHub's latest can be
+    # an older release once a newer one is retracted.
+    current = current_version(root)
+    if not _newer(release.version, current):
+        raise UpdateRefused(f"the newest release is {release.version}, and this is "
+                            f"already version {current}")
     body = _get(release.zip_url, limit=MAX_DOWNLOAD_BYTES)
     if not zipfile.is_zipfile(io.BytesIO(body)):
         # A failed download (an error or rate-limit page), not a release this

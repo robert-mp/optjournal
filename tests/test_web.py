@@ -10446,6 +10446,33 @@ def test_the_update_button_stages_and_answers_before_restarting(populated, monke
     assert (status, reply["version"], staged) == (202, "9.9.9", ["9.9.9"])
 
 
+@pytest.mark.parametrize("latest", ["the same", "older"])
+def test_the_update_button_never_installs_a_version_that_is_not_newer(
+        populated, monkeypatch, latest):
+    """A banner left open on a server that had since updated asked again, and the
+    server staged, swapped and restarted onto the version it already ran; a
+    retracted release would have moved a friend back a version. Refused before
+    anything is downloaded."""
+    from optjournal import updates
+
+    current = updates.current_version()
+    version = current if latest == "the same" else "0.0.1"
+    downloads: list[str] = []
+
+    def get(url, *, limit):
+        downloads.append(url)
+        raise OSError("no network in this test")
+
+    monkeypatch.setattr(updates, "latest_release", lambda: updates.Release(
+        version=version, notes="", page_url="", zip_url="https://x/y.zip"))
+    monkeypatch.setattr(updates, "cannot_apply", lambda root=None: None)
+    monkeypatch.setattr(updates, "_get", get)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/update")
+    assert (status, reply["kind"], downloads) == (409, "refused", [])
+    assert f"already version {current}" in reply["message"]
+
+
 def test_importing_a_journal_it_did_not_find_is_refused(populated, monkeypatch, tmp_path):
     monkeypatch.setenv("OPTJOURNAL_SUPERVISED", "1")
     from optjournal import install
