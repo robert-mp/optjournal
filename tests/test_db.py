@@ -347,15 +347,14 @@ def test_fractional_stock_quantities_survive_ingest(tmp_path):
     """
     import json
 
-    # From `sources`, not `ingest`: quantity coercion is the reading half of the
-    # broker seam, so it moved there with the rest of the vocabulary.
-    from optjournal.sources import _qty
+    # One rule for every source that reads a count, on the seam itself.
+    from optjournal.fills import exact_quantity
 
-    assert _qty("3") == 3 and isinstance(_qty("3"), int)
-    assert _qty("-2.0") == -2 and isinstance(_qty("-2.0"), int)
-    assert _qty("413.22") == 413.22
-    assert _qty("1.79") == 1.79
-    assert _qty("") is None
+    assert exact_quantity(3.0) == 3 and isinstance(exact_quantity(3.0), int)
+    assert exact_quantity(-2.0) == -2 and isinstance(exact_quantity(-2.0), int)
+    assert exact_quantity(413.22) == 413.22
+    assert exact_quantity(1.79) == 1.79
+    assert exact_quantity(None) is None
 
     conn = connect(tmp_path / "frac.db")
     migrate(conn)
@@ -524,71 +523,6 @@ def test_the_commission_warning_does_not_repeat_on_every_re_ingest(tmp_path):
     conn.close()
 
 
-def test_commission_currency_backfills_from_the_stored_raw(tmp_path):
-    """A journal that ingested before the column existed holds the value in
-    `raw` and NULL in the column, and no broker request is needed to recover it.
-
-    Deliberately not gated on schema_version: that stamp is written the first
-    time migrate() runs after the bump, so for any journal merely OPENED since
-    then a one-shot hook would silently never fire -- which is exactly the state
-    the real journal was in. The work guards itself instead.
-    """
-    from optjournal.db import _backfill_commission_currency
-    from optjournal.demo import write_demo_statement
-
-    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
-    conn = connect(tmp_path / "demo.db")
-    migrate(conn)
-    ingest_file(conn, statement)
-
-    # Simulate the pre-column journal: the value survives only in `raw`.
-    conn.execute("UPDATE trades SET ib_commission_currency = NULL")
-    conn.commit()
-    assert conn.execute(
-        "SELECT COUNT(*) FROM trades WHERE ib_commission_currency IS NOT NULL"
-    ).fetchone()[0] == 0
-
-    filled = _backfill_commission_currency(conn)
-    assert filled > 0, "nothing was recovered from raw"
-    rows = conn.execute(
-        "SELECT currency, ib_commission_currency FROM trades"
-        " WHERE ib_commission IS NOT NULL AND ib_commission <> 0"
-    ).fetchall()
-    assert all(r["ib_commission_currency"] for r in rows), "rows still NULL"
-    for r in rows:
-        assert r["ib_commission_currency"] == r["currency"]
-
-    # Self-terminating: the set it operates on is empty once it has run, so a
-    # second pass does no work and cannot loop on rows raw cannot supply.
-    assert _backfill_commission_currency(conn) == 0
-    conn.close()
-
-
-def test_the_backfill_runs_on_open_without_a_version_bump(tmp_path):
-    """migrate() performs it, so an existing journal heals by being opened --
-    no command to remember, and no dependence on a version transition that has
-    already happened.
-    """
-    from optjournal.db import open_journal
-    from optjournal.demo import write_demo_statement
-
-    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
-    conn = connect(tmp_path / "demo.db")
-    migrate(conn)
-    ingest_file(conn, statement)
-    conn.execute("UPDATE trades SET ib_commission_currency = NULL")
-    conn.commit()
-    version_before = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    conn.close()
-
-    with open_journal(tmp_path / "demo.db") as c:
-        assert c.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] \
-            == version_before, "the test relies on the version already being current"
-        assert c.execute(
-            "SELECT COUNT(*) FROM trades WHERE ib_commission_currency IS NOT NULL"
-        ).fetchone()[0] > 0, "opening the journal did not heal it"
-
-
 def test_commission_base_uses_a_rate_that_applies_to_the_commission():
     """`fxRateToBase` is the INSTRUMENT's rate, so applying it to the commission
     is right only while the two currencies agree.
@@ -610,60 +544,6 @@ def test_commission_base_uses_a_rate_that_applies_to_the_commission():
     assert _commission_base(-1.5, "GBP", "SEK", 0.090897, "EUR") is None
     # Nothing to convert.
     assert _commission_base(None, "USD", "USD", 1.0, "EUR") is None
-
-
-def test_a_wrongly_converted_commission_is_repaired_on_open(tmp_path):
-    """Derived data, provably wrong and recomputable, so it heals by opening --
-    no command to remember. Only rows the data can DEFINITIVELY correct are
-    touched: a commission billed in base needs no conversion, so its base value
-    is its native value. A third currency has no rate and is left alone.
-    """
-    from optjournal.db import _repair_base_commission, open_journal
-    from optjournal.demo import write_demo_statement
-
-    statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
-    conn = connect(tmp_path / "demo.db")
-    migrate(conn)
-    ingest_file(conn, statement)
-    base = conn.execute("SELECT base_currency FROM statements").fetchone()[0]
-
-    # Recreate the defect: a row billed in base, but converted as if it were in
-    # the instrument's currency.
-    victim = conn.execute(
-        "SELECT trade_id, ib_commission FROM trades"
-        " WHERE ib_commission <> 0 AND currency <> ?", (base,)
-    ).fetchone()
-    if victim is None:  # demo holds no non-base commissioned row
-        return
-    conn.execute(
-        "UPDATE trades SET ib_commission_currency = ?,"
-        " ib_commission_base = ib_commission * 0.09 WHERE trade_id = ?",
-        (base, victim["trade_id"]),
-    )
-    conn.commit()
-    conn.close()
-
-    with open_journal(tmp_path / "demo.db") as c:
-        row = c.execute(
-            "SELECT ib_commission, ib_commission_base FROM trades WHERE trade_id = ?",
-            (victim["trade_id"],),
-        ).fetchone()
-        assert row["ib_commission_base"] == row["ib_commission"], \
-            "opening the journal did not repair the mis-converted row"
-        # Idempotent: nothing left to repair.
-        assert _repair_base_commission(c) == 0
-
-    # A third currency is NOT touched -- there is no rate to correct it with.
-    conn = connect(tmp_path / "demo.db")
-    conn.execute(
-        "UPDATE trades SET ib_commission_currency = 'GBP',"
-        " ib_commission_base = -99.0 WHERE trade_id = ?", (victim["trade_id"],))
-    conn.commit()
-    assert _repair_base_commission(conn) == 0, "guessed at a currency with no rate"
-    assert conn.execute(
-        "SELECT ib_commission_base FROM trades WHERE trade_id = ?",
-        (victim["trade_id"],)).fetchone()[0] == -99.0
-    conn.close()
 
 
 # --- broker identity ---------------------------------------------------------
@@ -997,8 +877,6 @@ def test_a_pre_migration_journal_gains_the_earnings_column(tmp_path):
     lost a typed note would be worse than a missing column, because `watchlist` is
     the user-input table -- nothing can re-derive what was in it.
     """
-    from optjournal.db import schema_is_current
-
     path = tmp_path / "j.db"
     conn = connect(path)
     conn.executescript(
@@ -1017,7 +895,6 @@ def test_a_pre_migration_journal_gains_the_earnings_column(tmp_path):
     assert "earnings_on" not in {
         r["name"] for r in conn.execute("PRAGMA table_info(watchlist)")
     }, "the fixture is meant to start at the pre-migration shape"
-    assert not schema_is_current(conn)
 
     migrate(conn)
 
@@ -1042,7 +919,6 @@ def test_a_pre_migration_journal_gains_the_earnings_column(tmp_path):
         "SELECT earnings_on FROM watchlist WHERE symbol = 'DELL'"
     ).fetchone()["earnings_on"] == "2026-08-27"
     migrate(conn)  # idempotent: migrate runs on every single connection
-    assert schema_is_current(conn)
     conn.close()
 
 
@@ -1476,45 +1352,6 @@ def test_compact_confirm_dates_already_stored_are_rewritten_on_open(tmp_path):
     assert conn.execute(
         "SELECT opened_on FROM journal_entries").fetchone()[0] == "2026-09-24"
     conn.close()
-
-
-# --- the commission repairs stay inside the row's own broker (L6) -------------
-
-
-def test_the_commission_backfill_writes_only_the_row_whose_raw_it_read(conn):
-    """L6: the UPDATE matched on `trade_id` alone, so another broker's fill with
-    the same id took this one's commission currency."""
-    from optjournal.db import _backfill_commission_currency
-
-    _statement_row(conn)
-    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="ibkr",
-                  raw='{"ibCommissionCurrency": "USD"}')
-    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="schwab", raw="{}")
-    conn.execute("UPDATE trades SET ib_commission_currency = NULL")
-
-    assert _backfill_commission_currency(conn) == 1
-    got = dict(conn.execute("SELECT broker, ib_commission_currency FROM trades"))
-    assert got == {"ibkr": "USD", "schwab": None}
-
-
-def test_the_base_commission_repair_writes_only_the_row_it_found(conn):
-    """L6, the same key in the repair: only the mis-converted row is rewritten."""
-    from optjournal.db import _repair_base_commission
-
-    conn.execute(
-        "INSERT INTO statements (source_file, sha256, account_id, from_date,"
-        " to_date, base_currency, asset_filter, ingested_at)"
-        " VALUES ('s.xml', 'x', 'U1', '2026-07-01', '2026-07-31', 'EUR', 'ALL', 'now')")
-    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="ibkr",
-                  currency="SEK", ib_commission=-1.7,
-                  ib_commission_currency="EUR", ib_commission_base=-0.15)
-    _insert_trade(conn, trade_id="1", ib_exec_id="E1", broker="schwab",
-                  currency="SEK", ib_commission=-3.0,
-                  ib_commission_currency="SEK", ib_commission_base=-0.27)
-
-    assert _repair_base_commission(conn) == 1
-    got = dict(conn.execute("SELECT broker, ib_commission_base FROM trades"))
-    assert got == {"ibkr": -1.7, "schwab": -0.27}
 
 
 # --- a statement file holding two accounts (M4) --------------------------------

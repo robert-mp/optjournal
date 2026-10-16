@@ -536,6 +536,73 @@ def test_the_scheduler_runs_the_history_import_once_and_then_never_again(
     assert mod.reconcile(conn, ctx=ctx, now=sunday + timedelta(days=6)) == []
 
 
+@pytest.mark.parametrize(("stop", "retried"), [
+    ("busy", True), ("unreachable", True), ("lock", True), ("refused", False),
+])
+def test_a_history_import_stopped_by_a_passing_error_is_tried_again_and_a_refusal_is_not(
+    conn, ctx, clock, monkeypatch, stop, retried
+):
+    """The journal's own run 907: the first of four chunks landed, IBKR answered
+    the fourth with 1019 ("try again shortly"), and the run recorded `ok`, so the
+    import was done for good with a year still owed. A stop that clears by itself
+    is a failed run the schedule tries again a day later; a refusal is final once
+    years have landed."""
+    from datetime import UTC, datetime
+    from functools import partial
+
+    from conftest import RAW_DIR, add_statement
+    from py_ibkr import FlexError
+
+    from optjournal import jobs as mod
+    from optjournal import sync
+    from optjournal.archive import newest_statement
+    from optjournal.flex import FlexBusy, FlexUnreachable
+    from optjournal.locks import LockTimeout
+
+    raised = {
+        "busy": FlexBusy("IBKR could not answer just now (error 1019)", "1019"),
+        "unreachable": FlexUnreachable("URL Error: nodename nor servname provided"),
+        "lock": LockTimeout("raw/.fetch.lock held by another fetch"),
+        "refused": FlexError("Flex API Error 1003: Statement is not available."),
+    }[stop]
+
+    class _Fetched:
+        raw_path = newest_statement(RAW_DIR)
+
+    asked: list[str] = []
+
+    def fetch(*_a, from_date, **_k):
+        asked.append(from_date)
+        if len(asked) % 2 == 0:
+            raise raised
+        return _Fetched()
+
+    monkeypatch.setattr(sync, "history_plan", lambda *_a, **_k: [
+        ("20240802", "20250801"), ("20230804", "20240802")])
+    monkeypatch.setattr(sync, "fetch", fetch)
+    monkeypatch.setattr(sync, "_snapshot", lambda _conn: None)
+    monkeypatch.setattr(mod, "import_history",
+                        partial(sync.import_history, sleep=lambda _s: None))
+    monkeypatch.setattr(mod, "JOBS", (mod.job_by_name("history"),))
+    add_statement(conn, source_file="activity-20261002.xml")
+    conn.commit()
+
+    sunday = datetime(2026, 10, 4, 15, 0, tzinfo=UTC)
+    clock["t"] = sunday
+    assert mod.reconcile(conn, ctx=ctx, now=sunday) == ["history"]
+    run = conn.execute("SELECT status, done, total FROM job_runs").fetchone()
+    assert (run["done"], run["total"]) == (1, 2), "the year that landed is counted"
+    assert run["status"] == ("failed" if retried else "ok")
+
+    later = sunday + timedelta(seconds=mod.ONCE_RETRY_S - 60)
+    assert mod.reconcile(conn, ctx=ctx, now=later) == [], "retried inside a day"
+    next_day = sunday + timedelta(seconds=mod.ONCE_RETRY_S + 60)
+    assert mod.reconcile(conn, ctx=ctx, now=next_day) == (
+        ["history"] if retried else []), (
+        "a year IBKR only asked us to wait for was never asked again" if retried
+        else "a refusal was asked again")
+
+
 def test_a_catchup_window_is_bounded_and_only_ever_offers_the_latest_instant():
     """A week, so a laptop shut for days collects on its first tick, and never a
     backlog: only the most recent instant is ever offered.
@@ -1279,7 +1346,8 @@ def test_a_query_id_saved_while_serving_reaches_the_next_run(
         handed.append(query_id)
         if job == "sync":
             return {"changed": False, "summary": "stub", "new_trades": 0}
-        return {"fetched": [], "planned": 0, "stopped": None, "summary": "stub"}
+        return {"fetched": [], "planned": 0, "stopped": None, "retryable": False,
+                "summary": "stub"}
 
     monkeypatch.setattr(jobs, "sync_journal", shared_path)
     monkeypatch.setattr(jobs, "import_history", shared_path)
@@ -2090,7 +2158,9 @@ def test_a_backed_off_window_job_is_retried_once_per_window_not_never():
     Their failures do not brake, so they retry on every 60 s tick, and five
     minutes offline was enough to reach the limit. Backed off, a failed attempt
     now brakes like a poll: once per `window_s`, which is also the cadence a
-    healthy poll keeps.
+    healthy poll keeps. `confirm` brakes so from its first failure, because each
+    attempt spends an IBKR request: four more inside four minutes answered a
+    "too many requests" (1018) with more requests.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -2106,9 +2176,13 @@ def test_a_backed_off_window_job_is_retried_once_per_window_not_never():
         assert name not in _names(just), f"a backed-off {name} retried after a tick"
         late = _due(now, last_try={name: epoch - window}, failures=backed)
         assert name in _names(late), f"a backed-off {name} is never retried"
-        # And below the limit a failure still retries on the next tick.
+        # Below the limit a failure still retries on the next tick, unless the
+        # attempt spends an IBKR request.
         fresh = _due(now, last_try={name: epoch - 60}, failures={name: 1})
-        assert name in _names(fresh), f"{name} lost its quick retry before backing off"
+        if name == "bars_live":
+            assert name in _names(fresh), f"{name} lost its quick retry"
+        else:
+            assert name not in _names(fresh), f"{name} asked IBKR again after a tick"
 
 
 def test_the_payload_says_when_a_job_is_backed_off(conn):
@@ -2808,15 +2882,18 @@ def test_the_history_import_is_never_due():
     ({"fetched": ["a"], "planned": 3, "stopped": "refused"}, "ok"),
     ({"fetched": [], "planned": 3, "stopped": "refused"}, "failed"),
     ({"fetched": [], "planned": 0, "stopped": None}, "nothing"),
+    # But a stop that clears by itself leaves the rest to ask again.
+    ({"fetched": ["a"], "planned": 3, "stopped": "busy", "retryable": True}, "failed"),
 ])
 def test_the_history_outcome_names_what_happened(reply, status, monkeypatch, tmp_path):
     from optjournal import jobs
 
     monkeypatch.setattr(jobs, "import_history",
-                        lambda **_k: {**reply, "summary": "s"})
+                        lambda **_k: {"retryable": False, **reply, "summary": "s"})
     ctx = jobs.Context(archive_dir=tmp_path, db_path=tmp_path / "j.db", query_id="1")
     outcome = jobs._history(None, ctx)
     assert outcome.status == status
+    assert outcome.transient is bool(reply.get("retryable"))
     assert (outcome.done, outcome.total) == (len(reply["fetched"]), reply["planned"])
 
 
@@ -3112,6 +3189,72 @@ def test_waiting_out_the_fetch_lock_is_busy_for_the_confirm_poll_too(
     ).fetchone()[0] == jobs.FAILURE_BACKOFF, "the runner's busy run lifted the backoff"
 
 
+def test_a_confirm_poll_converts_at_one_live_rate_per_currency(
+    conn, ctx, monkeypatch, tmp_path
+):
+    """The job's own path, with no rate injected: a confirm carries no FX rate,
+    so `ingest._live_rate_for` fetches one per currency, every base figure is
+    converted at it, and the row is marked estimated."""
+    from conftest import add_statement
+    from test_confirms import CONFIRM_XML
+
+    from optjournal import jobs, marketdata
+    from optjournal.flex import ConfirmFetch
+    from optjournal.marketdata import Quote
+
+    confirm = tmp_path / "confirm-20260924.xml"
+    confirm.write_text(CONFIRM_XML, encoding="utf-8")
+    quoted: list[str] = []
+
+    def fetch_quote(symbol, **_k):
+        quoted.append(symbol)
+        return Quote(symbol=symbol, price=0.8795, at=1790244000,
+                     previous_close=None, currency="EUR")
+
+    monkeypatch.setattr(jobs.prefs, "confirm_query_id", lambda *a, **k: "1621016")
+    monkeypatch.setattr(jobs, "fetch_confirms", lambda *_a, **_k: ConfirmFetch(
+        raw_path=confirm, raw_bytes=confirm.stat().st_size))
+    monkeypatch.setattr(marketdata, "fetch_quote", fetch_quote)
+    add_statement(conn)                                       # an EUR account
+    conn.commit()
+
+    jobs.run_job(conn, "confirm", ctx=ctx)
+    run = conn.execute("SELECT status, done, total FROM job_runs").fetchone()
+    assert (run["status"], run["done"], run["total"]) == ("ok", 1, 1)
+    assert quoted == ["USDEUR=X"], "not one live rate per currency"
+    fill = conn.execute(
+        "SELECT fx_rate_to_base, proceeds_base, ib_commission_base,"
+        " fx_rate_estimated FROM trades WHERE trade_id = '1592002840'").fetchone()
+    assert tuple(fill) == pytest.approx((0.8795, 980 * 0.8795, -1.393368 * 0.8795, 1))
+
+
+@pytest.mark.parametrize("error", ["busy", "unreachable"])
+def test_a_confirm_poll_ibkr_could_not_answer_is_a_passing_failure_not_a_crash(
+    conn, ctx, monkeypatch, error
+):
+    """A 1018 or a dropped connection is the schedule's to retry, recorded the way
+    the sync records it, rather than a traceback in the log."""
+    from conftest import add_statement
+
+    from optjournal import jobs
+    from optjournal.flex import FlexBusy, FlexUnreachable
+
+    raised = (FlexBusy("IBKR could not answer just now (error 1018)", "1018")
+              if error == "busy" else FlexUnreachable("URL Error: timed out"))
+
+    def fetch_confirms(*_a, **_k):
+        raise raised
+
+    monkeypatch.setattr(jobs.prefs, "confirm_query_id", lambda *a, **k: "1621016")
+    monkeypatch.setattr(jobs, "fetch_confirms", fetch_confirms)
+    add_statement(conn)
+    conn.commit()
+    jobs.run_job(conn, "confirm", ctx=ctx)
+    row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
+    assert row["status"] == "failed"
+    assert jobs.clears_by_itself(row["detail"]), row["detail"]
+
+
 def _confirm_due(conn, now) -> bool:
     """Whether `confirm` is due at `now`, read from the ledger as `reconcile` does."""
     from optjournal import jobs as mod
@@ -3174,7 +3317,9 @@ def test_meeting_the_fetch_lock_does_not_lift_a_backoff(conn, clock):
     start = datetime(2026, 9, 30, 15, 0, tzinfo=UTC)             # 11:00 ET
     asked: list[datetime] = []
     busy_at = None
-    for minute in range(45):
+    # A failing confirm asks once a window, so five failures take five windows.
+    span = mod.FAILURE_BACKOFF * window + timedelta(minutes=15)
+    for minute in range(int(span.total_seconds()) // 60):
         clock["t"] = start + timedelta(minutes=minute)
         if not _confirm_due(conn, clock["t"]):
             continue
@@ -3189,7 +3334,7 @@ def test_meeting_the_fetch_lock_does_not_lift_a_backoff(conn, clock):
 
     assert busy_at is not None, "the job never backed off, so nothing was tested"
     quick = mod.FAILURE_BACKOFF
-    assert len(asked) == quick + 1, f"{len(asked)} requests in 45 minutes: {asked}"
+    assert len(asked) == quick + 1, f"{len(asked)} requests in {span}: {asked}"
     assert asked[quick] == busy_at + timedelta(minutes=1), (
         "the attempt a busy run stood for waited a window instead of the next tick")
     assert all(b - a >= window for a, b in zip(asked[quick - 1:], asked[quick:],
@@ -3259,10 +3404,10 @@ def test_a_week_offline_never_asks_ibkr_faster_than_a_healthy_week(
 
     What the numbers mean. Before the fix `confirm` made its five quick retries on
     Monday morning and then never ran again (that was H7), and `sync` made one
-    attempt per scheduled noon. Now `sync` is unchanged, and `confirm` keeps its
-    five quick retries and then asks once per 25-minute window, the cadence a
-    WORKING poll keeps. So an outage costs at most what a healthy week spends, plus
-    those five, and no two backed-off requests are closer than a window.
+    attempt per scheduled noon. Now `sync` is unchanged, and `confirm` asks once
+    per 25-minute window from its first failure, the cadence a WORKING poll keeps.
+    So an outage costs at most what a healthy week spends, and no two requests are
+    closer than a window.
     """
     import socket
     from datetime import UTC, datetime, timedelta
@@ -3316,19 +3461,18 @@ def test_a_week_offline_never_asks_ibkr_faster_than_a_healthy_week(
         "Tue 12:00", "Wed 12:00", "Thu 12:00", "Fri 12:00", "Sat 12:00"]
     assert len(sync) <= 5 + mod.FAILURE_BACKOFF
 
-    # `confirm`: at most a healthy week's polls, plus the five quick retries.
+    # `confirm`: at most a healthy week's polls.
     job = mod.job_by_name("confirm")
     session_s = ((mod.SESSION_CLOSE_H * 60 + mod.SESSION_TAIL_M)
                  - (mod.SESSION_OPEN_H * 60 + mod.SESSION_OPEN_M)) * 60
     healthy_week = 5 * (session_s // job.window_s + 1)
-    assert len(confirm) <= healthy_week + mod.FAILURE_BACKOFF, (
+    assert len(confirm) <= healthy_week, (
         f"{len(confirm)} confirm requests in a week offline, against "
         f"{healthy_week} for a healthy week"
     )
     gaps = [(b - a).total_seconds() for a, b in zip(confirm, confirm[1:], strict=False)]
-    assert min(gaps) >= mod.TICK_S, "two confirm requests inside one tick"
-    assert min(gaps[mod.FAILURE_BACKOFF - 1:]) >= job.window_s, (
-        "a backed-off confirm poll asked IBKR more often than a healthy one"
+    assert min(gaps) >= job.window_s, (
+        "a failing confirm poll asked IBKR more often than a healthy one"
     )
     assert all(mod._in_session(t) for t in confirm), "a confirm request out of session"
     # And it is no longer parked: every session of the week was tried.

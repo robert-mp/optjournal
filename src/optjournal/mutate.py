@@ -445,9 +445,9 @@ MUTANTS: tuple[Mutant, ...] = (
     # same events under two sources and asserts both survive.
     Mutant(
         key="qty-lossless",
-        module="sources.py",
-        find="    return i if abs(f - i) < 1e-9 else f",
-        replace="    return i",
+        module="fills.py",
+        find="    return whole if abs(value - whole) < 1e-9 else value",
+        replace="    return whole",
         breaks="a 0.0007-share fill would be stored as 0 shares",
     ),
     Mutant(

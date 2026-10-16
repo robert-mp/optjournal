@@ -217,22 +217,17 @@ def test_a_failed_snapshot_does_not_fail_the_sync_it_protects(populated, monkeyp
     conn.close()
 
 
-def test_the_snapshot_is_taken_on_the_sync_path_and_not_as_its_own_job():
+def test_the_snapshot_is_not_its_own_job():
     """Placement is the argument, so it is worth an assertion.
 
     Beside the write it protects, it cannot be the thing that silently stopped
     running -- the same reasoning that turned `bars-audit` from a cron into a
     page-load field, and this project has now watched three scheduled jobs report
-    health for two days while doing nothing.
+    health for two days while doing nothing. That the sync takes it is
+    `test_a_sync_that_changed_something_writes_one_snapshot`.
     """
-    import inspect  # noqa: PLC0415 - local to this test
-
     from optjournal.jobs import JOBS  # noqa: PLC0415 - local to this test
-    from optjournal.sync import sync_journal  # noqa: PLC0415 - local
 
-    assert "_snapshot(" in inspect.getsource(sync_journal), (
-        "the sync no longer snapshots, so nothing captures the perishable bars"
-    )
     assert not [job for job in JOBS if "snap" in job.name or "backup" in job.name], (
         "the snapshot became a scheduled job, which makes it something that can "
         "stop running unnoticed"
@@ -283,6 +278,81 @@ def test_a_sync_that_changed_nothing_writes_no_snapshot(populated, monkeypatch):
         "the day something actually happened"
     )
     assert result["snapshot"] is None
+
+
+def test_a_sync_that_changed_something_writes_one_snapshot(tmp_path, monkeypatch):
+    """The twin of the test above: a statement that brings trades leaves a
+    readable copy of the journal beside it, named in the reply."""
+    import sqlite3  # noqa: PLC0415 - local to this test
+
+    from optjournal import sync as mod  # noqa: PLC0415 - local to this test
+    from optjournal.archive import newest_statement  # noqa: PLC0415 - local
+    from optjournal.db import open_journal  # noqa: PLC0415 - local to this test
+
+    archive = newest_statement(RAW_DIR)
+
+    class _Fetched:
+        raw_path = archive
+        raw_bytes = archive.stat().st_size
+        is_duplicate = False
+
+    monkeypatch.setattr(mod, "fetch", lambda *_a, **_k: _Fetched())
+    with open_journal(tmp_path / "journal.db") as conn:
+        result = mod.sync_journal(conn=conn, archive_dir=RAW_DIR, query_id="1591754")
+        trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+
+    assert result["changed"] is True and result["new_trades"] == trades > 0
+    taken = sorted((tmp_path / mod.SNAPSHOT_DIR).glob("*.db"))
+    assert [p.name for p in taken] == [result["snapshot"]], "the sync took no snapshot"
+    copy = sqlite3.connect(taken[0])
+    assert copy.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == trades
+    copy.close()
+
+
+def test_a_confirm_landing_during_a_sync_is_not_the_syncs_new_trade(
+    populated, monkeypatch, tmp_path,
+):
+    """The confirm poll runs on the scheduler's thread while the page's Sync runs
+    on its own, and "new" was every trade first seen since the sync began. So a
+    confirm ingested meanwhile made a byte-identical statement report a new trade
+    and take a snapshot of nothing the statement brought."""
+    from test_confirms import CONFIRM_XML
+
+    from optjournal import ingest
+    from optjournal import sync as mod  # noqa: PLC0415 - local to this test
+    from optjournal.archive import newest_statement  # noqa: PLC0415 - local
+    from optjournal.db import connect  # noqa: PLC0415 - local to this test
+
+    archive = newest_statement(RAW_DIR)
+    confirm = tmp_path / "confirm-20260924.xml"
+    confirm.write_text(CONFIRM_XML, encoding="utf-8")
+    conn = connect(populated)
+
+    class _Fetched:
+        raw_path = archive
+        raw_bytes = archive.stat().st_size
+        is_duplicate = True
+
+    def fetch(*_a, **_k):
+        ingest.ingest_confirms(conn, confirm, base_currency="EUR",
+                               assets=ingest.ASSET_FILTER_ALL,
+                               rate_for=lambda _ccy: (0.87, True))
+        return _Fetched()
+
+    # Seconds apart, so the confirm is after the sync began and the fixture's
+    # own ingest is before it (see the no-snapshot test above).
+    monkeypatch.setattr(mod, "_now", lambda: "2099-01-01T00:00:00+00:00")
+    monkeypatch.setattr(ingest, "_now", lambda: "2099-01-01T00:00:05+00:00")
+    monkeypatch.setattr(mod, "fetch", fetch)
+    calls = []
+    monkeypatch.setattr(mod, "_snapshot", lambda conn: calls.append(conn))
+    result = mod.sync_journal(conn=conn, archive_dir=RAW_DIR, query_id="1591754")
+    landed = conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE source_file = ?", (confirm.name,),
+    ).fetchone()[0]
+    conn.close()
+    assert landed == 1, "premise: the confirm landed while the sync ran"
+    assert (result["new_trades"], result["changed"], calls) == (0, False, [])
 
 
 # --------------------------------------------------------------------------

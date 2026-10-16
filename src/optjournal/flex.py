@@ -930,11 +930,6 @@ class ConfirmFetch:
 
     raw_path: Path
     raw_bytes: int
-    duplicate_of: Path | None = None
-
-    @property
-    def is_duplicate(self) -> bool:
-        return self.duplicate_of is not None
 
 
 def fetch_confirms(
@@ -1000,19 +995,13 @@ def fetch_confirms(
         # evening poll in Europe is already tomorrow in UTC, and filed Monday's
         # session under Tuesday's name, where Tuesday's first poll then
         # overwrote it.
-        path, duplicate_of = _archive(
+        path, _ = _archive(
             raw, archive_dir, prefix=CONFIRM_PREFIX,
             stamp=_payload_to_date(raw) or datetime.now(UTC).strftime("%Y%m%d"),
         )
-        if duplicate_of is not None:
-            log.info("confirms identical to %s; not archiving a second copy",
-                     path.name)
-        else:
-            log.info("archived %d bytes to %s", len(raw), path)
+        log.info("archived %d bytes to %s", len(raw), path)
         _record_fetch(archive_dir, query_id, hashlib.sha256(raw).hexdigest(), path)
-        return ConfirmFetch(
-            raw_path=path, raw_bytes=len(raw), duplicate_of=duplicate_of,
-        )
+        return ConfirmFetch(raw_path=path, raw_bytes=len(raw))
 
 
 _PAYLOAD_TO_DATE = re.compile(rb'<FlexStatement\s[^>]*?toDate="(\d{8})"')

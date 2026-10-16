@@ -263,3 +263,15 @@ class StatementMeta:
     #: "this statement is a day stale" answerable without refetching.
     generated_at: str | None
     base_currency: str
+
+
+def exact_quantity(value: float | None) -> int | float | None:
+    """A count as the seam carries it: whole as `int`, a fraction as it is.
+
+    One rule for every source that reads a count, so a 0.0007-share fill is
+    never stored as 0 and a whole one is an exact integer (db.py's quantity note).
+    """
+    if value is None:
+        return None
+    whole = int(round(value))
+    return whole if abs(value - whole) < 1e-9 else value

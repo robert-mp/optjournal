@@ -149,23 +149,6 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def _f(value: Any) -> float | None:
-    """Coerce to float, tolerating None and blank strings."""
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _s(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value)
-    return text or None
-
-
 @contextmanager
 def _all_or_nothing(conn: sqlite3.Connection) -> Iterator[None]:
     """Write one statement completely or not at all, then commit.

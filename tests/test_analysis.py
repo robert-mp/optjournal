@@ -524,7 +524,7 @@ def test_taxes_use_the_same_sign_convention():
 # Truncating per fill rather than once at the end is what made it severe: any
 # fill under one whole unit contributed nothing at all. The archive holds
 # 0.0007-share IBKR fills and 1.79-share dividend-reinvestment buys, so this is
-# not a hypothetical shape. db.py's schema note and `ingest._quantity` both
+# not a hypothetical shape. db.py's schema note and `fills.exact_quantity` both
 # already treat a fractional lot as lossless; this is the third place that has
 # to agree, and it was the one that did not.
 

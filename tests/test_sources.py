@@ -110,12 +110,13 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
     including for a fill fetched from IBKR long after the direct-read code was
     deleted. That is what makes this a comparison rather than a snapshot.
 
-    `broker` and `source_kind` are excluded from the hash because the pre-seam
-    schema had no such columns, and `first_seen_at` because it is a wall clock
-    rather than data. A column added since is not evidence about the seam either
-    way, and re-baselining the hashes to absorb one would throw away the only
-    thing that makes them a comparison: they came from running the deleted code,
-    and it cannot be run again to produce a new set.
+    So the hash reads `pre_seam_columns`, the columns the pre-seam ingest wrote,
+    less `broker` and the wall-clock `first_seen_at`. A column added since is not
+    evidence about the seam either way, and re-baselining the hashes to absorb
+    one would throw away the only thing that makes them a comparison: they came
+    from running the deleted code, and it cannot be run again to produce a new
+    set. Popping each new column instead missed `pnl_estimated` (schema 18), and
+    the test failed on live data from then on.
     """
     if not LIVE_STATEMENTS:
         pytest.skip("needs the optional live acceptance corpus")
@@ -138,6 +139,16 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
         # yet both versions agree on the row. The strongest form of the claim.
         "1534769849": "572d8269a9a2471e",   # PLTR 260918P130, sold to open
     }
+    pre_seam_columns = (
+        "trade_id", "ib_exec_id", "transaction_id", "ib_order_id", "account_id",
+        "trade_date", "date_time", "asset_category", "symbol", "conid",
+        "underlying_symbol", "underlying_conid", "put_call", "strike", "expiry",
+        "multiplier", "buy_sell", "open_close", "notes", "level_of_detail",
+        "quantity", "trade_price", "currency", "fx_rate_to_base", "proceeds",
+        "proceeds_base", "ib_commission", "ib_commission_base",
+        "ib_commission_currency", "taxes", "fifo_pnl_realized",
+        "fifo_pnl_realized_base", "mtm_pnl", "raw", "source_file",
+    )
 
     conn = connect_migrated(tmp_path / "seam.db")
     for path in LIVE_STATEMENTS:
@@ -153,17 +164,9 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
         row = rows.get(trade_id)
         if row is None:
             continue
-        row.pop("first_seen_at", None)
-        row.pop("broker", None)
-        row.pop("source_kind", None)
-        # Provenance added after the baseline, like `source_kind` above: it records
-        # whether the FX rate came from the broker, and for an Activity Statement
-        # it is always 0. Popped rather than re-baselined, because the claim under
-        # test is that the seam produces the same FIGURES, and a column the
-        # pre-seam code had no concept of is not one of them.
-        row.pop("fx_rate_estimated", None)
+        pre_seam = {column: row[column] for column in pre_seam_columns}
         actual = hashlib.sha256(
-            json.dumps(row, sort_keys=True, default=str).encode()
+            json.dumps(pre_seam, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
         assert actual == expected, (
             f"trade {trade_id} ({row.get('symbol')}) no longer ingests to the "
@@ -468,6 +471,33 @@ def test_ingest_reads_no_broker_vocabulary_of_its_own():
         f"ingest.py reads IBKR's own vocabulary: {leaked}. Read it in sources.py "
         f"and hand the writer a normalised shape."
     )
+
+
+def test_an_open_position_is_its_summary_row_not_its_last_lot(tmp_path):
+    """With the Flex query's Lot option ticked, IBKR follows each SUMMARY row with
+    one LOT row per opening. They share the position's key, so the last lot used
+    to overwrite the summary: a -5 put made of lots of -3 and -2 was stored as -2,
+    with that lot's cost."""
+    summary = 'conid="985393011"'
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    (row,) = [line for line in text.splitlines() if "<OpenPosition " in line
+              and summary in line]
+    lots = "".join(
+        "\n" + row.replace('levelOfDetail="SUMMARY"', 'levelOfDetail="LOT"')
+        .replace('position="-5"', f'position="{qty}"')
+        .replace('costBasisMoney="-2521.75"', f'costBasisMoney="{cost}"')
+        for qty, cost in ((-3, -1500), (-2, -1021.75))
+    )
+    assert 'position="-5"' in row and 'costBasisMoney="-2521.75"' in row
+    path = tmp_path / STATEMENTS[0].name
+    path.write_text(text.replace(row, row + lots), encoding="utf-8")
+
+    conn = connect_migrated(tmp_path / "j.db")
+    ingest_file(conn, path)
+    stored = conn.execute(
+        "SELECT position, cost_basis_money FROM position_snapshots"
+        " WHERE conid = '985393011'").fetchall()
+    assert [tuple(r) for r in stored] == [(-5, -2521.75)]
 
 
 # --- the base currency is read from the statement, never assumed (L2) ---------

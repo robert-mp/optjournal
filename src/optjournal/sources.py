@@ -38,6 +38,7 @@ from optjournal.fills import (
     NormalisedPosition,
     NormalisedSecurity,
     StatementMeta,
+    exact_quantity,
 )
 
 
@@ -123,15 +124,6 @@ def _f(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _qty(value: Any) -> int | float | None:
-    """Integers exact, fractions lossless -- see db.py's quantity note."""
-    f = _f(value)
-    if f is None:
-        return None
-    i = int(round(f))
-    return i if abs(f - i) < 1e-9 else f
 
 
 def _model_dump(model: Any) -> dict[str, Any]:
@@ -226,7 +218,7 @@ class IbkrSource:
             open_close=_enum_value(t.openCloseIndicator),
             notes=_notes(t.notes),
             level_of_detail=_enum_value(t.levelOfDetail),
-            quantity=_qty(t.quantity),
+            quantity=exact_quantity(_f(t.quantity)),
             trade_price=_f(t.tradePrice),
             currency=_s(t.currency),
             fx_rate_to_base=_f(t.fxRateToBase) or 1.0,
@@ -277,6 +269,10 @@ class IbkrSource:
         from optjournal.sections import raw_sections
 
         for row in raw_sections(path).get("OpenPositions") or ():
+            # The query's Lot option adds a LOT row per opening under the
+            # SUMMARY row's key, and the last lot then overwrote the position.
+            if (row.get("levelOfDetail") or "SUMMARY") != "SUMMARY":
+                continue
             yield NormalisedPosition(
                 contract_id=_s(row.get("conid")) or "",
                 account_id=_s(row.get("accountId")) or "",
@@ -288,7 +284,7 @@ class IbkrSource:
                 strike=_f(row.get("strike")),
                 expiry=_s(row.get("expiry")),
                 multiplier=_f(row.get("multiplier")),
-                quantity=_qty(row.get("position")),
+                quantity=exact_quantity(_f(row.get("position"))),
                 mark_price=_f(row.get("markPrice")),
                 position_value=_f(row.get("positionValue")),
                 cost_basis=_f(row.get("costBasisMoney")),

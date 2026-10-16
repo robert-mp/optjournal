@@ -255,8 +255,8 @@ def test_a_migration_does_not_drop_a_view_from_under_a_reader(tmp_path):
     that way. Recombining them is what made this test lie once already.
 
     The lock is still necessary -- two interleaved migrations are their own
-    problem -- but the load-bearing guard is `schema_is_current`: a migration that
-    does not run cannot drop a view.
+    problem -- but the load-bearing guard is `db._stale_views`: a migration drops
+    only a view whose definition changed, so in the steady state it drops none.
     """
     import sqlite3
     import threading
@@ -303,51 +303,6 @@ def test_a_migration_does_not_drop_a_view_from_under_a_reader(tmp_path):
     assert not errors, (
         f"a migration dropped a view from under a reader: {sorted(set(errors))}"
     )
-
-
-def test_a_current_schema_is_not_migrated_again(tmp_path):
-    """The guard that actually closes the race: don't run when nothing is needed.
-
-    Not an optimisation. A migration that does not run cannot drop a view, and the
-    steady state of any journal is that no migration is needed -- so the common
-    path stops touching the schema at all.
-    """
-    from optjournal.db import SCHEMA_VERSION, connect, migrate, schema_is_current
-
-    path = tmp_path / "j.db"
-    conn = connect(path)
-    assert not schema_is_current(conn), "an empty file cannot be current"
-    migrate(conn)
-    assert schema_is_current(conn)
-    assert migrate(conn) == SCHEMA_VERSION, "a no-op migrate still reports the version"
-
-    # A missing view means NOT current, however right the version stamp looks --
-    # which is the state a half-run migration leaves behind.
-    conn.execute("DROP VIEW trade_orders")
-    assert not schema_is_current(conn), (
-        "the check must look at the views, not just the version: dropping one is "
-        "exactly the damage it exists to notice"
-    )
-    migrate(conn)
-    assert schema_is_current(conn), "migrate did not repair the missing view"
-    conn.close()
-
-
-def test_a_brand_new_database_is_migrated_rather_than_skipped(tmp_path):
-    """The first-open case, which the check must answer False for and not raise.
-
-    `schema_version` does not exist yet on an empty file, so a naive check throws
-    `no such table` and every fresh journal fails to initialise. Caught by the
-    reader/migrator test above, which starts from an empty file.
-    """
-    from optjournal.db import connect, migrate, schema_is_current
-
-    conn = connect(tmp_path / "fresh.db")
-    assert schema_is_current(conn) is False
-    migrate(conn)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM trade_orders").fetchone()[0] == 0
-    conn.close()
 
 
 def test_open_journal_rolls_back_a_failed_write(tmp_path):

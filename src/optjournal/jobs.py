@@ -477,8 +477,10 @@ def _history(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     after the first sync (`Catchup.ONCE`), or by hand from Settings.
 
     `ok` when anything was fetched, even if a later chunk was refused: the years
-    that landed are real, and the refusal is named in the detail. `failed` only
-    when the first chunk was refused, because then nothing happened.
+    that landed are real, and the refusal is named in the detail. `failed` when
+    the first chunk was refused, because then nothing happened, and whenever the
+    stop clears by itself (IBKR's "try again shortly"), so the years still owed
+    are asked again `ONCE_RETRY_S` later rather than never.
     """
     query_id = prefs.query_id(ctx.query_id)       # per run: see `Context`
     if not query_id:
@@ -493,6 +495,8 @@ def _history(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     except (TokenMissing, TokenRejected) as exc:
         return _credentials(exc)
     fetched, planned = len(result["fetched"]), result["planned"]
+    if result["retryable"]:
+        return Outcome("failed", result["summary"], fetched, planned, transient=True)
     if fetched:
         return Outcome("ok", result["summary"], fetched, planned)
     return Outcome("failed" if result["stopped"] else "nothing",
@@ -548,12 +552,9 @@ def _confirm(conn: sqlite3.Connection, ctx: Context) -> Outcome:
         result = fetch_confirms(
             query_id, archive_dir=ctx.archive_dir, cooldown_s=CONFIRM_COOLDOWN_S,
         )
-    except FetchCooldown as exc:
-        return Outcome("nothing", f"cooldown: {exc}")
-    except KeychainAsleep as exc:
-        return _busy(exc)
-    except (TokenMissing, TokenRejected) as exc:
-        return _credentials(exc)
+    except (FetchCooldown, TokenMissing, TokenRejected, KeychainAsleep,
+            FlexBusy, FlexUnreachable) as exc:
+        return sync_outcome(exc)
 
     ingested = ingest_confirms(
         conn, result.raw_path, base_currency=base, assets=ctx.assets or ASSET_FILTER_ALL,
@@ -1139,7 +1140,8 @@ def _window_due(
     which is what lets a session be polled several times.
 
     A failed poll does not brake, so a transient failure retries on the next tick.
-    Once the job is BACKED OFF, a failed attempt brakes like a poll, which slows it
+    Once the job is BACKED OFF, or from the first failure for a job that spends an
+    IBKR request (`due_jobs`), a failed attempt brakes like a poll, which slows it
     to one attempt per window: the cadence it keeps when healthy, so a backed-off
     `confirm` never asks IBKR more often than a working one does. `last_try` is
     then the last attempt that could have asked (`due_jobs` passes it from
@@ -1286,10 +1288,12 @@ def due_jobs(
         if job.catchup is Catchup.WINDOW:
             # A backed-off job's window runs from its last ATTEMPT, which `tries`
             # knows and `last_try` does not: a busy run asked nothing.
+            # One that spends an IBKR request brakes from its first failure: its
+            # quick retries answered a 1018 ("too many requests") with four more.
             asked = (last_try.get(job.name) if tries is None
                      else max(tries.get(job.name, ()), default=None))
-            found = _window_due(job, now, last_poll.get(job.name),
-                                last_try=asked, backed_off=backed_off)
+            found = _window_due(job, now, last_poll.get(job.name), last_try=asked,
+                                backed_off=backed_off or job.spends_broker_request)
             if found is not None:
                 out.append(found)
             continue

@@ -32,7 +32,6 @@ Design notes, and the reasoning behind the non-obvious choices:
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import sqlite3
@@ -42,8 +41,7 @@ from pathlib import Path
 from optjournal.locks import locked
 
 __all__ = ["ACTIVITY_SOURCE", "CONFIRM_SOURCE", "DEFAULT_BROKER",
-           "SCHEMA_VERSION", "connect", "migrate",
-           "open_journal", "schema_is_current"]
+           "SCHEMA_VERSION", "connect", "migrate", "open_journal"]
 
 log = logging.getLogger(__name__)
 
@@ -794,91 +792,6 @@ _VIEWS = ("trade_legs", "trade_orders", "option_legs", "option_orders",
           "current_option_positions")
 
 
-def _backfill_commission_currency(conn: sqlite3.Connection) -> int:
-    """Fill ib_commission_currency from each row's own stored `raw` payload.
-
-    The column arrived after these rows were written, so a journal that has been
-    ingesting for months holds the value in `raw` and NULL in the column. No
-    broker request is needed to recover it: `raw` is the statement's own trade
-    object, ibCommissionCurrency included.
-
-    Not gated on schema_version. The version is stamped the first time migrate()
-    runs after the bump, which for any journal that has merely been OPENED since
-    then is already in the past -- a one-shot hook would silently never fire.
-    Instead the work defines its own guard: rows that still need it, and whose
-    `raw` can actually supply it. After one pass that set is empty and this costs
-    a single indexless count on a table of a few hundred rows; it can never loop.
-
-    Self-terminating in practice: after one pass the only rows still matching are
-    those whose `raw` carries the key with an empty value, which no statement
-    observed does -- and those cost a parse per open, never a write. The narrower
-    alternative (only rows with non-zero commission) left a repaired journal
-    disagreeing with a fresh ingest of the same archive on 127 zero-commission
-    rows, which makes "rebuild from the archive and compare" useless as a check.
-
-    Returns the number of rows filled, so a caller can log or test it.
-    """
-    pending = conn.execute(
-        "SELECT broker, trade_id, raw FROM trades"
-        " WHERE ib_commission_currency IS NULL"
-        "   AND raw LIKE '%ibCommissionCurrency%'"
-    ).fetchall()
-    filled = 0
-    for row in pending:
-        try:
-            payload = json.loads(row["raw"])
-        except (TypeError, ValueError):
-            continue  # a raw we cannot parse is not a reason to fail an open
-        ccy = payload.get("ibCommissionCurrency")
-        if not ccy:
-            continue
-        # Keyed like the table, (broker, trade_id): another broker may number a
-        # fill the same, and its row must not take this one's currency.
-        conn.execute(
-            "UPDATE trades SET ib_commission_currency = ?"
-            " WHERE broker = ? AND trade_id = ?",
-            (str(ccy), row["broker"], row["trade_id"]),
-        )
-        filled += 1
-    return filled
-
-
-def _repair_base_commission(conn: sqlite3.Connection) -> int:
-    """Recompute ib_commission_base where it was converted at the wrong rate.
-
-    `fxRateToBase` belongs to the INSTRUMENT's currency, and the original ingest
-    applied it to the commission unconditionally. That is right whenever the two
-    currencies agree -- which is every row on this account except FX conversions,
-    where IBKR bills the commission in the BASE currency while the row's currency
-    is the pair's quote. A EUR amount times a SEK->EUR rate stored a figure 11x
-    too small.
-
-    Only rows the data can definitively correct are touched: commission billed in
-    the base currency needs no conversion at all, so the base value IS the native
-    value. A commission in some third currency has no rate anywhere in the
-    statement and is deliberately left alone rather than guessed at.
-
-    Self-terminating for the same reason as the backfill: after one pass no row
-    matches the WHERE, so this costs one count per open. Returns rows repaired.
-    """
-    rows = conn.execute(
-        "SELECT t.broker, t.trade_id, t.ib_commission, s.base_currency"
-        " FROM trades t JOIN statements s ON s.source_file = t.source_file"
-        " WHERE t.ib_commission IS NOT NULL AND t.ib_commission <> 0"
-        "   AND t.ib_commission_currency IS NOT NULL"
-        "   AND t.ib_commission_currency <> t.currency"
-        "   AND t.ib_commission_currency = s.base_currency"
-        "   AND t.ib_commission_base IS NOT t.ib_commission"
-    ).fetchall()
-    for row in rows:
-        conn.execute(
-            "UPDATE trades SET ib_commission_base = ib_commission"
-            " WHERE broker = ? AND trade_id = ?",
-            (row["broker"], row["trade_id"]),
-        )
-    return len(rows)
-
-
 #: IBKR's compact forms, as SQLite GLOB patterns: `20260924` and `20260924;101659`.
 _COMPACT_DAY = "[0-9]" * 8
 _COMPACT_STAMP = _COMPACT_DAY + ";" + "[0-9]" * 6
@@ -921,9 +834,9 @@ def _normalise_confirm_dates(conn: sqlite3.Connection) -> int:
     the ones already written, including the statements rows the confirms
     opened and the journal entries that took their `opened_on` from a confirm.
 
-    Self-terminating like the backfills: it touches only values still in the
-    compact form, which no parsed row is. Trades are scoped to confirm rows so a
-    hand-built activity row is never rewritten. Returns rows changed.
+    Self-terminating: it touches only values still in the compact form, which
+    no parsed row is. Trades are scoped to confirm rows so a hand-built activity
+    row is never rewritten. Returns rows changed.
     """
     changed = 0
     for table, column, pattern, rewrite, scope in _COMPACT_DATE_COLUMNS:
@@ -1065,23 +978,6 @@ def _rekey_by_broker(conn: sqlite3.Connection, table: str,
     return True
 
 
-def _late_indexes_current(conn: sqlite3.Connection) -> bool:
-    """Whether indexes created after column migrations match the shipped SQL."""
-    stored = {
-        row["name"]: " ".join((row["sql"] or "").split())
-        for row in conn.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
-        )
-    }
-    for statement in _LATE_INDEXES:
-        match = re.search(r"CREATE UNIQUE INDEX (\w+)", statement)
-        if match is None:
-            raise RuntimeError(f"cannot determine index name from {statement!r}")
-        if stored.get(match.group(1)) != " ".join(statement.split()):
-            return False
-    return True
-
-
 def _refresh_late_indexes(conn: sqlite3.Connection) -> None:
     """Create or replace indexes whose definition changed."""
     stored = {
@@ -1182,85 +1078,27 @@ def _stale_views(conn: sqlite3.Connection) -> list[str]:
     ]
 
 
-def schema_is_current(conn: sqlite3.Connection) -> bool:
-    """Whether a migration would change anything structural. Cheap, and strict.
-
-    Checked, in order of cost: the version stamp, then every view's DEFINITION
-    (not merely its existence), then every `_ADDED_COLUMNS` column.
-
-    An earlier draft checked only version and view existence, and `test_db` caught
-    it -- the suite already pinned the contract it broke. `migrate` HEALS a journal
-    whose stamp looks right: `_ADDED_COLUMNS` runs ALTERs and two backfills repair
-    rows predating a column. "The version matches" is a different question from
-    "nothing needs doing", and answering the wrong one silently disabled every
-    self-healing path here.
-
-    The row-level BACKFILLS are deliberately not part of this, which is why
-    `migrate` does not use this function to skip itself -- see there. This answers
-    a narrower question: is the STRUCTURE current.
-    """
-    try:
-        row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
-    except sqlite3.OperationalError:
-        return False        # no schema_version table: nothing has been applied yet
-    if not row or row["v"] != SCHEMA_VERSION:
-        return False
-    if _stale_views(conn):
-        return False
-    if not _late_indexes_current(conn):
-        return False
-    for table in {table for table, _column, _decl in _ADDED_COLUMNS}:
-        columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-        if not columns:
-            return False    # the table itself is missing
-        wanted = {c for t, c, _d in _ADDED_COLUMNS if t == table}
-        if not wanted <= columns:
-            return False
-    return True
-
-
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply the schema when it is not already applied. Returns the version.
 
-    TWO guards, and the ORDER OF DISCOVERY here is worth recording because the
-    first one alone looked sufficient and was not.
-
-    `open_journal` migrates on every request, and the first thing a migration does
-    is DROP EVERY VIEW. Two overlapping requests meant one dropping the views the
-    other was querying, reaching the browser as `HTTP 500: no such table:
+    `open_journal` migrates on every request, and a migration used to begin by
+    DROPPING EVERY VIEW. Two overlapping requests meant one dropping the views
+    the other was querying, reaching the browser as `HTTP 500: no such table:
     current_option_positions`.
 
-    The cross-process lock (`locks`) was the first fix, and it is necessary: two
-    migrations must not interleave, and a `threading.Lock` cannot say that across
-    the cron and the server. But it is NOT SUFFICIENT, and the test that said
-    otherwise was mine and was wrong. It ran migrate-then-read inside each worker,
-    so every reader happened to hold the lock while reading. A real reader takes no
-    lock at all -- `/api/state` migrates, releases, and only then runs its SELECTs.
-    Re-measured with readers and migrators as separate threads: 4,941 failures.
-    Over real HTTP it appears from four concurrent requests upward (3 of 40), which
-    my original "0 in 10" missed only because it used two.
+    The cross-process lock (`locks`) is necessary, because two migrations must
+    not interleave and a `threading.Lock` cannot say that across processes. It
+    is NOT SUFFICIENT: a real reader takes no lock -- `/api/state` migrates,
+    releases, and only then runs its SELECTs. Measured with readers and
+    migrators as separate threads, 4,941 failures; over real HTTP it appears
+    from four concurrent requests upward (3 of 40).
 
-    So the second guard is the load-bearing one: DO NOT MIGRATE WHEN THE SCHEMA IS
-    ALREADY CURRENT. A migration that does not run cannot drop a view, and the
-    steady state of a journal is that no migration is needed. The lock still covers
-    the case where one IS needed -- startup, or the first open after a version bump.
-
-    The check is deliberately outside the lock. Reading a version and a view list
-    needs no exclusion: if it races with a real migration it can only answer "not
-    current", and the lock then serialises the work.
-
-    WHY THIS DOES NOT SIMPLY RETURN EARLY WHEN `schema_is_current`. That was the
-    first attempt and `test_db` refused it, correctly: three tests require that
-    merely OPENING a journal heals it -- an ALTER for a column added after ship, and
-    two backfills that repair rows written before one. Skipping the whole migration
-    on a current-looking stamp disabled all of that silently. The row-level repairs
-    cannot be detected more cheaply than they can be performed, so they run every
-    time; they are idempotent and measured in milliseconds.
-
-    So the fix is narrower and lands where the damage actually was: `_stale_views`
-    means a view is dropped only when its stored SQL differs from the shipped SQL.
-    In the steady state nothing is dropped, so there is nothing for a concurrent
-    reader to miss, and the healing still happens.
+    What closes the race is `_stale_views`: a view is dropped only when its
+    stored SQL differs from the shipped SQL, so in the steady state nothing is
+    dropped and there is nothing for a concurrent reader to miss. The rest runs
+    on every open, because merely OPENING a journal heals it (an ALTER for a
+    column added after ship, a rekey, a row repair guarded by its own WHERE),
+    and every step is idempotent and measured in milliseconds.
     """
     lock = _lock_path(conn)
     if lock is None:
@@ -1298,20 +1136,14 @@ def _migrate_unlocked(conn: sqlite3.Connection) -> int:
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-    # After the ALTER, so the column exists to be written into. Here rather than
-    # behind the version bump: the stamp is written the first time migrate() runs
-    # after the bump, so for a journal merely OPENED since then a one-shot hook
-    # would silently never fire. The backfill guards itself instead.
-    # After the ALTER that adds `broker`, and before the backfills, so anything
-    # they write lands in the rebuilt table rather than in one about to be dropped.
+    # After the ALTER that adds `broker`, and before the row repair, so anything
+    # it writes lands in the rebuilt table rather than in one about to be dropped.
     for table, want_pk, ddl in _REKEYED_TABLES:
         _rekey_by_broker(conn, table, want_pk, ddl)
     _refresh_late_indexes(conn)
-    _backfill_commission_currency(conn)
-    # After the backfill, which is what makes the mismatch detectable: the
-    # repair's WHERE compares ib_commission_currency, so on a journal that has
-    # not been backfilled yet there is nothing for it to find.
-    _repair_base_commission(conn)
+    # Not behind the version bump: the stamp is written the first time migrate()
+    # runs after the bump, so for a journal merely OPENED since then a one-shot
+    # hook would never fire. The repair guards itself instead.
     _normalise_confirm_dates(conn)
     row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
     current = row["v"] if row and row["v"] is not None else 0

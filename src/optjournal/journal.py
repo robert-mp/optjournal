@@ -129,14 +129,6 @@ class Entry:
     #: a present key holding None was cleared.
     values: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def is_empty(self) -> bool:
-        """Nothing written. A row can reach this by having every field cleared,
-        and `save` deletes rather than storing one -- an empty entry would count
-        against journal completeness while saying nothing.
-        """
-        return not any(v not in (None, "") for v in self.values.values())
-
     def payload(self) -> dict[str, Any]:
         return {
             "broker": self.broker,
@@ -159,8 +151,8 @@ def _clean(value: Any) -> str | None:
 
     One rule for every field, so a cleared textarea and an untouched one are the
     same absence. `''` and `None` would otherwise both mean "nothing written"
-    while comparing unequal, and `is_empty` would then depend on which surface
-    did the writing.
+    while comparing unequal, and whether `save` deletes an emptied entry would
+    then depend on which surface did the writing.
     """
     if value is None:
         return None
