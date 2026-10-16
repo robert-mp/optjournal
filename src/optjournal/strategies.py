@@ -22,10 +22,9 @@ are a roll (one leg closes an expiry, another opens the next), which is a
 statement about the *fills*, not about position lineage: the episode model in
 `history.py` still ends one episode and starts another, unlinked.
 
-The grouping RULE itself lives in `campaigns.py`, not here. It has a second
-consumer -- the Dashboard's scoreboard, which must count a roll as one decision
-rather than two wins -- and `stats.py` cannot import this module. What stays
-here is naming the shape and aggregating the legs.
+The grouping RULE itself lives in `campaigns.py`, not here, because `stats.py`
+and `serialize.py` resolve positions too (the open-position count, the journal).
+What stays here is naming the shape and aggregating the legs.
 """
 
 from __future__ import annotations
@@ -320,10 +319,8 @@ def position_groups(
     the accounting layer already knows it: `history.py` FIFO-matches fills
     into per-conid episodes, so the open and the close share an episode.
 
-    The union itself is `campaigns.link`'s, handed in rather than recomputed,
-    which is what makes this card and the Dashboard's win rate the same reading
-    of the same fills. Before, the rule was written here and the scoreboard
-    counted episodes, so a roll drew ONE card while the headline said two wins.
+    The union itself is `campaigns.link`'s, handed in rather than recomputed, so
+    this card and the open-position count read the same positions.
 
     Two deliberate consequences, both `campaigns.py`'s:
 
