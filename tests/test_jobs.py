@@ -2158,7 +2158,9 @@ def test_a_backed_off_window_job_is_retried_once_per_window_not_never():
     Their failures do not brake, so they retry on every 60 s tick, and five
     minutes offline was enough to reach the limit. Backed off, a failed attempt
     now brakes like a poll: once per `window_s`, which is also the cadence a
-    healthy poll keeps.
+    healthy poll keeps. `confirm` brakes so from its first failure, because each
+    attempt spends an IBKR request: four more inside four minutes answered a
+    "too many requests" (1018) with more requests.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -2174,9 +2176,13 @@ def test_a_backed_off_window_job_is_retried_once_per_window_not_never():
         assert name not in _names(just), f"a backed-off {name} retried after a tick"
         late = _due(now, last_try={name: epoch - window}, failures=backed)
         assert name in _names(late), f"a backed-off {name} is never retried"
-        # And below the limit a failure still retries on the next tick.
+        # Below the limit a failure still retries on the next tick, unless the
+        # attempt spends an IBKR request.
         fresh = _due(now, last_try={name: epoch - 60}, failures={name: 1})
-        assert name in _names(fresh), f"{name} lost its quick retry before backing off"
+        if name == "bars_live":
+            assert name in _names(fresh), f"{name} lost its quick retry"
+        else:
+            assert name not in _names(fresh), f"{name} asked IBKR again after a tick"
 
 
 def test_the_payload_says_when_a_job_is_backed_off(conn):
@@ -3183,6 +3189,33 @@ def test_waiting_out_the_fetch_lock_is_busy_for_the_confirm_poll_too(
     ).fetchone()[0] == jobs.FAILURE_BACKOFF, "the runner's busy run lifted the backoff"
 
 
+@pytest.mark.parametrize("error", ["busy", "unreachable"])
+def test_a_confirm_poll_ibkr_could_not_answer_is_a_passing_failure_not_a_crash(
+    conn, ctx, monkeypatch, error
+):
+    """A 1018 or a dropped connection is the schedule's to retry, recorded the way
+    the sync records it, rather than a traceback in the log."""
+    from conftest import add_statement
+
+    from optjournal import jobs
+    from optjournal.flex import FlexBusy, FlexUnreachable
+
+    raised = (FlexBusy("IBKR could not answer just now (error 1018)", "1018")
+              if error == "busy" else FlexUnreachable("URL Error: timed out"))
+
+    def fetch_confirms(*_a, **_k):
+        raise raised
+
+    monkeypatch.setattr(jobs.prefs, "confirm_query_id", lambda *a, **k: "1621016")
+    monkeypatch.setattr(jobs, "fetch_confirms", fetch_confirms)
+    add_statement(conn)
+    conn.commit()
+    jobs.run_job(conn, "confirm", ctx=ctx)
+    row = conn.execute("SELECT status, detail FROM job_runs").fetchone()
+    assert row["status"] == "failed"
+    assert jobs.clears_by_itself(row["detail"]), row["detail"]
+
+
 def _confirm_due(conn, now) -> bool:
     """Whether `confirm` is due at `now`, read from the ledger as `reconcile` does."""
     from optjournal import jobs as mod
@@ -3245,7 +3278,9 @@ def test_meeting_the_fetch_lock_does_not_lift_a_backoff(conn, clock):
     start = datetime(2026, 9, 30, 15, 0, tzinfo=UTC)             # 11:00 ET
     asked: list[datetime] = []
     busy_at = None
-    for minute in range(45):
+    # A failing confirm asks once a window, so five failures take five windows.
+    span = mod.FAILURE_BACKOFF * window + timedelta(minutes=15)
+    for minute in range(int(span.total_seconds()) // 60):
         clock["t"] = start + timedelta(minutes=minute)
         if not _confirm_due(conn, clock["t"]):
             continue
@@ -3260,7 +3295,7 @@ def test_meeting_the_fetch_lock_does_not_lift_a_backoff(conn, clock):
 
     assert busy_at is not None, "the job never backed off, so nothing was tested"
     quick = mod.FAILURE_BACKOFF
-    assert len(asked) == quick + 1, f"{len(asked)} requests in 45 minutes: {asked}"
+    assert len(asked) == quick + 1, f"{len(asked)} requests in {span}: {asked}"
     assert asked[quick] == busy_at + timedelta(minutes=1), (
         "the attempt a busy run stood for waited a window instead of the next tick")
     assert all(b - a >= window for a, b in zip(asked[quick - 1:], asked[quick:],
@@ -3330,10 +3365,10 @@ def test_a_week_offline_never_asks_ibkr_faster_than_a_healthy_week(
 
     What the numbers mean. Before the fix `confirm` made its five quick retries on
     Monday morning and then never ran again (that was H7), and `sync` made one
-    attempt per scheduled noon. Now `sync` is unchanged, and `confirm` keeps its
-    five quick retries and then asks once per 25-minute window, the cadence a
-    WORKING poll keeps. So an outage costs at most what a healthy week spends, plus
-    those five, and no two backed-off requests are closer than a window.
+    attempt per scheduled noon. Now `sync` is unchanged, and `confirm` asks once
+    per 25-minute window from its first failure, the cadence a WORKING poll keeps.
+    So an outage costs at most what a healthy week spends, and no two requests are
+    closer than a window.
     """
     import socket
     from datetime import UTC, datetime, timedelta
@@ -3387,19 +3422,18 @@ def test_a_week_offline_never_asks_ibkr_faster_than_a_healthy_week(
         "Tue 12:00", "Wed 12:00", "Thu 12:00", "Fri 12:00", "Sat 12:00"]
     assert len(sync) <= 5 + mod.FAILURE_BACKOFF
 
-    # `confirm`: at most a healthy week's polls, plus the five quick retries.
+    # `confirm`: at most a healthy week's polls.
     job = mod.job_by_name("confirm")
     session_s = ((mod.SESSION_CLOSE_H * 60 + mod.SESSION_TAIL_M)
                  - (mod.SESSION_OPEN_H * 60 + mod.SESSION_OPEN_M)) * 60
     healthy_week = 5 * (session_s // job.window_s + 1)
-    assert len(confirm) <= healthy_week + mod.FAILURE_BACKOFF, (
+    assert len(confirm) <= healthy_week, (
         f"{len(confirm)} confirm requests in a week offline, against "
         f"{healthy_week} for a healthy week"
     )
     gaps = [(b - a).total_seconds() for a, b in zip(confirm, confirm[1:], strict=False)]
-    assert min(gaps) >= mod.TICK_S, "two confirm requests inside one tick"
-    assert min(gaps[mod.FAILURE_BACKOFF - 1:]) >= job.window_s, (
-        "a backed-off confirm poll asked IBKR more often than a healthy one"
+    assert min(gaps) >= job.window_s, (
+        "a failing confirm poll asked IBKR more often than a healthy one"
     )
     assert all(mod._in_session(t) for t in confirm), "a confirm request out of session"
     # And it is no longer parked: every session of the week was tried.
