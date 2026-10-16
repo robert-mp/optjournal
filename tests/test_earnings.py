@@ -20,7 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from optjournal.earnings import EarningsFetchError, parse_earnings
+from optjournal import earnings
+from optjournal.earnings import EarningsFetchError, fetch_earnings, parse_earnings
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "earnings"
 
@@ -76,3 +77,15 @@ def test_an_error_reply_is_a_failure_not_an_absence(code):
                "status": {"rCode": code, "bCodeMessage": None}}
     with pytest.raises(EarningsFetchError, match=str(code)):
         parse_earnings(payload)
+
+
+@pytest.mark.parametrize("mode", ["truncated", "hangup"])
+def test_a_reply_broken_off_mid_way_is_an_earnings_fetch_error(broken_http, monkeypatch, mode):
+    """`IncompleteRead` is an `http.client.HTTPException`, not an `OSError`.
+
+    It escaped `fetch_earnings`, past `web._refresh_earnings`, and failed the whole
+    quotes refresh with a 500, every quote and rank in it lost with the one date.
+    """
+    monkeypatch.setattr(earnings, "_URL", broken_http(mode) + "/{symbol}")
+    with pytest.raises(EarningsFetchError):
+        fetch_earnings("NKE", timeout=5)

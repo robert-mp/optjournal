@@ -26,6 +26,7 @@ measure it.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.error
@@ -111,7 +112,9 @@ def fetch_earnings(symbol: str, *, timeout: int = _TIMEOUT_S) -> Earnings | None
             payload = json.load(response)
     except urllib.error.HTTPError as exc:
         raise EarningsFetchError(f"{symbol} earnings: HTTP {exc.code}") from exc
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, OSError, ValueError,
+            http.client.HTTPException) as exc:
+        # `HTTPException` for a body cut short (IncompleteRead): see marketdata.
         raise EarningsFetchError(
             f"{symbol} earnings: {type(exc).__name__}: {exc}") from exc
     return parse_earnings(payload)
