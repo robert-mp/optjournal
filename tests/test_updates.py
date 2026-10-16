@@ -137,6 +137,16 @@ def test_a_release_whose_code_is_another_version_is_refused(tmp_path, monkeypatc
         updates.stage(_release("0.2.0"), root=root)
 
 
+def test_a_release_of_another_project_is_refused(tmp_path, monkeypatch, supervised):
+    root = _install(tmp_path)
+    other = b'[project]\nname = "not-optjournal"\nversion = "0.2.0"\n'
+    monkeypatch.setattr(updates, "_get",
+                        lambda _url, limit: _zipball(extra={"pyproject.toml": other}))
+    with pytest.raises(updates.UpdateRefused, match="not optjournal"):
+        updates.stage(_release(), root=root)
+    assert not (root / updates.STAGING).exists()
+
+
 def test_a_git_clone_is_never_updated_from_a_release(tmp_path, supervised):
     root = _install(tmp_path)
     (root / ".git").mkdir()
@@ -152,6 +162,53 @@ def test_an_unsupervised_server_cannot_restart_so_it_does_not_offer(tmp_path, mo
 def test_downloads_must_be_https():
     with pytest.raises(updates.UpdateRefused, match="HTTPS"):
         updates._get("http://example.com/x.zip", limit=10)
+
+
+def _answering(monkeypatch, body: bytes) -> list[tuple[str, float]]:
+    """`urlopen` answering `body`. Returns each URL it was asked, with its timeout."""
+    asked: list[tuple[str, float]] = []
+
+    def urlopen(request, *, timeout):
+        asked.append((request.full_url, timeout))
+        return io.BytesIO(body)
+
+    monkeypatch.setattr(updates, "urlopen", urlopen)
+    return asked
+
+
+def test_a_download_one_byte_over_its_limit_is_refused(monkeypatch):
+    asked = _answering(monkeypatch, b"x" * 11)
+    with pytest.raises(updates.UpdateRefused, match="more than 10 bytes"):
+        updates._get("https://example.com/x.zip", limit=10)
+    assert asked == [("https://example.com/x.zip", updates.TIMEOUT_S)]
+    _answering(monkeypatch, b"x" * 10)
+    assert updates._get("https://example.com/x.zip", limit=10) == b"x" * 10
+
+
+#: The real one: `conftest` replaces `updates.latest_release` in every test.
+_LATEST_RELEASE = updates.latest_release
+
+
+def test_githubs_latest_release_is_read_by_its_tag_and_a_tag_that_is_no_version_refused(
+        monkeypatch):
+    def latest(tag: str) -> bytes:
+        return json.dumps({
+            "tag_name": tag, "body": "What changed.",
+            "zipball_url": f"https://api.github.com/repos/robert-mp/optjournal/zipball/{tag}",
+            "html_url": f"https://github.com/robert-mp/optjournal/releases/tag/{tag}",
+        }).encode()
+
+    monkeypatch.delenv(updates.REPO_ENV, raising=False)
+    asked = _answering(monkeypatch, latest("v0.5.0"))
+    assert _LATEST_RELEASE() == updates.Release(
+        version="0.5.0", notes="What changed.",
+        zip_url="https://api.github.com/repos/robert-mp/optjournal/zipball/v0.5.0",
+        page_url="https://github.com/robert-mp/optjournal/releases/tag/v0.5.0")
+    assert asked == [("https://api.github.com/repos/robert-mp/optjournal/releases/latest",
+                      updates.TIMEOUT_S)]
+    _answering(monkeypatch, latest("nightly"))
+    with pytest.raises(updates.UpdateRefused, match="'nightly' is not a version"):
+        _LATEST_RELEASE()
 
 
 def test_an_interrupted_download_is_discarded_not_applied(tmp_path):
