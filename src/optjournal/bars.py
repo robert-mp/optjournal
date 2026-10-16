@@ -76,6 +76,11 @@ __all__ = [
 #: a Monday open is the previous Thursday.
 PAD_DAYS = 4
 
+#: Days after a window's end past which its stored bars are final. A daily job
+#: asks again for a window ending inside this, and never for one ending before it
+#: whose rows already run from its start.
+SETTLED_DAYS = 7
+
 #: Above this many calendar days a window is charted daily rather than hourly.
 #: Roughly four trading weeks: a 5-8 day hold wants hourly (21-42 points),
 #: while a months-long position wants daily or the series becomes thousands of
@@ -509,8 +514,12 @@ def backfill_bars(
     the market-hours poll. See :func:`bars_manifest`.
     """
     moment = now or datetime.now(UTC)
-    requests = bars_manifest(conn, now=moment, perishable_only=perishable_only)
     cutoff = int(moment.timestamp())
+    requests = [
+        request
+        for request in bars_manifest(conn, now=moment, perishable_only=perishable_only)
+        if not _settled(conn, request, cutoff)
+    ]
     written = skipped = 0
     failures: list[str] = []
     for request in requests:
@@ -547,6 +556,24 @@ def backfill_bars(
         requested=len(requests), written=written,
         skipped=skipped, failures=tuple(failures),
     )
+
+
+def _settled(conn: sqlite3.Connection, request: BarRequest, cutoff: int) -> bool:
+    """Whether a window ended over `SETTLED_DAYS` ago and is stored from its start.
+
+    From its START, not merely somewhere inside: an older statement ingested later
+    widens a window backwards, and a check for any row would never fetch the new
+    part. A week of slack covers the pad, a weekend and a holiday.
+    """
+    slack = SETTLED_DAYS * 86400
+    if request.end > cutoff - slack:
+        return False
+    first = conn.execute(
+        "SELECT MIN(ts) FROM price_bars WHERE conid = ? AND bar_size = ?"
+        " AND ts BETWEEN ? AND ?",
+        (request.conid, request.bar_size, request.start, request.end),
+    ).fetchone()[0]
+    return first is not None and first <= request.start + slack
 
 
 @dataclass(frozen=True, slots=True)

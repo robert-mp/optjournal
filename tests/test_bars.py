@@ -1071,6 +1071,47 @@ def test_backfill_treats_a_past_option_404_as_unavailable(conn):
     assert outcome.written >= 1, "the unavailable option abandoned its underlying"
 
 
+def test_a_window_long_closed_and_already_stored_is_not_asked_again(conn):
+    """A session's bars do not change once it has long closed, and the daily job
+    asked for every window the book ever implied, every day: 77 of 120 requests
+    were for windows that ended over a week before, ~21 s a run, growing with
+    every contract traded. A window whose stored rows do not reach its start is
+    still asked: an older statement ingested later widens it backwards.
+    """
+    for trade_id, day, open_close, quantity in (
+        ("open", "2026-01-05", "O", -1),
+        ("close", "2026-01-06", "C", 1),
+    ):
+        _option_trade(conn, conid="C1", symbol="AAA  260109P00100000",
+                      underlying="AAA", ucid="U1", date=day, trade_id=trade_id,
+                      open_close=open_close, quantity=quantity)
+    asked: list[tuple[str, str]] = []
+
+    def fetch(symbol, *, bar_size, start, end, source):
+        asked.append((symbol, bar_size))
+        return [_bar(start + DAY)]
+
+    def run() -> set[tuple[str, str]]:
+        asked.clear()
+        backfill_bars(conn, fetch=fetch, now=datetime(2026, 2, 1, tzinfo=UTC))
+        return set(asked)
+
+    first = run()
+    assert {("AAA  260109P00100000", "1d"), ("AAA", "1h"), ("AAA", "1d")} <= first
+    context = first - {("AAA  260109P00100000", "1d"), ("AAA", "1h"), ("AAA", "1d")}
+    assert context, "the context symbols' windows reach today"
+    assert run() == context, "a window that reaches this week is still asked"
+
+    for trade_id, day, open_close, quantity in (
+        ("old-open", "2025-11-03", "O", -1),
+        ("old-close", "2025-11-04", "C", 1),
+    ):
+        _option_trade(conn, conid="C0", symbol="AAA  251107P00100000",
+                      underlying="AAA", ucid="U1", date=day, trade_id=trade_id,
+                      open_close=open_close, quantity=quantity)
+    assert run() == context | {("AAA  251107P00100000", "1d"), ("AAA", "1h"), ("AAA", "1d")}
+
+
 def test_backfill_keeps_a_current_option_404_loud(conn):
     """A live contract missing from the source may be malformed or an outage."""
     _option_trade(
