@@ -61,8 +61,9 @@ throughout the window when `orders` and `history` were both crashing.
 registry, unlike the broker seam. That seam earned its abstraction by having a
 second implementation in prospect and a schema whose identity depended on it; a
 calendar has one feed, and an abstraction with one implementation is untested by
-construction — which this repo learned expensively (see PLAN.md's "a seam is only
-as good as the test that uses two of them"). What keeps a second feed possible is
+construction — which this repo learned expensively (the two-broker cases in
+`tests/test_sources.py` each caught a defect one broker could not show). What
+keeps a second feed possible is
 the `(source, event_id)` primary key, not an interface. So: add a second
 fetch/parse pair, and extract the Protocol *at that point*, when it can first be
 verified by two implementations.

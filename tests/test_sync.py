@@ -45,7 +45,7 @@ def populated(populated_db) -> Path:
 
 
 # --------------------------------------------------------------------------
-# The snapshot (SCHEDULER_PLAN.md step 5d).
+# The snapshot.
 #
 # This replaces the 100-line `backup.py` the draft plan proposed, and the reason
 # it shrank is worth keeping: the draft treated "`raw/` is the provenance root" as

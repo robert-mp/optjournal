@@ -566,7 +566,7 @@ CREATE TABLE IF NOT EXISTS campaign_links (
   PRIMARY KEY (broker, order_id, joins_order_id)
 );
 
--- The SCHEDULING ANCHOR: one row per job, forever. See SCHEDULER_PLAN.md step 4.
+-- The SCHEDULING ANCHOR: one row per job, forever. `jobs.py` writes it.
 --
 -- Separate from `job_runs` deliberately, and the reason is load-bearing rather
 -- than tidiness: run history has to be PRUNED, and a retention pass over one
@@ -634,7 +634,7 @@ CREATE TABLE IF NOT EXISTS job_runs (
 -- also the DST fall-back guard -- the repeated 01:30 is the same instant.
 --
 -- PARTIAL only so the index holds scheduled rows and nothing else. It is NOT what
--- keeps manual runs unconstrained, though SCHEDULER_PLAN.md says so and the first
+-- keeps manual runs unconstrained, though the scheduler plan said so and the first
 -- version of the test agreed: SQLite treats NULLs as DISTINCT in a unique index,
 -- so repeated `fired_for IS NULL` rows are accepted with or without the WHERE.
 -- Verified by ablation -- removing the clause left the test green. Kept for the

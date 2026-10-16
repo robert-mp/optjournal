@@ -162,7 +162,7 @@ class Quote:
     #:
     #: Probed live across nine symbols (six stocks, an ETF, a dual-class ticker and
     #: an OCC option): present on every one, in a 25-key block that carries no
-    #: implied vol. Not cached anywhere -- see the plan for why `watchlist` (the
+    #: implied vol. Not cached anywhere, because `watchlist` (the
     #: user-input table) and `securities.description` (one of six real watched
     #: symbols, and "TESLA INC" against this source's "Tesla, Inc.") are both the
     #: wrong home.

@@ -206,8 +206,8 @@ POLL_WORST_CASE_S = 2 * sum(
 #: IT EXISTS BECAUSE NOTHING ELSE BOUNDS A HUNG SOCKET. `py_ibkr` calls
 #: `urlopen(req)` with no timeout (py_ibkr/flex/client.py:109) and
 #: `socket.getdefaulttimeout()` is None -- both verified -- so a connection that
-#: opens and then stalls blocks forever. Today the only killer is the MeshClaw
-#: cron's 720s subprocess timeout, and SCHEDULER_PLAN.md deletes the cron. In the
+#: opens and then stalls blocks forever. The only killer was the MeshClaw
+#: cron's 720s subprocess timeout, and that cron is gone. In the
 #: app the same stall would hold a job thread, its file lock and its `running` row
 #: indefinitely, and Python cannot interrupt a thread blocked in a syscall -- so no
 #: `timeout_s` on a job spec could help. It has to be on the socket.

@@ -5627,7 +5627,7 @@ def test_the_kicker_names_what_the_server_says_is_carried():
 
 
 # --------------------------------------------------------------------------
-# The collection strip (SCHEDULER_PLAN.md step 4c).
+# The collection strip.
 #
 # The one panel whose job is to say whether this journal is still being fed.
 # Every assertion here exists because the FIRST version of this surface -- the
@@ -7172,8 +7172,7 @@ def test_the_search_input_carries_an_id():
 
 
 # --------------------------------------------------------------------------
-# POST /api/jobs/run, and the 503 guard that had to land with it
-# (SCHEDULER_PLAN.md step 5c).
+# POST /api/jobs/run, and the 503 guard that had to land with it.
 #
 # These use a SCRATCH archive rather than RAW_DIR, and that is not incidental:
 # `market` reaches a rate-limited feed and `sync` spends an IBKR request against a

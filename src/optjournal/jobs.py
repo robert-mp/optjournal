@@ -1,9 +1,7 @@
 """The run ledger: what a scheduled job did, recorded where the page can see it.
 
-SCHEDULER_PLAN.md step 4. This is the WRITE side of `job_state`/`job_runs`;
-`serialize.jobs_data` reads them. Deliberately the whole module for now -- step 5
-adds the registry and the runner here, and starting the file with only the ledger
-keeps that commit about scheduling rather than about plumbing.
+This is the WRITE side of `job_state`/`job_runs`, which `serialize.jobs_data`
+reads, and it holds the registry (`JOBS`), the runner and the reconciler.
 
 WHY THE CLI WRITES THIS AND NOT THE CRON. The plan said "the existing MeshClaw
 crons get a ~10-line helper to write a job_runs row". They cannot: a cron runs under
@@ -345,8 +343,8 @@ class Job:
     #: Whether a run consumes one of IBKR's rate-limited Flex requests. Read by
     #: the runner when a run fails: a job that spends none gives its instant back
     #: and is retried after `RETRY_AFTER_S`, while one that does keeps the claim,
-    #: which is the reason `sync` may not be made due again by a mere failure (see
-    #: the plan's step 6). A failed fetch may already have reached IBKR. The one
+    #: which is the reason `sync` may not be made due again by a mere failure,
+    #: since a failed fetch may already have reached IBKR. The one
     #: exception is a `transient` failure (IBKR unreachable or busy), retried after
     #: `RETRY_BROKER_AFTER_S` and at most `FAILURE_BACKOFF` times (`_gives_back`).
     spends_broker_request: bool = False
@@ -1026,7 +1024,7 @@ def interrupted_runs(conn: sqlite3.Connection, *, archive_dir: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Due-ness (SCHEDULER_PLAN.md step 6a).
+# Due-ness.
 #
 # A PURE FUNCTION over a clock and a ledger snapshot, which is the only reason the
 # whole catch-up policy is testable: every rule below is exercised by passing a
@@ -1344,7 +1342,7 @@ def due_jobs(
 
 
 # ---------------------------------------------------------------------------
-# The reconciler (SCHEDULER_PLAN.md step 6b).
+# The reconciler.
 #
 # A WALL-CLOCK CATCH-UP RECONCILER, NEVER A SLEEPING TIMER, and that is forced by
 # measurement rather than chosen for elegance. On this machine:

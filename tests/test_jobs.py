@@ -370,7 +370,7 @@ def test_a_journal_that_never_collected_is_not_a_stopped_collector(conn, populat
 
 
 # ---------------------------------------------------------------------------
-# The registry (SCHEDULER_PLAN.md step 5a).
+# The registry.
 #
 # THE REGISTRY BEING CODE IS THE POINT. MeshClaw's registration was an
 # unversioned, hand-typed side channel, and the consequence is measurable: four
@@ -650,7 +650,7 @@ def test_an_unknown_job_name_raises_its_own_type():
 
 
 # ---------------------------------------------------------------------------
-# The runner (SCHEDULER_PLAN.md step 5a), and the two hazards the plan measured.
+# The runner, and the two hazards measured before it was written.
 # ---------------------------------------------------------------------------
 
 
@@ -1385,7 +1385,7 @@ def test_a_job_that_left_the_registry_keeps_its_history_and_is_marked(conn):
 
 
 # ---------------------------------------------------------------------------
-# Due-ness (SCHEDULER_PLAN.md step 6a).
+# Due-ness.
 #
 # `due_jobs` is pure, so the whole catch-up and sleep policy is tested by passing a
 # clock rather than by waiting for one. That is the point of the shape: a scheduler
@@ -1908,7 +1908,7 @@ def test_a_claimed_instant_does_not_brake_the_live_poll():
 
 
 # ---------------------------------------------------------------------------
-# The reconciler thread (SCHEDULER_PLAN.md step 6b).
+# The reconciler thread.
 #
 # Every test here drives a SCRATCH journal and a stubbed registry. Nothing in this
 # file may reach a network: the tick's whole job is to start work, and the work is

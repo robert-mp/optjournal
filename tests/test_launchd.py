@@ -30,7 +30,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def agent() -> dict:
     if not PLIST.is_file():
-        pytest.fail(f"{PLIST} is missing; step 7 of SCHEDULER_PLAN.md adds it")
+        pytest.fail(f"{PLIST} is missing; it is what keeps `serve` running")
     with PLIST.open("rb") as handle:
         return plistlib.load(handle)
 
@@ -91,7 +91,7 @@ def test_the_plist_supervises_the_process_and_never_a_schedule(agent):
     assert agent["RunAtLoad"] is True
     assert "StartCalendarInterval" not in agent, (
         "the plist carries a schedule. The schedule is jobs.JOBS, in code, where a "
-        "test can read it -- see SCHEDULER_PLAN.md on why the side channel went."
+        "test can read it, not in a hand-typed side channel."
     )
     assert "StartInterval" not in agent, "same: no schedule in the plist"
 

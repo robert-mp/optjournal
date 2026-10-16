@@ -252,7 +252,7 @@ should get you running, not explain every decision.
 | [docs/theming.md](docs/theming.md) | the theme registry and the contrast rules |
 | [docs/trade-confirmations.md](docs/trade-confirmations.md) | same-session fills: the confirm query's real attribute names, the FX estimate they force, and how the two queries are ranked |
 | [docs/contributing.md](docs/contributing.md) | adding functionality, data safety, local development |
-| `PLAN.md`, `SCHEDULER_PLAN.md` | open work, with the measured scope for each step |
+| `PLAN.md` | the two tasks that wait for a second broker (the vocabulary rename and computed P&L), with the measured scope for each step |
 
 ## Development
 

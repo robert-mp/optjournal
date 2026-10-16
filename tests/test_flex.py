@@ -364,14 +364,14 @@ def test_an_unparseable_timestamp_does_not_wedge_fetching(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# The socket timeout (SCHEDULER_PLAN.md step 7).
+# The socket timeout.
 #
 # `py_ibkr` calls `urlopen(req)` with NO timeout (py_ibkr/flex/client.py:109) and
 # `socket.getdefaulttimeout()` is None, so a connection that opens and then stalls
 # blocks forever. Verified both facts before writing the fix.
 #
-# Today the only thing that kills such a stall is the MeshClaw cron's 720s
-# subprocess timeout, and the scheduler plan DELETES the cron. In the app the same
+# The only thing that killed such a stall was the MeshClaw cron's 720s
+# subprocess timeout, and that cron is gone. In the app the same
 # stall would hold a job thread, its file lock and its `running` row indefinitely --
 # and Python cannot interrupt a thread blocked in a syscall, so no amount of
 # `timeout_s` on the job spec would help. It has to be on the socket.

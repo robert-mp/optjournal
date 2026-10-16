@@ -844,7 +844,7 @@ def test_rekeying_is_idempotent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The job ledger (v8). SCHEDULER_PLAN.md step 4.
+# The job ledger (v8).
 # ---------------------------------------------------------------------------
 
 
@@ -884,7 +884,7 @@ def test_a_manual_run_is_never_blocked_by_the_schedule(tmp_path):
     """A Run-now press claims no scheduled slot, so it repeats freely.
 
     HONEST ABOUT WHAT THIS PROVES. The first version of this test claimed it was
-    demonstrating why the unique index is PARTIAL, and SCHEDULER_PLAN.md gives the
+    demonstrating why the unique index is PARTIAL, and the scheduler plan gave the
     same reason -- "the partial index is what keeps manual run-now presses
     unconstrained". Both are wrong, and ablation showed it: removing
     `WHERE fired_for IS NOT NULL` left this test green, because SQLite treats NULLs
