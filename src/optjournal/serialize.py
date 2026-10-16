@@ -1356,13 +1356,12 @@ def watchlist_data(
     session cap governs the daily figures only. Both still come off one
     deduplicated series, which is why the weekly reader is built on the daily one.
 
-    TWO OF THE ROW'S FACTS ARE TYPED, not measured: `note` and `earnings_on`. They
-    are the only ones stored on the watchlist table, because they are the only ones
-    with nowhere else to come from -- nothing this repo can reach publishes an
-    earnings date (see `db.py`'s column comment for what was probed). So the row
-    carries the date VERBATIM, and `earnings_in_days` beside it is derived here on
-    every read rather than stored; the surfaces label the pair as recorded rather
-    than fetched, which is the whole reason the column is honest.
+    TWO OF THE ROW'S FACTS ARE TYPED, not measured: `note` and `earnings_on`. The
+    earnings date can also be FETCHED (`earnings_next`, Nasdaq's from Zacks, see
+    `earnings`), and `earnings_date` is the one in force, the typed one winning.
+    `earnings_source` says whose it is, so no surface prints Zacks' estimate as a
+    date, and `earnings_in_days` beside it is derived here on every read rather
+    than stored.
 
     `now` exists so a countdown can be asserted without asserting the calendar. It
     is optional rather than required because every caller wants the same answer --
