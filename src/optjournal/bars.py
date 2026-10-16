@@ -65,6 +65,7 @@ __all__ = [
     "close_series",
     "ReplaySeries",
     "replay_bars",
+    "underlying_conids",
     "upsert_bars",
     "watch_closes",
     "weekly_closes",
@@ -283,7 +284,7 @@ def _bar_size_for(start: int, end: int, *, kind: str) -> str:
     return "1h" if span_days <= HOURLY_LIMIT_DAYS else "1d"
 
 
-def _underlying_conids(conn: sqlite3.Connection) -> dict[str, str]:
+def underlying_conids(conn: sqlite3.Connection) -> dict[str, str]:
     """Underlying symbol -> IBKR conid, from anywhere the journal states it.
 
     The LEAP has no trade row, so its underlying id has to come from another
@@ -325,7 +326,7 @@ def bars_manifest(
     pad = PAD_DAYS * 86400
     floor_start = int((moment - timedelta(days=SNAPSHOT_FLOOR_DAYS)).timestamp())
 
-    underlyings = _underlying_conids(conn)
+    underlyings = underlying_conids(conn)
     merged: dict[tuple[str, str], BarRequest] = {}
 
     def add(
@@ -579,7 +580,7 @@ def market_traded_on(conn: sqlite3.Connection, day: str) -> bool:
     happened. No bars for anyone means the market was shut; bars for the
     underlying but none for an option means collection failed.
     """
-    conids = set(_underlying_conids(conn).values())
+    conids = set(underlying_conids(conn).values())
     if not conids:
         return False
     placeholders = ", ".join("?" for _ in conids)
@@ -895,6 +896,7 @@ def replay_bars(
     conn: sqlite3.Connection,
     symbol: str,
     *,
+    conids: dict[str, str],
     opened_at: str | None,
     closed_at: str | None,
     now: datetime | None = None,
@@ -911,8 +913,10 @@ def replay_bars(
     The size actually drawn is returned so the panel can say which it is: a
     reader comparing two charts must not have to guess whether a flat stretch is
     a quiet week or a coarser grid.
+
+    ``conids`` is `underlying_conids`, read once by the caller: per call it
+    rescanned the trades table for every card on every page load.
     """
-    conids = _underlying_conids(conn)
     conid = conids.get(str(symbol or "").strip())
     if not conid:
         return ReplaySeries(conid=None, bar_size=None)
@@ -973,7 +977,7 @@ def fetch_watch_bars(
     """
     name = symbol.strip().upper()
     moment = now or datetime.now(UTC)
-    conid = _underlying_conids(conn).get(name) or f"watch:{name}"
+    conid = underlying_conids(conn).get(name) or f"watch:{name}"
     start = int((moment - timedelta(days=WATCH_LOOKBACK_DAYS)).timestamp())
     try:
         bars = (fetch or fetch_bars)(name, bar_size="1d", start=start,

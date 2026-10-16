@@ -61,7 +61,7 @@ from datetime import datetime, time
 from functools import cache
 from typing import Any
 
-from optjournal.bars import close_series, replay_bars
+from optjournal.bars import close_series, replay_bars, underlying_conids
 from optjournal.blackscholes import bs_delta, bs_price, expected_move, implied_vol
 from optjournal.clock import MARKET_TZ, epoch_et, et_day, expiry_epoch
 
@@ -901,6 +901,7 @@ def attach(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     whatever subset of trades you are looking at.
     """
     replays: dict[str, dict[str, Any]] = {}
+    underlyings = underlying_conids(conn)
 
     for lifecycle in state["lifecycles"]:
         conids = [str(c) for c in (lifecycle.get("conids") or [])]
@@ -919,7 +920,7 @@ def attach(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
             for leg in (order.get("legs") or [])
         ]
         bars = replay_bars(
-            conn, str(lifecycle.get("underlying") or ""),
+            conn, str(lifecycle.get("underlying") or ""), conids=underlyings,
             opened_at=opened, closed_at=closed,
         )
         # Grouped once and shared: the strikes and the marks must follow the same
@@ -971,7 +972,7 @@ def attach(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
         key = "pos:" + conid
         opened = row.get("open_date_time")
         bars = replay_bars(
-            conn, str(row.get("underlying_symbol") or ""),
+            conn, str(row.get("underlying_symbol") or ""), conids=underlyings,
             opened_at=opened, closed_at=None,
         )
         # One leg, shared by the strikes and the marks below: built twice they

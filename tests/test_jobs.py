@@ -264,7 +264,7 @@ def test_a_healthy_session_is_not_a_blackout(populated_db):
     """The other direction, so `blackout` is not simply always true.
 
     Uses the REAL archive rather than a hand-built row, and that is not laziness:
-    `market_traded_on` derives its underlying set from `_underlying_conids`, which
+    `market_traded_on` derives its underlying set from `underlying_conids`, which
     reads TRADES, not `securities`. A fixture that inserts a bar and a security row
     but no trade yields an empty conid set and `market_traded=False` -- which is how
     the first version of this test failed, looking like a code bug when it was a

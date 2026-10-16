@@ -28,6 +28,7 @@ from optjournal.bars import (
     close_series,
     last_traded_day,
     replay_bars,
+    underlying_conids,
     upsert_bars,
     watch_closes,
     weekly_closes,
@@ -561,6 +562,10 @@ def test_a_series_clips_to_the_window_inclusively(conn):
     assert got == [(200, 2.0), (300, 3.0)]
 
 
+def _replay(conn, symbol, **window):
+    return replay_bars(conn, symbol, conids=underlying_conids(conn), **window)
+
+
 def test_replay_picks_the_granularity_the_backfill_stored(conn):
     """The chart must ask for what the manifest wrote. Both use _bar_size_for,
     so a short trade gets hourly and a long one daily by construction rather
@@ -570,7 +575,7 @@ def test_replay_picks_the_granularity_the_backfill_stored(conn):
                   underlying="AAA", ucid="U1", date="2026-01-05", trade_id="o1")
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1h", source="yahoo",
                 bars=[_bar(_ts("2026-01-06"), 50.0), _bar(_ts("2026-01-07"), 51.0)])
-    got = replay_bars(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
+    got = _replay(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
     assert got.bar_size == "1h"
     assert got.conid == "U1"
     assert [c for _, c in got.points] == [50.0, 51.0]
@@ -584,7 +589,7 @@ def test_replay_falls_back_to_a_coarser_series_rather_than_drawing_nothing(conn)
                   underlying="AAA", ucid="U1", date="2026-01-05", trade_id="o1")
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
                 bars=[_bar(_ts("2026-01-06"), 50.0)])
-    got = replay_bars(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
+    got = _replay(conn, "AAA", opened_at="2026-01-05", closed_at="2026-01-12")
     assert got.bar_size == "1d", "hourly was empty, so daily should be drawn"
     assert got.points
 
@@ -601,7 +606,7 @@ def test_replay_of_a_snapshot_only_contract_draws_every_bar_held(conn):
         " raw, updated_at) "
         "VALUES ('OPTX', 'AAA  270101C00700000', 'AAA', 'U1', '{}', 'now')"
     )
-    got = replay_bars(conn, "AAA", opened_at=None, closed_at=None)
+    got = _replay(conn, "AAA", opened_at=None, closed_at=None)
     assert [c for _, c in got.points] == [10.0, 20.0]
 
 
@@ -612,7 +617,7 @@ def test_replay_of_an_unknown_symbol_is_empty_not_invented(conn):
     replay, so the unresolved case has to answer the same three questions the
     populated one does rather than be absent.
     """
-    got = replay_bars(conn, "NOPE", opened_at="2026-01-05", closed_at="2026-01-12")
+    got = _replay(conn, "NOPE", opened_at="2026-01-05", closed_at="2026-01-12")
     assert (got.conid, got.bar_size, got.points) == (None, None, [])
 
 
@@ -627,7 +632,7 @@ def test_context_is_counted_in_bars_not_calendar_days(conn):
     bars = [_bar(_ts("2026-01-01") + n * DAY, 100.0 + n) for n in range(40)]
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d",
                 source="yahoo", bars=bars)
-    got = replay_bars(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
+    got = _replay(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
     kept = [ts for ts, _ in got.points]
     before = [ts for ts in kept if ts < _ts("2026-01-12")]
     inside = [ts for ts in kept
@@ -661,7 +666,7 @@ def test_context_scales_with_the_window_it_pads(conn):
                 source="yahoo", bars=bars)
 
     def shape(opened: str, closed: str) -> tuple[int, int]:
-        got = replay_bars(conn, "BBB", opened_at=opened, closed_at=closed)
+        got = _replay(conn, "BBB", opened_at=opened, closed_at=closed)
         lo, hi = _ts(opened), _ts(closed) + DAY - 1
         kept = [ts for ts, _ in got.points]
         inside = sum(1 for ts in kept if lo <= ts <= hi)
@@ -703,7 +708,7 @@ def test_the_closing_session_belongs_to_the_trade(conn):
             _bar(close_day + 16 * 3600, 103.0)]
     upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d",
                 source="yahoo", bars=bars)
-    got = replay_bars(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
+    got = _replay(conn, "AAA", opened_at="2026-01-12", closed_at="2026-01-16")
     inside = [ts for ts, _ in got.points
               if _ts("2026-01-12") <= ts <= close_day + DAY - 1]
     assert len(inside) == 4, "the closing session's bars were treated as context"
@@ -721,7 +726,7 @@ def test_a_snapshot_only_window_is_not_trimmed(conn):
         " raw, updated_at) "
         "VALUES ('OPTY', 'AAA  270101C00700000', 'AAA', 'U1', '{}', 'now')"
     )
-    got = replay_bars(conn, "AAA", opened_at=None, closed_at=None)
+    got = _replay(conn, "AAA", opened_at=None, closed_at=None)
     assert len(got.points) == 30
 
 
