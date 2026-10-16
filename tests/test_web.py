@@ -10716,7 +10716,7 @@ def test_the_update_button_never_installs_a_version_that_is_not_newer(
     monkeypatch.setattr(updates, "_get", get)
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         status, reply = _post(base, "/api/update")
-    assert (status, reply["kind"], downloads) == (409, "refused", [])
+    assert (status, reply["kind"], downloads) == (409, "current", [])
     assert f"already version {current}" in reply["message"]
 
 
@@ -10800,6 +10800,34 @@ def test_a_banner_button_is_handed_back_after_any_failure(button, label, failure
     assert (out["disabled"], out["busy"], out["text"]) == (False, False, label)
     if failure != "never back":
         assert out["notes"] == ["bad"], "the failure was not reported"
+
+
+def test_an_update_already_installed_takes_its_banner_down():
+    """The server answers kind "current" when the newest release is the version it
+    runs, which a banner drawn from an older check can still offer. The banner goes,
+    and the note says why, rather than offering the same click again."""
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const notes=[]; let drawn=0;",
+        "const b={id:'updgo',textContent:'Update to 0.5.1',disabled:false,dataset:{},",
+        "  cls:new Set(),get classList(){const c=this.cls;",
+        "    return {add:k=>c.add(k),remove:k=>c.delete(k)};}};",
+        "const $=sel=>sel==='#updgo'?b:null;",
+        "const S={update:{latest:'0.5.1',current:'0.5.1',available:true}};",
+        "function note(text,kind){notes.push([kind,text]);}",
+        "function draw(){drawn++;}",
+        "async function awaitRestart(){throw new Error('no restart is due');}",
+        "const fetch=async()=>({json:async()=>({ok:false,kind:'current',",
+        "  message:'the newest release is 0.5.1, and this is already version 0.5.1'})});",
+        *_page_fns("bannerPost", "bindAppBanners"),
+        "bindAppBanners();",
+        "await b.onclick();",
+        "console.log(JSON.stringify({available:S.update.available,drawn,notes}));",
+    ])
+    assert out["available"] is False, "the banner still offers an update already in"
+    assert out["drawn"] == 1
+    assert out["notes"] == [["ok", "the newest release is 0.5.1, and this is "
+                                   "already version 0.5.1."]]
 
 
 @pytest.mark.parametrize(("replies", "reload_on"), [

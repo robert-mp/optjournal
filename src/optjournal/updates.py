@@ -76,6 +76,10 @@ class UpdateRefused(RuntimeError):
     """This install cannot, or must not, be updated from a release."""
 
 
+class UpdateCurrent(UpdateRefused):
+    """The newest release is not newer than the version running."""
+
+
 @dataclass(frozen=True)
 class Release:
     version: str
@@ -203,7 +207,7 @@ def stage(release: Release, *, root: Path = ROOT) -> Path:
     # an older release once a newer one is retracted.
     current = current_version(root)
     if not _newer(release.version, current):
-        raise UpdateRefused(f"the newest release is {release.version}, and this is "
+        raise UpdateCurrent(f"the newest release is {release.version}, and this is "
                             f"already version {current}")
     body = _get(release.zip_url, limit=MAX_DOWNLOAD_BYTES)
     if not zipfile.is_zipfile(io.BytesIO(body)):

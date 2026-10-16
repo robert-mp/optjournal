@@ -2171,6 +2171,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             release = updates.latest_release()
             updates.stage(release)
+        except updates.UpdateCurrent as exc:
+            # Its own kind, so a banner from an older check can take itself down.
+            return 409, {"ok": False, "kind": "current", "message": str(exc)}
         except updates.UpdateRefused as exc:
             return 409, {"ok": False, "kind": "refused", "message": str(exc)}
         except (OSError, ValueError, KeyError, zipfile.BadZipFile,

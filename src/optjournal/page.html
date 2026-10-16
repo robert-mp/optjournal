@@ -6217,6 +6217,10 @@ async function bannerPost(b,path,body,failed,started){
     if(!ures.ok) why=ures.message||'';
   }catch(e){why=String(e);}
   if(ures&&ures.ok){note(started(ures),'ok'); await awaitRestart();}
+  /* Already on the newest: the banner came from a check older than the update
+     that made it true, so it goes rather than offering the same click again. */
+  else if(ures&&ures.kind==='current'){
+    S.update={...S.update,available:false}; note(esc(why)+'.','ok'); draw(); return;}
   else note(failed+esc(why),'bad');
   b.disabled=false; b.classList.remove('busy'); b.textContent=label;
 }
