@@ -714,6 +714,34 @@ def test_the_closing_session_belongs_to_the_trade(conn):
     assert len(inside) == 4, "the closing session's bars were treated as context"
 
 
+@pytest.mark.parametrize("opened, closed", [
+    ("2026-07-01", "2026-08-05"),   # closed after 35 days
+    ("2026-06-28", None),           # open, 39 days old at _NOW
+])
+def test_replay_draws_the_grid_the_backfill_fetched(conn, opened, closed):
+    """The manifest pads a window 4 days each side before choosing hourly or
+    daily, so these holds are fetched daily. Sized from the bare hold, the chart
+    chose hourly and drew only what a shorter trade on the same name left: TSLA
+    opened 1 Jul and closed 5 Aug drew 98 hourly bars from 20 Jul, its first 13
+    sessions missing.
+    """
+    _option_trade(conn, conid="OPT1", symbol="AAA  261016P00100000",
+                  underlying="AAA", ucid="U1", date=opened, trade_id="o1")
+    if closed:
+        _option_trade(conn, conid="OPT1", symbol="AAA  261016P00100000",
+                      underlying="AAA", ucid="U1", date=closed, trade_id="c1",
+                      open_close="C", quantity=1)
+    fetched = {r.bar_size for r in bars_manifest(conn, now=_NOW) if r.conid == "U1"}
+    assert fetched == {"1d"}
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1d", source="yahoo",
+                bars=[_bar(_ts("2026-06-20") + n * DAY, 100.0 + n) for n in range(50)])
+    upsert_bars(conn, conid="U1", symbol="AAA", bar_size="1h", source="yahoo",
+                bars=[_bar(_ts("2026-07-20") + 14 * 3600 + n * DAY, 1.0) for n in range(15)])
+    got = _replay(conn, "AAA", opened_at=opened, closed_at=closed, now=_NOW)
+    assert got.bar_size in fetched
+    assert any(ts == _ts(opened) for ts, _ in got.points), "the opening session is drawn"
+
+
 def test_a_snapshot_only_window_is_not_trimmed(conn):
     """Nothing to be context FOR: with no entry date, everything held is the
     answer rather than a slice around a window that does not exist.

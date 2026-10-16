@@ -284,6 +284,25 @@ def _bar_size_for(start: int, end: int, *, kind: str) -> str:
     return "1h" if span_days <= HOURLY_LIMIT_DAYS else "1d"
 
 
+def _fetched_window(
+    opened: int | None, closed: int | None, moment: datetime
+) -> tuple[int, int]:
+    """The window the manifest fetches for one holding: padded, never past tomorrow.
+
+    `replay_bars` sizes its grid from this same window. Sized from the bare hold,
+    a 33 to 39 day hold chose hourly where the manifest had fetched daily.
+    """
+    ceiling = int((moment + timedelta(days=1)).timestamp())
+    pad = PAD_DAYS * 86400
+    # No opening fill in the archive: ask wide and let the source truncate
+    # to the contract's real listed life. Guessing an open date from the
+    # cost basis would match several sessions and state a fact we lack.
+    start = (opened - pad) if opened is not None else int(
+        (moment - timedelta(days=SNAPSHOT_FLOOR_DAYS)).timestamp())
+    end = min((closed + pad) if closed is not None else ceiling, ceiling)
+    return start, end
+
+
 def underlying_conids(conn: sqlite3.Connection) -> dict[str, str]:
     """Underlying symbol -> IBKR conid, from anywhere the journal states it.
 
@@ -323,8 +342,6 @@ def bars_manifest(
     """
     moment = now or datetime.now(UTC)
     ceiling = int((moment + timedelta(days=1)).timestamp())
-    pad = PAD_DAYS * 86400
-    floor_start = int((moment - timedelta(days=SNAPSHOT_FLOOR_DAYS)).timestamp())
 
     underlyings = underlying_conids(conn)
     merged: dict[tuple[str, str], BarRequest] = {}
@@ -378,13 +395,8 @@ def bars_manifest(
 
     report = build_history(conn, asset_category="OPT")
     for episode in report.episodes:
-        opened = _epoch(episode.opened_at)
-        closed = _epoch(episode.closed_at)
-        # No opening fill in the archive: ask wide and let the source truncate
-        # to the contract's real listed life. Guessing an open date from the
-        # cost basis would match several sessions and state a fact we lack.
-        start = (opened - pad) if opened is not None else floor_start
-        end = min((closed + pad) if closed is not None else ceiling, ceiling)
+        start, end = _fetched_window(
+            _epoch(episode.opened_at), _epoch(episode.closed_at), moment)
         if end <= start:
             continue
         open_ = not episode.is_closed
@@ -921,7 +933,7 @@ def replay_bars(
     if not conid:
         return ReplaySeries(conid=None, bar_size=None)
     moment = now or datetime.now(UTC)
-    start = _epoch(opened_at)
+    opened = start = _epoch(opened_at)
     # A journal stamp truncates to its date, so a closing day's epoch is that
     # day's MIDNIGHT -- every bar of the session the trade closed in sorts after
     # it. Harmless while the window was padded by whole days; it would have cut
@@ -942,7 +954,7 @@ def replay_bars(
     # holidays, and reading more rows from a local SQLite table is free.
     pad = _READ_PAD_DAYS * 86400
     lo, hi = max(0, start - pad), end + pad
-    preferred = _bar_size_for(start or lo, end, kind="underlying")
+    preferred = _bar_size_for(*_fetched_window(opened, closed, moment), kind="underlying")
     for size in (preferred, "1d" if preferred == "1h" else "1h"):
         points = close_series(conn, conid, bar_size=size, start=lo, end=hi)
         if points:
