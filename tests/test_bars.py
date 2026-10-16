@@ -1198,11 +1198,29 @@ def test_a_traded_day_with_no_option_bars_is_reported(conn):
     """
     _open_short_option(conn)
     _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    # The strike traded that session: its daily close says so.
+    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-05",
+                  bar_size="1d", hours=(14,))
     audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
     assert audited.market_traded, "the underlying's own bars say it traded"
     assert not audited.ok
     assert audited.missing == ("AAA  271001P00100000",)
     assert not audited.covered
+
+
+def test_a_strike_that_did_not_trade_is_not_reported_missing(conn):
+    """No daily close for the session means the strike did not trade in it, so
+    there were no bars to collect: QCOM 261120P00175000 was "1 missed of 3",
+    "cannot be backfilled later", on a day every live poll answered empty.
+    """
+    _open_short_option(conn)
+    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
+    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-04",
+                  bar_size="1d", hours=(14,))
+    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
+    assert audited.market_traded
+    assert audited.ok, "a strike that never traded was counted as lost bars"
+    assert not audited.missing and not audited.covered
 
 
 def test_a_covered_session_is_silent(conn):
@@ -1274,6 +1292,8 @@ def test_a_bar_from_a_neighbouring_session_does_not_count_as_coverage(conn):
     _open_short_option(conn)
     _session_bars(conn, "UAAA", "AAA", "2026-08-05")
     _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-04")
+    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-05",
+                  bar_size="1d", hours=(14,))
     audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
     assert not audited.ok, "yesterday's bars were counted as today's"
     assert audited.missing == ("AAA  271001P00100000",)
@@ -1300,6 +1320,8 @@ def test_the_audit_exit_codes_separate_all_three_outcomes(tmp_path, capsys):
     assert main(argv) == 3, "an un-backfilled journal is not a lost session"
 
     _session_bars(conn, "UAAA", "AAA", yesterday)
+    _session_bars(conn, "C1", "AAA  271001P00100000", yesterday,
+                  bar_size="1d", hours=(14,))
     conn.commit()
     assert main(argv) == 1, "a traded day with no option bars must report"
     assert "MISSING" in capsys.readouterr().out

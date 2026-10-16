@@ -593,7 +593,8 @@ class SessionAudit:
     market_traded: bool
     #: Contracts that were asked for AND have hourly bars for the day.
     covered: tuple[str, ...]
-    #: Contracts that were asked for and have none. The reportable set.
+    #: Contracts that were asked for, traded that day (a daily close says so) and
+    #: have no hourly bars for it. The reportable set.
     missing: tuple[str, ...]
 
     @property
@@ -682,6 +683,13 @@ def audit_perishable(
     unexamined. The reverse case is handled -- a contract opened after the
     session cannot have bars for it, and counting that as missing would alarm
     every time a position was opened.
+
+    So is a strike that did not trade that session. With no daily close for the
+    day there were no hourly bars to collect, and calling it lost was a red alarm
+    over QCOM 261120P00175000 on a day every live poll answered empty. The daily
+    series is a fair witness here: `market_traded_on` needs the underlying's
+    hourly bars for the day, which only the daily job fetches, and the same run
+    asks for every open option's daily window.
     """
     audited = day or last_traded_day(conn, now=now)
     if audited is None:
@@ -716,6 +724,12 @@ def audit_perishable(
             (request.conid,),
         ).fetchall()
         found = any(et_day(int(row["ts"])) == audited for row in stamps)
+        if not found and not any(
+            et_day(int(row["ts"])) == audited for row in conn.execute(
+                "SELECT ts FROM price_bars WHERE conid = ? AND bar_size = '1d'"
+                " AND close IS NOT NULL", (request.conid,))
+        ):
+            continue  # no daily close either: it did not trade, so nothing was lost
         (covered if found else missing).append(request.symbol)
     return SessionAudit(
         day=audited, market_traded=traded,
