@@ -553,7 +553,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} cost_basis_price
  * @property {number} fifo_pnl_unrealized -- raw column; read `unrealized` instead
  * @property {Money} value -- market value, native and base
- * @property {Money} cost_basis -- falls back to the open episode's basis
+ * @property {Money|null} cost_basis -- null when the statement carried no basis,
+ *   which is not a zero
  * @property {Money|null} unrealized -- no base column exists; derived at the row
  *   rate. Null when the statement carried no figure, which is not a zero
  * @property {string} side
@@ -4009,8 +4010,7 @@ function positions(){
      position. This used to read only from the history payload's open episodes,
      where cost_basis is set exclusively for snapshot-only ones -- so the short
      put, which has fills on record, rendered a dash even though the snapshot
-     held -1569.907847. The history lookup stays as a fallback for a snapshot
-     row that lacks the column. */
+     held -1569.907847. */
   let val=0; ps.forEach(pos=>val+=(pos.value.base||0));
   /* Snapshot rows grouped by the LIFECYCLE that opened them, via conid --
      the same episode-exact linkage the Trades tab uses, so the strangle is

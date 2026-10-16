@@ -2814,6 +2814,26 @@ def test_a_position_the_statement_did_not_mark_has_no_unrealised_figure(populate
         "the card holding the unmarked contract still sums a figure")
 
 
+def test_a_position_with_no_basis_reads_unknown_not_free(populated):
+    """The fallback that once covered a snapshot row with no cost basis is gone,
+    and `Money.at_rate(None)` is a zero, so Holdings would print "€0.00" for it: a
+    position that cost nothing. It is null now, as a missing unrealised figure is,
+    which `moneyOf` prints as a dash; the rows that carry one are kept."""
+    from optjournal.db import connect  # noqa: PLC0415
+
+    conid = str(build_state(db_path=populated, archive_dir=RAW_DIR,
+                            query_id=None)["positions"][0]["conid"])
+    conn = connect(populated)
+    conn.execute("UPDATE position_snapshots SET cost_basis_money = NULL"
+                 " WHERE conid = ?", (conid,))
+    conn.commit()
+    conn.close()
+    state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    basis = {str(pos["conid"]): pos["cost_basis"] for pos in state["positions"]}
+    assert basis.pop(conid) is None, "a missing basis is still sent as a zero"
+    assert basis and all(mo is not None for mo in basis.values())
+
+
 def test_a_stock_card_is_marked_from_the_stock_book(populated):
     """Under Equities the cards are stock positions, and their unrealised figure was
     summed from the OPTION book, which never holds them: every one read €0.00. Each
