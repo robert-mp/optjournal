@@ -452,9 +452,9 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Money|null} largest_win -- the best single decided outcome
  * @property {Money|null} largest_loss -- the worst single decided outcome
  * @property {StrategyRank|null} best_strategy -- set by web.build_state from the
- *   lifecycles (stats.strategy_ranking); null with nothing decided
+ *   period's closes (stats.strategy_ranking); null with nothing closed
  * @property {StrategyRank|null} worst_strategy -- null unless two or more
- *   strategies decided, since one would repeat best_strategy
+ *   strategies closed something, since one would repeat best_strategy
  * @property {Money} open_premium -- excluded from P&L until positions close
  * @property {number|null} net_liq_base -- null until equity summaries exist
  * @property {string|null} net_liq_date
@@ -1142,8 +1142,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
 
 /** @typedef {Object} StrategyRank -- one strategy's result (stats.strategy_ranking)
  * @property {string} label -- the shape the positions were opened as
- * @property {Money} pnl -- summed realised P&L over its decided positions, in base
- * @property {number} decided -- how many decided positions that sum covers
+ * @property {Money} pnl -- summed realised P&L over its closes in the period, in base
+ * @property {number} decided -- how many closes that sum covers
  */
 
 /** @typedef {Object} Cohort -- one side of the 0DTE comparison, counted by the
@@ -2400,11 +2400,11 @@ function dashboard(){
        name is the answer and the sum is its evidence -- a tile reading only
        "Strangle" asks the reader to trust it. Summed, not averaged: see
        stats.strategy_ranking. Worst is absent rather than equal to best when one
-       strategy decided everything, and says so. */
+       strategy made every close, and says so. */
     best_strategy:()=>stratTile('Best Strategy', s.best_strategy, 'best_strategy',
       'nothing closed yet'),
     worst_strategy:()=>stratTile('Worst Strategy', s.worst_strategy, 'worst_strategy',
-      s.best_strategy?'only one strategy decided':'nothing closed yet'),
+      s.best_strategy?'only one strategy closed anything':'nothing closed yet'),
     largest_win:()=>statCard('Largest Win', moneyOf(s.largest_win),
       'the best single close', cls(s.largest_win?.base),'largest_win'),
     largest_loss:()=>statCard('Largest Loss',
@@ -2418,7 +2418,7 @@ function dashboard(){
     return rk
       ? statCard(k,`${esc(rk.label)}<span class="vsub ${cls(rk.pnl.base)}">${
           moneyOf(rk.pnl)}</span>`,
-          `${plural(rk.decided,'closed position')}, realised P&L summed`,'sm',key)
+          `${plural(rk.decided,'close')}, realised P&L summed`,'sm',key)
       : statCard(k,'—',none,'dim2',key);
   }
   const cards=tileKeys().map(k=>R[k]()).join('');
