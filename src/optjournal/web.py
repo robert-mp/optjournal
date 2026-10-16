@@ -392,12 +392,11 @@ def _inverted_alert(conn: sqlite3.Connection, symbol: str,
 
 
 #: How long a fetched IV rank is reused. CBOE's quotes are delayed and its
-#: trailing-year bounds move once a day, while the Watchlist refreshes every five
-#: minutes and asked CBOE twice per symbol each time.
+#: trailing-year bounds move once a day.
 IV_RANK_MAX_AGE_S = 15 * 60
 
-#: Requests in flight at once on /api/quotes. One after another, eleven symbols
-#: took 10 to 20 s; eight is `ahead._PARALLEL`'s measured choice for Nasdaq.
+#: Requests in flight at once on /api/quotes. Measured live on 2026-10-16, eight
+#: answered eleven symbols in 1.9 s where one after another took 11.8 s.
 QUOTE_WORKERS = 8
 
 

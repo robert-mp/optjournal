@@ -545,8 +545,6 @@ def render_watchlist(rows: list[dict]) -> str:
             signed(row["bx_daily"]),
             signed(row["bx_weekly"]),
             _money(row["expected_move_5d"]),
-            # Typed or fetched, never measured: it sits between the derived
-            # figures and the journal's own context.
             earnings(row),
             # The context a broker screen cannot give: what YOU hold against it.
             ", ".join(

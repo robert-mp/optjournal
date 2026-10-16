@@ -203,8 +203,8 @@ def occ_symbol(symbol: str) -> str:
 #:
 #: Matched on the WHOLE symbol, so an option on one of these roots is untouched:
 #: `SPX   261120C07000000` is not `SPX`. A stock ticker colliding with an index
-#: root would be mistranslated here, which is why this is an explicit list of five
-#: rather than a rule about leading carets.
+#: root would be mistranslated here, which is why this is an explicit list rather
+#: than a rule about leading carets.
 INDEX_SYMBOLS = {
     "SPX": "^GSPC",
     "VIX": "^VIX",

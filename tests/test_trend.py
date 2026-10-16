@@ -308,10 +308,9 @@ def test_fewer_than_the_gate_returns_none_rather_than_a_warm_up_reading():
 
     The behavioural assertions come FIRST and the relationship between the two
     constants comes last, deliberately: `mutate.py`'s `bx-gate` collapses the gate
-    onto the floor, and a test that reported that as "35 is not less than 35" would
+    onto the floor, and a test that reported that as "25 is not less than 25" would
     be catching a mutant on an inequality rather than on what a reader would see.
     """
-    # One past the arithmetic floor, and the honest answer there is nothing at all.
     assert bxtrender_short(newest_first(FALLING[: MIN_CLOSES + 1])) is None
 
     # 45 sessions is the state five of the six real watched symbols were in when

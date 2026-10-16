@@ -76,9 +76,7 @@ __all__ = [
 #: a Monday open is the previous Thursday.
 PAD_DAYS = 4
 
-#: Days after a window's end past which its stored bars are final. A daily job
-#: asks again for a window ending inside this, and never for one ending before it
-#: whose rows already run from its start.
+#: Days after a window's end past which its stored bars are final. See `_settled`.
 SETTLED_DAYS = 7
 
 #: Above this many calendar days a window is charted daily rather than hourly.
@@ -724,13 +722,12 @@ def audit_perishable(
             (request.conid,),
         ).fetchall()
         found = any(et_day(int(row["ts"])) == audited for row in stamps)
-        if not found and not any(
+        had_trades = found or any(
             et_day(int(row["ts"])) == audited for row in conn.execute(
                 "SELECT ts FROM price_bars WHERE conid = ? AND bar_size = '1d'"
-                " AND close IS NOT NULL", (request.conid,))
-        ):
-            continue  # no daily close either: it did not trade, so nothing was lost
-        (covered if found else missing).append(request.symbol)
+                " AND close IS NOT NULL", (request.conid,)))
+        if had_trades:
+            (covered if found else missing).append(request.symbol)
     return SessionAudit(
         day=audited, market_traded=traded,
         covered=tuple(sorted(covered)), missing=tuple(sorted(missing)),

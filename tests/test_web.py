@@ -10358,8 +10358,9 @@ def _watching(tmp_path, *symbols: str) -> Path:
 def test_the_quotes_are_asked_together_and_a_failure_stays_its_symbols(
         tmp_path, monkeypatch):
     """One after another, eleven symbols took 10 to 20 s. Each fetch here waits
-    for the other two, so asked in turn the first never returns; and one symbol's
-    failure still blanks only its own row."""
+    for the other two, so asked in turn the first breaks the barrier after five
+    seconds and the route answers 500. One symbol's failure still blanks only its
+    own row."""
     import threading  # noqa: PLC0415 - local to this test
 
     from optjournal.marketdata import BarFetchError, Quote  # noqa: PLC0415
