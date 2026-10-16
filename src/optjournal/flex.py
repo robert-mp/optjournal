@@ -444,8 +444,12 @@ class _KeyringCall:
     has to be a wait on another thread rather than a timeout on the call.
     """
 
-    def __init__(self, account: str) -> None:
+    def __init__(self, account: str, seq: int) -> None:
         self.account = account
+        #: Its place in the order calls were started, which `next_call` compares
+        #: rather than `started`: Windows' monotonic clock ticks every ~16ms, so a
+        #: call begun just before a read could carry the read's own timestamp.
+        self.seq = seq
         self.started = time.monotonic()
         self.finished = self.started
         self.done = threading.Event()
@@ -483,6 +487,9 @@ class _Keyring:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.pending: list[_KeyringCall] = []
+        #: How many calls this process has started, so a read can tell a call that
+        #: began after it from one that began before.
+        self.issued = 0
         #: When a token was last stored by this process, per account. The keychain
         #: has answered since, so a call pending from before then is not waited on.
         self.saved_at: dict[str, float] = {}
@@ -491,8 +498,13 @@ class _Keyring:
         with self.lock:
             self.saved_at[account] = time.monotonic()
 
-    def next_call(self, account: str, arrived: float) -> tuple[bool, _KeyringCall | None]:
-        """For a read that began at `arrived`: (answers it, the call to wait on).
+    def ticket(self) -> int:
+        """A read's place in the order calls start: later calls are numbered above."""
+        with self.lock:
+            return self.issued
+
+    def next_call(self, account: str, ticket: int) -> tuple[bool, _KeyringCall | None]:
+        """For a read holding `ticket`: (answers it, the call to wait on).
 
         `(True, call)`: the call's answer is the read's, because it started after
         the read began. `(False, call)`: an older call, to wait on until it
@@ -504,7 +516,7 @@ class _Keyring:
             self.pending = [c for c in self.pending if not c.done.is_set()]
             mine = [c for c in self.pending if c.account == account]
             newest = mine[-1] if mine else None
-            if newest is not None and newest.started >= arrived:
+            if newest is not None and newest.seq > ticket:
                 return True, newest
             since_save = (newest is not None
                           and newest.started < self.saved_at.get(account, float("-inf")))
@@ -518,7 +530,8 @@ class _Keyring:
                 # calls stuck for good refuse a read.
                 live = [c for c in self.pending if now - c.started < _stuck_after()]
                 return False, (live[-1] if live else None)
-            call = _KeyringCall(account)
+            self.issued += 1
+            call = _KeyringCall(account, self.issued)
             self.pending.append(call)
         threading.Thread(target=call.run, name="keyring-read", daemon=True).start()
         return True, call
@@ -608,10 +621,11 @@ def read_token(account: str | None = None, *, timeout_s: float | None = None) ->
 
     wait_s = KEYRING_READ_TIMEOUT_S if timeout_s is None else timeout_s
     arrived = time.monotonic()
+    ticket = _KEYRING.ticket()
     deadline = arrived + wait_s
     behind: _KeyringCall | None = None
     while True:
-        answers, call = _KEYRING.next_call(account, arrived)
+        answers, call = _KEYRING.next_call(account, ticket)
         if call is None:
             raise TokenUnreadable(_unreadable(None, arrived, wait_s))
         # An older call is waited on only until it counts as stuck, when the next

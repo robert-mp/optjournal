@@ -1143,7 +1143,8 @@ def test_a_refused_save_does_not_count_as_one(monkeypatch):
         _drain(release)
 
 
-def test_a_read_never_returns_an_answer_asked_for_before_it_began(monkeypatch):
+@pytest.mark.parametrize("clock", ["fine", "coarse"])
+def test_a_read_never_returns_an_answer_asked_for_before_it_began(monkeypatch, clock):
     """A token rotated by ANOTHER process (`optjournal setup` in a terminal)
     moves nothing in this one, so a read begun after it joined a call begun
     before it and returned the OLD token, which a Sync would then spend an IBKR
@@ -1161,6 +1162,11 @@ def test_a_read_never_returns_an_answer_asked_for_before_it_began(monkeypatch):
 
     monkeypatch.setattr(flex.keyring, "get_password", slow)
     monkeypatch.setattr(flex, "KEYRING_READ_TIMEOUT_S", 2.0)
+    if clock == "coarse":
+        # Windows' monotonic clock ticks about every 16ms, so the earlier call and
+        # this read can carry one timestamp; CI's windows-latest failed on that.
+        fine = time.monotonic
+        monkeypatch.setattr(flex.time, "monotonic", lambda: fine() // 1.0)
     first: dict[str, str] = {}
     earlier = threading.Thread(
         target=lambda: first.setdefault("token", flex.read_token("someone")))
