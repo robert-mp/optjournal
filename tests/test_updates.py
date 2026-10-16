@@ -169,42 +169,117 @@ def _code(root: Path) -> dict[str, bytes | None]:
             if not p.relative_to(root).parts[0].startswith((".update-",))}
 
 
+#: `os.replace` itself, before any test wraps it: the launcher's `os` is this one.
+_REPLACE = os.replace
+
+
+def _replace_failing(monkeypatch, launcher, fail) -> list[int]:
+    """The launcher's `os.replace`, raising `fail(n, src)` at its n-th call when
+    that is an exception rather than None. Returns the count, as a one-item list."""
+    calls = [0]
+
+    def replace(src, dst):
+        calls[0] += 1
+        exc = fail(calls[0], Path(src))
+        if exc is not None:
+            raise exc
+        return _REPLACE(src, dst)
+
+    monkeypatch.setattr(launcher.os, "replace", replace)
+    return calls
+
+
+def _a_clean_update(root: Path, monkeypatch, launcher) -> tuple[int, dict[str, bytes | None]]:
+    """How many renames a whole swap makes, and the install it leaves."""
+    updates.stage(_release(), root=root)
+    calls = _replace_failing(monkeypatch, launcher, lambda _n, _src: None)
+    assert launcher.apply_staged(root) == "0.2.0"
+    assert calls[0] >= 4
+    return calls[0], _code(root)
+
+
 def test_a_swap_that_fails_at_any_step_puts_the_old_code_back(
         tmp_path, monkeypatch, supervised):
     """Every rename of the swap is made to fail in turn, and each time the install
     must be exactly the old version, with nothing left stranded mid-swap."""
     monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball())
     launcher = _launcher()
-    real = launcher.os.replace
-    steps = {"n": 0}
-
-    def counting(src, dst):
-        steps["n"] += 1
-        return real(src, dst)
-
-    counted = _install(tmp_path / "counted")
-    updates.stage(_release(), root=counted)
-    monkeypatch.setattr(launcher.os, "replace", counting)
-    assert launcher.apply_staged(counted) == "0.2.0"
-    total, steps["n"] = steps["n"], 0
-    assert total >= 4
+    total, _new = _a_clean_update(_install(tmp_path / "clean"), monkeypatch, launcher)
 
     for failing in range(1, total + 1):
         root = _install(tmp_path / f"fail-{failing}")
         before = _code(root)
         updates.stage(_release(), root=root)
-
-        def flaky(src, dst, failing=failing):
-            steps["n"] += 1
-            if steps["n"] == failing:
-                raise OSError("file in use")
-            return real(src, dst)
-
-        steps["n"] = 0
-        monkeypatch.setattr(launcher.os, "replace", flaky)
+        fail = {failing: OSError("in use")}
+        _replace_failing(monkeypatch, launcher, lambda n, _src, fail=fail: fail.get(n))
         assert launcher.apply_staged(root) is None, failing
         assert _code(root) == before, f"step {failing} of {total} left a mixed install"
         assert not list((root / launcher.OLD).glob("*")), "old code stranded in .update-old"
+
+
+class _Died(BaseException):
+    """The launcher's process ending: its window closed, or Ctrl+C, which is no
+    OSError. Raised from inside a rename, so nothing after it runs."""
+
+
+def test_a_swap_cut_off_at_any_step_is_put_right_by_the_next_starts(
+        tmp_path, monkeypatch, supervised):
+    """Cut off after `src` had moved into `.update-old`, the next start found no
+    `.ready`, deleted the staged release, and left an install with no `src/`.
+
+    Now the next start puts the old code back before it tries the release
+    again, so when that try cannot install anything the old version runs, and
+    the start after it installs the new one."""
+    monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball())
+    launcher = _launcher()
+    total, new = _a_clean_update(_install(tmp_path / "clean"), monkeypatch, launcher)
+
+    def blocked(_n, src):
+        return OSError("in use") if src.parent.name == updates.STAGING else None
+
+    for step in range(1, total + 1):
+        root = _install(tmp_path / f"cut-{step}")
+        updates.stage(_release(), root=root)
+        cut = {step: _Died()}
+        _replace_failing(monkeypatch, launcher, lambda n, _src, cut=cut: cut.get(n))
+        with pytest.raises(_Died):
+            launcher.apply_staged(root)
+
+        _replace_failing(monkeypatch, launcher, blocked)
+        assert launcher.apply_staged(root) is None
+        code = sorted(p.name for p in (root / "src" / "optjournal").iterdir())
+        assert (updates.current_version(root), code) == ("0.1.0", ["old.py"]), (
+            f"cut at step {step} of {total}, then a mixed install")
+        assert (root / "journal.db").read_bytes() == b"my trades"
+
+        monkeypatch.setattr(launcher.os, "replace", _REPLACE)
+        assert launcher.apply_staged(root) == "0.2.0", f"cut at step {step} of {total}"
+        assert _code(root) == new, f"cut at step {step} of {total}, then a mixed install"
+        assert not (root / updates.STAGING).exists() and not (root / launcher.OLD).exists()
+
+
+def test_an_undo_that_meets_a_locked_file_is_finished_by_the_next_start(
+        tmp_path, monkeypatch, supervised):
+    """On Windows the undo of a failed swap can meet a file an antivirus scan
+    holds. That PermissionError escaped the undo and crashed the launcher, and
+    the next start deleted the old code waiting in `.update-old`: pyproject.toml
+    said the new version over the old `src/`, so the banner never offered the
+    update again. Now the undo goes on past it, and the next start finishes it
+    and installs the release."""
+    monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball())
+    launcher = _launcher()
+    total, new = _a_clean_update(_install(tmp_path / "clean"), monkeypatch, launcher)
+
+    for failing in range(1, total + 1):
+        root = _install(tmp_path / f"held-{failing}")
+        updates.stage(_release(), root=root)
+        # The rename after the failing one is the undo's first.
+        fail = {failing: OSError("in use"), failing + 1: PermissionError("scanning")}
+        _replace_failing(monkeypatch, launcher, lambda n, _src, fail=fail: fail.get(n))
+        assert launcher.apply_staged(root) is None, failing
+        monkeypatch.setattr(launcher.os, "replace", _REPLACE)
+        assert launcher.apply_staged(root) == "0.2.0", f"failed at step {failing} of {total}"
+        assert _code(root) == new, f"failed at step {failing} of {total}, then a mixed install"
 
 
 @pytest.mark.parametrize(("latest", "available"), [("0.2.0", True), ("0.1.0", False),

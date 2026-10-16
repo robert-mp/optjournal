@@ -19,6 +19,7 @@ Both run as `uv run --frozen`, so a start never rewrites `uv.lock`.
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import os
 import re
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import time
 import webbrowser
+from collections.abc import Iterable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -54,35 +56,65 @@ def apply_staged(root: Path = ROOT) -> str | None:
     put back, so the install is either the old version or the new one and never
     half of each. Entries the release does not contain are left alone, which is
     what keeps the journal's data untouched when it sits beside the code.
+
+    `READY` goes only once every entry is in place, so a start that still finds
+    it is looking at a swap that did not finish: this process was cut off
+    partway (its window closed, Ctrl+C), or a locked file stopped the undo. The
+    old code waiting in `OLD` is put back first, then the release is tried again.
+    (An entry only the release has, moved in before the cutoff, stays in place
+    until a later try succeeds: nothing in `OLD` names it.)
     """
-    staging = root / STAGING
+    staging, old = root / STAGING, root / OLD
     ready = staging / READY
     if not ready.exists():
-        shutil.rmtree(staging, ignore_errors=True)   # an interrupted download
+        # An interrupted download, or what a finished swap had left to delete.
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(old, ignore_errors=True)
         return None
     version = ready.read_text().strip()
-    ready.unlink()
-    old = root / OLD
-    shutil.rmtree(old, ignore_errors=True)
-    old.mkdir()
+    if old.exists() and not _put_back(root, [p.name for p in old.iterdir()]):
+        print(f"Update to {version} is not undone yet. {_START_AGAIN}")
+        return None
+    old.mkdir(exist_ok=True)
     swapped: list[str] = []
     try:
-        for entry in sorted(p.name for p in staging.iterdir()):
+        for entry in sorted(p.name for p in staging.iterdir() if p.name != READY):
             if (root / entry).exists():
                 os.replace(root / entry, old / entry)
             swapped.append(entry)
             os.replace(staging / entry, root / entry)
     except OSError as exc:
-        for entry in reversed(swapped):
+        if _put_back(root, reversed(swapped)):
+            print(f"Update to {version} failed and was undone: {exc}")
+        else:
+            print(f"Update to {version} failed: {exc}. {_START_AGAIN}")
+        return None
+    ready.unlink()
+    shutil.rmtree(old, ignore_errors=True)
+    shutil.rmtree(staging, ignore_errors=True)
+    return version
+
+
+_START_AGAIN = ("Some files could not be put back yet, so close this window and "
+                "start optjournal again.")
+
+
+def _put_back(root: Path, entries: Iterable[str]) -> bool:
+    """Undo the swap of `entries`, and say whether `OLD` is empty now.
+
+    Each entry the release put in place goes back into `STAGING`, then the one
+    it replaced comes back from `OLD`. Best effort, entry by entry: one that
+    cannot move (a file an antivirus scan holds) stays as it is, its old copy
+    stays in `OLD`, and the next start tries again.
+    """
+    staging, old = root / STAGING, root / OLD
+    for entry in entries:
+        with contextlib.suppress(OSError):
             if (root / entry).exists() and not (staging / entry).exists():
                 os.replace(root / entry, staging / entry)
             if (old / entry).exists():
                 os.replace(old / entry, root / entry)
-        print(f"Update to {version} failed and was undone: {exc}")
-        return None
-    shutil.rmtree(old, ignore_errors=True)
-    shutil.rmtree(staging, ignore_errors=True)
-    return version
+    return not any(old.iterdir())
 
 
 def _whats_on(port: int = PORT, timeout_s: float = 2.0) -> str | None:

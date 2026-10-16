@@ -60,7 +60,8 @@ DEFAULT_REPO = "robert-mp/optjournal"
 #: pins the two copies of these names together.
 STAGING = ".update-staging"
 #: Written LAST into `STAGING`: a staging folder without it is a download that
-#: was interrupted, and the launcher ignores it.
+#: was interrupted, and the launcher ignores it. The launcher deletes it only
+#: once the swap is complete, so it also marks a swap still to finish.
 READY = ".ready"
 
 #: A release archive is a few hundred KB. Anything past this is not one.
