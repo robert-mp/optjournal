@@ -374,6 +374,20 @@ def test_the_countdown_is_counted_from_the_et_day_not_the_utc_one(conn):
     assert watchlist_data(conn, now=evening)[0]["earnings_in_days"] == 14
 
 
+@pytest.mark.parametrize("hour, through, last", [
+    (11, "2026-08-07", 101.0),   # Monday mid-session: Friday is the newest close
+    (17, "2026-08-10", 105.0),   # after the settle, Monday's bar is final
+])
+def test_a_session_in_progress_is_not_yet_a_stored_close(conn, hour, through, last):
+    """Adding a symbol mid-session stores today's daily bar while it still moves,
+    and the row printed it as "stored close from" today, while the 0DTE calculator
+    leaves the same bar out until 16:15 ET."""
+    _seed_watched_symbol(conn, "NVDA", ["2026-08-06", "2026-08-07", "2026-08-10"],
+                         [100.0, 101.0, 105.0], duplicated=False)
+    row = watchlist_data(conn, now=datetime(2026, 8, 10, hour, tzinfo=MARKET_TZ))[0]
+    assert (row["closes_through"], row["last"]) == (through, last)
+
+
 def test_a_symbol_with_no_bars_reports_nothing_rather_than_zero(conn):
     """A watched row with no stored close is a row of Nones, never of zeroes.
 
@@ -573,6 +587,19 @@ def test_scoring_excludes_today_because_its_close_is_still_moving(conn):
     now = datetime(2026, 8, 31, 17, 0, tzinfo=UTC)      # Monday, mid-session ET
 
     assert odte_scoring_data(conn, now=now) == [], "today is not a settled outcome"
+
+
+def test_scoring_counts_today_once_it_has_settled_as_the_calculator_does(conn):
+    """At 17:00 ET on 14 Oct the calculator planned off 14 Oct's close while
+    scoring's newest session was 13 Oct. One rule for both."""
+    from optjournal.serialize import odte_context_data, odte_scoring_data
+    for day, spx, vix in (("2026-10-13", 6600.0, 18.0), ("2026-10-14", 6650.0, 17.0)):
+        _seed_index(conn, "^GSPC", day, spx)
+        _seed_index(conn, "^VIX", day, vix)
+    now = datetime(2026, 10, 14, 17, 0, tzinfo=MARKET_TZ)
+    scored = odte_scoring_data(conn, now=now)
+    assert [row["date"] for row in scored] == ["2026-10-14"]
+    assert scored[-1]["date"] == odte_context_data(conn, now=now)["spx_date"]
 
 
 def test_scoring_skips_a_session_whose_vix_never_landed(conn):
