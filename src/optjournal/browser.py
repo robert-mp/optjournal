@@ -180,26 +180,8 @@ def console_errors(stderr: str) -> list[str]:
     return found
 
 
-def _strip_code(dom: str) -> str:
-    """The document with script and style bodies removed, tags intact.
-
-    HTML COMMENTS GO FIRST, and that ordering is the whole correctness of this.
-    The pattern below is non-greedy but it cannot tell a real opening tag from the
-    tag name written inside a comment, so a comment mentioning the page's inline
-    module opened a match that ran to the document's actual closing tag and deleted
-    everything between -- the entire body. Observed exactly that: a note added to
-    <head> about the CSP's script-src exemption truncated the rendered DOM at the
-    comment, and every structural check on every tab reported the page as empty.
-
-    Stripping comments first is also right independently: a comment is neither
-    markup structure nor code, so no caller of `markup()` wants it either way.
-    """
-    dom = re.sub(r"<!--.*?-->", " ", dom, flags=re.S)
-    return re.sub(r"<(script|style)\b.*?</\1>", " ", dom, flags=re.S | re.I)
-
-
 def markup(dom: str) -> str:
-    """The rendered markup: script and style bodies gone, tags kept.
+    """The rendered markup: comments, script and style bodies gone, tags kept.
 
     The view structural checks need, and the reason it exists as a third view
     rather than callers using the raw dump: ``--dump-dom`` embeds the page's
@@ -210,10 +192,20 @@ def markup(dom: str) -> str:
     template as a Positions subtotal, and ``${String(pos.side)...}`` as a CSS
     class.
 
+    HTML COMMENTS GO FIRST, and that ordering is the whole correctness of this.
+    The pattern below is non-greedy but it cannot tell a real opening tag from the
+    tag name written inside a comment, so a comment mentioning the page's inline
+    module opened a match that ran to the document's actual closing tag and deleted
+    everything between -- the entire body. Observed exactly that: a note added to
+    <head> about the CSP's script-src exemption truncated the rendered DOM at the
+    comment, and every structural check on every tab reported the page as empty.
+    A comment is neither structure nor code, so no caller wants it anyway.
+
     `rendered_text` cannot serve here because it also strips tags, which is
     exactly what a structural check reads.
     """
-    return _strip_code(dom)
+    dom = re.sub(r"<!--.*?-->", " ", dom, flags=re.S)
+    return re.sub(r"<(script|style)\b.*?</\1>", " ", dom, flags=re.S | re.I)
 
 
 def rendered_text(dom: str) -> str:
@@ -223,4 +215,4 @@ def rendered_text(dom: str) -> str:
     contains words like "undefined" -- scanning it would make the junk-text
     assertion fire on healthy code.
     """
-    return re.sub(r"<[^>]+>", " ", _strip_code(dom))
+    return re.sub(r"<[^>]+>", " ", markup(dom))

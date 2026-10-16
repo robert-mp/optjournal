@@ -1004,7 +1004,6 @@ def _find_uv() -> str | None:
     shell that has not re-read its profile since the install (and a
     double-clicked Start file) may not have on PATH.
     """
-    import os
     import shutil
 
     exported = os.environ.get("UV")
