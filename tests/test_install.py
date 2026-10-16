@@ -11,7 +11,9 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -186,6 +188,42 @@ def test_prepare_leaves_a_git_clones_journal_where_it_is(tmp_path):
     assert (code / "journal.db").exists(), "a developer's journal was moved"
 
 
+#: One `prepare` in its own process, started when `go` appears, as a second
+#: launcher's is when a Start file is opened twice during the first start.
+_PREPARE = """
+import sys, time
+from pathlib import Path
+from optjournal import install
+go, ready, home, code = map(Path, sys.argv[1:])
+ready.touch()
+while not go.exists():
+    time.sleep(0.001)
+print(install.prepare(home, code_dir=code))
+"""
+
+
+def test_two_starts_at_once_move_the_journal_once_and_lose_none_of_it(tmp_path):
+    """Two `prepare`s on one download, at the same moment. The one that lost the
+    race undid its half of the move, and the undo took away the `journal.db`
+    the other had just put in the home: it was gone in 16 of 16 trials."""
+    code = _journal(tmp_path / "code")
+    home = tmp_path / "home"
+    go = tmp_path / "go"
+    ready = [tmp_path / f"ready-{n}" for n in range(2)]
+    procs = [subprocess.Popen([sys.executable, "-c", _PREPARE, str(go), str(r),
+                               str(home), str(code)],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+             for r in ready]
+    while not all(r.exists() for r in ready) and all(p.poll() is None for p in procs):
+        time.sleep(0.01)
+    go.touch()
+    outputs = [p.communicate(timeout=60)[0] for p in procs]
+
+    assert install._statement_count(home / "journal.db") == 1, outputs
+    assert (home / "raw" / "activity-x.xml").exists(), outputs
+    assert not config.holds_journal(code), outputs
+
+
 # --- a move that fails partway --------------------------------------------------
 #
 # The failure a friend meets is an antivirus scan or a OneDrive sync holding one
@@ -215,7 +253,13 @@ def _lock(monkeypatch, blocked: Path, *, copies: bool = True) -> None:
 
 def _tree(directory: Path) -> dict[str, bytes]:
     return {p.relative_to(directory).as_posix(): p.read_bytes()
-            for p in sorted(directory.rglob("*")) if p.is_file()}
+            for p in sorted(directory.rglob("*"))
+            if p.is_file() and p.name != install.PREPARE_LOCK}
+
+
+def _names(directory: Path) -> list[str]:
+    """What `directory` holds, but for the lock `prepare` leaves in a home."""
+    return sorted(p.name for p in directory.iterdir() if p.name != install.PREPARE_LOCK)
 
 
 @pytest.mark.parametrize("copies", [True, False], ids=["copying-fails", "removing-fails"])
@@ -241,7 +285,7 @@ def test_a_move_that_fails_partway_leaves_the_whole_journal_where_it_was(
     assert _tree(code) == code_before, "the source lost part of the journal"
     assert _tree(home) == home_before, "the home kept part of a move that was undone"
     assert sorted(p.name for p in code.iterdir()) == [".optjournal.json", "journal.db", "raw"]
-    assert sorted(p.name for p in home.iterdir()) == ["journal.db", "raw"]
+    assert _names(home) == ["journal.db", "raw"]
     monkeypatch.delenv(config.HOME_ENV, raising=False)
     monkeypatch.setattr(config, "ROOT", code)
     assert config.data_home() == code
@@ -260,7 +304,7 @@ def test_a_failed_move_leaves_no_copy_behind_and_the_next_start_finishes_it(tmp_
     try:
         done = install.prepare(home, code_dir=code)
         assert done[0].startswith("journal left beside the code"), done
-        assert sorted(p.name for p in home.iterdir()) == [], "the failed move left files"
+        assert _names(home) == [], "the failed move left files"
         assert sorted(p.name for p in code.iterdir()) == ["journal.db", "raw"]
     finally:
         (code / "raw").chmod(0o755)
@@ -268,7 +312,7 @@ def test_a_failed_move_leaves_no_copy_behind_and_the_next_start_finishes_it(tmp_
     done = install.prepare(home, code_dir=code)
 
     assert done[0].startswith("moved journal.db, raw"), done
-    assert sorted(p.name for p in home.iterdir()) == ["journal.db", "raw"]
+    assert _names(home) == ["journal.db", "raw"]
     assert sorted(p.name for p in code.iterdir()) == []
 
 
