@@ -39,7 +39,7 @@ packages = ["src/optjournal"]
 testpaths = ["tests"]
 
 [tool.mypy]
-files = ["src/optjournal"]
+files = ["src/optjournal", "launcher/app.py"]
 python_version = "3.12"
 check_untyped_defs = true
 warn_redundant_casts = true

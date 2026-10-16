@@ -160,7 +160,7 @@ status.
 
 ```bash
 uv run pytest -q            # deterministic tracked fixtures
-uv run ruff check src tests
+uv run ruff check src tests launcher
 uv run mypy
 uv run optjournal sweep     # every page in a real browser (~2 min)
 uv run optjournal mutate    # full mutation survey; intentionally slower

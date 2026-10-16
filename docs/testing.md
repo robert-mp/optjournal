@@ -9,7 +9,7 @@ acceptance checks and never decide whether the normal suite is green.
 Run the quality gate with:
 
 ```bash
-uv run ruff check src tests
+uv run ruff check src tests launcher
 uv run mypy
 uv run pytest -q
 ```
