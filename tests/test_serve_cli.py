@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from optjournal import web
+from optjournal import logs, web
 from optjournal.cli import main
 from optjournal.config import (
     DEFAULT_ARCHIVE,
@@ -17,6 +17,8 @@ from optjournal.config import (
 def _serve_kwargs(monkeypatch, argv: list[str]) -> dict:
     captured: dict = {}
     monkeypatch.setattr(web, "serve", lambda **kw: captured.update(kw))
+    # Its log would land beside the DEFAULT journal, outside the test's folders.
+    monkeypatch.setattr(logs, "configure", lambda root, **kw: None)
     assert main(argv) == 0
     return captured
 

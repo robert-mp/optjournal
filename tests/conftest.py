@@ -20,6 +20,7 @@ back to the behaviour it exercises.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import re
 import shutil
@@ -222,6 +223,20 @@ def add_statement(
         (source_file, sha256, account_id, from_date, to_date,
          base_currency, asset_filter),
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_leftover_log_handlers():
+    """A handler a test attaches to the root logger (a `serve` adds its rotating
+    file) is closed when the test ends. AUTOUSE because one left behind writes every
+    later test's warnings into whatever file it named, which was once the per-user
+    log folder."""
+    before = list(logging.getLogger().handlers)
+    yield
+    for handler in logging.getLogger().handlers:
+        if handler not in before:
+            logging.getLogger().removeHandler(handler)
+            handler.close()
 
 
 @pytest.fixture(autouse=True)
