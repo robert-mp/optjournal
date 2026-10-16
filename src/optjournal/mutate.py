@@ -708,8 +708,10 @@ _SELF_REFERENTIAL = frozenset({
 CLONE_ENV = "OPTJOURNAL_TREE_IS_COPY"
 
 #: Seconds a single suite run may take before the mutant is called out as hung.
-#: The clean suite is ~52s, so this is ~10x headroom -- generous on purpose, since
-#: a slow machine reporting "hung" would be worse than waiting.
+#: The clean suite takes ~155s (2,124 tests, measured 2026-10-16), so this is ~3x
+#: headroom: room for a slow run, since reporting "hung" would be worse than
+#: waiting, and short enough that `loopback`, which serves until killed, costs
+#: minutes. Raise it with the suite.
 _SUITE_TIMEOUT_S = 500
 
 #: An internal sentinel rather than `-SIGKILL`: Windows has no SIGKILL and

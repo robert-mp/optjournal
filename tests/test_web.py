@@ -7194,29 +7194,6 @@ def _get(base: str, path: str) -> tuple[int, dict]:
         return exc.code, json.loads(exc.read())
 
 
-def _post_slow(base: str, path: str, body: dict) -> tuple[int, dict]:
-    """`_post` with a client timeout longer than the SERVER's busy timeout.
-
-    Needed for exactly one test. `db.BUSY_TIMEOUT_MS` is 15,000, so sqlite waits
-    15 s before raising `database is locked` and only then does the handler answer
-    503 -- which is longer than `_post`'s 10 s and made the first version of that
-    test fail on the CLIENT's timeout while the server was behaving correctly.
-    The wait is the point being measured, so the client has to outlast it.
-    """
-    import urllib.error  # noqa: PLC0415 - local to this helper
-    import urllib.request  # noqa: PLC0415
-
-    request = urllib.request.Request(
-        f"{base}{path}", method="POST", data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=40) as response:  # noqa: S310
-            return response.status, json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read())
-
-
 def test_an_unknown_job_is_a_400_that_names_the_real_ones(populated, tmp_path):
     """400, not 500, and the reply lists what IS runnable.
 
@@ -7301,7 +7278,7 @@ def test_the_run_endpoint_takes_its_target_in_the_body_not_the_path():
 
 
 def test_a_locked_database_answers_503_rather_than_dropping_the_connection(
-    populated, tmp_path
+    populated, tmp_path, monkeypatch
 ):
     """MEASURED, not assumed, and the measurement is why this guard exists.
 
@@ -7319,14 +7296,19 @@ def test_a_locked_database_answers_503_rather_than_dropping_the_connection(
 
     Exercised through a REAL server against a REAL exclusive lock rather than by
     stubbing the error, because the thing under test is what reaches the socket.
+    The server's wait is shortened to 0.3 s: what is measured is the reply after
+    the wait, not the wait's length.
     """
+    from optjournal import db  # noqa: PLC0415 - local to this test
+
+    monkeypatch.setattr(db, "BUSY_TIMEOUT_MS", 300)
     conn = connect(populated)
     conn.execute("BEGIN EXCLUSIVE")
     conn.execute("INSERT OR IGNORE INTO watchlist (symbol, note, added_at)"
                  " VALUES ('LOCKHOLDER', NULL, '2026-08-09')")
     try:
         with web.serve_ephemeral(db_path=populated, archive_dir=tmp_path) as base:
-            status, payload = _post_slow(base, "/api/watchlist", {"symbol": "SPY"})
+            status, payload = _post(base, "/api/watchlist", {"symbol": "SPY"})
     finally:
         conn.rollback()
         conn.close()

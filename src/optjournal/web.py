@@ -2637,7 +2637,10 @@ def serve_ephemeral(
 
     httpd = _Ephemeral(("127.0.0.1", 0), partial(_Handler, cfg))
     port = httpd.socket.getsockname()[1]
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    # A twentieth of a second between polls rather than the default half:
+    # `shutdown()` waits out one poll, and most tests open one of these.
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05},
+                     daemon=True).start()
     try:
         yield f"http://127.0.0.1:{port}"
     finally:
