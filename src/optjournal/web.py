@@ -58,6 +58,7 @@ import time
 import urllib.parse
 import zipfile
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -99,7 +100,7 @@ from optjournal.flex import (
 )
 from optjournal.history import build_history
 from optjournal.ingest import DEFAULT_ASSET_FILTER
-from optjournal.iv import IvFetchError, fetch_iv_rank
+from optjournal.iv import IvFetchError, IvRank, fetch_iv_rank
 from optjournal.iv import band as iv_band
 from optjournal.jobs import (
     FIRST_COLLECTION,
@@ -390,7 +391,18 @@ def _inverted_alert(conn: sqlite3.Connection, symbol: str,
             f"price: the level above has to be higher than the level below.")
 
 
-def _iv_ranks(symbols: list[str]) -> dict[str, Any]:
+#: How long a fetched IV rank is reused. CBOE's quotes are delayed and its
+#: trailing-year bounds move once a day, while the Watchlist refreshes every five
+#: minutes and asked CBOE twice per symbol each time.
+IV_RANK_MAX_AGE_S = 15 * 60
+
+#: Requests in flight at once on /api/quotes. One after another, eleven symbols
+#: took 10 to 20 s; eight is `ahead._PARALLEL`'s measured choice for Nasdaq.
+QUOTE_WORKERS = 8
+
+
+def _iv_ranks(symbols: list[str], *, held: dict[str, tuple[float, IvRank | None]],
+              pool: ThreadPoolExecutor) -> dict[str, Any]:
     """CBOE's IV rank per symbol, and the two absences told apart.
 
     THREE OUTCOMES, not two, which is the whole reason this is a function rather
@@ -407,13 +419,26 @@ def _iv_ranks(symbols: list[str]) -> dict[str, Any]:
     `band` is computed HERE rather than in the page, so the cut point that the two
     filter chips are worded from lives once, in `iv.py`, beside the comment that
     says it is the reader's chosen line and not tastytrade's.
+
+    An answer, a rank or "not carried", is kept in `held` for `IV_RANK_MAX_AGE_S`
+    with the monotonic time it was fetched; a failure is not kept, so the next
+    refresh asks again.
     """
+    def ask(symbol: str) -> IvRank | None:
+        kept = held.get(symbol)
+        if kept is not None and time.monotonic() - kept[0] < IV_RANK_MAX_AGE_S:
+            return kept[1]
+        got = fetch_iv_rank(symbol)
+        held[symbol] = (time.monotonic(), got)
+        return got
+
+    asked = {symbol: pool.submit(ask, symbol) for symbol in symbols}
     ranks: dict[str, Any] = {}
     unranked: list[str] = []
     ranks_failed: list[str] = []
     for symbol in symbols:
         try:
-            got = fetch_iv_rank(symbol)
+            got = asked[symbol].result()
         except IvFetchError as exc:
             log.debug("iv rank %s failed: %s", symbol, exc)
             ranks_failed.append(symbol)
@@ -1215,6 +1240,8 @@ class ServeConfig:
     #: This server's scheduler, so a settings save can ask it to collect now
     #: (`_Handler._collect_now`). None with `--no-scheduler` and in the demo.
     collector: Scheduler | None = None
+    #: CBOE's answers by symbol, kept for `IV_RANK_MAX_AGE_S`. See `_iv_ranks`.
+    iv_ranks: dict[str, tuple[float, IvRank | None]] = field(default_factory=dict)
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -1421,11 +1448,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # Earnings ride along, but only for dates over a day old: one request
             # per symbol per day, whatever the quote cadence.
             earnings_failed, earnings_asked = _refresh_earnings(conn, symbols)
+        with ThreadPoolExecutor(max_workers=QUOTE_WORKERS) as pool:
+            asked = {symbol: pool.submit(fetch_quote, symbol) for symbol in symbols}
+            ranked = _iv_ranks(symbols, held=self.cfg.iv_ranks, pool=pool)
         quotes: dict[str, Any] = {}
         failed: list[str] = []
         for symbol in symbols:
             try:
-                quote = fetch_quote(symbol)
+                quote = asked[symbol].result()
             except BarFetchError as exc:
                 log.debug("quote %s failed: %s", symbol, exc)
                 failed.append(symbol)
@@ -1457,9 +1487,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             #: IV ranks ride this route for the reason the route exists, and they
             #: are the most expensive thing on it: TWO requests per symbol, because
             #: CBOE serves the current implied vol and its trailing-year bounds from
-            #: two different paths. So a Refresh on a six-symbol watchlist costs six
-            #: quote requests plus twelve of these, which is why nothing on the state
-            #: payload triggers it.
+            #: two different paths, at most once per `IV_RANK_MAX_AGE_S`. That is
+            #: why nothing on the state payload triggers it.
             #:
             #: A SEPARATE KEY, not a field on each quote, and the reason is
             #: provenance rather than tidiness: a quote is Yahoo's and a rank is
@@ -1467,7 +1496,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             #: one per-symbol dict would put two sources under one name and make the
             #: attribution a thing the renderer has to remember rather than a thing
             #: the shape carries.
-            **_iv_ranks(symbols),
+            **ranked,
             #: The server's clock at the moment it answered, so the page renders
             #: an AGE rather than a timestamp it would have to trust its own clock
             #: to interpret. A quote is meaningless without one -- run on a
