@@ -35,7 +35,6 @@ from optjournal.bars import (
 from optjournal.clock import MARKET_TZ, parse_day
 from optjournal.compat import unknown_codes, unknown_values
 from optjournal.config import (
-    DATA_HOME,
     DEFAULT_ARCHIVE,
     DEFAULT_DB,
     DEFAULT_DEMO_DB,
@@ -916,8 +915,9 @@ def cmd_serve(args) -> int:
     # whose reconciler logs every tick -- and macOS rotates nothing for a launchd
     # agent's stdout, so a supervised `serve` would otherwise append to one file
     # forever. A one-shot `optjournal bars` needs no such thing and should not
-    # leave a file behind.
-    logs.configure(DATA_HOME)
+    # leave a file behind. Beside the journal served, so a `serve --db` in a
+    # scratch folder (the test suite's) never writes into the real one's log.
+    logs.configure(Path(db).parent)
 
     try:
         restart = serve(
