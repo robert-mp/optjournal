@@ -10473,6 +10473,34 @@ def test_the_update_button_never_installs_a_version_that_is_not_newer(
     assert f"already version {current}" in reply["message"]
 
 
+def test_two_state_loads_look_for_a_previous_download_once(tmp_path, monkeypatch):
+    """While the journal is empty, every /api/state walked Downloads, Desktop and
+    Documents for a journal a previous download left, every 5 s of a first
+    collection, and on macOS each walk of those folders can ask the reader for
+    access. Now one walk per server, and what it found is still offered."""
+    old = tmp_path / "me" / "Downloads" / "optjournal-old"
+    old.mkdir(parents=True)
+    (old / "pyproject.toml").write_text('[project]\nname = "optjournal"\n')
+    with sqlite3.connect(old / "journal.db") as held:
+        held.execute("CREATE TABLE statements (source_file TEXT)")
+        held.execute("INSERT INTO statements VALUES ('activity-1.xml')")
+    held.close()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "me"))
+    listed: list[Path] = []
+    iterdir = Path.iterdir
+
+    def listing(self):
+        if self.name == "Downloads":
+            listed.append(self)
+        return iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", listing)
+    with web.serve_ephemeral(db_path=tmp_path / "journal.db", archive_dir=tmp_path / "raw") as base:
+        offered = [_get(base, "/api/state")[1]["install"]["previous"] for _ in range(2)]
+    assert offered == [[str(old)], [str(old)]]
+    assert len(listed) == 1, f"Downloads was listed {len(listed)} times"
+
+
 def test_importing_a_journal_it_did_not_find_is_refused(populated, monkeypatch, tmp_path):
     monkeypatch.setenv("OPTJOURNAL_SUPERVISED", "1")
     from optjournal import install

@@ -27,6 +27,7 @@ and the fewer imports it needs the fewer ways a broken update can stop it.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -266,7 +267,17 @@ def previous_journals(
     home = home or config.home()
     if _statement_count(home / "journal.db"):
         return []
-    base = search_root or Path.home()
+    return list(_other_downloads(home, search_root or Path.home()))
+
+
+@functools.cache
+def _other_downloads(home: Path, base: Path) -> tuple[Path, ...]:
+    """The walk behind `previous_journals`, once per process for each home.
+
+    The page asks on every state load, every 5 s during a first collection, and
+    on macOS Downloads, Desktop and Documents are privacy-protected: each walk
+    of them can ask the reader for access.
+    """
     found: list[Path] = []
     frontier = [(base / name, SEARCH_DEPTH) for name in SEARCH_DIRS]
     frontier.append((base, HOME_DEPTH))
@@ -284,7 +295,7 @@ def previous_journals(
                 found.append(child)
             elif depth > 1:
                 frontier.append((child, depth - 1))
-    return sorted(found, key=lambda p: (p / "journal.db").stat().st_mtime, reverse=True)
+    return tuple(sorted(found, key=lambda p: (p / "journal.db").stat().st_mtime, reverse=True))
 
 
 def choose_import(source: Path, home: Path | None = None) -> None:
