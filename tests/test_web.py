@@ -2294,9 +2294,10 @@ def test_a_render_preserves_what_the_user_was_typing():
       `#wadd`, so the next input inherits the fix instead of rediscovering the bug.
     """
     js = code_only(_js())
-    capture = js.index("preserveInputs()")
-    render = js.index("$('#body').innerHTML=")
-    restore = js.index("restoreInputs(")
+    drawn = _fn("draw")
+    capture = drawn.index("preserveInputs()")
+    render = drawn.index("$('#body').innerHTML=")
+    restore = drawn.index("restoreInputs(")
     assert capture < render < restore, (
         "the input capture must straddle the innerHTML replacement, or typing is "
         "lost on every redraw"
@@ -3690,7 +3691,7 @@ def _load_harness(real_note: bool = False) -> list[str]:
         "    months:['2026-09'],selected_month:m==='current'?'2026-09':m,trade_type:'all',",
         "    stats:{}})};",
         "}",
-        *banner, "function staleServerCheck(){} function draw(){}",
+        *banner, "function staleServerCheck(){} function draw(){} function bareBanners(){}",
         "function esc(s){return String(s);}",
         *consts,
         *_page_fns("stateQuery", "pinDayMonth", "load"),
@@ -10516,6 +10517,44 @@ def test_a_banner_button_is_handed_back_after_any_failure(button, label, failure
     assert (out["disabled"], out["busy"], out["text"]) == (False, False, label)
     if failure != "never back":
         assert out["notes"] == ["bad"], "the failure was not reported"
+
+
+@pytest.mark.parametrize("first", ["state", "update"])
+def test_a_journal_the_server_cannot_read_still_offers_the_update(first):
+    """A release whose migration fails on one friend's journal answers every
+    `/api/state` with a 500, and the page showed only "Could not read state": the
+    update that would fix it was never drawn, because `checkUpdate` waited for a
+    payload and the failed load drew nothing. Both replies land here through the
+    page's own `load` and `checkUpdate`, in either order, and the button posts.
+    """
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        _page_const("COLLECT_BANNER"),
+        "const S={}; let READ_NOTE=null, LOADED={}; const posted=[];",
+        "const body={innerHTML:''}, msg={innerHTML:'',className:''}; let upd=null;",
+        "const $=sel=>sel==='#body'?body:sel==='#msg'?msg",
+        "  :sel==='#updgo'&&body.innerHTML.includes('id=\"updgo\"')",
+        "    ?(upd=upd||{id:'updgo',textContent:'Update to 0.5.2',disabled:false,",
+        "      classList:{add(){},remove(){}}}):null;",
+        "function note(text){msg.innerHTML=text;}",
+        "function draw(){throw new Error('drew a page with no payload');}",
+        "async function awaitRestart(){}",
+        "async function fetch(path,opts){",
+        "  if(opts&&opts.method==='POST'){posted.push(path);",
+        "    return {json:async()=>({ok:false,message:'refused'})};}",
+        "  if(path.startsWith('/api/state')) return {ok:false,status:500};",
+        "  return {ok:true,json:async()=>({current:'0.5.1',latest:'0.5.2',",
+        "    available:true,cannot_apply:null})};}",
+        *_page_fns("stateQuery", "load", "checkUpdate", "bareBanners", "appBanners",
+                   "bindAppBanners", "bannerPost"),
+        "await (" + ("load" if first == "state" else "checkUpdate") + ")();",
+        "await (" + ("checkUpdate" if first == "state" else "load") + ")();",
+        "const shown=body.innerHTML.includes('Update to 0.5.2');",
+        "await $('#updgo')?.onclick?.();",
+        "console.log(JSON.stringify({shown,posted,msg:msg.innerHTML}));",
+    ])
+    assert out["shown"], "no update banner over a journal the server cannot read"
+    assert out["posted"] == ["/api/update"]
 
 
 def test_a_late_update_banner_leaves_the_focused_field_where_it_was():

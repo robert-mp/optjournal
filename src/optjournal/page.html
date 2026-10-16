@@ -6168,9 +6168,18 @@ async function checkUpdate(){
     const r=await fetch('/api/update');
     S.update=await r.json();
   }catch(e){S.update=null;}
-  /* The first load may still be in flight; it draws the banner when it lands. */
-  if(!S.state) return;
+  if(!S.state){bareBanners(); return;}
   await keepPlace(draw);
+}
+
+/* The banners with no payload in hand: the first read is still in flight, or it
+   failed. A release whose migration fails on this journal answers every read with
+   a 500, and the update that fixes it must still be offered, which it can be:
+   POST /api/update never opens the journal. Only the update banner can show here,
+   since the other two read the payload. */
+function bareBanners(){
+  $('#body').innerHTML=appBanners();
+  bindAppBanners();
 }
 
 /* Redraw without moving what the reader is in. The update check answers seconds
@@ -7573,6 +7582,7 @@ async function load(){
     /* Over figures that did not move, with the controls that produced them: the
        banner says the read failed, and nothing else claims otherwise. */
     if(S.state){Object.assign(S,LOADED);draw();}
+    else bareBanners();
     return;
   }
   /* Before the payload guard, whose own banner this must not take down. */
