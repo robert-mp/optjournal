@@ -5,17 +5,16 @@ A leaf: imports nothing internal, no database, no journal shapes, exactly like
 it because `vol.py` is titled for realised volatility and its whole body is one
 argument about realised against implied -- an oscillator in there would make the
 module name and the docstring a lie -- and because `MIN_RETURNS = 5` is not this
-indicator's floor. This one's is 35 by arithmetic and about 120 by honesty, which
+indicator's floor. This one's is 25 by arithmetic and about 120 by honesty, which
 is the same discipline applied to a different number.
 
 ATTRIBUTION. The algorithm is Bharat Jhunjhunwala's, published in the IFTA
 Journal (2019); the implementation everyone actually reads is QuantTherapy's
-TradingView (Pine) port. Both arms, both seedings and every default here are that
+TradingView (Pine) port. The arm, both seedings and every default here are that
 implementation's, because the whole meaning of the figure is "what the published
 indicator says about this symbol":
 
     short arm   rsi(ema(close, 5) - ema(close, 20), 5) - 50
-    long arm    rsi(ema(close, 20), 5) - 50
 
 THE RSI READS THE EMA DIFFERENCE, NOT THE PRICE. That is the one step every wrong
 copy drops. A popular Python repository computes `ema(rsi(close, 5) - 50, 3)`
@@ -60,8 +59,6 @@ __all__ = [
     "BX_OVERBOUGHT",
     "BX_OVERSOLD",
     "CENTRE",
-    "LONG_L1",
-    "LONG_L2",
     "MIN_CLOSES",
     "MIN_SETTLED",
     "PARAMS_CAPTION",
@@ -69,7 +66,6 @@ __all__ = [
     "SHORT_L2",
     "SHORT_L3",
     "bucket",
-    "bxtrender_long",
     "bxtrender_short",
     "ema",
     "rsi",
@@ -89,19 +85,11 @@ __all__ = [
 #:
 #: Measured on the real journal over 520 closes each, changing L3/L2 from 15 to 5:
 #: TSLA's short arm moved +19.21 -> +29.15, SPY's -7.51 -> -22.17, META's
-#: +5.32 -> +28.46, and GOOG's long arm -15.15 -> -44.84. Several cross a band edge
-#: and GOOG's short arm changes sign, so this was never a rounding difference.
+#: +5.32 -> +28.46. Several cross a band edge and GOOG's short arm changes sign,
+#: so this was never a rounding difference.
 SHORT_L1 = 5
 SHORT_L2 = 20
 SHORT_L3 = 5
-
-#: The long arm's two periods: the same slow EMA, read by an RSI of the same
-#: smoothing as the short arm's. `LONG_L1` shares `SHORT_L2`'s value at 20 and is
-#: spelled separately anyway, because the two are independent inputs in the
-#: published indicator and collapsing them would make a retune of one silently
-#: retune the other.
-LONG_L1 = 20
-LONG_L2 = 5
 
 #: An RSI runs 0 to 100; the indicator subtracts this so its zero is the RSI's
 #: midpoint and the sign carries the state. It also bounds the output to
@@ -112,7 +100,7 @@ CENTRE = 50
 #: Where the arithmetic first produces a number at all, and therefore the floor
 #: below which there is nothing to gate. An SMA-seeded EMA(20) over n closes
 #: yields n-19 values; Wilder's RSI(5) needs 6 inputs to produce its first; so
-#: both arms need 20 + 5 = 25 closes for one value, and 25 is not a choice.
+#: the arm needs 20 + 5 = 25 closes for one value, and 25 is not a choice.
 #:
 #: It is NOT the gate. `MIN_SETTLED` is. The two are separate constants because
 #: they answer different questions -- "can this be computed" and "is the answer
@@ -140,12 +128,6 @@ MIN_CLOSES = SHORT_L2 + SHORT_L3
 #: * the SIGN flips inside the warm-up on every one of the four -- TSLA and GOOG
 #:   at 25 to 27 closes, PLTR at 40 to 41, SPY at 25 -- and the sign is this
 #:   indicator's primary published state;
-#: * the long arm reports exactly +/-50.0000, the pegged extreme, from 25 closes
-#:   through 27 (GOOG), 33 (TSLA), 36 (SPY) and 40 (PLTR). That renders as the
-#:   strongest signal anything on the page can show. It is pegged because a
-#:   six-value EMA(20) is still climbing out of its own seed, so every change has
-#:   one sign, the other average is zero, and the RSI saturates with nothing
-#:   wrong with the arithmetic;
 #: * by 60 closes the four are within 0.35 points, by 90 within 0.016, and by 120
 #:   within 0.0012 -- under the last digit anything prints.
 #:
@@ -184,11 +166,6 @@ MIN_SETTLED = 120
 #: shorter smoothing widens the distribution, and the band has to widen with it.
 #: The old figures (+/-20 cutting 12.1% and 9.2%) were measured at L3=15 and
 #: described a different indicator.
-#:
-#: The LONG arm is still not banded, and by more than before: it sits at or above
-#: +30 on 37.1% (TSLA), 46.8% (META), 49.2% (NVDA), 52.7% (PLTR), 55.4% (GOOG)
-#: and 64.2% (SPY) of the same sessions. One band set cannot serve both arms,
-#: which is why the panel states which arm it is banding.
 BX_OVERSOLD = -30.0
 BX_OVERBOUGHT = 30.0
 
@@ -306,9 +283,8 @@ def rsi(values: list[float], length: int) -> list[float]:
     `ema`: it is what the published implementation does, and near the start of a
     series the choice is worth more than ten points of the output.
 
-    This reads whatever it is given. The short arm gives it an EMA DIFFERENCE and
-    the long arm an EMA -- neither gives it prices, which is the step the wrong
-    copies drop.
+    This reads whatever it is given. The short arm gives it an EMA DIFFERENCE,
+    not prices, which is the step the wrong copies drop.
     """
     if length < 1:
         raise ValueError(f"rsi length must be positive, got {length}")
@@ -348,25 +324,6 @@ def bxtrender_short(closes: Sequence[float | None]) -> float | None:
     offset = len(fast) - len(slow)
     difference = [f - s for f, s in zip(fast[offset:], slow, strict=True)]
     series = rsi(difference, SHORT_L3)
-    return series[-1] - CENTRE if series else None
-
-
-def bxtrender_long(closes: list[float | None]) -> float | None:
-    """The long arm's newest value, or None below `MIN_SETTLED`.
-
-    `rsi(ema(c, 20), 5) - 50`: the RSI reads the slow EMA itself rather than a
-    difference of two, so this arm is a statement about the trend of the trend.
-
-    It shares the floor with the short arm (both are 20 + 15 = 35 closes), and it
-    is the arm that misbehaves loudest below it: MEASURED on TSLA's real closes it
-    reports exactly -50.0000 from 35 closes through 43, and ANY strictly falling
-    series pegs it there the moment it can be computed at all. That is why the gate
-    is a shared constant rather than one guess per arm.
-    """
-    usable = _chronological(closes)
-    if len(usable) < MIN_SETTLED:
-        return None
-    series = rsi(ema(usable, LONG_L1), LONG_L2)
     return series[-1] - CENTRE if series else None
 
 
