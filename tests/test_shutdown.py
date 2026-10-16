@@ -42,7 +42,7 @@ from pathlib import Path
 import pytest
 from conftest import ROOT, code_only, connect_migrated
 
-from optjournal.cli import EXIT_RESTART
+from optjournal.cli import EXIT_ERROR, EXIT_RESTART
 from optjournal.demo import write_demo_statement
 from optjournal.ingest import ingest_file
 
@@ -227,7 +227,9 @@ def _post_restart(port: int) -> tuple[int, dict]:
 def test_restart_now_exits_with_the_code_the_launcher_starts_again_on(journal,
                                                                      monkeypatch):
     """The page's Restart now through a real `serve`: answered first, then the
-    exit `launcher/app.py` reads as "start me again"."""
+    exit `launcher/app.py` reads as "start me again", and the start again binds
+    the port the last run answered on, which on Windows it does without
+    SO_REUSEADDR (see `web._Server`)."""
     monkeypatch.setenv("OPTJOURNAL_SUPERVISED", "1")
     port = _free_port()
     proc = _serve(journal, port)
@@ -239,6 +241,35 @@ def test_restart_now_exits_with_the_code_the_launcher_starts_again_on(journal,
         if proc.poll() is None:
             proc.kill()
     assert proc.returncode == EXIT_RESTART, output
+    again = _serve(journal, port)
+    try:
+        _wait_until_bound(again, port)
+    finally:
+        _stop(again)
+        again.communicate(timeout=EXIT_BUDGET_S)
+
+
+def test_a_second_serve_cannot_take_the_port_the_first_is_serving_on(journal):
+    """Two launches at once, a double-click while the first start installs, ran
+    two servers and two schedulers on one journal on Windows: `http.server` sets
+    SO_REUSEADDR, and there it lets a second socket bind a port another is
+    listening on. The second must fail to bind and exit, and the first serve on."""
+    port = _free_port()
+    first = _serve(journal, port)
+    try:
+        _wait_until_bound(first, port)
+        second = _serve(journal, port)
+        try:
+            output = second.communicate(timeout=EXIT_BUDGET_S)[0]
+        except subprocess.TimeoutExpired:
+            second.kill()
+            pytest.fail(f"a second serve shared port {port} with the first, and was "
+                        f"still serving {EXIT_BUDGET_S}s later")
+        assert (second.returncode, "Could not bind" in output) == (EXIT_ERROR, True), output
+        assert first.poll() is None, "the first serve stopped"
+    finally:
+        _stop(first)
+        first.communicate(timeout=EXIT_BUDGET_S)
 
 
 def test_restart_now_is_refused_where_nothing_would_start_serve_again(journal,
