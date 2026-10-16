@@ -306,3 +306,15 @@ def test_the_clone_is_told_it_is_a_copy(tmp_path, monkeypatch):
     assert seen.get(mutate.CLONE_ENV), (
         f"the clone's suite is not told it is a copy; env was {sorted(seen)}"
     )
+
+
+def test_the_developer_tools_run_by_name_but_stay_out_of_the_help():
+    """`optjournal --help` is the list a friend reads, and neither tool is for them."""
+    from optjournal.cli import build_parser, cmd_mutate, cmd_sweep
+
+    parser = build_parser()
+    listing = parser.format_help()
+    assert "mutate" not in listing and "sweep" not in listing, listing
+    assert "SUPPRESS" not in listing, listing
+    assert parser.parse_args(["mutate", "--only", "fee-ccy"]).func is cmd_mutate
+    assert parser.parse_args(["sweep"]).func is cmd_sweep

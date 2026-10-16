@@ -1698,8 +1698,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"journal database (default: {DEFAULT_DB})")
     p.set_defaults(func=cmd_serve)
 
+    # The two developer tools run by name but stay out of `optjournal --help`,
+    # which is the list a friend reads. `description`, not `help=SUPPRESS`:
+    # Python 3.12 lists a suppressed subcommand as "==SUPPRESS==".
     p = sub.add_parser("mutate", parents=[common],
-                       help="inject known defects, report which tests catch each")
+                       description="inject known defects, report which tests catch each")
     p.add_argument("--only", action="append", metavar="KEY",
                    help="run just this defect (repeatable); default is all")
     mutant_workdir = Path(tempfile.gettempdir()) / "optjournal-mutants"
@@ -1714,7 +1717,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_mutate)
 
     p = sub.add_parser("sweep", parents=[common],
-                       help="render every page in a browser and check it")
+                       description="render every page in a browser and check it")
     p.add_argument("--query-id", dest="query_id", default=None,
                    help="Flex Query ID, so the Sync button renders as it does live")
     p.add_argument("--real-only", action="store_true", help="skip the demo journal")
