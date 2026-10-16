@@ -194,33 +194,6 @@ def check_header_icons_grouped(p: Page) -> Verdict:
 # Money: the invariant the whole model exists to hold
 # ---------------------------------------------------------------------------
 
-#: The page's own `CCY` table, parsed rather than restated.
-#:
-#: These were two independent literals and they had already drifted BOTH ways:
-#: the page rendered `¥` for JPY, which the sweep did not know was a currency at
-#: all, so a costs block mixing yen with anything else would have passed; and the
-#: sweep listed `kr` for SEK, which the page never emits -- it has no SEK glyph
-#: and falls back to the ISO prefix, so `kr` could only ever match by accident in
-#: prose.
-#:
-#: A check that reads glyphs back out of the page has to know which glyphs the
-#: page can produce, and the page is the only honest source for that. Parsed the
-#: same way `tests/test_sweep.py` parses `TABS`, and for the same reason.
-def _currency_glyphs() -> dict[str, str]:
-    """`{ISO: glyph}` as page.html declares it, or the fallback if it moved."""
-    from optjournal.web import page_html
-
-    block = re.search(r"const CCY=\{(.*?)\};", page_html())
-    if block is None:  # pragma: no cover - the page always declares it
-        return dict(_CURRENCY_GLYPH_FALLBACK)
-    return dict(re.findall(r"(\w+):'([^']+)'", block.group(1)))
-
-
-#: Used only when the literal cannot be found, so a moved declaration degrades to
-#: a stale check rather than to no check.
-_CURRENCY_GLYPH_FALLBACK = {"EUR": "€", "USD": "$", "GBP": "£", "KRW": "₩"}
-
-
 #: The Costs headline: the figure, then the split line beneath it. Matched on the
 #: rendered classes rather than on prose, so rewording the caption cannot silently
 #: disable the checks below.

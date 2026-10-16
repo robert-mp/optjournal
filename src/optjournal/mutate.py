@@ -97,7 +97,7 @@ import signal
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -674,11 +674,6 @@ class MutationOutcome:
     tests: tuple[str, ...] = ()
     detail: str = ""
 
-    @property
-    def uncaught(self) -> bool:
-        """Measured, and nothing failed. Judge equivalence before believing it."""
-        return self.status == "measured" and self.failed == 0
-
 
 _PTH = "_editable_impl_optjournal.pth"
 
@@ -855,7 +850,7 @@ def run_mutant(mutant: Mutant, *, source: Path, workdir: Path) -> MutationOutcom
     # Found exactly that way: `loopback` makes `serve()` bind instead of raise, the
     # test then serves forever, and the survey called the security guard untested.
     # A hang is a MEASUREMENT FAILURE, not a result, so it belongs with the other
-    # untrustworthy statuses that `Report.ok` refuses.
+    # untrustworthy statuses that make `optjournal mutate` exit 1.
     if result.returncode == MUTATION_TIMEOUT_RETURN_CODE:
         shutil.rmtree(clone, ignore_errors=True)
         return MutationOutcome(
@@ -923,16 +918,6 @@ def run_all(
     # `map` preserves input order, so a parallel report reads like a serial one.
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         return list(pool.map(one, wanted))
-
-
-@dataclass(slots=True)
-class Report:
-    outcomes: list[MutationOutcome] = field(default_factory=list)
-
-    @property
-    def ok(self) -> bool:
-        """No mutant went unnoticed, and every measurement was trustworthy."""
-        return all(o.status == "measured" and o.failed > 0 for o in self.outcomes)
 
 
 def format_report(outcomes: list[MutationOutcome]) -> str:

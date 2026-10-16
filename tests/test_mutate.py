@@ -24,12 +24,12 @@ from pathlib import Path
 import pytest
 
 from optjournal import mutate
+from optjournal.cli import EXIT_ERROR, EXIT_OK, main
 from optjournal.mutate import (
     _SUITE_TIMEOUT_S,
     MUTANTS,
     MUTATION_TIMEOUT_RETURN_CODE,
     MutationOutcome,
-    Report,
     format_report,
     run_mutant,
 )
@@ -37,6 +37,12 @@ from optjournal.mutate import (
 
 def _outcome(**kw) -> MutationOutcome:
     return MutationOutcome(mutant=MUTANTS[0], **kw)
+
+
+def _exit_code(monkeypatch, outcomes: list[MutationOutcome]) -> int:
+    """What `optjournal mutate` exits with when the survey comes back as `outcomes`."""
+    monkeypatch.setattr(mutate, "run_all", lambda **_: outcomes)
+    return main(["mutate"])
 
 
 def _fake_clone(tmp_path, mutant):
@@ -82,15 +88,15 @@ def test_run_mutant_reports_a_timed_out_suite_as_hung(tmp_path, monkeypatch):
         f"failures it reads as UNCAUGHT, which is the defect that called the "
         f"loopback security guard untested"
     )
-    assert not outcome.uncaught
     assert str(_SUITE_TIMEOUT_S) in outcome.detail
 
 
-def test_a_killed_suite_is_not_a_measurement_of_zero():
-    """A hang must never read as `UNCAUGHT` once classified."""
+def test_a_killed_suite_fails_the_survey(monkeypatch):
+    """A hang measured nothing, so a scripted run must not read it as a pass."""
     hung = _outcome(status="hung", detail="the suite did not finish")
-    assert not hung.uncaught, "a hung suite must not be classed as a measured zero"
-    assert not Report([hung]).ok, "a hung suite must make the report refuse"
+    assert _exit_code(monkeypatch, [hung]) == EXIT_ERROR, (
+        "a hung suite must make `optjournal mutate` exit 1"
+    )
 
 
 def test_the_report_shows_a_hung_suite_as_untrustworthy_not_as_a_count():
@@ -101,23 +107,21 @@ def test_the_report_shows_a_hung_suite_as_untrustworthy_not_as_a_count():
     assert "did not finish in 500s" in text
 
 
-def test_a_measured_zero_is_still_reported_as_uncaught():
+def test_a_measured_zero_is_still_reported_as_uncaught(monkeypatch):
     """The other direction: the UNCAUGHT signal must survive this change.
 
     Suppressing hangs would be worthless if it also suppressed the real finding of
     a defect that genuinely no test notices.
     """
     zero = _outcome(status="measured", failed=0)
-    assert zero.uncaught
-    assert not Report([zero]).ok
+    assert _exit_code(monkeypatch, [zero]) == EXIT_ERROR
     assert "UNCAUGHT" in format_report([zero])
 
 
-def test_a_caught_mutant_reports_its_tests():
+def test_a_caught_mutant_reports_its_tests(monkeypatch):
     caught = _outcome(status="measured", failed=2,
                       tests=("tests/test_x.py::test_a", "tests/test_x.py::test_b"))
-    assert not caught.uncaught
-    assert Report([caught]).ok
+    assert _exit_code(monkeypatch, [caught]) == EXIT_OK
     text = format_report([caught])
     assert "2 test(s)" in text
     assert "tests/test_x.py::test_a" in text
