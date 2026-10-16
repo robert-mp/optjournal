@@ -261,21 +261,6 @@ def test_only_the_fetch_locks_own_wait_is_a_fetch_lock_timeout(tmp_path, monkeyp
     assert not isinstance(caught.value, flex.FetchLockTimeout)
 
 
-def test_retry_budget_stays_within_a_daily_cron_window():
-    """The guard that makes the timeout fix durable.
-
-    `~/.meshclaw/crons/optjournal_sync.py` sets a subprocess timeout above
-    POLL_WORST_CASE_S, and its cron registration sets a timeout above that.
-    Raising MAX_RETRIES silently invalidates both. Fail here instead, where the
-    message can say so, rather than at 07:00 in a sandboxed subprocess.
-    """
-    assert flex.POLL_WORST_CASE_S <= 720, (
-        f"POLL_WORST_CASE_S is {flex.POLL_WORST_CASE_S}s. Raise "
-        f"FETCH_TIMEOUT_S in optjournal_sync.py above it, and the cron's own "
-        f"timeout above that, or lower MAX_RETRIES."
-    )
-
-
 def test_backoff_is_capped_not_unbounded():
     waits = [
         min(flex.RETRY_INTERVAL * (2**i), flex.MAX_RETRY_INTERVAL)

@@ -187,7 +187,7 @@ def cmd_fetch(args) -> int:
         to_date=args.to_date,
         force=args.force,
         # A command line waits its turn behind another fetch rather than giving up.
-        lock_timeout_s=_lock_wait(),
+        lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
     )
     data = summary_data(result.response, result.raw_path)
     data["raw_path"] = str(result.raw_path)
@@ -908,9 +908,8 @@ def cmd_serve(args) -> int:
     # `query_id=None` on every due tick, and the ledger filled with `failed -- no
     # Flex query id configured` while `optjournal sync` in a shell worked fine.
     # The query id is an identifier, not the secret -- the TOKEN is in the OS
-    # keyring (`flex.read_token`) and `cron/optjournal_sync.py:104` has carried the
-    # id in the repo all along. So the environment is a channel `serve` can share
-    # with the cron rather than a place to hide something.
+    # keyring (`flex.read_token`). So the environment is a channel `serve` can share
+    # with the CLI rather than a place to hide something.
     #
     # READ AFTER the `--demo` check, deliberately: the guard above is about an
     # EXPLICIT flag, so a developer who exports the variable and then serves the
@@ -1299,7 +1298,7 @@ def cmd_setup(args) -> int:
         try:
             read_token(account)
             result = fetch(effective_qid, archive_dir=DEFAULT_ARCHIVE,
-                           lock_timeout_s=_lock_wait())
+                           lock_timeout_s=FETCH_LOCK_TIMEOUT_S)
         except FetchCooldown as exc:
             print(f"  skipped: {exc}")
         else:
@@ -1351,7 +1350,7 @@ def cmd_confirms(args) -> int:
             # said the same thing twice, and two spellings of one intent are how
             # they eventually disagree.
             cooldown_s=CONFIRM_COOLDOWN_S,
-            lock_timeout_s=_lock_wait(),
+            lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
         )
         ingested = ingest_confirms(
             conn, result.raw_path, base_currency=base,
@@ -1392,25 +1391,6 @@ def _journal_base_currency(conn) -> str | None:
     return str(row["base_currency"]) if row and row["base_currency"] else None
 
 
-#: A supervised caller's deadline for the shared fetch lock, in seconds. The CLI
-#: waits out a whole fetch by default (`FETCH_LOCK_TIMEOUT_S`) because a person
-#: running `optjournal sync` would rather wait than be refused. A caller that will
-#: KILL this process has to bound that wait below its own timeout, or the kill
-#: lands while we are merely queuing and reads as "no statement after Ns": that is
-#: `cron/optjournal_sync.py`'s ladder, which sets this.
-LOCK_WAIT_ENV = "OPTJOURNAL_LOCK_WAIT_S"
-
-
-def _lock_wait() -> float:
-    """How long a command-line fetch waits for another fetch to finish."""
-    raw = (os.environ.get(LOCK_WAIT_ENV) or "").strip()
-    try:
-        wait = float(raw)
-    except ValueError:
-        return FETCH_LOCK_TIMEOUT_S
-    return wait if wait > 0 else FETCH_LOCK_TIMEOUT_S
-
-
 def cmd_sync(args) -> int:
     """Fetch the latest statement, fold it in, and report only what is new.
 
@@ -1442,7 +1422,7 @@ def cmd_sync(args) -> int:
                 from_date=args.from_date,
                 to_date=args.to_date,
                 force=args.force,
-                lock_timeout_s=_lock_wait(),
+                lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
             )
         except (FetchCooldown, TokenMissing, TokenRejected, FetchLockTimeout) as exc:
             # RECORDED BEFORE RE-RAISING, so `main`'s handlers still decide the exit

@@ -30,7 +30,7 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --frozen
       - name: Lint
-        run: uv run ruff check src tests cron
+        run: uv run ruff check src tests
       - name: Type check
         run: uv run mypy
       - name: Test

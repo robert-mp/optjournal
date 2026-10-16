@@ -928,9 +928,9 @@ def test_sync_behind_another_fetch_is_busy_not_a_traceback(tmp_path, capsys, mon
 def test_sync_waits_for_the_real_fetch_lock_as_long_as_it_is_told(
     tmp_path, capsys, monkeypatch,
 ):
-    """The whole path behind the test above, with a real holder: the wait the cron
-    hands over in `OPTJOURNAL_LOCK_WAIT_S`, then busy and throttled. Nothing past
-    the lock may run, so the keyring and IBKR are refused outright."""
+    """The whole path behind the test above, with a real holder: the CLI's own wait,
+    cut short here, then busy and throttled. Nothing past the lock may run, so the
+    keyring and IBKR are refused outright."""
     import time
 
     from optjournal import flex, locks
@@ -940,7 +940,7 @@ def test_sync_waits_for_the_real_fetch_lock_as_long_as_it_is_told(
 
     monkeypatch.setattr(flex, "read_token", refused)
     monkeypatch.setattr(flex, "_client_factory", refused)
-    monkeypatch.setenv(cli.LOCK_WAIT_ENV, "0.2")
+    monkeypatch.setattr(cli, "FETCH_LOCK_TIMEOUT_S", 0.2)
     archive = tmp_path / "raw"
     started = time.monotonic()
     with locks.locked(archive / flex.FETCH_LOCK):

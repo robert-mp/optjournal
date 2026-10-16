@@ -122,13 +122,12 @@ It is 690 occurrences, so it waits for a real second broker — see PLAN.md's "t
 8" for the measured scope, the two migration traps that are confirmed by test, and
 the commit-by-commit order.
 
-**A new cron job**: implementation in `cron/`, a loader shim in the host cron
-runner's own script directory that locates it by path (never a copy — see
-below), and a case in `tests/test_cron.py`. The cron scripts run under that
-runner's interpreter, which has no py_ibkr, so they may import nothing from the
-`optjournal` package and must shell out to the CLI instead. Exit codes are
-mirrored rather than imported for that reason, and a test holds the copies to
-`cli.py`'s originals.
+**A new scheduled job**: a `Job` in `jobs.JOBS` (its run function, its schedule
+and catch-up rule, and whether it spends an IBKR request), its name in
+`KNOWN_JOBS`, and cases in `tests/test_jobs.py`, which hold the two lists to each
+other. Keep the run function thin. The work belongs in a module the CLI already
+calls, and the job only turns its result or its typed exception into a ledger
+status.
 
 ## Data safety
 
@@ -160,7 +159,7 @@ mirrored rather than imported for that reason, and a test holds the copies to
 
 ```bash
 uv run pytest -q            # deterministic tracked fixtures
-uv run ruff check src tests cron
+uv run ruff check src tests
 uv run mypy
 uv run optjournal sweep     # every page in a real browser (~2 min)
 uv run optjournal mutate    # full mutation survey; intentionally slower
@@ -188,14 +187,13 @@ it: that is the subject of those tests, not setup for them.
 one that was not shipped broken: `render.py` kept reading the flat money keys the
 `Money` conversion had removed, and `optjournal orders` and `optjournal history`
 both died on `float(dict)` behind a green suite. The page has its `@typedef`
-guards, `--json` has the sweep, the terminal reports have `test_render.py`, and
-the crons have `test_cron.py`. A new consumer needs one too.
+guards, `--json` has the sweep, and the terminal reports have `test_render.py`.
+A new consumer needs one too.
 
 Three rules the README used to state in prose and nothing enforced now have
 tests in `test_layering.py`: the leaf modules import nothing from the package,
 only `bars` and `demo` may import `blackscholes` (the modelled-number
-quarantine), and the import graph is acyclic — which matters because the cron
-loads this package under an interpreter that has no py_ibkr.
+quarantine), and the import graph is acyclic.
 
 `optjournal sweep` goes further than the suite can afford to: it renders **every
 page both journals can show** — each tab, the currency toggle, the asset switch,

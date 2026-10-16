@@ -258,7 +258,7 @@ should get you running, not explain every decision.
 
 ```bash
 uv run pytest -q                      # deterministic suite
-uv run ruff check src tests cron      # lint
+uv run ruff check src tests           # lint
 uv run mypy                           # static types
 uv run optjournal mutate              # mutation testing: see docs/testing.md
 ```

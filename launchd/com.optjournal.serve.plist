@@ -47,8 +47,7 @@
        (`cmd_serve` also falls back to the variable now, for a hand-run serve.)
 
        The id is an IDENTIFIER, not the credential: the Flex token lives in the OS
-       keyring (`flex.read_token`), which is why this is safe to track in the repo
-       and why `cron/optjournal_sync.py` has held the same value all along. -->
+       keyring (`flex.read_token`), which is why this is safe to track in the repo. -->
   <key>ProgramArguments</key>
   <array>
     <string>/Users/robrtmar/optjournal/.venv/bin/optjournal</string>

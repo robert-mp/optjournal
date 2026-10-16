@@ -411,8 +411,7 @@ def _bars(conn: sqlite3.Connection, _ctx: Context, *, live: bool) -> Outcome:
     """Fetch the manifest's windows. Shared by `bars_live` and `bars_daily`.
 
     One function with a flag rather than two, because the two differ ONLY in what
-    they ask for -- which is also how `cron/optjournal_bars.py` is written, and
-    the reason it is one file.
+    they ask for.
 
     Per-window failures are collected by `backfill_bars` rather than raised (one
     unreachable contract must not abandon the book), so the status is derived from

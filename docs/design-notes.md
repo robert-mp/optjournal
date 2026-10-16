@@ -214,42 +214,24 @@ and those bars are gone.
 That splits collection in two, and `bars_manifest` marks the difference with
 `BarRequest.perishable`:
 
-| | what | when | cron |
+| | what | when | collected by (`jobs.JOBS`) |
 |---|---|---|---|
-| Perishable | intraday bars of an **open** option whose replay is drawn hourly | only during its own session | `optjournal-bars-live`, hourly at :05 past, 10:05–16:05 **ET**, weekdays |
-| Re-fetchable | daily option closes, the whole underlying series | any time | `optjournal-bars-daily`, 12:30 Dublin, Tue–Sat |
-| Audit | did yesterday's perishable bars actually land? | after the daily run | `optjournal-bars-audit`, 13:00 Dublin, Tue–Sat |
+| Perishable | intraday bars of an **open** option whose replay is drawn hourly | only during its own session | `bars_live`, during the US session on weekdays, once its last success is over 55 minutes old |
+| Re-fetchable | daily option closes, the whole underlying series | any time | `bars_daily`, 12:30 Dublin, Tue–Sat |
+| Audit | did yesterday's perishable bars actually land? | after the daily run | no job, because `serialize.audit_data` answers it on every page load (and `optjournal bars --audit` on demand) |
 
-Both live in `cron/optjournal_bars.py`. `--live` restricts a run to the
-perishable set: running the full manifest seven times a session would re-fetch
-three years of settled daily history to collect a handful of new hourly rows.
+Both jobs run `jobs._bars`, and its `live` flag (`optjournal bars --live` on the
+command line) restricts a run to the perishable set. Running the full manifest
+seven times a session would re-fetch three years of settled daily history to
+collect a handful of new hourly rows.
 
-> **Deployment.** The host cron runner requires its scripts to live in a
-> directory of its own, which is not version controlled, so the implementations
-> live here and each deployed file is a **loader shim** that resolves one by path
-> at run time. That
-> is what makes editing `cron/*.py` take effect: the shim carries an `IMPL` path,
-> a `_load()`, and one delegate per registered entry point, and nothing else.
->
-> `optjournal_bars.py` was a byte-for-byte copy for a while, which is the failure
-> this pattern exists to prevent — an edit is reviewed, committed, and simply
-> never runs, silently, and the copy stays equal only until the next commit
-> touches that file. `tests/test_cron.py` now asserts both deployed files are
-> shims and that every registered entry point resolves to real code, so the state
-> cannot come back unnoticed. It matters more here than anywhere else in this
-> project: a perishable session missed is a session no later run can recover.
->
-> Each shim is deliberately self-contained, repeating ~15 lines rather than
-> importing a shared helper — that helper would have to live in the same
-> unversioned directory, which is the problem being solved. A shim whose only job
-> is to have no dependencies may not acquire one.
 The LEAP is deliberately excluded from hourly collection — the gate is the
 chart's own granularity rule, so an option is collected hourly exactly when its
 replay is *drawn* hourly.
 
 The intraday series is **cumulative within a session** — a 13:00 poll returns
 every completed bar since the open — which is what makes a lost poll harmless
-and lets the cron treat a fetch failure as a quiet retry rather than an alert.
+and lets `bars_live` treat a fetch failure as a quiet retry rather than an alert.
 
 That tolerance has one hole, and `bars --audit` is the only thing that sees it: a
 session where *every* poll failed is gone and says nothing about it. The audit
