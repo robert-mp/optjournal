@@ -395,6 +395,7 @@ def import_history(
     started = _now()
     plan = history_plan(conn, archive_dir)
     fetched: list[str] = []
+    files: list[str] = []
     stopped: str | None = None
     retryable = False
     for i, (fd, td) in enumerate(plan):
@@ -424,14 +425,18 @@ def import_history(
             break
         ingest_file(conn, result.raw_path, assets=assets)
         fetched.append(f"{fd}-{td}")
+        files.append(result.raw_path.name)
 
-    new_trades = conn.execute(
-        "SELECT COUNT(*) AS n FROM trades WHERE first_seen_at >= ?", (started,),
-    ).fetchone()["n"]
-    new_cash = conn.execute(
-        "SELECT COUNT(*) AS n FROM cash_transactions WHERE first_seen_at >= ?",
-        (started,),
-    ).fetchone()["n"]
+    # By file as well as by time, for `sync_journal`'s reason: a confirm poll
+    # landing during a minutes-long import is not this import's.
+    marks = ",".join("?" * len(files))
+    new_trades, new_cash = (
+        conn.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE first_seen_at >= ?"
+            f" AND source_file IN ({marks})", (started, *files),
+        ).fetchone()["n"] if files else 0
+        for table in ("trades", "cash_transactions")
+    )
     snapshot = _snapshot(conn) if new_trades or new_cash else None
 
     if not plan:

@@ -619,6 +619,42 @@ def test_import_history_fetches_every_chunk_forced_and_paced(tmp_path, monkeypat
     assert result["stopped"] is None
 
 
+def test_import_history_counts_only_what_its_own_statements_brought(
+        populated, tmp_path, monkeypatch):
+    """A confirm poll that lands a fill while a chunk is being fetched is the
+    confirm job's, not the import's: no "1 new trade" and no snapshot for it."""
+    from test_confirms import CONFIRM_XML
+    from optjournal import ingest  # noqa: PLC0415 - local to this test
+    from optjournal.db import connect  # noqa: PLC0415 - local to this test
+
+    mod, _calls = _stub_history(monkeypatch, plan=[("20240802", "20250801")])
+    confirm = tmp_path / "confirm-20260924.xml"
+    confirm.write_text(CONFIRM_XML, encoding="utf-8")
+    conn = connect(populated)
+    stub = mod.fetch
+
+    def fetch(*args, **kwargs):
+        ingest.ingest_confirms(conn, confirm, base_currency="EUR",
+                               assets=ingest.ASSET_FILTER_ALL,
+                               rate_for=lambda _ccy: (0.87, True))
+        return stub(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "_now", lambda: "2099-01-01T00:00:00+00:00")
+    monkeypatch.setattr(ingest, "_now", lambda: "2099-01-01T00:00:05+00:00")
+    monkeypatch.setattr(mod, "fetch", fetch)
+    snapshots: list[object] = []
+    monkeypatch.setattr(mod, "_snapshot", lambda conn: snapshots.append(conn))
+    result = mod.import_history(conn=conn, archive_dir=RAW_DIR, query_id="1",
+                                sleep=lambda _s: None)
+    landed = conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE source_file = ?", (confirm.name,),
+    ).fetchone()[0]
+    conn.close()
+    assert landed == 1, "premise: the confirm landed while the import ran"
+    assert "0 new trade" in result["summary"], result["summary"]
+    assert snapshots == [], "the confirm's fill took the import's snapshot"
+
+
 def test_import_history_stops_at_the_first_refusal(tmp_path, monkeypatch):
     from optjournal.db import open_journal  # noqa: PLC0415 - local to this test
 
