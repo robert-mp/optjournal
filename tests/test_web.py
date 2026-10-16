@@ -5646,6 +5646,28 @@ def test_only_a_success_banner_dismisses_itself():
     )
 
 
+def test_a_faded_success_note_leaves_the_layout_with_reduce_motion_on():
+    """Reduce Motion sets `#msg{transition:none}`, so the `transitionend` the page
+    waited on never fired: a faded success stayed `display:block` at opacity 0, a
+    42px invisible band above the panels (measured in Chromium), with one more dead
+    listener per note. The page's own `note`, every timer run, no transition event.
+    """
+    out = _node_run([
+        "const timers=[]; const setTimeout=f=>{timers.push(f); return timers.length;};",
+        "const clearTimeout=()=>{}; let listeners=0;",
+        "const msg={innerHTML:'',className:'',addEventListener(){listeners++;}};",
+        "msg.classList={contains:c=>msg.className.split(' ').includes(c),",
+        "  add:c=>{msg.className+=' '+c;}};",
+        "const $=sel=>sel==='#msg'?msg:null;",
+        "const getComputedStyle=()=>({transitionDuration:'0s'});",
+        "let noteTimer=null;", _page_const("NOTE_MS"), *_page_fns("note"),
+        "note('Prices updated.','ok');",
+        "while(timers.length) timers.shift()();",
+        "console.log(JSON.stringify({cls:msg.className,listeners}));",
+    ])
+    assert out == {"cls": "", "listeners": 0}
+
+
 def test_an_empty_loss_population_reads_as_a_fact_not_a_missing_number():
     """`—` on Avg Loss with zero losing trades reads as "failed to load". There
     have been no losses, which is information; the card should say so.
@@ -5905,6 +5927,33 @@ def _collection_rows(demo: bool) -> dict[str, str]:
     ])
     return dict(re.findall(r'<div class="jobrow">\s*<span class="jobname mono">([a-z_]+)'
                            r"</span>(.*?)</div>", html, re.S))
+
+
+def test_a_jobs_time_reads_as_an_age_not_a_bare_utc_clock():
+    """The jobs strip printed `slice(0,16)` of a UTC timestamp with no zone, so a
+    run at 15:00 in Madrid read "13:00". It says how long ago, as its comment
+    always promised, and "started" while the run is still going.
+    """
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    now = datetime.now(UTC)
+    run = {"status": "ok", "started_at": (now - timedelta(minutes=4)).isoformat(),
+           "finished_at": (now - timedelta(minutes=3)).isoformat(), "detail": None}
+    live = {**run, "status": "running", "finished_at": None}
+    state = {"demo": False, "audit": {"ever_collected": False},
+             "scheduler": {"ever_ran": False, "jobs": [
+                 {"job": job, "last_status": "ok", "consecutive_failures": 0,
+                  "spends_request": False, "requests": 0, "last_run": last}
+                 for job, last in (("market", run), ("bars_live", live))]}}
+    html = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        f"const S={{state:{json.dumps(state)}}};",
+        _page_const("DEMO_NO_IBKR"), *_page_fns("infoTip", "ago", "collection"),
+        "console.log(JSON.stringify(collection()));",
+    ])
+    when = dict(re.findall(r'jobname mono">([a-z_]+)</span>.*?jobwhen mono"[^>]*>([^<]*)<',
+                           html, re.S))
+    assert when == {"market": "3m ago", "bars_live": "started 4m ago"}, when
 
 
 def test_a_job_in_flight_reads_running():
@@ -10717,6 +10766,48 @@ def test_a_late_update_banner_leaves_the_focused_field_where_it_was():
     before = fn.index("getBoundingClientRect().top")
     assert before < fn.index("await redraw();") < fn.index("window.scrollBy("), (
         "the focused field has to be measured before the redraw and put back after")
+
+
+def test_the_last_lit_cost_chip_stays_lit():
+    """Deselecting the only lit chip sent an empty selection, which the wire spells
+    the same as none, so the server answered with its default and the chip came
+    straight back, at the cost of a request. The page's own chip handler, out of
+    `draw`, against the scope the server reported.
+    """
+    drawn = _code_only(_fn("draw"))
+    handler = re.search(
+        r"document\.querySelectorAll\('\.multi button\[data-cost\]'\)\.forEach\(.*?\n    \}\);",
+        drawn, re.S)
+    assert handler, "the cost chip handler moved"
+    out = _node_run([
+        "const chips=['OPT','STK'].map(k=>({dataset:{cost:k}})); let loads=0;",
+        "const document={querySelectorAll:()=>chips};",
+        "const S={cost:null,state:{broker_costs:{scope:{categories:['OPT']}}}};",
+        "function load(){loads++;}",
+        *_page_fns("costOn"), handler.group(0),
+        "chips[0].onclick(); const alone={loads,cost:S.cost};",
+        "chips[1].onclick();",
+        "console.log(JSON.stringify({alone,added:{loads,cost:S.cost}}));",
+    ])
+    assert out["alone"] == {"loads": 0, "cost": None}, "the last lit chip went dark"
+    assert out["added"] == {"loads": 1, "cost": ["OPT", "STK"]}
+
+
+def test_a_phone_hides_the_trades_columns_its_rule_names():
+    """At 390px the Trades list ran 653px wide inside its scroller, so a row's two
+    figures were off screen and an opened card's legs were cut. A phone drops the
+    third to fifth columns (measured: the table then fits a 390px screen). The rule
+    counts columns, so the header must still put Status, Dates and Held there, or a
+    reorder would hide a figure instead.
+    """
+    head = re.search(r'<table class="tlist"><thead><tr>(.*?)</tr></thead>', _fn("trades"), re.S)
+    assert head, "the Trades list header moved"
+    names = re.findall(r"<th[^>]*>([^<]+)</th>", head.group(1).replace("\n", " "))
+    assert names[2:5] == ["Status", "Dates", "Held"], names
+    rules = [(sel.strip(), body) for sel, body in _css_rules()]
+    assert any(sel == ".tlist tr>:is(th,td):nth-child(n+3):nth-child(-n+5)"
+               and "display:none" in body for sel, body in rules), (
+        "the phone rule that hides Status, Dates and Held is gone")
 
 
 def test_the_app_banners_wrap_on_a_phone():

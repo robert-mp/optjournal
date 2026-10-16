@@ -1718,6 +1718,14 @@ td.n,th.n{text-align:right;font-family:var(--fig);font-variant-numeric:tabular-n
 .tlist tbody tr.on{background:linear-gradient(160deg,var(--seg1),var(--seg2))}
 .tlist tbody tr.tdrawer>td{white-space:normal;padding:0 var(--s5) var(--s6);
   background:var(--bg2);border-bottom:1px solid var(--line)}
+/* On a phone a row is the position, its strategy and its two figures, which is
+   what fits 390px: status, dates and time held go (the switch above sorts open
+   from closed, and the card the row opens dates every event), and "no price yet"
+   wraps under its dash. */
+@media(max-width:760px){
+  .tlist tr>:is(th,td):nth-child(n+3):nth-child(-n+5){display:none}
+  .tlist :is(th,td){padding-inline:var(--s2)}
+  .tlist td:last-child{white-space:normal}}
 .tbar{display:flex;justify-content:flex-end;padding-top:var(--s5)}
 .grp{margin-top:var(--s5);border:1px solid var(--line);border-radius:var(--r2);overflow:hidden}
 .grp .gh{display:flex;justify-content:space-between;align-items:center;gap:var(--s5);

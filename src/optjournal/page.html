@@ -1545,7 +1545,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local chosen ws opts thin px
  * @local shownByDay next picked plan u
  * @local JSON Object ages input mine qb wf was
- * @local when parts names err
+ * @local parts names err
  * @local COST_OPTIONS bits cost fees on wh
  * @local state SCOPE_KEYS
  * @local qidsave cqidsave tokcheck toksave
@@ -2631,12 +2631,14 @@ function collection(){
     const detail=run&&run.detail?run.detail:'';
     /* `finished_at` over `started_at`: for a job that is still running the
        former is null, and "started 3m ago" is the honest thing to say then. */
-    const when=run?(run.finished_at||run.started_at||''):'';
+    const when=run&&(run.finished_at||run.started_at);
+    const age=!when?'':(run.finished_at?'':'started ')
+      +ago((Date.now()-Date.parse(when))/1000);
     return `<div class="jobrow">
       <span class="jobname mono">${esc(j.job)}</span>
       <span class="jobstat ${tint}">${esc(status||'never run')}</span>
       <span class="dim jobdet">${esc(detail)}</span>
-      <span class="dim2 jobwhen mono">${esc(when.slice(0,16).replace('T',' '))}</span>
+      <span class="dim2 jobwhen mono">${esc(age)}</span>
       ${j.consecutive_failures>1?`<span class="pill gap neg"
         title="${j.backed_off
           ? 'Backed off: the quick retries have stopped. It is still tried at its usual pace (once per window, or once per scheduled time, and once more if it costs no IBKR request) and comes back on its own when a run succeeds.'
@@ -4283,13 +4285,19 @@ const COST_OPTIONS=[
   ['CASH','FX conversions',false],
   ['0DTE','0DTE',true],
 ];
-function costScope(){
-  /* The SERVER's answer, not S.cost: with nothing chosen S.cost is null and the
-     server applied its own default, so reading local state would leave every
-     chip unlit on first load while the figures below described a real scope. */
+/* The lit chips, from the SERVER's answer, not S.cost: with nothing chosen
+   S.cost is null and the server applied its own default, so reading local state
+   would leave every chip unlit on first load while the figures below described a
+   real scope, and the first click would discard that default instead of adding
+   to it. */
+function costOn(){
   const csc=(S.state.broker_costs||{}).scope||{};
   const on=new Set(csc.categories||[]);
   if(csc.subset) on.add(csc.subset);
+  return on;
+}
+function costScope(){
+  const csc=(S.state.broker_costs||{}).scope||{}, on=costOn();
   return `<div class="filters">
     <div><div class="flabel">Costs to include</div>
       <div class="multi">${COST_OPTIONS.map(([key,label,sub])=>{
@@ -4377,7 +4385,8 @@ function costs(){
       published rate, so the figure shown is the midpoint of
       ${cash(F.total_low_base)}–${cash(F.total_high_base)}.</span>i</span>`:''}</h2>
       <div class="sub">${esc(costPeriod(bc))} ·
-        ${plural(CT.fills,'fill')} · ${esc(costScopeLabel(bc.scope))} · ${esc(ccyNote())}</div></div>
+        ${plural(CT.fills,'fill')} · ${esc(costScopeLabel(bc.scope))}${
+          ccyNote()?` · ${esc(ccyNote())}`:''}</div></div>
       <div class="pills">
         <span class="pill tipped" tabindex="0">charged <b>${
           cash(F.stated.base)}</b><span class="tip">What IBKR billed, summed from
@@ -6751,16 +6760,6 @@ function draw(push){
   document.querySelectorAll('.seg button[data-type]').forEach(b=>
     b.onclick=()=>{const t=b.dataset.type||null;
       if(t===S.type)return; S.type=t; load();});
-  /* The cost scope TOGGLES rather than selects: this is a multi-select, so a
-     click flips one option and leaves the rest alone. Seeded from the scope the
-     server reported rather than from S.cost, which is null until the reader has
-     touched anything -- reading it would make the first click discard the default
-     selection instead of adding to it.
-
-     Deselecting the last option leaves an EMPTY array, not null: "nothing
-     selected" is a real answer and shows an empty state, where null would silently
-     restore the default and make the click look ignored. A reload costs a request
-     because commission is summed server-side under the new predicate. */
   /* The tile chooser edits a draft; nothing here reaches the server until Save.
      Every handler copies the draft, changes the copy, and redraws, so the list on
      screen is always a rendering of `S.tiledraft` and never a DOM the page has
@@ -6874,12 +6873,15 @@ function draw(push){
     }
     draw();
   };
+  /* The cost scope TOGGLES rather than selects: this is a multi-select, so a
+     click flips one option and leaves the rest alone. The last lit option stays
+     lit: the wire has no word for "nothing", so an empty selection asks for the
+     server's default, which put the chip straight back at the cost of a request.
+     A reload, because commission is summed server-side under the new predicate. */
   document.querySelectorAll('.multi button[data-cost]').forEach(b=>
     b.onclick=()=>{
-      const csc=(S.state.broker_costs||{}).scope||{};
-      const on=new Set(csc.categories||[]);
-      if(csc.subset) on.add(csc.subset);
-      const key=b.dataset.cost;
+      const on=costOn(), key=b.dataset.cost;
+      if(on.has(key)&&on.size===1) return;
       if(on.has(key)) on.delete(key); else on.add(key);
       S.cost=[...on];
       load();
@@ -7132,12 +7134,12 @@ function note(text,kind){
     const el=$('#msg');
     if(!el||!el.classList.contains('ok')) return;
     el.classList.add('fading');
-    /* Hidden only after the fade has run, so the element leaves the layout
-       instead of holding an invisible gap above the panels below it. `once`, so
-       repeated notes cannot stack listeners on one element. */
-    el.addEventListener('transitionend',()=>{
-      if(el.classList.contains('fading')) el.className='';
-    },{once:true});
+    /* Hidden once the fade has run, so the element leaves the layout instead of
+       holding an invisible gap above the panels below it. Timed by the fade's own
+       length in app.css, not by `transitionend`, which never fires when Reduce
+       Motion turns the transition off: the note stayed an invisible band. */
+    const fade=parseFloat(getComputedStyle(el).transitionDuration)*1000||0;
+    setTimeout(()=>{if(el.classList.contains('fading')) el.className='';},fade);
   },NOTE_MS);
 }
 

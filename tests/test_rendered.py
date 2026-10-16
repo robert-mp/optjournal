@@ -328,7 +328,9 @@ def test_every_tab_writes_dates_and_counts_the_way_a_reader_does(
     snapshot", "2025-04-04 → 2026-10-14", "newest 2026-10-14"), the option book
     named contracts by their OSI symbol ("QQQ 261030P00735000"), and counts read
     "2 fill(s)". Dates now read "14 Oct" (the year only when it is not this one),
-    a contract reads as its leg does, and a count takes its noun's number."""
+    a contract reads as its leg does, and a count takes its noun's number. A
+    caption does not end on a separator either: the Costs line read "Options ·"
+    whenever no currency note followed."""
     if not browser.browsers():
         pytest.skip("no Chrome/Chromium on this machine")
     from optjournal import serialize  # noqa: PLC0415 - the server's own binding
@@ -344,10 +346,12 @@ def test_every_tab_writes_dates_and_counts_the_way_a_reader_does(
              *re.findall(r'title="([^"]*)"', browser.markup(dom))]))
         found = (re.findall(r"\b\d{4}-\d{2}-\d{2}\b|\b20\d{6}\b", text)
                  + re.findall(r"\w\(s\)", text)
-                 + re.findall(r"\b[A-Z]{1,5} +\d{6}[CP]\d{8}\b", text))
+                 + re.findall(r"\b[A-Z]{1,5} +\d{6}[CP]\d{8}\b", text)
+                 + re.findall(r"\S+ ·\s*</div>", browser.markup(dom)))
         if found:
             leaks[tab] = found
-    assert not leaks, f"machine dates, OSI symbols or (s) plurals on screen: {leaks}"
+    assert not leaks, (
+        f"machine dates, OSI symbols, (s) plurals or trailing separators: {leaks}")
 
 
 def test_an_estimated_close_is_marked_where_its_pnl_shows(tmp_path):
