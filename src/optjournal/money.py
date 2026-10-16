@@ -133,16 +133,10 @@ class Money:
         """Accumulate base and the per-currency ledger in one pass, then gate.
 
         Each row is `(base, native, currency)` -- the shape an episode or a
-        fill already has. This replaces the accumulate-then-gate block that was
-        written out four times in `stats.py`, identically each time.
+        fill already has. The accumulating is `Charge.of`'s, so a figure and a
+        cost built from the same rows agree.
         """
-        base = 0.0
-        ledger: dict[str, float] = {}
-        for row_base, row_native, row_ccy in rows:
-            base += row_base or 0.0
-            if row_native and row_ccy:
-                ledger[row_ccy] = ledger.get(row_ccy, 0.0) + row_native
-        return cls.gated(base, ledger)
+        return Charge.of(rows).money
 
     @classmethod
     def at_rate(
@@ -271,9 +265,8 @@ class Charge:
     def of(cls, rows: Iterable[tuple[float | None, float | None, str | None]]) -> Charge:
         """Accumulate `(base, native, currency)` rows into one charge.
 
-        The same row shape `Money.charged` takes, deliberately: a caller that
-        has rows for one can hand them to the other without reshaping, and the
-        two stay comparable when a surface shows both.
+        `Money.charged` is this, gated, so a caller holding rows can ask for
+        either without reshaping them.
         """
         base = 0.0
         ledger: dict[str, float] = {}
