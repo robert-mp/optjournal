@@ -71,8 +71,6 @@ from optjournal import __version__, install, journal, replay, updates
 from optjournal import earnings as earnings_mod
 from optjournal import settings as prefs
 from optjournal.ahead import WEEKS_SHOWN, refresh_calendar
-from optjournal.analysis import analyse
-from optjournal.archive import newest_statement
 from optjournal.bars import fetch_watch_bars
 from optjournal.campaigns import open_underlyings, position_count
 from optjournal.clock import MARKET_TZ, parse_day
@@ -93,7 +91,6 @@ from optjournal.flex import (
     TokenUnreadable,
     cooldown_remaining,
     last_fetch,
-    load,
     read_token,
     write_token,
 )
@@ -121,7 +118,6 @@ from optjournal.serialize import (
     audit_data,
     broker_costs_data,
     collection_status,
-    costs_data,
     history_data,
     jobs_data,
     journal_cards,
@@ -892,21 +888,6 @@ def build_state(
             report=report,
             asset_category=asset_category,
         )
-
-    newest = newest_statement(archive_dir)
-    if newest is not None:
-        try:
-            reports = [analyse(s) for s in load(newest).FlexStatements]
-            state["costs"] = [costs_data(r) for r in reports]
-            state["costs_source"] = newest.name
-        except Exception as exc:  # pragma: no cover - defensive
-            # A malformed archive must not blank the whole page; the rest of
-            # the state is read from SQLite and is still valid.
-            log.warning("cost report unavailable: %s", exc)
-            state["costs"] = []
-            state["costs_error"] = str(exc)
-    else:
-        state["costs"] = []
 
     # WHERE the effective id came from, so the settings page can offer to edit it
     # only when editing would actually take effect. A `--query-id` flag or an

@@ -240,7 +240,7 @@ def test_state_is_pure_json(state):
 
 
 def test_state_has_every_panel(state):
-    for key in ("positions", "orders", "history", "statements", "costs", "sync"):
+    for key in ("positions", "orders", "history", "statements", "broker_costs", "sync"):
         assert key in state, f"panel data {key!r} missing"
 
 
@@ -277,8 +277,8 @@ def _parse_contract(js: str) -> tuple[dict[str, dict[str, bool]], dict[str, str]
     """(shapes, bindings, locals) parsed from RAW script text.
 
     shapes:   {shape name: {key: is_optional}} -- `[key]` brackets mark keys
-              the API sends only sometimes (costs_source, the sync reply's
-              branch-dependent fields); required keys must always be sent.
+              the API sends only sometimes (the sync reply's branch-dependent
+              fields); required keys must always be sent.
     bindings: {binding name: shape name} from the @payload rows.
     locals:   names declared page machinery (DOM nodes, builtins, local
               collections) from the @local rows.
@@ -416,7 +416,6 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
     def first(rows):
         return rows[0] if rows else None
 
-    costs = first(state["costs"])
     # The cost payload under the WIDEST scope. The tab defaults to options only,
     # so a conversion pair, a fee group and a withholding line do not appear in
     # `state["broker_costs"]` -- and sampling only that would leave those shapes
@@ -457,9 +456,6 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "LegMoney": first(orders[0]["legs"])["money"] if orders else None,
         "Episode": first(history["closed"] + history["open"]),
         "History": history,
-        "Costs": costs,
-        "CostsTotals": costs["totals"] if costs else None,
-        "FxRow": first(costs["fx"]) if costs else None,
         "Statement": first(state["statements"]),
         # Always present and always four keys, even on a journal with no confirms
         # -- so it anchors properly rather than needing an exemption. The counts
@@ -2810,7 +2806,6 @@ def test_build_state_survives_an_empty_database(tmp_path):
     conn.close()
     state = build_state(db_path=db, archive_dir=tmp_path, query_id=None)
     assert state["positions"] == []
-    assert state["costs"] == []
     # A journal where nothing has happened has no first day, so there is no day
     # to be the Nth of. Null rather than 1: the header drops the dateline
     # entirely, which is honest, where "log day 1" would date a log that was
@@ -2916,17 +2911,15 @@ def test_cost_dates_come_from_selected_journal_rows(populated):
             "SELECT MIN(trade_date), MAX(trade_date) FROM trades"
             " WHERE asset_category IN ('OPT', 'STK', 'CASH')"
         ).fetchone()
+        reported = conn.execute("SELECT MIN(from_date) FROM statements").fetchone()[0]
     finally:
         conn.close()
     assert costs["from_date"] == expected[0]
     assert costs["to_date"] == expected[1]
 
-    # Statement analysis keeps the XML reporting period. The fixture's first
-    # trade is later, proving the DB path did not copy that metadata.
-    statement = build_state(
-        db_path=populated, archive_dir=RAW_DIR, query_id=None
-    )["costs"][0]
-    assert statement["from_date"] != costs["from_date"]
+    # The statement's reporting period starts before its first trade, proving
+    # the DB path did not copy that metadata.
+    assert reported != costs["from_date"]
 
 
 def test_a_repeated_parameter_is_a_multi_select(populated):
@@ -3218,7 +3211,7 @@ def test_scope_does_not_reach_the_tabs_without_a_filter_bar(populated):
     everything = build_state(**kw)
     scoped = build_state(**kw, trade_type="odte")
     assert scoped["positions"] == everything["positions"]
-    assert scoped["costs"] == everything["costs"]
+    assert scoped["broker_costs"] == everything["broker_costs"]
     assert scoped["annual"] == everything["annual"]
     assert scoped["monthly"] == everything["monthly"]
     assert scoped["odte"] == everything["odte"], (
