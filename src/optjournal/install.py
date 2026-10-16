@@ -20,13 +20,14 @@ NEVER OVERWRITES A JOURNAL WITH DATA. A home that already has statements is left
 alone and the move is refused. A home with an empty journal (what the server
 creates on its first start) is set aside, not deleted.
 
-Stdlib and `config` only: `optjournal prepare` runs before the server, and the
-fewer imports it needs the fewer ways a broken update can stop it.
+Stdlib, `config` and `locks` only: `optjournal prepare` runs before the server,
+and the fewer imports it needs the fewer ways a broken update can stop it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -38,11 +39,12 @@ import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 
-from optjournal import config
+from optjournal import config, locks
 from optjournal.config import DATA_NAMES, holds_journal
 
 __all__ = [
     "PENDING_IMPORT",
+    "PREPARE_LOCK",
     "RelocateRefused",
     "choose_import",
     "prepare",
@@ -55,6 +57,8 @@ log = logging.getLogger(__name__)
 #: The reader's confirmed choice of a previous journal, written by the page and
 #: carried out by the next `prepare()`, when the server is no longer running.
 PENDING_IMPORT = ".pending-import.json"
+#: Held by `prepare()` for the whole of its run, and left in the home.
+PREPARE_LOCK = ".prepare.lock"
 
 #: Where a previous download is looked for, and how deep. Two levels covers
 #: `Downloads/optjournal-main` and `Downloads/old/optjournal-main`; deeper walks
@@ -263,7 +267,17 @@ def previous_journals(
     home = home or config.home()
     if _statement_count(home / "journal.db"):
         return []
-    base = search_root or Path.home()
+    return list(_other_downloads(home, search_root or Path.home()))
+
+
+@functools.cache
+def _other_downloads(home: Path, base: Path) -> tuple[Path, ...]:
+    """The walk behind `previous_journals`, once per process for each home.
+
+    The page asks on every state load, every 5 s during a first collection, and
+    on macOS Downloads, Desktop and Documents are privacy-protected: each walk
+    of them can ask the reader for access.
+    """
     found: list[Path] = []
     frontier = [(base / name, SEARCH_DEPTH) for name in SEARCH_DIRS]
     frontier.append((base, HOME_DEPTH))
@@ -281,7 +295,7 @@ def previous_journals(
                 found.append(child)
             elif depth > 1:
                 frontier.append((child, depth - 1))
-    return sorted(found, key=lambda p: (p / "journal.db").stat().st_mtime, reverse=True)
+    return tuple(sorted(found, key=lambda p: (p / "journal.db").stat().st_mtime, reverse=True))
 
 
 def choose_import(source: Path, home: Path | None = None) -> None:
@@ -310,25 +324,29 @@ def prepare(home: Path | None = None, *, code_dir: Path | None = None) -> list[s
     """
     home = home or config.home()
     code_dir = code_dir or config.ROOT
-    done: list[str] = []
-    pending = home / PENDING_IMPORT
-    if pending.exists():
-        try:
-            source = Path(json.loads(pending.read_text())["source"])
-            moved = relocate(source, home)
-            done.append(f"imported {', '.join(moved)} from {source}")
-        except (RelocateRefused, OSError, ValueError, KeyError) as exc:
-            done.append(f"import not done: {exc}")
-        finally:
-            pending.unlink(missing_ok=True)
-    # A git clone is a developer's checkout, not a download: its journal stays
-    # where they put it, beside the tests that read it and the launchd agent.
-    if (code_dir / ".git").exists():
+    # One at a time: two Start files opened at once run two of these, and the
+    # one that loses a race to move the same journal undoes its half, taking
+    # away the journal the other just put in the home.
+    with locks.locked(home / PREPARE_LOCK):
+        done: list[str] = []
+        pending = home / PENDING_IMPORT
+        if pending.exists():
+            try:
+                source = Path(json.loads(pending.read_text())["source"])
+                moved = relocate(source, home)
+                done.append(f"imported {', '.join(moved)} from {source}")
+            except (RelocateRefused, OSError, ValueError, KeyError) as exc:
+                done.append(f"import not done: {exc}")
+            finally:
+                pending.unlink(missing_ok=True)
+        # A git clone is a developer's checkout, not a download: its journal stays
+        # where they put it, beside the tests that read it and the launchd agent.
+        if (code_dir / ".git").exists():
+            return done
+        if code_dir.resolve() != home.resolve() and holds_journal(code_dir):
+            try:
+                moved = relocate(code_dir, home)
+                done.append(f"moved {', '.join(moved)} from {code_dir} to {home}")
+            except (RelocateRefused, OSError) as exc:
+                done.append(f"journal left beside the code: {exc}")
         return done
-    if code_dir.resolve() != home.resolve() and holds_journal(code_dir):
-        try:
-            moved = relocate(code_dir, home)
-            done.append(f"moved {', '.join(moved)} from {code_dir} to {home}")
-        except (RelocateRefused, OSError) as exc:
-            done.append(f"journal left beside the code: {exc}")
-    return done

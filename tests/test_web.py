@@ -7146,29 +7146,6 @@ def _get(base: str, path: str) -> tuple[int, dict]:
         return exc.code, json.loads(exc.read())
 
 
-def _post_slow(base: str, path: str, body: dict) -> tuple[int, dict]:
-    """`_post` with a client timeout longer than the SERVER's busy timeout.
-
-    Needed for exactly one test. `db.BUSY_TIMEOUT_MS` is 15,000, so sqlite waits
-    15 s before raising `database is locked` and only then does the handler answer
-    503 -- which is longer than `_post`'s 10 s and made the first version of that
-    test fail on the CLIENT's timeout while the server was behaving correctly.
-    The wait is the point being measured, so the client has to outlast it.
-    """
-    import urllib.error  # noqa: PLC0415 - local to this helper
-    import urllib.request  # noqa: PLC0415
-
-    request = urllib.request.Request(
-        f"{base}{path}", method="POST", data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=40) as response:  # noqa: S310
-            return response.status, json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read())
-
-
 def test_an_unknown_job_is_a_400_that_names_the_real_ones(populated, tmp_path):
     """400, not 500, and the reply lists what IS runnable.
 
@@ -7253,7 +7230,7 @@ def test_the_run_endpoint_takes_its_target_in_the_body_not_the_path():
 
 
 def test_a_locked_database_answers_503_rather_than_dropping_the_connection(
-    populated, tmp_path
+    populated, tmp_path, monkeypatch
 ):
     """MEASURED, not assumed, and the measurement is why this guard exists.
 
@@ -7271,14 +7248,19 @@ def test_a_locked_database_answers_503_rather_than_dropping_the_connection(
 
     Exercised through a REAL server against a REAL exclusive lock rather than by
     stubbing the error, because the thing under test is what reaches the socket.
+    The server's wait is shortened to 0.3 s: what is measured is the reply after
+    the wait, not the wait's length.
     """
+    from optjournal import db  # noqa: PLC0415 - local to this test
+
+    monkeypatch.setattr(db, "BUSY_TIMEOUT_MS", 300)
     conn = connect(populated)
     conn.execute("BEGIN EXCLUSIVE")
     conn.execute("INSERT OR IGNORE INTO watchlist (symbol, note, added_at)"
                  " VALUES ('LOCKHOLDER', NULL, '2026-08-09')")
     try:
         with web.serve_ephemeral(db_path=populated, archive_dir=tmp_path) as base:
-            status, payload = _post_slow(base, "/api/watchlist", {"symbol": "SPY"})
+            status, payload = _post(base, "/api/watchlist", {"symbol": "SPY"})
     finally:
         conn.rollback()
         conn.close()
@@ -10450,6 +10432,61 @@ def test_the_update_button_stages_and_answers_before_restarting(populated, monke
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         status, reply = _post(base, "/api/update")
     assert (status, reply["version"], staged) == (202, "9.9.9", ["9.9.9"])
+
+
+@pytest.mark.parametrize("latest", ["the same", "older"])
+def test_the_update_button_never_installs_a_version_that_is_not_newer(
+        populated, monkeypatch, latest):
+    """A banner left open on a server that had since updated asked again, and the
+    server staged, swapped and restarted onto the version it already ran; a
+    retracted release would have moved a friend back a version. Refused before
+    anything is downloaded."""
+    from optjournal import updates
+
+    current = updates.current_version()
+    version = current if latest == "the same" else "0.0.1"
+    downloads: list[str] = []
+
+    def get(url, *, limit):
+        downloads.append(url)
+        raise OSError("no network in this test")
+
+    monkeypatch.setattr(updates, "latest_release", lambda: updates.Release(
+        version=version, notes="", page_url="", zip_url="https://x/y.zip"))
+    monkeypatch.setattr(updates, "cannot_apply", lambda root=None: None)
+    monkeypatch.setattr(updates, "_get", get)
+    with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
+        status, reply = _post(base, "/api/update")
+    assert (status, reply["kind"], downloads) == (409, "refused", [])
+    assert f"already version {current}" in reply["message"]
+
+
+def test_two_state_loads_look_for_a_previous_download_once(tmp_path, monkeypatch):
+    """While the journal is empty, every /api/state walked Downloads, Desktop and
+    Documents for a journal a previous download left, every 5 s of a first
+    collection, and on macOS each walk of those folders can ask the reader for
+    access. Now one walk per server, and what it found is still offered."""
+    old = tmp_path / "me" / "Downloads" / "optjournal-old"
+    old.mkdir(parents=True)
+    (old / "pyproject.toml").write_text('[project]\nname = "optjournal"\n')
+    with sqlite3.connect(old / "journal.db") as held:
+        held.execute("CREATE TABLE statements (source_file TEXT)")
+        held.execute("INSERT INTO statements VALUES ('activity-1.xml')")
+    held.close()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "me"))
+    listed: list[Path] = []
+    iterdir = Path.iterdir
+
+    def listing(self):
+        if self.name == "Downloads":
+            listed.append(self)
+        return iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", listing)
+    with web.serve_ephemeral(db_path=tmp_path / "journal.db", archive_dir=tmp_path / "raw") as base:
+        offered = [_get(base, "/api/state")[1]["install"]["previous"] for _ in range(2)]
+    assert offered == [[str(old)], [str(old)]]
+    assert len(listed) == 1, f"Downloads was listed {len(listed)} times"
 
 
 def test_importing_a_journal_it_did_not_find_is_refused(populated, monkeypatch, tmp_path):

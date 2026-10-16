@@ -137,6 +137,16 @@ def test_a_release_whose_code_is_another_version_is_refused(tmp_path, monkeypatc
         updates.stage(_release("0.2.0"), root=root)
 
 
+def test_a_release_of_another_project_is_refused(tmp_path, monkeypatch, supervised):
+    root = _install(tmp_path)
+    other = b'[project]\nname = "not-optjournal"\nversion = "0.2.0"\n'
+    monkeypatch.setattr(updates, "_get",
+                        lambda _url, limit: _zipball(extra={"pyproject.toml": other}))
+    with pytest.raises(updates.UpdateRefused, match="not optjournal"):
+        updates.stage(_release(), root=root)
+    assert not (root / updates.STAGING).exists()
+
+
 def test_a_git_clone_is_never_updated_from_a_release(tmp_path, supervised):
     root = _install(tmp_path)
     (root / ".git").mkdir()
@@ -154,6 +164,53 @@ def test_downloads_must_be_https():
         updates._get("http://example.com/x.zip", limit=10)
 
 
+def _answering(monkeypatch, body: bytes) -> list[tuple[str, float]]:
+    """`urlopen` answering `body`. Returns each URL it was asked, with its timeout."""
+    asked: list[tuple[str, float]] = []
+
+    def urlopen(request, *, timeout):
+        asked.append((request.full_url, timeout))
+        return io.BytesIO(body)
+
+    monkeypatch.setattr(updates, "urlopen", urlopen)
+    return asked
+
+
+def test_a_download_one_byte_over_its_limit_is_refused(monkeypatch):
+    asked = _answering(monkeypatch, b"x" * 11)
+    with pytest.raises(updates.UpdateRefused, match="more than 10 bytes"):
+        updates._get("https://example.com/x.zip", limit=10)
+    assert asked == [("https://example.com/x.zip", updates.TIMEOUT_S)]
+    _answering(monkeypatch, b"x" * 10)
+    assert updates._get("https://example.com/x.zip", limit=10) == b"x" * 10
+
+
+#: The real one: `conftest` replaces `updates.latest_release` in every test.
+_LATEST_RELEASE = updates.latest_release
+
+
+def test_githubs_latest_release_is_read_by_its_tag_and_a_tag_that_is_no_version_refused(
+        monkeypatch):
+    def latest(tag: str) -> bytes:
+        return json.dumps({
+            "tag_name": tag, "body": "What changed.",
+            "zipball_url": f"https://api.github.com/repos/robert-mp/optjournal/zipball/{tag}",
+            "html_url": f"https://github.com/robert-mp/optjournal/releases/tag/{tag}",
+        }).encode()
+
+    monkeypatch.delenv(updates.REPO_ENV, raising=False)
+    asked = _answering(monkeypatch, latest("v0.5.0"))
+    assert _LATEST_RELEASE() == updates.Release(
+        version="0.5.0", notes="What changed.",
+        zip_url="https://api.github.com/repos/robert-mp/optjournal/zipball/v0.5.0",
+        page_url="https://github.com/robert-mp/optjournal/releases/tag/v0.5.0")
+    assert asked == [("https://api.github.com/repos/robert-mp/optjournal/releases/latest",
+                      updates.TIMEOUT_S)]
+    _answering(monkeypatch, latest("nightly"))
+    with pytest.raises(updates.UpdateRefused, match="'nightly' is not a version"):
+        _LATEST_RELEASE()
+
+
 def test_an_interrupted_download_is_discarded_not_applied(tmp_path):
     root = _install(tmp_path)
     (root / updates.STAGING / "src").mkdir(parents=True)     # no READY marker
@@ -169,42 +226,117 @@ def _code(root: Path) -> dict[str, bytes | None]:
             if not p.relative_to(root).parts[0].startswith((".update-",))}
 
 
+#: `os.replace` itself, before any test wraps it: the launcher's `os` is this one.
+_REPLACE = os.replace
+
+
+def _replace_failing(monkeypatch, launcher, fail) -> list[int]:
+    """The launcher's `os.replace`, raising `fail(n, src)` at its n-th call when
+    that is an exception rather than None. Returns the count, as a one-item list."""
+    calls = [0]
+
+    def replace(src, dst):
+        calls[0] += 1
+        exc = fail(calls[0], Path(src))
+        if exc is not None:
+            raise exc
+        return _REPLACE(src, dst)
+
+    monkeypatch.setattr(launcher.os, "replace", replace)
+    return calls
+
+
+def _a_clean_update(root: Path, monkeypatch, launcher) -> tuple[int, dict[str, bytes | None]]:
+    """How many renames a whole swap makes, and the install it leaves."""
+    updates.stage(_release(), root=root)
+    calls = _replace_failing(monkeypatch, launcher, lambda _n, _src: None)
+    assert launcher.apply_staged(root) == "0.2.0"
+    assert calls[0] >= 4
+    return calls[0], _code(root)
+
+
 def test_a_swap_that_fails_at_any_step_puts_the_old_code_back(
         tmp_path, monkeypatch, supervised):
     """Every rename of the swap is made to fail in turn, and each time the install
     must be exactly the old version, with nothing left stranded mid-swap."""
     monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball())
     launcher = _launcher()
-    real = launcher.os.replace
-    steps = {"n": 0}
-
-    def counting(src, dst):
-        steps["n"] += 1
-        return real(src, dst)
-
-    counted = _install(tmp_path / "counted")
-    updates.stage(_release(), root=counted)
-    monkeypatch.setattr(launcher.os, "replace", counting)
-    assert launcher.apply_staged(counted) == "0.2.0"
-    total, steps["n"] = steps["n"], 0
-    assert total >= 4
+    total, _new = _a_clean_update(_install(tmp_path / "clean"), monkeypatch, launcher)
 
     for failing in range(1, total + 1):
         root = _install(tmp_path / f"fail-{failing}")
         before = _code(root)
         updates.stage(_release(), root=root)
-
-        def flaky(src, dst, failing=failing):
-            steps["n"] += 1
-            if steps["n"] == failing:
-                raise OSError("file in use")
-            return real(src, dst)
-
-        steps["n"] = 0
-        monkeypatch.setattr(launcher.os, "replace", flaky)
+        fail = {failing: OSError("in use")}
+        _replace_failing(monkeypatch, launcher, lambda n, _src, fail=fail: fail.get(n))
         assert launcher.apply_staged(root) is None, failing
         assert _code(root) == before, f"step {failing} of {total} left a mixed install"
         assert not list((root / launcher.OLD).glob("*")), "old code stranded in .update-old"
+
+
+class _Died(BaseException):
+    """The launcher's process ending: its window closed, or Ctrl+C, which is no
+    OSError. Raised from inside a rename, so nothing after it runs."""
+
+
+def test_a_swap_cut_off_at_any_step_is_put_right_by_the_next_starts(
+        tmp_path, monkeypatch, supervised):
+    """Cut off after `src` had moved into `.update-old`, the next start found no
+    `.ready`, deleted the staged release, and left an install with no `src/`.
+
+    Now the next start puts the old code back before it tries the release
+    again, so when that try cannot install anything the old version runs, and
+    the start after it installs the new one."""
+    monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball())
+    launcher = _launcher()
+    total, new = _a_clean_update(_install(tmp_path / "clean"), monkeypatch, launcher)
+
+    def blocked(_n, src):
+        return OSError("in use") if src.parent.name == updates.STAGING else None
+
+    for step in range(1, total + 1):
+        root = _install(tmp_path / f"cut-{step}")
+        updates.stage(_release(), root=root)
+        cut = {step: _Died()}
+        _replace_failing(monkeypatch, launcher, lambda n, _src, cut=cut: cut.get(n))
+        with pytest.raises(_Died):
+            launcher.apply_staged(root)
+
+        _replace_failing(monkeypatch, launcher, blocked)
+        assert launcher.apply_staged(root) is None
+        code = sorted(p.name for p in (root / "src" / "optjournal").iterdir())
+        assert (updates.current_version(root), code) == ("0.1.0", ["old.py"]), (
+            f"cut at step {step} of {total}, then a mixed install")
+        assert (root / "journal.db").read_bytes() == b"my trades"
+
+        monkeypatch.setattr(launcher.os, "replace", _REPLACE)
+        assert launcher.apply_staged(root) == "0.2.0", f"cut at step {step} of {total}"
+        assert _code(root) == new, f"cut at step {step} of {total}, then a mixed install"
+        assert not (root / updates.STAGING).exists() and not (root / launcher.OLD).exists()
+
+
+def test_an_undo_that_meets_a_locked_file_is_finished_by_the_next_start(
+        tmp_path, monkeypatch, supervised):
+    """On Windows the undo of a failed swap can meet a file an antivirus scan
+    holds. That PermissionError escaped the undo and crashed the launcher, and
+    the next start deleted the old code waiting in `.update-old`: pyproject.toml
+    said the new version over the old `src/`, so the banner never offered the
+    update again. Now the undo goes on past it, and the next start finishes it
+    and installs the release."""
+    monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball())
+    launcher = _launcher()
+    total, new = _a_clean_update(_install(tmp_path / "clean"), monkeypatch, launcher)
+
+    for failing in range(1, total + 1):
+        root = _install(tmp_path / f"held-{failing}")
+        updates.stage(_release(), root=root)
+        # The rename after the failing one is the undo's first.
+        fail = {failing: OSError("in use"), failing + 1: PermissionError("scanning")}
+        _replace_failing(monkeypatch, launcher, lambda n, _src, fail=fail: fail.get(n))
+        assert launcher.apply_staged(root) is None, failing
+        monkeypatch.setattr(launcher.os, "replace", _REPLACE)
+        assert launcher.apply_staged(root) == "0.2.0", f"failed at step {failing} of {total}"
+        assert _code(root) == new, f"failed at step {failing} of {total}, then a mixed install"
 
 
 @pytest.mark.parametrize(("latest", "available"), [("0.2.0", True), ("0.1.0", False),
@@ -225,6 +357,28 @@ def test_offline_is_not_an_error_the_page_has_to_handle(tmp_path, monkeypatch):
     monkeypatch.setattr(updates, "latest_release", offline)
     reply = updates.check(root=_install(tmp_path), force=True)
     assert reply["available"] is False and "could not check" in reply["error"]
+
+
+def test_a_failed_check_is_asked_again_and_a_successful_one_is_kept(tmp_path, monkeypatch):
+    """A failed check was kept for six hours like a good one, so a server
+    started offline showed no banner for six hours after the network came back.
+    Only an answer is kept now; GitHub is still asked once per six hours."""
+    from urllib.error import URLError
+
+    asked: list[int] = []
+
+    def latest():
+        asked.append(1)
+        if len(asked) == 1:
+            raise URLError("offline")
+        return _release("0.2.0")
+
+    monkeypatch.setattr(updates, "latest_release", latest)
+    root = _install(tmp_path)
+    assert "could not check" in updates.check(root=root)["error"]
+    assert updates.check(root=root)["available"] is True, "the failure was kept"
+    assert updates.check(root=root)["available"] is True
+    assert len(asked) == 2, "the answer was not kept"
 
 
 def _free_port() -> int:

@@ -60,7 +60,8 @@ DEFAULT_REPO = "robert-mp/optjournal"
 #: pins the two copies of these names together.
 STAGING = ".update-staging"
 #: Written LAST into `STAGING`: a staging folder without it is a download that
-#: was interrupted, and the launcher ignores it.
+#: was interrupted, and the launcher ignores it. The launcher deletes it only
+#: once the swap is complete, so it also marks a swap still to finish.
 READY = ".ready"
 
 #: A release archive is a few hundred KB. Anything past this is not one.
@@ -88,6 +89,10 @@ def _version_key(version: str) -> tuple[int, ...] | None:
         return tuple(int(part) for part in version.strip().lstrip("v").split("."))
     except ValueError:
         return None
+
+
+def _newer(version: str, than: str) -> bool:
+    return (_version_key(version) or ()) > (_version_key(than) or ())
 
 
 def current_version(root: Path = ROOT) -> str:
@@ -139,7 +144,9 @@ def cannot_apply(root: Path = ROOT) -> str | None:
     return None
 
 
-#: The last check, and when it ran: one per process, like the server itself.
+#: The last check that GitHub answered, and when it ran: one per process, like
+#: the server itself. A failed check is not kept, so a server started offline
+#: shows the banner on the first page load after the network is back.
 _last: tuple[float, dict[str, object]] | None = None
 
 
@@ -156,10 +163,9 @@ def check(*, root: Path = ROOT, force: bool = False) -> dict[str, object]:
         release = latest_release()
     except (URLError, OSError, UpdateRefused, ValueError, KeyError) as exc:
         reply["error"] = f"could not check for updates: {exc}"
-    else:
-        newer = (_version_key(release.version) or ()) > (_version_key(current) or ())
-        reply.update(latest=release.version, available=newer,
-                     notes=release.notes, url=release.page_url)
+        return reply
+    reply.update(latest=release.version, available=_newer(release.version, current),
+                 notes=release.notes, url=release.page_url)
     _last = (now, reply)
     return dict(reply)
 
@@ -186,12 +192,19 @@ def _members(archive: zipfile.ZipFile) -> tuple[str, list[zipfile.ZipInfo]]:
 def stage(release: Release, *, root: Path = ROOT) -> Path:
     """Download, verify and unpack `release` into `root/STAGING`. Returns it.
 
-    Verifies that the archive is optjournal at the version the release claims,
-    and that it names no journal data. Nothing outside `STAGING` is written.
+    Verifies that the release is newer than the code on disk, that the archive
+    is optjournal at the version the release claims, and that it names no
+    journal data. Nothing outside `STAGING` is written.
     """
     reason = cannot_apply(root)
     if reason:
         raise UpdateRefused(reason)
+    # A banner left open across an update asks again, and GitHub's latest can be
+    # an older release once a newer one is retracted.
+    current = current_version(root)
+    if not _newer(release.version, current):
+        raise UpdateRefused(f"the newest release is {release.version}, and this is "
+                            f"already version {current}")
     body = _get(release.zip_url, limit=MAX_DOWNLOAD_BYTES)
     if not zipfile.is_zipfile(io.BytesIO(body)):
         # A failed download (an error or rate-limit page), not a release this

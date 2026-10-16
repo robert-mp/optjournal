@@ -53,6 +53,7 @@ import re
 import signal
 import socket
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -178,6 +179,17 @@ def _is_loopback(host: str) -> bool:
 #: listings, and not enough for a path or a quote. Not a ticker universe:
 #: see `_watchlist_write` on why this journal has no such list.
 _SYMBOL_OK = re.compile(r"^[A-Za-z0-9.\-]+$")
+
+
+def watch_symbol(text: str) -> str | None:
+    """`text` as the watchlist stores a symbol, or None when it is not one.
+
+    Stripped and upper-cased, then held to `_SYMBOL_OK` and 24 characters. The
+    endpoint and `optjournal watch` both ask this, so neither stores a symbol
+    the page's Remove would refuse.
+    """
+    symbol = text.strip().upper()
+    return symbol if len(symbol) <= 24 and _SYMBOL_OK.match(symbol) else None
 
 #: A Flex query id as Client Portal shows it: ASCII digits, and not many.
 #: Spelled `[0-9]` rather than `\d` or `str.isdigit()`, both of which also
@@ -1829,11 +1841,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         over something that does not exist -- see `clock.parse_day`.
         """
         body = self._body()
-        symbol = str(body.get("symbol") or "").strip().upper()
+        typed = str(body.get("symbol") or "")
+        symbol = watch_symbol(typed)
         action = str(body.get("action") or "add")
-        if not symbol or len(symbol) > 24 or not _SYMBOL_OK.match(symbol):
+        if symbol is None:
             return 400, {"ok": False, "kind": "symbol",
-                         "message": f"{symbol or '(empty)'} is not a symbol"}
+                         "message": f"{typed.strip().upper() or '(empty)'} is not a symbol"}
         if action not in ("add", "remove"):
             return 400, {"ok": False, "kind": "action",
                          "message": f"unknown action {action!r}"}
@@ -2373,6 +2386,30 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.cfg.sync_lock.release()
 
 
+class _Server(http.server.ThreadingHTTPServer):
+    """The listener `serve` and `serve_ephemeral` both run."""
+
+    daemon_threads = True
+    address_family = socket.AF_INET
+    # `http.server` turns SO_REUSEADDR on, which lets a restart bind past the
+    # last run's TIME_WAIT on POSIX. On Windows it lets a second socket bind a
+    # port another is listening on, so two Start files opened at once ran two
+    # servers and two schedulers on one journal. asyncio makes the same choice.
+    allow_reuse_address = sys.platform != "win32"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Set once `serve_forever()` runs. The constructor binds and listens, so
+        # a supervisor can see the port and signal a stop while socketserver's
+        # private shutdown event is still unset, and `shutdown()` in that
+        # interval waits forever. `service_actions()` is first called after
+        # `serve_forever()` has cleared that event and entered its loop.
+        self.serving = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def service_actions(self) -> None:
+        self.serving.set()
+
+
 def serve(
     *,
     db_path: Path,
@@ -2424,22 +2461,6 @@ def serve(
         demo=demo,
         collector=clock,
     )
-
-    # `ThreadingHTTPServer(...)` binds and starts listening in its constructor,
-    # before `serve_forever()` has entered its loop. A supervisor can therefore
-    # observe the port and send a stop signal while socketserver's private
-    # shutdown event is still unset; calling `shutdown()` in that interval waits
-    # forever. `service_actions()` is first called only after `serve_forever()` has
-    # cleared that event and entered its selector loop, so it is a safe readiness
-    # barrier for the shutdown path.
-    serving = threading.Event()
-
-    class _Server(http.server.ThreadingHTTPServer):
-        daemon_threads = True
-        address_family = socket.AF_INET
-
-        def service_actions(self) -> None:
-            serving.set()
 
     # ThreadingHTTPServer instantiates its handler class per request; partial
     # prepends the config, which is the stdlib-sanctioned way to inject
@@ -2529,7 +2550,7 @@ def serve(
             daemon=True,
         )
         server_thread.start()
-        while not serving.wait(0.1):
+        while not httpd.serving.wait(0.1):
             if not server_thread.is_alive():
                 raise RuntimeError("HTTP serving thread exited during startup")
         try:
@@ -2612,13 +2633,12 @@ def serve_ephemeral(
         collector=collector,
     )
 
-    class _Ephemeral(http.server.ThreadingHTTPServer):
-        daemon_threads = True
-        address_family = socket.AF_INET
-
-    httpd = _Ephemeral(("127.0.0.1", 0), partial(_Handler, cfg))
+    httpd = _Server(("127.0.0.1", 0), partial(_Handler, cfg))
     port = httpd.socket.getsockname()[1]
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    # A twentieth of a second between polls rather than the default half:
+    # `shutdown()` waits out one poll, and most tests open one of these.
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05},
+                     daemon=True).start()
     try:
         yield f"http://127.0.0.1:{port}"
     finally:

@@ -544,6 +544,17 @@ def cmd_watch(args) -> int:
             file=sys.stderr,
         )
         return EXIT_CONFIG
+    # The endpoint's rule, so the page can remove whatever this adds.
+    from optjournal.web import watch_symbol
+
+    adding: list[str] = []
+    for typed in args.add or []:
+        symbol = watch_symbol(typed)
+        if symbol is None:
+            print(f"\n{typed.strip().upper()!r} is not a symbol: letters, digits, dot"
+                  f" and dash, like BRK.B.", file=sys.stderr)
+            return EXIT_CONFIG
+        adding.append(symbol)
     # Which fields this invocation is writing, decided before the loop so the SQL
     # is built once. A flag absent from the command line is absent from here, which
     # is what leaves the stored value alone.
@@ -568,18 +579,18 @@ def cmd_watch(args) -> int:
         # re-add is a no-op rather than a blanking -- the endpoint's rule, spelled
         # the same way, because both write the same row.
         updates = ", ".join(f"{column}=excluded.{column}" for column in fields)
-        for symbol in (args.add or []):
+        for symbol in adding:
             conn.execute(
                 "INSERT INTO watchlist (symbol, note, earnings_on, added_at)"
                 " VALUES (:symbol, :note, :earnings_on, :added_at)"
                 " ON CONFLICT(symbol) DO "
                 + (f"UPDATE SET {updates}" if updates else "NOTHING"),
-                {"symbol": symbol.upper(), "added_at": now,
+                {"symbol": symbol, "added_at": now,
                  "note": fields.get("note"),
                  "earnings_on": fields.get("earnings_on")},
             )
         for symbol in (args.rm or []):
-            conn.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.upper(),))
+            conn.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.strip().upper(),))
         if args.add or args.rm:
             conn.commit()
 
@@ -968,7 +979,6 @@ def _find_uv() -> str | None:
     shell that has not re-read its profile since the install (and a
     double-clicked Start file) may not have on PATH.
     """
-    import os
     import shutil
 
     exported = os.environ.get("UV")

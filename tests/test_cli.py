@@ -683,6 +683,19 @@ def test_watch_refuses_a_field_with_no_symbol_to_write_it_to(tmp_path, capsys):
     assert "name the symbol" in capsys.readouterr().err
 
 
+def test_watch_stores_a_symbol_the_way_the_page_does(tmp_path, capsys):
+    """`watch " nvda"` stored " NVDA" and `watch "brk b"` stored "BRK B", rows
+    the page's Remove then refused as no symbol. The CLI now strips and checks
+    a symbol with the endpoint's own rule, `web.watch_symbol`."""
+    db = tmp_path / "watch.db"
+    rows = _watch_json(capsys, " nvda ", "--db", str(db))
+    assert [r["symbol"] for r in rows] == ["NVDA"]
+
+    assert main(["watch", "brk b", "--db", str(db)]) == 2
+    assert "'BRK B' is not a symbol" in capsys.readouterr().err
+    assert [r["symbol"] for r in _watch_json(capsys, "--db", str(db))] == ["NVDA"]
+
+
 def test_watch_refuses_setting_and_clearing_a_note_at_once(tmp_path):
     """Two requests in one command, so argparse refuses it at the parser.
 
