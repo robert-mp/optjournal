@@ -302,6 +302,28 @@ def test_offline_is_not_an_error_the_page_has_to_handle(tmp_path, monkeypatch):
     assert reply["available"] is False and "could not check" in reply["error"]
 
 
+def test_a_failed_check_is_asked_again_and_a_successful_one_is_kept(tmp_path, monkeypatch):
+    """A failed check was kept for six hours like a good one, so a server
+    started offline showed no banner for six hours after the network came back.
+    Only an answer is kept now; GitHub is still asked once per six hours."""
+    from urllib.error import URLError
+
+    asked: list[int] = []
+
+    def latest():
+        asked.append(1)
+        if len(asked) == 1:
+            raise URLError("offline")
+        return _release("0.2.0")
+
+    monkeypatch.setattr(updates, "latest_release", latest)
+    root = _install(tmp_path)
+    assert "could not check" in updates.check(root=root)["error"]
+    assert updates.check(root=root)["available"] is True, "the failure was kept"
+    assert updates.check(root=root)["available"] is True
+    assert len(asked) == 2, "the answer was not kept"
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

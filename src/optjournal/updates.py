@@ -144,7 +144,9 @@ def cannot_apply(root: Path = ROOT) -> str | None:
     return None
 
 
-#: The last check, and when it ran: one per process, like the server itself.
+#: The last check that GitHub answered, and when it ran: one per process, like
+#: the server itself. A failed check is not kept, so a server started offline
+#: shows the banner on the first page load after the network is back.
 _last: tuple[float, dict[str, object]] | None = None
 
 
@@ -161,9 +163,9 @@ def check(*, root: Path = ROOT, force: bool = False) -> dict[str, object]:
         release = latest_release()
     except (URLError, OSError, UpdateRefused, ValueError, KeyError) as exc:
         reply["error"] = f"could not check for updates: {exc}"
-    else:
-        reply.update(latest=release.version, available=_newer(release.version, current),
-                     notes=release.notes, url=release.page_url)
+        return reply
+    reply.update(latest=release.version, available=_newer(release.version, current),
+                 notes=release.notes, url=release.page_url)
     _last = (now, reply)
     return dict(reply)
 
