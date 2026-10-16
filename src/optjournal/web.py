@@ -183,6 +183,17 @@ def _is_loopback(host: str) -> bool:
 #: see `_watchlist_write` on why this journal has no such list.
 _SYMBOL_OK = re.compile(r"^[A-Za-z0-9.\-]+$")
 
+
+def watch_symbol(text: str) -> str | None:
+    """`text` as the watchlist stores a symbol, or None when it is not one.
+
+    Stripped and upper-cased, then held to `_SYMBOL_OK` and 24 characters. The
+    endpoint and `optjournal watch` both ask this, so neither stores a symbol
+    the page's Remove would refuse.
+    """
+    symbol = text.strip().upper()
+    return symbol if len(symbol) <= 24 and _SYMBOL_OK.match(symbol) else None
+
 #: A Flex query id as Client Portal shows it: ASCII digits, and not many.
 #: Spelled `[0-9]` rather than `\d` or `str.isdigit()`, both of which also
 #: accept superscripts and other scripts' digits ("²³", "١٢٣") that IBKR can
@@ -1849,11 +1860,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         over something that does not exist -- see `clock.parse_day`.
         """
         body = self._body()
-        symbol = str(body.get("symbol") or "").strip().upper()
+        typed = str(body.get("symbol") or "")
+        symbol = watch_symbol(typed)
         action = str(body.get("action") or "add")
-        if not symbol or len(symbol) > 24 or not _SYMBOL_OK.match(symbol):
+        if symbol is None:
             return 400, {"ok": False, "kind": "symbol",
-                         "message": f"{symbol or '(empty)'} is not a symbol"}
+                         "message": f"{typed.strip().upper() or '(empty)'} is not a symbol"}
         if action not in ("add", "remove"):
             return 400, {"ok": False, "kind": "action",
                          "message": f"unknown action {action!r}"}
