@@ -285,6 +285,52 @@ def test_a_sync_that_changed_nothing_writes_no_snapshot(populated, monkeypatch):
     assert result["snapshot"] is None
 
 
+def test_a_confirm_landing_during_a_sync_is_not_the_syncs_new_trade(
+    populated, monkeypatch, tmp_path,
+):
+    """The confirm poll runs on the scheduler's thread while the page's Sync runs
+    on its own, and "new" was every trade first seen since the sync began. So a
+    confirm ingested meanwhile made a byte-identical statement report a new trade
+    and take a snapshot of nothing the statement brought."""
+    from test_confirms import CONFIRM_XML
+
+    from optjournal import ingest
+    from optjournal import sync as mod  # noqa: PLC0415 - local to this test
+    from optjournal.archive import newest_statement  # noqa: PLC0415 - local
+    from optjournal.db import connect  # noqa: PLC0415 - local to this test
+
+    archive = newest_statement(RAW_DIR)
+    confirm = tmp_path / "confirm-20260924.xml"
+    confirm.write_text(CONFIRM_XML, encoding="utf-8")
+    conn = connect(populated)
+
+    class _Fetched:
+        raw_path = archive
+        raw_bytes = archive.stat().st_size
+        is_duplicate = True
+
+    def fetch(*_a, **_k):
+        ingest.ingest_confirms(conn, confirm, base_currency="EUR",
+                               assets=ingest.ASSET_FILTER_ALL,
+                               rate_for=lambda _ccy: (0.87, True))
+        return _Fetched()
+
+    # Seconds apart, so the confirm is after the sync began and the fixture's
+    # own ingest is before it (see the no-snapshot test above).
+    monkeypatch.setattr(mod, "_now", lambda: "2099-01-01T00:00:00+00:00")
+    monkeypatch.setattr(ingest, "_now", lambda: "2099-01-01T00:00:05+00:00")
+    monkeypatch.setattr(mod, "fetch", fetch)
+    calls = []
+    monkeypatch.setattr(mod, "_snapshot", lambda conn: calls.append(conn))
+    result = mod.sync_journal(conn=conn, archive_dir=RAW_DIR, query_id="1591754")
+    landed = conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE source_file = ?", (confirm.name,),
+    ).fetchone()[0]
+    conn.close()
+    assert landed == 1, "premise: the confirm landed while the sync ran"
+    assert (result["new_trades"], result["changed"], calls) == (0, False, [])
+
+
 # --------------------------------------------------------------------------
 # The first sync reaches back a year.
 #

@@ -237,18 +237,21 @@ def sync_journal(
     ingested = ingest_file(conn, result.raw_path, assets=assets)
     # `first_seen_at` is stamped per row at insert, so anything at or after this
     # run's start is genuinely new rather than a row re-presented by an
-    # overlapping statement.
+    # overlapping statement. And from THIS statement: a confirm poll can land a
+    # fill while the sync runs.
     new_trade_rows = [
         dict(row) for row in conn.execute(
             "SELECT trade_date, symbol, buy_sell, open_close, quantity,"
             " trade_price, ib_commission, currency FROM trades"
-            " WHERE first_seen_at >= ? ORDER BY COALESCE(date_time, trade_date)",
-            (started,),
+            " WHERE first_seen_at >= ? AND source_file = ?"
+            " ORDER BY COALESCE(date_time, trade_date)",
+            (started, result.raw_path.name),
         )
     ]
     new_cash = conn.execute(
-        "SELECT COUNT(*) AS n FROM cash_transactions WHERE first_seen_at >= ?",
-        (started,),
+        "SELECT COUNT(*) AS n FROM cash_transactions"
+        " WHERE first_seen_at >= ? AND source_file = ?",
+        (started, result.raw_path.name),
     ).fetchone()["n"]
     changed = bool(new_trade_rows or new_cash)
 
