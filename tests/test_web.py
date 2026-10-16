@@ -1152,7 +1152,7 @@ def test_the_month_and_the_running_total_add_up_what_the_days_show():
         "  realized:{base:99.3827,native:100,ccy:'USD'}});",
         "const days=[day('2026-09-01'),day('2026-09-02')];",
         "const S={calday:null,state:{stats:{month:'2026-09',days},month_range:['2026-09']}};",
-        *_page_fns("calendar", "chart"),
+        *_page_fns("calendar", "yTicks", "chart"),
         "const pill=calendar().match(/Month P\\/L <b[^>]*>([^<]*)</)[1];",
         "const tips=[...chart(days).matchAll(/<title>([^<]*)<\\/title>/g)].map(t=>t[1]);",
         "console.log(JSON.stringify({pill,last:tips.at(-1)}));",
@@ -4078,11 +4078,13 @@ def test_the_chart_axis_follows_the_display_currency():
     the axis in the base currency while the headline, the cards and every dot
     tooltip on the same chart restated -- the one figure on the page that
     ignored the toggle, and it carried no symbol to admit which currency it
-    meant.
+    meant. Both money charts draw their axis through `yTicks`.
     """
-    chart = _fn("chart").replace(" ", "")
-    assert "text-anchor=\"end\">${cash(v,0)}" in chart, "axis ticks not restated"
-    assert "${num(v,0)}" not in chart
+    for drawn in ("chart", "navChart"):
+        assert "yTicks(lo,hi,sy," in _fn(drawn), f"{drawn} draws its own axis"
+    ticks = _fn("yTicks").replace(" ", "")
+    assert "text-anchor=\"end\">${cash(v,0)}" in ticks, "axis ticks not restated"
+    assert "${num(v,0)}" not in ticks
 
 
 def test_dashboard_commission_reads_the_same_as_the_tables():
@@ -5594,7 +5596,7 @@ def test_the_performance_axis_labels_round_numbers_in_display_currency():
     the axis would have looked exactly as arbitrary as before. So the domain is
     converted, ticks are chosen there, and `unconv` maps them back to position.
     """
-    chart = _fn("chart")
+    chart = _fn("yTicks")
     assert "niceTicks(conv(lo),conv(hi))" in chart.replace(" ", ""), (
         "the axis no longer picks round ticks from the CONVERTED domain, so a "
         "round tick under one currency is an arbitrary one under another"

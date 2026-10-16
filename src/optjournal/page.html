@@ -2664,8 +2664,8 @@ function collection(){
 }
 
 /* Seconds, in words. Small enough to inline, and the wording matters: an age with
-   no unit reads as a timestamp. Mirrors the vocabulary quoteNote() uses so two
-   freshness readouts on the same page do not describe time differently. */
+   no unit reads as a timestamp. quoteNote() words its first six hours the same
+   way and then dates the quote instead, since an older quote is a close. */
 function ago(secs){
   if(secs==null) return 'never';
   if(secs<90) return 'just now';
@@ -2675,6 +2675,16 @@ function ago(secs){
 }
 
 /* ------------------------------------------------ chart (inline SVG) */
+/* A money axis's gridlines and labels, from `x0` to `x1` over a base-currency
+   scale `sy`, chosen round in the currency on screen: see `chart`. */
+function yTicks(lo,hi,sy,x0,x1){
+  return niceTicks(conv(lo),conv(hi)).map(dv=>{
+    const v=unconv(dv), y=sy(v).toFixed(1);
+    return `<line class="grid" x1="${x0}" y1="${y}" x2="${x1}" y2="${y}"/>
+     <text class="axis" x="${x0-8}" y="${(sy(v)+3.5).toFixed(1)}"
+       text-anchor="end">${cash(v,0)}</text>`;
+  }).join('');
+}
 function chart(days){
   if(!days||!days.length) return `<div class="empty">no fills in this period</div>`;
   /* W MATCHES THE CSS HEIGHT'S ASPECT, and the SVG scales UNIFORMLY. This was
@@ -2730,12 +2740,7 @@ function chart(days){
      same chart restated to USD -- the axis was the one figure on the page that
      ignored the toggle. The plotted SHAPE is unaffected either way, since conv()
      is a uniform scale factor and cancels out of sy()'s normalisation. */
-  const ticks=niceTicks(conv(lo),conv(hi)).map(dv=>{
-    const v=unconv(dv), y=sy(v).toFixed(1);
-    return `<line class="grid" x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}"/>
-     <text class="axis" x="${PL-8}" y="${(sy(v)+3.5).toFixed(1)}"
-       text-anchor="end">${cash(v,0)}</text>`;
-  }).join('');
+  const ticks=yTicks(lo,hi,sy,PL,W-PR);
   /* NO BREAK-EVEN RULE. There was a labelled dashed line at zero whenever the
      series crossed it, on the argument that a drawdown should not read as
      ordinary variation. Removed by request, and the argument it rested on was
@@ -4235,12 +4240,7 @@ function navChart(days){
      in. It crosses itself where the result changes sign, which fills correctly
      under the default nonzero rule and needs no crossing points found. */
   const gap=path('nav')+days.map((pday,i)=>`L${at(pday,i,'put_in')}`).reverse().join('')+'Z';
-  const ticks=niceTicks(conv(lo),conv(hi)).map(dv=>{
-    const v=unconv(dv), y=sy(v).toFixed(1);
-    return `<line class="grid" x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}"/>
-     <text class="axis" x="${PL-8}" y="${(sy(v)+3.5).toFixed(1)}"
-       text-anchor="end">${cash(v,0)}</text>`;
-  }).join('');
+  const ticks=yTicks(lo,hi,sy,PL,W-PR);
   const pd0=days[0], pdn=days[days.length-1];
   const spansYears=pd0.day.slice(0,4)!==pdn.day.slice(0,4);
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet"
@@ -4678,8 +4678,8 @@ function market(){
      The VOCABULARY and the defaults are the server's (`mk.countries`,
      `mk.impacts`, each row carrying `default`), so the page holds no copy of
      which currencies exist or which ones matter -- both would drift from the feed
-     the moment either side changed. `seed()` takes those defaults on first draw
-     and respects an empty Set thereafter; see `S.mkcountries`. */
+     the moment either side changed. `seedFacets` takes those defaults on first
+     draw and respects an empty Set thereafter; see `S.mkcountries`. */
   const countries=seedFacets(S.mkcountries,mk.countries);
   const impacts=seedFacets(S.mkimpacts,mk.impacts);
   /* An axis with nothing selected filters nothing OUT, rather than emptying the
@@ -4883,7 +4883,7 @@ const PARAMS_CAPTION='B-Xtrender, short arm 5/20/5, centred on 50; Jhunjhunwala 
 /* The three cut points the filter row offers, and the two sentences saying where
    each came from. Every one of them is a copy of a Python constant, bound by test
    (`test_the_band_caption_matches_the_constants_that_produced_it` and
-   `test_the_rvr_chips_and_the_ring_tick_read_one_constant`) for the reason
+   `test_the_ivr_chips_and_the_ring_tick_read_one_constant`) for the reason
    BX_SETTLED is: a chip labelled "below -20" beside a bucket cut somewhere else is
    a control that lies about what it does, and a retune in `trend.py` would leave
    this row offering the old band with nothing on screen to say so.
@@ -4902,11 +4902,12 @@ const BX_LO=-30;
 const BX_HI=30;
 const BX_BANDS="band at +/-30, the reference implementation's default and the outer fifth of sessions measured here; 'oversold' and 'overbought' are the RSI convention's words for below and above it, not this journal's view of what a share is worth";
 /* The IV rank cut, a copy of `iv.IVR_HIGH` and bound to it by
-   `test_the_ivr_chips_read_ivs_own_constant`. THIRTY IS THE READER'S CHOSEN LINE,
-   which is why the caption says so instead of citing anyone: tastytrade publish 50
-   as the level premium selling leans on, 80 as extreme and 20 as depressed, and 30
-   is none of those. A chip is allowed to cut where its reader wants; what it is not
-   allowed to do is imply someone else's research put the line there. */
+   `test_the_ivr_chips_and_the_ring_tick_read_one_constant`. THIRTY IS THE READER'S
+   CHOSEN LINE, which is why the caption says so instead of citing anyone:
+   tastytrade publish 50 as the level premium selling leans on, 80 as extreme and 20
+   as depressed, and 30 is none of those. A chip is allowed to cut where its reader
+   wants; what it is not allowed to do is imply someone else's research put the line
+   there. */
 const IVR_HIGH=30;
 const IVR_BANDS="your own screening line, not tastytrade's: they lean on 50 for selling premium, call 80 and above extreme and under 20 depressed. 30 is the wider net";
 /* WHOSE number the rank is, printed wherever the rank is. CBOE computes iv30 and
@@ -6896,14 +6897,13 @@ function draw(push){
      The Set is REBUILT rather than mutated in place, because `S.mkcountries` may
      still be null (meaning "the server's default"), and mutating the Set that
      `market()` derived from the payload would edit a value the state does not own
-     yet. `mkFacet` reads the current selection back out of the same payload the
-     view did, so the two cannot disagree about what was showing. */
+     yet. `mkFacet` reads the current selection back out of the same payload
+     through the view's own `seedFacets`, so the two cannot disagree about what
+     was showing. */
   const mkFacet=axis=>{
     const mk=marketWeek()||{};
-    const held=axis==='country'?S.mkcountries:S.mkimpacts;
-    if(held instanceof Set) return new Set(held);
-    const facets=axis==='country'?mk.countries:mk.impacts;
-    return new Set((facets||[]).filter(mf=>mf.default).map(mf=>mf.value));
+    return new Set(axis==='country'?seedFacets(S.mkcountries,mk.countries)
+      :seedFacets(S.mkimpacts,mk.impacts));
   };
   const mkPut=(axis,next)=>{
     if(axis==='country') S.mkcountries=next; else S.mkimpacts=next;
@@ -6919,9 +6919,9 @@ function draw(push){
      silently stop tracking a change to `events.DEFAULT_COUNTRIES`. */
   document.querySelectorAll('[data-mkreset]').forEach(b=>
     b.onclick=()=>{S.mkcountries=null; S.mkimpacts=null; S.marketday=null; draw();});
-  /* All is an EMPTY Set on both axes, which filters nothing out -- see `passes` in
-     `market()`. Not "every value selected": a new country arriving in the feed
-     would then be excluded until the reader noticed. */
+  /* All is an EMPTY Set on both axes, which filters nothing out -- see
+     `eventPasses` in market.js. Not "every value selected": a new country
+     arriving in the feed would then be excluded until the reader noticed. */
   document.querySelectorAll('[data-mkall]').forEach(b=>
     b.onclick=()=>{S.mkcountries=new Set(); S.mkimpacts=new Set();
       S.marketday=null; draw();});
