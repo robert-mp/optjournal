@@ -19,7 +19,8 @@ A fund has no earnings: SPY answers ``rCode`` 400 with no data, which is an answ
 throttled, a 500) is a failure, raised so the caller keeps the date it has.
 
 Chosen after the Yahoo endpoints this journal already reaches were probed and found
-to carry no earnings date at all (see ``db.py``'s comment on ``earnings_on``). The
+to carry no earnings date at all: the chart meta block has no earnings key, its
+``events`` parameter serves dividends and splits, and ``quoteSummary`` answers 401. The
 date is attributed on screen to Nasdaq and Zacks, because this journal did not
 measure it.
 """

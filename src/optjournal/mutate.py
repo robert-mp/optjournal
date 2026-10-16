@@ -522,9 +522,7 @@ MUTANTS: tuple[Mutant, ...] = (
         breaks="a symbol holding 40 daily closes would report a B-Xtrender "
                "reading computed inside the warm-up zone: measured on real "
                "closes, 2.2 to 7.5 points from the settled value at 45 sessions, "
-               "a flipped SIGN on TSLA at 44, and the long arm pegged at exactly "
-               "-50.0000 from 35 closes through 43 -- the strongest signal the "
-               "page can draw, from five weeks of history",
+               "a flipped SIGN on TSLA at 44, from five weeks of history",
     ),
     # The degenerate case, not the formula. `(now - lo) / (hi - lo)` is the kind of
     # arithmetic a hand-computed vector pins on the first run; what would ship

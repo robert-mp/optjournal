@@ -463,13 +463,9 @@ CREATE INDEX IF NOT EXISTS market_events_when ON market_events(starts_at);
 CREATE TABLE IF NOT EXISTS watchlist (
   symbol     TEXT PRIMARY KEY,
   note       TEXT,
-  -- The next earnings date, YYYY-MM-DD, as YOU recorded it. Nothing this journal
-  -- can reach publishes one: the chart meta block has no earnings key, the
-  -- endpoint's `events` parameter serves dividends and splits at every window
-  -- tested, `quoteSummary` answers 401, and `market_events` is a macro calendar
-  -- whose country column holds currency codes. So the provenance is unambiguous
-  -- and every surface labels it as typed rather than fetched. Deriving a next
-  -- date from a quarterly cadence would be a guess wearing a date's clothes.
+  -- The next earnings date, YYYY-MM-DD, as YOU recorded it. A typed date wins
+  -- over the one fetched from Nasdaq or Zacks (earnings.py, stored elsewhere),
+  -- so this column only ever holds the reader's own date.
   --
   -- The COUNTDOWN is deliberately not stored beside it: a stored "14 days" is
   -- wrong tomorrow, so `serialize.watchlist_data` derives it against

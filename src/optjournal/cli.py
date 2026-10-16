@@ -103,13 +103,13 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_CONFIG = 2
 EXIT_NO_DATA = 3
-#: IBKR asked us to back off. Distinct from EXIT_ERROR so the daily cron can
+#: IBKR asked us to back off. Distinct from EXIT_ERROR so a scheduled caller can
 #: stay silent on throttling and only alert on a genuine failure.
 EXIT_THROTTLED = 4
 #: Gave up waiting for a lock OTHER than the fetch lock: the migration's or the
 #: settings file's, which guard work taking milliseconds, so something is wedged.
-#: Not EXIT_ERROR, which the bars cron reads as a per-window fetch failure and
-#: skips, and not EXIT_THROTTLED ("try later"): every cron raises this one.
+#: Not EXIT_ERROR (a failure of the work itself) and not EXIT_THROTTLED ("try
+#: later"): a wedged lock needs a person, whichever command met it.
 EXIT_LOCKED = 5
 #: `serve` stopped so the launcher can start it again: an update or a journal
 #: import is waiting, or the page asked (see `launcher/app.py`). 75 is sysexits'
@@ -196,7 +196,7 @@ def cmd_fetch(args) -> int:
 def cmd_statements(args) -> int:
     conn = connect(args.db) if args.db.exists() else None
     data = statements_data(args.archive, conn)
-    # A daily cron adds roughly one distinct statement per trading day, so the
+    # The daily sync adds roughly one distinct statement per trading day, so the
     # full list stops being readable within weeks. JSON is never truncated,
     # because a machine consumer wants the whole set.
     limit = 0 if (args.all or args.json) else args.limit
@@ -603,8 +603,8 @@ def cmd_market(args) -> int:
 
     Reading and fetching are separate flags rather than one command that always
     fetches, because they answer different questions and only one touches the
-    network. `--fetch` is what the nightly cron runs; a bare `market` is what a
-    reader runs, and it works offline.
+    network. `--fetch` does what the `market` job and the page's Refresh do; a bare
+    `market` is what a reader runs, and it works offline.
 
     Defaults to `events.DEFAULT_COUNTRIES` / `DEFAULT_IMPACTS` -- USD plus the
     feed's global rows, High and Medium -- which is the slice that moves an
@@ -622,8 +622,8 @@ def cmd_market(args) -> int:
             done = refresh_calendar(conn, now=datetime.now(UTC))
             record_run(conn, "market", status=done.status, detail=done.detail,
                        done=done.stored, total=done.fetched)
-            # The days ahead get no exit code of their own: the cron reads this
-            # command's exit for ForexFactory's week.
+            # The days ahead get no exit code of their own: the exit code is
+            # ForexFactory's week, the calendar the rest is judged by.
             if isinstance(done.ahead, EventFetchError):
                 print(f"calendar ahead failed: {done.ahead}", file=sys.stderr)
                 result["ahead_error"] = str(done.ahead)
@@ -632,7 +632,7 @@ def cmd_market(args) -> int:
                 lines.append(f"ahead {done.ahead.stored} listed by {AHEAD}")
             if isinstance(done.error, EventRateLimited):
                 # EXIT_THROTTLED, not EXIT_ERROR: the same distinction the IBKR
-                # path draws, so a nightly cron stays silent on a back-off and
+                # path draws, so a scheduled caller stays silent on a back-off and
                 # alerts only on something that actually changed.
                 print(f"calendar: {done.error}", file=sys.stderr)
                 return EXIT_THROTTLED
@@ -756,15 +756,10 @@ def cmd_bars(args) -> int:
         ]
         lines += [f"  FAILED: {failure}" for failure in outcome.failures]
         _emit(data, "\n".join(lines), args.json)
-        # Recorded HERE rather than in the cron, because a cron runs under
-        # MeshClaw's interpreter and cannot import this package at all --
-        # `import py_ibkr` there is a ModuleNotFoundError, which is why the crons
-        # shell out in the first place. See jobs.py.
-        #
         # Three statuses where the old ledger had one: `failed` when a window
         # failed, `nothing` when the run was legitimately empty, `ok` when bars
-        # landed. That distinction is the whole point -- crons.json read `ok` for
-        # two days while this command wrote no bars at all.
+        # landed. That distinction is the whole point -- the old MeshClaw cron
+        # read `ok` for two days while this command wrote no bars at all.
         record_run(
             conn, "bars_live" if live else "bars_daily",
             status=("failed" if outcome.failures
@@ -901,7 +896,7 @@ def cmd_serve(args) -> int:
     # EXPLICIT flag, so a developer who exports the variable and then serves the
     # demo gets the demo, not a refusal and not a real fetch into synthetic tables.
     # `settings.query_id` holds the precedence (argument, environment, stored
-    # file) so `serve`, `sync` and the cron cannot each carry their own version
+    # file) so `serve` and `sync` cannot each carry their own version
     # of it -- and the STORED step is the one a launchd agent can actually see,
     # which the environment channel above never was.
     #
@@ -1370,9 +1365,9 @@ def cmd_confirms(args) -> int:
 def cmd_sync(args) -> int:
     """Fetch the latest statement, fold it in, and report only what is new.
 
-    This is the command the daily cron runs, so it is built to be quiet when
-    nothing changed and to distinguish IBKR throttling from a real failure --
-    a cron that cannot tell those apart either spams or hides outages.
+    Built for a scheduled caller as well as a person: quiet when nothing changed,
+    and throttling told apart from a real failure, because a scheduler that cannot
+    tell those apart either spams or hides outages.
     """
     query_id = settings.query_id(args.query_id)
     if not query_id:
@@ -1605,7 +1600,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_setup, verify=True)
 
     p = sub.add_parser("sync", parents=[common, archive, database],
-                       help="fetch, ingest and report new activity (for cron)")
+                       help="fetch, ingest and report new activity")
     p.add_argument("query_id", nargs="?",
                    help="Flex Query ID; falls back to $OPTJOURNAL_QUERY_ID")
     p.add_argument("--from", dest="from_date", metavar="DATE",
@@ -1743,7 +1738,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_THROTTLED
     except (FlexRateLimitError, FlexLockoutError) as exc:
         # Not a failure: IBKR throttles repeat generation of the same query.
-        # Callers (the daily cron) treat this as "try again later".
+        # A scheduled caller treats this as "try again later".
         print(f"\nThrottled by IBKR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_THROTTLED
     except FetchLockTimeout as exc:

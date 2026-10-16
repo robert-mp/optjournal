@@ -3,19 +3,12 @@
 This is the WRITE side of `job_state`/`job_runs`, which `serialize.jobs_data`
 reads, and it holds the registry (`JOBS`), the runner and the reconciler.
 
-WHY THE CLI WRITES THIS AND NOT THE CRON. The plan said "the existing MeshClaw
-crons get a ~10-line helper to write a job_runs row". They cannot: a cron runs under
-MeshClaw's own interpreter, which has no py_ibkr -- verified, `import py_ibkr` there
-is a ModuleNotFoundError -- which is the entire reason the crons shell out to the
-CLI instead of importing anything. So the helper lives here, called by the CLI
-commands the crons already invoke, and the cron files stay untouched. That also
-means the ledger records what the WORK did rather than what the cron's delivery
-policy decided, which is the more useful of the two: the delivery decision is
-already visible in Slack, and the thing that was missing was any record that the
-work happened at all.
+WHO WRITES IT. The reconciler, for every job it runs inside `serve`, and the CLI
+commands for a run started by hand, so both show in the one ledger. The ledger
+records what the WORK did rather than whether a scheduler fired.
 
-THE FAILURE THIS EXISTS FOR, measured on this machine rather than imagined:
-~/.meshclaw/crons.json read `last_status: "ok"` for optjournal-bars-live,
+THE FAILURE THIS EXISTS FOR, measured on this machine rather than imagined: the
+retired MeshClaw crons' crons.json read `last_status: "ok"` for optjournal-bars-live,
 bars-daily AND bars-audit, while `price_bars.fetched_at` shows 28 hourly rows
 written on 08-06, two on 08-07, and nothing after until a human ran the command by
 hand. Three jobs green for two days while collecting nothing -- including the audit

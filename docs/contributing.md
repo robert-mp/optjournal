@@ -193,7 +193,7 @@ A new consumer needs one too.
 
 Three rules the README used to state in prose and nothing enforced now have
 tests in `test_layering.py`: the leaf modules import nothing from the package,
-only `bars` and `demo` may import `blackscholes` (the modelled-number
+only `replay` and `demo` may import `blackscholes` (the modelled-number
 quarantine), and the import graph is acyclic.
 
 `optjournal sweep` goes further than the suite can afford to: it renders **every

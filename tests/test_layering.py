@@ -12,10 +12,9 @@ documented only in prose:
   modelled figure can reach the same card, and the only thing standing
   between the two is which modules may import it.
 
-* **Imports point one way.** A cycle would not merely be untidy: this package is
-  loaded by a cron through a by-path shim under an interpreter with no py_ibkr,
-  so an import that doubles back is how a module acquires a dependency the real
-  runtime does not have.
+* **Imports point one way.** A cycle would not merely be untidy: an import that
+  doubles back is how a leaf module acquires a dependency (py_ibkr, a database)
+  its own callers never meant it to have.
 
 Both are checked with `ast` over the source rather than by importing, so a rule
 is enforced even for a module the suite never imports.
@@ -157,10 +156,9 @@ def test_a_leaf_holder_imports_only_leaves(module):
 def test_the_import_graph_is_acyclic():
     """A cycle costs more here than tidiness.
 
-    The cron loads this package's CLI through a by-path shim under MeshClaw's
-    interpreter, which has no py_ibkr, so an import doubling back is how a module
-    picks up a dependency the real runtime lacks. Reported as the actual path,
-    since "there is a cycle" is not actionable.
+    An import doubling back is how a module picks up a dependency its callers
+    never meant it to have. Reported as the actual path, since "there is a cycle"
+    is not actionable.
     """
     graph = _graph()
     WHITE, GREY, BLACK = 0, 1, 2
