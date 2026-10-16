@@ -470,6 +470,33 @@ def test_ingest_reads_no_broker_vocabulary_of_its_own():
     )
 
 
+def test_an_open_position_is_its_summary_row_not_its_last_lot(tmp_path):
+    """With the Flex query's Lot option ticked, IBKR follows each SUMMARY row with
+    one LOT row per opening. They share the position's key, so the last lot used
+    to overwrite the summary: a -5 put made of lots of -3 and -2 was stored as -2,
+    with that lot's cost."""
+    summary = 'conid="985393011"'
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    (row,) = [line for line in text.splitlines() if "<OpenPosition " in line
+              and summary in line]
+    lots = "".join(
+        "\n" + row.replace('levelOfDetail="SUMMARY"', 'levelOfDetail="LOT"')
+        .replace('position="-5"', f'position="{qty}"')
+        .replace('costBasisMoney="-2521.75"', f'costBasisMoney="{cost}"')
+        for qty, cost in ((-3, -1500), (-2, -1021.75))
+    )
+    assert 'position="-5"' in row and 'costBasisMoney="-2521.75"' in row
+    path = tmp_path / STATEMENTS[0].name
+    path.write_text(text.replace(row, row + lots), encoding="utf-8")
+
+    conn = connect_migrated(tmp_path / "j.db")
+    ingest_file(conn, path)
+    stored = conn.execute(
+        "SELECT position, cost_basis_money FROM position_snapshots"
+        " WHERE conid = '985393011'").fetchall()
+    assert [tuple(r) for r in stored] == [(-5, -2521.75)]
+
+
 # --- the base currency is read from the statement, never assumed (L2) ---------
 
 

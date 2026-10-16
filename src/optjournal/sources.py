@@ -277,6 +277,10 @@ class IbkrSource:
         from optjournal.sections import raw_sections
 
         for row in raw_sections(path).get("OpenPositions") or ():
+            # The query's Lot option adds a LOT row per opening under the
+            # SUMMARY row's key, and the last lot then overwrote the position.
+            if (row.get("levelOfDetail") or "SUMMARY") != "SUMMARY":
+                continue
             yield NormalisedPosition(
                 contract_id=_s(row.get("conid")) or "",
                 account_id=_s(row.get("accountId")) or "",
