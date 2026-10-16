@@ -4635,9 +4635,10 @@ const MKWEEK_LABEL=['This week','Next week','Week after next'];
 const MKWEEK_KEY=['','next','after-next'];
 /* Market Awareness: this week and the two after it, and what lands on each day.
  *
- * Read-only. The page never fetches the calendar -- `optjournal market --fetch`
- * does, from the nightly cron, because the feed rate limits (429 with a
- * retry-after) and a tab reload is not a reason to spend a request against it.
+ * Read-only. A tab load never fetches the calendar: the `market` job does each
+ * weekday morning, and so does Refresh (`/api/market/fetch`), because the feed
+ * rate limits (429 with a retry-after) and a reload is not a reason to spend a
+ * request against it.
  *
  * Every timestamp arrives ALREADY RENDERED in the payload's zone (`mk.zone`), so
  * this function parses no dates and knows nothing about timezones. Deriving the

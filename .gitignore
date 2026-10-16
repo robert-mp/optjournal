@@ -60,6 +60,8 @@ journal.db-wal
 # anywhere else is still covered.
 snapshots/
 journal-*.db
+journal-*.db-shm
+journal-*.db-wal
 # Cross-process lock files. Empty, per-database, and recreated on demand --
 # see locks.py. Committing one would be committing a runtime artifact.
 *.migrate.lock
