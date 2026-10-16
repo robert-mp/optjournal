@@ -37,6 +37,7 @@ Two deliberate choices about what gets counted:
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
@@ -109,6 +110,19 @@ def _day_of(value: str | None) -> str | None:
     if len(text) >= 8 and text[:8].isdigit():
         return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
     return None
+
+
+def _close_of(row: Any) -> tuple[Any, ...] | None:
+    """The close a fill row is part of, or None for an opening or unpriced fill.
+
+    One order's closing fills on one contract on one trade day, once its P&L is
+    known: the scoreboard's unit (see the module docstring), shared with the
+    strategy ranking so the two count the same closes.
+    """
+    if "C" not in (row["open_close"] or "").upper() or row["fifo_pnl_realized"] is None:
+        return None
+    return (row["broker"], row["account_id"], row["conid"],
+            row["ib_order_id"], _day_of(row["trade_date"]))
 
 
 def _category_where(asset_category: str | None) -> tuple[str, tuple[Any, ...]]:
@@ -852,10 +866,9 @@ def month_stats(
             orders.add(str(row["ib_order_id"]))
         pnl = (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"], row["currency"])
         fill_pnl.append(pnl)
-        if "C" in (row["open_close"] or "").upper() and row["fifo_pnl_realized"] is not None:
-            closing.setdefault((row["broker"], row["account_id"], row["conid"],
-                                row["ib_order_id"], _day_of(row["trade_date"])),
-                               []).append(pnl)
+        close = _close_of(row)
+        if close is not None:
+            closing.setdefault(close, []).append(pnl)
         fill_commission.append((row["ib_commission_base"],
                                 row["ib_commission"], row["currency"]))
     stats.orders = len(orders)
@@ -957,41 +970,50 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
 
 
 def strategy_ranking(
-    lifecycles: list[dict[str, Any]], period: str | None
+    conn: sqlite3.Connection,
+    period: str | None,
+    *,
+    shapes: Mapping[tuple[str, str], str],
+    asset_category: str | None = "OPT",
+    scope: TradeScope = ALL_TRADES,
 ) -> dict[str, dict[str, Any] | None]:
-    """The best and worst strategy over decided positions closing in `period`.
+    """The best and worst strategy by what IBKR booked in `period`.
 
-    A strategy is the shape a position was OPENED as -- the lifecycle's `label`,
-    the name its Trades card carries -- and its figure is the SUM of realised
-    P&L over its decided positions in the period, in base. Summed rather than
-    averaged, because the question is which way of trading made or lost the most
-    money here, and one lucky trade should not top the list over a strategy that
-    earned more across twenty.
+    A strategy is the shape a position was OPENED as, the name its Trades card
+    carries, and `shapes` maps each closing fill `(broker, trade id)` to it
+    (`strategies.fill_shapes`). Its figure is the sum of its closes in the
+    period, counted as `month_stats` counts them, so the strategies sum to Net
+    P&L and a position still open ranks by what it has booked. Summed rather
+    than averaged: one lucky trade should not top a strategy that earned more
+    across twenty. `decided` is how many closes that is.
 
-    Positions, not contracts, unlike the scoreboard: a strategy is a property of
-    a decision, and a strangle's two legs are not two strategies. The money is
-    the same either way -- every closed contract sits in exactly one position --
-    except cash settled inside a position still running, which belongs to no
-    strategy's result yet.
-
-    `worst` is None when only one strategy decided anything: it would repeat
-    `best`, and a tile saying the same strategy is both best and worst is
-    arithmetic, not information. Ties break on the label, so the answer is stable.
+    `worst` is None when only one strategy closed anything: it would repeat
+    `best`. Ties break on the label, so the answer is stable.
     """
-    totals: dict[str, list[float]] = {}
-    for lc in lifecycles:
-        pnl = lc.get("realized_pnl")
-        if (lc.get("status") != "closed" or not pnl or pnl.get("base") is None
-                or not lc.get("label") or not _in_period(lc.get("closed_at"), period)):
+    where, params = _category_where(asset_category)
+    closes: dict[str, dict[tuple[Any, ...], list[tuple[Any, Any, Any]]]] = {}
+    for row in conn.execute(
+        f"SELECT broker, account_id, conid, open_close, trade_date, trade_id,"
+        f" ib_order_id, fifo_pnl_realized_base, fifo_pnl_realized, currency"
+        f" FROM trades {where}", params
+    ):
+        if not _in_period(row["trade_date"], period) or not scope.has_trade(row["trade_id"]):
             continue
-        totals.setdefault(str(lc["label"]), []).append(float(pnl["base"]))
-    if not totals:
+        close = _close_of(row)
+        shape = shapes.get((str(row["broker"]), str(row["trade_id"])))
+        if close is None or shape is None:
+            continue
+        closes.setdefault(shape, {}).setdefault(close, []).append(
+            (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"], row["currency"]))
+    if not closes:
         return {"best": None, "worst": None}
-    ranked = sorted(totals.items(), key=lambda kv: (-sum(kv[1]), kv[0]))
+    totals = {shape: (Money.charged(r for rows in by_close.values() for r in rows),
+                      len(by_close))
+              for shape, by_close in closes.items()}
+    ranked = sorted(totals.items(), key=lambda kv: (-kv[1][0].base, kv[0]))
 
-    def entry(label: str, values: list[float]) -> dict[str, Any]:
-        return {"label": label, "pnl": Money.restated(sum(values)).payload(),
-                "decided": len(values)}
+    def entry(label: str, total: tuple[Money, int]) -> dict[str, Any]:
+        return {"label": label, "pnl": total[0].payload(), "decided": total[1]}
 
     return {
         "best": entry(*ranked[0]),

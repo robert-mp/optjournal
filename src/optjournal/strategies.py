@@ -415,6 +415,30 @@ def position_groups(
     return out
 
 
+def fill_shapes(
+    cards: list[Row], campaign_list: list[campaigns.Campaign], episodes: list[Any],
+) -> dict[tuple[str, str], str]:
+    """The shape each closing fill's card was opened as, by `(broker, trade id)`.
+
+    What `stats.strategy_ranking` ranks under. `cards` are `position_groups`'
+    over the same campaigns. A fill through zero (`C;O`) is in two cards, and
+    its P&L is the closing half's, so it takes the shape of the card it closed.
+    """
+    label_of = {card["anchor"]: card["label"] for card in cards
+                if card.get("anchor") and card.get("label")}
+    out: dict[tuple[str, str], str] = {}
+    for camp in campaign_list:
+        label = label_of.get(camp.anchor)
+        if label is None:
+            continue
+        for i in camp.episode_indices:
+            episode = episodes[i]
+            for trade_id, part in episode.fill_parts.items():
+                if "C" in part.open_close.upper():
+                    out[(str(episode.broker), str(trade_id))] = label
+    return out
+
+
 def _unrealized(held: list[str], marks: Mapping[str, Row | None]) -> Row | None:
     """The summed mark on the contracts still held, or None unless each has one.
 

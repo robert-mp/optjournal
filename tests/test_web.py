@@ -15,7 +15,6 @@ only thing that would have caught any of those five.
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import re
@@ -9813,12 +9812,48 @@ def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state, popul
         assert at["largest_loss"]["base"] <= at["avg_loss"]["base"]
 
 
-def test_each_stats_block_ranks_strategies_over_its_own_period():
-    """`stats` is the selected month and `all_time` is everything; ranking both over
-    all time would put a lifetime answer on a one-month dashboard."""
-    src = inspect.getsource(web.build_state).replace(" ", "")
-    assert 'for block, period in (("stats", selected), ("all_time", None)):'.replace(" ", "") in src
-    assert "strategy_ranking(state[\"lifecycles\"],period)" in src
+def test_every_close_ranks_under_a_shape_and_each_block_ranks_its_own_period(
+    state, populated,
+):
+    """The strategy tiles rank the money the tiles beside them count.
+
+    Every closing fill ranks under some card's opening shape, so ranked as one
+    shape a period's closes sum to its Net P&L. And `stats` ranks the selected
+    month while `all_time` ranks everything: a lifetime answer on a one-month
+    dashboard is the defect the first check would not see.
+    """
+    from optjournal.stats import month_stats, strategy_ranking
+    from optjournal.strategies import fill_shapes
+
+    conn = connect(populated)
+    try:
+        report = build_history(conn, asset_category="OPT")
+        camps = campaigns_for(conn, "OPT", report.episodes)
+        shapes = fill_shapes(state["lifecycles"], camps, report.episodes)
+        closing = {(str(r["broker"]), str(r["trade_id"])) for r in conn.execute(
+            "SELECT broker, trade_id FROM trades WHERE asset_category = 'OPT'"
+            " AND open_close LIKE '%C%' AND fifo_pnl_realized IS NOT NULL")}
+        assert closing and closing <= set(shapes), closing - set(shapes)
+        one = dict.fromkeys(shapes, "every shape")
+        closes = {}
+        for month in state["months"]:
+            ranked = strategy_ranking(conn, month, shapes=one)["best"]
+            stats = month_stats(conn, month, report=report)
+            closes[month] = stats.closes
+            if not stats.closes:
+                assert ranked is None, month
+                continue
+            assert (ranked["decided"], ranked["pnl"]["base"]) == (
+                stats.closes, pytest.approx(stats.net_pnl.base)), month
+    finally:
+        conn.close()
+
+    quiet = min((m for m in closes if closes[m]), key=closes.__getitem__)
+    picked = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None,
+                         month=quiet)["stats"]
+    ranked = [r for r in (picked["best_strategy"], picked["worst_strategy"]) if r]
+    assert ranked and sum(r["decided"] for r in ranked) <= closes[quiet] \
+        < state["all_time"]["closes"]
 
 
 def _at_rules(width: int, kind: str = "media") -> list[tuple[str, str]]:

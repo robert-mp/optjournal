@@ -6,8 +6,8 @@ money to the broker statement (`stats.py`), and it is also the unit the
 scoreboard counts. A campaign is the POSITION a trader thinks in: an opening
 trade plus every roll of it, or a spread's legs placed together. It is what the
 Trades tab draws as one card, what a journal write-up is filed under, what the
-open-position count and the strategy ranking count, and what the Review tab
-reviews.
+open-position count counts, whose opening shape the strategy ranking files each
+close under, and what the Review tab reviews.
 
 A campaign is DECIDED only when every episode in it is closed, because a roll
 is a continuation. Its outcome is the SUM of its episodes' realised P&L: roll a

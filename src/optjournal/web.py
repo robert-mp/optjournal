@@ -159,6 +159,7 @@ from optjournal.stats import (
 )
 from optjournal.strategies import (
     campaign_events,
+    fill_shapes,
     position_groups,
 )
 from optjournal.sync import history_plan, newest_statement_end, sync_journal
@@ -812,14 +813,15 @@ def build_state(
             view_campaigns if view_category == asset_category
             else campaigns_for(conn, asset_category, report.episodes),
             report.episodes)
-        # The strategy ranking, for the same reason as open_positions: it reads
-        # the lifecycles, which carry each position's opening shape, and those are
-        # built here rather than inside month_stats. Unlike open_positions it IS
-        # period-bound, so each block ranks its own period. The lifecycles come
-        # from scope-filtered orders, so the ranking obeys the trade type exactly
-        # as the tiles beside it do.
+        # The strategy ranking, for the same reason as open_positions: a close is
+        # ranked under its card's opening shape, and the cards are built here
+        # rather than inside month_stats. Unlike open_positions it IS
+        # period-bound, so each block ranks its own period, over the scope the
+        # tiles beside it count.
+        shapes = fill_shapes(state["lifecycles"], view_campaigns, view_episodes)
         for block, period in (("stats", selected), ("all_time", None)):
-            ranking = strategy_ranking(state["lifecycles"], period)
+            ranking = strategy_ranking(conn, period, shapes=shapes,
+                                       asset_category=view_category, scope=scope)
             state[block]["best_strategy"] = ranking["best"]
             state[block]["worst_strategy"] = ranking["worst"]
         # Over the same cards the Trades tab draws, so the review and the cards

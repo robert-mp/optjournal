@@ -173,8 +173,8 @@ MUTANTS: tuple[Mutant, ...] = (
     Mutant(
         key="close-per-order",
         module="stats.py",
-        find='                                row["ib_order_id"], _day_of(row["trade_date"])),',
-        replace='                                _day_of(row["trade_date"])),',
+        find='            row["ib_order_id"], _day_of(row["trade_date"]))',
+        replace='            _day_of(row["trade_date"]))',
         breaks="two orders closing one contract on one day would score as one close",
     ),
     Mutant(
