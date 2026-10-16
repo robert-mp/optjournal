@@ -1,7 +1,7 @@
 """Monthly statistics and daily P&L series for the journal dashboard.
 
-Kept separate from `analysis` (which measures account *costs* from a single
-statement) and from `history` (which reconstructs position episodes). This
+Kept separate from `costs` (what the broker charged) and from `history`
+(which reconstructs position episodes). This
 module answers the calendar-shaped questions a journal dashboard asks: what
 happened in March, and what happened on the 14th.
 

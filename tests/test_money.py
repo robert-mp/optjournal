@@ -251,8 +251,7 @@ def test_charge_magnitude_carries_every_currency():
 def test_money_stays_a_leaf_module():
     """Money is a value type, so every layer may hold one without acquiring a
     dependency direction. The moment it imports another journal module, that
-    stops being true and `analysis.py` -- which imports nothing internal -- can
-    no longer be handed one.
+    stops being true.
     """
     import ast
     import pathlib

@@ -231,11 +231,8 @@ def test_page_comments_are_balanced():
 
 
 def test_state_is_pure_json(state):
-    """No default=str crutch: the payload must serialise on its own.
-
-    Decimal money and datetime.date periods both violate this, and both make
-    it out of `analysis` unless coerced.
-    """
+    """No default=str crutch: the payload must serialise on its own, so a
+    Decimal or a datetime.date that reaches it fails here."""
     json.dumps(state)
 
 
@@ -4100,68 +4097,12 @@ def test_net_pnl_is_shown_as_realised_not_restated(state):
     assert "cash(s.net_pnl" not in js, "a display site bypasses the rule"
 
 
-def test_journal_taxes_is_a_money_and_the_gate_reaches_it():
-    """The last cash figure that shipped as a bare `_base` float.
-
-    `journal_taxes_base` had a scoped base total and no path to the as-charged
-    amount, because the journal-scoped tax ledger existed only inlined inside
-    `journal_friction_native_by_ccy` -- aggregated, but not reachable.
-
-    Both branches are exercised here rather than on the live payload, because
-    neither journal has a single taxed trade: `journal_taxes_base` is 0.0 on
-    both, so real data cannot distinguish a working gate from one that never
-    runs.
-    """
-    from decimal import Decimal
-    from types import SimpleNamespace
-
-    from optjournal.analysis import analyse
-    from optjournal.serialize import costs_data
-
-    def fill(taxes, ccy, rate="1"):
-        return SimpleNamespace(
-            assetCategory=SimpleNamespace(value="OPT"), symbol="TSLA",
-            currency=ccy, ibCommissionCurrency=ccy,
-            proceeds=Decimal("-1000"), ibCommission=Decimal("-1.00"),
-            taxes=Decimal(taxes), fxRateToBase=Decimal(rate),
-            quantity=Decimal("1"), notes=[],
-        )
-
-    def totals(trades):
-        stmt = SimpleNamespace(fromDate="20250801", toDate="20260731",
-                              Trades=trades, CashTransactions=[])
-        return costs_data(analyse(stmt))["totals"]
-
-    uniform = totals([fill("-0.25", "USD"), fill("-0.75", "USD")])
-    assert set(uniform["journal_taxes"]) == {"base", "native", "ccy"}
-    assert uniform["journal_taxes"] == {"base": 1.0, "native": 1.0, "ccy": "USD"}
-    assert "journal_taxes_base" not in uniform, "the flat key outlived its Money"
-
-    # A second currency must withhold the native while keeping the base whole:
-    # an exact-looking figure covering part of a total is the failure the gate
-    # exists to prevent.
-    mixed = totals([fill("-0.25", "USD"), fill("-3.00", "SEK", rate="0.09")])
-    assert mixed["journal_taxes"]["native"] is None
-    assert mixed["journal_taxes"]["ccy"] is None
-    assert mixed["journal_taxes"]["base"] == pytest.approx(0.25 + 3.00 * 0.09)
-
-    # The serializer half of the rule, which is what this test is really about:
-    # the figure is a Money and the gate reaches it.
-    #
-    # The page-side assertion that used to live here named `moneyOf(T.journal_taxes)`
-    # -- a read in the statement-backed Costs view, which no longer exists. The Costs
-    # tab now reads the DB-backed payload, where the same rule is enforced more
-    # broadly and structurally: `chargeFig` is the single display path for every
-    # `Charge`, it delegates to `moneyOf`, and the payload contract guard checks
-    # every key the page reads against the typedefs. So the narrow assertion was
-    # retired rather than repointed at an arbitrary new call site.
+def test_a_charge_is_displayed_through_the_one_money_rule():
+    """`chargeFig` is the single display path for every `Charge` on the Costs tab,
+    so it must go through `moneyOf`, or a cost is shown by a second rule that can
+    disagree with every other cash figure on the page."""
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
-    assert "cash(T.journal_taxes" not in js, "a display site bypasses the rule"
-    # `chargeFig` is that single path, and it must go through `moneyOf`.
-    assert "moneyOf(ch)" in js, (
-        "chargeFig no longer delegates to moneyOf, so a Charge is displayed by a "
-        "second rule that can disagree with every other cash figure on the page"
-    )
+    assert "moneyOf(ch)" in js
 
 
 def test_the_page_has_exactly_one_native_first_rule():

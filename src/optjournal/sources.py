@@ -251,7 +251,7 @@ class IbkrSource:
                     transaction_id=_s(c.transactionID) or "",
                     account_id=account_id,
                     # `_enum_value`, not str(): py_ibkr yields CashAction members
-                    # whose str() is 'CashAction.FEES'. analysis.py branches on
+                    # whose str() is 'CashAction.FEES'. costs.py branches on
                     # this by substring, so the leak would change which bucket a
                     # row lands in rather than merely how it prints.
                     kind=_enum_value(c.type),

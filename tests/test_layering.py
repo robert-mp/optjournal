@@ -1,7 +1,7 @@
 """The import rules the README states, asserted over the real import graph.
 
-Two of those rules had no test. `test_analysis.py` and `test_money.py` each pin
-their own module's leaf status, which is the pattern this generalises -- but the
+Two of those rules had no test. `test_money.py` pins its own module's leaf
+status, which is the pattern this generalises -- but the
 two rules the README calls load-bearing for the journal's credibility were
 documented only in prose:
 
@@ -61,28 +61,19 @@ MAY_MODEL = {"replay", "demo"}
 #: publishes (a 30-day implied vol and the high and low of that same series over
 #: the trailing year) and divides. The quarantine is a rule against modelling, not
 #: against the word "implied", so the count above is still two.
-#:
-#: `analysis` is not here: it holds `notes`, which is itself a leaf. That is the
-#: point of a leaf -- any layer may hold one without acquiring a direction -- and
-#: the rule it needs, reading IBKR note codes as whole tokens, is shared with
-#: `history` on the far side of the graph. `IMPORTS_LEAVES_ONLY` states the
-#: weaker property that still holds: it depends on nothing that reads a database.
 LEAVES = {"money", "notes", "blackscholes", "clock", "config", "marketdata",
           "compat", "fills", "events", "vol", "trend", "iv", "locks", "logs"}
 
-#: Modules that may import leaves and nothing else. Weaker than `LEAVES` and
-#: load-bearing for the same reason: `analysis.py` is pure statement mathematics,
-#: testable against a hand-built statement, and it stays that way only while
-#: everything it imports is a value type. The specific temptation is `stats`,
-#: whose single-currency gate it would like for its per-currency ledgers --
-#: `serialize` applies that instead, being the layer that already holds both.
+#: Modules that may import leaves and nothing else. Weaker than `LEAVES`, and
+#: load-bearing because such a module stays testable against a literal only
+#: while everything it imports is a value type.
 #:
 #: `campaigns` is here rather than in `LEAVES` because a campaign's outcome IS a
 #: `Money` -- it cannot answer "did this decision win" without one. It holds no
 #: episode type either: everything it reads off an episode is duck-typed, which
 #: is what keeps every case in it testable against a literal instead of a
 #: database, and what stops the win rate's own rule from depending on `history`.
-IMPORTS_LEAVES_ONLY = {"analysis", "campaigns"}
+IMPORTS_LEAVES_ONLY = {"campaigns"}
 
 
 def _internal_imports(path: Path) -> set[str]:

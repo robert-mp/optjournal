@@ -26,7 +26,6 @@ from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 from optjournal import __version__, browser, install, logs, settings
 from optjournal.ahead import SOURCE as AHEAD
 from optjournal.ahead import refresh_calendar
-from optjournal.analysis import analyse, format_report
 from optjournal.archive import newest_statement, prune_archive
 from optjournal.bars import (
     audit_perishable,
@@ -91,7 +90,6 @@ from optjournal.render import (
 )
 from optjournal.serialize import (
     broker_costs_data,
-    costs_data,
     history_data,
     orders_data,
     positions_data,
@@ -130,7 +128,6 @@ examples:
   optjournal orders                        option orders, partial fills collapsed
   optjournal positions                     current option book
   optjournal history                       closed-position P&L, round trip by round trip
-  optjournal costs --json                  one statement's cost report as JSON
   optjournal friction                      what the broker cost, whole journal
   optjournal friction --assets OPT CASH    options and conversions only
   optjournal serve --query-id 1591754      local web UI with a Sync now button
@@ -301,23 +298,6 @@ def cmd_show(args) -> int:
     data = summary_data(response, path)
     data["source_file"] = path.name
     _emit(data, render_summary(data), args.json)
-    return EXIT_OK
-
-
-def cmd_costs(args) -> int:
-    path = _resolve_path(args)
-    if path is None:
-        return _no_statements(args)
-    try:
-        response = load(path)
-    except StatementUnreadable as exc:
-        return _unreadable(exc)
-    reports = [analyse(s) for s in response.FlexStatements]
-    _emit(
-        [costs_data(r) for r in reports],
-        "\n\n".join(format_report(r) for r in reports),
-        args.json,
-    )
     return EXIT_OK
 
 
@@ -509,11 +489,8 @@ def _month_or_year(text: str) -> str:
 def cmd_friction(args) -> int:
     """What the broker cost, from the DATABASE rather than one statement.
 
-    The sibling of `costs`, and the difference is the question each answers.
-    `costs` reports one statement's own costs -- the right thing when the question
-    is about a statement, and the only way to read a section no column carries.
-    This reports the JOURNAL's: every ingested fill, narrowable to a set of asset
-    categories, which is what the web page shows.
+    Every ingested fill, narrowable to a set of asset categories and a period,
+    which is what the web page shows.
 
     Emits JSON through the same serializer the page reads, so `--json` here and
     the tab cannot disagree about a figure.
@@ -1531,11 +1508,6 @@ def build_parser() -> argparse.ArgumentParser:
                        help="structural summary of a statement")
     p.add_argument("path", type=Path, nargs="?", help="defaults to newest")
     p.set_defaults(func=cmd_show)
-
-    p = sub.add_parser("costs", parents=[common, archive],
-                       help="fee, FX and withholding cost report")
-    p.add_argument("path", type=Path, nargs="?", help="defaults to newest")
-    p.set_defaults(func=cmd_costs)
 
     p = sub.add_parser("friction", parents=[common, database],
                        help="what the broker cost, from the journal (any scope)")

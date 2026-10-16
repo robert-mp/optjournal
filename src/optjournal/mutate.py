@@ -210,14 +210,6 @@ MUTANTS: tuple[Mutant, ...] = (
                "instrument's rate, storing an EUR amount 11x too small",
     ),
     Mutant(
-        key="qty-truncate",
-        module="analysis.py",
-        find="            g.quantity += abs(Decimal(str(t.quantity)))",
-        replace="            g.quantity += int(abs(t.quantity))",
-        breaks="a thousand half-share fills would sum to 0 units, so the per-unit "
-               "commission column silently shows a dash",
-    ),
-    Mutant(
         key="note-token",
         module="notes.py",
         find="    return code in split_notes(notes)",
@@ -248,6 +240,36 @@ MUTANTS: tuple[Mutant, ...] = (
                "market-data and custody charges the account still pays",
     ),
     Mutant(
+        key="qty-truncate",
+        module="costs.py",
+        find='                cost.quantity += abs(float(row["quantity"]))',
+        replace='                cost.quantity += int(abs(row["quantity"]))',
+        breaks="a thousand half-share fills would sum to 0 units, so the per-unit "
+               "commission column silently shows a dash",
+    ),
+    Mutant(
+        key="credit-gate",
+        module="costs.py",
+        find="        if commission_base < 0:\n            cost.credit_fills += 1",
+        replace="        if commission_base != 0:\n            cost.credit_fills += 1",
+        breaks="every charged fill would be reported as carrying a commission CREDIT",
+    ),
+    Mutant(
+        key="fee-kind",
+        module="costs.py",
+        find='        if "FEES" in kind:',
+        replace='        if "FEES" in kind or "INT" in kind:',
+        breaks="broker interest RECEIVED would be booked as a cost: "
+               "BROKER INTEREST RECEIVED contains 'INT' but not 'FEES'",
+    ),
+    Mutant(
+        key="withholding-sign",
+        module="costs.py",
+        find="            withheld[key] = withheld.get(key, Charge()) + charge",
+        replace="            withheld[key] = withheld.get(key, Charge()) + stated",
+        breaks="withholding arrives negative, so the effective tax rate would invert",
+    ),
+    Mutant(
         key="snapshot-sign",
         module="replay.py",
         find='        seed_quantity=float(row.get("position") or 0.0),',
@@ -261,13 +283,6 @@ MUTANTS: tuple[Mutant, ...] = (
         replace='        return {k: v for k, v in {"base": self.base, '
                 '"native": self.native, "ccy": self.currency}.items() if v is not None}',
         breaks="the page would see a missing property where it tests for null",
-    ),
-    Mutant(
-        key="num-decimal",
-        module="serialize.py",
-        find="    return float(value)",
-        replace="    return value",
-        breaks="Decimals would reach the payload, so JSON carries strings",
     ),
     Mutant(
         key="asset-sentinel",
@@ -351,36 +366,6 @@ MUTANTS: tuple[Mutant, ...] = (
         find="    if not _is_loopback(host):",
         replace="    if False:",
         breaks="an unauthenticated brokerage dashboard could bind a public interface",
-    ),
-    Mutant(
-        key="credit-gate",
-        module="analysis.py",
-        find="        if commission > ZERO:\n            g.credit_fills += 1",
-        replace="        if commission != ZERO:\n            g.credit_fills += 1",
-        breaks="every charged fill would be reported as carrying a commission CREDIT",
-    ),
-    Mutant(
-        key="fee-ccy",
-        module="analysis.py",
-        find='            fee_ccy = str(getattr(c, "currency", None) or "") or base_currency',
-        replace="            fee_ccy = base_currency",
-        breaks="313 KRW custody fees would claim to be EUR amounts",
-    ),
-    Mutant(
-        key="fee-kind",
-        module="analysis.py",
-        find='        if "FEES" in kind:',
-        replace='        if "FEES" in kind or "INT" in kind:',
-        breaks="broker interest RECEIVED would be booked as a cost. `kind` is an "
-               "enum MEMBER NAME, so a loose substring is the live hazard: "
-               "BROKERINTRCVD contains 'INT' but not 'INTEREST'",
-    ),
-    Mutant(
-        key="withholding-sign",
-        module="analysis.py",
-        find="            withheld[key] -= amount_base",
-        replace="            withheld[key] += amount_base",
-        breaks="withholding arrives negative, so the effective tax rate would invert",
     ),
     Mutant(
         key="wire-enum",

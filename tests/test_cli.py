@@ -187,11 +187,8 @@ def test_a_value_less_enum_falls_back_to_its_last_component():
 
 @pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
 def test_friction_reports_the_journal_not_one_statement(tmp_path, capsys):
-    """The command exists because `costs` answers a different question.
-
-    `costs` reads one statement -- the newest archive covers 30 calendar days --
-    while this reads every ingested fill. Asserted as a SPAN comparison rather
-    than against a literal, so it stays true as the archive grows.
+    """Every ingested fill, not one statement's 30 days. Asserted as a SPAN
+    rather than against a literal, so it stays true as the archive grows.
     """
     db = tmp_path / "friction.db"
     assert main(["ingest", "--archive", str(STATEMENTS[0].parent), "--db", str(db)]) == 0
@@ -785,13 +782,11 @@ def test_ingest_reports_an_unreadable_file_in_its_json(tmp_path, capsys):
     assert [u["file"] for u in data["unreadable"]] == ["activity-bad.xml"]
 
 
-@pytest.mark.parametrize("command", ["costs", "show"])
-def test_a_malformed_statement_is_one_line_not_a_traceback(tmp_path, capsys,
-                                                            command):
-    """L24: `costs <file>` printed a raw ParseError traceback."""
+def test_a_malformed_statement_is_one_line_not_a_traceback(tmp_path, capsys):
+    """L24: a statement command printed a raw ParseError traceback."""
     bad = tmp_path / "activity-bad.xml"
     bad.write_bytes(b"<FlexQueryResponse")
-    code = main([command, str(bad)])
+    code = main(["show", str(bad)])
     err = capsys.readouterr().err.strip()
     assert code != 0
     assert "activity-bad.xml" in err
@@ -837,7 +832,7 @@ def test_each_run_names_the_undeclared_values_it_met_and_no_others(tmp_path, cap
 
 
 @pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")
-@pytest.mark.parametrize("command", ["costs", "show", "ingest"])
+@pytest.mark.parametrize("command", ["show", "ingest"])
 def test_a_statement_with_a_malformed_number_is_one_line_not_a_traceback(
     tmp_path, capsys, command,
 ):

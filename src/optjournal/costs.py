@@ -1,9 +1,7 @@
 """What the broker cost, over the journal's whole life, scoped by the reader.
 
-The sibling of `analysis.py`, and the difference is the source. `analysis` reads
-one raw statement, which is how the CLI reports a statement's own costs and the
-only way to see a section a database column does not carry. This module reads
-SQLite, and that buys the three things a statement cannot give:
+Read from SQLite rather than from one raw statement, which buys the three
+things a statement cannot give:
 
 * **The account's whole history.** The newest archived statement covers the last
   30 calendar days, so a cost tab backed by it silently narrows to a month --
@@ -45,16 +43,11 @@ breakdown; the flip happens once, at the query.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
-#: `categorise_fee` is imported, not reimplemented: IBKR fee descriptions are free
-#: text and the patterns that bucket them are a judgement, so one description
-#: landing in two different categories depending on which reader saw it would be a
-#: defect the two surfaces could not agree about. `analysis` owns the rule because
-#: it had it first; this module reads the same fees out of SQLite.
-from optjournal.analysis import categorise_fee
 from optjournal.history import journal_base_currency
 from optjournal.money import Charge
 from optjournal.notes import AUTOFX, has_code
@@ -71,18 +64,26 @@ __all__ = [
     "FxPair",
     "WithholdingLine",
     "build_costs",
+    "categorise_fee",
 ]
 
-#: Markup IBKR embeds in the exchange rate on auto-conversions, in basis points,
-#: as published for Interactive Brokers Ireland. The reasoning, the verification
-#: against a year of conversions and the reason it is a constant rather than
-#: something derived from reference rates all live in `analysis.AUTOFX_MARKUP_BPS`
-#: -- the statement path measures the same cost and there must be one number.
+#: Markup IBKR embeds in the exchange rate on auto-conversions, in basis points.
+#: Interactive Brokers Ireland Limited (the entity for EUR-base accounts, CBI ref
+#: C423427) publishes it under Commissions -> Spot Currencies: "For currency
+#: trades executed under the auto currency conversion service, IB will typically
+#: add or subtract (at its discretion) 0.03% to the exchange rate that would
+#: otherwise apply. Please note that IB does not separately charge a commission
+#: on these auto-conversion trades." 0.03% is 3 bps, which is why `ibCommission`
+#: is zero on every AFx row.
+#:
+#: A published constant rather than something computed from reference rates: per
+#: conversion the deviation from ECB daily mid is dominated by intraday drift (sd
+#: ~37 bps on EUR.USD) and is not measurable, and only the aggregate converges.
 AUTOFX_MARKUP_BPS = 3.0
 
-#: What the same year of conversions actually implied, volume-weighted against
-#: ECB daily mid. IBKR publishes 3.0 and hedges it with "typically" and "at its
-#: discretion", so the realised markup is a RANGE, and this is its far end.
+#: What a year of this account's conversions actually implied, volume-weighted
+#: against ECB daily mid. IBKR publishes 3.0 and hedges it with "typically" and
+#: "at its discretion", so the realised markup is a RANGE, and this is its far end.
 #:
 #: Carried as data rather than left in prose because it is the largest single
 #: uncertainty in the report -- around a quarter of account friction is this
@@ -94,6 +95,26 @@ AUTOFX_MARKUP_MEASURED_BPS = 3.2
 #: "quantity" is an amount of money, so a per-unit cost would be commission per
 #: euro, which is not a rate anyone charges or reads.
 CASH_CATEGORY = "CASH"
+
+#: Fee description patterns, most specific first. IBKR fee descriptions are
+#: free text, so this is heuristic by necessity; `Other` is the honest bucket for
+#: anything unmatched rather than a forced guess.
+FEE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("Market data", re.compile(r"\b(OPRA|NP L1|L1|L2|SNAPSHOT|MARKET DATA)\b", re.I)),
+    ("Custody", re.compile(r"CUSTODY", re.I)),
+    ("Commission adj", re.compile(r"COMMISSION|EXECUTION", re.I)),
+    ("Interest", re.compile(r"INTEREST|CREDIT INT", re.I)),
+    ("Transaction tax", re.compile(r"STAMP|FTT|TRANSACTION TAX", re.I)),
+)
+
+
+def categorise_fee(description: str | None) -> str:
+    """Map a free-text IBKR fee description to a coarse category."""
+    text = description or ""
+    for name, pattern in FEE_PATTERNS:
+        if pattern.search(text):
+            return name
+    return "Other"
 
 
 # --- scope -------------------------------------------------------------------

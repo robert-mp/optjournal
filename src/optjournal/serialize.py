@@ -28,7 +28,6 @@ from typing import Any
 
 from optjournal.ahead import SOURCE as AHEAD_SOURCE
 from optjournal.ahead import covered_weeks, week_of
-from optjournal.analysis import CostReport
 from optjournal.bars import (
     audit_perishable,
     upsert_bars,
@@ -43,9 +42,9 @@ from optjournal.clock import MARKET_TZ, et_day, parse_day
 from optjournal.costs import (
     AUTOFX_MARKUP_BPS,
     AUTOFX_MARKUP_MEASURED_BPS,
+    CostReport,
     Friction,
 )
-from optjournal.costs import CostReport as DbCostReport
 from optjournal.events import (
     DEFAULT_COUNTRIES,
     DEFAULT_IMPACTS,
@@ -99,30 +98,6 @@ def _wire(value: Any) -> str:
         return inner
     text = str(value)
     return text.rsplit(".", 1)[-1] if "." in text else text
-
-def _num(value: Any) -> float | None:
-    """Coerce a money/rate value to float for JSON.
-
-    `analysis` computes in Decimal because py_ibkr parses money that way, but
-    Decimal is not JSON-serialisable and `json.dumps(default=str)` silently
-    turns it into a *string* -- so consumers received "42.728611289" where a
-    number was expected. The schema already stores money as REAL, so float is
-    the right wire type; this makes the JSON match that decision.
-    """
-    if value is None:
-        return None
-    return float(value)
-
-def _iso(value: Any) -> str | None:
-    """Render a date-like value as an ISO string for JSON.
-
-    py_ibkr parses statement periods into `datetime.date`, which json.dumps
-    rejects. Coercing here rather than leaning on the caller's `default=str`
-    means the payload is self-contained JSON regardless of how it is dumped.
-    """
-    if value is None:
-        return None
-    return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 def summary_data(resp, path: Path | None = None) -> Row:
     """Structural summary of a parsed statement. No monetary values."""
@@ -466,166 +441,8 @@ def portfolio_data(conn: sqlite3.Connection) -> Row:
     }
 
 
-def _money(base: Any, ledger: dict) -> Money:
-    """A cost figure: the base total, plus the as-charged amount where one exists.
-
-    analysis.py carries the per-currency breakdown and deliberately does not
-    judge it -- it imports nothing internal and must stay that way. The gate
-    lives once, in `Money`, and is applied here, where the base total and the
-    ledger are both already in hand.
-
-    Returning one `Money` rather than a `(amount, currency)` tuple is what
-    removed the duplication this block used to carry: reaching each half of a
-    tuple through subscripting meant `_gate` was called twice per payload key,
-    and the `journal_friction` case spelled its whole dict comprehension twice.
-    """
-    return Money.gated(_num(base) or 0.0, {c: float(v) for c, v in ledger.items()})
-
-
-def _journal_commission(report: CostReport) -> Money:
-    """Commission for the journalled asset only, base and as-charged."""
-    return _money(report.journal_commission_base, report.journal_native_by_ccy)
-
-
-def _journal_per_unit(report: CostReport) -> Row | None:
-    """Commission per contract, or None when the scope has no quantity.
-
-    Both halves come from one `Money.per`, so the base and as-charged figures
-    are guaranteed to share a denominator. The base used to come from a separate
-    `CostReport.journal_per_unit_base` property while the native was divided
-    here -- two divisions that had to agree by inspection. That property is gone
-    rather than left unread, so there is no second answer to fall back to.
-    """
-    # float(), because `quantity` is a Decimal to keep fractional share lots
-    # exact while they accumulate, and `Money` is the float domain the payload
-    # speaks. Coerced here, at the boundary that already owns that conversion
-    # (see `_num`), rather than letting a Decimal cross into `Money.per`.
-    qty = float(sum(g.quantity for g in report.journal_commissions))
-    per = _journal_commission(report).per(qty)
-    return None if per is None else per.payload()
-
-
-def costs_data(report: CostReport) -> Row:
-    """Cost report as a JSON-safe structure.
-
-    Hand-built rather than `dataclasses.asdict(report)`, which was the previous
-    approach and silently wrong: asdict serialises *fields* only, so every
-    computed total -- friction, commission, fees, the AutoFX estimate -- was
-    absent from `costs --json`, leaving consumers a payload of raw components
-    and no answers. The same trap applies per pair, where `autofx_spread_base`
-    and `commission_bps` are properties.
-    """
-    return {
-        "base_currency": report.base_currency,
-        "from_date": _iso(report.from_date),
-        "to_date": _iso(report.to_date),
-        "fx_caveat": report.fx_caveat,
-        "fx": [
-            {
-                "symbol": p.symbol,
-                "conversions": p.conversions,
-                "notional_base": _num(p.notional_base),
-                "commission_base": _num(p.commission_base),
-                "commission_bps": _num(p.commission_bps),
-                "autofx_conversions": p.autofx_conversions,
-                "autofx_notional_base": _num(p.autofx_notional_base),
-                "autofx_spread_base": _num(p.autofx_spread_base),
-            }
-            for p in report.fx
-        ],
-        "commissions": [
-            {
-                "asset_category": g.asset_category,
-                "fills": g.fills,
-                "quantity": _num(g.quantity),
-                "commission_base": _num(g.commission_base),
-                "taxes_base": _num(g.taxes_base),
-                "per_unit_base": _num(g.per_unit_base),
-            }
-            for g in report.commissions
-        ],
-        "fees": [
-            {
-                "name": c.name,
-                "count": c.count,
-                "total_base": _num(c.total_base),
-                "examples": list(c.examples),
-            }
-            for c in report.fees
-        ],
-        "withholding": [
-            {
-                "symbol": w.symbol,
-                "currency": w.currency,
-                "gross_base": _num(w.gross_base),
-                "withheld_base": _num(w.withheld_base),
-                "effective_rate": _num(w.effective_rate),
-            }
-            for w in report.withholding
-        ],
-        "journal_asset": report.journal_asset,
-        "totals": {
-            # Each gated figure is one `Money` -- one gate call, one key, and
-            # the amount inseparable from the currency it was charged in.
-            "commission": _money(
-                report.total_commission_base, report.total_native_by_ccy).payload(),
-            "fees": _money(
-                report.total_fees_base, report.total_fees_native_by_ccy).payload(),
-            "taxes": _money(
-                report.total_taxes_base, report.total_taxes_native_by_ccy).payload(),
-            "autofx_notional_base": _num(report.total_autofx_notional_base),
-            "autofx_spread_base": _num(report.total_autofx_spread_base),
-            "stated_friction": _money(
-                report.total_stated_friction_base,
-                report.total_stated_friction_native_by_ccy).payload(),
-            "friction_base": _num(report.total_friction_base),
-            "fx_notional_base": _num(report.total_fx_notional_base),
-            "fx_commission": _money(
-                report.total_fx_commission_base,
-                report.total_fx_commission_native_by_ccy).payload(),
-            # Scope split. `commission` above spans the whole account, so
-            # a consumer that wants this journal's cost must read the journal_*
-            # keys -- presenting the account figure as the journal's was the
-            # defect this split exists to remove.
-            "journal_commission": _journal_commission(report).payload(),
-            "journal_taxes": _money(
-                report.journal_taxes_base,
-                report.journal_taxes_native_by_ccy).payload(),
-            "journal_friction": _money(
-                report.journal_friction_base,
-                report.journal_friction_native_by_ccy).payload(),
-            # Divided by the same quantity the base figure uses, so the two
-            # halves differ only in the currency of the numerator. `Money.per`
-            # divides both at once, so an as-charged numerator can never end up
-            # over a restated denominator.
-            "journal_per_unit": _journal_per_unit(report),
-            # Account-level figures take the same gate. On a multi-currency
-            # account it almost always withholds -- these deliberately span
-            # asset categories -- but "withheld because the scope is mixed" is
-            # a different statement from "never considered", and only one of
-            # them survives a currency becoming uniform later.
-            #
-            # account_friction and friction are flat base-only floats on
-            # purpose: both include the estimated AutoFX markup, which was never
-            # billed as a line item in any currency, so no as-charged figure
-            # exists and the shape should not imply one could.
-            "other_commission": _money(
-                report.other_commission_base, report.other_native_by_ccy).payload(),
-            "other_taxes": _money(
-                report.other_taxes_base, report.other_taxes_native_by_ccy).payload(),
-            "account_friction_base": _num(report.account_friction_base),
-            "credit_fills": sum(g.credit_fills for g in report.commissions),
-        },
-    }
-
-
-def broker_costs_data(report: DbCostReport) -> Row:
+def broker_costs_data(report: CostReport) -> Row:
     """The DB-backed cost report as a JSON-safe structure.
-
-    Distinct from `costs_data`, which serialises the statement-derived
-    `analysis.CostReport`. Both exist on purpose: the CLI reports one statement's
-    own costs and the page reports the journal's, and a single serializer would
-    have to blur two different scopes into one shape.
 
     Every cost is a `Charge`, so each figure carries the ledger it was billed in
     alongside the gated single figure -- `{base, native, ccy, charged}`. A
@@ -650,7 +467,7 @@ def broker_costs_data(report: DbCostReport) -> Row:
                 "category": c.category,
                 "fills": c.fills,
                 "orders": c.orders,
-                "quantity": _num(c.quantity),
+                "quantity": c.quantity,
                 "commission": c.commission.payload(),
                 "taxes": c.taxes.payload(),
                 "total": c.total.payload(),
@@ -665,21 +482,19 @@ def broker_costs_data(report: DbCostReport) -> Row:
             {
                 "symbol": p.symbol,
                 "conversions": p.conversions,
-                "notional_base": _num(p.notional),
+                "notional_base": p.notional,
                 "commission": p.commission.payload(),
-                "commission_bps": _num(p.commission_bps),
+                "commission_bps": p.commission_bps,
                 "auto": {
                     "conversions": p.auto.conversions,
-                    "notional_base": _num(p.auto.notional),
+                    "notional_base": p.auto.notional,
                     # A bare float, not a Charge: no currency was ever billed.
-                    "markup_base": _num(p.markup_at(AUTOFX_MARKUP_BPS)),
-                    "markup_high_base": _num(
-                        p.markup_at(AUTOFX_MARKUP_MEASURED_BPS)
-                    ),
+                    "markup_base": p.markup_at(AUTOFX_MARKUP_BPS),
+                    "markup_high_base": p.markup_at(AUTOFX_MARKUP_MEASURED_BPS),
                 },
                 "manual": {
                     "conversions": p.manual.conversions,
-                    "notional_base": _num(p.manual.notional),
+                    "notional_base": p.manual.notional,
                     "commission": p.manual.commission.payload(),
                 },
             }
@@ -700,7 +515,7 @@ def broker_costs_data(report: DbCostReport) -> Row:
                 "currency": w.currency,
                 "gross": w.gross.payload(),
                 "withheld": w.withheld.payload(),
-                "effective_rate": _num(w.effective_rate),
+                "effective_rate": w.effective_rate,
             }
             for w in report.withholding
         ],
@@ -713,7 +528,7 @@ def broker_costs_data(report: DbCostReport) -> Row:
             "credit_fills": report.credit_fills,
             "autofx": {
                 "conversions": report.autofx_conversions,
-                "notional_base": _num(report.autofx_notional),
+                "notional_base": report.autofx_notional,
                 "bps": AUTOFX_MARKUP_BPS,
                 "measured_bps": AUTOFX_MARKUP_MEASURED_BPS,
             },
@@ -736,15 +551,15 @@ def _friction_payload(friction: Friction) -> Row:
     """
     return {
         "stated": friction.stated.payload(),
-        "estimated_low_base": _num(friction.estimated_low),
-        "estimated_mid_base": _num(friction.estimated_mid),
-        "estimated_high_base": _num(friction.estimated_high),
-        "total_low_base": _num(friction.total_low),
+        "estimated_low_base": friction.estimated_low,
+        "estimated_mid_base": friction.estimated_mid,
+        "estimated_high_base": friction.estimated_high,
+        "total_low_base": friction.total_low,
         # What the headline prints. Sent rather than derived in the page so the
         # figure on screen and the figure in `--json` cannot drift, and so the
         # midpoint rule lives in one place.
-        "total_mid_base": _num(friction.total_mid),
-        "total_high_base": _num(friction.total_high),
+        "total_mid_base": friction.total_mid,
+        "total_high_base": friction.total_high,
         "is_estimated": friction.is_estimated,
     }
 

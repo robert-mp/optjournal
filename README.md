@@ -137,16 +137,13 @@ which the command tells you about.
 | `prepare` | move the journal to its home folder (the Start file runs this) |
 | `history` | closed-position P&L, round trip by round trip |
 | `positions` | the current option book |
-| `costs` | one statement's cost report |
 | `friction` | what the broker cost, across the journal's whole history |
 | `demo` | synthetic data in `demo/`, never in `raw/` |
 
 Every reporting command takes `--json`.
 
-Two cost commands, answering two questions. `costs` reads one statement — the
-newest archive covers 30 calendar days — and is the only way to see a section no
-database column carries. `friction` reads the journal: every ingested fill, over
-the account's whole history, narrowable to any set of asset categories.
+`friction` reads the journal: every ingested fill, over the account's whole
+history, narrowable to any set of asset categories and to a month or a year.
 
 ```
 optjournal friction                       the whole account

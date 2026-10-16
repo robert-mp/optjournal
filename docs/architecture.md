@@ -11,20 +11,17 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
                                                       │
                        ┌──────────────┬───────────────┤
                        ▼              ▼               ▼
-                  history.py      stats.py       analysis.py ◀── raw XML
-                  (episodes)   (periods, scopes)  (cost report)
-                       │              │           costs.py ◀── the same costs,
-                       │              │           (scoped, whole history)  from SQL
+                  history.py      stats.py        costs.py
+                  (episodes)   (periods, scopes)  (what the broker cost,
+                       │              │            scoped, whole history)
                        └──────────────┼───────────────┘
                                       ▼
-                     serialize.py (JSON payload contract; wraps analysis's
-                                   per-currency ledgers into Money)
+                     serialize.py (JSON payload contract)
                      render.py    (terminal reports)
                           ▲
                      money.py (Money, Charge: held by every layer above,
                                depends on none)
-                     notes.py (IBKR note codes: read by history and analysis,
-                               which cannot import each other)
+                     notes.py (IBKR note codes: read by history and costs)
                                       │
                             ┌─────────┴─────────┐
                             ▼                   ▼
@@ -50,7 +47,7 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `sync.py` | the ONE sync path — fetch, ingest, snapshot — called by `POST /api/sync`, `optjournal sync` and the `sync` job. A journal with no statement asks that one request for the last year instead of the template's 30 days. Also the history import behind the hand-run `history` job: one request per year back to IBKR's retention or the account's opening, newest first, stopping at the first refusal Its own module because of the import graph, not for tidiness: it briefly lived in `web.py` and `jobs.py` reached it through a deferred import, which `tests/test_layering.py` correctly called a cycle. It raises rather than returning an error dict, because each caller needs a different shape for a cooldown (HTTP body, exit code, ledger status) and flattening them into a string is how a locked keychain became a bare exit 1. Its success reply stays a **dict** on purpose — see [Why the sync reply is not a dataclass](#why-the-sync-reply-is-not-a-dataclass) |
 | `history.py` | fills → round-trip episodes (status, 0DTE, holding period) |
 | `money.py` | `Money`: an amount, the currency it was charged in, and the base translation. A leaf — imports nothing, so any layer can hold one. See [The Money model](#the-money-model) |
-| `notes.py` | IBKR trade note codes (`AFx`, `Ep`, `A`) and the one rule for reading them: whole-token matching, over either the stored `AFx;P` string or py_ibkr's parsed list. A leaf, because its two readers — `history.py` (database) and `analysis.py` (statement) — sit on opposite sides of the graph and cannot import each other |
+| `notes.py` | IBKR trade note codes (`AFx`, `Ep`, `A`) and the one rule for reading them: whole-token matching, over either the stored `AFx;P` string or py_ibkr's parsed list. A leaf, so its readers (`history.py`, `costs.py`) hold one rule |
 | `stats.py` | period stats (month/year/all-time), `TradeScope` filters, cohorts. **Never reads `blackscholes.py`** — see [Modelled numbers](#modelled-numbers) |
 | `marketdata.py` | price-bar fetch and parse for one contract over one window. A leaf: no DB, no journal shapes |
 | `vol.py` | realised volatility from closes, the move it implies, and realised vol's own distribution: a trailing year of readings and today's min-max position inside it (`rank`, deliberately not a percentile). A leaf, and deliberately NOT `blackscholes` — see [Modelled numbers](#modelled-numbers) |
@@ -63,12 +60,11 @@ flex.py ──▶ archive (raw/*.xml) ──▶ ingest.py ──▶ SQLite (db.p
 | `bars.py` | the journal-shaped half of price bars — which contract over which window (from episodes), the idempotent write, and the series a chart reads. Storage only: it imports no price model, which is what `tests/test_layering.py` now enforces by naming `replay.py` rather than this module in the pricing allowlist |
 | `replay.py` | the whole replay concern, in two halves. The MODELLED one is the only place anything is priced: implied vol solved from each contract's own closes, the expected-move band, the mark-to-market series and the effective delta, with one solve shared by the band and the marks so they cannot disagree. The ASSEMBLY one turns lifecycles and position rows into the `replays` map the panel reads — strike segments, fill stamps, event cards — and was `web.py`'s until the concern was made whole. `attach()` is the interface; `build_state` calls it once, last. Holds `bars.close_series` and `bars.replay_bars`, one way — see [Modelled numbers](#modelled-numbers) |
 | `blackscholes.py` | option pricing and the implied vol backed out of a market price. A leaf: pure float maths, `math.erf` for the normal CDF, so no numpy or scipy |
-| `analysis.py` | cost/friction report from the raw statement (whole account); pure statement mathematics — holds leaves (`notes.py`) and nothing that reads a database |
-| `costs.py` | the same costs read from SQLite instead: the account's whole life, narrowed to any set of asset categories, with measured cost kept structurally apart from the estimated AutoFX markup. Reconciled against `analysis.py` statement by statement — see `tests/test_costs.py` |
+| `costs.py` | what the broker cost, read from SQLite: the account's whole life, narrowed to any set of asset categories, with measured cost kept structurally apart from the estimated AutoFX markup |
 | `campaigns.py` | which episodes were ONE position, and what that position earned. A roll continues a position rather than closing it, and a spread's legs are separate contracts, so the Trades tab draws a campaign as one card while the scoreboard counts closes and the money counts fills. A leaf holder (`money.py` and `notes.py`, both leaves), because its two readers (`strategies.py` for the Trades tab cards, and `stats.py`, which builds the linkage in `campaigns_for`) cannot import each other, and a rule living in either would leave the other to re-derive it |
 | `journal.py` | the one thing no statement records: what the trade was FOR. The plan at entry, the review at close, an enum for why it actually came off so adherence can be counted, and free text everywhere else. Every other row in the database is re-derivable from `raw/`; these are not, which is why the module caches nothing and stores no figure the app could compute. Keyed on a fill, `t:` and the card's first fill (`campaigns.Campaign.key`), because campaigns are rebuilt on every ingest and notes keyed on a rebuilt grouping are notes waiting to be lost, while a fill is in exactly one card; rows the released version filed under an order id still resolve (`campaigns.named`). Holds `db.py` and NOTHING else — the module for the one table that cannot be rebuilt must not depend on the layer that rebuilds the rest, so which card shows which row is decided in `serialize.journal_shown` |
 | `strategies.py` | orders folded into the strategies they were placed as (a strangle sold as two same-second orders is one group), then linked into position lifecycles. The grouping RULE is `campaigns.py`'s; what lives here is naming the shape and aggregating the legs |
-| `serialize.py` | the JSON payload the page renders and `--json` emits; wraps `analysis`'s per-currency ledgers into `Money`. Also `portfolio_data`, the Portfolio tab's net liquidation over time against the money put in, read from `equity_summaries` and the deposit rows of `cash_transactions` |
+| `serialize.py` | the JSON payload the page renders and `--json` emits. Also `portfolio_data`, the Portfolio tab's net liquidation over time against the money put in, read from `equity_summaries` and the deposit rows of `cash_transactions` |
 | `render.py` | human-readable terminal reports. Bound to `serialize`'s shapes by `tests/test_render.py`: it once read flat money keys the `Money` conversion had removed, and `orders`/`history` died on `float(dict)` behind a green suite |
 | `cli.py` | argparse wiring only: every command opens the database via `db.open_journal` and emits through `_emit(data, text, json)`, so `--json` comes for free |
 | `web.py` | loopback HTTP server; `ServeConfig` injected per server |

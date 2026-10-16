@@ -1,11 +1,8 @@
 """The DB-backed cost engine: what it attributes, and what it refuses to.
 
-Two halves. The first states costs as literal rows and asserts the arithmetic,
-because a report is only as good as its attribution rules and each of those is a
-decision worth pinning. The second runs the engine over every archived statement
-and reconciles it against `analysis.py`, the statement-reading sibling: the two
-read the same broker data by different routes, so a figure they disagree about is
-a defect in one of them.
+Costs are stated as literal rows and the arithmetic asserted, because a report
+is only as good as its attribution rules and each of those is a decision worth
+pinning.
 """
 
 from __future__ import annotations
@@ -20,6 +17,7 @@ from optjournal.costs import (
     AUTOFX_MARKUP_MEASURED_BPS,
     CostScope,
     build_costs,
+    categorise_fee,
 )
 
 # `currency` and `ib_commission_currency` are separate columns on purpose: IBKR
@@ -186,6 +184,34 @@ def test_a_period_refunded_more_than_it_was_charged_is_a_net_credit(conn):
         pytest.approx(-0.01))
     assert build_costs(conn, period="2026-08").unattributable.base == (
         pytest.approx(1.30))
+
+
+def test_only_fee_rows_are_counted_as_fees(conn):
+    """Interest received is income, a dividend is income, and neither is a fee,
+    though the interest row's type holds "INT" as a fee's description can."""
+    add_cash(conn, "f1", amount=-1.30)
+    add_cash(conn, "i1", kind="Broker Interest Received", amount=4.20,
+             description="EUR CREDIT INT FOR SEP-2026")
+    add_cash(conn, "d1", kind="Dividends", amount=3.51, currency="USD",
+             symbol="NVDA", description="NVDA CASH DIVIDEND")
+    r = build_costs(conn)
+    assert [(f.name, f.count) for f in r.fees] == [("Market data", 1)]
+    assert r.unattributable.base == pytest.approx(1.30)
+
+
+@pytest.mark.parametrize(
+    "description,expected",
+    [
+        ("R*******99:OPRA NP L1 FOR JUN 2026", "Market data"),
+        ("KRW CUSTODY FEE ON STK FOR 2026-05-29 FOR JUN 2026", "Custody"),
+        ("WITHHOLDING @ 20% ON CREDIT INT FOR MAY-2026", "Interest"),
+        ("SOMETHING ENTIRELY NEW", "Other"),
+        (None, "Other"),
+        ("", "Other"),
+    ],
+)
+def test_categorise_fee(description, expected):
+    assert categorise_fee(description) == expected
 
 
 def test_fees_are_not_mixed_into_the_attributable_figure(conn):
@@ -649,102 +675,3 @@ def test_the_payload_echoes_the_scope_it_measured(conn):
     sent = broker_costs_data(build_costs(conn, scope=scope))["scope"]
     assert sent == {"categories": ["OPT"], "is_everything": False,
                     "subset": "0DTE", "is_subset": True}
-
-
-# --- reconciliation against the statement path -------------------------------
-
-
-#: Reconciled ONE statement at a time, each into its own database. The obvious
-#: shape -- ingest everything, compare against the widest statement -- is wrong,
-#: and wrong in the direction that matters: the database is the UNION of every
-#: archive, so its OPT commission is 15.16 where the widest single statement sees
-#: 4.85. That gap is not a defect, it is the entire reason this engine exists, so
-#: a test built on the two being equal would have to be "fixed" by narrowing the
-#: engine back to a statement's window. One statement in, one statement compared.
-def _one_statement_db(path, tmp_path) -> sqlite3.Connection:
-    from optjournal.ingest import ASSET_FILTER_ALL, ingest_file
-
-    conn = connect_migrated(tmp_path / f"{path.stem}.db")
-    ingest_file(conn, path, assets=ASSET_FILTER_ALL)
-    return conn
-
-
-def _statement_ids() -> list[str]:
-    from conftest import STATEMENTS
-
-    return [p.stem for p in STATEMENTS]
-
-
-@pytest.mark.parametrize("index", range(len(_statement_ids())), ids=_statement_ids())
-def test_the_two_engines_agree_on_every_archived_statement(index, tmp_path):
-    """The load-bearing test: same broker data, two routes, one answer.
-
-    `analysis.py` reads the XML; this module reads the SQLite that same XML was
-    ingested into. A figure they disagree about is a defect in one of them, and
-    which one is a question the reconciliation makes answerable rather than a
-    judgement call.
-
-    Every statement, not a representative one: the archive holds 30-day slices
-    and 12-month spans, one statement with a single conversion and one with 127,
-    and the interesting failures live at the edges.
-    """
-    from conftest import STATEMENTS
-
-    from optjournal.analysis import analyse
-    from optjournal.flex import load
-
-    path = STATEMENTS[index]
-    expected = analyse(load(path).FlexStatements[0])
-    conn = _one_statement_db(path, tmp_path)
-    try:
-        engine = build_costs(conn)
-    finally:
-        conn.close()
-
-    mine = {c.category: c for c in engine.by_category}
-    for group in expected.commissions:
-        got = mine.get(group.asset_category)
-        assert got is not None, f"{group.asset_category} missing from the DB engine"
-        assert got.commission.base == pytest.approx(
-            float(group.commission_base), abs=1e-6
-        ), group.asset_category
-        assert got.fills == group.fills, group.asset_category
-
-    assert engine.attributable.base == pytest.approx(
-        float(expected.total_commission_base + expected.total_taxes_base), abs=1e-6
-    )
-    assert engine.unattributable.base == pytest.approx(
-        float(expected.total_fees_base), abs=1e-6
-    )
-
-
-@pytest.mark.parametrize("index", range(len(_statement_ids())), ids=_statement_ids())
-def test_both_engines_estimate_the_same_autofx_markup(index, tmp_path):
-    """The figure the `AFx;P` defect silently reduced.
-
-    Reconciled rather than asserted against a literal, so it stays true as the
-    archive grows -- and per statement, because the one carrying `AFx;P` is the
-    only one where the two engines could ever have disagreed.
-    """
-    from conftest import STATEMENTS
-
-    from optjournal.analysis import analyse
-    from optjournal.flex import load
-
-    path = STATEMENTS[index]
-    expected = analyse(load(path).FlexStatements[0])
-    conn = _one_statement_db(path, tmp_path)
-    try:
-        engine = build_costs(conn)
-    finally:
-        conn.close()
-
-    assert engine.autofx_conversions == sum(
-        p.autofx_conversions for p in expected.fx
-    )
-    assert engine.autofx_notional == pytest.approx(
-        float(expected.total_autofx_notional_base), abs=1e-6
-    )
-    assert engine.autofx_markup() == pytest.approx(
-        float(expected.total_autofx_spread_base), abs=1e-6
-    )
