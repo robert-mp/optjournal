@@ -133,16 +133,10 @@ class Money:
         """Accumulate base and the per-currency ledger in one pass, then gate.
 
         Each row is `(base, native, currency)` -- the shape an episode or a
-        fill already has. This replaces the accumulate-then-gate block that was
-        written out four times in `stats.py`, identically each time.
+        fill already has. The accumulating is `Charge.of`'s, so a figure and a
+        cost built from the same rows agree.
         """
-        base = 0.0
-        ledger: dict[str, float] = {}
-        for row_base, row_native, row_ccy in rows:
-            base += row_base or 0.0
-            if row_native and row_ccy:
-                ledger[row_ccy] = ledger.get(row_ccy, 0.0) + row_native
-        return cls.gated(base, ledger)
+        return Charge.of(rows).money
 
     @classmethod
     def at_rate(
@@ -193,11 +187,6 @@ class Money:
             (row.get(f"{field}_base"), row.get(field), row.get("currency"))
             for row in rows
         )
-
-    @property
-    def is_exact(self) -> bool:
-        """Whether an as-charged figure is available."""
-        return self.native is not None
 
     def __abs__(self) -> Money:
         """Magnitude, carrying the currency with it.
@@ -268,16 +257,16 @@ class Charge:
     #: cost of nothing is a fact.
     base: float = 0.0
     #: Amount billed per currency, non-zero entries only. Empty when nothing was
-    #: charged, which is different from an unknown charge -- see `is_free`.
+    #: charged, and also for an ESTIMATED cost, which has a base and no billing
+    #: currency: the AutoFX markup, which IBKR never itemised in one.
     by_ccy: Mapping[str, float] = field(default_factory=dict)
 
     @classmethod
     def of(cls, rows: Iterable[tuple[float | None, float | None, str | None]]) -> Charge:
         """Accumulate `(base, native, currency)` rows into one charge.
 
-        The same row shape `Money.charged` takes, deliberately: a caller that
-        has rows for one can hand them to the other without reshaping, and the
-        two stay comparable when a surface shows both.
+        `Money.charged` is this, gated, so a caller holding rows can ask for
+        either without reshaping them.
         """
         base = 0.0
         ledger: dict[str, float] = {}
@@ -297,16 +286,6 @@ class Charge:
         reimplemented, so the two can never disagree.
         """
         return Money.gated(self.base, dict(self.by_ccy))
-
-    @property
-    def is_free(self) -> bool:
-        """Whether nothing was charged at all.
-
-        Distinct from an empty ledger with a non-zero base, which is how an
-        *estimated* cost arrives: the AutoFX markup has a base and no billing
-        currency, because IBKR never itemised it in one. See `Money.restated`.
-        """
-        return not self.base and not self.by_ccy
 
     def __add__(self, other: Charge) -> Charge:
         """Sum two charges, merging their ledgers.

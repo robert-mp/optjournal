@@ -71,8 +71,6 @@ from optjournal import __version__, install, journal, replay, updates
 from optjournal import earnings as earnings_mod
 from optjournal import settings as prefs
 from optjournal.ahead import WEEKS_SHOWN, refresh_calendar
-from optjournal.analysis import analyse
-from optjournal.archive import newest_statement
 from optjournal.bars import fetch_watch_bars
 from optjournal.campaigns import open_underlyings, position_count
 from optjournal.clock import MARKET_TZ, parse_day
@@ -93,7 +91,6 @@ from optjournal.flex import (
     TokenUnreadable,
     cooldown_remaining,
     last_fetch,
-    load,
     read_token,
     write_token,
 )
@@ -121,7 +118,6 @@ from optjournal.serialize import (
     audit_data,
     broker_costs_data,
     collection_status,
-    costs_data,
     history_data,
     jobs_data,
     journal_cards,
@@ -159,6 +155,7 @@ from optjournal.stats import (
 )
 from optjournal.strategies import (
     campaign_events,
+    fill_shapes,
     position_groups,
 )
 from optjournal.sync import history_plan, newest_statement_end, sync_journal
@@ -551,7 +548,6 @@ def _broker_costs(
     conn: sqlite3.Connection,
     *,
     selection: list[str] | None,
-    base_currency: str,
     report: Any,
     asset_category: str,
 ) -> dict[str, Any]:
@@ -590,7 +586,7 @@ def _broker_costs(
         subset=ODTE_SELECTION if wants_odte else "",
     )
     return broker_costs_data(
-        build_costs(conn, scope=scope, base_currency=base_currency)
+        build_costs(conn, scope=scope)
     )
 
 
@@ -813,14 +809,15 @@ def build_state(
             view_campaigns if view_category == asset_category
             else campaigns_for(conn, asset_category, report.episodes),
             report.episodes)
-        # The strategy ranking, for the same reason as open_positions: it reads
-        # the lifecycles, which carry each position's opening shape, and those are
-        # built here rather than inside month_stats. Unlike open_positions it IS
-        # period-bound, so each block ranks its own period. The lifecycles come
-        # from scope-filtered orders, so the ranking obeys the trade type exactly
-        # as the tiles beside it do.
+        # The strategy ranking, for the same reason as open_positions: a close is
+        # ranked under its card's opening shape, and the cards are built here
+        # rather than inside month_stats. Unlike open_positions it IS
+        # period-bound, so each block ranks its own period, over the scope the
+        # tiles beside it count.
+        shapes = fill_shapes(state["lifecycles"], view_campaigns, view_episodes)
         for block, period in (("stats", selected), ("all_time", None)):
-            ranking = strategy_ranking(state["lifecycles"], period)
+            ranking = strategy_ranking(conn, period, shapes=shapes,
+                                       asset_category=view_category, scope=scope)
             state[block]["best_strategy"] = ranking["best"]
             state[block]["worst_strategy"] = ranking["worst"]
         # Over the same cards the Trades tab draws, so the review and the cards
@@ -882,31 +879,15 @@ def build_state(
             # the same way it renders the absent planner.
             "history": odte_scoring_data(conn, now=datetime.now(UTC)),
         }
-        base_ccy = str(state["stats"].get("base_currency") or "")
-        state["fx"] = {"base": base_ccy, "quotes": fx_quotes(conn, base_ccy)}
+        state["fx"] = {"base": report.base_currency,
+                       "quotes": fx_quotes(conn, report.base_currency)}
         replay.attach(conn, state)
         state["broker_costs"] = _broker_costs(
             conn,
             selection=cost_scope,
-            base_currency=base_ccy or "EUR",
             report=report,
             asset_category=asset_category,
         )
-
-    newest = newest_statement(archive_dir)
-    if newest is not None:
-        try:
-            reports = [analyse(s) for s in load(newest).FlexStatements]
-            state["costs"] = [costs_data(r) for r in reports]
-            state["costs_source"] = newest.name
-        except Exception as exc:  # pragma: no cover - defensive
-            # A malformed archive must not blank the whole page; the rest of
-            # the state is read from SQLite and is still valid.
-            log.warning("cost report unavailable: %s", exc)
-            state["costs"] = []
-            state["costs_error"] = str(exc)
-    else:
-        state["costs"] = []
 
     # WHERE the effective id came from, so the settings page can offer to edit it
     # only when editing would actually take effect. A `--query-id` flag or an

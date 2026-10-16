@@ -359,7 +359,7 @@ def test_a_strangle_scores_each_leg_as_its_own_outcome(conn):
     count and the money read the same two closes.
     """
     _strangle(conn)
-    s = month_stats(conn, "2026-03", base_currency="EUR")
+    s = month_stats(conn, "2026-03")
 
     assert (s.wins, s.losses) == (1, 1), "the call leg is its own loss"
     assert s.closes == 2
@@ -381,7 +381,7 @@ def test_a_closed_leg_is_decided_while_its_partner_is_still_open(conn):
     _leg(conn, conid="1", order_id="12", at="2026-03-09 15:00:00",
          qty=1, proceeds=-100.0, pnl=400.0, put_call="P")
 
-    s = month_stats(conn, "2026-03", base_currency="EUR")
+    s = month_stats(conn, "2026-03")
     assert s.net_pnl.base == 400.0
     assert (s.wins, s.losses, s.closes) == (1, 0, 1), (
         "the close is a finished outcome on its own terms"
@@ -468,45 +468,84 @@ def test_a_same_session_close_counts_once_ibkr_books_it(conn):
     assert (s.net_pnl.base, s.avg_pnl.base) == (148.0, 74.0)
 
 
-def _lc(label, pnl, *, closed="2026-08-20", status="closed"):
-    return {"label": label, "status": status, "closed_at": closed,
-            "realized_pnl": None if pnl is None else {"base": pnl, "native": None, "ccy": None}}
+def _ranking(conn: sqlite3.Connection, period: str | None) -> dict:
+    """`strategy_ranking` over the cards the Trades tab would draw for `conn`."""
+    from optjournal.history import build_history
+    from optjournal.serialize import orders_data
+    from optjournal.stats import campaigns_for, strategy_ranking
+    from optjournal.strategies import fill_shapes, position_groups
+
+    episodes = build_history(conn).episodes
+    camps = campaigns_for(conn, "OPT", episodes)
+    cards = position_groups(orders_data(conn), episodes=episodes, campaign_list=camps)
+    return strategy_ranking(conn, period, shapes=fill_shapes(cards, camps, episodes))
 
 
-def test_the_strategy_ranking_sums_decided_positions_per_opening_shape():
-    """Summed, not averaged: two modest strangles outrank one lucky put."""
-    from optjournal.stats import strategy_ranking
-
-    lcs = [_lc("Strangle", 300.0), _lc("Strangle", 250.0), _lc("Short put", 500.0),
-           _lc("Put vertical", -120.0)]
-    r = strategy_ranking(lcs, None)
-    assert (r["best"]["label"], r["best"]["pnl"]["base"], r["best"]["decided"]) == \
-        ("Strangle", 550.0, 2)
-    assert (r["worst"]["label"], r["worst"]["pnl"]["base"]) == ("Put vertical", -120.0)
-
-
-def test_the_strategy_ranking_counts_only_what_decided_inside_the_period():
-    from optjournal.stats import strategy_ranking
-
-    lcs = [_lc("Strangle", 900.0, status="open"),          # not decided
-           _lc("Short put", 400.0, closed="2026-07-31"),    # another month
-           _lc("Short call", 50.0), _lc("Short put", 10.0)]
-    r = strategy_ranking(lcs, "2026-08")
-    assert (r["best"]["label"], r["best"]["pnl"]["base"]) == ("Short call", 50.0)
-    assert (r["worst"]["label"], r["worst"]["pnl"]["base"]) == ("Short put", 10.0)
-    # IBKR's compact dates match a period exactly as ISO ones do.
-    assert strategy_ranking([_lc("Strangle", 5.0, closed="20260820")], "2026-08")["best"]
+def _september_put_and_october_call(conn: sqlite3.Connection) -> None:
+    """A short put half bought back in September and the rest in October (the
+    GOOG shape behind the finding), a second put sold in October and half bought
+    back, still open, and a short call opened and closed in October."""
+    _leg(conn, conid="1", order_id="10", at="2026-09-02 10:00:00", qty=-2,
+         proceeds=1000.0, pnl=None, expiry="2026-11-20")
+    _leg(conn, conid="1", order_id="11", at="2026-09-20 10:00:00", qty=1,
+         proceeds=-200.0, pnl=300.0, expiry="2026-11-20")
+    _leg(conn, conid="1", order_id="12", at="2026-10-05 10:00:00", qty=1,
+         proceeds=-400.0, pnl=100.0, expiry="2026-11-20")
+    _leg(conn, conid="3", order_id="30", at="2026-10-01 11:00:00", qty=-2,
+         proceeds=600.0, pnl=None, expiry="2026-12-18")
+    _leg(conn, conid="3", order_id="31", at="2026-10-09 10:00:00", qty=1,
+         proceeds=-280.0, pnl=20.0, expiry="2026-12-18")
+    _leg(conn, conid="2", order_id="20", at="2026-10-01 10:00:00", qty=-1,
+         proceeds=300.0, pnl=None, put_call="C", expiry="2026-11-20")
+    _leg(conn, conid="2", order_id="21", at="2026-10-08 10:00:00", qty=1,
+         proceeds=-350.0, pnl=-50.0, put_call="C", expiry="2026-11-20")
 
 
-def test_one_strategy_has_no_worst_and_nothing_decided_has_neither():
-    """A tile calling the same strategy best AND worst is arithmetic, not news."""
-    from optjournal.stats import strategy_ranking
+def test_a_strategy_is_ranked_by_what_ibkr_booked_in_the_period(conn):
+    """October ranks the puts by October's buybacks alone, as Net P&L counts them.
 
-    one = strategy_ranking([_lc("Strangle", 5.0), _lc("Strangle", -9.0)], None)
-    assert one["best"]["label"] == "Strangle" and one["worst"] is None
-    assert strategy_ranking([], None) == {"best": None, "worst": None}
-    assert strategy_ranking([_lc("Strangle", 5.0, status="open")], None) == \
-        {"best": None, "worst": None}
+    Ranking each position by the month it closed put September's +300 in
+    October's Best Strategy tile, beside an October Net P&L that does not hold
+    it, and left out the put still open. Each strategy is now the sum of its
+    closes in the period, so the tiles sum to Net P&L.
+    """
+    _september_put_and_october_call(conn)
+
+    october = _ranking(conn, "2026-10")
+    assert (october["best"]["label"], october["best"]["pnl"]["base"],
+            october["best"]["decided"]) == ("Short put", 120.0, 2)
+    assert (october["worst"]["label"], october["worst"]["pnl"]["base"]) == \
+        ("Short call", -50.0)
+    assert october["best"]["pnl"]["base"] + october["worst"]["pnl"]["base"] == \
+        month_stats(conn, "2026-10").net_pnl.base
+
+    september = _ranking(conn, "2026-09")
+    assert (september["best"]["label"], september["best"]["pnl"]["base"]) == \
+        ("Short put", 300.0), "a close counts while its position is still open"
+    assert september["worst"] is None, "one strategy is not also the worst"
+
+    whole = _ranking(conn, None)
+    assert (whole["best"]["pnl"]["base"], whole["best"]["decided"]) == (420.0, 3)
+
+
+def test_a_fill_through_zero_ranks_under_the_position_it_closed(conn):
+    """A buy of 2 against a short 1 (IBKR's `C;O`) closes the short put and opens
+    a long one, still held. Its +200 is the closing half's, so it is the short
+    put's, not the shape of the position it opened."""
+    _leg(conn, conid="1", order_id="10", at="2026-09-02 10:00:00", qty=-1,
+         proceeds=500.0, pnl=None)
+    _leg(conn, conid="1", order_id="11", at="2026-09-10 10:00:00", qty=2,
+         proceeds=-600.0, pnl=200.0, open_close="C;O")
+
+    ranked = _ranking(conn, None)
+    assert (ranked["best"]["label"], ranked["best"]["pnl"]["base"]) == ("Short put", 200.0)
+    assert ranked["worst"] is None
+
+
+def test_nothing_closed_ranks_nothing(conn):
+    _leg(conn, conid="1", order_id="10", at="2026-09-02 10:00:00", qty=-1,
+         proceeds=500.0, pnl=None)
+    assert _ranking(conn, None) == {"best": None, "worst": None}
 
 
 def test_account_fees_are_signed_so_a_refund_month_agrees_with_the_costs_tab(conn):

@@ -2,12 +2,12 @@
 
 An episode (`history.py`) is one round trip in ONE contract. Its realised P&L is
 the sum of its fills', each booked on its own trade date, which is what ties the
-money to the broker statement (`stats.py`), and it is also the unit the
-scoreboard counts. A campaign is the POSITION a trader thinks in: an opening
-trade plus every roll of it, or a spread's legs placed together. It is what the
-Trades tab draws as one card, what a journal write-up is filed under, what the
-open-position count and the strategy ranking count, and what the Review tab
-reviews.
+money to the broker statement (`stats.py`). The scoreboard counts closes there,
+so nothing here decides a win. A campaign is the POSITION a trader thinks in: an
+opening trade plus every roll of it, or a spread's legs placed together. It is
+what the Trades tab draws as one card, what a journal write-up is filed under,
+what the open-position count counts, whose opening shape the strategy ranking
+files each close under, and what the Review tab reviews.
 
 A campaign is DECIDED only when every episode in it is closed, because a roll
 is a continuation. Its outcome is the SUM of its episodes' realised P&L: roll a
@@ -26,7 +26,7 @@ So order-id union alone finds nothing on real data. `cluster_orders` is what
 bridges that, and `strategy_groups`'s docstring has recorded the same fact since
 the first strangle. The consequence is worth stating plainly: which fills share
 a card depends on a 90-second heuristic. No euro and no win depends on it, since
-the money and the scoreboard count episodes.
+the money counts fills and the scoreboard counts closes.
 
 Why a module of its own, rather than a helper inside `strategies.py`: the union
 rule has readers on both sides of the import graph. `strategies.py` draws the
@@ -224,20 +224,6 @@ class Campaign:
     #: TypeError. Equality still reads it.
     leg_parts: Mapping[tuple[str, str], Mapping[str, Any]] = field(
         default_factory=dict, hash=False)
-
-    @property
-    def brokers(self) -> frozenset[str]:
-        """The brokers whose fills it holds; one, in all but a hand-made case."""
-        return frozenset(broker for broker, _oid in self.orders)
-
-    @property
-    def is_win(self) -> bool:
-        """Decided and up. Judged on `base`, the only figure always present."""
-        return self.realized is not None and self.realized.base > 0
-
-    @property
-    def is_loss(self) -> bool:
-        return self.realized is not None and self.realized.base < 0
 
 
 def cluster_orders(

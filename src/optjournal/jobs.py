@@ -51,6 +51,7 @@ from optjournal.flex import (
     TokenRejected,
     fetch_confirms,
 )
+from optjournal.history import journal_base_currency
 from optjournal.ingest import ASSET_FILTER_ALL, ingest_confirms
 from optjournal.locks import LockTimeout, locked
 from optjournal.sync import import_history, newest_statement_end, sync_journal
@@ -537,7 +538,7 @@ def _confirm(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     if not query_id:
         return Outcome("nothing", "no Trade Confirmation query configured")
 
-    base = _base_currency(conn)
+    base = journal_base_currency(conn)
     if not base:
         # `nothing`, not `failed`, for the same reason an absent query id is: the
         # precondition is unmet rather than broken, and the daily sync resolves it
@@ -570,22 +571,6 @@ def _confirm(conn: sqlite3.Connection, ctx: Context) -> Outcome:
     seen = (ingested.trades_inserted + ingested.trades_superseded
             + ingested.trades_skipped_existing + ingested.trades_filtered_out)
     return Outcome("ok" if wrote else "nothing", detail, wrote, seen)
-
-
-def _base_currency(conn: sqlite3.Connection) -> str | None:
-    """The account's base currency, from the newest ingested statement.
-
-    A confirm payload carries no AccountInformation section, so the journal's own
-    statements are the only honest source. `None` when nothing is ingested yet, and
-    the caller reports that rather than defaulting: converting a USD fill into a
-    currency this account may not even use would be a guess wearing a figure's
-    clothes, and it would reach the scoreboard.
-    """
-    row = conn.execute(
-        "SELECT base_currency FROM statements WHERE base_currency IS NOT NULL"
-        " ORDER BY ingested_at DESC LIMIT 1"
-    ).fetchone()
-    return str(row["base_currency"]) if row and row["base_currency"] else None
 
 
 def sync_outcome(result: dict[str, Any] | Exception) -> Outcome:

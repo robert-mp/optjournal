@@ -15,10 +15,8 @@ string `"AFx;P"` by luck and true for `"A"` -- assignment -- by accident, and
 those are different events. Splitting first makes an exact comparison possible;
 substring matching cannot be made correct by being careful.
 
-A leaf: the two accounting layers that read codes sit on opposite sides of the
-import graph -- `analysis.py` reads a statement, `history.py` reads the database
--- and neither may depend on the other, so the shared rule lives in a module
-both can hold. It imports nothing itself, so holding it acquires no direction.
+A leaf, so every layer that reads codes (`history.py`, `costs.py`) holds the
+one rule. It imports nothing itself, so holding it acquires no direction.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ __all__ = ["AUTOFX", "has_code", "split_notes"]
 #: Auto-conversion. IBKR prices these as a markup embedded in the exchange rate
 #: and reports zero commission on them, which is why the flag is load-bearing:
 #: it is the only thing distinguishing a conversion whose cost must be estimated
-#: from a manual one that paid a real commission. See `analysis.AUTOFX_MARKUP_BPS`.
+#: from a manual one that paid a real commission. See `costs.AUTOFX_MARKUP_BPS`.
 AUTOFX = "AFx"
 
 #: The separator `sources.py` joins stored codes with.

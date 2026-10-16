@@ -76,7 +76,7 @@ broker_costs.totals.attributable      (scope: options only)
 One case the ledger deliberately cannot express: the AutoFX rate markup has a
 base and **no** billing currency, because IBKR never itemised it in one. An
 empty ledger with a non-zero base is therefore an *estimate*, distinct from
-`is_free` (nothing charged at all), and `costs.Friction` keeps the two apart as
+nothing charged at all (a zero base), and `costs.Friction` keeps the two apart as
 a type rather than as a caption.
 
 ## Six constructors, six provenances
@@ -162,9 +162,8 @@ differently.
 
 Neither journal holds a single taxed trade (`journal_taxes_base` is `0.0` on
 both, and no row in the database carries non-zero `taxes`), so real data cannot
-tell a working gate from one that never runs. Both branches are therefore
-exercised against hand-built statements in `test_analysis.py` and
-`test_web.py` — which is what `analysis.py` being a leaf buys. The demo is
+tell a working gate from one that never runs. Taxes are therefore exercised
+against hand-built rows in `test_costs.py`. The demo is
 deliberately **not** given a fake tax: IBKR levies none on US options, and a
 fixture that emits what the broker would not is how the `underlyingSymbol` bug
 stayed hidden.

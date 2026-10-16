@@ -1,7 +1,7 @@
 """Monthly statistics and daily P&L series for the journal dashboard.
 
-Kept separate from `analysis` (which measures account *costs* from a single
-statement) and from `history` (which reconstructs position episodes). This
+Kept separate from `costs` (what the broker charged) and from `history`
+(which reconstructs position episodes). This
 module answers the calendar-shaped questions a journal dashboard asks: what
 happened in March, and what happened on the 14th.
 
@@ -37,6 +37,7 @@ Two deliberate choices about what gets counted:
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
@@ -88,18 +89,6 @@ def _in_period(value: str | None, period: str | None) -> bool:
     return day is not None and day.startswith(period)
 
 
-def _month_of(value: str | None) -> str | None:
-    """YYYY-MM from a stored date, tolerating both ISO and IBKR compact forms."""
-    if not value:
-        return None
-    text = str(value).strip().replace("/", "-")
-    if len(text) >= 7 and text[4] == "-":
-        return text[:7]
-    if len(text) >= 6 and text[:6].isdigit():
-        return f"{text[:4]}-{text[4:6]}"
-    return None
-
-
 def _day_of(value: str | None) -> str | None:
     if not value:
         return None
@@ -109,6 +98,19 @@ def _day_of(value: str | None) -> str | None:
     if len(text) >= 8 and text[:8].isdigit():
         return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
     return None
+
+
+def _close_of(row: Any) -> tuple[Any, ...] | None:
+    """The close a fill row is part of, or None for an opening or unpriced fill.
+
+    One order's closing fills on one contract on one trade day, once its P&L is
+    known: the scoreboard's unit (see the module docstring), shared with the
+    strategy ranking so the two count the same closes.
+    """
+    if "C" not in (row["open_close"] or "").upper() or row["fifo_pnl_realized"] is None:
+        return None
+    return (row["broker"], row["account_id"], row["conid"],
+            row["ib_order_id"], _day_of(row["trade_date"]))
 
 
 def _category_where(asset_category: str | None) -> tuple[str, tuple[Any, ...]]:
@@ -316,7 +318,7 @@ class DayPnl:
 @dataclass(slots=True)
 class MonthStats:
     month: str            #: "YYYY-MM", "YYYY" for an annual row, or "ALL"
-    base_currency: str = "EUR"
+    base_currency: str    #: the journal's, as `HistoryReport.base_currency`
     asset_category: str = "OPT"
 
     total_trades: int = 0          #: fills
@@ -525,7 +527,6 @@ def odte_scope(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     report: Any = None,
 ) -> TradeScope:
     """The 0DTE round trips, as a fill-level scope.
@@ -536,9 +537,7 @@ def odte_scope(
     would still show.
     """
     if report is None:
-        report = build_history(
-            conn, asset_category=asset_category, base_currency=base_currency
-        )
+        report = build_history(conn, asset_category=asset_category)
     trade_ids = {str(t) for e in report.episodes if e.is_odte is True for t in e.trade_ids}
     # Orders are aggregated in a view keyed by ib_order_id, so filtering them
     # needs the order ids those fills belong to rather than the fills.
@@ -593,14 +592,9 @@ def available_months(
     rows = conn.execute(
         f"SELECT DISTINCT trade_date, trade_id FROM trades {where}", params
     ).fetchall()
-    months = {
-        m
-        for m in (
-            _month_of(r["trade_date"]) for r in rows if scope.has_trade(r["trade_id"])
-        )
-        if m
-    }
-    return sorted(months, reverse=True)
+    months = {(_day_of(r["trade_date"]) or "")[:7]
+              for r in rows if scope.has_trade(r["trade_id"])}
+    return sorted(months - {""}, reverse=True)
 
 
 def available_years(
@@ -622,7 +616,6 @@ def _period_stats(
     periods: list[str],
     *,
     asset_category: str | None,
-    base_currency: str,
     report: Any = None,
 ) -> list[MonthStats]:
     """`month_stats` over several periods, sharing one episode history pass.
@@ -633,14 +626,9 @@ def _period_stats(
     identical results.
     """
     if report is None:
-        report = build_history(
-            conn, asset_category=asset_category, base_currency=base_currency
-        )
+        report = build_history(conn, asset_category=asset_category)
     return [
-        month_stats(
-            conn, period, asset_category=asset_category,
-            base_currency=base_currency, report=report,
-        )
+        month_stats(conn, period, asset_category=asset_category, report=report)
         for period in periods
     ]
 
@@ -649,7 +637,6 @@ def annual_stats(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     report: Any = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar year, newest first.
@@ -667,7 +654,7 @@ def annual_stats(
     """
     return _period_stats(
         conn, available_years(conn, asset_category),
-        asset_category=asset_category, base_currency=base_currency, report=report,
+        asset_category=asset_category, report=report,
     )
 
 
@@ -675,7 +662,6 @@ def monthly_stats(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     report: Any = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar month, newest first.
@@ -689,8 +675,7 @@ def monthly_stats(
     """
     return _period_stats(
         conn, available_months(conn, asset_category),
-        asset_category=asset_category, base_currency=base_currency,
-        report=report,
+        asset_category=asset_category, report=report,
     )
 
 
@@ -698,7 +683,6 @@ def odte_cohorts(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     report: Any = None,
 ) -> tuple[MonthStats, MonthStats]:
     """0DTE against everything else, over the whole journal.
@@ -713,11 +697,8 @@ def odte_cohorts(
     Dashboard and in neither side here.
     """
     if report is None:
-        report = build_history(
-            conn, asset_category=asset_category, base_currency=base_currency
-        )
-    odte = odte_scope(conn, asset_category=asset_category,
-                      base_currency=base_currency, report=report)
+        report = build_history(conn, asset_category=asset_category)
+    odte = odte_scope(conn, asset_category=asset_category, report=report)
     where, params = _category_where(asset_category)
     every = frozenset(str(r["trade_id"]) for r in conn.execute(
         f"SELECT trade_id FROM trades {where}", params))
@@ -726,7 +707,7 @@ def odte_cohorts(
 
     def side(scope: TradeScope) -> MonthStats:
         return month_stats(conn, None, asset_category=asset_category,
-                           base_currency=base_currency, scope=scope, report=report)
+                           scope=scope, report=report)
 
     return side(odte), side(rest)
 
@@ -818,7 +799,6 @@ def month_stats(
     period: str | None = None,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     scope: TradeScope = ALL_TRADES,
     report: Any = None,
 ) -> MonthStats:
@@ -833,9 +813,11 @@ def month_stats(
     Annual tab asks for a dozen months, two years and an all-time row on every
     page load, and rebuilding the episode history for each was the whole cost.
     """
+    if report is None:
+        report = build_history(conn, asset_category=asset_category)
     stats = MonthStats(
         month=period or "ALL",
-        base_currency=base_currency,
+        base_currency=report.base_currency,
         asset_category=asset_category or "ALL",
     )
 
@@ -867,10 +849,9 @@ def month_stats(
             orders.add(str(row["ib_order_id"]))
         pnl = (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"], row["currency"])
         fill_pnl.append(pnl)
-        if "C" in (row["open_close"] or "").upper() and row["fifo_pnl_realized"] is not None:
-            closing.setdefault((row["broker"], row["account_id"], row["conid"],
-                                row["ib_order_id"], _day_of(row["trade_date"])),
-                               []).append(pnl)
+        close = _close_of(row)
+        if close is not None:
+            closing.setdefault(close, []).append(pnl)
         fill_commission.append((row["ib_commission_base"],
                                 row["ib_commission"], row["currency"]))
     stats.orders = len(orders)
@@ -892,10 +873,6 @@ def month_stats(
         fee_rows.append((row["amount_base"], row["amount"], row["currency"]))
     stats.fees = Money.charged(fee_rows)
 
-    if report is None:
-        report = build_history(
-            conn, asset_category=asset_category, base_currency=base_currency
-        )
     stats.open_episodes = sum(1 for e in report.open if scope.has_episode(e))
     # Premium is cash received or paid in the contract's own currency, so it
     # takes the same treatment as commission: exact when one currency accounts
@@ -976,41 +953,50 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
 
 
 def strategy_ranking(
-    lifecycles: list[dict[str, Any]], period: str | None
+    conn: sqlite3.Connection,
+    period: str | None,
+    *,
+    shapes: Mapping[tuple[str, str], str],
+    asset_category: str | None = "OPT",
+    scope: TradeScope = ALL_TRADES,
 ) -> dict[str, dict[str, Any] | None]:
-    """The best and worst strategy over decided positions closing in `period`.
+    """The best and worst strategy by what IBKR booked in `period`.
 
-    A strategy is the shape a position was OPENED as -- the lifecycle's `label`,
-    the name its Trades card carries -- and its figure is the SUM of realised
-    P&L over its decided positions in the period, in base. Summed rather than
-    averaged, because the question is which way of trading made or lost the most
-    money here, and one lucky trade should not top the list over a strategy that
-    earned more across twenty.
+    A strategy is the shape a position was OPENED as, the name its Trades card
+    carries, and `shapes` maps each closing fill `(broker, trade id)` to it
+    (`strategies.fill_shapes`). Its figure is the sum of its closes in the
+    period, counted as `month_stats` counts them, so the strategies sum to Net
+    P&L and a position still open ranks by what it has booked. Summed rather
+    than averaged: one lucky trade should not top a strategy that earned more
+    across twenty. `decided` is how many closes that is.
 
-    Positions, not contracts, unlike the scoreboard: a strategy is a property of
-    a decision, and a strangle's two legs are not two strategies. The money is
-    the same either way -- every closed contract sits in exactly one position --
-    except cash settled inside a position still running, which belongs to no
-    strategy's result yet.
-
-    `worst` is None when only one strategy decided anything: it would repeat
-    `best`, and a tile saying the same strategy is both best and worst is
-    arithmetic, not information. Ties break on the label, so the answer is stable.
+    `worst` is None when only one strategy closed anything: it would repeat
+    `best`. Ties break on the label, so the answer is stable.
     """
-    totals: dict[str, list[float]] = {}
-    for lc in lifecycles:
-        pnl = lc.get("realized_pnl")
-        if (lc.get("status") != "closed" or not pnl or pnl.get("base") is None
-                or not lc.get("label") or not _in_period(lc.get("closed_at"), period)):
+    where, params = _category_where(asset_category)
+    closes: dict[str, dict[tuple[Any, ...], list[tuple[Any, Any, Any]]]] = {}
+    for row in conn.execute(
+        f"SELECT broker, account_id, conid, open_close, trade_date, trade_id,"
+        f" ib_order_id, fifo_pnl_realized_base, fifo_pnl_realized, currency"
+        f" FROM trades {where}", params
+    ):
+        if not _in_period(row["trade_date"], period) or not scope.has_trade(row["trade_id"]):
             continue
-        totals.setdefault(str(lc["label"]), []).append(float(pnl["base"]))
-    if not totals:
+        close = _close_of(row)
+        shape = shapes.get((str(row["broker"]), str(row["trade_id"])))
+        if close is None or shape is None:
+            continue
+        closes.setdefault(shape, {}).setdefault(close, []).append(
+            (row["fifo_pnl_realized_base"], row["fifo_pnl_realized"], row["currency"]))
+    if not closes:
         return {"best": None, "worst": None}
-    ranked = sorted(totals.items(), key=lambda kv: (-sum(kv[1]), kv[0]))
+    totals = {shape: (Money.charged(r for rows in by_close.values() for r in rows),
+                      len(by_close))
+              for shape, by_close in closes.items()}
+    ranked = sorted(totals.items(), key=lambda kv: (-kv[1][0].base, kv[0]))
 
-    def entry(label: str, values: list[float]) -> dict[str, Any]:
-        return {"label": label, "pnl": Money.restated(sum(values)).payload(),
-                "decided": len(values)}
+    def entry(label: str, total: tuple[Money, int]) -> dict[str, Any]:
+        return {"label": label, "pnl": total[0].payload(), "decided": total[1]}
 
     return {
         "best": entry(*ranked[0]),

@@ -118,7 +118,7 @@ class NormalisedCash:
     within it -- see db._rekey_by_broker for why that took a migration.
 
     `kind` is the transaction type, and it is the field a second broker is most
-    likely to spell differently. `analysis.py` branches on it by substring
+    likely to spell differently. `costs.py` branches on it by substring
     (`"FEES" in kind`), which is why the source is responsible for handing over a
     stable string rather than an enum member whose repr leaks a class name.
     """

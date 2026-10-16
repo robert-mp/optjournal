@@ -119,8 +119,7 @@ def test_a_withheld_native_renders_as_a_dash_not_a_crash():
     """An order spanning currencies has `native: null`, and must still render.
 
     Hand-built because this account's option orders are all single-currency,
-    so real data cannot reach the withheld branch -- the same reason
-    test_analysis builds statements for the tax gate.
+    so real data cannot reach the withheld branch.
     """
     order = {
         "ib_order_id": "1", "underlyings": "GOOG", "leg_count": 1, "fills": 1,

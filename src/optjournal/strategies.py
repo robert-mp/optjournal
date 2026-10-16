@@ -22,10 +22,9 @@ are a roll (one leg closes an expiry, another opens the next), which is a
 statement about the *fills*, not about position lineage: the episode model in
 `history.py` still ends one episode and starts another, unlinked.
 
-The grouping RULE itself lives in `campaigns.py`, not here. It has a second
-consumer -- the Dashboard's scoreboard, which must count a roll as one decision
-rather than two wins -- and `stats.py` cannot import this module. What stays
-here is naming the shape and aggregating the legs.
+The grouping RULE itself lives in `campaigns.py`, not here, because `stats.py`
+and `serialize.py` resolve positions too (the open-position count, the journal).
+What stays here is naming the shape and aggregating the legs.
 """
 
 from __future__ import annotations
@@ -320,10 +319,8 @@ def position_groups(
     the accounting layer already knows it: `history.py` FIFO-matches fills
     into per-conid episodes, so the open and the close share an episode.
 
-    The union itself is `campaigns.link`'s, handed in rather than recomputed,
-    which is what makes this card and the Dashboard's win rate the same reading
-    of the same fills. Before, the rule was written here and the scoreboard
-    counted episodes, so a roll drew ONE card while the headline said two wins.
+    The union itself is `campaigns.link`'s, handed in rather than recomputed, so
+    this card and the open-position count read the same positions.
 
     Two deliberate consequences, both `campaigns.py`'s:
 
@@ -412,6 +409,30 @@ def position_groups(
             "events": members,
         })
     out.sort(key=lambda p: str(p["opened_at"] or ""), reverse=True)
+    return out
+
+
+def fill_shapes(
+    cards: list[Row], campaign_list: list[campaigns.Campaign], episodes: list[Any],
+) -> dict[tuple[str, str], str]:
+    """The shape each closing fill's card was opened as, by `(broker, trade id)`.
+
+    What `stats.strategy_ranking` ranks under. `cards` are `position_groups`'
+    over the same campaigns. A fill through zero (`C;O`) is in two cards, and
+    its P&L is the closing half's, so it takes the shape of the card it closed.
+    """
+    label_of = {card["anchor"]: card["label"] for card in cards
+                if card.get("anchor") and card.get("label")}
+    out: dict[tuple[str, str], str] = {}
+    for camp in campaign_list:
+        label = label_of.get(camp.anchor)
+        if label is None:
+            continue
+        for i in camp.episode_indices:
+            episode = episodes[i]
+            for trade_id, part in episode.fill_parts.items():
+                if "C" in part.open_close.upper():
+                    out[(str(episode.broker), str(trade_id))] = label
     return out
 
 

@@ -54,6 +54,7 @@ __all__ = [
     "HistoryReport",
     "build_history",
     "disposition_of",
+    "journal_base_currency",
     "split_notes",
 ]
 
@@ -166,12 +167,6 @@ class Episode:
 
     opened_at: str | None = None
     closed_at: str | None = None
-    #: IBKR's trade date of the last closing fill: the day its statement books
-    #: the realised P&L on. Usually `closed_at`'s day, but `closed_at` is the ET
-    #: stamp (see `clock.epoch_et`), so a Korean sale at 20:03 ET on 31 August
-    #: closed on 1 September. The scoreboard dates the outcome by it, the day
-    #: its last P&L is booked.
-    closed_on: str | None = None
 
     open_fills: int = 0
     close_fills: int = 0
@@ -259,6 +254,7 @@ class Episode:
 @dataclass(slots=True)
 class HistoryReport:
     asset_category: str
+    #: Empty until a statement lands; see `journal_base_currency`.
     base_currency: str
     episodes: list[Episode]
     snapshot_date: str | None
@@ -396,7 +392,6 @@ def _absorb(ep: Episode, row: Any) -> None:
         ep.close_fills += 1
         ep.closed_qty += qty
         ep.closed_at = row["date_time"] or row["trade_date"]
-        ep.closed_on = row["trade_date"] or row["date_time"]
     else:
         ep.open_fills += 1
         ep.opened_qty += qty
@@ -727,11 +722,24 @@ def _pre_archive(
     return out
 
 
+def journal_base_currency(conn: sqlite3.Connection) -> str | None:
+    """The account's base currency, from the newest ingested statement.
+
+    None before any statement lands, and no caller guesses one: every `*_base`
+    figure is IBKR's conversion into whatever this account's base is, so a
+    default would label a USD account's money in euros.
+    """
+    row = conn.execute(
+        "SELECT base_currency FROM statements WHERE base_currency IS NOT NULL"
+        " ORDER BY ingested_at DESC LIMIT 1"
+    ).fetchone()
+    return str(row["base_currency"]) if row and row["base_currency"] else None
+
+
 def build_history(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
 ) -> HistoryReport:
     """Reconstruct position episodes from the accumulated trade ledger.
 
@@ -857,7 +865,7 @@ def build_history(
     episodes.sort(key=lambda e: (e.closed_at or "", e.opened_at or ""), reverse=True)
     return HistoryReport(
         asset_category=asset_category or "ALL",
-        base_currency=base_currency,
+        base_currency=journal_base_currency(conn) or "",
         episodes=episodes,
         snapshot_date=snapshot_date,
         partial_record=sum(1 for e in episodes if e.entry_outside_window),

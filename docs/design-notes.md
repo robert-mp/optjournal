@@ -75,7 +75,7 @@ has the design for the fallback a broker that reports nothing would need.
 Its output reaches the replay panel and nowhere else, through `replay.py`: the
 expected-move band, the per-bar P&L on the scorecard, and the effective-delta
 series — each labelled as modelled, on a panel whose caption says so. `stats.py`,
-`analysis.py` and `serialize.py` never import it, so no headline number, no
+`costs.py` and `serialize.py` never import it, so no headline number, no
 calendar day and no annual row can be traced back to a model. The journal's
 credibility rests on that separation: "every figure is what IBKR booked" is
 worth little if a modelled figure can reach the same card.
@@ -272,28 +272,22 @@ Layering rules (import direction only goes down this list):
 1. Entry points (`cli`, `web`) construct dependencies — paths from
    `config`, connections via `db.open_journal`, a shared `HistoryReport` —
    and pass them in. Nothing below the entry points reads globals.
-2. Domain modules (`history`, `stats`, `analysis`) take a connection or a
-   statement and return dataclasses. They know nothing about JSON, HTML,
+2. Domain modules (`history`, `stats`, `costs`) take a connection and
+   return dataclasses. They know nothing about JSON, HTML,
    or argparse.
 3. Presentation (`serialize`, `render`) consumes domain objects and never
    opens its own connections (the two `*_data(conn)` readers are the
    deliberate exception: they wrap single SELECTs over views).
 4. A domain module produces raw material; the layer that already holds
-   several of them composes. `analysis.py` accumulates commission, taxes
-   and fees keyed by the currency they were *billed* in, and deliberately
-   does not decide whether one currency can speak for a total — that
-   judgement is `Money.gated()`, and `serialize.py` applies it when it
-   builds the payload. `analysis` could now import `money.py` directly
-   (it is a leaf, so it costs no dependency direction), and the split is
-   kept anyway: a report that measures cost has nothing to say about how
-   a reader's display currency should be chosen.
+   several of them composes. `costs.py` keeps each charge in the currency
+   it was *billed* in, as a `Charge`, and whether one currency can speak
+   for a total is `Money.gated()`'s judgement, made in one place.
 
-   A leaf is the escape hatch when two domain modules need one rule and
-   neither may hold the other. `history.py` reads note codes out of SQLite
-   and `analysis.py` reads them off a statement, so neither can own the
-   rule for both; `notes.py` does, and each imports it. The alternative
-   was what stood there before — the rule written twice, once per reader,
-   agreeing until one input shape changed.
+   A leaf is the escape hatch when two domain modules need one rule.
+   `history.py` and `costs.py` both read note codes, so `notes.py` owns the
+   rule and each imports it. The alternative was what stood there before —
+   the rule written twice, once per reader, agreeing until one input shape
+   changed.
 5. A quantity and its unit travel together. `Money` carries an amount,
    the currency it was charged in and the base translation as one frozen
    value, because the three-field spelling it replaced (`x_base`,

@@ -26,7 +26,6 @@ from py_ibkr import FlexError, FlexLockoutError, FlexRateLimitError
 from optjournal import __version__, browser, install, logs, settings
 from optjournal.ahead import SOURCE as AHEAD
 from optjournal.ahead import refresh_calendar
-from optjournal.analysis import analyse, format_report
 from optjournal.archive import newest_statement, prune_archive
 from optjournal.bars import (
     audit_perishable,
@@ -68,7 +67,7 @@ from optjournal.flex import (
     read_token,
     write_token,
 )
-from optjournal.history import build_history
+from optjournal.history import build_history, journal_base_currency
 from optjournal.ingest import (
     ASSET_FILTER_ALL,
     ingest_confirms,
@@ -91,7 +90,6 @@ from optjournal.render import (
 )
 from optjournal.serialize import (
     broker_costs_data,
-    costs_data,
     history_data,
     orders_data,
     positions_data,
@@ -130,7 +128,6 @@ examples:
   optjournal orders                        option orders, partial fills collapsed
   optjournal positions                     current option book
   optjournal history                       closed-position P&L, round trip by round trip
-  optjournal costs --json                  one statement's cost report as JSON
   optjournal friction                      what the broker cost, whole journal
   optjournal friction --assets OPT CASH    options and conversions only
   optjournal serve --query-id 1591754      local web UI with a Sync now button
@@ -304,23 +301,6 @@ def cmd_show(args) -> int:
     return EXIT_OK
 
 
-def cmd_costs(args) -> int:
-    path = _resolve_path(args)
-    if path is None:
-        return _no_statements(args)
-    try:
-        response = load(path)
-    except StatementUnreadable as exc:
-        return _unreadable(exc)
-    reports = [analyse(s) for s in response.FlexStatements]
-    _emit(
-        [costs_data(r) for r in reports],
-        "\n\n".join(format_report(r) for r in reports),
-        args.json,
-    )
-    return EXIT_OK
-
-
 def cmd_demo(args) -> int:
     """Generate a synthetic statement and ingest it into a scratch database.
 
@@ -488,8 +468,7 @@ def cmd_history(args) -> int:
     scope = None if args.assets.strip().upper() == "ALL" else args.assets.strip().upper()
     with open_journal(args.db) as conn:
         report = build_history(conn, asset_category=scope)
-        totals = month_stats(conn, None, asset_category=scope,
-                             base_currency=report.base_currency, report=report)
+        totals = month_stats(conn, None, asset_category=scope, report=report)
     data = history_data(report, totals)
     _emit(data, render_history(data), args.json)
     return EXIT_OK if report.episodes else EXIT_NO_DATA
@@ -510,11 +489,8 @@ def _month_or_year(text: str) -> str:
 def cmd_friction(args) -> int:
     """What the broker cost, from the DATABASE rather than one statement.
 
-    The sibling of `costs`, and the difference is the question each answers.
-    `costs` reports one statement's own costs -- the right thing when the question
-    is about a statement, and the only way to read a section no column carries.
-    This reports the JOURNAL's: every ingested fill, narrowable to a set of asset
-    categories, which is what the web page shows.
+    Every ingested fill, narrowable to a set of asset categories and a period,
+    which is what the web page shows.
 
     Emits JSON through the same serializer the page reads, so `--json` here and
     the tab cannot disagree about a figure.
@@ -1334,7 +1310,7 @@ def cmd_confirms(args) -> int:
         return EXIT_CONFIG
 
     with open_journal(args.db) as conn:
-        base = _journal_base_currency(conn)
+        base = journal_base_currency(conn)
         if not base:
             print(
                 "No ingested statement to read the base currency from. Run "
@@ -1379,15 +1355,6 @@ def cmd_confirms(args) -> int:
     lines.extend(f"  ! {w}" for w in ingested.warnings)
     _emit(data, "\n".join(lines), args.json)
     return EXIT_OK
-
-
-def _journal_base_currency(conn) -> str | None:
-    """The account's base currency, from the newest ingested statement."""
-    row = conn.execute(
-        "SELECT base_currency FROM statements WHERE base_currency IS NOT NULL"
-        " ORDER BY ingested_at DESC LIMIT 1"
-    ).fetchone()
-    return str(row["base_currency"]) if row and row["base_currency"] else None
 
 
 def cmd_sync(args) -> int:
@@ -1520,11 +1487,6 @@ def build_parser() -> argparse.ArgumentParser:
                        help="structural summary of a statement")
     p.add_argument("path", type=Path, nargs="?", help="defaults to newest")
     p.set_defaults(func=cmd_show)
-
-    p = sub.add_parser("costs", parents=[common, archive],
-                       help="fee, FX and withholding cost report")
-    p.add_argument("path", type=Path, nargs="?", help="defaults to newest")
-    p.set_defaults(func=cmd_costs)
 
     p = sub.add_parser("friction", parents=[common, database],
                        help="what the broker cost, from the journal (any scope)")

@@ -163,7 +163,6 @@ def test_a_roll_is_one_decision_and_is_undecided_until_the_last_leg_closes():
     assert camp.episode_indices == (0, 1)
     assert not camp.is_decided, "the rolled-into leg is still open"
     assert camp.realized is None and camp.closed_at is None
-    assert not camp.is_win and not camp.is_loss
 
 
 def test_a_rolled_loser_scratched_at_the_end_is_a_loss_not_a_win():
@@ -182,7 +181,6 @@ def test_a_rolled_loser_scratched_at_the_end_is_a_loss_not_a_win():
                                    "t3": "roll", "t4": "close"})
     assert camp.is_decided
     assert camp.realized.base == pytest.approx(-1150.0)
-    assert camp.is_loss and not camp.is_win
 
 
 def test_a_spread_is_one_decision_though_it_is_two_contracts():
@@ -196,7 +194,6 @@ def test_a_spread_is_one_decision_though_it_is_two_contracts():
                                    "t2": "close", "t4": "close"})
     assert camp.is_decided
     assert camp.realized.base == pytest.approx(562.32)
-    assert camp.is_win, "one win, where the episode unit scored 1W and 1L"
 
 
 def test_a_spread_closed_by_two_orders_on_two_days_is_still_one_decision():

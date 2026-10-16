@@ -15,7 +15,6 @@ only thing that would have caught any of those five.
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import re
@@ -232,16 +231,13 @@ def test_page_comments_are_balanced():
 
 
 def test_state_is_pure_json(state):
-    """No default=str crutch: the payload must serialise on its own.
-
-    Decimal money and datetime.date periods both violate this, and both make
-    it out of `analysis` unless coerced.
-    """
+    """No default=str crutch: the payload must serialise on its own, so a
+    Decimal or a datetime.date that reaches it fails here."""
     json.dumps(state)
 
 
 def test_state_has_every_panel(state):
-    for key in ("positions", "orders", "history", "statements", "costs", "sync"):
+    for key in ("positions", "orders", "history", "statements", "broker_costs", "sync"):
         assert key in state, f"panel data {key!r} missing"
 
 
@@ -278,8 +274,8 @@ def _parse_contract(js: str) -> tuple[dict[str, dict[str, bool]], dict[str, str]
     """(shapes, bindings, locals) parsed from RAW script text.
 
     shapes:   {shape name: {key: is_optional}} -- `[key]` brackets mark keys
-              the API sends only sometimes (costs_source, the sync reply's
-              branch-dependent fields); required keys must always be sent.
+              the API sends only sometimes (the sync reply's branch-dependent
+              fields); required keys must always be sent.
     bindings: {binding name: shape name} from the @payload rows.
     locals:   names declared page machinery (DOM nodes, builtins, local
               collections) from the @local rows.
@@ -417,7 +413,6 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
     def first(rows):
         return rows[0] if rows else None
 
-    costs = first(state["costs"])
     # The cost payload under the WIDEST scope. The tab defaults to options only,
     # so a conversion pair, a fee group and a withholding line do not appear in
     # `state["broker_costs"]` -- and sampling only that would leave those shapes
@@ -458,9 +453,6 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "LegMoney": first(orders[0]["legs"])["money"] if orders else None,
         "Episode": first(history["closed"] + history["open"]),
         "History": history,
-        "Costs": costs,
-        "CostsTotals": costs["totals"] if costs else None,
-        "FxRow": first(costs["fx"]) if costs else None,
         "Statement": first(state["statements"]),
         # Always present and always four keys, even on a journal with no confirms
         # -- so it anchors properly rather than needing an exemption. The counts
@@ -2811,7 +2803,6 @@ def test_build_state_survives_an_empty_database(tmp_path):
     conn.close()
     state = build_state(db_path=db, archive_dir=tmp_path, query_id=None)
     assert state["positions"] == []
-    assert state["costs"] == []
     # A journal where nothing has happened has no first day, so there is no day
     # to be the Nth of. Null rather than 1: the header drops the dateline
     # entirely, which is honest, where "log day 1" would date a log that was
@@ -2917,17 +2908,15 @@ def test_cost_dates_come_from_selected_journal_rows(populated):
             "SELECT MIN(trade_date), MAX(trade_date) FROM trades"
             " WHERE asset_category IN ('OPT', 'STK', 'CASH')"
         ).fetchone()
+        reported = conn.execute("SELECT MIN(from_date) FROM statements").fetchone()[0]
     finally:
         conn.close()
     assert costs["from_date"] == expected[0]
     assert costs["to_date"] == expected[1]
 
-    # Statement analysis keeps the XML reporting period. The fixture's first
-    # trade is later, proving the DB path did not copy that metadata.
-    statement = build_state(
-        db_path=populated, archive_dir=RAW_DIR, query_id=None
-    )["costs"][0]
-    assert statement["from_date"] != costs["from_date"]
+    # The statement's reporting period starts before its first trade, proving
+    # the DB path did not copy that metadata.
+    assert reported != costs["from_date"]
 
 
 def test_a_repeated_parameter_is_a_multi_select(populated):
@@ -3024,6 +3013,26 @@ def test_fx_never_quotes_the_base_currency(state):
     """Offering EUR->EUR would imply a conversion that does not happen."""
     fx = state["fx"]
     assert fx["base"] not in [q["code"] for q in fx["quotes"]]
+
+
+def test_the_base_currency_is_the_one_the_statement_states(populated):
+    """A USD account's figures are labelled USD, and USD is not offered as a switch.
+
+    Every figure is IBKR's own `*_base` column, so only the label could be wrong,
+    and it was: the payload said EUR whatever the statement said, and the switch
+    offered USD at the rate of a conversion that never happens.
+    """
+    with open_journal(populated) as conn:
+        conn.execute("UPDATE statements SET base_currency = 'USD'")
+        conn.commit()
+    state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    assert state["fx"]["base"] == "USD"
+    assert "USD" not in [q["code"] for q in state["fx"]["quotes"]]
+    labels = {state[block]["base_currency"]
+              for block in ("stats", "all_time", "annual_total", "history",
+                            "broker_costs")}
+    labels |= {row["base_currency"] for row in state["annual"] + state["monthly"]}
+    assert labels == {"USD"}
 
 
 def _usd_quote(state) -> dict:
@@ -3199,7 +3208,7 @@ def test_scope_does_not_reach_the_tabs_without_a_filter_bar(populated):
     everything = build_state(**kw)
     scoped = build_state(**kw, trade_type="odte")
     assert scoped["positions"] == everything["positions"]
-    assert scoped["costs"] == everything["costs"]
+    assert scoped["broker_costs"] == everything["broker_costs"]
     assert scoped["annual"] == everything["annual"]
     assert scoped["monthly"] == everything["monthly"]
     assert scoped["odte"] == everything["odte"], (
@@ -4088,68 +4097,12 @@ def test_net_pnl_is_shown_as_realised_not_restated(state):
     assert "cash(s.net_pnl" not in js, "a display site bypasses the rule"
 
 
-def test_journal_taxes_is_a_money_and_the_gate_reaches_it():
-    """The last cash figure that shipped as a bare `_base` float.
-
-    `journal_taxes_base` had a scoped base total and no path to the as-charged
-    amount, because the journal-scoped tax ledger existed only inlined inside
-    `journal_friction_native_by_ccy` -- aggregated, but not reachable.
-
-    Both branches are exercised here rather than on the live payload, because
-    neither journal has a single taxed trade: `journal_taxes_base` is 0.0 on
-    both, so real data cannot distinguish a working gate from one that never
-    runs.
-    """
-    from decimal import Decimal
-    from types import SimpleNamespace
-
-    from optjournal.analysis import analyse
-    from optjournal.serialize import costs_data
-
-    def fill(taxes, ccy, rate="1"):
-        return SimpleNamespace(
-            assetCategory=SimpleNamespace(value="OPT"), symbol="TSLA",
-            currency=ccy, ibCommissionCurrency=ccy,
-            proceeds=Decimal("-1000"), ibCommission=Decimal("-1.00"),
-            taxes=Decimal(taxes), fxRateToBase=Decimal(rate),
-            quantity=Decimal("1"), notes=[],
-        )
-
-    def totals(trades):
-        stmt = SimpleNamespace(fromDate="20250801", toDate="20260731",
-                              Trades=trades, CashTransactions=[])
-        return costs_data(analyse(stmt))["totals"]
-
-    uniform = totals([fill("-0.25", "USD"), fill("-0.75", "USD")])
-    assert set(uniform["journal_taxes"]) == {"base", "native", "ccy"}
-    assert uniform["journal_taxes"] == {"base": 1.0, "native": 1.0, "ccy": "USD"}
-    assert "journal_taxes_base" not in uniform, "the flat key outlived its Money"
-
-    # A second currency must withhold the native while keeping the base whole:
-    # an exact-looking figure covering part of a total is the failure the gate
-    # exists to prevent.
-    mixed = totals([fill("-0.25", "USD"), fill("-3.00", "SEK", rate="0.09")])
-    assert mixed["journal_taxes"]["native"] is None
-    assert mixed["journal_taxes"]["ccy"] is None
-    assert mixed["journal_taxes"]["base"] == pytest.approx(0.25 + 3.00 * 0.09)
-
-    # The serializer half of the rule, which is what this test is really about:
-    # the figure is a Money and the gate reaches it.
-    #
-    # The page-side assertion that used to live here named `moneyOf(T.journal_taxes)`
-    # -- a read in the statement-backed Costs view, which no longer exists. The Costs
-    # tab now reads the DB-backed payload, where the same rule is enforced more
-    # broadly and structurally: `chargeFig` is the single display path for every
-    # `Charge`, it delegates to `moneyOf`, and the payload contract guard checks
-    # every key the page reads against the typedefs. So the narrow assertion was
-    # retired rather than repointed at an arbitrary new call site.
+def test_a_charge_is_displayed_through_the_one_money_rule():
+    """`chargeFig` is the single display path for every `Charge` on the Costs tab,
+    so it must go through `moneyOf`, or a cost is shown by a second rule that can
+    disagree with every other cash figure on the page."""
     js = _code_only(_js()).replace(" ", "").replace("\n", "")
-    assert "cash(T.journal_taxes" not in js, "a display site bypasses the rule"
-    # `chargeFig` is that single path, and it must go through `moneyOf`.
-    assert "moneyOf(ch)" in js, (
-        "chargeFig no longer delegates to moneyOf, so a Charge is displayed by a "
-        "second rule that can disagree with every other cash figure on the page"
-    )
+    assert "moneyOf(ch)" in js
 
 
 def test_the_page_has_exactly_one_native_first_rule():
@@ -9792,12 +9745,48 @@ def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state, popul
         assert at["largest_loss"]["base"] <= at["avg_loss"]["base"]
 
 
-def test_each_stats_block_ranks_strategies_over_its_own_period():
-    """`stats` is the selected month and `all_time` is everything; ranking both over
-    all time would put a lifetime answer on a one-month dashboard."""
-    src = inspect.getsource(web.build_state).replace(" ", "")
-    assert 'for block, period in (("stats", selected), ("all_time", None)):'.replace(" ", "") in src
-    assert "strategy_ranking(state[\"lifecycles\"],period)" in src
+def test_every_close_ranks_under_a_shape_and_each_block_ranks_its_own_period(
+    state, populated,
+):
+    """The strategy tiles rank the money the tiles beside them count.
+
+    Every closing fill ranks under some card's opening shape, so ranked as one
+    shape a period's closes sum to its Net P&L. And `stats` ranks the selected
+    month while `all_time` ranks everything: a lifetime answer on a one-month
+    dashboard is the defect the first check would not see.
+    """
+    from optjournal.stats import month_stats, strategy_ranking
+    from optjournal.strategies import fill_shapes
+
+    conn = connect(populated)
+    try:
+        report = build_history(conn, asset_category="OPT")
+        camps = campaigns_for(conn, "OPT", report.episodes)
+        shapes = fill_shapes(state["lifecycles"], camps, report.episodes)
+        closing = {(str(r["broker"]), str(r["trade_id"])) for r in conn.execute(
+            "SELECT broker, trade_id FROM trades WHERE asset_category = 'OPT'"
+            " AND open_close LIKE '%C%' AND fifo_pnl_realized IS NOT NULL")}
+        assert closing and closing <= set(shapes), closing - set(shapes)
+        one = dict.fromkeys(shapes, "every shape")
+        closes = {}
+        for month in state["months"]:
+            ranked = strategy_ranking(conn, month, shapes=one)["best"]
+            stats = month_stats(conn, month, report=report)
+            closes[month] = stats.closes
+            if not stats.closes:
+                assert ranked is None, month
+                continue
+            assert (ranked["decided"], ranked["pnl"]["base"]) == (
+                stats.closes, pytest.approx(stats.net_pnl.base)), month
+    finally:
+        conn.close()
+
+    quiet = min((m for m in closes if closes[m]), key=closes.__getitem__)
+    picked = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None,
+                         month=quiet)["stats"]
+    ranked = [r for r in (picked["best_strategy"], picked["worst_strategy"]) if r]
+    assert ranked and sum(r["decided"] for r in ranked) <= closes[quiet] \
+        < state["all_time"]["closes"]
 
 
 def _at_rules(width: int, kind: str = "media") -> list[tuple[str, str]]:
