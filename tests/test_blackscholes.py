@@ -13,6 +13,7 @@ import pytest
 
 from optjournal.blackscholes import (
     RISK_FREE,
+    bs_delta,
     bs_price,
     expected_move,
     implied_vol,
@@ -28,6 +29,17 @@ def test_put_call_parity_holds():
     put = bs_price(spot, strike, years, vol, "P")
     expected = spot - strike * math.exp(-RISK_FREE * years)
     assert call - put == pytest.approx(expected, abs=1e-9)
+
+
+def test_delta_matches_a_hand_computed_case():
+    """S = K = 100, one year, 20% vol, 4% rate, no dividend: d1 = (0.04 + 0.02) / 0.2
+    = 0.30, and N(0.30) = 0.6179 from the normal table. The replay tests take their
+    expectation from `bs_delta` itself, so N(d2) in place of N(d1) passed all 180.
+    """
+    assert bs_delta(100, 100, 1.0, 0.2, "C", rate=0.04, yield_=0.0) == pytest.approx(
+        0.6179, abs=1e-4)
+    assert bs_delta(100, 100, 1.0, 0.2, "P", rate=0.04, yield_=0.0) == pytest.approx(
+        -0.3821, abs=1e-4)
 
 
 def test_value_rises_with_volatility():
