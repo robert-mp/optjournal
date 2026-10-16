@@ -152,8 +152,8 @@ class MarketEvent:
 
     `event_id` is OURS. The feed supplies no id, so it is a short hash of
     `(starts_at, country, title)` -- verified distinct across all 99 rows of a
-    real week. That makes a re-fetch correct a revised forecast in place rather
-    than adding a second copy of the same event.
+    real week. A re-fetch corrects a revised forecast in place. A re-timed event
+    gets a new id, and `store_events` drops the old one.
     """
 
     event_id: str
@@ -283,8 +283,22 @@ def store_events(
     `forecast` and `previous` are updated because they are revised between the
     announcement and the release, and a stale forecast beside a released number
     reads as a miss that never happened.
+
+    The batch is the truth for the span it covers, so a row of this source
+    between its first and last event that it no longer carries is deleted. The
+    feed re-times a released event to the minute, and its id hashes the instant,
+    so the old row stood beside the new one: "ADP Weekly Employment Change" at
+    08:14, 08:15 and 08:16 one morning. Past weeks lie outside the span and stay.
     """
     now = datetime.now(UTC).isoformat(timespec="seconds")
+    if events:
+        held = [event.event_id for event in events]
+        conn.execute(
+            "DELETE FROM market_events WHERE source = ? AND starts_at BETWEEN ? AND ?"
+            f" AND event_id NOT IN ({','.join('?' * len(held))})",
+            (source, min(e.starts_at for e in events),
+             max(e.starts_at for e in events), *held),
+        )
     written = 0
     for event in events:
         conn.execute(
