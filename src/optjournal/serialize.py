@@ -232,8 +232,11 @@ def positions_data(conn: sqlite3.Connection) -> list[Row]:
         row = dict(r)
         ccy, rate = row.get("currency"), row.get("fx_rate_to_base")
         row["value"] = Money.at_rate(row.get("position_value"), rate, ccy).payload()
-        row["cost_basis"] = Money.at_rate(
-            row.get("cost_basis_money"), rate, ccy).payload()
+        # None for no basis, as for the unrealised P&L below: `Money.at_rate`'s
+        # zero printed "€0.00", a position that cost nothing.
+        basis = row.get("cost_basis_money")
+        row["cost_basis"] = (None if basis is None
+                             else Money.at_rate(basis, rate, ccy).payload())
         row["unrealized"] = _unrealized_money(row)
         out.append(row)
     return out

@@ -167,7 +167,7 @@ import {PRICE_TIERS, alertState, bxDirection, bxStrong, earningsSoon, histBars,
   meterKnob,
   priceTier, ringArc, ringPoint, shownPrice} from '/static/watch.js';
 import {cls, compact, dayLabel, dp, esc, level, money, monthLabel, num, pct, plural,
-  strike, sym}
+  strike, sumMoney, sym}
   from '/static/format.js';
 import {chooseMarketDay, eventPasses, facetsAtDefault, seedFacets}
   from '/static/market.js';
@@ -550,7 +550,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} cost_basis_price
  * @property {number} fifo_pnl_unrealized -- raw column; read `unrealized` instead
  * @property {Money} value -- market value, native and base
- * @property {Money} cost_basis -- falls back to the open episode's basis
+ * @property {Money|null} cost_basis -- null when the statement carried no basis,
+ *   which is not a zero
  * @property {Money|null} unrealized -- no base column exists; derived at the row
  *   rate. Null when the statement carried no figure, which is not a zero
  * @property {string} side
@@ -609,6 +610,8 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} fills
  * @property {string} first_fill_at
  * @property {string} last_fill_at
+ * @property {string} trade_date -- IBKR's, of the first fill; a calendar day's key
+ * @property {string} last_trade_date
  * @property {number} quantity
  * @property {number} avg_price -- always in the contract's own currency
  * Raw leaf columns. Kept because every level above re-aggregates them; read
@@ -1431,6 +1434,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} x
  * @property {number} y
  * @property {number} n
+ * @property {Money} total -- the running total at this point, which `y` plots
  */
 
 /** @typedef {Object} Contract -- page-side: what names a contract on a Leg or a
@@ -1489,7 +1493,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @local chosen ws opts thin px
  * @local shownByDay next picked plan u
  * @local JSON Object ages input mine qb wf was
- * @local when parts names err
+ * @local parts names err
  * @local COST_OPTIONS bits cost fees on wh
  * @local state SCOPE_KEYS
  * @local qidsave cqidsave tokcheck toksave
@@ -1620,8 +1624,9 @@ const S={tab:'dashboard',month:null,state:null,showCog:false,ccy:null,type:null,
   /* Live quotes, keyed by symbol, and the server clock when they were asked for.
      NOT part of `state`: they come from their own endpoint because each one costs
      an HTTP request, so they must not ride along on every payload reload. Null
-     until the Watchlist tab asks. */
-  quotes:null,quotesAt:null,wqat:0,
+     until the Watchlist tab asks. `wqat` is when the last ask STARTED and
+     `quoting` is true while one is out; see quotesDue. */
+  quotes:null,quotesAt:null,wqat:0,quoting:false,
   /* IV ranks, from the SAME reply as the quotes, and the whole reply rather than
      just its ranks: `{ranks, unranked, ranks_failed}`. The two lists are kept
      because they are what lets a dash say WHICH absence it is -- not fetched, not
@@ -2574,12 +2579,14 @@ function collection(){
     const detail=run&&run.detail?run.detail:'';
     /* `finished_at` over `started_at`: for a job that is still running the
        former is null, and "started 3m ago" is the honest thing to say then. */
-    const when=run?(run.finished_at||run.started_at||''):'';
+    const when=run&&(run.finished_at||run.started_at);
+    const age=!when?'':(run.finished_at?'':'started ')
+      +ago((Date.now()-Date.parse(when))/1000);
     return `<div class="jobrow">
       <span class="jobname mono">${esc(j.job)}</span>
       <span class="jobstat ${tint}">${esc(status||'never run')}</span>
       <span class="dim jobdet">${esc(detail)}</span>
-      <span class="dim2 jobwhen mono">${esc(when.slice(0,16).replace('T',' '))}</span>
+      <span class="dim2 jobwhen mono">${esc(age)}</span>
       ${j.consecutive_failures>1?`<span class="pill gap neg"
         title="${j.backed_off
           ? 'Backed off: the quick retries have stopped. It is still tried at its usual pace (once per window, or once per scheduled time, and once more if it costs no IBKR request) and comes back on its own when a run succeeds.'
@@ -2604,8 +2611,8 @@ function collection(){
 }
 
 /* Seconds, in words. Small enough to inline, and the wording matters: an age with
-   no unit reads as a timestamp. Mirrors the vocabulary quoteNote() uses so two
-   freshness readouts on the same page do not describe time differently. */
+   no unit reads as a timestamp. quoteNote() words its first six hours the same
+   way and then dates the quote instead, since an older quote is a close. */
 function ago(secs){
   if(secs==null) return 'never';
   if(secs<90) return 'just now';
@@ -2615,6 +2622,16 @@ function ago(secs){
 }
 
 /* ------------------------------------------------ chart (inline SVG) */
+/* A money axis's gridlines and labels, from `x0` to `x1` over a base-currency
+   scale `sy`, chosen round in the currency on screen: see `chart`. */
+function yTicks(lo,hi,sy,x0,x1){
+  return niceTicks(conv(lo),conv(hi)).map(dv=>{
+    const v=unconv(dv), y=sy(v).toFixed(1);
+    return `<line class="grid" x1="${x0}" y1="${y}" x2="${x1}" y2="${y}"/>
+     <text class="axis" x="${x0-8}" y="${(sy(v)+3.5).toFixed(1)}"
+       text-anchor="end">${cash(v,0)}</text>`;
+  }).join('');
+}
 function chart(days){
   if(!days||!days.length) return `<div class="empty">no fills in this period</div>`;
   /* W MATCHES THE CSS HEIGHT'S ASPECT, and the SVG scales UNIFORMLY. This was
@@ -2633,7 +2650,12 @@ function chart(days){
      PL leaves room for a tick label carrying a currency symbol as well as
      digits; at 54px "€4,138" collided with the plot area. */
   const W=1400,H=230,PL=76,PR=18,PT=16,PB=28;
-  let run=0; const pts=days.map(dy=>({x:dy.day,y:(run+=dy.realized.base),n:dy.trades}));
+  /* Each point's running total is a Money, so its tooltip prints by the rule the
+     day cells use; the line is drawn from its base. */
+  const pts=days.map((dy,i)=>{
+    const mo=sumMoney(days.slice(0,i+1).map(dy=>dy.realized));
+    return {x:dy.day,y:mo.base,n:dy.trades,total:mo};
+  });
   const ys=pts.map(pt=>pt.y).concat([0]);
   let lo=Math.min(...ys), hi=Math.max(...ys);
   if(lo===hi){lo-=1;hi+=1;}
@@ -2665,12 +2687,7 @@ function chart(days){
      same chart restated to USD -- the axis was the one figure on the page that
      ignored the toggle. The plotted SHAPE is unaffected either way, since conv()
      is a uniform scale factor and cancels out of sy()'s normalisation. */
-  const ticks=niceTicks(conv(lo),conv(hi)).map(dv=>{
-    const v=unconv(dv), y=sy(v).toFixed(1);
-    return `<line class="grid" x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}"/>
-     <text class="axis" x="${PL-8}" y="${(sy(v)+3.5).toFixed(1)}"
-       text-anchor="end">${cash(v,0)}</text>`;
-  }).join('');
+  const ticks=yTicks(lo,hi,sy,PL,W-PR);
   /* NO BREAK-EVEN RULE. There was a labelled dashed line at zero whenever the
      series crossed it, on the argument that a drawdown should not read as
      ordinary variation. Removed by request, and the argument it rested on was
@@ -2690,7 +2707,7 @@ function chart(days){
      stylesheet, which is why the whole chart sat out the theme swap. */
   const dots=pts.map((pt,i)=>`<circle class="cdot ${pt.y<0?'neg':'pos'}"
      cx="${sx(i).toFixed(1)}" cy="${sy(pt.y).toFixed(1)}" r="3.5"
-     ><title>${esc(dayLabel(pt.x,true))} · total ${cash(pt.y)} (${plural(pt.n,'fill')})</title></circle>`).join('');
+     ><title>${esc(dayLabel(pt.x,true))} · total ${moneyOf(pt.total)} (${plural(pt.n,'fill')})</title></circle>`).join('');
   /* The year appears only when the span crosses one, decided from the data rather
      than always shown or always hidden: on a two-week chart "'26" twice is noise,
      and on one running from December into January its absence makes the axis lie
@@ -2776,7 +2793,9 @@ function calendar(){
      and for a specific month it reproduces s.green_days/s.red_days exactly,
      because the grid then holds every day the period has. */
   const shown=(s.days||[]).filter(dy=>dy.day.slice(0,7)===month);
-  let total=0; shown.forEach(dy=>total+=dy.realized.base);
+  /* A Money printed as the cells are: under the display currency the trades were
+     charged in, two +$100 days total $200, not their base restated. */
+  const total=sumMoney(shown.map(dy=>dy.realized));
   const greenDays=shown.filter(dy=>dy.realized.base>0).length;
   const redDays=shown.filter(dy=>dy.realized.base<0).length;
 
@@ -2822,7 +2841,7 @@ function calendar(){
        money.`)}</h2>
       <div class="sub">Daily realised P&L.</div></div>
       <div class="pills">
-        <span class="pill">Month P/L <b class="${cls(total)}">${cash(total)}</b></span>
+        <span class="pill">Month P/L <b class="${cls(amountOf(total))}">${moneyOf(total)}</b></span>
         <span class="pill">Green days <b>${greenDays}</b></span>
         <span class="pill">Red days <b>${redDays}</b></span>
       </div></div>
@@ -2837,23 +2856,23 @@ function calendar(){
 
 function dayDetail(by){
   /* The clicked day's trades, from the leg data already in the payload --
-     no extra request. Legs are matched by their own fill date, the day the
+     no extra request. Legs are matched on IBKR's trade dates, the ones the
      cell's money is booked on, so an opening day shows its fills beside a
-     dash. The panel says which day it describes rather than leaving the
-     reader to infer it from the highlight. */
+     dash, and an evening fill is on the next session's day as its money is.
+     The panel says which day it describes rather than leaving the reader to
+     infer it from the highlight. */
   const key=S.calday;
   if(!key) return `<div class="note">Click a day with fills to see its trades.</div>`;
   if(!by[key]){S.calday=null;return '';} /* heal: selection from another month */
   const groups=S.state.strategies||[];
   const rows=[];
   groups.forEach(g=>(g.orders||[]).forEach(o=>(o.legs||[]).forEach(l=>{
-    if(String(l.first_fill_at||'').slice(0,10)===key)
-      rows.push({g,o,l});
+    if(l.trade_date<=key&&key<=l.last_trade_date) rows.push({g,o,l});
   })));
-  if(!rows.length) return `<div class="note">No leg detail for ${esc(shortDay(key))}:
-    fills exist but their orders are outside the current filter.</div>`;
+  if(!rows.length) return `<div class="note">No trades to list for ${esc(shortDay(key))}.</div>`;
+  const fills=rows.reduce((n,{l})=>n+l.fills,0);
   return `<div class="grp mt-3">
-    <div class="gh"><span class="gl">${esc(shortDay(key))} · ${plural(rows.length,'fill')}</span>
+    <div class="gh"><span class="gl">${esc(shortDay(key))} · ${plural(fills,'fill')}</span>
       <button class="linkish" data-calday-clear="1">clear</button></div>
     ${rows.map(({g,l})=>legRow(l,
       `<span class="dim lbl-sm">${esc(g.label)}</span>`)).join('')}
@@ -3943,8 +3962,7 @@ function positions(){
      position. This used to read only from the history payload's open episodes,
      where cost_basis is set exclusively for snapshot-only ones -- so the short
      put, which has fills on record, rendered a dash even though the snapshot
-     held -1569.907847. The history lookup stays as a fallback for a snapshot
-     row that lacks the column. */
+     held -1569.907847. */
   let val=0; ps.forEach(pos=>val+=(pos.value.base||0));
   /* Snapshot rows grouped by the LIFECYCLE that opened them, via conid --
      the same episode-exact linkage the Trades tab uses, so the strangle is
@@ -4169,12 +4187,7 @@ function navChart(days){
      in. It crosses itself where the result changes sign, which fills correctly
      under the default nonzero rule and needs no crossing points found. */
   const gap=path('nav')+days.map((pday,i)=>`L${at(pday,i,'put_in')}`).reverse().join('')+'Z';
-  const ticks=niceTicks(conv(lo),conv(hi)).map(dv=>{
-    const v=unconv(dv), y=sy(v).toFixed(1);
-    return `<line class="grid" x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}"/>
-     <text class="axis" x="${PL-8}" y="${(sy(v)+3.5).toFixed(1)}"
-       text-anchor="end">${cash(v,0)}</text>`;
-  }).join('');
+  const ticks=yTicks(lo,hi,sy,PL,W-PR);
   const pd0=days[0], pdn=days[days.length-1];
   const spansYears=pd0.day.slice(0,4)!==pdn.day.slice(0,4);
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet"
@@ -4219,13 +4232,19 @@ const COST_OPTIONS=[
   ['CASH','FX conversions',false],
   ['0DTE','0DTE',true],
 ];
-function costScope(){
-  /* The SERVER's answer, not S.cost: with nothing chosen S.cost is null and the
-     server applied its own default, so reading local state would leave every
-     chip unlit on first load while the figures below described a real scope. */
+/* The lit chips, from the SERVER's answer, not S.cost: with nothing chosen
+   S.cost is null and the server applied its own default, so reading local state
+   would leave every chip unlit on first load while the figures below described a
+   real scope, and the first click would discard that default instead of adding
+   to it. */
+function costOn(){
   const csc=(S.state.broker_costs||{}).scope||{};
   const on=new Set(csc.categories||[]);
   if(csc.subset) on.add(csc.subset);
+  return on;
+}
+function costScope(){
+  const csc=(S.state.broker_costs||{}).scope||{}, on=costOn();
   return `<div class="filters">
     <div><div class="flabel">Costs to include</div>
       <div class="multi">${COST_OPTIONS.map(([key,label,sub])=>{
@@ -4313,7 +4332,8 @@ function costs(){
       published rate, so the figure shown is the midpoint of
       ${cash(F.total_low_base)}–${cash(F.total_high_base)}.</span>i</span>`:''}</h2>
       <div class="sub">${esc(costPeriod(bc))} ·
-        ${plural(CT.fills,'fill')} · ${esc(costScopeLabel(bc.scope))} · ${esc(ccyNote())}</div></div>
+        ${plural(CT.fills,'fill')} · ${esc(costScopeLabel(bc.scope))}${
+          ccyNote()?` · ${esc(ccyNote())}`:''}</div></div>
       <div class="pills">
         <span class="pill tipped" tabindex="0">charged <b>${
           cash(F.stated.base)}</b><span class="tip">What IBKR billed, summed from
@@ -4605,8 +4625,8 @@ function market(){
      The VOCABULARY and the defaults are the server's (`mk.countries`,
      `mk.impacts`, each row carrying `default`), so the page holds no copy of
      which currencies exist or which ones matter -- both would drift from the feed
-     the moment either side changed. `seed()` takes those defaults on first draw
-     and respects an empty Set thereafter; see `S.mkcountries`. */
+     the moment either side changed. `seedFacets` takes those defaults on first
+     draw and respects an empty Set thereafter; see `S.mkcountries`. */
   const countries=seedFacets(S.mkcountries,mk.countries);
   const impacts=seedFacets(S.mkimpacts,mk.impacts);
   /* An axis with nothing selected filters nothing OUT, rather than emptying the
@@ -4810,7 +4830,7 @@ const PARAMS_CAPTION='B-Xtrender, short arm 5/20/5, centred on 50; Jhunjhunwala 
 /* The three cut points the filter row offers, and the two sentences saying where
    each came from. Every one of them is a copy of a Python constant, bound by test
    (`test_the_band_caption_matches_the_constants_that_produced_it` and
-   `test_the_rvr_chips_and_the_ring_tick_read_one_constant`) for the reason
+   `test_the_ivr_chips_and_the_ring_tick_read_one_constant`) for the reason
    BX_SETTLED is: a chip labelled "below -20" beside a bucket cut somewhere else is
    a control that lies about what it does, and a retune in `trend.py` would leave
    this row offering the old band with nothing on screen to say so.
@@ -4829,11 +4849,12 @@ const BX_LO=-30;
 const BX_HI=30;
 const BX_BANDS="band at +/-30, the reference implementation's default and the outer fifth of sessions measured here; 'oversold' and 'overbought' are the RSI convention's words for below and above it, not this journal's view of what a share is worth";
 /* The IV rank cut, a copy of `iv.IVR_HIGH` and bound to it by
-   `test_the_ivr_chips_read_ivs_own_constant`. THIRTY IS THE READER'S CHOSEN LINE,
-   which is why the caption says so instead of citing anyone: tastytrade publish 50
-   as the level premium selling leans on, 80 as extreme and 20 as depressed, and 30
-   is none of those. A chip is allowed to cut where its reader wants; what it is not
-   allowed to do is imply someone else's research put the line there. */
+   `test_the_ivr_chips_and_the_ring_tick_read_one_constant`. THIRTY IS THE READER'S
+   CHOSEN LINE, which is why the caption says so instead of citing anyone:
+   tastytrade publish 50 as the level premium selling leans on, 80 as extreme and 20
+   as depressed, and 30 is none of those. A chip is allowed to cut where its reader
+   wants; what it is not allowed to do is imply someone else's research put the line
+   there. */
 const IVR_HIGH=30;
 const IVR_BANDS="your own screening line, not tastytrade's: they lean on 50 for selling premium, call 80 and above extreme and under 20 depressed. 30 is the wider net";
 /* WHOSE number the rank is, printed wherever the rank is. CBOE computes iv30 and
@@ -5868,12 +5889,18 @@ function zdue(){
      &&Date.now()-S.zat>=60000) zrefresh();
 }
 setInterval(zdue,15000);
-/* The watchlist's quotes go stale the same way: a tab left open read "quotes 5h
-   ago". Refetched every five minutes while the tab is open and visible, which is
-   two requests per symbol, so no faster. */
+/* Quotes for an open Watchlist: on its first view, so the tab is useful without
+   a click, and every five minutes while it stays open and visible, since a tab
+   left open read "quotes 5h ago". Each ask costs the server three requests per
+   symbol, so no faster, and the five minutes run from when an ask STARTS: the
+   redraws an ask causes, and one that failed, ask nothing more. Refresh is the
+   way to ask sooner. */
+function quotesDue(){
+  return S.tab==='watchlist'&&S.state&&(S.state.watchlist||[]).length
+    &&Date.now()-S.wqat>=5*60000;
+}
 setInterval(()=>{
-  if(S.tab==='watchlist'&&S.state&&document.visibilityState==='visible'
-     &&(S.state.watchlist||[]).length&&Date.now()-(S.wqat||0)>=5*60000) loadQuotes(false);
+  if(document.visibilityState==='visible'&&quotesDue()) loadQuotes(false);
 },30000);
 document.addEventListener('visibilitychange',zdue);
 
@@ -6115,9 +6142,17 @@ async function checkUpdate(){
     const r=await fetch('/api/update');
     S.update=await r.json();
   }catch(e){S.update=null;}
-  /* The first load may still be in flight; it draws the banner when it lands. */
-  if(!S.state) return;
   await keepPlace(draw);
+}
+
+/* What draw() draws with no payload in hand: the first read is still in flight,
+   or it failed. A release whose migration fails on this journal answers every read
+   with a 500, and the update that fixes it must still be offered, which it can be:
+   POST /api/update never opens the journal. Only the update banner can show here,
+   since the other two read the payload. */
+function bareBanners(){
+  $('#body').innerHTML=appBanners();
+  bindAppBanners();
 }
 
 /* Redraw without moving what the reader is in. The update check answers seconds
@@ -6135,17 +6170,30 @@ async function keepPlace(redraw){
     window.scrollBy(0,now.getBoundingClientRect().top-top);
 }
 
-/* After a restart is asked for, wait for the server to come back, then reload
-   onto the new code. The first start after an update installs dependencies,
-   so the wait is generous. */
+/* After a restart is asked for, wait for the old server to go, then for the new
+   one to answer, then reload onto it. The old one keeps answering until a running
+   job lets its scheduler stop, up to about ten seconds, and a reload in that
+   window landed on a process about to exit. Gone is a poll that fails, or one
+   that names another version (a restart quicker than a poll); after twenty
+   seconds of neither, the restart is taken as done. The first start after an
+   update installs dependencies, so the wait for it to answer is generous. */
 async function awaitRestart(){
-  await new Promise(r=>setTimeout(r,3000));
-  for(let i=0;i<180;i++){
+  const pause=()=>new Promise(r=>setTimeout(r,1000));
+  const ask=async()=>{
     try{
       const r=await fetch('/api/update',{cache:'no-store'});
-      if(r.ok){location.reload(); return;}
-    }catch(e){/* still restarting */}
-    await new Promise(r=>setTimeout(r,1000));
+      return r.ok?await r.json():null;
+    }catch(e){return null;}
+  };
+  const was=await ask();
+  for(let i=0;was&&i<20;i++){
+    await pause();
+    const upd=await ask();
+    if(!upd||upd.current!==was.current) break;
+  }
+  for(let i=0;i<180;i++){
+    if(await ask()){location.reload(); return;}
+    await pause();
   }
   note('optjournal has not come back. Close its window and open the Start file '
     +'again.','bad');
@@ -6510,6 +6558,7 @@ function syncHash(push){
 
 /* ------------------------------------------------ shell */
 function draw(push){
+  if(!S.state) return bareBanners();
   /* A currency the account has no quote for falls back to base on display
      (DISP does that); clearing it makes the hash heal to match. Healed here
      rather than in load() because a hash edit is a same-document navigation
@@ -6659,16 +6708,6 @@ function draw(push){
   document.querySelectorAll('.seg button[data-type]').forEach(b=>
     b.onclick=()=>{const t=b.dataset.type||null;
       if(t===S.type)return; S.type=t; load();});
-  /* The cost scope TOGGLES rather than selects: this is a multi-select, so a
-     click flips one option and leaves the rest alone. Seeded from the scope the
-     server reported rather than from S.cost, which is null until the reader has
-     touched anything -- reading it would make the first click discard the default
-     selection instead of adding to it.
-
-     Deselecting the last option leaves an EMPTY array, not null: "nothing
-     selected" is a real answer and shows an empty state, where null would silently
-     restore the default and make the click look ignored. A reload costs a request
-     because commission is summed server-side under the new predicate. */
   /* The tile chooser edits a draft; nothing here reaches the server until Save.
      Every handler copies the draft, changes the copy, and redraws, so the list on
      screen is always a rendering of `S.tiledraft` and never a DOM the page has
@@ -6782,12 +6821,15 @@ function draw(push){
     }
     draw();
   };
+  /* The cost scope TOGGLES rather than selects: this is a multi-select, so a
+     click flips one option and leaves the rest alone. The last lit option stays
+     lit: the wire has no word for "nothing", so an empty selection asks for the
+     server's default, which put the chip straight back at the cost of a request.
+     A reload, because commission is summed server-side under the new predicate. */
   document.querySelectorAll('.multi button[data-cost]').forEach(b=>
     b.onclick=()=>{
-      const csc=(S.state.broker_costs||{}).scope||{};
-      const on=new Set(csc.categories||[]);
-      if(csc.subset) on.add(csc.subset);
-      const key=b.dataset.cost;
+      const on=costOn(), key=b.dataset.cost;
+      if(on.has(key)&&on.size===1) return;
       if(on.has(key)) on.delete(key); else on.add(key);
       S.cost=[...on];
       load();
@@ -6802,14 +6844,13 @@ function draw(push){
      The Set is REBUILT rather than mutated in place, because `S.mkcountries` may
      still be null (meaning "the server's default"), and mutating the Set that
      `market()` derived from the payload would edit a value the state does not own
-     yet. `mkFacet` reads the current selection back out of the same payload the
-     view did, so the two cannot disagree about what was showing. */
+     yet. `mkFacet` reads the current selection back out of the same payload
+     through the view's own `seedFacets`, so the two cannot disagree about what
+     was showing. */
   const mkFacet=axis=>{
     const mk=marketWeek()||{};
-    const held=axis==='country'?S.mkcountries:S.mkimpacts;
-    if(held instanceof Set) return new Set(held);
-    const facets=axis==='country'?mk.countries:mk.impacts;
-    return new Set((facets||[]).filter(mf=>mf.default).map(mf=>mf.value));
+    return new Set(axis==='country'?seedFacets(S.mkcountries,mk.countries)
+      :seedFacets(S.mkimpacts,mk.impacts));
   };
   const mkPut=(axis,next)=>{
     if(axis==='country') S.mkcountries=next; else S.mkimpacts=next;
@@ -6825,9 +6866,9 @@ function draw(push){
      silently stop tracking a change to `events.DEFAULT_COUNTRIES`. */
   document.querySelectorAll('[data-mkreset]').forEach(b=>
     b.onclick=()=>{S.mkcountries=null; S.mkimpacts=null; S.marketday=null; draw();});
-  /* All is an EMPTY Set on both axes, which filters nothing out -- see `passes` in
-     `market()`. Not "every value selected": a new country arriving in the feed
-     would then be excluded until the reader noticed. */
+  /* All is an EMPTY Set on both axes, which filters nothing out -- see
+     `eventPasses` in market.js. Not "every value selected": a new country
+     arriving in the feed would then be excluded until the reader noticed. */
   document.querySelectorAll('[data-mkall]').forEach(b=>
     b.onclick=()=>{S.mkcountries=new Set(); S.mkimpacts=new Set();
       S.marketday=null; draw();});
@@ -6844,11 +6885,7 @@ function draw(push){
   companionPost();
   bindJobRuns();
   bindAppBanners();
-  /* First view of the Watchlist fetches quotes once, so the tab is useful without
-     a click -- and NOT on any later redraw, because each quote is an HTTP request
-     and a redraw happens on every toggle, filter and edit. `quotesAt` is the
-     latch; Refresh is the way to ask again. */
-  if(S.tab==='watchlist'&&!S.quotesAt&&(S.state.watchlist||[]).length) loadQuotes(false);
+  if(quotesDue()) loadQuotes(false);
   const st=S.state, cn=st.collection||{};
   /* innerHTML rather than textContent because dev mode adds a marked pill, so
      the dynamic pieces are escaped. A visible, always-on marker on purpose: a
@@ -7044,12 +7081,12 @@ function note(text,kind){
     const el=$('#msg');
     if(!el||!el.classList.contains('ok')) return;
     el.classList.add('fading');
-    /* Hidden only after the fade has run, so the element leaves the layout
-       instead of holding an invisible gap above the panels below it. `once`, so
-       repeated notes cannot stack listeners on one element. */
-    el.addEventListener('transitionend',()=>{
-      if(el.classList.contains('fading')) el.className='';
-    },{once:true});
+    /* Hidden once the fade has run, so the element leaves the layout instead of
+       holding an invisible gap above the panels below it. Timed by the fade's own
+       length in app.css, not by `transitionend`, which never fires when Reduce
+       Motion turns the transition off: the note stayed an invisible band. */
+    const fade=parseFloat(getComputedStyle(el).transitionDuration)*1000||0;
+    setTimeout(()=>{if(el.classList.contains('fading')) el.className='';},fade);
   },NOTE_MS);
 }
 
@@ -7363,11 +7400,15 @@ async function watchWrite(body,said){
  * `announce` is false for the implicit refresh after an edit: a toast saying
  * "prices updated" when you only removed a symbol is noise. */
 async function loadQuotes(announce){
+  /* One ask at a time: Refresh, the timer and a new watch can each start one,
+     and a redraw hands Refresh back while an ask is still out. */
+  if(S.quoting) return;
+  S.quoting=true; S.wqat=Date.now();
   const b=$('#wquote'); if(b){b.disabled=true;b.classList.add('busy');}
   try{
     const r=await fetch('/api/quotes');
     const qres=await r.json();
-    S.quotes=qres.quotes||{}; S.quotesAt=qres.asked_at||null; S.wqat=Date.now();
+    S.quotes=qres.quotes||{}; S.quotesAt=qres.asked_at||null;
     /* Set even when `ranks` is empty, because the OBJECT is the signal: null means
        never asked and `{}` means asked-and-nothing-came-back, and only the second
        one lets the IV rank chips enable themselves honestly. */
@@ -7381,6 +7422,7 @@ async function loadQuotes(announce){
         +' — the request failed, not the symbol.','warn');
     else if(announce) note('Prices updated.','ok');
   }catch(e){note('Quote fetch failed: '+esc(e),'bad');}
+  finally{S.quoting=false;}
   draw();
 }
 
@@ -7519,7 +7561,8 @@ async function load(){
     READ_NOTE=$('#msg').innerHTML;
     /* Over figures that did not move, with the controls that produced them: the
        banner says the read failed, and nothing else claims otherwise. */
-    if(S.state){Object.assign(S,LOADED);draw();}
+    if(S.state) Object.assign(S,LOADED);
+    draw();
     return;
   }
   /* Before the payload guard, whose own banner this must not take down. */

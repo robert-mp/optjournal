@@ -1072,6 +1072,87 @@ def test_calendar_day_drilldown_is_wired():
     assert "load()" not in handler, "day selection must not spend a request"
 
 
+def test_a_calendar_day_lists_the_legs_booked_on_it(tmp_path):
+    """The cells are keyed by IBKR's trade date and the day detail matched the date
+    of a leg's first fill, so an evening fill (SPCX: traded 11 Jun 20:25, booked
+    12 Jun) and the second day of an order filled over two showed "No leg detail",
+    and the header counted legs as fills. The view's trade dates, through the
+    page's own `dayDetail`.
+    """
+    from conftest import add_statement, connect_migrated  # noqa: PLC0415
+
+    from optjournal.serialize import orders_data  # noqa: PLC0415
+
+    conn = connect_migrated(tmp_path / "journal.db")
+    add_statement(conn)
+    for tid, order, cat, conid, day, at in (
+        ("1", "100", "STK", "S1", "2026-06-12", "2026-06-11 20:25:00"),
+        ("2", "100", "STK", "S1", "2026-06-12", "2026-06-12 09:31:00"),
+        ("3", "200", "STK", "S2", "2026-06-15", "2026-06-15 15:59:00"),
+        ("4", "200", "STK", "S2", "2026-06-16", "2026-06-16 09:30:00"),
+    ):
+        conn.execute(
+            "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
+            " account_id, trade_date, date_time, asset_category, symbol, conid,"
+            " underlying_symbol, open_close, quantity, currency, fx_rate_to_base,"
+            " raw, source_file, first_seen_at) VALUES (?,?,?,?,'U1',?,?,?,?,?,"
+            " NULL,'O',1,'USD',1.0,'{}','t.xml','now')",
+            (tid, tid, tid, order, day, at, cat, conid, conid),
+        )
+    orders = orders_data(conn, asset_category="STK")
+    conn.close()
+    legs = {lg["conid"]: lg for o in orders for lg in o["legs"]}
+    assert (legs["S1"]["trade_date"], legs["S1"]["last_trade_date"]) == (
+        "2026-06-12", "2026-06-12")
+    assert (legs["S2"]["trade_date"], legs["S2"]["last_trade_date"]) == (
+        "2026-06-15", "2026-06-16")
+
+    out = _node_run([
+        f"import {{esc,plural}} from '{_static('format.js')}';",
+        "const shortDay=d=>d; function legRow(l){return `<leg ${l.conid}>`;}",
+        "const S={calday:null,state:{strategies:"
+        + json.dumps([{"label": "x", "orders": orders}]) + "}};",
+        "const days=['2026-06-12','2026-06-15','2026-06-16'];",
+        *_page_fns("dayDetail"),
+        "const by=Object.fromEntries(days.map(d=>[d,{}]));",
+        "console.log(JSON.stringify(days.map(d=>{S.calday=d; return dayDetail(by);})));",
+    ])
+    overnight, first, second = out
+    assert "<leg S1>" in overnight and "2026-06-12 · 2 fills" in overnight, overnight
+    assert "<leg S2>" in first and "<leg S2>" in second, (first, second)
+    assert "<leg S1>" not in first + second
+
+
+def test_the_month_and_the_running_total_add_up_what_the_days_show():
+    """With a EUR base and the USD switch on, each +$100 day read "$100.00" (its
+    native, by `moneyOf`) and the Month P/L pill read "$201.25": it summed the
+    days' base and restated it at the display rate. The chart's dot tooltip did the
+    same. Both through the page's own `calendar` and `chart`, in USD.
+    """
+    out = _node_run([
+        f"import {{esc,money,cls,compact,dayLabel,monthLabel,plural,sumMoney}} "
+        f"from '{_static('format.js')}';",
+        f"import {{niceTicks}} from '{_static('replay.js')}';",
+        "const DISP=()=>'USD', conv=v=>v==null?null:Number(v)*1.0125,",
+        "  unconv=v=>v==null?null:Number(v)/1.0125;",
+        "const cash=(v,d)=>money(conv(v),DISP(),d);",
+        *(_page_stmt(n) for n in ("isNativeCharge", "moneyOf", "amountOf", "EST_WHY",
+                                  "estMark")),
+        "function scopeNote(){return '';} function infoTip(){return '';}",
+        "function dayDetail(){return '';}",
+        "const day=d=>({day:d,trades:1,pnl_estimated:false,",
+        "  realized:{base:99.3827,native:100,ccy:'USD'}});",
+        "const days=[day('2026-09-01'),day('2026-09-02')];",
+        "const S={calday:null,state:{stats:{month:'2026-09',days},month_range:['2026-09']}};",
+        *_page_fns("calendar", "yTicks", "chart"),
+        "const pill=calendar().match(/Month P\\/L <b[^>]*>([^<]*)</)[1];",
+        "const tips=[...chart(days).matchAll(/<title>([^<]*)<\\/title>/g)].map(t=>t[1]);",
+        "console.log(JSON.stringify({pill,last:tips.at(-1)}));",
+    ])
+    assert out["pill"] == "$200.00", out
+    assert "total $200.00" in out["last"], out
+
+
 def test_a_drill_down_opens_from_the_keyboard():
     """M31, the handler half (test_rendered checks the tab stops): a calendar day
     and a replay row answered a click and nothing else. They now go through
@@ -2286,9 +2367,10 @@ def test_a_render_preserves_what_the_user_was_typing():
       `#wadd`, so the next input inherits the fix instead of rediscovering the bug.
     """
     js = code_only(_js())
-    capture = js.index("preserveInputs()")
-    render = js.index("$('#body').innerHTML=")
-    restore = js.index("restoreInputs(")
+    drawn = _fn("draw")
+    capture = drawn.index("preserveInputs()")
+    render = drawn.index("$('#body').innerHTML=")
+    restore = drawn.index("restoreInputs(")
     assert capture < render < restore, (
         "the input capture must straddle the innerHTML replacement, or typing is "
         "lost on every redraw"
@@ -2722,6 +2804,26 @@ def test_a_position_the_statement_did_not_mark_has_no_unrealised_figure(populate
                if lc["status"] == "open" and conid in map(str, lc["conids"])]
     assert holding and all(lc["unrealized"] is None for lc in holding), (
         "the card holding the unmarked contract still sums a figure")
+
+
+def test_a_position_with_no_basis_reads_unknown_not_free(populated):
+    """The fallback that once covered a snapshot row with no cost basis is gone,
+    and `Money.at_rate(None)` is a zero, so Holdings would print "€0.00" for it: a
+    position that cost nothing. It is null now, as a missing unrealised figure is,
+    which `moneyOf` prints as a dash; the rows that carry one are kept."""
+    from optjournal.db import connect  # noqa: PLC0415
+
+    conid = str(build_state(db_path=populated, archive_dir=RAW_DIR,
+                            query_id=None)["positions"][0]["conid"])
+    conn = connect(populated)
+    conn.execute("UPDATE position_snapshots SET cost_basis_money = NULL"
+                 " WHERE conid = ?", (conid,))
+    conn.commit()
+    conn.close()
+    state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    basis = {str(pos["conid"]): pos["cost_basis"] for pos in state["positions"]}
+    assert basis.pop(conid) is None, "a missing basis is still sent as a zero"
+    assert basis and all(mo is not None for mo in basis.values())
 
 
 def test_a_stock_card_is_marked_from_the_stock_book(populated):
@@ -3985,11 +4087,13 @@ def test_the_chart_axis_follows_the_display_currency():
     the axis in the base currency while the headline, the cards and every dot
     tooltip on the same chart restated -- the one figure on the page that
     ignored the toggle, and it carried no symbol to admit which currency it
-    meant.
+    meant. Both money charts draw their axis through `yTicks`.
     """
-    chart = _fn("chart").replace(" ", "")
-    assert "text-anchor=\"end\">${cash(v,0)}" in chart, "axis ticks not restated"
-    assert "${num(v,0)}" not in chart
+    for drawn in ("chart", "navChart"):
+        assert "yTicks(lo,hi,sy," in _fn(drawn), f"{drawn} draws its own axis"
+    ticks = _fn("yTicks").replace(" ", "")
+    assert "text-anchor=\"end\">${cash(v,0)}" in ticks, "axis ticks not restated"
+    assert "${num(v,0)}" not in ticks
 
 
 def test_dashboard_commission_reads_the_same_as_the_tables():
@@ -5445,7 +5549,7 @@ def test_the_performance_axis_labels_round_numbers_in_display_currency():
     the axis would have looked exactly as arbitrary as before. So the domain is
     converted, ticks are chosen there, and `unconv` maps them back to position.
     """
-    chart = _fn("chart")
+    chart = _fn("yTicks")
     assert "niceTicks(conv(lo),conv(hi))" in chart.replace(" ", ""), (
         "the axis no longer picks round ticks from the CONVERTED domain, so a "
         "round tick under one currency is an arbitrary one under another"
@@ -5515,6 +5619,28 @@ def test_only_a_success_banner_dismisses_itself():
         "the fade-out state is gone; dropping `.show` instead sets display:none "
         "in the same frame and the transition never runs"
     )
+
+
+def test_a_faded_success_note_leaves_the_layout_with_reduce_motion_on():
+    """Reduce Motion sets `#msg{transition:none}`, so the `transitionend` the page
+    waited on never fired: a faded success stayed `display:block` at opacity 0, a
+    42px invisible band above the panels (measured in Chromium), with one more dead
+    listener per note. The page's own `note`, every timer run, no transition event.
+    """
+    out = _node_run([
+        "const timers=[]; const setTimeout=f=>{timers.push(f); return timers.length;};",
+        "const clearTimeout=()=>{}; let listeners=0;",
+        "const msg={innerHTML:'',className:'',addEventListener(){listeners++;}};",
+        "msg.classList={contains:c=>msg.className.split(' ').includes(c),",
+        "  add:c=>{msg.className+=' '+c;}};",
+        "const $=sel=>sel==='#msg'?msg:null;",
+        "const getComputedStyle=()=>({transitionDuration:'0s'});",
+        "let noteTimer=null;", _page_const("NOTE_MS"), *_page_fns("note"),
+        "note('Prices updated.','ok');",
+        "while(timers.length) timers.shift()();",
+        "console.log(JSON.stringify({cls:msg.className,listeners}));",
+    ])
+    assert out == {"cls": "", "listeners": 0}
 
 
 def test_an_empty_loss_population_reads_as_a_fact_not_a_missing_number():
@@ -5776,6 +5902,33 @@ def _collection_rows(demo: bool) -> dict[str, str]:
     ])
     return dict(re.findall(r'<div class="jobrow">\s*<span class="jobname mono">([a-z_]+)'
                            r"</span>(.*?)</div>", html, re.S))
+
+
+def test_a_jobs_time_reads_as_an_age_not_a_bare_utc_clock():
+    """The jobs strip printed `slice(0,16)` of a UTC timestamp with no zone, so a
+    run at 15:00 in Madrid read "13:00". It says how long ago, as its comment
+    always promised, and "started" while the run is still going.
+    """
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    now = datetime.now(UTC)
+    run = {"status": "ok", "started_at": (now - timedelta(minutes=4)).isoformat(),
+           "finished_at": (now - timedelta(minutes=3)).isoformat(), "detail": None}
+    live = {**run, "status": "running", "finished_at": None}
+    state = {"demo": False, "audit": {"ever_collected": False},
+             "scheduler": {"ever_ran": False, "jobs": [
+                 {"job": job, "last_status": "ok", "consecutive_failures": 0,
+                  "spends_request": False, "requests": 0, "last_run": last}
+                 for job, last in (("market", run), ("bars_live", live))]}}
+    html = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        f"const S={{state:{json.dumps(state)}}};",
+        _page_const("DEMO_NO_IBKR"), *_page_fns("infoTip", "ago", "collection"),
+        "console.log(JSON.stringify(collection()));",
+    ])
+    when = dict(re.findall(r'jobname mono">([a-z_]+)</span>.*?jobwhen mono"[^>]*>([^<]*)<',
+                           html, re.S))
+    assert when == {"market": "3m ago", "bars_live": "started 4m ago"}, when
 
 
 def test_a_job_in_flight_reads_running():
@@ -6582,6 +6735,41 @@ def test_a_refusal_ends_the_saved_that_was_being_held():
     assert out["said"] == "", (
         f"a redraw after the refusal says {out['said']!r}: the held word outlived "
         "the claim it was making")
+
+
+#: How the stand-in `/api/quotes` answers: never, or with a refused connection.
+#: A failure stops after 50 asks, so a page that loops ends with a count to read.
+_QUOTE_REPLIES = {
+    "pending": "return new Promise(()=>{});",
+    "failing": "if(asks>50) return new Promise(()=>{});"
+               " throw new TypeError('Failed to fetch');",
+}
+
+
+@pytest.mark.parametrize("reply", sorted(_QUOTE_REPLIES))
+def test_opening_the_watchlist_asks_for_quotes_once(reply):
+    """Each ask costs the server three requests per symbol, and the latch was the
+    REPLY's stamp: one open plus three redraws sent four asks while the first was
+    out, and a failing ask redrew, found no stamp and asked again with no pause,
+    146 times in 200ms. The page's own `quotesDue` and `loadQuotes`, with `draw`
+    standing in as the trigger line the real one runs, and Refresh pressed during
+    the ask.
+    """
+    assert "if(quotesDue()) loadQuotes(false);" in _fn("draw")
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        "const S={tab:'watchlist',state:{watchlist:[{symbol:'SPY'}]},wqat:0,",
+        "  quoting:false};",
+        "let asks=0; const $=()=>null; function note(){} async function load(){}",
+        f"async function fetch(){{asks++; {_QUOTE_REPLIES[reply]}}}",
+        *_page_fns("quotesDue", "loadQuotes"),
+        "function draw(){if(quotesDue()) loadQuotes(false);}",
+        "for(let i=0;i<4;i++) draw();",
+        "loadQuotes(true);",
+        "await new Promise(r=>setTimeout(r,50));",
+        "console.log(JSON.stringify({asks}));",
+    ])
+    assert out["asks"] == 1, out
 
 
 def test_a_refused_stop_watching_hands_its_button_back():
@@ -10614,6 +10802,78 @@ def test_a_banner_button_is_handed_back_after_any_failure(button, label, failure
         assert out["notes"] == ["bad"], "the failure was not reported"
 
 
+@pytest.mark.parametrize(("replies", "reload_on"), [
+    # A job running: the old server answers for seconds after it agreed.
+    (["0.5.1"] * 5 + [None] * 3 + ["0.5.2"], 8),
+    # A restart quicker than one poll: no failure is ever seen.
+    (["0.5.1", "0.5.1", "0.5.2"], 3),
+    # Restart now and Use this journal keep the version.
+    (["0.5.1", None, "0.5.1"], 2),
+    # The old server never went: taken as done after twenty seconds.
+    (["0.5.1"] * 30, 21),
+])
+def test_after_a_restart_the_page_reloads_onto_the_new_server(replies, reload_on):
+    """The page reloaded on the first reply after three seconds, and while a job
+    ran the old server was still answering, so it reloaded onto the old process
+    and then went dead under the reader. The page's own `awaitRestart` against a
+    stand-in server: each poll gets the next reply, a version or a refused
+    connection (None), and the reload must land on the poll named here.
+    """
+    out = _node_run([
+        f"const replies={json.dumps(replies)}; let polls=0, reloaded=null;",
+        "const setTimeout=f=>f();",
+        "const location={reload(){reloaded=polls-1;}};",
+        "function note(){}",
+        "async function fetch(){const v=replies[Math.min(polls++,replies.length-1)];",
+        "  if(v===null) throw new TypeError('Failed to fetch');",
+        "  return {ok:true,json:async()=>({current:v})};}",
+        *_page_fns("awaitRestart"),
+        "await awaitRestart();",
+        "console.log(JSON.stringify({reloaded,polls}));",
+    ])
+    assert out["reloaded"] == reload_on, out
+
+
+@pytest.mark.parametrize("first", ["state", "update"])
+def test_a_journal_the_server_cannot_read_still_offers_the_update(first):
+    """A release whose migration fails on one friend's journal answers every
+    `/api/state` with a 500, and the page showed only "Could not read state": the
+    update that would fix it was never drawn, because `checkUpdate` waited for a
+    payload and the failed load drew nothing. Both replies land here through the
+    page's own `load` and `checkUpdate`, in either order, and the button posts.
+    The gear and the edition chip redraw, and a redraw over no payload erased the
+    banner for "This tab could not be rendered" (seen in Chromium): it keeps it.
+    """
+    out = _node_run([
+        f"import {{esc}} from '{_static('format.js')}';",
+        _page_const("COLLECT_BANNER"),
+        "const S={}; let READ_NOTE=null, LOADED={}; const posted=[];",
+        "const body={innerHTML:''}, msg={innerHTML:'',className:''}; let upd=null;",
+        "const $=sel=>sel==='#body'?body:sel==='#msg'?msg",
+        "  :sel==='#updgo'&&body.innerHTML.includes('id=\"updgo\"')",
+        "    ?(upd=upd||{id:'updgo',textContent:'Update to 0.5.2',disabled:false,",
+        "      classList:{add(){},remove(){}}}):null;",
+        "function note(text){msg.innerHTML=text;}",
+        "async function awaitRestart(){} async function keepPlace(f){await f();}",
+        "async function fetch(path,opts){",
+        "  if(opts&&opts.method==='POST'){posted.push(path);",
+        "    return {json:async()=>({ok:false,message:'refused'})};}",
+        "  if(path.startsWith('/api/state')) return {ok:false,status:500};",
+        "  return {ok:true,json:async()=>({current:'0.5.1',latest:'0.5.2',",
+        "    available:true,cannot_apply:null})};}",
+        *_page_fns("stateQuery", "load", "checkUpdate", "draw", "bareBanners",
+                   "appBanners", "bindAppBanners", "bannerPost"),
+        "await (" + ("load" if first == "state" else "checkUpdate") + ")();",
+        "await (" + ("checkUpdate" if first == "state" else "load") + ")();",
+        "S.showCog=true; draw();",
+        "const shown=body.innerHTML.includes('Update to 0.5.2');",
+        "await $('#updgo')?.onclick?.();",
+        "console.log(JSON.stringify({shown,posted,msg:msg.innerHTML}));",
+    ])
+    assert out["shown"], "no update banner over a journal the server cannot read"
+    assert out["posted"] == ["/api/update"]
+
+
 def test_a_late_update_banner_leaves_the_focused_field_where_it_was():
     """L38: the update check answers seconds after the page, and the banner it
     draws landed above a journal entry being typed, moving the field 123px under
@@ -10626,6 +10886,48 @@ def test_a_late_update_banner_leaves_the_focused_field_where_it_was():
     before = fn.index("getBoundingClientRect().top")
     assert before < fn.index("await redraw();") < fn.index("window.scrollBy("), (
         "the focused field has to be measured before the redraw and put back after")
+
+
+def test_the_last_lit_cost_chip_stays_lit():
+    """Deselecting the only lit chip sent an empty selection, which the wire spells
+    the same as none, so the server answered with its default and the chip came
+    straight back, at the cost of a request. The page's own chip handler, out of
+    `draw`, against the scope the server reported.
+    """
+    drawn = _code_only(_fn("draw"))
+    handler = re.search(
+        r"document\.querySelectorAll\('\.multi button\[data-cost\]'\)\.forEach\(.*?\n    \}\);",
+        drawn, re.S)
+    assert handler, "the cost chip handler moved"
+    out = _node_run([
+        "const chips=['OPT','STK'].map(k=>({dataset:{cost:k}})); let loads=0;",
+        "const document={querySelectorAll:()=>chips};",
+        "const S={cost:null,state:{broker_costs:{scope:{categories:['OPT']}}}};",
+        "function load(){loads++;}",
+        *_page_fns("costOn"), handler.group(0),
+        "chips[0].onclick(); const alone={loads,cost:S.cost};",
+        "chips[1].onclick();",
+        "console.log(JSON.stringify({alone,added:{loads,cost:S.cost}}));",
+    ])
+    assert out["alone"] == {"loads": 0, "cost": None}, "the last lit chip went dark"
+    assert out["added"] == {"loads": 1, "cost": ["OPT", "STK"]}
+
+
+def test_a_phone_hides_the_trades_columns_its_rule_names():
+    """At 390px the Trades list ran 653px wide inside its scroller, so a row's two
+    figures were off screen and an opened card's legs were cut. A phone drops the
+    third to fifth columns (measured: the table then fits a 390px screen). The rule
+    counts columns, so the header must still put Status, Dates and Held there, or a
+    reorder would hide a figure instead.
+    """
+    head = re.search(r'<table class="tlist"><thead><tr>(.*?)</tr></thead>', _fn("trades"), re.S)
+    assert head, "the Trades list header moved"
+    names = re.findall(r"<th[^>]*>([^<]+)</th>", head.group(1).replace("\n", " "))
+    assert names[2:5] == ["Status", "Dates", "Held"], names
+    rules = [(sel.strip(), body) for sel, body in _css_rules()]
+    assert any(sel == ".tlist tr>:is(th,td):nth-child(n+3):nth-child(-n+5)"
+               and "display:none" in body for sel, body in rules), (
+        "the phone rule that hides Status, Dates and Held is gone")
 
 
 def test_the_app_banners_wrap_on_a_phone():

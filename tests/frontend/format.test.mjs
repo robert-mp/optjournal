@@ -14,6 +14,7 @@ import {
   pct,
   plural,
   strike,
+  sumMoney,
 } from "../../src/optjournal/static/format.js";
 
 test("a compact amount fits five characters and keeps its sign", () => {
@@ -150,4 +151,20 @@ test("a count carries its noun in the right number", () => {
   assert.equal(plural(1, "fill"), "1 fill");
   assert.equal(plural(0, "fill"), "0 fills");
   assert.equal(plural(3, "entry", "entries"), "3 entries");
+});
+
+test("money adds up in one currency and withholds the native across two", () => {
+  const usd = (native, base) => ({ base, native, ccy: "USD" });
+  assert.deepEqual(sumMoney([usd(100, 99.38), usd(100, 99.38)]),
+    { base: 198.76, native: 200, ccy: "USD" });
+  /* A day of opening fills only carries no figure, and must not cost the month
+     its native. */
+  assert.deepEqual(sumMoney([usd(100, 99.38), { base: 0, native: null, ccy: null }]),
+    { base: 99.38, native: 100, ccy: "USD" });
+  /* A second currency, or a part that already spans two, withholds it. */
+  const sek = { base: 9, native: 100, ccy: "SEK" };
+  assert.deepEqual(sumMoney([usd(100, 99.38), sek]), { base: 108.38, native: null, ccy: null });
+  assert.deepEqual(sumMoney([usd(100, 99.38), { base: 5, native: null, ccy: null }]),
+    { base: 104.38, native: null, ccy: null });
+  assert.deepEqual(sumMoney([]), { base: 0, native: null, ccy: null });
 });
