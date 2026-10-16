@@ -551,7 +551,6 @@ def _broker_costs(
     conn: sqlite3.Connection,
     *,
     selection: list[str] | None,
-    base_currency: str,
     report: Any,
     asset_category: str,
 ) -> dict[str, Any]:
@@ -590,7 +589,7 @@ def _broker_costs(
         subset=ODTE_SELECTION if wants_odte else "",
     )
     return broker_costs_data(
-        build_costs(conn, scope=scope, base_currency=base_currency)
+        build_costs(conn, scope=scope)
     )
 
 
@@ -882,13 +881,12 @@ def build_state(
             # the same way it renders the absent planner.
             "history": odte_scoring_data(conn, now=datetime.now(UTC)),
         }
-        base_ccy = str(state["stats"].get("base_currency") or "")
-        state["fx"] = {"base": base_ccy, "quotes": fx_quotes(conn, base_ccy)}
+        state["fx"] = {"base": report.base_currency,
+                       "quotes": fx_quotes(conn, report.base_currency)}
         replay.attach(conn, state)
         state["broker_costs"] = _broker_costs(
             conn,
             selection=cost_scope,
-            base_currency=base_ccy or "EUR",
             report=report,
             asset_category=asset_category,
         )

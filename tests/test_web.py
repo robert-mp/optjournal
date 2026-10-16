@@ -3026,6 +3026,26 @@ def test_fx_never_quotes_the_base_currency(state):
     assert fx["base"] not in [q["code"] for q in fx["quotes"]]
 
 
+def test_the_base_currency_is_the_one_the_statement_states(populated):
+    """A USD account's figures are labelled USD, and USD is not offered as a switch.
+
+    Every figure is IBKR's own `*_base` column, so only the label could be wrong,
+    and it was: the payload said EUR whatever the statement said, and the switch
+    offered USD at the rate of a conversion that never happens.
+    """
+    with open_journal(populated) as conn:
+        conn.execute("UPDATE statements SET base_currency = 'USD'")
+        conn.commit()
+    state = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
+    assert state["fx"]["base"] == "USD"
+    assert "USD" not in [q["code"] for q in state["fx"]["quotes"]]
+    labels = {state[block]["base_currency"]
+              for block in ("stats", "all_time", "annual_total", "history",
+                            "broker_costs")}
+    labels |= {row["base_currency"] for row in state["annual"] + state["monthly"]}
+    assert labels == {"USD"}
+
+
 def _usd_quote(state) -> dict:
     """The USD quote, selected by code -- index 0 is not guaranteed to be USD."""
     for quote in state["fx"]["quotes"]:

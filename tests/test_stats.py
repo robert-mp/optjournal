@@ -359,7 +359,7 @@ def test_a_strangle_scores_each_leg_as_its_own_outcome(conn):
     count and the money read the same two closes.
     """
     _strangle(conn)
-    s = month_stats(conn, "2026-03", base_currency="EUR")
+    s = month_stats(conn, "2026-03")
 
     assert (s.wins, s.losses) == (1, 1), "the call leg is its own loss"
     assert s.closes == 2
@@ -381,7 +381,7 @@ def test_a_closed_leg_is_decided_while_its_partner_is_still_open(conn):
     _leg(conn, conid="1", order_id="12", at="2026-03-09 15:00:00",
          qty=1, proceeds=-100.0, pnl=400.0, put_call="P")
 
-    s = month_stats(conn, "2026-03", base_currency="EUR")
+    s = month_stats(conn, "2026-03")
     assert s.net_pnl.base == 400.0
     assert (s.wins, s.losses, s.closes) == (1, 0, 1), (
         "the close is a finished outcome on its own terms"

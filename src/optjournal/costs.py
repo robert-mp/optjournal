@@ -55,6 +55,7 @@ from typing import Any
 #: defect the two surfaces could not agree about. `analysis` owns the rule because
 #: it had it first; this module reads the same fees out of SQLite.
 from optjournal.analysis import categorise_fee
+from optjournal.history import journal_base_currency
 from optjournal.money import Charge
 from optjournal.notes import AUTOFX, has_code
 
@@ -497,7 +498,6 @@ def build_costs(
     *,
     scope: CostScope | None = None,
     period: str | None = None,
-    base_currency: str = "EUR",
 ) -> CostReport:
     """Read every cost in the database, narrowed to `scope` and `period`.
 
@@ -508,7 +508,7 @@ def build_costs(
     """
     scope = scope or CostScope()
     report = CostReport(
-        base_currency=base_currency,
+        base_currency=journal_base_currency(conn) or "",
         scope=scope,
         from_date=None,
         to_date=None,

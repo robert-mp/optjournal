@@ -316,7 +316,7 @@ class DayPnl:
 @dataclass(slots=True)
 class MonthStats:
     month: str            #: "YYYY-MM", "YYYY" for an annual row, or "ALL"
-    base_currency: str = "EUR"
+    base_currency: str    #: the journal's, as `HistoryReport.base_currency`
     asset_category: str = "OPT"
 
     total_trades: int = 0          #: fills
@@ -525,7 +525,6 @@ def odte_scope(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     report: Any = None,
 ) -> TradeScope:
     """The 0DTE round trips, as a fill-level scope.
@@ -536,9 +535,7 @@ def odte_scope(
     would still show.
     """
     if report is None:
-        report = build_history(
-            conn, asset_category=asset_category, base_currency=base_currency
-        )
+        report = build_history(conn, asset_category=asset_category)
     trade_ids = {str(t) for e in report.episodes if e.is_odte is True for t in e.trade_ids}
     # Orders are aggregated in a view keyed by ib_order_id, so filtering them
     # needs the order ids those fills belong to rather than the fills.
@@ -622,7 +619,6 @@ def _period_stats(
     periods: list[str],
     *,
     asset_category: str | None,
-    base_currency: str,
     report: Any = None,
 ) -> list[MonthStats]:
     """`month_stats` over several periods, sharing one episode history pass.
@@ -633,14 +629,9 @@ def _period_stats(
     identical results.
     """
     if report is None:
-        report = build_history(
-            conn, asset_category=asset_category, base_currency=base_currency
-        )
+        report = build_history(conn, asset_category=asset_category)
     return [
-        month_stats(
-            conn, period, asset_category=asset_category,
-            base_currency=base_currency, report=report,
-        )
+        month_stats(conn, period, asset_category=asset_category, report=report)
         for period in periods
     ]
 
@@ -649,7 +640,6 @@ def annual_stats(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     report: Any = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar year, newest first.
@@ -667,7 +657,7 @@ def annual_stats(
     """
     return _period_stats(
         conn, available_years(conn, asset_category),
-        asset_category=asset_category, base_currency=base_currency, report=report,
+        asset_category=asset_category, report=report,
     )
 
 
@@ -675,7 +665,6 @@ def monthly_stats(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     report: Any = None,
 ) -> list[MonthStats]:
     """One `MonthStats` per calendar month, newest first.
@@ -689,8 +678,7 @@ def monthly_stats(
     """
     return _period_stats(
         conn, available_months(conn, asset_category),
-        asset_category=asset_category, base_currency=base_currency,
-        report=report,
+        asset_category=asset_category, report=report,
     )
 
 
@@ -698,7 +686,6 @@ def odte_cohorts(
     conn: sqlite3.Connection,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     report: Any = None,
 ) -> tuple[MonthStats, MonthStats]:
     """0DTE against everything else, over the whole journal.
@@ -713,11 +700,8 @@ def odte_cohorts(
     Dashboard and in neither side here.
     """
     if report is None:
-        report = build_history(
-            conn, asset_category=asset_category, base_currency=base_currency
-        )
-    odte = odte_scope(conn, asset_category=asset_category,
-                      base_currency=base_currency, report=report)
+        report = build_history(conn, asset_category=asset_category)
+    odte = odte_scope(conn, asset_category=asset_category, report=report)
     where, params = _category_where(asset_category)
     every = frozenset(str(r["trade_id"]) for r in conn.execute(
         f"SELECT trade_id FROM trades {where}", params))
@@ -726,7 +710,7 @@ def odte_cohorts(
 
     def side(scope: TradeScope) -> MonthStats:
         return month_stats(conn, None, asset_category=asset_category,
-                           base_currency=base_currency, scope=scope, report=report)
+                           scope=scope, report=report)
 
     return side(odte), side(rest)
 
@@ -818,7 +802,6 @@ def month_stats(
     period: str | None = None,
     *,
     asset_category: str | None = "OPT",
-    base_currency: str = "EUR",
     scope: TradeScope = ALL_TRADES,
     report: Any = None,
 ) -> MonthStats:
@@ -833,9 +816,11 @@ def month_stats(
     Annual tab asks for a dozen months, two years and an all-time row on every
     page load, and rebuilding the episode history for each was the whole cost.
     """
+    if report is None:
+        report = build_history(conn, asset_category=asset_category)
     stats = MonthStats(
         month=period or "ALL",
-        base_currency=base_currency,
+        base_currency=report.base_currency,
         asset_category=asset_category or "ALL",
     )
 
@@ -892,10 +877,6 @@ def month_stats(
         fee_rows.append((row["amount_base"], row["amount"], row["currency"]))
     stats.fees = Money.charged(fee_rows)
 
-    if report is None:
-        report = build_history(
-            conn, asset_category=asset_category, base_currency=base_currency
-        )
     stats.open_episodes = sum(1 for e in report.open if scope.has_episode(e))
     # Premium is cash received or paid in the contract's own currency, so it
     # takes the same treatment as commission: exact when one currency accounts

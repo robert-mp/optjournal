@@ -68,7 +68,7 @@ from optjournal.flex import (
     read_token,
     write_token,
 )
-from optjournal.history import build_history
+from optjournal.history import build_history, journal_base_currency
 from optjournal.ingest import (
     ASSET_FILTER_ALL,
     ingest_confirms,
@@ -488,8 +488,7 @@ def cmd_history(args) -> int:
     scope = None if args.assets.strip().upper() == "ALL" else args.assets.strip().upper()
     with open_journal(args.db) as conn:
         report = build_history(conn, asset_category=scope)
-        totals = month_stats(conn, None, asset_category=scope,
-                             base_currency=report.base_currency, report=report)
+        totals = month_stats(conn, None, asset_category=scope, report=report)
     data = history_data(report, totals)
     _emit(data, render_history(data), args.json)
     return EXIT_OK if report.episodes else EXIT_NO_DATA
@@ -1335,7 +1334,7 @@ def cmd_confirms(args) -> int:
         return EXIT_CONFIG
 
     with open_journal(args.db) as conn:
-        base = _journal_base_currency(conn)
+        base = journal_base_currency(conn)
         if not base:
             print(
                 "No ingested statement to read the base currency from. Run "
@@ -1381,15 +1380,6 @@ def cmd_confirms(args) -> int:
     lines.extend(f"  ! {w}" for w in ingested.warnings)
     _emit(data, "\n".join(lines), args.json)
     return EXIT_OK
-
-
-def _journal_base_currency(conn) -> str | None:
-    """The account's base currency, from the newest ingested statement."""
-    row = conn.execute(
-        "SELECT base_currency FROM statements WHERE base_currency IS NOT NULL"
-        " ORDER BY ingested_at DESC LIMIT 1"
-    ).fetchone()
-    return str(row["base_currency"]) if row and row["base_currency"] else None
 
 
 #: A supervised caller's deadline for the shared fetch lock, in seconds. The CLI
