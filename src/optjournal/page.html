@@ -2007,9 +2007,9 @@ function renderPeriod(){
   const has=cur==='all'||(S.state.months||[]).includes(cur);
   const label=cur==='all'?'All time':monthLabel(cur);
   const tipFor=m=>m==='all'?'All time':monthLabel(m);
-  /* Not on the Dashboard while a tile there states it: the same figure three
-     times on one screen reads as three figures. */
-  const s=S.tab==='dashboard'&&tileKeys().includes('net_pnl')?null:S.state.stats;
+  /* On every tab with the stepper, the Dashboard included: the month's result
+     belongs beside the month it is for, wherever the tiles below are scrolled. */
+  const s=S.state.stats;
   el.innerHTML=`<div class="pstep">
       <button data-month="${prev??''}" ${prev===null?'disabled':''}
         title="${prev===null?'account start':esc(tipFor(prev))}"
