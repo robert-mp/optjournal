@@ -654,8 +654,8 @@ def build_state(
     server is threaded, so a shared handle would fail intermittently under the
     one condition nobody tests for.
 
-    `trade_type` drives the Trade Types control for the three views that carry
-    the filter bar -- Dashboard, Calendar and Trades. Two kinds of selection
+    `trade_type` drives the Trade Types control for the four views that carry
+    the filter bar -- Dashboard, Calendar, Trades and Journal. Two kinds of selection
     hide behind one control: "odte" is a fill-level *scope* within options,
     while "equities" switches the *category* the summations run over, because
     stocks are not a subset of options trades. Either way it deliberately

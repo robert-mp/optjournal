@@ -3455,7 +3455,7 @@ def test_the_period_controls_appear_only_on_the_tabs_they_drive():
     """
     js = _js()
     assert "const PERIOD_TABS=['dashboard','calendar'];" in js
-    assert "const TYPE_TABS=['dashboard','calendar','trades'];" in js
+    assert "const TYPE_TABS=['dashboard','calendar','trades','review'];" in js
     assert "if(!PERIOD_TABS.includes(S.tab)" in _fn("renderPeriod")
     view = _fn("renderViewOptions")
     assert "const onType=TYPE_TABS.includes(S.tab);" in view

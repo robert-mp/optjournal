@@ -1969,7 +1969,7 @@ function ccyControl(){
    its numbers. Trades lists every position whatever the month, so it shows the
    trade type and not the stepper; Holdings ignores both, so it gets neither. */
 const PERIOD_TABS=['dashboard','calendar'];
-const TYPE_TABS=['dashboard','calendar','trades'];
+const TYPE_TABS=['dashboard','calendar','trades','review'];
 const TYPE_LABEL={'':'Options',equities:'Equities',odte:'0DTE'};
 
 /* THE MONTH STEPPER. It replaces the month dropdown and the calendar's own
@@ -2112,14 +2112,15 @@ function equitiesNote(){
   const n=(S.state.asset_counts||{}).STK;
   return n
     ? `Show the ${plural(n,'stock fill')} instead of options. Stocks are a different `
-      +`asset category, not a subset: Dashboard, Calendar and Trades switch to `
-      +`STK, and other tabs stay on options.`
+      +`asset category, not a subset: Dashboard, Calendar, Trades and Journal `
+      +`switch to STK, and other tabs stay on options.`
     : 'No stock trades in the journal. If some exist in the archive, run '
       +'`optjournal ingest` to fold them in.';
 }
-/* Rendered at the head of exactly the tabs the trade type drives -- Dashboard,
-   Calendar and Trades, TYPE_TABS -- and more necessary than it was, now that the
-   control itself sits in a panel that is usually closed. A filter that silently changes
+/* Rendered at the head of the tabs the trade type drives -- Dashboard, Calendar
+   and Trades; the Journal, the last of TYPE_TABS, names it in its own line --
+   and more necessary than it was, now that the control itself sits in a panel
+   that is usually closed. A filter that silently changes
    every number is the same failure as a total that silently spans a wider
    scope than its label, and fees genuinely do not narrow, so naming which
    figures moved is the honest version. Equities gets its own wording: it is
@@ -2127,8 +2128,8 @@ function equitiesNote(){
 function scopeNote(){
   if(!S.type) return '';
   if(S.type==='equities')
-    return `<div class="note"><b>Equities.</b> Dashboard, Calendar and Trades show
-      STK activity; Holdings, Costs, Annual and 0DTE stay on options.${infoTip(
+    return `<div class="note"><b>Equities.</b> Dashboard, Calendar, Trades and Journal
+      show STK activity; Holdings, Costs, Annual and 0DTE stay on options.${infoTip(
       `STK is a different asset category, not a subset of the options journal.
        <br><br>Stock P&amp;L uses IBKR's per-fill realisation: each lot sold is
        realised when it is sold.`)}</div>`;
