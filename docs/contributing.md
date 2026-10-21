@@ -178,11 +178,12 @@ binding `page.html` to `build_state`, static checks over the page's JavaScript
 browser engine (`test_rendered.py`).
 
 Shared scaffolding lives in `tests/conftest.py` — `RAW_DIR`/`STATEMENTS` point
-at the tracked, redacted corpus, while `LIVE_RAW_DIR`/`LIVE_STATEMENTS` are an
-explicit opt-in for private acceptance checks. It also provides a migrated
-`conn`, a `populated_db`, `add_statement`, and the `code_only` comment stripper
-both JS guards use. What a *trade row* contains stays in the module asserting
-it: that is the subject of those tests, not setup for them.
+at the tracked, redacted corpus, while `LIVE_STATEMENTS` is the private corpus
+for acceptance checks, read only when `OPTJOURNAL_LIVE=1` asks for it. It also
+provides a migrated `conn`, a `populated_db`, `add_statement`, and the
+`code_only` comment stripper both JS guards use. What a *trade row* contains
+stays in the module asserting it: that is the subject of those tests, not setup
+for them.
 
 **Every consumer of a payload is bound to its producer by a test**, because the
 one that was not shipped broken: `render.py` kept reading the flat money keys the

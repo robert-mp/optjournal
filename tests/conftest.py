@@ -45,11 +45,18 @@ STATEMENTS = sorted(RAW_DIR.glob("activity-*.xml"))
 #: The project root, for tests reaching source files rather than data.
 ROOT = Path(__file__).resolve().parent.parent
 
-#: Optional acceptance corpus from the developer's account. Tests that make
-#: claims about specific live rows opt into this explicitly; the normal suite
-#: never changes when another statement is fetched.
-LIVE_RAW_DIR = data_home() / "raw"
-LIVE_STATEMENTS = sorted(LIVE_RAW_DIR.glob("activity-*.xml"))
+#: Optional acceptance corpus from the developer's account, read only when
+#: `OPTJOURNAL_LIVE=1` asks for it. Tests that make claims about specific live
+#: rows opt into this explicitly; the normal suite never reads a private archive,
+#: so it never changes when another statement is fetched.
+LIVE_STATEMENTS = (
+    sorted((data_home() / "raw").glob("activity-*.xml"))
+    if os.environ.get("OPTJOURNAL_LIVE") else []
+)
+
+#: Skip marker for those tests, saying how to opt in.
+needs_live = pytest.mark.skipif(
+    not LIVE_STATEMENTS, reason="needs the live corpus: run with OPTJOURNAL_LIVE=1")
 
 
 def _is_copy() -> bool:

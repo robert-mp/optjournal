@@ -13,7 +13,7 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
-from conftest import LIVE_STATEMENTS, STATEMENTS, add_statement, connect_migrated
+from conftest import LIVE_STATEMENTS, STATEMENTS, add_statement, connect_migrated, needs_live
 
 from optjournal.history import (
     NON_POSITION_CATEGORIES,
@@ -688,7 +688,7 @@ def test_empty_database_yields_empty_report(conn):
 # ----------------------------------------------- end-to-end against real data
 
 
-@pytest.mark.skipif(not LIVE_STATEMENTS, reason="needs the optional live corpus")
+@needs_live
 def test_real_sive_round_trip(tmp_path):
     """SIVE: bought twice, fully sold, re-entered. IBKR states the P&L itself.
 
@@ -1224,7 +1224,7 @@ def _fifo_realized(rows: list[dict]) -> dict[str, float]:
     return dict(pnl)
 
 
-@pytest.mark.skipif(not LIVE_STATEMENTS, reason="needs the optional live corpus")
+@needs_live
 def test_computed_fifo_pnl_agrees_with_the_brokers_own_figure(tmp_path):
     """The oracle for task 9: can this journal derive what IBKR reports?
 
@@ -1311,7 +1311,7 @@ def _partially_closed(rows: list[dict]) -> set[str]:
     return partial
 
 
-@pytest.mark.skipif(not LIVE_STATEMENTS, reason="needs the optional live corpus")
+@needs_live
 def test_specific_lot_selection_leaves_no_trace_this_journal_can_follow():
     """The limitation, pinned so it is discovered here rather than in April.
 
