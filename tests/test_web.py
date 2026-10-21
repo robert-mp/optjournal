@@ -122,6 +122,7 @@ def state(populated) -> dict:
         " detail, done, total) VALUES ('sync', ?, ?, ?, 'ok', '2 new trades', 1, 1)",
         (fired, str(today), str(today)),
     )
+    conn.commit()
     # A journal entry, seeded for the same reason as the events and the job row:
     # the contract guard anchors `JournalEntry` to a real payload row, and every
     # fresh journal has none -- so the shape would be quietly exempted rather than
@@ -141,7 +142,6 @@ def state(populated) -> dict:
                     "followed_target": "yes", "exit_trigger": "target",
                     "lessons": "sized right, closed a week early"},
         )
-    conn.commit()
     conn.close()
     return build_state(db_path=populated, archive_dir=RAW_DIR, query_id="1591754")
 

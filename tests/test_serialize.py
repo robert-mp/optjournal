@@ -1111,6 +1111,7 @@ def test_a_note_no_decision_claims_is_listed_rather_than_lost(tmp_path):
             " '2026-09-01 10:00:00',?,?,?,'SPY','O',1,'USD',1.0,'{}','t.xml','now')",
             (tid, tid, tid, order, cat, conid, conid),
         )
+    conn.commit()
     for anchor in ("100", "200", "999"):
         journal.save(conn, anchor, account_id="U1", underlying_symbol="SPY",
                      opened_on="2026-09-01", values={"entry_note": f"note {anchor}"})
