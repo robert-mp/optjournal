@@ -549,13 +549,6 @@ def test_scope_narrows_every_trade_derived_figure(conn):
     assert len(only.days) < len(everything.days)
 
 
-def test_scope_leaves_account_level_fees_alone(conn):
-    """Fees carry no trade linkage, so narrowing them would invent one."""
-    everything = month_stats(conn, None)
-    only = month_stats(conn, None, scope=odte_scope(conn))
-    assert only.fees == everything.fees
-
-
 def test_scope_hides_months_it_has_emptied(conn):
     """Offering a month the filter emptied would look like a broken dashboard."""
     all_months = available_months(conn)
@@ -682,8 +675,6 @@ def test_the_scope_reaches_the_payload_end_to_end(demo, tmp_path):
     )
     assert scoped["positions"] == everything["positions"]
     assert scoped["odte"] == everything["odte"]
-    # And fees have no trade to attach to, so they cannot narrow either.
-    assert scoped["stats"]["fees"] == everything["stats"]["fees"]
 
     # The reconciliation the Annual table invites must survive an active filter.
     assert sum(y["total_trades"] for y in scoped["annual"]) == (

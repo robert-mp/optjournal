@@ -344,12 +344,6 @@ class MonthStats:
     #: `.native` is that exact figure, present only where one currency
     #: accounts for all of it; see `Money`.
     commissions: Money = Money.restated(0.0)
-    #: Account-level fee rows. IBKR bills each in a currency and stores it
-    #: alongside the base translation, so this takes the same treatment as
-    #: commission -- and had to, because the cost report already presented
-    #: `fees` as a Money while this panel showed a base-only float for the
-    #: same charges.
-    fees: Money = Money.restated(0.0)
 
     #: Closes: one order's closing fills on one contract on one trade day. A
     #: partial close is one, so the scoreboard reads the fills `net_pnl` does and
@@ -418,62 +412,6 @@ class MonthStats:
         # Base over base: NAV arrives from IBKR in base only (the section is
         # EquitySummaryByReportDateInBase), so the ratio has no native form.
         return self.net_pnl.base / self.net_liq_base * 100.0
-
-    @property
-    def options_friction(self) -> Money:
-        """Friction attributable to `asset_category`, base and as-charged.
-
-        Commission is charged per trade, so it carries an assetCategory and
-        the ingest filter genuinely applies to it. This is the only friction
-        figure on this panel that is scoped to the journalled instruments.
-
-        Derived from `commissions` rather than tracked separately: they are the
-        same money, and computing the magnitude twice is how the two drift
-        apart. Taking `abs` of a `Money` carries the currency along, so the
-        as-charged figure cannot end up labelled with another figure's
-        currency -- which is what the two separate properties this replaces
-        had to do, reading `commissions_native_ccy` for their own label.
-        """
-        return abs(self.commissions)
-
-    @property
-    def account_friction_base(self) -> float:
-        """Friction that cannot be attributed to `asset_category`.
-
-        Fee rows carry no assetCategory at all -- market-data subscriptions
-        and custody charges are levied on the account, not on a trade -- so
-        ingest deliberately does not filter them and they cannot be
-        apportioned to options without inventing the split. The AutoFX markup
-        has the same problem: IBKR never ties a conversion back to the trade
-        that caused it.
-
-        Narrower than `CostReport.account_friction_base` despite the matching
-        name: this panel reads the `asset_category`-filtered database, so it
-        cannot see commission on other instruments at all, while the cost
-        report reads the raw statement and includes it. Do not present the two
-        under the same label -- they differ by the whole of stock commission.
-
-        The signed sum flipped once, not its magnitude: a period whose refunds
-        exceed its charges (September 2026 on the real account, +0.01) is a net
-        credit, and the Costs tab (`costs.build_costs`) reports it as one.
-        """
-        return -self.fees.base
-
-    @property
-    def total_friction_base(self) -> float:
-        """Both scopes together.
-
-        Presenting this single figure under a panel headed "options" was
-        wrong: it labelled account-level fees as this journal's cost, which
-        is the same defect the cost report carried. Read
-        `options_friction` and `account_friction_base` instead wherever
-        the scope is being claimed.
-
-        Base only, and not a `Money`: it merges a per-trade charge with
-        account-level fees, so no single currency can speak for the sum even
-        when the commission half is uniform.
-        """
-        return self.options_friction.base + self.account_friction_base
 
 
 @dataclass(frozen=True)
@@ -858,21 +796,6 @@ def month_stats(
     stats.commissions = Money.charged(fill_commission)
     stats.net_pnl = Money.charged(fill_pnl)
 
-    # Fees are account-level CashTransaction rows, never trade-linked -- verified
-    # against real data, where none of the 65 fee rows carries a conid or tradeID.
-    # Deliberately NOT scoped: there is nothing to filter them on, and pro-rating
-    # them into a fill subset would be inventing an attribution. Under an active
-    # scope they stay the account's figure, which is what the pill already says.
-    fee_rows: list[tuple[float | None, float | None, str | None]] = []
-    for row in conn.execute(
-        "SELECT date_time, amount_base, amount, currency, type FROM cash_transactions"
-        " WHERE UPPER(type) LIKE '%FEES%'"
-    ):
-        if not _in_period(row["date_time"], period):
-            continue
-        fee_rows.append((row["amount_base"], row["amount"], row["currency"]))
-    stats.fees = Money.charged(fee_rows)
-
     stats.open_episodes = sum(1 for e in report.open if scope.has_episode(e))
     # Premium is cash received or paid in the contract's own currency, so it
     # takes the same treatment as commission: exact when one currency accounts
@@ -919,11 +842,9 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         # A `Money` figure serialises as one nested object rather than three
         # parallel keys. The page reads `.base`, `.native` and `.ccy` off it
         # through a single helper, so a new gated figure costs no new display
-        # branch. Figures that stay flat floats -- net_pnl, avg_win, net_liq,
-        # the friction rollups -- are the ones for which no as-charged amount
-        # can exist, and the shape says so.
+        # branch. A figure that stays a flat float, as net_liq_base does, is one
+        # for which no as-charged amount can exist, and the shape says so.
         "commissions": stats.commissions.payload(),
-        "fees": stats.fees.payload(),
         "closes": stats.closes,
         "open_episodes": stats.open_episodes,
         "wins": stats.wins,
@@ -939,9 +860,6 @@ def stats_data(stats: MonthStats) -> dict[str, Any]:
         "net_liq_base": stats.net_liq_base,
         "net_liq_date": stats.net_liq_date,
         "gain_pct_of_net_liq": stats.gain_pct_of_net_liq,
-        "options_friction": stats.options_friction.payload(),
-        "account_friction_base": stats.account_friction_base,
-        "total_friction_base": stats.total_friction_base,
         "green_days": stats.green_days,
         "red_days": stats.red_days,
         "days": [

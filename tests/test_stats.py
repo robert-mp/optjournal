@@ -548,31 +548,6 @@ def test_nothing_closed_ranks_nothing(conn):
     assert _ranking(conn, None) == {"best": None, "worst": None}
 
 
-def test_account_fees_are_signed_so_a_refund_month_agrees_with_the_costs_tab(conn):
-    """September 2026 on the real account was refunded more than it was charged.
-
-    The Dashboard took the magnitude of the signed sum, so a net CREDIT of 0.01
-    read as a 0.01 charge while the Costs tab (`costs.build_costs`) reported the
-    credit. Both now flip the sign once, on the total.
-    """
-    from optjournal.costs import build_costs
-
-    for tid, day, amount in (("f1", "2026-09-02 13:33:52", 1.30),
-                             ("f2", "2026-09-02 17:34:36", -1.29)):
-        conn.execute(
-            "INSERT INTO cash_transactions (transaction_id, account_id, date_time,"
-            " type, description, amount, currency, fx_rate_to_base, amount_base,"
-            " raw, source_file, first_seen_at)"
-            " VALUES (?, 'U1', ?, 'Other Fees', 'OPRA NP L1', ?, 'EUR', 1.0, ?,"
-            " '{}', 't.xml', 'now')",
-            (tid, day, amount, amount),
-        )
-    s = month_stats(conn, "2026-09")
-    assert s.account_friction_base == pytest.approx(-0.01)
-    assert s.account_friction_base == pytest.approx(
-        build_costs(conn, period="2026-09").unattributable.base)
-
-
 def test_a_reversal_through_zero_scores_the_long_and_the_short_apart(conn):
     """`pnl/s_cross_zero.py`: long 2 calls, one SELL 3 (`C;O`) realising +198 in
     September, the leftover short bought back in October for +149.

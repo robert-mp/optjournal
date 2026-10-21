@@ -831,11 +831,11 @@ def test_stats_panel_keys_present(state):
     """The dashboard's ten stat cards each need a real key."""
     s = state["stats"]
     for key in (
-        "total_trades", "orders", "net_pnl", "commissions", "fees",
+        "total_trades", "orders", "net_pnl", "commissions",
         "wins", "losses", "win_rate", "avg_win", "avg_loss",
         "closes", "open_episodes",
         "green_days", "red_days", "days",
-        "total_friction_base", "net_liq_base", "gain_pct_of_net_liq",
+        "net_liq_base", "gain_pct_of_net_liq",
     ):
         assert key in s, f"stats.{key} missing"
 
@@ -2621,28 +2621,6 @@ def test_the_companion_is_a_window_not_a_frame():
     assert "window.open(companionUrl()" in _js().replace(" ", "")
     for doc in (page_html(), companion_html()):
         assert "<iframe" not in doc and "<frame" not in doc
-
-
-def test_dashboard_friction_is_split_by_scope(state):
-    """The panel is headed by an asset category, so it must not blend scopes.
-
-    It presented one `total_friction_base` pill labelled "friction (options)"
-    that was options commission plus account-level fees -- the same defect the
-    cost report carried. Fees carry no assetCategory, so ingest does not filter
-    them and they cannot be attributed to options.
-    """
-    s = state["stats"]
-    assert s["options_friction"]["base"] == abs(s["commissions"]["base"])
-    assert s["account_friction_base"] == -s["fees"]["base"]
-    # The split reapportions; it must not change or drop anything.
-    assert (
-        s["options_friction"]["base"] + s["account_friction_base"]
-        == s["total_friction_base"]
-    )
-    # Guards the actual bug: the attributable figure must exclude fees.
-    assert s["options_friction"]["base"] != s["total_friction_base"], (
-        "fees are being counted as options friction again"
-    )
 
 
 def test_a_snapshot_leg_keeps_the_sign_of_the_position_it_seeds():
