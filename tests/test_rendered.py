@@ -437,10 +437,10 @@ def test_the_journal_offers_the_trade_type_its_review_follows(served, tmp_path):
     """The review counts the Trades tab's cards, so the trade type narrows it,
     and a control that moves a tab's numbers is one that tab displays."""
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     dom = browser.dump_dom(f"{served}/#tab=review&type=odte", tmp_path / "review-odte")
     if dom is None:
-        pytest.skip("no browser produced a DOM (environment, not the page)")
+        no_browser("no browser produced a DOM (environment, not the page)")
     assert "0DTE only" in browser.rendered_text(dom)
     page = browser.markup(dom)
     assert 'data-type="odte"' in page, "the Journal follows a trade type it does not offer"
