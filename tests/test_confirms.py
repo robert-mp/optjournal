@@ -632,3 +632,55 @@ def test_a_close_with_nothing_on_record_to_close_stays_unpriced(tmp_path):
     ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
     row = _buyback(conn)
     assert (row["fifo_pnl_realized"], row["pnl_estimated"]) == (None, 0)
+
+
+# --- the statement is the record of its own period ----------------------------
+
+
+def _confirmed_then_settled(tmp_path: Path, **settled: str):
+    """A journal holding the sale's confirm, then a statement with `settled` set."""
+    conn = connect_migrated(tmp_path / "j.db")
+    confirm = tmp_path / "confirm-20260924.xml"
+    confirm.write_text(CONFIRM_XML, encoding="utf-8")
+    ingest_confirms(conn, confirm, base_currency="EUR", rate_for=_fixed_rate())
+    activity = tmp_path / "activity-20260925T050000Z.xml"
+    activity.write_text(_with(ACTIVITY_XML, **settled), encoding="utf-8")
+    ingest_file(conn, activity)
+    return conn
+
+
+def _stored(conn) -> list[tuple]:
+    return [tuple(r) for r in conn.execute(
+        "SELECT trade_id, source_kind, quantity FROM trades ORDER BY trade_id")]
+
+
+def test_a_confirm_the_statement_records_under_another_id_is_replaced_not_kept(
+    tmp_path,
+):
+    """The statement holds the sale under its own trade id. The confirm's row, which
+    it does not hold, would stand beside it as a second sale, so the contract would
+    net -4 where the account holds -2."""
+    conn = _confirmed_then_settled(tmp_path, tradeID="1592002999",
+                                   ibExecID="0002920a.6ab5328c.09.01")
+    assert _stored(conn) == [("1592002999", "activity", -2)]
+
+
+def test_a_confirm_the_statement_records_under_another_id_with_its_exec_id_lands(
+    tmp_path,
+):
+    """The same execution id under a new trade id. While the confirm's row holds
+    that id, the one-row-per-execution index would refuse the statement's row, and
+    the whole statement with it."""
+    conn = _confirmed_then_settled(tmp_path, tradeID="1592002999")
+    assert _stored(conn) == [("1592002999", "activity", -2)]
+
+
+def test_a_statement_for_an_earlier_period_leaves_todays_confirms_alone(tmp_path):
+    """A statement speaks for its own days only: today's fills are not in it
+    because they have not settled, not because they did not happen."""
+    conn = _confirmed_then_settled(
+        tmp_path, fromDate="20260922", toDate="20260923", tradeID="1591000001",
+        ibExecID="0002920a.6ab50000.01.01", transactionID="6711000001",
+        tradeDate="20260922", dateTime="20260922;101659", reportDate="20260922")
+    assert _stored(conn) == [("1591000001", "activity", -2),
+                             ("1592002840", "confirm", -2)]

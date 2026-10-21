@@ -253,9 +253,11 @@ def ingest_file(
     # makes, and which was only true of the trade path until now.
     #
     with _all_or_nothing(conn):
+        periods: dict[str, tuple[str | None, str | None]] = {}
         # Provenance first: `statements.source_file` is a foreign key from every
         # other table, so its row has to exist before theirs.
         for meta in source.metadata(path):
+            periods[meta.account_id or ""] = (meta.from_date, meta.to_date)
             conn.execute(
                 "INSERT INTO statements (broker, source_file, sha256, account_id,"
                 " from_date, to_date, when_generated, base_currency, asset_filter,"
@@ -279,7 +281,10 @@ def ingest_file(
             )
 
         base_currency = source.base_currency(path)
-        for _account_id, fills in source.statements(path):
+        for account_id, fills in source.statements(path):
+            if SOURCE_RANK.get(source_kind, 0) > SOURCE_RANK[CONFIRM_SOURCE]:
+                _drop_confirms_not_restated(conn, broker, account_id,
+                                            periods[account_id], fills)
             _ingest_trades(conn, fills, path.name, assets, result,
                            base_currency=base_currency, broker=broker,
                            source_kind=source_kind)
@@ -372,6 +377,31 @@ def ingest_confirms(
                            source_kind=CONFIRM_SOURCE, fx_rate_estimated=estimated)
         _estimate_same_session_closes(conn, broker)
     return result
+
+
+def _drop_confirms_not_restated(
+    conn: sqlite3.Connection, broker: str, account_id: str,
+    period: tuple[str | None, str | None], fills: list[NormalisedFill],
+) -> None:
+    """Delete this account's confirm rows dated inside `period` that `fills`,
+    the statement's for that period, do not hold.
+
+    The statement is the record of its own days. A confirm it does not restate
+    under the same trade id is one it records under another id or not at all,
+    and left standing it counts a fill twice: the contract nets double what the
+    account holds, and an execution id the statement brings back trips
+    `trades_exec`, refusing the whole statement.
+    """
+    held = {fill.trade_id for fill in fills}
+    stale = [
+        (broker, row["trade_id"]) for row in conn.execute(
+            "SELECT trade_id FROM trades WHERE broker = ? AND account_id = ?"
+            " AND source_kind = ? AND trade_date BETWEEN ? AND ?",
+            (broker, account_id, CONFIRM_SOURCE, *period),
+        )
+        if row["trade_id"] not in held
+    ]
+    conn.executemany("DELETE FROM trades WHERE broker = ? AND trade_id = ?", stale)
 
 
 def _estimate_same_session_closes(conn: sqlite3.Connection, broker: str) -> None:
