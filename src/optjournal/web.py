@@ -313,15 +313,14 @@ EARNINGS_MAX_AGE_S = 20 * 3600
 
 
 def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
-                      force: bool = False) -> tuple[list[str], int]:
+                      force: bool = False) -> int:
     """Fetch the next earnings date for symbols whose stored one is stale.
 
-    Returns the symbols whose fetch FAILED, so the reply can say so, and how
-    many were asked, so the page knows whether its payload is now stale; a symbol
-    with no earnings (a fund) is an answer and is stored as none, while a failed
-    fetch keeps the stored date. Every asked symbol is stamped, success or not,
-    so a dead endpoint costs one request per symbol per day rather than one per
-    refresh.
+    Returns how many were asked, so the page knows whether its payload is now
+    stale. A symbol with no earnings (a fund) is an answer and is stored as
+    none, while a failed fetch keeps the stored date. Every asked symbol is
+    stamped, success or not, so a dead endpoint costs one request per symbol per
+    day rather than one per refresh.
 
     EVERY FETCH FIRST, THEN EVERY WRITE in one short transaction. A fetch can
     take up to `earnings._TIMEOUT_S`, and writing after each one held the
@@ -346,14 +345,15 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
             if age < EARNINGS_MAX_AGE_S:
                 continue
         due.append(symbol)
-    failed: list[str] = []
     found: dict[str, earnings_mod.Earnings | None] = {}
+    # Side by side: Nasdaq takes seconds a symbol, and the quotes wait on these.
+    with ThreadPoolExecutor(max_workers=QUOTE_WORKERS) as pool:
+        asked = {symbol: pool.submit(earnings_mod.fetch_earnings, symbol) for symbol in due}
     for symbol in due:
         try:
-            found[symbol] = earnings_mod.fetch_earnings(symbol)
+            found[symbol] = asked[symbol].result()
         except earnings_mod.EarningsFetchError as exc:
             log.debug("earnings %s failed: %s", symbol, exc)
-            failed.append(symbol)
     for symbol in due:
         if symbol not in found:
             conn.execute("UPDATE watchlist SET earnings_checked_at = ? WHERE symbol = ?",
@@ -369,7 +369,7 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
              stamp, symbol),
         )
     conn.commit()
-    return failed, len(due)
+    return len(due)
 
 
 def _inverted_alert(conn: sqlite3.Connection, symbol: str,
@@ -653,8 +653,8 @@ def build_state(
     server is threaded, so a shared handle would fail intermittently under the
     one condition nobody tests for.
 
-    `trade_type` drives the Trade Types control for the three views that carry
-    the filter bar -- Dashboard, Calendar and Trades. Two kinds of selection
+    `trade_type` drives the Trade Types control for the four views that carry
+    the filter bar -- Dashboard, Calendar, Trades and Journal. Two kinds of selection
     hide behind one control: "odte" is a fill-level *scope* within options,
     while "equities" switches the *category* the summations run over, because
     stocks are not a subset of options trades. Either way it deliberately
@@ -766,10 +766,6 @@ def build_state(
                 month_stats(conn, selected, asset_category=view_category,
                             scope=scope, report=view_report)
             ),
-            "all_time": stats_data(
-                month_stats(conn, None, asset_category=view_category,
-                            scope=scope, report=view_report)
-            ),
             "positions": positions_data(conn),
             "allocation": allocation_data(conn),
             # Net liquidation over time against the money put in, for the
@@ -810,7 +806,7 @@ def build_state(
             # The requests a history import would make now, newest first, so the
             # Advanced panel can say how many before anyone presses it.
             "history_plan": [{"from": fd, "to": td} for fd, td in plan],
-            # The header's dateline. Deliberately outside `stats`/`all_time`:
+            # The header's dateline. Deliberately outside `stats`:
             # how long the log has been kept is a fact about the JOURNAL, not
             # about a selected month or a trade-type scope, and a header figure
             # that moved with a filter the header does not display is the same
@@ -823,14 +819,11 @@ def build_state(
             "journal": journal_data(conn),
         }
         # How many POSITIONS the open contracts form, which needs the campaign
-        # grouping and so cannot be computed inside month_stats. Set on both
-        # blocks because they share the Stats shape, and it is period-invariant
-        # either way: the open book is the open book whatever month is selected.
-        open_positions = position_count(
+        # grouping and so cannot be computed inside month_stats. Period-invariant:
+        # the open book is the open book whatever month is selected.
+        state["stats"]["open_positions"] = position_count(
             view_campaigns, view_episodes, in_scope=scope.has_episode,
         )
-        for block in ("stats", "all_time"):
-            state[block]["open_positions"] = open_positions
         # The header's open book, over the HOME category's campaigns whatever the
         # trade type, because the dateline is a fact about the journal and shows on
         # tabs the trade type does not reach. Only Equities builds other ones.
@@ -841,14 +834,13 @@ def build_state(
         # The strategy ranking, for the same reason as open_positions: a close is
         # ranked under its card's opening shape, and the cards are built here
         # rather than inside month_stats. Unlike open_positions it IS
-        # period-bound, so each block ranks its own period, over the scope the
+        # period-bound, so it ranks the selected period, over the scope the
         # tiles beside it count.
         shapes = fill_shapes(state["lifecycles"], view_campaigns, view_episodes)
-        for block, period in (("stats", selected), ("all_time", None)):
-            ranking = strategy_ranking(conn, period, shapes=shapes,
-                                       asset_category=view_category, scope=scope)
-            state[block]["best_strategy"] = ranking["best"]
-            state[block]["worst_strategy"] = ranking["worst"]
+        ranking = strategy_ranking(conn, selected, shapes=shapes,
+                                   asset_category=view_category, scope=scope)
+        state["stats"]["best_strategy"] = ranking["best"]
+        state["stats"]["worst_strategy"] = ranking["worst"]
         # Over the same cards the Trades tab draws, so the review and the cards
         # are one reading of one scope.
         state["journal"]["review"] = journal_review(
@@ -871,8 +863,8 @@ def build_state(
                 report=report,
             )
         ]
-        # The Annual table's total row. Deliberately not `all_time`, which is the
-        # Dashboard's figure and therefore scoped: under an active filter the
+        # The Annual table's total row. Deliberately not `stats` at All time, which
+        # is the Dashboard's figure and therefore scoped: under an active filter the
         # year rows stayed whole while that total shrank, so the table stopped
         # adding up -- destroying the one reconciliation it exists to show.
         state["annual_total"] = stats_data(whole)
@@ -1432,7 +1424,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "SELECT symbol FROM watchlist ORDER BY symbol")]
             # Earnings ride along, but only for dates over a day old: one request
             # per symbol per day, whatever the quote cadence.
-            earnings_failed, earnings_asked = _refresh_earnings(conn, symbols)
+            earnings_asked = _refresh_earnings(conn, symbols)
         with ThreadPoolExecutor(max_workers=QUOTE_WORKERS) as pool:
             asked = {symbol: pool.submit(fetch_quote, symbol) for symbol in symbols}
             ranked = _iv_ranks(symbols, held=self.cfg.iv_ranks, pool=pool)
@@ -1463,9 +1455,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             "ok": True,
             "quotes": quotes,
             "failed": failed,
-            #: Symbols whose earnings date could not be refreshed; the stored one
-            #: stands and the page says so.
-            "earnings_failed": earnings_failed,
             #: How many earnings dates were re-asked; nonzero means the state
             #: payload's dates may have moved, so the page reloads it.
             "earnings_asked": earnings_asked,

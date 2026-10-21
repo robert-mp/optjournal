@@ -431,9 +431,10 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
     samples = {
         "State": state,
         "Stats": state["stats"],
-        # all_time rather than the selected month: a single month can hold no
-        # decided position and leave the shape null, which would exempt it.
-        "StrategyRank": state["all_time"]["best_strategy"],
+        # The fixture selects no month, so `stats` spans all time: a single month
+        # can hold no decided position and leave the shape null, which would
+        # exempt it.
+        "StrategyRank": state["stats"]["best_strategy"],
         # Anchors the nested money shape to a real figure, so the Money
         # typedef cannot drift from what the serializer actually sends.
         "Money": state["stats"]["commissions"],
@@ -934,7 +935,7 @@ def test_an_estimated_close_is_flagged_on_its_day_its_event_and_its_card(populat
     st = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
 
     day = str(fill["trade_date"]).replace("-", "")
-    assert [d["day"].replace("-", "") for d in st["all_time"]["days"]
+    assert [d["day"].replace("-", "") for d in st["stats"]["days"]
             if d["pnl_estimated"]] == [day]
 
     def holds(event) -> bool:
@@ -1053,7 +1054,7 @@ def test_options_commission_reconciles_with_the_fills(populated):
         for m in everything["month_range"]
     )
     assert monthly_sum == pytest.approx(billed)
-    assert everything["all_time"]["commissions"]["base"] == pytest.approx(billed)
+    assert everything["stats"]["commissions"]["base"] == pytest.approx(billed)
 
 
 def test_calendar_day_drilldown_is_wired():
@@ -1230,7 +1231,7 @@ def test_a_lifecycle_spans_open_and_close_and_matches_the_dashboard(populated):
     assert any(x["status"] == "open" and x["realized_pnl"] for x in st["lifecycles"]), (
         "precondition: an open card has booked P&L")
     assert sum(x["realized_pnl"]["base"] for x in st["lifecycles"]
-               if x["realized_pnl"]) == pytest.approx(st["all_time"]["net_pnl"]["base"])
+               if x["realized_pnl"]) == pytest.approx(st["stats"]["net_pnl"]["base"])
 
 
 def test_dashboard_headline_counts_closes_for_options():
@@ -3145,8 +3146,7 @@ def test_the_base_currency_is_the_one_the_statement_states(populated):
     assert state["fx"]["base"] == "USD"
     assert "USD" not in [q["code"] for q in state["fx"]["quotes"]]
     labels = {state[block]["base_currency"]
-              for block in ("stats", "all_time", "annual_total", "history",
-                            "broker_costs")}
+              for block in ("stats", "annual_total", "history", "broker_costs")}
     labels |= {row["base_currency"] for row in state["annual"] + state["monthly"]}
     assert labels == {"USD"}
 
@@ -3469,7 +3469,7 @@ def test_the_period_controls_appear_only_on_the_tabs_they_drive():
     """
     js = _js()
     assert "const PERIOD_TABS=['dashboard','calendar'];" in js
-    assert "const TYPE_TABS=['dashboard','calendar','trades'];" in js
+    assert "const TYPE_TABS=['dashboard','calendar','trades','review'];" in js
     assert "if(!PERIOD_TABS.includes(S.tab)" in _fn("renderPeriod")
     view = _fn("renderViewOptions")
     assert "const onType=TYPE_TABS.includes(S.tab);" in view
@@ -8476,6 +8476,18 @@ def test_the_open_page_follows_the_server_without_a_refresh_button():
     assert "if(Date.now()-(S.pulseAt||0)>=PULSE_MS)pulse();" in js.replace(" ", "")
 
 
+def test_the_sync_button_comes_back_when_its_cooldown_ends_with_nothing_new():
+    """The cooldown runs down with the clock alone, and only a load reads it
+    again. So while one runs, a pulse that finds nothing new reloads anyway, and
+    once it is over the pulse is back to reloading only for a new stamp."""
+    ok = {"state": "ok", "message": "Up to date.", "fix": None, "through": "2026-10-05"}
+    same = {"stamp": "7", "collection": ok}
+    cooling = {**same, "sync": {"configured": True, "cooldown_remaining_s": 840}}
+    assert _pulse(cooling, same)["loads"] == 1
+    over = {**same, "sync": {"configured": True, "cooldown_remaining_s": 0}}
+    assert _pulse(over, same)["loads"] == 0
+
+
 def test_a_server_with_no_scheduler_reports_collection_off(tmp_path, monkeypatch):
     """`serve --no-scheduler` on a journal a scheduler once fed: the old heartbeat
     is stale, and the server, which knows it runs none, says "off" rather than
@@ -9709,6 +9721,17 @@ def test_the_typed_readings_ride_in_the_hash_and_heal_back_out():
     )
 
 
+def test_a_reading_in_the_hash_is_masked_as_its_own_field():
+    """A level grouped in threes is that level, and a VIX of 18.250 stays 18.25:
+    read as 18250 it drew an expected move near 1100% with no warning."""
+    out = _hash_harness([
+        "location.hash='#tab=odte&spx=7,706&vix=18.250&call=7.780&put=7,600';",
+        "applyHash();",
+        "console.log(JSON.stringify([S.zspx,S.zvix,S.zcall,S.zput]));",
+    ])
+    assert out == ["7706", "18.250", "7780", "7600"]
+
+
 def test_the_calculator_explains_itself_on_hover_rather_than_on_the_page():
     """Its two explanations live in tips, and the figures stay on the page.
 
@@ -9862,7 +9885,7 @@ def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state, popul
     sum to what Avg P&L per Trade implies, or the Best Strategy tile is ranking
     different money from the tiles beside it. Recomputed, not pinned.
     """
-    at = state["all_time"]
+    at = state["stats"]
     if not at["closes"]:
         pytest.skip("needs closes")
     conn = connect(populated)
@@ -9892,9 +9915,9 @@ def test_every_close_ranks_under_a_shape_and_each_block_ranks_its_own_period(
     """The strategy tiles rank the money the tiles beside them count.
 
     Every closing fill ranks under some card's opening shape, so ranked as one
-    shape a period's closes sum to its Net P&L. And `stats` ranks the selected
-    month while `all_time` ranks everything: a lifetime answer on a one-month
-    dashboard is the defect the first check would not see.
+    shape a period's closes sum to its Net P&L. And a month's `stats` ranks that
+    month, not everything: a lifetime answer on a one-month dashboard is the
+    defect the first check would not see.
     """
     from optjournal.stats import month_stats, strategy_ranking
     from optjournal.strategies import fill_shapes
@@ -9927,7 +9950,7 @@ def test_every_close_ranks_under_a_shape_and_each_block_ranks_its_own_period(
                          month=quiet)["stats"]
     ranked = [r for r in (picked["best_strategy"], picked["worst_strategy"]) if r]
     assert ranked and sum(r["decided"] for r in ranked) <= closes[quiet] \
-        < state["all_time"]["closes"]
+        < state["stats"]["closes"]
 
 
 def _at_rules(width: int, kind: str = "media") -> list[tuple[str, str]]:
@@ -10447,12 +10470,10 @@ def test_a_refresh_asks_for_an_earnings_date_once_a_day(populated, monkeypatch):
         _, second = _get(base, "/api/quotes")
     assert asked_first == [], "the add just asked; a refresh must not ask again"
     assert (first["earnings_asked"], second["earnings_asked"]) == (0, 0)
-    assert first["earnings_failed"] == []
 
 
-def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, monkeypatch):
-    """A dead endpoint costs one request per symbol per day, not one per refresh,
-    and the page is told which symbols it could not refresh."""
+def test_a_failed_earnings_fetch_is_not_retried_all_day(populated, monkeypatch):
+    """A dead endpoint costs one request per symbol per day, not one per refresh."""
     from optjournal import earnings  # noqa: PLC0415 - local to this test
 
     calls: list[str] = []
@@ -10466,9 +10487,8 @@ def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, 
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         _post(base, "/api/watchlist", {"symbol": "zzzq"})
         assert calls == ["ZZZQ"], "the add asked and the fetch failed"
-        _, reply = _get(base, "/api/quotes")
+        _get(base, "/api/quotes")
     assert calls == ["ZZZQ"], "a failure is stamped, so the day's budget is spent"
-    assert reply["earnings_failed"] == []
 
 
 def _watching(tmp_path, *symbols: str) -> Path:
@@ -10571,7 +10591,7 @@ def _offline_quotes(monkeypatch) -> None:
 def test_a_nasdaq_error_reply_keeps_the_stored_earnings_date(tmp_path, monkeypatch):
     """L8: a throttled Nasdaq reply (HTTP 200, `rCode` 429, no data) used to parse
     as "no earnings" and wipe the stored date for a day. It is a failure now, so
-    the refresh names the symbol and the date on screen stays."""
+    the date on screen stays."""
     from optjournal import earnings  # noqa: PLC0415 - local to this test
 
     db = tmp_path / "j.db"
@@ -10580,8 +10600,8 @@ def test_a_nasdaq_error_reply_keeps_the_stored_earnings_date(tmp_path, monkeypat
     monkeypatch.setattr(earnings, "fetch_earnings", lambda symbol, **_: (
         earnings.parse_earnings({"data": None, "status": {"rCode": 429}})))
     with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
-        status, reply = _get(base, "/api/quotes")
-    assert (status, reply["earnings_failed"]) == (200, ["AMD"])
+        status, _ = _get(base, "/api/quotes")
+    assert status == 200
     with open_journal(db) as conn:
         row = conn.execute(
             "SELECT earnings_next, earnings_confirmed, earnings_timing"
@@ -10619,13 +10639,51 @@ def test_the_earnings_refresh_holds_no_write_lock_while_it_asks_nasdaq(tmp_path,
 
     monkeypatch.setattr(earnings, "fetch_earnings", fetch)
     with open_journal(db) as conn:
-        failed, asked = web._refresh_earnings(conn, ["AAA", "BBB", "CCC"])
+        asked = web._refresh_earnings(conn, ["AAA", "BBB", "CCC"])
         rows = {r["symbol"]: (r["earnings_next"], bool(r["earnings_checked_at"]))
                 for r in conn.execute("SELECT * FROM watchlist")}
     assert blocked == [], f"a fetch ran while the journal was write-locked: {blocked}"
-    assert (failed, asked) == (["BBB"], 3)
+    assert asked == 3
     assert rows == {"AAA": ("2026-10-28", True), "BBB": (None, True),
                     "CCC": ("2026-10-28", True)}
+
+
+def test_the_earnings_refresh_asks_nasdaq_for_its_symbols_side_by_side(tmp_path, monkeypatch):
+    """Nasdaq takes 2 to 3 s a symbol, 15 s when it hangs, and the quotes wait on
+    these dates: a pool's width of symbols is in flight at once, with the same
+    answers and the same failures as one after another."""
+    import threading  # noqa: PLC0415 - local to this test
+
+    from optjournal import earnings  # noqa: PLC0415 - local to this test
+
+    symbols = [f"S{n}" for n in range(web.QUOTE_WORKERS)]
+    db = tmp_path / "j.db"
+    with open_journal(db) as conn:
+        for symbol in symbols:
+            conn.execute("INSERT INTO watchlist (symbol, added_at, earnings_next)"
+                         " VALUES (?, '2026-01-01', '2026-01-15')", (symbol,))
+        conn.commit()
+    together = threading.Barrier(len(symbols), timeout=2)
+    alone: list[str] = []
+
+    def fetch(symbol, **_):
+        try:
+            together.wait()
+        except threading.BrokenBarrierError:
+            alone.append(symbol)
+        if symbol in ("S2", "S5"):
+            raise earnings.EarningsFetchError(f"{symbol} earnings: URLError")
+        return earnings.Earnings(day="2026-10-28", confirmed=True, timing=None)
+
+    monkeypatch.setattr(earnings, "fetch_earnings", fetch)
+    with open_journal(db) as conn:
+        asked = web._refresh_earnings(conn, symbols)
+        rows = {r["symbol"]: (r["earnings_next"], bool(r["earnings_checked_at"]))
+                for r in conn.execute("SELECT * FROM watchlist")}
+    assert alone == [], "the symbols were asked one after another"
+    assert asked == len(symbols)
+    assert rows == {s: ("2026-01-15" if s in ("S2", "S5") else "2026-10-28", True)
+                    for s in symbols}
 
 
 def test_each_job_row_says_how_many_requests_one_run_spends():

@@ -222,7 +222,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} trade_type
  * @property {string} trade_type_label
  * @property {Stats} stats -- the selected period
- * @property {Stats} all_time
  * @property {Array} positions -- Position rows, newest snapshot
  * @property {Allocation} allocation -- the account by holding (serialize.allocation_data)
  * @property {Portfolio} portfolio -- net liquidation over time against the money put
@@ -249,7 +248,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   form writes it in (serialize.journal_data)
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
- * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
+ * @property {Stats} annual_total -- whole-book total row, ignores both filters
  * @property {Object} replays -- Replay by key; rows resolve into it (replay.attach)
  * @property {OdteBlock} odte
  * @property {FxBlock} fx
@@ -1344,8 +1343,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {boolean} ok
  * @property {Object} quotes -- symbol -> Quote (price, at, previous_close,
  *   currency, name)
- * @property {Array} earnings_failed -- symbols whose earnings date could not be
- *   refreshed; the stored date stands
  * @property {number} earnings_asked -- how many earnings dates were re-asked; when
  *   nonzero the state payload's dates may have moved
  * @property {Array} failed -- symbols the source would not answer for. One dead
@@ -1931,7 +1928,7 @@ function ccyControl(){
    its numbers. Trades lists every position whatever the month, so it shows the
    trade type and not the stepper; Holdings ignores both, so it gets neither. */
 const PERIOD_TABS=['dashboard','calendar'];
-const TYPE_TABS=['dashboard','calendar','trades'];
+const TYPE_TABS=['dashboard','calendar','trades','review'];
 const TYPE_LABEL={'':'Options',equities:'Equities',odte:'0DTE'};
 
 /* THE MONTH STEPPER. It replaces the month dropdown and the calendar's own
@@ -2074,14 +2071,15 @@ function equitiesNote(){
   const n=(S.state.asset_counts||{}).STK;
   return n
     ? `Show the ${plural(n,'stock fill')} instead of options. Stocks are a different `
-      +`asset category, not a subset: Dashboard, Calendar and Trades switch to `
-      +`STK, and other tabs stay on options.`
+      +`asset category, not a subset: Dashboard, Calendar, Trades and Journal `
+      +`switch to STK, and other tabs stay on options.`
     : 'No stock trades in the journal. If some exist in the archive, run '
       +'`optjournal ingest` to fold them in.';
 }
-/* Rendered at the head of exactly the tabs the trade type drives -- Dashboard,
-   Calendar and Trades, TYPE_TABS -- and more necessary than it was, now that the
-   control itself sits in a panel that is usually closed. A filter that silently changes
+/* Rendered at the head of the tabs the trade type drives -- Dashboard, Calendar
+   and Trades; the Journal, the last of TYPE_TABS, names it in its own line --
+   and more necessary than it was, now that the control itself sits in a panel
+   that is usually closed. A filter that silently changes
    every number is the same failure as a total that silently spans a wider
    scope than its label, and fees genuinely do not narrow, so naming which
    figures moved is the honest version. Equities gets its own wording: it is
@@ -2089,8 +2087,8 @@ function equitiesNote(){
 function scopeNote(){
   if(!S.type) return '';
   if(S.type==='equities')
-    return `<div class="note"><b>Equities.</b> Dashboard, Calendar and Trades show
-      STK activity; Holdings, Costs, Annual and 0DTE stay on options.${infoTip(
+    return `<div class="note"><b>Equities.</b> Dashboard, Calendar, Trades and Journal
+      show STK activity; Holdings, Costs, Annual and 0DTE stay on options.${infoTip(
       `STK is a different asset category, not a subset of the options journal.
        <br><br>Stock P&amp;L uses IBKR's per-fill realisation: each lot sold is
        realised when it is sold.`)}</div>`;
@@ -4459,9 +4457,9 @@ function annual(){
      by the same summations over a year-wide period rather than a parallel
      aggregation. The total row is `annual_total`, computed independently of the
      years -- so if they ever stop accounting for everything the discrepancy is
-     on screen. Not `all_time`: that one follows the Trade Types filter, which
-     this tab does not show, and using it made the total shrink below the sum
-     of its own rows whenever the filter was on. */
+     on screen. Not the Dashboard's all-time `stats`: that one follows the Trade
+     Types filter, which this tab does not show, and using it made the total
+     shrink below the sum of its own rows whenever the filter was on. */
   let best=yrs[0];
   yrs.forEach(s=>{if(s.net_pnl.base>best.net_pnl.base)best=s;});
   const row=(s,klass)=>statsRow(s,{
@@ -5875,7 +5873,7 @@ function bindZdte(){
          refused at the moment it would otherwise blank the ladder. The caret then
          goes back where it was, less whatever the mask removed -- without that,
          typing into the middle of a number jumps the cursor to the end. */
-      const was=el.value, clean=sanitizeLevel(was);
+      const was=el.value, clean=sanitizeLevel(was,key);
       if(clean!==was){
         const at=Math.max(0,(el.selectionStart||clean.length)-(was.length-clean.length));
         el.value=clean;
@@ -5891,7 +5889,7 @@ function bindZdte(){
     el.ondrop=ev=>{
       ev.preventDefault();
       const text=ev.dataTransfer?ev.dataTransfer.getData('text/plain'):'';
-      if(text) zfill(key,sanitizeLevel(text));
+      if(text) zfill(key,sanitizeLevel(text,key));
     };
   });
   /* Two ways to move a strike into a pad, because the mouse gesture people reach
@@ -6194,6 +6192,8 @@ async function pulse(){
   }catch(e){return;}  /* a missed pulse is the next minute's to make up */
   if(!S.state) return;
   if(pl.stamp!==S.state.stamp){await keepPlace(load);return;}
+  /* Sync's cooldown runs down with the clock alone, and only a load reads it. */
+  if((S.state.sync||{}).cooldown_remaining_s>0){await keepPlace(load);return;}
   S.checkedAt=Date.now();
   if(JSON.stringify(pl.collection)!==JSON.stringify(S.state.collection)){
     S.state.collection=pl.collection;
@@ -6428,7 +6428,7 @@ function applyHash(){
      reading stands) rather than as a cleared field, since a URL carrying `spx=`
      was not a reader clearing anything. */
   const typed=key=>{
-    const raw=sanitizeLevel(hs.get(key)||'');
+    const raw=sanitizeLevel(hs.get(key)||'',key);
     return raw===''?null:raw;
   };
   S.zspx=typed('spx');S.zvix=typed('vix');

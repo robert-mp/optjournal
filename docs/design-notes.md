@@ -258,9 +258,9 @@ Four invariants worth knowing before changing the UI:
 
 * **A tab's numbers change only in response to a control that tab
   displays.** The month drives Dashboard and Calendar (`PERIOD_TABS` in
-  `page.html`); the trade type drives those two and Trades (`TYPE_TABS`), and
+  `page.html`); the trade type drives those two, Trades and Journal (`TYPE_TABS`), and
   nothing else. "0DTE" is a fill-level scope within options; "Equities"
-  switches the asset category those three tabs run over. Holdings, Annual and
+  switches the asset category those four tabs run over. Holdings, Annual and
   0DTE stay pinned to options.
 
   It binds in the other direction too, and that is the one the header makes

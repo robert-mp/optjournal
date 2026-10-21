@@ -94,7 +94,7 @@ def test_an_update_replaces_the_code_and_leaves_the_journal(tmp_path, monkeypatc
     # Windows has no executable bit to keep, and never runs the macOS Start file.
     assert os.name == "nt" or (root / "Start optjournal.command").stat().st_mode & 0o111, (
         "the macOS Start file lost its executable bit, so it no longer opens")
-    assert not (root / updates.STAGING).exists() and not (root / ".update-old").exists()
+    assert not (root / updates.STAGING).exists() and not list(root.glob(".update-old*"))
 
 
 def test_a_release_that_names_journal_data_is_refused(tmp_path, monkeypatch, supervised):
@@ -271,7 +271,7 @@ def test_a_swap_that_fails_at_any_step_puts_the_old_code_back(
         _replace_failing(monkeypatch, launcher, lambda n, _src, fail=fail: fail.get(n))
         assert launcher.apply_staged(root) is None, failing
         assert _code(root) == before, f"step {failing} of {total} left a mixed install"
-        assert not list((root / launcher.OLD).glob("*")), "old code stranded in .update-old"
+        assert not list(root.glob(f"{launcher.OLD}*/*")), "old code stranded mid-swap"
 
 
 class _Died(BaseException):
@@ -312,7 +312,7 @@ def test_a_swap_cut_off_at_any_step_is_put_right_by_the_next_starts(
         monkeypatch.setattr(launcher.os, "replace", _REPLACE)
         assert launcher.apply_staged(root) == "0.2.0", f"cut at step {step} of {total}"
         assert _code(root) == new, f"cut at step {step} of {total}, then a mixed install"
-        assert not (root / updates.STAGING).exists() and not (root / launcher.OLD).exists()
+        assert not (root / updates.STAGING).exists() and not list(root.glob(f"{launcher.OLD}*"))
 
 
 def test_an_undo_that_meets_a_locked_file_is_finished_by_the_next_start(
@@ -337,6 +337,57 @@ def test_an_undo_that_meets_a_locked_file_is_finished_by_the_next_start(
         monkeypatch.setattr(launcher.os, "replace", _REPLACE)
         assert launcher.apply_staged(root) == "0.2.0", f"failed at step {failing} of {total}"
         assert _code(root) == new, f"failed at step {failing} of {total}, then a mixed install"
+
+
+#: `os.unlink` itself, for the same reason as `_REPLACE`.
+_UNLINK = os.unlink
+
+
+def test_a_file_held_after_a_good_swap_does_not_stop_the_next_update(
+        tmp_path, monkeypatch, supervised):
+    """A file another process holds (an antivirus scan, on Windows) can outlive
+    the delete of the old code after a good swap. That old code is no undo for
+    a second update staged in the same window: it goes in while the files are
+    still held, none of them comes back into the install, and a later start
+    deletes them once they are let go."""
+    launcher = _launcher()
+    root = _install(tmp_path)
+
+    def held(path, *args, **kwargs):
+        if os.path.basename(path) in ("old.py", "pyproject.toml"):
+            raise PermissionError("scanning")
+        return _UNLINK(path, *args, **kwargs)
+
+    monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball("0.2.0"))
+    updates.stage(_release("0.2.0"), root=root)
+    monkeypatch.setattr(os, "unlink", held)
+    assert launcher.apply_staged(root) == "0.2.0"
+
+    monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball("0.3.0"))
+    updates.stage(_release("0.3.0"), root=root)
+    version = launcher.apply_staged(root)
+    code = sorted(p.name for p in (root / "src" / "optjournal").iterdir())
+    assert (updates.current_version(root), code) == ("0.3.0", ["new.py"])
+    assert version == "0.3.0"
+
+    monkeypatch.setattr(os, "unlink", _UNLINK)
+    assert launcher.apply_staged(root) is None
+    assert updates.current_version(root) == "0.3.0"
+    assert sorted(p.name for p in root.iterdir() if p.name.startswith(".update-")) == []
+
+
+def test_a_ready_marker_that_names_no_version_is_never_made_a_path(
+        tmp_path, monkeypatch, supervised):
+    """The old code's folder is named for the version `READY` holds, so a name
+    that is not a plain version swaps nothing in and writes nothing outside."""
+    monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball())
+    root = _install(tmp_path)
+    before = _code(root)
+    updates.stage(_release(), root=root)
+    (root / updates.STAGING / updates.READY).write_text("../../escape")
+    assert _launcher().apply_staged(root) is None
+    assert _code(root) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["optjournal-main"]
 
 
 @pytest.mark.parametrize(("latest", "available"), [("0.2.0", True), ("0.1.0", False),

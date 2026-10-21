@@ -44,35 +44,44 @@ READY = ".ready"
 #: Pinned to `optjournal.cli.EXIT_RESTART` by the same test.
 RESTART = 75
 #: Where the previous code waits while a swap is in progress, so a failed swap
-#: can be put back.
+#: can be put back: `OLD-<version>`, named for the version going in. A file
+#: another process holds can outlive the delete after a good swap, and in a
+#: folder named for its own version it never reads as the next swap's undo.
 OLD = ".update-old"
 
 
 def apply_staged(root: Path = ROOT) -> str | None:
     """Swap a staged release into `root`. Returns its version, or None.
 
-    Entry by entry at the top level: the current one moves into `OLD`, the
-    staged one into its place. If any move fails, everything already swapped is
-    put back, so the install is either the old version or the new one and never
-    half of each. Entries the release does not contain are left alone, which is
-    what keeps the journal's data untouched when it sits beside the code.
+    Entry by entry at the top level: the current one moves into `OLD-<version>`,
+    the staged one into its place. If any move fails, everything already swapped
+    is put back, so the install is either the old version or the new one and
+    never half of each. Entries the release does not contain are left alone,
+    which is what keeps the journal's data untouched when it sits beside the code.
 
     `READY` goes only once every entry is in place, so a start that still finds
     it is looking at a swap that did not finish: this process was cut off
     partway (its window closed, Ctrl+C), or a locked file stopped the undo. The
-    old code waiting in `OLD` is put back first, then the release is tried again.
-    (An entry only the release has, moved in before the cutoff, stays in place
-    until a later try succeeds: nothing in `OLD` names it.)
+    old code waiting in that version's folder is put back first, then the release
+    is tried again. Any other `OLD-*` folder is old code a finished swap could not
+    delete, and is only ever deleted. (An entry only the release has, moved in
+    before the cutoff, stays in place until a later try succeeds: nothing in the
+    old code's folder names it.)
     """
-    staging, old = root / STAGING, root / OLD
+    staging = root / STAGING
     ready = staging / READY
-    if not ready.exists():
+    version = ready.read_text().strip() if ready.exists() else ""
+    # `stage` writes a version it checked against the release's tag, which is a
+    # plain name. Anything else is no release, and must not become a path.
+    old = root / f"{OLD}-{version}" if re.fullmatch(r"[\w.]+", version) else None
+    for folder in root.glob(f"{OLD}*"):
+        if folder != old:
+            shutil.rmtree(folder, ignore_errors=True)
+    if old is None:
         # An interrupted download, or what a finished swap had left to delete.
         shutil.rmtree(staging, ignore_errors=True)
-        shutil.rmtree(old, ignore_errors=True)
         return None
-    version = ready.read_text().strip()
-    if old.exists() and not _put_back(root, [p.name for p in old.iterdir()]):
+    if old.exists() and not _put_back(root, old, [p.name for p in old.iterdir()]):
         print(f"Update to {version} is not undone yet. {_START_AGAIN}")
         return None
     old.mkdir(exist_ok=True)
@@ -84,7 +93,7 @@ def apply_staged(root: Path = ROOT) -> str | None:
             swapped.append(entry)
             os.replace(staging / entry, root / entry)
     except OSError as exc:
-        if _put_back(root, reversed(swapped)):
+        if _put_back(root, old, reversed(swapped)):
             print(f"Update to {version} failed and was undone: {exc}")
         else:
             print(f"Update to {version} failed: {exc}. {_START_AGAIN}")
@@ -99,15 +108,15 @@ _START_AGAIN = ("Some files could not be put back yet, so close this window and 
                 "start optjournal again.")
 
 
-def _put_back(root: Path, entries: Iterable[str]) -> bool:
-    """Undo the swap of `entries`, and say whether `OLD` is empty now.
+def _put_back(root: Path, old: Path, entries: Iterable[str]) -> bool:
+    """Undo the swap of `entries`, and say whether `old` is empty now.
 
     Each entry the release put in place goes back into `STAGING`, then the one
-    it replaced comes back from `OLD`. Best effort, entry by entry: one that
+    it replaced comes back from `old`. Best effort, entry by entry: one that
     cannot move (a file an antivirus scan holds) stays as it is, its old copy
-    stays in `OLD`, and the next start tries again.
+    stays in `old`, and the next start tries again.
     """
-    staging, old = root / STAGING, root / OLD
+    staging = root / STAGING
     for entry in entries:
         with contextlib.suppress(OSError):
             if (root / entry).exists() and not (staging / entry).exists():
