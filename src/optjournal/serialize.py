@@ -251,15 +251,18 @@ def _unrealized_money(row: Any) -> Row | None:
         row["fifo_pnl_unrealized"], row["fx_rate_to_base"], row["currency"]).payload()
 
 
-def position_marks(conn: sqlite3.Connection, asset_category: str) -> dict[str, Row | None]:
-    """Each contract on the category's current book, by conid, to its unrealised
-    P&L: what a Trades card sums over the contracts it still holds
-    (`strategies._unrealized`). By category because the cards are, so a stock
-    position under Equities is marked from the stock book."""
+def position_marks(
+    conn: sqlite3.Connection, asset_category: str
+) -> dict[tuple[str, str, str], Row | None]:
+    """Each position on the category's current book, by `(broker, account_id,
+    conid)`, to its unrealised P&L: what a Trades card sums over the contracts it
+    still holds (`strategies._unrealized`). By category because the cards are, so
+    a stock position under Equities is marked from the stock book."""
     return {
-        str(r["conid"]): _unrealized_money(r)
+        (str(r["broker"]), str(r["account_id"]), str(r["conid"])): _unrealized_money(r)
         for r in conn.execute(
-            "SELECT conid, fifo_pnl_unrealized, fx_rate_to_base, currency"
+            "SELECT p.broker, p.account_id, conid, fifo_pnl_unrealized,"
+            " fx_rate_to_base, currency"
             f" FROM position_snapshots p{book_join_sql(asset_category)}"
             " WHERE p.asset_category = ?", (asset_category,))
     }

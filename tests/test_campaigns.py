@@ -434,6 +434,31 @@ def test_a_strangle_is_one_open_position_not_two():
     )
 
 
+def test_two_accounts_placing_inside_the_window_hold_two_positions():
+    """A position is held in one account. U1 selling a SPY put and U2 a SPY call
+    thirty seconds later fall inside the window, and are two bets, not a
+    strangle spanning both accounts."""
+    eps = [_Ep("P1", ["t1"], closed=False), _Ep("C1", ["t2"], closed=False)]
+    eps[0].account_id, eps[1].account_id = "U1", "U2"
+    groups = cluster_orders([("1", "2026-09-02 10:00:00", "SPY"),
+                             ("2", "2026-09-02 10:00:30", "SPY")])
+    assert groups == [("1", "2")], "the control: the window joins the two orders"
+    camps = link(eps, order_groups=groups, order_of_trade={"t1": "1", "t2": "2"})
+    assert position_count(camps, eps) == 2
+
+
+def test_a_strangle_allocated_to_two_accounts_is_a_card_in_each():
+    """One order allocated to two accounts belongs to two cards (the module
+    docstring): each account holds a strangle of its own."""
+    eps = [_Ep("P1", ["t1"], closed=False), _Ep("C1", ["t2"], closed=False),
+           _Ep("P1", ["t3"], closed=False), _Ep("C1", ["t4"], closed=False)]
+    for ep, account in zip(eps, ("U1", "U1", "U2", "U2"), strict=True):
+        ep.account_id = account
+    camps = link(eps, order_groups=_one_group("put", "call"),
+                 order_of_trade={"t1": "put", "t3": "put", "t2": "call", "t4": "call"})
+    assert sorted(c.episode_indices for c in camps) == [(0, 1), (2, 3)]
+
+
 def test_a_decided_position_is_not_an_open_one():
     eps = [_Ep("A", ["t1"], pnl=10.0)]
     camps = link(eps, order_groups=_one_group("o"), order_of_trade={"t1": "o"})

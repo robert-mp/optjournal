@@ -311,7 +311,7 @@ def position_groups(
     *,
     episodes: list[Any],
     campaign_list: list[campaigns.Campaign],
-    marks: Mapping[str, Row | None] | None = None,
+    marks: Mapping[tuple[str, str, str], Row | None] | None = None,
 ) -> list[Row]:
     """Strategy events linked into position lifecycles, newest first.
 
@@ -349,8 +349,9 @@ def position_groups(
     contract.
 
     Unrealised P&L is the newest statement's mark on each contract still held:
-    `marks` maps a conid to that position row's `unrealized`, or to None where the
-    row carried no figure. See `_unrealized` for why it is all or nothing.
+    `marks` maps a position, `(broker, account_id, conid)`, to that row's
+    `unrealized`, or to None where the row carried no figure. See `_unrealized`
+    for why it is all or nothing.
     """
     # Keyed by campaign index, or by the event's own position when no campaign
     # claims it -- a unique key, so an unlinked event stays a card of its own
@@ -403,7 +404,8 @@ def position_groups(
             ),
             "pnl_estimated": any(ev["pnl_estimated"] for ev in members),
             "unrealized": (
-                _unrealized([str(e.conid) for e in eps if not e.is_closed], marks or {})
+                _unrealized([(str(e.broker), str(e.account_id), str(e.conid))
+                             for e in eps if not e.is_closed], marks or {})
                 if camp and not camp.is_decided else None
             ),
             "events": members,
@@ -436,7 +438,9 @@ def fill_shapes(
     return out
 
 
-def _unrealized(held: list[str], marks: Mapping[str, Row | None]) -> Row | None:
+def _unrealized(
+    held: list[tuple[str, str, str]], marks: Mapping[tuple[str, str, str], Row | None]
+) -> Row | None:
     """The summed mark on the contracts still held, or None unless each has one.
 
     All or nothing because a position opened since the newest statement has no
@@ -444,7 +448,7 @@ def _unrealized(held: list[str], marks: Mapping[str, Row | None]) -> Row | None:
     the position's, and a position with no row at all would read as flat, €0.00,
     when the journal simply has no price for it yet.
     """
-    known = [mark for mark in (marks.get(conid) for conid in held) if mark is not None]
+    known = [mark for mark in map(marks.get, held) if mark is not None]
     if not held or len(known) < len(held):
         return None
     return Money.charged(

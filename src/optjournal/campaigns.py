@@ -336,16 +336,18 @@ def link(
         for oid in ids:
             group_of_order[str(oid)] = index
 
-    #: Per broker as well: a decision is placed at one broker, and an order id is
-    #: the issuing broker's own, so two brokers' order 5000 are not one order
-    #: touching two contracts, which is what a spread looks like.
-    members_of_group: dict[tuple[int, str], list[int]] = {}
+    #: Per broker and account as well: a decision is placed in one account at one
+    #: broker, and an order id is the issuing broker's own, so two brokers' order
+    #: 5000 are not one order touching two contracts, which is what a spread
+    #: looks like.
+    members_of_group: dict[tuple[int, str, str], list[int]] = {}
     #: The orders of each episode's OWN fills. Every order of a group that joins
     #: episodes (below) is some member's own anyway; a group that joins nothing,
     #: a contract closed and re-opened or flipped through two orders seconds
     #: apart, would otherwise list each side's order under the other.
     orders_of_episode: dict[int, set[str]] = {}
     broker_of = [str(getattr(episode, "broker", "") or "") for episode in episodes]
+    account_of = [str(getattr(episode, "account_id", "") or "") for episode in episodes]
     for i, episode in enumerate(episodes):
         for tid in getattr(episode, "trade_ids", ()) or ():
             order_id = order_of_trade.get(str(tid))
@@ -354,7 +356,8 @@ def link(
             orders_of_episode.setdefault(i, set()).add(order_id)
             group = group_of_order.get(order_id)
             if group is not None:
-                members_of_group.setdefault((group, broker_of[i]), []).append(i)
+                members_of_group.setdefault(
+                    (group, broker_of[i], account_of[i]), []).append(i)
     # A group joins DIFFERENT contracts: a roll's two expiries, a spread's legs.
     # A group that touched episodes of only ONE contract has reversed it -- a fill
     # through zero (IBKR's `C;O`) belongs to the long it closed and the short it
@@ -370,7 +373,6 @@ def link(
     # anywhere and in each account: what a card's key and anchor and a stored id
     # are read from (see the module docstring). The two halves of a fill through
     # zero sort together, the opening half first.
-    account_of = [str(getattr(episode, "account_id", "") or "") for episode in episodes]
     halves: dict[str, int] = {}
     for episode in episodes:
         for tid in _parts_of(episode):
