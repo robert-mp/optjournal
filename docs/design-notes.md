@@ -202,69 +202,12 @@ revealed and the P&L readout already counts it, and where a click on the card an
 a stop in playback land. Stamped at the open, the readout counted a fill one bar
 before its card and dot appeared.
 
-## Perishable data
-
-Bar retention is **asymmetric**, and the collection schedule follows from it
-rather than from convenience. Measured pre-market on 2026-08-06: every option
-contract in the book returned **zero** hourly bars, while its underlying still
-returned five days of them. An option's intraday series exists only while its
-session is running, so it cannot be backfilled at any price — miss the session
-and those bars are gone.
-
-That splits collection in two, and `bars_manifest` marks the difference with
-`BarRequest.perishable`:
-
-| | what | when | collected by (`jobs.JOBS`) |
-|---|---|---|---|
-| Perishable | intraday bars of an **open** option whose replay is drawn hourly | only during its own session | `bars_live`, during the US session on weekdays, once its last success is over 55 minutes old |
-| Re-fetchable | daily option closes, the whole underlying series | any time | `bars_daily`, 12:30 Dublin, Tue–Sat |
-| Audit | did yesterday's perishable bars actually land? | after the daily run | no job, because `serialize.audit_data` answers it on every page load (and `optjournal bars --audit` on demand) |
-
-Both jobs run `jobs._bars`, and its `live` flag (`optjournal bars --live` on the
-command line) restricts a run to the perishable set. Running the full manifest
-seven times a session would re-fetch three years of settled daily history to
-collect a handful of new hourly rows.
-
-The LEAP is deliberately excluded from hourly collection — the gate is the
-chart's own granularity rule, so an option is collected hourly exactly when its
-replay is *drawn* hourly.
-
-The intraday series is **cumulative within a session** — a 13:00 poll returns
-every completed bar since the open — which is what makes a lost poll harmless
-and lets `bars_live` treat a fetch failure as a quiet retry rather than an alert.
-
-That tolerance has one hole, and `bars --audit` is the only thing that sees it: a
-session where *every* poll failed is gone and says nothing about it. The audit
-asks one question a day, about the one thing that cannot be recovered, and stays
-silent otherwise. Three properties make it trustworthy rather than noisy:
-
-- **Eligibility is the live manifest itself**, not a second rule. An audit with
-  its own idea of what should have been collected drifts from the collector and
-  then reports on a book neither of them holds.
-- **The underlying's own hourly series is the holiday oracle.** No date list
-  anywhere: US markets shut around nine days a year, a hardcoded calendar would
-  need maintaining forever, and the underlying's series — retained for days, and
-  re-fetched by the daily run — already answers whether the session happened. No
-  bars for anyone means the market was shut; bars for the underlying and none for
-  an option means collection failed.
-- **A contract opened after the audited session is excluded**, so opening a
-  position never triggers a report.
-
-It runs *after* `optjournal-bars-daily`, not before, precisely because that oracle
-depends on the daily run having topped the underlying up. Run first, it would read
-a stale series, conclude the market was shut, and pass a genuinely lost session.
-Exit codes are the whole interface: `0` covered, `1` bars missing (report), `3`
-nothing to check. A `1` whose JSON names no missing contract is an error, and so
-is any other code (`5` is a lock held elsewhere): both are raised with the CLI's
-own message.
-
 `marketdata.parse_chart` drops bars off the series' own grid. The source appends
 a synthetic bar for the moment you asked, stamped at that moment: a 13:17 request
 returns 09:00, 10:00, 11:00, 12:00 and then **12:35**. That stamp is unique per
-request, so it upserts over nothing and every poll deposits a fresh phantom bar —
-six such rows were already stored from two backfills during one session, and
-polling hourly would have added seven a day per contract. Daily bars are
-deliberately *not* filtered: a daily bar for a session in progress is
+request, so it upserts over nothing and every run deposits a fresh phantom bar —
+six such rows were already stored from two backfills during one session. Daily
+bars are deliberately *not* filtered: a daily bar for a session in progress is
 legitimately incomplete and the chart draws it as "where it is now".
 
 Layering rules (import direction only goes down this list):

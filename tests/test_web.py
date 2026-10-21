@@ -520,7 +520,6 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
         "FxLegManual": first(widest["fx"])["manual"],
         "FeeGroup": first(widest["fees"]),
         "Withholding": first(widest["withholding"]),
-        "Audit": state["audit"],
         # The header dateline. Anchored to the real payload rather than exempted,
         # even though it is two keys: the page slices `opened` apart to format a
         # date, so a rename there renders the header's most prominent line wrong
@@ -5731,63 +5730,25 @@ def test_the_kicker_names_what_the_server_says_is_carried():
 # --------------------------------------------------------------------------
 
 
-def test_the_collection_strip_reads_witnesses_and_blackout_never_ok():
-    """`audit.ok` IS GREEN IN A TOTAL BLACKOUT, and the page must not show it.
+def test_a_journal_that_never_scheduled_is_not_shown_as_a_failure():
+    """`ever_ran:false` (no scheduler has written a heartbeat here) is the NORMAL
+    state of a CLI-driven journal, and the demo journal is in it. Tinting it red
+    would make the page cry wolf on a first run, which is the noise that teaches a
+    reader to ignore the panel -- and then it cannot do its job when something is
+    really wrong.
 
-    `ok` is `not market_traded or not missing`, and `market_traded` is answered by
-    "does any underlying have hourly bars that day" -- an oracle that fails the
-    same way as the thing it certifies. Reproduced on three copies of the real
-    journal: delete every hourly bar, as a fully dead collector would, and `ok`
-    goes green because "no bars for anyone" reads as a holiday.
-
-    So this pins the NEGATIVE too. A reader of the payload would reasonably reach
-    for `au.ok` -- it is right there, it is a boolean, and it is named for exactly
-    this question. That is what makes it worth a test rather than a comment.
-    """
-    strip = _fn("collection")
-    assert "au.witnesses" in strip and "au.blackout" in strip, (
-        "the strip no longer reads the two fields that survive a blackout"
-    )
-    assert "au.ok" not in strip, (
-        "the strip is reading audit.ok, which is GREEN in a total collection "
-        "blackout -- read witnesses/blackout instead (serialize.audit_data says why)"
-    )
-
-
-def test_a_journal_that_never_collected_is_not_shown_as_a_failure():
-    """Two absences that look identical in the payload and need opposite responses.
-
-    `ever_ran:false` (no scheduler has written a heartbeat here) and
-    `ever_collected:false` (no bar has ever been stored) are the NORMAL state of a
-    CLI-driven journal, and the demo journal is in both. Tinting either red would
-    make the page cry wolf on a first run, which is the noise that teaches a reader
-    to ignore the panel -- and then it cannot do its job when something is really
-    wrong.
-
-    Verified in a browser at both states: `bars none collected` and `scheduler not
-    running` render with no tinted `<b>` at all, while `stale` and `blackout`
-    render rgb(240,137,154).
+    Verified in a browser: `scheduler not running` renders with no tinted `<b>`
+    at all, while `stale` renders rgb(240,137,154).
     """
     strip = _fn("collection").replace(" ", "").replace("\n", "")
-    assert "!au.ever_collected" in strip, (
-        "the strip no longer distinguishes a journal that never collected from a "
-        "collector that died -- measured identical in the payload without it"
-    )
     assert "!sc.ever_ran" in strip, "the never-scheduled case is gone"
-    # The untinted branches come FIRST, so a red one cannot shadow them.
-    never_bars = strip.index("!au.ever_collected")
-    blackout = strip.index("au.blackout?")
-    assert never_bars < blackout, (
-        "the blackout branch is evaluated before the never-collected one, so a "
-        "fresh journal shows a red alarm for bars it never had"
-    )
-    # And neither untinted branch may carry a tint class. Matched on the ELEMENT
+    # And the untinted branch may carry no tint class. Matched on the ELEMENT
     # in the raw source rather than searched for in a window of the space-stripped
     # text: stripping turns `<b class="neg">` into `<bclass="neg">`, so the first
     # version of this assertion could not have matched whatever the code said --
     # and the ablation proved it, passing with the pill tinted red.
     raw = _fn("collection")
-    for label in ("none collected", "not running"):
+    for label in ("not running",):
         element = re.search(rf"<b([^>]*)>{re.escape(label)}</b>", raw)
         assert element, f"the {label!r} pill is gone from the strip"
         assert "class" not in element.group(1), (
@@ -5889,7 +5850,7 @@ def test_collection_details_live_in_settings_and_run_nothing():
 def _collection_rows(demo: bool) -> dict[str, str]:
     """The jobs strip rendered by the page's own `collection`, row by job name.
 
-    `bars_live` has a run in flight (the ledger's newest row says `running`) while
+    `bars_daily` has a run in flight (the ledger's newest row says `running`) while
     its state row still holds the previous outcome, `ok`: that is the payload a
     page reads for the whole of a run. `sync` is idle and spends a request.
     """
@@ -5897,9 +5858,8 @@ def _collection_rows(demo: bool) -> dict[str, str]:
     consts = [_page_const("DEMO_NO_IBKR")] if "const DEMO_NO_IBKR=" in js else []
     state = {
         "demo": demo,
-        "audit": {"ever_collected": False},
         "scheduler": {"ever_ran": False, "jobs": [
-            {"job": "bars_live", "last_status": "ok", "consecutive_failures": 0,
+            {"job": "bars_daily", "last_status": "ok", "consecutive_failures": 0,
              "spends_request": False, "requests": 1,
              "last_run": {"status": "running", "started_at": "2026-09-30T14:00:00",
                           "finished_at": None, "detail": None}},
@@ -5930,11 +5890,11 @@ def test_a_jobs_time_reads_as_an_age_not_a_bare_utc_clock():
     run = {"status": "ok", "started_at": (now - timedelta(minutes=4)).isoformat(),
            "finished_at": (now - timedelta(minutes=3)).isoformat(), "detail": None}
     live = {**run, "status": "running", "finished_at": None}
-    state = {"demo": False, "audit": {"ever_collected": False},
+    state = {"demo": False,
              "scheduler": {"ever_ran": False, "jobs": [
                  {"job": job, "last_status": "ok", "consecutive_failures": 0,
                   "spends_request": False, "requests": 0, "last_run": last}
-                 for job, last in (("market", run), ("bars_live", live))]}}
+                 for job, last in (("market", run), ("bars_daily", live))]}}
     html = _node_run([
         f"import {{esc}} from '{_static('format.js')}';",
         f"const S={{state:{json.dumps(state)}}};",
@@ -5943,7 +5903,7 @@ def test_a_jobs_time_reads_as_an_age_not_a_bare_utc_clock():
     ])
     when = dict(re.findall(r'jobname mono">([a-z_]+)</span>.*?jobwhen mono"[^>]*>([^<]*)<',
                            html, re.S))
-    assert when == {"market": "3m ago", "bars_live": "started 4m ago"}, when
+    assert when == {"market": "3m ago", "bars_daily": "started 4m ago"}, when
 
 
 def test_a_job_in_flight_reads_running():
@@ -5952,7 +5912,7 @@ def test_a_job_in_flight_reads_running():
     newest run's own status is what says a run is in flight.
     """
     rows = _collection_rows(demo=False)
-    assert '<span class="jobstat ">running</span>' in rows["bars_live"], rows["bars_live"]
+    assert '<span class="jobstat ">running</span>' in rows["bars_daily"], rows["bars_daily"]
     assert '<span class="jobstat ">nothing</span>' in rows["sync"], rows["sync"]
 
 
@@ -6235,7 +6195,7 @@ def test_only_the_job_that_spends_a_broker_request_asks_for_confirmation():
         "to a return -- a decline must not post"
     )
     assert "return;" in runner, "declining the dialogue no longer aborts the run"
-    for name in ("'sync'", '"sync"', "'market'", "'bars_live'"):
+    for name in ("'sync'", '"sync"', "'market'", "'bars_daily'"):
         assert name not in runner, (
             f"the page names {name} directly, so it now holds its own copy of "
             "which jobs touch the broker -- read spends_request instead"
@@ -6276,9 +6236,9 @@ def test_the_strip_survives_a_payload_without_a_scheduler_block():
     guarded reads are cheaper than that.
     """
     strip = _fn("collection").replace(" ", "").replace("\n", "")
-    assert "if(!sc||!au)return''" in strip, (
-        "the strip no longer guards a missing scheduler/audit block, so a payload "
-        "without them throws and takes the entire dashboard down with it"
+    assert "if(!sc)return''" in strip, (
+        "the strip no longer guards a missing scheduler block, so a payload "
+        "without it throws and takes the entire dashboard down with it"
     )
 
 
@@ -7349,14 +7309,14 @@ def test_an_unknown_job_is_a_400_that_names_the_real_ones(populated, tmp_path):
 
     An endpoint that answers "unknown job" without saying which exist makes the
     caller guess -- and the names are underscore-separated here while MeshClaw's
-    are hyphenated (`bars_live` versus `optjournal-bars-live`), which is exactly
+    are hyphenated (`bars_daily` versus `optjournal-bars-daily`), which is exactly
     the typo a reader will make.
     """
     with web.serve_ephemeral(db_path=populated, archive_dir=tmp_path) as base:
-        status, payload = _post(base, "/api/jobs/run", {"job": "bars-live"})
+        status, payload = _post(base, "/api/jobs/run", {"job": "bars-daily"})
     assert status == 400
     assert payload["kind"] == "unknown"
-    assert "bars_live" in payload["jobs"], (
+    assert "bars_daily" in payload["jobs"], (
         "the 400 does not name the jobs that exist, so a hyphen typo is a dead end"
     )
 
@@ -10369,7 +10329,8 @@ def test_a_failed_odte_refresh_says_so_and_the_reading_is_not_fresh(populated, m
                               source="yahoo",
                               bars=[Bar(ts=1790000000, open=level, high=level,
                                         low=level, close=level, volume=0)])
-    conn.execute("UPDATE price_bars SET fetched_at = '2026-01-01T00:00:00+00:00'")
+    # Fetched after that session's settle, and long before the last one.
+    conn.execute("UPDATE price_bars SET fetched_at = '2026-09-22T00:00:00+00:00'")
     conn.commit()
     conn.close()
     monkeypatch.setattr(serialize, "fetch_bars", offline)

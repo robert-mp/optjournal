@@ -117,7 +117,6 @@ from optjournal.locks import LockTimeout
 from optjournal.marketdata import BarFetchError, fetch_quote
 from optjournal.serialize import (
     allocation_data,
-    audit_data,
     broker_costs_data,
     collection_status,
     history_data,
@@ -667,10 +666,10 @@ def build_state(
     with open_journal(db_path) as conn:
         # RESOLVE ABANDONED RUNS FIRST, before anything reads `job_runs`.
         #
-        # On page load rather than from a scheduled job, for the same reason the
-        # perishable audit moved out of a cron: a watchdog that is itself scheduled
-        # stops when the scheduler does, and this project has already watched three
-        # cron jobs report health for two days while collecting nothing.
+        # On page load rather than from a scheduled job: a watchdog that is itself
+        # scheduled stops when the scheduler does, and this project has already
+        # watched three cron jobs report health for two days while collecting
+        # nothing.
         #
         # The KERNEL answers it -- a `running` row whose per-job file lock can be
         # acquired has no live holder, because OS locks release on process death
@@ -811,12 +810,6 @@ def build_state(
             # The requests a history import would make now, newest first, so the
             # Advanced panel can say how many before anyone presses it.
             "history_plan": [{"from": fd, "to": td} for fd, td in plan],
-            # Computed on EVERY load, unconditionally, and that is the design
-            # rather than laziness: this used to be a cron, so the watchdog and
-            # the thing it watched could stop together -- and did, for two days,
-            # while three jobs reported `ok`. 2.95 ms measured on the real
-            # journal, against a payload that already issues ~142 statements.
-            "audit": audit_data(conn, now=datetime.now(UTC)),
             # The header's dateline. Deliberately outside `stats`/`all_time`:
             # how long the log has been kept is a fact about the JOURNAL, not
             # about a selected month or a trade-type scope, and a header figure
@@ -913,7 +906,7 @@ def build_state(
             # the same rails the ladder uses -- no level is stored on either side.
             # Empty until two sessions of bars have landed, which the page renders
             # the same way it renders the absent planner.
-            "history": odte_scoring_data(conn, now=datetime.now(UTC)),
+            "history": odte_scoring_data(conn),
         }
         state["fx"] = {"base": report.base_currency,
                        "quotes": fx_quotes(conn, report.base_currency)}

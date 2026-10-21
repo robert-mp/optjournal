@@ -199,8 +199,7 @@ def test_a_failed_snapshot_does_not_fail_the_sync_it_protects(populated, monkeyp
 
     A sync that spent an IBKR request and ingested a statement must not report
     failure because a disk was full. The return value carries `snapshot: null` so
-    the absence is visible rather than silent -- which is the distinction the
-    audit's `witnesses` field exists for, one layer down.
+    the absence is visible rather than silent.
     """
     from optjournal.db import connect  # noqa: PLC0415 - local to this test
     from optjournal.sync import _snapshot  # noqa: PLC0415 - private by design

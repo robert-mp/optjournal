@@ -22,11 +22,9 @@ from optjournal.bars import (
     SNAPSHOT_FLOOR_DAYS,
     WATCH_LOOKBACK_DAYS,
     BackfillOutcome,
-    audit_perishable,
     backfill_bars,
     bars_manifest,
     close_series,
-    last_traded_day,
     replay_bars,
     underlying_conids,
     upsert_bars,
@@ -340,8 +338,7 @@ def _ts(day: str) -> int:
 def _option_trade(conn, *, conid, symbol, underlying, ucid, date, trade_id,
                   open_close="O", quantity=-1):
     """One option fill. `open_close`/`quantity` default to a short open, and are
-    parameters so a test can close an episode -- which is what decides whether
-    the manifest asks for that contract's perishable intraday bars.
+    parameters so a test can close an episode.
     """
     conn.execute(
         "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, account_id,"
@@ -373,67 +370,21 @@ def test_option_history_is_daily_only(conn):
     options = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "option"]
     assert options, "no option window derived"
     assert {r.bar_size for r in options} == {"1d"}
-    assert not any(r.perishable for r in options), (
-        "a seven-month window cannot be collected live and must not claim to be"
-    )
 
 
-def test_a_short_open_option_also_asks_for_live_intraday_bars(conn):
-    """The one thing that cannot be backfilled. An option serves hourly bars
-    while its session runs and discards them afterwards, so the only way to hold
-    an hourly option series is to collect it as it happens.
+def test_a_short_open_option_is_asked_for_daily_bars_only(conn):
+    """Nothing reads an option's hourly bars: the replay solves its vol from the
+    option's DAILY closes and draws the underlying's hourly ones. A short open
+    position is the window where an hourly request would be most tempting.
     """
     _option_trade(conn, conid="C1", symbol="AAA  260801P00100000",
                   underlying="AAA", ucid="U1", date="2026-08-03",
                   trade_id="t1")
     options = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "option"]
-    assert {r.bar_size for r in options} == {"1d", "1h"}
-    hourly = [r for r in options if r.bar_size == "1h"]
-    assert [r.perishable for r in hourly] == [True]
-    assert not any(r.perishable for r in options if r.bar_size == "1d"), (
-        "the daily series is settled history and can be re-fetched at leisure"
-    )
-
-
-def test_a_closed_option_asks_for_no_live_bars(conn):
-    """Its sessions are over, so its intraday bars are already gone. Asking
-    would spend a request per poll for a series the source will never return.
-    """
-    for trade_id, oc, qty in (("t1", "O", -1), ("t2", "C", 1)):
-        _option_trade(conn, conid="C1", symbol="AAA  260801P00100000",
-                      underlying="AAA", ucid="U1", date="2026-08-03",
-                      trade_id=trade_id, open_close=oc, quantity=qty)
-    options = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "option"]
-    assert options, "a closed contract still needs its daily history"
     assert {r.bar_size for r in options} == {"1d"}
-
-
-def test_a_long_open_option_asks_for_no_live_bars(conn):
-    """The LEAP. Its replay is drawn daily over hundreds of sessions, so hourly
-    bars would be thousands of rows the chart never draws -- and the gate is the
-    chart's own granularity rule, not a second threshold that could disagree.
-    """
-    _option_trade(conn, conid="LEAP", symbol="AAA  270617C00700000",
-                  underlying="AAA", ucid="U1", date="2025-02-03",
-                  trade_id="t1")
-    options = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "option"]
-    assert {r.bar_size for r in options} == {"1d"}
-
-
-def test_perishable_only_narrows_to_what_cannot_wait(conn):
-    """What the market-hours poll asks for. Running the whole manifest seven
-    times a session would re-fetch years of settled daily history to collect a
-    handful of new hourly rows.
-    """
-    _option_trade(conn, conid="C1", symbol="AAA  260801P00100000",
-                  underlying="AAA", ucid="U1", date="2026-08-03",
-                  trade_id="t1")
-    full = bars_manifest(conn, now=_NOW)
-    live = bars_manifest(conn, now=_NOW, perishable_only=True)
-    assert len(full) > len(live), "the control: the filter must remove something"
-    assert live, "nothing derived for an open short-dated option"
-    assert all(r.perishable and r.kind == "option" and r.bar_size == "1h"
-               for r in live)
+    underlying = {r.bar_size for r in bars_manifest(conn, now=_NOW)
+                  if r.kind == "underlying"}
+    assert underlying == {"1h", "1d"}, "the replay still draws the underlying hourly"
 
 
 def test_underlying_granularity_follows_the_window_length(conn):
@@ -458,18 +409,54 @@ def test_underlying_granularity_follows_the_window_length(conn):
     assert HOURLY_LIMIT_DAYS > 0
 
 
-def test_windows_merge_per_conid_and_bar_size(conn):
-    """Two episodes on the same contract become one request covering both, so
-    an overlapping pair is not fetched twice.
+def _round_trip(conn, *, conid, symbol, opened, closed, underlying="TSLA",
+                ucid="UT"):
+    """One short option opened and bought back: a closed episode."""
+    for trade_id, day, open_close, quantity in (
+        (f"{conid}-{opened}", opened, "O", -1), (f"{conid}-{closed}", closed, "C", 1),
+    ):
+        _option_trade(conn, conid=conid, symbol=symbol, underlying=underlying,
+                      ucid=ucid, date=day, trade_id=trade_id,
+                      open_close=open_close, quantity=quantity)
+
+
+def _underlying(conn, *, now=_NOW) -> dict[str, list[tuple[int, int]]]:
+    """The underlying's windows per bar size, oldest first."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    for r in bars_manifest(conn, now=now):
+        if r.kind == "underlying":
+            out.setdefault(r.bar_size, []).append((r.start, r.end))
+    return {size: sorted(windows) for size, windows in out.items()}
+
+
+def test_overlapping_windows_on_one_underlying_are_one_request(conn):
+    """Two short holds a few days apart pad into one span, so they are fetched as
+    one window rather than twice over the same days.
     """
-    _option_trade(conn, conid="C1", symbol="AAA  260101P00100000",
-                  underlying="AAA", ucid="U1", date="2026-01-05",
-                  trade_id="t1")
-    _option_trade(conn, conid="C1", symbol="AAA  260101P00100000",
-                  underlying="AAA", ucid="U1", date="2026-01-09",
-                  trade_id="t2")
-    keys = [r.key for r in bars_manifest(conn)]
-    assert len(keys) == len(set(keys)), f"duplicate windows: {keys}"
+    _round_trip(conn, conid="C1", symbol="TSLA  260807P00300000",
+                opened="2026-07-20", closed="2026-07-22")
+    _round_trip(conn, conid="C2", symbol="TSLA  260814P00300000",
+                opened="2026-07-27", closed="2026-07-29")
+    windows = _underlying(conn)
+    assert windows == {"1h": [(_ts("2026-07-16"), _ts("2026-08-02"))],
+                       "1d": [(_ts("2026-07-16"), _ts("2026-08-02"))]}, windows
+
+
+def test_windows_years_apart_stay_apart_and_an_old_one_is_not_hourly(conn):
+    """A 5-day put from an imported 2023 statement and one open today are two
+    windows, not one from 2023 to now. Their union asked hourly bars back to 2023,
+    which the source refuses past 730 days, so the open trade's hourly bars never
+    landed; inside 730 days it re-fetched a year of hourly bars every day. The old
+    window is asked daily only, which its replay falls back to.
+    """
+    _round_trip(conn, conid="C0", symbol="TSLA  230113P00120000",
+                opened="2023-01-10", closed="2023-01-12")
+    _option_trade(conn, conid="C1", symbol="TSLA  260807P00300000",
+                  underlying="TSLA", ucid="UT", date="2026-08-03", trade_id="t1")
+    windows = _underlying(conn)
+    recent = (_ts("2026-07-30"), int((_NOW + timedelta(days=1)).timestamp()))
+    assert windows == {"1h": [recent],
+                       "1d": [(_ts("2023-01-06"), _ts("2023-01-16")), recent]}, windows
 
 
 def test_a_flat_book_asks_only_for_the_market_context(conn):
@@ -483,10 +470,6 @@ def test_a_flat_book_asks_only_for_the_market_context(conn):
         ("^GSPC", "context", "1d"),
         ("^VIX", "context", "1d"),
     }
-    # Non-perishable, so a market-hours poll (which asks perishable-only) still
-    # asks for nothing: index closes backfill, and re-fetching them intraday
-    # would spend requests on a figure that only changes at the daily close.
-    assert bars_manifest(conn, perishable_only=True) == []
 
 
 # --------------------------------------------------------------------------
@@ -878,8 +861,7 @@ def test_the_watch_window_covers_a_year_of_sessions(conn):
     which is the reason the constant now carries.
 
     The request COST is asserted in the same breath, because that is what makes
-    the width free: one daily request per watched symbol, whatever the span, and
-    never a perishable one.
+    the width free: one daily request per watched symbol, whatever the span.
     """
     conn.execute(
         "INSERT INTO watchlist (symbol, note, added_at) VALUES ('NVDA', NULL, ?)",
@@ -890,7 +872,7 @@ def test_the_watch_window_covers_a_year_of_sessions(conn):
     watched = [r for r in bars_manifest(conn, now=_NOW) if r.kind == "watchlist"]
     assert len(watched) == 1, "one request per watched symbol, or the span is not free"
     request = watched[0]
-    assert request.bar_size == "1d" and not request.perishable
+    assert request.bar_size == "1d"
     span_days = (request.end - request.start) / DAY
     assert span_days >= 840, (
         f"the watch window is {span_days:.0f} calendar days; the weekly arm needs "
@@ -909,8 +891,8 @@ def test_the_watch_window_covers_a_year_of_sessions(conn):
 def test_a_week_is_its_last_session_and_a_short_week_is_still_a_week(conn):
     """A week's close is where it ENDED, and a holiday-shortened week is one week.
 
-    No gap filling and no holiday calendar, for the perishable audit's own reason:
-    the sessions present in the data are the definition. That is not an edge case
+    No gap filling and no holiday calendar: the sessions present in the data are
+    the definition. That is not an edge case
     either -- measured over 755 fetched closes, 31 of 158 ISO weeks hold four
     sessions and 2 hold three, so filling them to five would invent a third of a
     year of closes the market never printed.
@@ -1112,6 +1094,62 @@ def test_a_window_long_closed_and_already_stored_is_not_asked_again(conn):
     assert run() == context | {("AAA  251107P00100000", "1d"), ("AAA", "1h"), ("AAA", "1d")}
 
 
+def _asked_per_run(conn, fetch, now):
+    """A `run()` that backfills at `now` and returns the (symbol, size) it asked."""
+    asked: list[tuple[str, str]] = []
+
+    def recording(symbol, *, bar_size, start, end, source):
+        asked.append((symbol, bar_size))
+        return fetch(symbol, bar_size=bar_size, start=start, end=end, source=source)
+
+    def run() -> set[tuple[str, str]]:
+        asked.clear()
+        backfill_bars(conn, fetch=recording, now=now)
+        return set(asked)
+
+    return run
+
+
+def test_a_finished_window_whose_first_bar_comes_late_is_asked_once(conn):
+    """The TSLA 260904P270 put sold 2026-07-24 has its first stored bar 7 days and 4
+    hours after its padded start, past the week `_settled` allows, so it was asked
+    on every daily run 75 days after it ended.
+    """
+    _round_trip(conn, conid="C1", symbol="TSLA  260904P00270000",
+                opened="2026-07-24", closed="2026-07-28")
+    run = _asked_per_run(
+        conn, lambda symbol, *, bar_size, start, end, source:
+        [_bar(start + 7 * DAY + 4 * 3600)], now=datetime(2026, 10, 11, tzinfo=UTC))
+    option = ("TSLA  260904P00270000", "1d")
+    assert option in run()
+    assert option not in run(), "a finished window with a late first bar is asked again"
+
+
+def test_an_expired_option_that_answers_404_is_asked_once(conn):
+    """144 expired contracts from an imported history answered 404 on every run,
+    about 40 s a day and growing with the history. Asked once, it is not asked
+    again -- until an older statement widens its window backwards, when the new
+    part is fetched.
+    """
+    _round_trip(conn, conid="C1", symbol="TSLA  260109P00250000",
+                opened="2026-01-05", closed="2026-01-06")
+
+    def fetch(symbol, *, bar_size, start, end, source):
+        if symbol.startswith("TSLA "):
+            raise BarNotFound(f"{symbol} {bar_size}: HTTP Error 404")
+        return [_bar(start + DAY)]
+
+    run = _asked_per_run(conn, fetch, now=datetime(2026, 2, 1, tzinfo=UTC))
+    option = ("TSLA  260109P00250000", "1d")
+    assert option in run()
+    assert option not in run(), "an expired option's 404 is asked on every run"
+
+    # An older round trip on the same contract, close enough to widen the window.
+    _round_trip(conn, conid="C1", symbol="TSLA  260109P00250000",
+                opened="2025-12-26", closed="2025-12-29")
+    assert option in run(), "a window widened backwards was not asked again"
+
+
 def test_backfill_keeps_a_current_option_404_loud(conn):
     """A live contract missing from the source may be malformed or an outage."""
     _option_trade(
@@ -1156,190 +1194,6 @@ def test_backfill_keeps_an_underlying_404_loud(conn):
         "AAA 1h: HTTP Error 404",
         "AAA 1d: HTTP Error 404",
     }
-
-
-# --------------------------------------------------------------------------
-# the session audit: noticing a session whose perishable bars never landed
-# --------------------------------------------------------------------------
-def _session_bars(conn, conid, symbol, day, *, bar_size="1h", hours=(14, 15, 16)):
-    """Bars stamped inside one ET trading day, on the hour."""
-    base = _ts(day)
-    upsert_bars(
-        conn, conid=conid, symbol=symbol, bar_size=bar_size, source="yahoo",
-        bars=[_bar(base + hour * 3600) for hour in hours],
-    )
-
-
-def _open_short_option(conn, *, date="2026-08-03", conid="C1"):
-    """An open short-dated short option: the one shape that is collected live."""
-    _option_trade(conn, conid=conid, symbol="AAA  271001P00100000",
-                  underlying="AAA", ucid="UAAA", date=date, trade_id=f"t{conid}")
-
-
-def test_a_day_the_market_did_not_trade_is_not_a_fault(conn):
-    """The holiday guard, and the reason there is no date list anywhere.
-
-    US markets shut around nine days a year plus the odd half-session. Alarming
-    on each would be nine false reports a year on a job whose entire value is
-    that its silence means something.
-    """
-    _open_short_option(conn)
-    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
-    audited = audit_perishable(conn, day="2026-08-06", now=_NOW)
-    assert not audited.market_traded, "no underlying bars, yet it claims a session"
-    assert audited.ok, "a closed market was reported as lost data"
-    assert not audited.missing
-
-
-def test_a_traded_day_with_no_option_bars_is_reported(conn):
-    """The control for the test above: the SAME shape, one underlying bar added,
-    and the verdict must invert. Without this, a market_traded oracle stuck at
-    False would pass every audit forever and the job would be decorative.
-    """
-    _open_short_option(conn)
-    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
-    # The strike traded that session: its daily close says so.
-    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-05",
-                  bar_size="1d", hours=(14,))
-    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
-    assert audited.market_traded, "the underlying's own bars say it traded"
-    assert not audited.ok
-    assert audited.missing == ("AAA  271001P00100000",)
-    assert not audited.covered
-
-
-def test_a_strike_that_did_not_trade_is_not_reported_missing(conn):
-    """No daily close for the session means the strike did not trade in it, so
-    there were no bars to collect: QCOM 261120P00175000 was "1 missed of 3",
-    "cannot be backfilled later", on a day every live poll answered empty.
-    """
-    _open_short_option(conn)
-    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
-    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-04",
-                  bar_size="1d", hours=(14,))
-    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
-    assert audited.market_traded
-    assert audited.ok, "a strike that never traded was counted as lost bars"
-    assert not audited.missing and not audited.covered
-
-
-def test_a_covered_session_is_silent(conn):
-    _open_short_option(conn)
-    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
-    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-05")
-    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
-    assert audited.ok
-    assert audited.covered == ("AAA  271001P00100000",)
-    assert not audited.missing
-
-
-def test_a_contract_opened_after_the_session_is_not_reported_missing(conn):
-    """Otherwise every new position would trigger a report on the day it opened:
-    it cannot have bars for a session it did not exist in, and calling that a
-    loss would make the job cry wolf on the most ordinary event there is.
-    """
-    _open_short_option(conn, date="2026-08-06")
-    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
-    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
-    assert audited.ok, "a position opened today was blamed for yesterday"
-    assert not audited.missing and not audited.covered
-
-
-def test_only_the_contracts_the_poll_asks_for_are_audited(conn):
-    """Eligibility is the live manifest itself, not a second rule. A rule of its
-    own would drift from the collector and then report on a book neither holds --
-    the LEAP is the case that proves it, since it is deliberately never collected
-    hourly and so can never be missing hourly bars.
-    """
-    _option_trade(conn, conid="LEAP", symbol="AAA  270617C00700000",
-                  underlying="AAA", ucid="UAAA", date="2025-02-03",
-                  trade_id="tleap")
-    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
-    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
-    assert audited.market_traded
-    assert audited.ok, "the LEAP was audited for bars nothing ever collects"
-    assert not audited.missing and not audited.covered
-
-
-def test_the_audited_day_skips_weekends_and_holidays(conn):
-    """Walking back to the last day an underlying traded, rather than
-    subtracting one day: on a Monday the previous session is Friday, and the
-    same mechanism covers a holiday without knowing which days those are.
-    """
-    _open_short_option(conn, date="2026-07-20")
-    _session_bars(conn, "UAAA", "AAA", "2026-07-31")     # a Friday
-    monday = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
-    assert last_traded_day(conn, now=monday) == "2026-07-31"
-    assert audit_perishable(conn, now=monday).day == "2026-07-31"
-
-
-def test_no_recent_underlying_bars_reports_nothing_rather_than_guessing(conn):
-    """An empty or un-backfilled journal is the daily job's problem. Reporting it
-    here as well would double up on a failure that job already surfaces.
-    """
-    _open_short_option(conn)
-    audited = audit_perishable(conn, now=_NOW)
-    assert not audited.market_traded
-    assert audited.ok
-    assert audited.day == "2026-08-05", "the fallback day must still be yesterday"
-
-
-def test_a_bar_from_a_neighbouring_session_does_not_count_as_coverage(conn):
-    """The day is matched on the ET trading date, not on a raw epoch window.
-    Comparing timestamps against a UTC midnight boundary would count a 20:00 ET
-    bar -- which is 00:00Z the NEXT day -- as the following session's coverage.
-    """
-    _open_short_option(conn)
-    _session_bars(conn, "UAAA", "AAA", "2026-08-05")
-    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-04")
-    _session_bars(conn, "C1", "AAA  271001P00100000", "2026-08-05",
-                  bar_size="1d", hours=(14,))
-    audited = audit_perishable(conn, day="2026-08-05", now=_NOW)
-    assert not audited.ok, "yesterday's bars were counted as today's"
-    assert audited.missing == ("AAA  271001P00100000",)
-
-
-def test_the_audit_exit_codes_separate_all_three_outcomes(tmp_path, capsys):
-    """The cron reads nothing but the exit code to decide whether to speak, so
-    the three states have to be distinguishable: covered (silent), missing
-    (report), and nothing-to-check (also silent, but for a different reason a
-    human reading `cron_list` needs to be able to tell apart).
-    """
-    from optjournal.cli import main
-
-    db = tmp_path / "audit.db"
-    conn = connect_migrated(db)
-    add_statement(conn)
-
-    moment = datetime.now(UTC).astimezone(MARKET_TZ)
-    yesterday = (moment - timedelta(days=1)).strftime("%Y-%m-%d")
-    opened = (moment - timedelta(days=2)).strftime("%Y-%m-%d")
-    _open_short_option(conn, date=opened)
-
-    argv = ["bars", "--audit", "--db", str(db)]
-    assert main(argv) == 3, "an un-backfilled journal is not a lost session"
-
-    _session_bars(conn, "UAAA", "AAA", yesterday)
-    _session_bars(conn, "C1", "AAA  271001P00100000", yesterday,
-                  bar_size="1d", hours=(14,))
-    conn.commit()
-    assert main(argv) == 1, "a traded day with no option bars must report"
-    assert "MISSING" in capsys.readouterr().out
-
-    _session_bars(conn, "C1", "AAA  271001P00100000", yesterday)
-    conn.commit()
-    assert main(argv) == 0, "a covered session must be silent"
-
-
-def test_the_audit_refuses_to_be_combined_with_a_fetch(tmp_path):
-    """`--audit` reads and `--live` writes. One argv asking for both has no
-    single meaning, and guessing which won would make a cron's behaviour depend
-    on flag order.
-    """
-    from optjournal.cli import build_parser
-
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["bars", "--audit", "--live"])
 
 
 # --------------------------------------------------------------------------

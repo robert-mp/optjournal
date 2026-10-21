@@ -243,7 +243,7 @@ should get you running, not explain every decision.
 | document | what is in it |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | data flow, the module table, layering rules |
-| [docs/design-notes.md](docs/design-notes.md) | clocks, perishable data, modelled numbers, why the sync reply is not a dataclass |
+| [docs/design-notes.md](docs/design-notes.md) | clocks, modelled numbers, why the sync reply is not a dataclass |
 | [docs/money.md](docs/money.md) | the `Money` model: base vs as-charged, and when the native figure is withheld |
 | [docs/testing.md](docs/testing.md) | what the suite measures, and mutation testing |
 | [docs/theming.md](docs/theming.md) | the theme registry and the contrast rules |

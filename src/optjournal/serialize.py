@@ -29,16 +29,15 @@ from typing import Any
 from optjournal.ahead import SOURCE as AHEAD_SOURCE
 from optjournal.ahead import covered_weeks, week_of
 from optjournal.bars import (
-    audit_perishable,
+    close_series as bars_close_series,
+)
+from optjournal.bars import (
     upsert_bars,
     watch_closes,
     weekly_closes,
 )
-from optjournal.bars import (
-    close_series as bars_close_series,
-)
 from optjournal.campaigns import named as campaign_named
-from optjournal.clock import MARKET_TZ, et_day, parse_day
+from optjournal.clock import MARKET_TZ, SETTLE_H, SETTLE_M, et_day, parse_day
 from optjournal.costs import (
     AUTOFX_MARKUP_BPS,
     AUTOFX_MARKUP_MEASURED_BPS,
@@ -804,10 +803,6 @@ def market_data(
     }
 
 
-#: When a session's daily bar is final, in ET: the 16:00 close plus a margin for
-#: the source to publish the settled print. Before it, the day's bar is still
-#: moving; after it, that bar IS the prior close for the next session.
-SETTLE_H, SETTLE_M = 16, 15
 #: The cash open, in ET. Between the open and the settle the VIX is a live
 #: reading and has to be recent to be true.
 OPEN_H, OPEN_M = 9, 30
@@ -840,16 +835,6 @@ def in_session(now: datetime) -> bool:
         return False
     return (et.replace(hour=OPEN_H, minute=OPEN_M, second=0, microsecond=0) <= et
             < et.replace(hour=SETTLE_H, minute=SETTLE_M, second=0, microsecond=0))
-
-
-def _unsettled_day(now: datetime) -> str | None:
-    """Today's ET day until its settle, while its daily bar still moves; else None.
-
-    One rule for every reader of a settled daily close: the 0DTE calculator, its
-    scoring and the watchlist.
-    """
-    today = now.astimezone(MARKET_TZ).date().isoformat()
-    return None if last_settle(now).date().isoformat() == today else today
 
 
 def _fetched_at(conn: sqlite3.Connection, conid: str) -> datetime | None:
@@ -901,20 +886,16 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
     same-day seller wants beside the ladder. Filtered here rather than in the page
     so the two surfaces cannot disagree about which day "today" is.
     """
-    spx = bars_close_series(conn, "^GSPC", bar_size="1d")
+    # The last close from a SETTLED session: a bar fetched after its own settle.
+    # After 16:15 ET today's is final, and it is the prior close for the next
+    # session -- excluding it all evening planned tomorrow off yesterday.
+    spx = bars_close_series(conn, "^GSPC", bar_size="1d", settled=True)
     vix = bars_close_series(conn, "^VIX", bar_size="1d")
     if not spx or not vix:
         return None
 
-    # The last close from a SETTLED session. Today's bar is excluded only until
-    # the settle: after 16:15 ET it is final, and it is the prior close for the
-    # next session -- excluding it all evening planned tomorrow off yesterday.
     settle = last_settle(now)
-    open_day = _unsettled_day(now)
-    settled = [(ts, close) for ts, close in spx if et_day(ts) != open_day]
-    if not settled:
-        return None
-    spx_ts, spx_close = settled[-1]
+    spx_ts, spx_close = spx[-1]
     # The VIX is the live level, so the newest row stands. See the docstring.
     vix_ts, vix_close = vix[-1]
     # A non-positive close is a bad row and a negative VIX is impossible: both are
@@ -1011,7 +992,7 @@ def refresh_odte_bars(conn: sqlite3.Connection, *, now: datetime) -> str | None:
     return "; ".join(errors) or None
 
 
-def odte_scoring_data(conn: sqlite3.Connection, *, now: datetime) -> list[Row]:
+def odte_scoring_data(conn: sqlite3.Connection) -> list[Row]:
     """Settled sessions the 0DTE rails can be scored against, oldest first.
 
     One row per session that has CLOSED: `{date, prev_close, vix, close}` -- the
@@ -1041,11 +1022,11 @@ def odte_scoring_data(conn: sqlite3.Connection, *, now: datetime) -> list[Row]:
     2026-09-24 carries VIX 16.33 against the 15.67 the tab was read at on the same
     close -- so `railScores` says so rather than implying the two are one thing.
 
-    TODAY IS EXCLUDED UNTIL ITS SETTLE, by the calculator's rule. Before it, its
-    close is still moving, and scoring a band against a price that has not settled
-    would report a hit that the afternoon can take back. After it, the calculator
-    plans off that close, and leaving it unscored all evening put the two a
-    session apart.
+    A SESSION IS SCORED ONCE ITS BAR WAS FETCHED AFTER ITS SETTLE, by the
+    calculator's rule. Before that its close is still moving, and scoring a band
+    against a price that has not settled would report a hit that the afternoon can
+    take back. After it, the calculator plans off that close, and leaving it
+    unscored all evening put the two a session apart.
 
     SO IS A PAIR ACROSS A HOLE. The index series is fetched over a 60-day window,
     so a journal left unopened for longer stores June and then August, and the
@@ -1056,16 +1037,15 @@ def odte_scoring_data(conn: sqlite3.Connection, *, now: datetime) -> list[Row]:
     closes two weekdays in a row outside an emergency closure, so this needs no
     holiday calendar.
     """
-    spx = bars_close_series(conn, "^GSPC", bar_size="1d")
-    vix = bars_close_series(conn, "^VIX", bar_size="1d")
+    spx = bars_close_series(conn, "^GSPC", bar_size="1d", settled=True)
+    vix = bars_close_series(conn, "^VIX", bar_size="1d", settled=True)
     if not spx or not vix:
         return []
 
-    open_day = _unsettled_day(now)
     # Keyed by trading day rather than by timestamp, because the two series are
     # not stamped alike even when they come from one provider -- see `clock.et_day`.
     vix_by_day = {et_day(ts): close for ts, close in vix}
-    sessions = [(et_day(ts), close) for ts, close in spx if et_day(ts) != open_day]
+    sessions = [(et_day(ts), close) for ts, close in spx]
 
     rows: list[Row] = []
     # Sliding pairs, so the shorter tail is the point rather than a mismatch: the
@@ -1203,9 +1183,6 @@ def watchlist_data(
     # opposite sides of midnight and report countdowns a day apart.
     moment = now or datetime.now(UTC)
     today = date.fromisoformat(et_day(int(moment.timestamp())))
-    # A session in progress is not yet a close. Adding a symbol mid-session stores
-    # today's moving bar, and the row read it as the stored close from today.
-    moving = _unsettled_day(moment)
 
     held: dict[str, list[Row]] = {}
     for position in conn.execute(
@@ -1224,8 +1201,7 @@ def watchlist_data(
     out: list[Row] = []
     for row in rows:
         symbol = str(row["symbol"]).upper()
-        series = [s for s in watch_closes(conn, symbol, sessions=history + 1)
-                  if s[0] != moving][:history]
+        series = watch_closes(conn, symbol, sessions=history)
         closes = [close for _, close in series]
         # The vol's own slice, taken here rather than by reading less: the whole
         # series is what says how much history exists, and `closes` reports that.
@@ -1533,80 +1509,6 @@ def collection_status(
         return say("behind", f"Statements end {through}. Bitácora keeps trying"
                              + (f"; the last attempt said: {failed[:160]}" if failed else "."))
     return say("ok", f"Up to date: statements through {through}.")
-
-
-def audit_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
-    """Did the last session's perishable option bars actually land?
-
-    Computed on EVERY page load rather than by a scheduled job, and that is the
-    point rather than a shortcut. The audit was a cron, which meant the watchdog
-    and the thing it watched could stop together -- and did. Measured at 2.95 ms
-    on the real journal (the plan predicted 0.76 ms; either way it is noise
-    against a payload that already issues ~142 statements), so there is no reason
-    to make it conditional.
-
-    Answers the one question no later run can fix: an option's intraday series
-    exists only while its own session runs.
-
-    `audit.ok` IS NOT ENOUGH, AND THE PAGE MUST NOT RENDER IT ALONE. `ok` is
-    `not market_traded or not missing` (bars.SessionAudit.ok), and `market_traded`
-    is answered by "does any UNDERLYING have hourly bars for that day" -- a
-    deliberately calendar-free holiday oracle. That oracle shares a failure mode
-    with the thing it certifies. Reproduced on three copies of the real journal:
-
-        healthy          traded=True  covered=5  missing=0  ok=True
-        option poll dead traded=True  covered=0  missing=5  ok=False   <- caught
-        TOTAL blackout   traded=False covered=0  missing=0  ok=True    <- MISSED
-
-    Delete every hourly bar, as a fully dead collector would, and `ok` goes GREEN
-    because "no bars for anyone" reads as a market holiday. That is the same
-    watchdog-and-watched-stop-together shape that moved this audit out of a cron in
-    the first place, one level down.
-
-    So two extra fields travel, and the page reads THEM rather than `ok`:
-
-    * `witnesses` -- how many contracts were actually checked. Falls to zero in a
-      blackout while `ok` is green, so a count is honest where a boolean is not.
-    * `blackout` -- no underlying traded across `last_traded_day`'s whole 10-day
-      lookback. Nine US market holidays a year do not fall in a ten-day row, so
-      this cannot be a quiet December: it means collection itself has stopped.
-    * `ever_collected` -- whether this journal holds ANY bar at all. Without it
-      `blackout` cannot tell "collection stopped" from "collection never started",
-      and those need opposite responses. MEASURED, not assumed: with `price_bars`
-      emptied out of a copy of the real journal and again on a fresh one, the two
-      payloads were byte-identical (`market_traded` False, `witnesses` 0,
-      `blackout` True, `ok` True). So the demo journal, and any journal before its
-      first `optjournal bars`, rendered a red collection alarm for the absence of
-      a thing that had never been there. Exactly the distinction the heartbeat
-      already draws with `ever_ran`, which is what makes its omission here an
-      oversight rather than a judgement.
-
-    `ok` is kept, unchanged, because `optjournal bars --audit` and the cron's
-    delivery policy both key on it and this is not the commit to move that.
-    """
-    audit = audit_perishable(conn, now=now)
-    # `day` is None only when last_traded_day found no session in ten days, which
-    # is the blackout: the audit could not even choose a day to examine.
-    blackout = not audit.market_traded and not audit.covered and not audit.missing
-    # LIMIT 1, not COUNT(*): the question is existence, and price_bars holds
-    # thousands of rows on a working journal.
-    ever = conn.execute("SELECT 1 FROM price_bars LIMIT 1").fetchone() is not None
-    return {
-        "day": audit.day,
-        "market_traded": audit.market_traded,
-        "covered": list(audit.covered),
-        "missing": list(audit.missing),
-        "ok": audit.ok,
-        #: What the check actually looked at. Zero means it proved nothing.
-        "witnesses": len(audit.covered) + len(audit.missing),
-        #: Nothing traded anywhere in the lookback -- not a holiday, a dead poll.
-        #: Read WITH `ever_collected`: a blackout on a journal that never collected
-        #: is not a fault, and the page must not tint it as one.
-        "blackout": blackout,
-        #: Whether any bar has ever been stored here. Distinguishes a stopped
-        #: collector from one that was never started.
-        "ever_collected": ever,
-    }
 
 
 def logbook_data(conn: sqlite3.Connection, *, today: date) -> Row:

@@ -38,11 +38,11 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from optjournal.clock import MARKET_TZ, epoch_et, et_day
+from optjournal.clock import MARKET_TZ, SETTLE_H, SETTLE_M, et_day
 from optjournal.history import build_history
 from optjournal.marketdata import (
     BAR_SIZES,
@@ -56,12 +56,8 @@ from optjournal.marketdata import (
 __all__ = [
     "BackfillOutcome",
     "BarRequest",
-    "SessionAudit",
-    "audit_perishable",
     "backfill_bars",
     "bars_manifest",
-    "last_traded_day",
-    "market_traded_on",
     "close_series",
     "ReplaySeries",
     "replay_bars",
@@ -84,6 +80,11 @@ SETTLED_DAYS = 7
 #: while a months-long position wants daily or the series becomes thousands of
 #: points for no added insight.
 HOURLY_LIMIT_DAYS = 40
+
+#: How far back the source serves hourly bars. It refuses an hourly range starting
+#: more than 730 days ago, so an older underlying window is asked daily only, and
+#: its replay falls back to the daily series.
+HOURLY_HISTORY_DAYS = 729
 
 #: Context either side of the trade window when CHARTING, as a FRACTION of the
 #: window itself. PAD_DAYS is what gets FETCHED (wide is free and already
@@ -222,10 +223,6 @@ class BarRequest:
     start: int
     end: int
     kind: str
-    #: True when this data exists only while the session is running and can
-    #: never be backfilled -- an option's intraday bars. Everything else can be
-    #: re-fetched at leisure, so only these justify polling during market hours.
-    perishable: bool = False
 
     @property
     def key(self) -> tuple[str, str]:
@@ -276,10 +273,6 @@ def _bar_size_for(start: int, end: int, *, kind: str) -> str:
     request to receive an empty series. Measured pre-market, every contract in
     this book returned zero hourly bars while the underlying still returned five
     days of them -- the retention is asymmetric, not merely short.
-
-    The live session is the exception, and `bars_manifest` handles it separately:
-    an option DOES serve hourly bars while its session is in progress. Those can
-    only be collected as they happen, never backfilled.
     """
     if kind == "option":
         return "1d"
@@ -330,29 +323,25 @@ def underlying_conids(conn: sqlite3.Connection) -> dict[str, str]:
 
 def bars_manifest(
     conn: sqlite3.Connection, *, now: datetime | None = None,
-    perishable_only: bool = False,
 ) -> list[BarRequest]:
     """Every (contract, granularity, window) the journal's own positions imply.
 
-    Windows for the same ``(conid, bar_size)`` are merged to their union, so an
-    overlapping pair becomes one request rather than two.
-
-    ``perishable_only`` narrows the result to data that cannot be collected
-    later: the intraday bars of an option that is still open. That is what a
-    market-hours poll should ask for, and asking for the whole manifest seven
-    times a session would re-fetch three years of settled daily history to
-    collect a handful of new hourly rows.
+    Windows for the same ``(conid, bar_size)`` that overlap or touch are merged
+    to their union, so an overlapping pair becomes one request rather than two.
+    Two holds years apart stay two requests: their union would fetch every bar
+    between them.
     """
     moment = now or datetime.now(UTC)
     ceiling = int((moment + timedelta(days=1)).timestamp())
+    hourly_floor = int((moment - timedelta(days=HOURLY_HISTORY_DAYS)).timestamp())
 
     underlyings = underlying_conids(conn)
-    merged: dict[tuple[str, str], BarRequest] = {}
+    windows: dict[tuple[str, str], list[BarRequest]] = {}
 
-    def add(
-        conid: str, symbol: str, start: int, end: int, kind: str, *, open_: bool
-    ) -> None:
+    def add(conid: str, symbol: str, start: int, end: int, kind: str) -> None:
         size = _bar_size_for(start, end, kind=kind)
+        if size == "1h" and start < hourly_floor:
+            size = "1d"
         _emit(conid, symbol, start, end, kind, size)
         # An hourly underlying window ALSO needs its daily series, because the
         # expected-move band solves implied vol by pairing an option's daily
@@ -363,38 +352,15 @@ def bars_manifest(
         # the same conid. One extra request per underlying per window.
         if kind == "underlying" and size == "1h":
             _emit(conid, symbol, start, end, kind, "1d")
-        # A STILL-OPEN option whose replay is drawn hourly also gets an hourly
-        # request, and it is the only perishable one in the manifest. Gated on
-        # the underlying's own granularity rule rather than a second threshold,
-        # so the option is collected hourly exactly when the chart renders it
-        # hourly: the strangles qualify, the LEAP does not -- months of hourly
-        # option bars would be thousands of rows the chart never draws.
-        if kind == "option" and open_ and _bar_size_for(
-            start, end, kind="underlying"
-        ) == "1h":
-            _emit(conid, symbol, start, end, kind, "1h", perishable=True)
 
     def _emit(
         conid: str, symbol: str, start: int, end: int, kind: str, size: str,
-        *, perishable: bool = False,
     ) -> None:
         request = BarRequest(
             conid=str(conid), symbol=str(symbol), bar_size=size,
-            start=start, end=end, kind=kind, perishable=perishable,
+            start=start, end=end, kind=kind,
         )
-        existing = merged.get(request.key)
-        if existing is None:
-            merged[request.key] = request
-            return
-        merged[request.key] = BarRequest(
-            conid=existing.conid, symbol=existing.symbol, bar_size=size,
-            start=min(existing.start, request.start),
-            end=max(existing.end, request.end),
-            kind=existing.kind,
-            # Sticky through a merge: two windows for one contract are the same
-            # rows, and if either was only collectable live then so is the union.
-            perishable=existing.perishable or request.perishable,
-        )
+        windows.setdefault(request.key, []).append(request)
 
     report = build_history(conn, asset_category="OPT")
     for episode in report.episodes:
@@ -402,22 +368,20 @@ def bars_manifest(
             _epoch(episode.opened_at), _epoch(episode.closed_at), moment)
         if end <= start:
             continue
-        open_ = not episode.is_closed
-        add(episode.conid, episode.symbol, start, end, "option", open_=open_)
+        add(episode.conid, episode.symbol, start, end, "option")
         name = (episode.underlying_symbol or "").strip()
         conid = underlyings.get(name)
         if name and conid:
-            add(conid, name, start, end, "underlying", open_=open_)
+            add(conid, name, start, end, "underlying")
 
     # Watched symbols. Without this a watchlist row is permanently blank: the
     # manifest derives windows from POSITIONS, so a symbol you merely watch has
     # no bars at all -- measured, GOOG had 5 daily closes and PLTR 4, which is
     # not enough for a 20-day realised vol.
     #
-    # Daily only, and never perishable. A watchlist wants a trend and a
-    # volatility, both of which daily closes answer; hourly bars for a symbol
-    # holding no position would multiply requests for a column nobody reads at
-    # that resolution.
+    # Daily only. A watchlist wants a trend and a volatility, both of which daily
+    # closes answer; hourly bars for a symbol holding no position would multiply
+    # requests for a column nobody reads at that resolution.
     for row in conn.execute("SELECT symbol FROM watchlist"):
         name = str(row["symbol"] or "").strip().upper()
         if not name:
@@ -441,21 +405,30 @@ def bars_manifest(
         # four months with the reason written beside it).
         add(underlyings.get(name) or f"watch:{name}", name,
             int((moment - timedelta(days=WATCH_LOOKBACK_DAYS)).timestamp()),
-            ceiling, "watchlist", open_=False)
+            ceiling, "watchlist")
 
     # Market context for the 0DTE planner: the S&P 500 and the VIX, always, on a
     # short daily window. Unconditional -- unlike watched symbols and positions
     # these do not come from the journal, they ARE the market the journal trades
     # in, so the planner should have them on a fresh clone before a single symbol
-    # is watched. Non-perishable (daily closes backfill), so this adds nothing to
-    # the perishable audit or its bars-missed count.
+    # is watched.
     for symbol in CONTEXT_SYMBOLS:
         add(symbol, symbol,
             int((moment - timedelta(days=CONTEXT_LOOKBACK_DAYS)).timestamp()),
-            ceiling, "context", open_=False)
+            ceiling, "context")
 
-    requests = [r for r in merged.values() if r.perishable or not perishable_only]
-    return sorted(requests, key=lambda r: (r.kind, r.symbol, r.bar_size))
+    merged: list[BarRequest] = []
+    for group in windows.values():
+        group.sort(key=lambda r: r.start)
+        current = group[0]
+        for request in group[1:]:
+            if request.start <= current.end:
+                current = replace(current, end=max(current.end, request.end))
+            else:
+                merged.append(current)
+                current = request
+        merged.append(current)
+    return sorted(merged, key=lambda r: (r.kind, r.symbol, r.bar_size, r.start))
 
 
 def upsert_bars(
@@ -500,22 +473,18 @@ def backfill_bars(
     source: str = "yahoo",
     fetch: Callable[..., list[Bar]] = fetch_bars,
     now: datetime | None = None,
-    perishable_only: bool = False,
 ) -> BackfillOutcome:
     """Fetch and store every window the manifest names.
 
     ``fetch`` is injected so the suite can exercise the whole path without a
     network call. A per-request failure is collected rather than raised: one
     unreachable contract should not abandon the rest of the book.
-
-    ``perishable_only`` restricts the run to the intraday bars of open options --
-    the market-hours poll. See :func:`bars_manifest`.
     """
     moment = now or datetime.now(UTC)
     cutoff = int(moment.timestamp())
     requests = [
         request
-        for request in bars_manifest(conn, now=moment, perishable_only=perishable_only)
+        for request in bars_manifest(conn, now=moment)
         if not _settled(conn, request, cutoff)
     ]
     written = skipped = 0
@@ -537,23 +506,45 @@ def backfill_bars(
             # or a provider outage and should still fail the job.
             if request.kind == "option" and request.end <= cutoff:
                 skipped += 1
+                _mark_asked(conn, request, cutoff, source)
                 continue
             failures.append(str(exc))
             continue
         except BarFetchError as exc:
             failures.append(str(exc))
             continue
-        if not bars:
+        if bars:
+            written += upsert_bars(
+                conn, conid=request.conid, symbol=request.symbol,
+                bar_size=request.bar_size, source=source, bars=bars,
+            )
+        else:
             skipped += 1
-            continue
-        written += upsert_bars(
-            conn, conid=request.conid, symbol=request.symbol,
-            bar_size=request.bar_size, source=source, bars=bars,
-        )
+        _mark_asked(conn, request, cutoff, source)
     return BackfillOutcome(
         requested=len(requests), written=written,
         skipped=skipped, failures=tuple(failures),
     )
+
+
+def _mark_asked(
+    conn: sqlite3.Connection, request: BarRequest, cutoff: int, source: str
+) -> None:
+    """Store an all-null bar at a finished window's start when nothing stored
+    reaches that start, so `_settled` stops asking for it.
+
+    The source has nothing there to give: an expired option answers 404 or an
+    empty series, and a contract that first traded days into its window starts
+    late. Without this each would be asked on every run for good. A null bar is
+    what the source itself sends for an interval with no print, and every reader
+    drops a null close or open. A window widened backwards later starts before
+    this bar, so it is asked again.
+    """
+    if request.end <= cutoff - SETTLED_DAYS * 86400 and not _settled(
+            conn, request, cutoff):
+        upsert_bars(conn, conid=request.conid, symbol=request.symbol,
+                    bar_size=request.bar_size, source=source,
+                    bars=[Bar(request.start, None, None, None, None, None)])
 
 
 def _settled(conn: sqlite3.Connection, request: BarRequest, cutoff: int) -> bool:
@@ -574,164 +565,21 @@ def _settled(conn: sqlite3.Connection, request: BarRequest, cutoff: int) -> bool
     return first is not None and first <= request.start + slack
 
 
-@dataclass(frozen=True, slots=True)
-class SessionAudit:
-    """Whether one session's perishable bars actually landed.
+def _is_settled_close(ts: int, fetched_at: str) -> bool:
+    """Whether a daily bar holds its session's close: fetched at or after that ET
+    day's settle.
 
-    Exists because the live poll treats a fetch failure as a quiet retry, which
-    is right seven times a session and wrong once a day: the intraday series is
-    cumulative within a session, so a single lost poll costs nothing, but a
-    session where EVERY poll failed is gone for good and says nothing about it.
-    One question, asked once, about the only thing that cannot be recovered.
+    A bar fetched mid-session holds the price of that moment and stays stored as
+    the session's row until a later fetch replaces it, so the clock alone cannot
+    say: read at 17:00, an 11:00 fetch is still an 11:00 price.
     """
-
-    #: The ET trading date examined, YYYY-MM-DD.
-    day: str
-    #: Whether the market traded that day at all -- see market_traded_on.
-    market_traded: bool
-    #: Contracts that were asked for AND have hourly bars for the day.
-    covered: tuple[str, ...]
-    #: Contracts that were asked for, traded that day (a daily close says so) and
-    #: have no hourly bars for it. The reportable set.
-    missing: tuple[str, ...]
-
-    @property
-    def ok(self) -> bool:
-        """True when there is nothing for a human to do.
-
-        A day the market did not trade is not a fault, and neither is a book
-        holding nothing eligible -- both produce no bars for entirely correct
-        reasons, and alarming on either would train the reader to ignore this.
-        """
-        return not self.market_traded or not self.missing
-
-
-def market_traded_on(conn: sqlite3.Connection, day: str) -> bool:
-    """Whether any UNDERLYING has hourly bars for the given ET date.
-
-    The holiday oracle, and deliberately not a hardcoded calendar. US markets
-    shut around nine days a year plus the odd half-session; a date list would
-    need maintaining forever and would be wrong the first year it was not. The
-    underlying's own hourly series answers the question directly: unlike an
-    option's, it is retained for days and is re-fetched by the daily backfill,
-    so by the time this runs it is an independent witness to whether the session
-    happened. No bars for anyone means the market was shut; bars for the
-    underlying but none for an option means collection failed.
-    """
-    conids = set(underlying_conids(conn).values())
-    if not conids:
+    settle = datetime.fromtimestamp(ts, MARKET_TZ).replace(
+        hour=SETTLE_H, minute=SETTLE_M, second=0, microsecond=0)
+    try:
+        fetched = datetime.fromisoformat(fetched_at)
+    except ValueError:
         return False
-    placeholders = ", ".join("?" for _ in conids)
-    rows = conn.execute(
-        f"SELECT ts FROM price_bars WHERE bar_size = '1h' AND conid IN ({placeholders})",
-        sorted(conids),
-    ).fetchall()
-    return any(et_day(int(row["ts"])) == day for row in rows)
-
-
-def last_traded_day(
-    conn: sqlite3.Connection, *, now: datetime | None = None, lookback: int = 10
-) -> str | None:
-    """The most recent ET date strictly before today that an underlying traded.
-
-    Walking backwards from yesterday rather than subtracting one day skips
-    weekends and holidays with the same mechanism and no calendar: the first day
-    that has underlying bars is the last session. Bounded by ``lookback``
-    because the source only retains a few days of hourly, so a longer walk would
-    silently pick a date whose option bars were never collectable anyway.
-    """
-    moment = (now or datetime.now(UTC)).astimezone(MARKET_TZ)
-    for back in range(1, lookback + 1):
-        day = (moment - timedelta(days=back)).strftime("%Y-%m-%d")
-        if market_traded_on(conn, day):
-            return day
-    return None
-
-
-def _first_fill_epochs(conn: sqlite3.Connection) -> dict[str, int]:
-    """Earliest fill epoch per option conid, for excluding same-day openings."""
-    rows = conn.execute(
-        "SELECT conid, MIN(first_fill_at) AS opened FROM trade_legs"
-        " WHERE asset_category = 'OPT' GROUP BY conid"
-    ).fetchall()
-    out: dict[str, int] = {}
-    for row in rows:
-        stamp = epoch_et(row["opened"])
-        if stamp is not None:
-            out[str(row["conid"])] = stamp
-    return out
-
-
-def audit_perishable(
-    conn: sqlite3.Connection,
-    *,
-    day: str | None = None,
-    now: datetime | None = None,
-) -> SessionAudit:
-    """Did the given session actually produce the option bars it should have?
-
-    Eligibility comes from ``bars_manifest(perishable_only=True)`` -- the exact
-    set the live poll asks for -- rather than from a second rule of its own. An
-    audit with its own idea of what should have been collected drifts from the
-    collector and then reports on a book neither of them has.
-
-    One correctness cost of reusing the manifest, stated because it bounds what
-    this can catch: the manifest is derived from what is open NOW, so a contract
-    that CLOSED during the audited session is no longer eligible and goes
-    unexamined. The reverse case is handled -- a contract opened after the
-    session cannot have bars for it, and counting that as missing would alarm
-    every time a position was opened.
-
-    So is a strike that did not trade that session. With no daily close for the
-    day there were no hourly bars to collect, and calling it lost was a red alarm
-    over QCOM 261120P00175000 on a day every live poll answered empty. The daily
-    series is a fair witness here: `market_traded_on` needs the underlying's
-    hourly bars for the day, which only the daily job fetches, and the same run
-    asks for every open option's daily window.
-    """
-    audited = day or last_traded_day(conn, now=now)
-    if audited is None:
-        # No underlying bars for any recent day. Either the journal is empty or
-        # the daily backfill has not run; both are the daily job's business, not
-        # this one's, and reporting them here would double up on its failure.
-        moment = (now or datetime.now(UTC)).astimezone(MARKET_TZ)
-        return SessionAudit(
-            day=(moment - timedelta(days=1)).strftime("%Y-%m-%d"),
-            market_traded=False, covered=(), missing=(),
-        )
-    traded = market_traded_on(conn, audited)
-    if not traded:
-        # Nothing was collectable, so nothing is missing. Walking the manifest
-        # anyway would fill `missing` on a day the market was shut -- true of the
-        # bars and false about the world, and a payload whose `missing` list
-        # contradicts its own `ok` is worse than one that says nothing.
-        return SessionAudit(day=audited, market_traded=False, covered=(), missing=())
-    end_of_day = int(
-        datetime.strptime(audited, "%Y-%m-%d")
-        .replace(hour=23, minute=59, tzinfo=MARKET_TZ).timestamp()
-    )
-    opened = _first_fill_epochs(conn)
-    covered: list[str] = []
-    missing: list[str] = []
-    for request in bars_manifest(conn, now=now, perishable_only=True):
-        entry = opened.get(request.conid)
-        if entry is not None and entry > end_of_day:
-            continue  # opened after the session; it could not have bars for it
-        stamps = conn.execute(
-            "SELECT ts FROM price_bars WHERE conid = ? AND bar_size = '1h'",
-            (request.conid,),
-        ).fetchall()
-        found = any(et_day(int(row["ts"])) == audited for row in stamps)
-        had_trades = found or any(
-            et_day(int(row["ts"])) == audited for row in conn.execute(
-                "SELECT ts FROM price_bars WHERE conid = ? AND bar_size = '1d'"
-                " AND close IS NOT NULL", (request.conid,)))
-        if had_trades:
-            (covered if found else missing).append(request.symbol)
-    return SessionAudit(
-        day=audited, market_traded=traded,
-        covered=tuple(sorted(covered)), missing=tuple(sorted(missing)),
-    )
+    return (fetched if fetched.tzinfo else fetched.replace(tzinfo=UTC)) >= settle
 
 
 def close_series(
@@ -741,6 +589,7 @@ def close_series(
     bar_size: str,
     start: int | None = None,
     end: int | None = None,
+    settled: bool = False,
 ) -> list[tuple[int, float]]:
     """Timestamped closes for one conid at one granularity, oldest first.
 
@@ -757,7 +606,8 @@ def close_series(
 
     Null closes are dropped. A quiet strike genuinely has no print, and the
     window is clipped inclusively so a caller asking for a trade's span gets
-    exactly that span.
+    exactly that span. `settled` drops a daily bar that does not hold its
+    session's close yet (`_is_settled_close`).
     """
     clauses = ["bar_size = ?", "conid = ?", "close IS NOT NULL"]
     args: list[Any] = [bar_size, str(conid)]
@@ -768,10 +618,12 @@ def close_series(
         clauses.append("ts <= ?")
         args.append(int(end))
     rows = conn.execute(
-        f"SELECT ts, close FROM price_bars WHERE {' AND '.join(clauses)} ORDER BY ts",
+        f"SELECT ts, close, fetched_at FROM price_bars WHERE {' AND '.join(clauses)}"
+        " ORDER BY ts",
         args,
     ).fetchall()
-    return [(int(r["ts"]), float(r["close"])) for r in rows]
+    return [(int(r["ts"]), float(r["close"])) for r in rows
+            if not settled or _is_settled_close(int(r["ts"]), r["fetched_at"])]
 
 
 def watch_closes(
@@ -809,9 +661,10 @@ def watch_closes(
 
     A null close is dropped, for `close_series`' reason: a bar's close is nullable
     by design and a day with no print is not a session this can report a price for.
+    So is a bar that does not hold its session's close yet (`_is_settled_close`).
     """
     rows = conn.execute(
-        f"SELECT ts, close, ({_RANK_CASE}) AS rank FROM price_bars"
+        f"SELECT ts, close, fetched_at, ({_RANK_CASE}) AS rank FROM price_bars"
         " WHERE symbol = ? AND bar_size = '1d' AND close IS NOT NULL"
         " ORDER BY ts DESC",
         (str(symbol or "").strip().upper(),),
@@ -822,6 +675,8 @@ def watch_closes(
     best: dict[str, tuple[int, int, float]] = {}
     order: list[str] = []
     for row in rows:
+        if not _is_settled_close(int(row["ts"]), row["fetched_at"]):
+            continue
         day = et_day(int(row["ts"]))
         contender = (int(row["rank"]), int(row["ts"]), float(row["close"]))
         if day not in best:
@@ -852,8 +707,7 @@ def weekly_closes(
     an average of it.
 
     NO GAP FILLING AND NO HOLIDAY CALENDAR. The sessions present in the data are the
-    definition of the week, which is the same principle the perishable audit's
-    holiday oracle uses rather than maintaining a date list forever. A
+    definition of the week, rather than a date list maintained forever. A
     holiday-shortened week is still one week, which is also what TradingView does,
     and it is not an edge case: MEASURED over 755 fetched daily closes (each of
     TSLA, GOOG, PLTR, SPY, NVDA and DELL, identically), 158 ISO weeks of which 125
