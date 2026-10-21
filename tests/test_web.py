@@ -8505,6 +8505,18 @@ def test_the_open_page_follows_the_server_without_a_refresh_button():
     assert "if(Date.now()-(S.pulseAt||0)>=PULSE_MS)pulse();" in js.replace(" ", "")
 
 
+def test_the_sync_button_comes_back_when_its_cooldown_ends_with_nothing_new():
+    """The cooldown runs down with the clock alone, and only a load reads it
+    again. So while one runs, a pulse that finds nothing new reloads anyway, and
+    once it is over the pulse is back to reloading only for a new stamp."""
+    ok = {"state": "ok", "message": "Up to date.", "fix": None, "through": "2026-10-05"}
+    same = {"stamp": "7", "collection": ok}
+    cooling = {**same, "sync": {"configured": True, "cooldown_remaining_s": 840}}
+    assert _pulse(cooling, same)["loads"] == 1
+    over = {**same, "sync": {"configured": True, "cooldown_remaining_s": 0}}
+    assert _pulse(over, same)["loads"] == 0
+
+
 def test_a_server_with_no_scheduler_reports_collection_off(tmp_path, monkeypatch):
     """`serve --no-scheduler` on a journal a scheduler once fed: the old heartbeat
     is stale, and the server, which knows it runs none, says "off" rather than

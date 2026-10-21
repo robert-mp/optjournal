@@ -6271,6 +6271,8 @@ async function pulse(){
   }catch(e){return;}  /* a missed pulse is the next minute's to make up */
   if(!S.state) return;
   if(pl.stamp!==S.state.stamp){await keepPlace(load);return;}
+  /* Sync's cooldown runs down with the clock alone, and only a load reads it. */
+  if((S.state.sync||{}).cooldown_remaining_s>0){await keepPlace(load);return;}
   S.checkedAt=Date.now();
   if(JSON.stringify(pl.collection)!==JSON.stringify(S.state.collection)){
     S.state.collection=pl.collection;
