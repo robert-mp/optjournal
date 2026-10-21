@@ -5950,7 +5950,7 @@ function bindZdte(){
          refused at the moment it would otherwise blank the ladder. The caret then
          goes back where it was, less whatever the mask removed -- without that,
          typing into the middle of a number jumps the cursor to the end. */
-      const was=el.value, clean=sanitizeLevel(was);
+      const was=el.value, clean=sanitizeLevel(was,key);
       if(clean!==was){
         const at=Math.max(0,(el.selectionStart||clean.length)-(was.length-clean.length));
         el.value=clean;
@@ -5966,7 +5966,7 @@ function bindZdte(){
     el.ondrop=ev=>{
       ev.preventDefault();
       const text=ev.dataTransfer?ev.dataTransfer.getData('text/plain'):'';
-      if(text) zfill(key,sanitizeLevel(text));
+      if(text) zfill(key,sanitizeLevel(text,key));
     };
   });
   /* Two ways to move a strike into a pad, because the mouse gesture people reach
@@ -6505,7 +6505,7 @@ function applyHash(){
      reading stands) rather than as a cleared field, since a URL carrying `spx=`
      was not a reader clearing anything. */
   const typed=key=>{
-    const raw=sanitizeLevel(hs.get(key)||'');
+    const raw=sanitizeLevel(hs.get(key)||'',key);
     return raw===''?null:raw;
   };
   S.zspx=typed('spx');S.zvix=typed('vix');

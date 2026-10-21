@@ -360,17 +360,21 @@ export function parseNumber(text) {
  *
  * A comma is a decimal point too: the page prints levels in the reader's locale
  * ("7706,03", "7.706,03") and a phone's decimal keypad offers one. A separator
- * with exactly three digits before the next separator, or before the end, groups
- * thousands and is dropped, so "7,706.03", "7.706,03" and "7,706" read alike,
- * typed or pasted. Three decimals would read as thousands too, and no level or
- * VIX is quoted to three. The first separator left is the point; any after it
- * are dropped.
+ * with exactly three digits before the next separator groups thousands and is
+ * dropped, so "7,706.03" and "7.706,03" read alike, typed or pasted. The first
+ * separator left is the point; any after it are dropped.
+ *
+ * `key` names the field. In a level field (any key but "vix") a whole number
+ * grouped in threes, "7,780" or "1,234,567", is that number: an index level is
+ * above 1000, so 7.78 is never what it means, while "7780.125" keeps its point.
+ * A VIX is never quoted in thousands, so there "18.250" stays 18.25.
  */
-export function sanitizeLevel(text) {
-  const cleaned = String(text ?? "")
-    .replace(/[^\d.,]/g, "")
-    .replace(/[.,](?=\d{3}(?:[.,]|$))/g, "")
-    .replace(/,/g, ".");
+export function sanitizeLevel(text, key) {
+  const kept = String(text ?? "").replace(/[^\d.,]/g, "");
+  if (key !== "vix" && /^\d{1,3}([.,])\d{3}(?:\1\d{3})*$/.test(kept)) {
+    return kept.replace(/[.,]/g, "");
+  }
+  const cleaned = kept.replace(/[.,](?=\d{3}[.,])/g, "").replace(/,/g, ".");
   const dot = cleaned.indexOf(".");
   return dot === -1
     ? cleaned

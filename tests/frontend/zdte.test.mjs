@@ -195,8 +195,27 @@ test("the input mask keeps digits and one decimal point", () => {
 test("a decimal comma is a decimal point, and a thousands separator is dropped", () => {
   /* The mask runs on every keystroke and rewrites the field, so each reading is
      checked pasted whole and typed one character at a time. */
-  const typed = (text) => [...text].reduce((field, ch) => sanitizeLevel(field + ch), "");
-  for (const [text, level] of [
+  const typed = (text, key) => [...text].reduce((field, ch) => sanitizeLevel(field + ch, key), "");
+  const reads = (keys, cases) => {
+    for (const key of keys) {
+      for (const [text, level] of cases) {
+        assert.equal(sanitizeLevel(text, key), level, `${key}: pasted ${text}`);
+        assert.equal(typed(text, key), level, `${key}: typed ${text}`);
+      }
+    }
+  };
+  const LEVELS = ["spx", "call", "put"];
+  reads(["vix"], [
+    ["18.250", "18.250"],
+    ["9.125", "9.125"],
+    ["18,25", "18.25"],
+  ]);
+  reads(LEVELS, [
+    ["7,780", "7780"],
+    ["7.780", "7780"],
+    ["7,706", "7706"],
+  ]);
+  reads([...LEVELS, "vix"], [
     ["18,5", "18.5"],
     ["7706,03", "7706.03"],
     ["7.706,03", "7706.03"],
@@ -204,20 +223,20 @@ test("a decimal comma is a decimal point, and a thousands separator is dropped",
     ["1.234.567,89", "1234567.89"],
     ["1,234,567.89", "1234567.89"],
     ["7706.03.", "7706.03"],
-    ["7,780", "7780"],
-    ["7.780", "7780"],
-    ["7,706", "7706"],
-    ["1,234,567", "1234567"],
     ["7,780.5", "7780.5"],
     ["7780,5", "7780.5"],
-  ]) {
-    assert.equal(sanitizeLevel(text), level, `pasted ${text}`);
-    assert.equal(typed(text), level, `typed ${text}`);
-  }
+    ["7780.125", "7780.125"],
+    ["7706.030", "7706.030"],
+  ]);
+  /* Pasted only: typed, "1,234" is already 1234 when ",567" arrives, and
+     "1234,567" reads as three decimals, like "7780.125". */
+  for (const key of LEVELS) assert.equal(sanitizeLevel("1,234,567", key), "1234567", key);
   /* The finding's own reading: a VIX of 18,5 is a 1.16% move, not 11.56%. */
-  assert.equal(expectedMove(SPX, sanitizeLevel("18,5")).pct.toFixed(2), "1.16");
+  assert.equal(expectedMove(SPX, sanitizeLevel("18,5", "vix")).pct.toFixed(2), "1.16");
+  /* A VIX of 18.250 is a 1.14% move, not 1140%. */
+  assert.equal(expectedMove(SPX, sanitizeLevel("18.250", "vix")).pct.toFixed(2), "1.14");
   /* A level pasted with its thousands grouped is the strike it names, not 10. */
-  assert.equal(strikeNear(sanitizeLevel("7,780"), "call"), 7780);
+  assert.equal(strikeNear(sanitizeLevel("7,780", "call"), "call"), 7780);
 });
 
 test("a level resolves to the listed strike nearest it", () => {

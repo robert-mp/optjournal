@@ -9750,6 +9750,17 @@ def test_the_typed_readings_ride_in_the_hash_and_heal_back_out():
     )
 
 
+def test_a_reading_in_the_hash_is_masked_as_its_own_field():
+    """A level grouped in threes is that level, and a VIX of 18.250 stays 18.25:
+    read as 18250 it drew an expected move near 1100% with no warning."""
+    out = _hash_harness([
+        "location.hash='#tab=odte&spx=7,706&vix=18.250&call=7.780&put=7,600';",
+        "applyHash();",
+        "console.log(JSON.stringify([S.zspx,S.zvix,S.zcall,S.zput]));",
+    ])
+    assert out == ["7706", "18.250", "7780", "7600"]
+
+
 def test_the_calculator_explains_itself_on_hover_rather_than_on_the_page():
     """Its two explanations live in tips, and the figures stay on the page.
 
