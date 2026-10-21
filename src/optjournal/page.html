@@ -479,7 +479,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *  liquidation (serialize.allocation_data). Rows plus cash sum to `nav`
  * @property {string|null} as_of -- the newest snapshot read
  * @property {number|null} nav -- the broker's net liquidation, base currency
- * @property {string|null} nav_date
  * @property {number|null} cash
  * @property {number|null} cash_share -- null without a net liquidation figure
  * @property {Array} rows -- AllocationRow, largest absolute net first
@@ -527,7 +526,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} options -- base; a short option is negative, a liability
  * @property {number} net -- stock plus options
  * @property {number|null} share -- net over net liquidation; negative for a short
- * @property {number} lines -- snapshot rows folded in
  */
 
 /** @typedef {Object} Position -- one open-position snapshot row (serialize.positions_data)
@@ -708,8 +706,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   axis, built from what is STORED in the window rather than the feed's alphabet
  * @property {Array} impacts -- MarketFacet rows in severity order, from
  *   `events.IMPACT_ORDER`, so the page holds no copy of what "important" means
- * @property {string} default_scope -- what the DEFAULT filter narrows to, in
- *   words, so the label comes from the server that applied it
  * @property {number} total_events -- every row in the window
  * @property {number} default_events -- how many the default filter shows, so
  *   Reset can state what it costs without the page recomputing the defaults
@@ -766,8 +762,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *  no bars were collected, including the audit job whose purpose was to notice. So
  *  a row can be green on outcome and red on freshness simultaneously.
  * @property {Array} jobs -- JobRow per registered job
- * @property {number|null} heartbeat_at -- epoch UTC, written by the TICK LOOP
- *   rather than by a job, so a dead loop reads as a dead heartbeat
  * @property {number|null} heartbeat_age_s
  * @property {boolean} running -- heartbeat fresher than stale_after_s
  * @property {boolean} ever_ran -- false when no scheduler has EVER written a
@@ -779,7 +773,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
 /** @typedef {Object} JobRow -- one registered job's state (serialize.jobs_data)
  * @property {string} job
  * @property {string|null} last_status
- * @property {number|null} last_fired_for -- the newest scheduled instant claimed
  * @property {number} consecutive_failures
  * @property {boolean} backed_off -- past jobs.FAILURE_BACKOFF: the fast retries have
  *   stopped and the job runs only at its healthy cadence until a run succeeds
@@ -1081,7 +1074,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {boolean} events_ahead -- those rows are the listing ahead of the
  *   calendar feed (ahead.py), so their grade is this journal's
  * @property {string} today -- the ET session date the calculator is drawn for
- * @property {string|null} spx_fetched_at -- when the S&P series last landed, UTC
  * @property {string|null} vix_fetched_at -- when the VIX series last landed, UTC
  * @property {boolean} live -- the cash session is open, so the VIX must be recent
  * @property {boolean} fresh -- both readings are current against the clock; when

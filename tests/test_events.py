@@ -26,6 +26,7 @@ from optjournal.events import (
     SOURCE,
     EventFetchError,
     EventRateLimited,
+    default_scope,
     parse_events,
     store_events,
     upcoming,
@@ -381,7 +382,7 @@ def test_a_day_count_is_the_total_so_the_strip_cannot_lie(conn):
         )
 
 
-def test_the_default_scope_is_named_by_the_server_that_applies_it(conn):
+def test_the_default_scope_is_named_from_the_filter_it_applies(conn):
     """The label comes from the constants, so it cannot describe a stale filter.
 
     This is the bug the CLI had: a hard-coded "USD high-impact" beside defaults
@@ -389,7 +390,7 @@ def test_the_default_scope_is_named_by_the_server_that_applies_it(conn):
     worse than no label.
     """
     payload = _market(conn)
-    assert payload["default_scope"] == "USD, All high/medium-impact"
+    assert default_scope() == "USD, All high/medium-impact"
     assert payload["default_events"] == 3, (
         "USD High x2 plus the 'All' Medium row -- the slice the label describes"
     )

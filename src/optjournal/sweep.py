@@ -65,12 +65,6 @@ class Page:
     kind: str | None
     calday: str | None
     replay: str | None
-    #: The raw dump, INCLUDING the page's own <script> source. NO check reads
-    #: this, deliberately: a pattern for a rendered cell matches the template
-    #: literal that generates it just as well, and every structural check in
-    #: the first run did exactly that. Retained because it is the artifact --
-    #: worth having when a failure needs explaining.
-    dom: str
     #: Script and style bodies removed, tags intact -- what a structural check
     #: reads.
     markup: str
@@ -845,7 +839,7 @@ def sweep_journal(
 
         for tab, ccy, kind, calday, replay in coords:
             page = Page(tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay,
-                        dom="", markup="", text="", payload=payload)
+                        markup="", text="", payload=payload)
             # Twice, because headless Chrome occasionally exits without a DOM
             # under load. Then a FAIL: `cmd_sweep` has already refused to run
             # with no browser at all, so a page that still has none did not
@@ -862,7 +856,7 @@ def sweep_journal(
                 continue
             page = Page(tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay,
                         console=tuple(browser.last_console_errors()),
-                        dom=dom, markup=browser.markup(dom),
+                        markup=browser.markup(dom),
                         text=browser.rendered_text(dom), payload=payload)
             result.pages.append((name, page.label, [(c.__name__, c(page)) for c in CHECKS]))
     return result

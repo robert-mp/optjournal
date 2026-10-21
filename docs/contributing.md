@@ -34,8 +34,8 @@ float](#what-stays-a-flat-float-and-why).
 `bad(reason)` or `skip(why)`, added to `sweep.CHECKS` — plus a pair of
 fragments in `tests/test_sweep.py::CASES`, one satisfying it and one violating
 it. The violation must FAIL, and a test refuses any check that joins `CHECKS`
-without that pair. Read `p.markup` for structure, `p.text` for prose; an AST
-test forbids reading `p.dom`, which contains the page's own JS.
+without that pair. Read `p.markup` for structure and `p.text` for prose.
+`Page` carries no raw dump, because `--dump-dom` embeds the page's own JS.
 
 **A new trade-type filter**: build a `TradeScope` (fill membership, not a
 predicate — see `odte_scope` for why) and register it in

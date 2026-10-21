@@ -20,7 +20,6 @@ understands.
 
 from __future__ import annotations
 
-import ast
 import re
 from pathlib import Path
 
@@ -76,7 +75,7 @@ def page(tab="dashboard", body="", ccy=None, kind=None, calday=None, replay=None
            + _SCRIPT + "</body></html>")
     return Page(
         tab=tab, ccy=ccy, kind=kind, calday=calday, replay=replay,
-        console=tuple(console), dom=dom,
+        console=tuple(console),
         markup=browser.markup(dom), text=browser.rendered_text(dom),
         payload=payload or {"stats": {}},
     )
@@ -139,7 +138,7 @@ def _cost_payload(*, estimated=True, charged=None, unattributable=3.97):
 def _bare(dom, tab, payload=None):
     """A page from an explicit DOM, for checks about the frame itself."""
     return Page(
-        tab=tab, ccy=None, kind=None, calday=None, replay=None, console=(), dom=dom,
+        tab=tab, ccy=None, kind=None, calday=None, replay=None, console=(),
         markup=browser.markup(dom), text=browser.rendered_text(dom),
         payload=payload or {"stats": {}},
     )
@@ -587,34 +586,6 @@ def test_replay_scrubber_must_span_every_bar():
         page(tab="trades", replay="lc:C1@2026-07-24", body=short,
              payload=_REPLAY_PAYLOAD))
     assert verdict.status == FAIL
-
-
-def test_no_check_reads_the_raw_dom():
-    """A check must read `markup` or `text`, never `dom`.
-
-    The defect this forbids cost the first sweep run five false failures: every
-    structural check matched page.html's own <script> source instead of its
-    output, because ``--dump-dom`` embeds it. A comment saying "don't read dom"
-    is a comment; parsing for it is a guard.
-
-    `Page.dom` stays available deliberately -- it is the artifact, and worth
-    having when a failure needs explaining -- so nothing but this test stops a
-    check reaching for it.
-    """
-    source = Path(sweep.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    offenders: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("check_"):
-            continue
-        for sub in ast.walk(node):
-            if (isinstance(sub, ast.Attribute) and sub.attr == "dom"
-                    and isinstance(sub.value, ast.Name)):
-                offenders.append(f"{node.name} reads {sub.value.id}.dom")
-    assert not offenders, (
-        "these checks read the raw dump, which contains the page's own JS: "
-        f"{offenders}"
-    )
 
 
 def test_the_matrix_covers_every_tab():

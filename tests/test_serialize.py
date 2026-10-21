@@ -443,7 +443,7 @@ def test_the_calculator_pairs_the_latest_index_closes_with_the_days_events(conn)
     assert ctx["spx_date"] == "2026-08-28" and ctx["vix_date"] == "2026-08-28"
     assert set(ctx) == {
         "spx_prev_close", "spx_date", "vix", "vix_date", "events_today", "today",
-        "events_ahead", "spx_fetched_at", "vix_fetched_at", "live", "fresh",
+        "events_ahead", "vix_fetched_at", "live", "fresh",
         "stale_reason",
     }, "a derived level in the payload is a second copy of the ladder"
 
@@ -748,7 +748,7 @@ def test_allocation_sums_every_accounts_net_liquidation(tmp_path):
         " ingested_at) VALUES ('20260923','U2','EUR',20,200,0,220,'{}','t.xml','now')")
     conn.commit()
     al = allocation_data(conn)
-    assert (al["nav"], al["cash"], al["nav_date"]) == (730, 100, "20260924")
+    assert (al["nav"], al["cash"]) == (730, 100)
     by = {r["holding"]: r for r in al["rows"]}
     assert (by["MRVL"]["stock"], by["MRVL"]["options"]) == (200.0, -20.0)
     assert sum(r["net"] for r in al["rows"]) + al["cash"] == pytest.approx(al["nav"])
