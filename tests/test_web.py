@@ -10668,6 +10668,43 @@ def test_the_earnings_refresh_holds_no_write_lock_while_it_asks_nasdaq(tmp_path,
                     "CCC": ("2026-10-28", True)}
 
 
+def test_the_earnings_refresh_asks_nasdaq_for_its_symbols_side_by_side(tmp_path, monkeypatch):
+    """Nasdaq takes 2 to 3 s a symbol, 15 s when it hangs, and the quotes wait on
+    these dates: a pool's width of symbols is in flight at once, with the same
+    answers and the same failures, in order, as one after another."""
+    import threading  # noqa: PLC0415 - local to this test
+
+    from optjournal import earnings  # noqa: PLC0415 - local to this test
+
+    symbols = [f"S{n}" for n in range(web.QUOTE_WORKERS)]
+    db = tmp_path / "j.db"
+    with open_journal(db) as conn:
+        for symbol in symbols:
+            conn.execute("INSERT INTO watchlist (symbol, added_at)"
+                         " VALUES (?, '2026-01-01')", (symbol,))
+        conn.commit()
+    together = threading.Barrier(len(symbols), timeout=2)
+    alone: list[str] = []
+
+    def fetch(symbol, **_):
+        try:
+            together.wait()
+        except threading.BrokenBarrierError:
+            alone.append(symbol)
+        if symbol in ("S2", "S5"):
+            raise earnings.EarningsFetchError(f"{symbol} earnings: URLError")
+        return earnings.Earnings(day="2026-10-28", confirmed=True, timing=None)
+
+    monkeypatch.setattr(earnings, "fetch_earnings", fetch)
+    with open_journal(db) as conn:
+        failed, asked = web._refresh_earnings(conn, symbols)
+        rows = {r["symbol"]: (r["earnings_next"], bool(r["earnings_checked_at"]))
+                for r in conn.execute("SELECT * FROM watchlist")}
+    assert alone == [], "the symbols were asked one after another"
+    assert (failed, asked) == (["S2", "S5"], len(symbols))
+    assert rows == {s: (None if s in ("S2", "S5") else "2026-10-28", True) for s in symbols}
+
+
 def test_each_job_row_says_how_many_requests_one_run_spends():
     """The confirm dialogue reads this, so it must not say "one" for five."""
     from optjournal.web import _with_request_counts

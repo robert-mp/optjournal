@@ -349,9 +349,12 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
         due.append(symbol)
     failed: list[str] = []
     found: dict[str, earnings_mod.Earnings | None] = {}
+    # Side by side: Nasdaq takes seconds a symbol, and the quotes wait on these.
+    with ThreadPoolExecutor(max_workers=QUOTE_WORKERS) as pool:
+        asked = {symbol: pool.submit(earnings_mod.fetch_earnings, symbol) for symbol in due}
     for symbol in due:
         try:
-            found[symbol] = earnings_mod.fetch_earnings(symbol)
+            found[symbol] = asked[symbol].result()
         except earnings_mod.EarningsFetchError as exc:
             log.debug("earnings %s failed: %s", symbol, exc)
             failed.append(symbol)
