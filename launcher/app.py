@@ -46,6 +46,10 @@ RESTART = 75
 #: Where the previous code waits while a swap is in progress, so a failed swap
 #: can be put back.
 OLD = ".update-old"
+#: Where `OLD` goes once a swap is complete, to be deleted. A file another
+#: process holds can outlive that delete, and left at `OLD` it would read as a
+#: swap still to undo once the next update is staged.
+DONE = ".update-done"
 
 
 def apply_staged(root: Path = ROOT) -> str | None:
@@ -55,7 +59,8 @@ def apply_staged(root: Path = ROOT) -> str | None:
     staged one into its place. If any move fails, everything already swapped is
     put back, so the install is either the old version or the new one and never
     half of each. Entries the release does not contain are left alone, which is
-    what keeps the journal's data untouched when it sits beside the code.
+    what keeps the journal's data untouched when it sits beside the code. The
+    last move is `OLD` itself, to `DONE`, so it fails and is undone like the rest.
 
     `READY` goes only once every entry is in place, so a start that still finds
     it is looking at a swap that did not finish: this process was cut off
@@ -64,8 +69,9 @@ def apply_staged(root: Path = ROOT) -> str | None:
     (An entry only the release has, moved in before the cutoff, stays in place
     until a later try succeeds: nothing in `OLD` names it.)
     """
-    staging, old = root / STAGING, root / OLD
+    staging, old, done = root / STAGING, root / OLD, root / DONE
     ready = staging / READY
+    shutil.rmtree(done, ignore_errors=True)
     if not ready.exists():
         # An interrupted download, or what a finished swap had left to delete.
         shutil.rmtree(staging, ignore_errors=True)
@@ -83,6 +89,7 @@ def apply_staged(root: Path = ROOT) -> str | None:
                 os.replace(root / entry, old / entry)
             swapped.append(entry)
             os.replace(staging / entry, root / entry)
+        os.replace(old, done)
     except OSError as exc:
         if _put_back(root, reversed(swapped)):
             print(f"Update to {version} failed and was undone: {exc}")
@@ -90,7 +97,7 @@ def apply_staged(root: Path = ROOT) -> str | None:
             print(f"Update to {version} failed: {exc}. {_START_AGAIN}")
         return None
     ready.unlink()
-    shutil.rmtree(old, ignore_errors=True)
+    shutil.rmtree(done, ignore_errors=True)
     shutil.rmtree(staging, ignore_errors=True)
     return version
 

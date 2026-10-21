@@ -339,6 +339,41 @@ def test_an_undo_that_meets_a_locked_file_is_finished_by_the_next_start(
         assert _code(root) == new, f"failed at step {failing} of {total}, then a mixed install"
 
 
+#: `os.unlink` itself, for the same reason as `_REPLACE`.
+_UNLINK = os.unlink
+
+
+def test_a_file_held_after_a_good_swap_does_not_stop_the_next_update(
+        tmp_path, monkeypatch, supervised):
+    """A file another process holds (an antivirus scan, on Windows) can outlive
+    the delete of the old code after a good swap. A second update staged in the
+    same window must still go in once the file is let go, and while it is held
+    the install stays whole."""
+    launcher = _launcher()
+    root = _install(tmp_path)
+
+    def held(path, *args, **kwargs):
+        if os.path.basename(path) == "old.py":
+            raise PermissionError("scanning")
+        return _UNLINK(path, *args, **kwargs)
+
+    monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball("0.2.0"))
+    updates.stage(_release("0.2.0"), root=root)
+    monkeypatch.setattr(os, "unlink", held)
+    assert launcher.apply_staged(root) == "0.2.0"
+    first = _code(root)
+
+    monkeypatch.setattr(updates, "_get", lambda _url, limit: _zipball("0.3.0"))
+    updates.stage(_release("0.3.0"), root=root)
+    assert launcher.apply_staged(root) is None
+    assert _code(root) == first, "a held file left a mixed install"
+
+    monkeypatch.setattr(os, "unlink", _UNLINK)
+    assert launcher.apply_staged(root) == "0.3.0"
+    assert updates.current_version(root) == "0.3.0"
+    assert sorted(p.name for p in root.iterdir() if p.name.startswith(".update-")) == []
+
+
 @pytest.mark.parametrize(("latest", "available"), [("0.2.0", True), ("0.1.0", False),
                                                    ("0.0.9", False), ("0.10.0", True)])
 def test_the_banner_offers_only_a_newer_version(tmp_path, monkeypatch, latest, available):
