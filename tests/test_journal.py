@@ -9,6 +9,10 @@ a reader's own sentence quietly gone.
 
 from __future__ import annotations
 
+import contextlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from optjournal import journal
@@ -58,6 +62,42 @@ def test_the_close_review_does_not_blank_the_entry_plan(db):
     assert reviewed.values["plan_target"] == "take at 50%"
     assert reviewed.values["plan_invalidation"] == "strike breached"
     assert reviewed.values["followed_target"] == "yes"
+
+
+def test_two_saves_at_once_keep_both_fields(db, tmp_path, monkeypatch):
+    """The server answers each request on its own thread, and a one-tap trigger
+    posts apart from the Save beside it, so two saves of one row can overlap.
+
+    Each save reads the row, merges its own fields and writes every column back.
+    Here each is held after its read until the other has read too, or for a
+    second where the other cannot read yet.
+    """
+    read = journal.entry_for
+    both_read = threading.Barrier(2, timeout=1.0)
+
+    def held(*args, **kwargs):
+        entry = read(*args, **kwargs)
+        with contextlib.suppress(threading.BrokenBarrierError):
+            both_read.wait()
+        return entry
+
+    monkeypatch.setattr(journal, "entry_for", held)
+
+    def write(values):
+        conn = connect(tmp_path / "j.db")
+        try:
+            journal.save(conn, "1241544513", account_id="U1", values=values)
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(2) as pool:
+        list(pool.map(write, [{"plan_target": "take at 50%"},
+                              {"exit_trigger": "target"}]))
+
+    stored = read(db, "1241544513", account_id="U1")
+    assert stored is not None
+    assert (stored.values["plan_target"], stored.values["exit_trigger"]) == (
+        "take at 50%", "target")
 
 
 def test_clearing_a_field_is_distinguishable_from_not_touching_it(db):

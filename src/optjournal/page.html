@@ -432,7 +432,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {Money} net_pnl -- what IBKR booked on the period's fills, net of
  *   commission, a partial close included
  * @property {Money} commissions -- billed on the period's fills
- * @property {Money} fees -- account-level, not attributable to the journal
  * @property {number} closes -- one order's closing fills on one contract on one
  *   trade day (stats.month_stats), a partial close included. The scoreboard's
  *   unit, which wins, losses and the averages count, and whose results sum to
@@ -459,9 +458,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number|null} net_liq_base -- null until equity summaries exist
  * @property {string|null} net_liq_date
  * @property {number|null} gain_pct_of_net_liq
- * @property {Money} options_friction -- magnitude of commissions, currency carried
- * @property {number} account_friction_base
- * @property {number} total_friction_base
  * @property {number} green_days
  * @property {number} red_days
  * @property {Array} days -- Day rows for the calendar

@@ -298,26 +298,12 @@ def check_costs_shows_what_it_cannot_attribute(p: Page) -> Verdict:
 
 
 def check_money_keys_are_shaped(p: Page) -> Verdict:
-    """Every Money in the payload is whole, and the flat figures stay flat.
-
-    Two directions, because the model's meaning is carried by the shape itself:
-    a nested object says "an as-charged figure could exist here", a flat
-    `_base` float says it cannot. `friction` includes the estimated AutoFX
-    markup, which IBKR never billed in any currency, so it must NOT be Money
-    -- if it ever becomes one, someone has invented precision.
-    """
+    """Every Money in the payload is whole: a native and its currency, or neither."""
     stats = p.payload.get("stats") or {}
     for key, value in stats.items():
         if (isinstance(value, dict) and "base" in value
                 and (value.get("native") is None) != (value.get("ccy") is None)):
             return bad(f"stats.{key} is half-assigned: {value!r}")
-    for forbidden in ("friction", "account_friction"):
-        value = stats.get(forbidden)
-        if isinstance(value, dict):
-            return bad(
-                f"stats.{forbidden} became Money-shaped -- it contains the AutoFX "
-                f"estimate, which was never billed as a line item"
-            )
     return ok()
 
 

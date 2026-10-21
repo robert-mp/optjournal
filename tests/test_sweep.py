@@ -316,14 +316,10 @@ _DRILL_PLAIN_LEGS = (
     + _DRILL_HEAD + '<div class="leg"></div><div class="leg ctx"></div>'
 )
 
-_MONEY_OK = {"stats": {"commissions": {"base": 1.0, "native": 1.1, "ccy": "USD"},
-                       "friction_base": 2.0}}
+_MONEY_OK = {"stats": {"commissions": {"base": 1.0, "native": 1.1, "ccy": "USD"}}}
 #: The state `Money.__post_init__` refuses in Python, asserted here because the
 #: payload is where a hand-built dict could reintroduce it.
 _MONEY_HALF = {"stats": {"commissions": {"base": 1.0, "native": 1.1, "ccy": None}}}
-#: friction contains the AutoFX estimate, which was never billed in any
-#: currency -- Money-shaping it invents precision rather than recovering it.
-_MONEY_INVENTED = {"stats": {"friction": {"base": 2.0, "native": 2.1, "ccy": "USD"}}}
 
 CASES: list[tuple[str, sweep.Check, Page, Page]] = [
     ("page renders",
@@ -356,10 +352,6 @@ CASES: list[tuple[str, sweep.Check, Page, Page]] = [
      sweep.check_money_keys_are_shaped,
      page(payload=_MONEY_OK),
      page(payload=_MONEY_HALF)),
-    ("friction stays flat",
-     sweep.check_money_keys_are_shaped,
-     page(payload=_MONEY_OK),
-     page(payload=_MONEY_INVENTED)),
     ("an estimated headline shows its range",
      sweep.check_costs_headline_states_its_basis,
      page(tab="costs", payload=_cost_payload(),

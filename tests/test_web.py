@@ -122,6 +122,7 @@ def state(populated) -> dict:
         " detail, done, total) VALUES ('sync', ?, ?, ?, 'ok', '2 new trades', 1, 1)",
         (fired, str(today), str(today)),
     )
+    conn.commit()
     # A journal entry, seeded for the same reason as the events and the job row:
     # the contract guard anchors `JournalEntry` to a real payload row, and every
     # fresh journal has none -- so the shape would be quietly exempted rather than
@@ -141,7 +142,6 @@ def state(populated) -> dict:
                     "followed_target": "yes", "exit_trigger": "target",
                     "lessons": "sized right, closed a week early"},
         )
-    conn.commit()
     conn.close()
     return build_state(db_path=populated, archive_dir=RAW_DIR, query_id="1591754")
 
@@ -831,11 +831,11 @@ def test_stats_panel_keys_present(state):
     """The dashboard's ten stat cards each need a real key."""
     s = state["stats"]
     for key in (
-        "total_trades", "orders", "net_pnl", "commissions", "fees",
+        "total_trades", "orders", "net_pnl", "commissions",
         "wins", "losses", "win_rate", "avg_win", "avg_loss",
         "closes", "open_episodes",
         "green_days", "red_days", "days",
-        "total_friction_base", "net_liq_base", "gain_pct_of_net_liq",
+        "net_liq_base", "gain_pct_of_net_liq",
     ):
         assert key in s, f"stats.{key} missing"
 
@@ -2623,28 +2623,6 @@ def test_the_companion_is_a_window_not_a_frame():
         assert "<iframe" not in doc and "<frame" not in doc
 
 
-def test_dashboard_friction_is_split_by_scope(state):
-    """The panel is headed by an asset category, so it must not blend scopes.
-
-    It presented one `total_friction_base` pill labelled "friction (options)"
-    that was options commission plus account-level fees -- the same defect the
-    cost report carried. Fees carry no assetCategory, so ingest does not filter
-    them and they cannot be attributed to options.
-    """
-    s = state["stats"]
-    assert s["options_friction"]["base"] == abs(s["commissions"]["base"])
-    assert s["account_friction_base"] == -s["fees"]["base"]
-    # The split reapportions; it must not change or drop anything.
-    assert (
-        s["options_friction"]["base"] + s["account_friction_base"]
-        == s["total_friction_base"]
-    )
-    # Guards the actual bug: the attributable figure must exclude fees.
-    assert s["options_friction"]["base"] != s["total_friction_base"], (
-        "fees are being counted as options friction again"
-    )
-
-
 def test_a_snapshot_leg_keeps_the_sign_of_the_position_it_seeds():
     """A short snapshot-only contract must seed a NEGATIVE quantity.
 
@@ -2804,6 +2782,43 @@ def test_a_position_the_statement_did_not_mark_has_no_unrealised_figure(populate
                if lc["status"] == "open" and conid in map(str, lc["conids"])]
     assert holding and all(lc["unrealized"] is None for lc in holding), (
         "the card holding the unmarked contract still sums a figure")
+
+
+def test_each_account_holding_a_contract_is_marked_from_its_own_row(tmp_path):
+    """The same contract held in two accounts is two positions, and each card
+    carries its own account's mark: U1 is up 50 on a short SPY put, and U2 down
+    30 on the same put sold an hour later."""
+    from conftest import add_statement, connect_migrated
+
+    path = tmp_path / "j.db"
+    conn = connect_migrated(path)
+    for order, account, at, unrealized in (("1", "U1", "10:00:00", 50.0),
+                                           ("2", "U2", "11:00:00", -30.0)):
+        source = f"{account}.xml"
+        add_statement(conn, source_file=source, sha256=account, account_id=account)
+        conn.execute(
+            "INSERT INTO trades (trade_id, ib_exec_id, transaction_id, ib_order_id,"
+            " account_id, trade_date, date_time, asset_category, symbol, conid,"
+            " underlying_symbol, put_call, strike, expiry, multiplier, buy_sell,"
+            " open_close, quantity, trade_price, currency, fx_rate_to_base, proceeds,"
+            " proceeds_base, ib_commission, ib_commission_base, raw, source_file,"
+            " first_seen_at) VALUES (?,?,?,?,?,'2026-09-01',?,'OPT','SPY 590P','C1',"
+            " 'SPY','P',590,'2026-12-18',100,'SELL','O',-1,2.5,'USD',1.0,250,250,"
+            " -1,-1,'{}',?,'now')",
+            (f"t{order}", f"e{order}", f"x{order}", order, account,
+             f"2026-09-01 {at}", source))
+        conn.execute(
+            "INSERT INTO position_snapshots (report_date, conid, account_id, symbol,"
+            " asset_category, underlying_symbol, put_call, strike, expiry, multiplier,"
+            " position, fifo_pnl_unrealized, currency, fx_rate_to_base, raw,"
+            " source_file, ingested_at) VALUES ('2026-09-30','C1',?,'SPY 590P','OPT',"
+            " 'SPY','P',590,'2026-12-18',100,-1,?,'USD',1.0,'{}',?,'now')",
+            (account, unrealized, source))
+    conn.commit()
+    conn.close()
+    state = build_state(db_path=path, archive_dir=tmp_path, query_id=None)
+    assert {lc["opened_at"]: lc["unrealized"]["base"] for lc in state["lifecycles"]} == {
+        "2026-09-01 10:00:00": 50.0, "2026-09-01 11:00:00": -30.0}
 
 
 def test_a_position_with_no_basis_reads_unknown_not_free(populated):

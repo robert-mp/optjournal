@@ -268,6 +268,9 @@ def save(
 
     `created_at` survives an update for the same reason `trades.first_seen_at`
     does: when the journal first gained this entry is a fact about the journal.
+
+    The read and the write are one transaction of its own, so `conn` must have
+    no write pending.
     """
     if anchor_order_id is None:
         raise JournalError(
@@ -276,6 +279,9 @@ def save(
         )
     fields = _validated(values)
     anchor = str(anchor_order_id)
+    # The server saves on parallel threads, and a save that read the row before
+    # another wrote it would write back what it read: the write lock comes first.
+    conn.execute("BEGIN IMMEDIATE")
     existing = entry_for(conn, anchor, account_id=account_id, broker=broker)
     merged = dict(existing.values) if existing else {}
     merged.update(fields)
@@ -303,7 +309,7 @@ def save(
         f" {updates}",
         (broker, account_id, anchor, underlying_symbol, opened_on,
          *(merged.get(k) for k in FIELDS),
-         existing.created_at if existing else stamp, stamp),
+         stamp, stamp),
     )
     conn.commit()
     stored = entry_for(conn, anchor, account_id=account_id, broker=broker)

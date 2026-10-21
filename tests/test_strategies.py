@@ -482,13 +482,14 @@ def test_an_open_card_has_no_unrealised_figure_until_every_held_leg_is_marked():
     put_mark = {"base": -90.0, "native": -100.0, "ccy": "USD"}
     call_mark = {"base": 45.0, "native": 50.0, "ccy": "USD"}
     flat = {"base": 0.0, "native": 0.0, "ccy": "USD"}
+    p1, c1 = ("", "", "P1"), ("", "", "C1")
     assert unrealised({}) is None, "no mark at all was summed to a figure"
-    assert unrealised({"P1": put_mark}) is None, "one leg's mark stood for both"
-    assert unrealised({"P1": put_mark, "C1": None}) is None, (
+    assert unrealised({p1: put_mark}) is None, "one leg's mark stood for both"
+    assert unrealised({p1: put_mark, c1: None}) is None, (
         "a row with no figure was read as zero")
-    assert unrealised({"P1": put_mark, "C1": call_mark}) == {
+    assert unrealised({p1: put_mark, c1: call_mark}) == {
         "base": -45.0, "native": -50.0, "ccy": "USD"}
-    assert unrealised({"P1": flat, "C1": flat})["base"] == 0.0
+    assert unrealised({p1: flat, c1: flat})["base"] == 0.0
 
 
 def test_a_closed_card_carries_no_unrealised_figure():
@@ -500,5 +501,5 @@ def test_a_closed_card_carries_no_unrealised_figure():
     (card,) = position_groups(
         [opening, closing], episodes=eps,
         campaign_list=_camps([opening, closing], eps),
-        marks={"P1": {"base": 1.0, "native": 1.0, "ccy": "USD"}})
+        marks={("", "", "P1"): {"base": 1.0, "native": 1.0, "ccy": "USD"}})
     assert card["status"] == "closed" and card["unrealized"] is None

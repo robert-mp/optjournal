@@ -40,7 +40,7 @@ float, because it contains the AutoFX markup estimate.
 `native` and `ccy` are always both present or both `null` — never one of the
 two. **The shape itself carries meaning**: a nested object says "an as-charged
 figure could exist here"; a flat `_base` float says it cannot. The sweep
-asserts that directly, in both directions.
+asserts that no figure is half-assigned.
 
 ## `Charge`: when withholding the native is the wrong answer
 
@@ -144,7 +144,7 @@ of work creates one:
 |---|---|
 | `net_liq_base` | IBKR's section is `EquitySummaryByReportDate`**`InBase`** — base at source |
 | `autofx_spread_base` | basis points on a converted notional; never billed |
-| `friction_base`, `account_friction_base` | contain the AutoFX estimate above |
+| the Costs tab's `friction.estimated_*_base`, `friction.total_*_base` | contain the AutoFX estimate above |
 | `notional_base` | a cross-pair notional, so no single currency |
 | `per_base` | an FX **rate**, not an amount |
 | `win_rate`, `gain_pct_of_net_liq` | unitless |
