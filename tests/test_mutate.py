@@ -15,6 +15,9 @@ asserting is the parsing, not pytest.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -89,6 +92,54 @@ def test_run_mutant_reports_a_timed_out_suite_as_hung(tmp_path, monkeypatch):
         f"loopback security guard untested"
     )
     assert str(_SUITE_TIMEOUT_S) in outcome.detail
+
+
+@pytest.mark.parametrize("ending", ["path-leak", "dirty-baseline", "stale-mutant",
+                                    "measured", "interrupted"])
+def test_the_clone_is_removed_however_the_run_ends(tmp_path, monkeypatch, ending):
+    """A clone is a copy of the checkout, so one left in `$TMPDIR` is a copy of
+    whatever the checkout held. Every way out of `run_mutant` removes it."""
+    mutant = MUTANTS[0]
+    module = _fake_clone(tmp_path, mutant)
+    if ending == "stale-mutant":
+        module.write_text("", encoding="utf-8")
+
+    def _scripted(clone, *args):
+        if ending == "interrupted":
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(
+            args, 1 if ending == "dirty-baseline" else 0, "", "")
+
+    monkeypatch.setattr(mutate, "_prepare", lambda source, clone: None)
+    monkeypatch.setattr(mutate, "_imports_the_clone", lambda clone: ending != "path-leak")
+    monkeypatch.setattr(mutate, "_pytest", _scripted)
+
+    with contextlib.suppress(KeyboardInterrupt):
+        outcome = run_mutant(mutant, source=tmp_path, workdir=tmp_path)
+        assert outcome.status == ending
+    assert not (tmp_path / mutant.key).exists(), f"the {ending} run left its clone"
+
+
+def test_a_clone_carries_the_code_but_not_the_journal(tmp_path):
+    """The suite runs on tracked fixtures, so a clone needs none of the journal
+    beside the code: not the database, its backups, the statements or settings.
+    Only the top level is the journal's; a `demo` inside a dependency is not."""
+    source, clone = tmp_path / "source", tmp_path / "clone"
+    for name in ("journal.db", "journal.db-wal", "journal-before-v12-20260909.db",
+                 ".optjournal.json", "raw/activity-1.xml", "logs/optjournal.log",
+                 "src/optjournal/x.py", "tests/fixtures/statements/activity-1.xml",
+                 ".venv/lib/pkg/demo/x.py"):
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_text("x", encoding="utf-8")
+
+    mutate._prepare(source, clone)
+
+    assert sorted(p.relative_to(clone).as_posix()
+                  for p in clone.rglob("*") if p.is_file()) == [
+        ".venv/lib/pkg/demo/x.py",
+        "src/optjournal/x.py",
+        "tests/fixtures/statements/activity-1.xml",
+    ]
 
 
 def test_a_killed_suite_fails_the_survey(monkeypatch):
@@ -229,30 +280,24 @@ def test_a_parallel_report_still_reads_in_registry_order(monkeypatch):
     assert seen != [m.key for m in MUTANTS] or len(MUTANTS) < 2
 
 
-def test_the_timeout_return_code_is_what_the_runner_signals():
-    """Guards the contract between `_pytest`'s timeout path and `run_mutant`.
+_POSIX_STAND_IN = pytest.mark.skipif(
+    sys.platform == "win32", reason="the stand-in venv is a POSIX script")
 
-    `run_mutant` recognises a hang by `MUTATION_TIMEOUT_RETURN_CODE`. If the
-    timeout path is ever changed to return something else, the two halves stop
-    agreeing silently and hangs become measured zeros again.
-    """
-    killed = subprocess.CompletedProcess(
-        args=[], returncode=MUTATION_TIMEOUT_RETURN_CODE,
-        stdout="\nTIMEOUT after 500s", stderr="",
-    )
-    assert killed.returncode == MUTATION_TIMEOUT_RETURN_CODE
-    assert not any(
-        line.startswith(("FAILED ", "ERROR "))
-        for line in killed.stdout.splitlines()
-    ), "the premise: a killed suite leaves no failure lines to count"
+#: A suite that blocks the way `loopback`'s does: it starts a server of its own,
+#: then never finishes. It writes both pids, so a test can see whether each died.
+_BLOCKING_SUITE = """\
+import os, subprocess, sys, time
+from pathlib import Path
+
+def test_blocks():
+    server = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    Path("pids").write_text(f"{os.getpid()} {server.pid}")
+    time.sleep(30)
+"""
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in venv is a POSIX script")
-def test_a_forced_colour_terminal_still_reports_failures_as_failed(tmp_path, monkeypatch):
-    """`run_mutant` counts lines that START with "FAILED " or "ERROR ". With
-    FORCE_COLOR set (some terminals and CI runners set it), pytest wrapped those
-    words in colour codes, nothing matched, and every mutant read as uncaught.
-    Run for real against a one-test suite that fails.
+def _stand_in_clone(tmp_path, suite: str) -> Path:
+    """A clone whose `.venv` python is this interpreter, holding one test file.
 
     The stand-in execs this interpreter by its own path. A symlink to it is
     started as the base install it links to, outside this venv, and passed
@@ -262,8 +307,85 @@ def test_a_forced_colour_terminal_still_reports_failures_as_failed(tmp_path, mon
     stand_in = clone / ".venv" / "bin" / "python"
     stand_in.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
     stand_in.chmod(0o755)
-    (clone / "test_one.py").write_text("def test_fails():\n    assert False\n",
-                                       encoding="utf-8")
+    (clone / "test_one.py").write_text(suite, encoding="utf-8")
+    return clone
+
+
+def _pids(clone: Path) -> tuple[int, int]:
+    """The blocking suite's pytest and server pids, once it has started."""
+    deadline = time.monotonic() + 10
+    while not (clone / "pids").exists():
+        assert time.monotonic() < deadline, "the blocking suite never started"
+        time.sleep(0.05)
+    pytest_pid, server_pid = map(int, (clone / "pids").read_text().split())
+    return pytest_pid, server_pid
+
+
+def _gone(pid: int) -> bool:
+    """Whether `pid` has exited, allowing its new parent a moment to reap it."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@_POSIX_STAND_IN
+def test_a_suite_that_outlives_the_timeout_is_killed_with_its_server(
+    tmp_path, monkeypatch,
+):
+    """The real timeout branch, against a suite that really blocks.
+
+    The server matters as much as pytest: one that outlives its suite goes on
+    holding the port it bound, which under `loopback` is the real app's.
+    """
+    clone = _stand_in_clone(tmp_path, _BLOCKING_SUITE)
+    monkeypatch.setattr(mutate, "_SUITE_TIMEOUT_S", 2)
+
+    result = mutate._pytest(clone)
+
+    assert result.returncode == MUTATION_TIMEOUT_RETURN_CODE, result.stdout
+    assert not any(
+        line.startswith(("FAILED ", "ERROR ")) for line in result.stdout.splitlines()
+    ), "a killed suite must leave no failure lines to count"
+    pytest_pid, server_pid = _pids(clone)
+    assert _gone(pytest_pid), "the timed-out pytest is still running"
+    assert _gone(server_pid), "the timed-out suite's server is still running"
+
+
+@_POSIX_STAND_IN
+def test_an_interrupted_survey_takes_the_running_suite_with_it(tmp_path, monkeypatch):
+    """Ctrl-C reaches the harness, not the suite: the suite runs in its own
+    session so the timeout can kill its whole group, which also puts it beyond
+    the terminal's signal. So the harness has to kill it on the way out."""
+    clone = _stand_in_clone(tmp_path, _BLOCKING_SUITE)
+    started: list[subprocess.Popen[str]] = []
+
+    class _Interrupted(subprocess.Popen):
+        def communicate(self, input=None, timeout=None):
+            started.append(self)
+            _pids(clone)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(mutate.subprocess, "Popen", _Interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        mutate._pytest(clone)
+
+    _, server_pid = _pids(clone)
+    assert _gone(server_pid), "the interrupted suite's server is still running"
+    assert started[0].wait(timeout=5) == -signal.SIGKILL
+
+
+@_POSIX_STAND_IN
+def test_a_forced_colour_terminal_still_reports_failures_as_failed(tmp_path, monkeypatch):
+    """`run_mutant` counts lines that START with "FAILED " or "ERROR ". With
+    FORCE_COLOR set (some terminals and CI runners set it), pytest wrapped those
+    words in colour codes, nothing matched, and every mutant read as uncaught.
+    Run for real against a one-test suite that fails."""
+    clone = _stand_in_clone(tmp_path, "def test_fails():\n    assert False\n")
     monkeypatch.setenv("FORCE_COLOR", "1")
     monkeypatch.setenv("PY_COLORS", "1")
 
