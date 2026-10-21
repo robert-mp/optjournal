@@ -485,7 +485,7 @@ def test_the_real_client_is_the_one_with_the_timeout():
         f"the fetch path builds {flex._client_factory!r}, which is not the client "
         "that carries a socket timeout"
     )
-    body = inspect.getsource(flex._fetch_locked)
+    body = inspect.getsource(flex._download)
     assert "_client_factory(" in body, (
         "the fetch path no longer goes through the one stubbable seam, so a test "
         "that stubs the network can silently miss and make real requests"
@@ -553,6 +553,17 @@ def test_write_token_refuses_an_empty_token_rather_than_storing_one(
     exists."""
     wrote = _captured_keyring(monkeypatch)
     with pytest.raises(ValueError, match="empty"):
+        flex.write_token(bad, "tester")
+    assert wrote == []
+
+
+@pytest.mark.parametrize("bad", ["123456789012 345678901234", "123456\t789012",
+                                 "123456\n789012"])
+def test_write_token_refuses_a_token_with_whitespace_inside(monkeypatch, bad):
+    """The token goes into the request URL as typed, so a space inside one makes
+    a URL no request can be sent with. Refused with what to do, nothing stored."""
+    wrote = _captured_keyring(monkeypatch)
+    with pytest.raises(ValueError, match="inside"):
         flex.write_token(bad, "tester")
     assert wrote == []
 
@@ -737,14 +748,15 @@ def _serve(monkeypatch, body: bytes) -> None:
         "C", (), {"download": lambda self, *a, **k: body})())
 
 
-@pytest.mark.parametrize("body", [
-    b"<html><body>Scheduled maintenance</body></html>\n",
-    b"",
-    b'<FlexQueryResponse queryName="q" type="AF"><FlexStatements count="1">',
-    _NO_STATEMENTS,
+@pytest.mark.parametrize(("body", "raised"), [
+    (b"<html><body>Scheduled maintenance</body></html>\n", flex.StatementUnreadable),
+    (b"", flex.FlexUnreachable),
+    (b'<FlexQueryResponse queryName="q" type="AF"><FlexStatements count="1">',
+     flex.FlexUnreachable),
+    (_NO_STATEMENTS, flex.StatementUnreadable),
 ], ids=["html", "empty", "truncated", "no-statements"])
 def test_a_body_that_is_not_a_statement_is_neither_archived_nor_stamped(
-    tmp_path, monkeypatch, body,
+    tmp_path, monkeypatch, body, raised,
 ):
     """M6: an HTML maintenance page used to become `activity-*.xml`.
 
@@ -753,10 +765,55 @@ def test_a_body_that_is_not_a_statement_is_neither_archived_nor_stamped(
     request that had produced nothing.
     """
     _serve(monkeypatch, body)
-    with pytest.raises(flex.StatementUnreadable):
+    with pytest.raises(raised):
         flex.fetch("1591754", archive_dir=tmp_path, force=True)
     assert not list(tmp_path.glob("activity-*.xml"))
     assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+
+
+#: IBKR's page while the Flex service is down: HTML, and not well-formed XML.
+_MAINTENANCE = (b"<!DOCTYPE html><html><head><meta charset=utf-8><title>Maintenance"
+                b"</title></head><body>Scheduled maintenance</body></html>")
+
+
+class _MaintenanceClient(flex._TimeoutFlexClient):
+    """py_ibkr's own two-stage download, with IBKR answering every request with
+    the maintenance page."""
+
+    def _get(self, url: str) -> bytes:
+        return _MAINTENANCE
+
+
+@pytest.mark.parametrize("entry", [flex.fetch, flex.fetch_confirms],
+                         ids=["fetch", "fetch_confirms"])
+def test_a_maintenance_page_instead_of_a_flex_reply_is_unreachable_try_later(
+    tmp_path, monkeypatch, entry,
+):
+    """IBKR down for maintenance is IBKR failing on its side, which clears by
+    itself: the error every caller reads as "try again later", nothing archived
+    and no cooldown started."""
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory", _MaintenanceClient)
+    with pytest.raises(flex.FlexUnreachable, match="not XML"):
+        entry("1591754", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("*.xml"))
+    assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+
+
+def test_a_statement_py_ibkr_cannot_parse_is_archived_and_named_unreadable(
+    tmp_path, monkeypatch,
+):
+    """The request is spent once the body is in, so the body is kept: a statement
+    the parser cannot read yet is re-read from disk once it can. Reading it is the
+    ingest's job, which names the file rather than raising the parser's error."""
+    whole = STATEMENTS_FIRST.read_bytes()
+    multi = whole.replace(b'dateTime="20250114;143005"', b'dateTime="MULTI"', 1)
+    assert multi != whole
+    _serve(monkeypatch, multi)
+    result = flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert result.raw_path.read_bytes() == multi
+    with pytest.raises(flex.StatementUnreadable, match="could not be parsed"):
+        flex.load(result.raw_path)
 
 
 def test_a_statement_stating_no_base_currency_is_neither_archived_nor_stamped(
@@ -783,6 +840,25 @@ def test_a_statement_stating_no_base_currency_is_neither_archived_nor_stamped(
     _serve(monkeypatch, whole)
     flex.fetch("1591754", archive_dir=tmp_path, force=True)
     assert len(list(tmp_path.glob("activity-*.xml"))) == 1
+
+
+def test_a_statement_with_a_foreign_row_and_no_rate_is_neither_archived_nor_stamped(
+    tmp_path, monkeypatch,
+):
+    """Ingest refuses a statement whose USD rows in an EUR account carry no
+    `fxRateToBase`, so the fetch refuses it first, before it spends the cooldown
+    or leaves a file no ingest can read."""
+    import re
+
+    whole = STATEMENTS_FIRST.read_bytes()
+    bare = re.sub(rb' fxRateToBase="[^"]*"', b"", whole)
+    assert bare != whole
+
+    _serve(monkeypatch, bare)
+    with pytest.raises(flex.StatementUnreadable, match="FX Rate To Base"):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("activity-*.xml"))
+    assert flex.cooldown_remaining(tmp_path, "1591754") == 0
 
 
 def test_a_statement_that_is_not_read_is_still_an_ordinary_flex_error(tmp_path,
@@ -1391,6 +1467,22 @@ def test_only_a_failure_that_clears_by_itself_is_unreachable(monkeypatch, raised
     with pytest.raises(FlexError) as caught:
         _TimeoutFlexClient(user_agent="test", timeout_s=1)._get("https://x/")
     assert isinstance(caught.value, FlexUnreachable) is unreachable
+
+
+def test_a_token_with_a_space_inside_never_reaches_the_error_message(tmp_path,
+                                                                    monkeypatch):
+    """The token travels in the URL, and a failed request's message can quote the
+    URL. That message is what the run ledger, the Sync reply and the command line
+    show, every retry, so the token must not be in it."""
+    token = "123456789012 345678901234"
+    monkeypatch.setattr(flex, "read_token", lambda account=None: token)
+    monkeypatch.setattr(flex._TimeoutFlexClient, "BASE_URL",
+                        "http://127.0.0.1:9/FlexWebService")
+    with pytest.raises(flex.FlexUnreachable) as caught:
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert "SendRequest?t=***&q=1591754" in str(caught.value)
+    for part in token.split():
+        assert part not in str(caught.value)
 
 
 # --- a reply broken off mid-way is this module's typed error (L3) -------------

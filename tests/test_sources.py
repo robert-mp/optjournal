@@ -554,3 +554,47 @@ def test_a_statement_that_states_no_base_currency_is_refused_not_defaulted(
         ingest_file(conn, path)
     assert conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+
+
+# --- a row outside the base currency is converted at IBKR's rate, never at 1 --
+
+
+def _rates_cut(tmp_path, currency: str):
+    """The fixture statement with `fxRateToBase` cut from every row in `currency`."""
+    import re
+
+    text = STATEMENTS[0].read_text(encoding="utf-8")
+    lines = [re.sub(r' fxRateToBase="[^"]*"', "", line)
+             if f'currency="{currency}"' in line else line
+             for line in text.splitlines(keepends=True)]
+    path = tmp_path / "activity-cut.xml"
+    path.write_text("".join(lines), encoding="utf-8")
+    assert path.read_text(encoding="utf-8") != text
+    return path
+
+
+def test_a_foreign_currency_row_without_a_rate_is_refused_not_read_at_one(tmp_path):
+    """Read at a rate of 1, this EUR account's USD fills would book dollars as
+    euros. Refused with the field to enable named, and nothing is written from
+    it, which is how `optjournal ingest` meets such a file on disk."""
+    from optjournal.flex import StatementUnreadable
+
+    path = _rates_cut(tmp_path, "USD")
+    conn = connect_migrated(tmp_path / "j.db")
+    with pytest.raises(StatementUnreadable, match="FX Rate To Base"):
+        ingest_file(conn, path)
+    for table in ("statements", "trades", "cash_transactions"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_a_base_currency_row_without_a_rate_is_read_at_one(tmp_path):
+    """A euro in an EUR account is a euro: the rate it lacks is 1, and the
+    statement is not refused for it."""
+    path = _rates_cut(tmp_path, "EUR")
+    conn = connect_migrated(tmp_path / "j.db")
+    ingest_file(conn, path)
+    rates = conn.execute(
+        "SELECT currency, fx_rate_to_base FROM trades WHERE currency = 'EUR'"
+        " UNION ALL SELECT currency, fx_rate_to_base FROM cash_transactions"
+        " WHERE currency = 'EUR'").fetchall()
+    assert [tuple(r) for r in rates] == [("EUR", 1.0)] * 3

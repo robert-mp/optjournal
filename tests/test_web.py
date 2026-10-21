@@ -8352,6 +8352,7 @@ def _no_keyring_writes(monkeypatch) -> list[tuple[str, str, str]]:
     ({"token": ""}, "no token in the request"),
     ({"token": "   \n  "}, "no token in the request"),
     ({"token": "1" * 129}, "characters"),
+    ({"token": "123456789012 345678901234"}, "inside"),
 ])
 def test_the_token_endpoint_refuses_a_request_without_storing_anything(
     populated, monkeypatch, body, expected,

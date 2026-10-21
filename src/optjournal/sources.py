@@ -156,12 +156,17 @@ class IbkrSource:
         leaves AccountInformation out. With neither, the statement is refused
         rather than read as EUR: that default was wrong for every account whose
         base is not EUR, and it converted every figure by a rate it did not need.
+        A statement with a row in another currency and no rate to the base is
+        refused too (`flex.check_rates`), so the readers' rate of 1 is only ever
+        a base-currency row's.
         """
-        from optjournal.flex import StatementUnreadable
+        from optjournal.flex import StatementUnreadable, check_rates
         from optjournal.sections import stated_base_currency, statement_blocks
 
-        code = stated_base_currency(statement_blocks(path))
+        blocks = statement_blocks(path)
+        code = stated_base_currency(blocks)
         if code:
+            check_rates(blocks, code, path.name)
             return code
         raise StatementUnreadable(
             f"{path.name} does not state the account's base currency: it has no "

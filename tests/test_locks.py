@@ -191,7 +191,6 @@ def test_two_processes_cannot_both_clear_the_fetch_cooldown(tmp_path):
         # this stub kept applying to a name nothing called -- so both subprocesses
         # went to the REAL IBKR endpoint. This test failing is what caught it.
         flex._client_factory = _Client
-        flex.parse_xml_file = lambda path: object()
 
         try:
             flex.fetch("Q", archive_dir=Path(sys.argv[1]))

@@ -45,7 +45,7 @@ from py_ibkr.flex.parser import parse_xml_file
 from optjournal.clock import MARKET_TZ
 from optjournal.confirms import CONFIRM_QUERY_TYPE
 from optjournal.locks import LockTimeout, locked
-from optjournal.sections import stated_base_currency
+from optjournal.sections import stated_base_currency, unrated_sections
 
 __all__ = [
     "FETCH_COOLDOWN_S",
@@ -67,6 +67,7 @@ __all__ = [
     "TokenUnreadable",
     "TokenWriteRefused",
     "archive_digest",
+    "check_rates",
     "cooldown_remaining",
     "fetch",
     "fetch_confirms",
@@ -261,6 +262,15 @@ FETCH_LOCK_TIMEOUT_S = FETCH_WORST_CASE_S + 60
 FETCH_LOCK_WAIT_S = 30
 
 
+#: The token in a Flex request URL. py_ibkr puts it there as typed, so an error
+#: that quotes the URL quotes the token.
+_URL_TOKEN = re.compile(r"([?&]t=)[^&]+")
+
+
+def _masked(message: str) -> str:
+    return _URL_TOKEN.sub(r"\1***", message)
+
+
 class _TimeoutFlexClient(FlexClient):
     """`FlexClient` with a socket timeout on every request.
 
@@ -289,9 +299,9 @@ class _TimeoutFlexClient(FlexClient):
             # A 5xx is IBKR's side failing, which clears by itself; a 4xx is this
             # request being wrong, which a retry would only repeat.
             error = FlexUnreachable if exc.code >= 500 else FlexError
-            raise error(f"HTTP Error {exc.code}: {exc.reason}") from exc
+            raise error(_masked(f"HTTP Error {exc.code}: {exc.reason}")) from exc
         except URLError as exc:
-            raise FlexUnreachable(f"URL Error: {exc.reason}") from exc
+            raise FlexUnreachable(_masked(f"URL Error: {exc.reason}")) from exc
         except TimeoutError as exc:
             # MEASURED, and my first version got it wrong: a socket timeout raises a
             # BARE `TimeoutError`, which is an `OSError` and NOT a `URLError`
@@ -300,19 +310,21 @@ class _TimeoutFlexClient(FlexClient):
             # every other transport failure does, so `sync_journal`'s callers would
             # have seen a raw traceback -- exactly the shape of the 2026-08-07
             # keychain failure this plan exists to stop.
-            raise FlexUnreachable(f"timed out after {self.timeout_s}s: {exc}") from exc
+            raise FlexUnreachable(
+                _masked(f"timed out after {self.timeout_s}s: {exc}")) from exc
         except (http.client.HTTPException, OSError) as exc:
             # The same gap one level over: a body cut short raises IncompleteRead,
             # an `http.client.HTTPException` and not an `OSError`, and a server
             # that hangs up raises RemoteDisconnected or ConnectionResetError. None
             # is a `URLError` once the response has started.
             raise FlexUnreachable(
-                f"connection failed: {type(exc).__name__}: {exc}") from exc
+                _masked(f"connection failed: {type(exc).__name__}: {exc}")) from exc
 
 
 class FlexUnreachable(FlexError):
     """IBKR could not be reached, or failed on its side: no network yet after a
-    wake, DNS, a timeout, a dropped connection, a 5xx.
+    wake, DNS, a timeout, a dropped connection, a 5xx, a reply that is not XML
+    (its maintenance page).
 
     A `FlexError`, so every handler of a failed request still catches it. Its own
     type so the scheduler can retry the same day (`jobs._gives_back`): nothing
@@ -348,10 +360,10 @@ class StatementUnreadable(FlexError):
 
     A `FlexError`, so every caller that already handles a failed Flex request
     handles this too. Raised by `fetch` BEFORE the body is archived or the
-    cooldown stamped: an HTML maintenance page archived as `activity-*.xml` used
-    to halt `optjournal ingest` at that file on every run. Raised by `load` for
-    a file already on disk, so a caller can skip it with one line rather than a
-    parser traceback.
+    cooldown stamped, for a reply that is a document but not the statement asked
+    for: archived as `activity-*.xml`, it would halt `optjournal ingest` at that
+    file on every run. Raised by `load` for a file already on disk, so a caller
+    can skip it with one line rather than a parser traceback.
     """
 
 
@@ -421,9 +433,8 @@ _KEYCHAIN_NOT_OURS = {
 
 @dataclass(frozen=True, slots=True)
 class FetchResult:
-    """A parsed statement plus the path of the raw XML it came from."""
+    """An archived Activity Statement, unparsed: `load` reads the file."""
 
-    response: FlexQueryResponse
     raw_path: Path
     raw_bytes: int
     #: Set when the download was byte-identical to a file already archived,
@@ -673,11 +684,17 @@ def write_token(token: str, account: str | None = None) -> str:
     Whitespace-stripped because the value arrives PASTED -- from Client Portal,
     through a terminal prompt or a browser field, all three of which pick up a
     trailing newline or a leading space that IBKR then rejects as an invalid
-    token. Nothing here echoes, logs or returns the value.
+    token. Whitespace INSIDE is refused: the token goes into the request URL as
+    typed, where a space makes a URL no request can be sent with. Nothing here
+    echoes, logs or returns the value.
     """
     token = token.strip()
     if not token:
         raise ValueError("refusing to store an empty Flex token")
+    if any(c.isspace() for c in token):
+        raise ValueError(
+            "refusing to store a Flex token with a space or line break inside it: "
+            "copy it again from Client Portal (Settings → Flex Web Service)")
     if len(token) > TOKEN_MAX_LEN:
         raise ValueError(
             f"refusing to store a {len(token)}-character Flex token: "
@@ -935,15 +952,43 @@ def _archive(
 class ConfirmFetch:
     """A downloaded Trade Confirmation payload, archived and unparsed.
 
-    Deliberately NOT a `FetchResult`. That type carries a parsed
-    `FlexQueryResponse`, and py_ibkr models the Activity Statement only -- there is
-    no `TCF` model to put there. Making its `response` optional would push a
-    `None` check into every Activity caller to serve a query type they never see.
     `confirms.parse_confirms` reads the file this points at.
     """
 
     raw_path: Path
     raw_bytes: int
+
+
+def _download(token: str, query_id: str, from_date: str | None,
+              to_date: str | None) -> bytes:
+    """py_ibkr's two-stage download, its failures read as this module's errors."""
+    # ONE SEAM NAME. `_client_factory` rather than naming the class here, because
+    # the class name IS the stub point: `tests/test_locks.py` replaces
+    # `flex.FlexClient` to keep the cross-process lock tests off the network, and
+    # introducing `_TimeoutFlexClient` at the call site silently broke that -- the
+    # stub still applied to a name nothing called, and two subprocesses went to the
+    # real IBKR endpoint. Caught by that test failing; it would otherwise have been
+    # a suite that quietly started making network calls.
+    client = _client_factory(user_agent=USER_AGENT)
+    try:
+        return client.download(
+            token,
+            query_id,
+            max_retries=MAX_RETRIES,
+            retry_interval=RETRY_INTERVAL,
+            max_retry_interval=MAX_RETRY_INTERVAL,
+            from_date=_norm_date(from_date),
+            to_date=_norm_date(to_date),
+        )
+    except FlexError as exc:
+        _reraise_if_token_rejected(exc)
+        raise
+    except ET.ParseError as exc:
+        # py_ibkr reads each reply as XML before looking at it, so a page that is
+        # not XML (IBKR's maintenance page) arrives as the parser's error.
+        raise FlexUnreachable(
+            f"IBKR's reply to query {query_id} is not XML ({exc}). IBKR answers "
+            f"like this while it is down: try again later") from exc
 
 
 def fetch_confirms(
@@ -978,21 +1023,8 @@ def fetch_confirms(
         if not force:
             _check_cooldown(archive_dir, query_id, cooldown_s)
         token = read_token(account)
-        client = _client_factory(user_agent=USER_AGENT)
         log.info("requesting Flex confirms query %s", query_id)
-        try:
-            raw = client.download(
-                token,
-                query_id,
-                max_retries=MAX_RETRIES,
-                retry_interval=RETRY_INTERVAL,
-                max_retry_interval=MAX_RETRY_INTERVAL,
-                from_date=_norm_date(from_date),
-                to_date=_norm_date(to_date),
-            )
-        except FlexError as exc:
-            _reraise_if_token_rejected(exc)
-            raise
+        raw = _download(token, query_id, from_date, to_date)
         _check_payload(raw, expect=CONFIRM_QUERY_TYPE,
                        source=f"IBKR's reply to query {query_id}")
         # ONE FILE PER DAY, overwritten by each poll, where the statement gets one
@@ -1058,19 +1090,36 @@ def _check_payload(raw: bytes, *, expect: str, source: str) -> None:
         root = ET.fromstring(raw)
     except ET.ParseError as exc:
         start = raw[:60].decode("utf-8", "replace").strip() or "(empty)"
-        raise StatementUnreadable(
-            f"{source} is not readable XML ({exc}); it starts {start!r}") from exc
+        raise FlexUnreachable(
+            f"{source} is not XML ({exc}); it starts {start!r}. IBKR answers "
+            f"like this while it is down: try again later") from exc
     _check_root(root, expect=expect, source=source)
     # Before archiving, because ingest refuses such a statement: archived, it
     # spent a request, stamped the cooldown and left a file no ingest can read,
     # one more on every daily sync.
-    if expect == ACTIVITY_QUERY_TYPE and not stated_base_currency(
-            root.findall(".//FlexStatement")):
+    if expect != ACTIVITY_QUERY_TYPE:
+        return
+    blocks = root.findall(".//FlexStatement")
+    base = stated_base_currency(blocks)
+    if not base:
         raise StatementUnreadable(
             f"{source} does not state the account's base currency: it has no "
             f"AccountInformation section. Enable Account Information in the "
             f"Activity Flex query (Client Portal, Performance & Reports, Flex "
             f"Queries), then fetch again.")
+    check_rates(blocks, base, source)
+
+
+def check_rates(statements: list[ET.Element], base: str, source: str) -> None:
+    """Refuse a statement holding a row the ingest cannot translate into `base`."""
+    unrated = unrated_sections(statements, base)
+    if unrated:
+        raise StatementUnreadable(
+            f"{source} has rows in {', '.join(unrated)} in a currency other than "
+            f"the base {base}, with no fxRateToBase to convert them. Enable FX "
+            f"Rate To Base in those sections of the Activity Flex query (Client "
+            f"Portal, Performance & Reports, Flex Queries; Select All includes "
+            f"it), then fetch again.")
 
 
 def _payload_to_date(raw: bytes) -> str | None:
@@ -1172,11 +1221,12 @@ def fetch(
       archived, no second copy is written. The request is already spent by
       then, so this protects the archive rather than the budget.
 
-    The raw XML is archived before parsing, so a parse failure still leaves
+    The raw XML is archived unparsed, so a parse failure is the ingest's, with
     the response on disk rather than costing another request. Only a body that
-    IS an Activity Statement gets that far: one that is not XML, has another
-    root, holds no FlexStatement or is a Trade Confirmation raises
-    `StatementUnreadable` before anything is archived or stamped.
+    IS an Activity Statement gets that far. One that is not XML raises
+    `FlexUnreachable` (IBKR down, try later); one that has another root, holds no
+    FlexStatement or is a Trade Confirmation raises `StatementUnreadable`. Neither
+    is archived or stamped.
 
     HELD UNDER A CROSS-PROCESS LOCK FROM THE CHECK TO THE STAMP, because the
     cooldown was otherwise check-then-act and the budget it guards is real. The
@@ -1232,29 +1282,8 @@ def _fetch_locked(
         _check_cooldown(archive_dir, query_id, cooldown_s)
 
     token = read_token(account)
-    # ONE SEAM NAME. `_client_factory` rather than naming the class here, because
-    # the class name IS the stub point: `tests/test_locks.py` replaces
-    # `flex.FlexClient` to keep the cross-process lock tests off the network, and
-    # introducing `_TimeoutFlexClient` at the call site silently broke that -- the
-    # stub still applied to a name nothing called, and two subprocesses went to the
-    # real IBKR endpoint. Caught by that test failing; it would otherwise have been
-    # a suite that quietly started making network calls.
-    client = _client_factory(user_agent=USER_AGENT)
-
     log.info("requesting Flex query %s", query_id)
-    try:
-        raw = client.download(
-            token,
-            query_id,
-            max_retries=MAX_RETRIES,
-            retry_interval=RETRY_INTERVAL,
-            max_retry_interval=MAX_RETRY_INTERVAL,
-            from_date=_norm_date(from_date),
-            to_date=_norm_date(to_date),
-        )
-    except FlexError as exc:
-        _reraise_if_token_rejected(exc)
-        raise
+    raw = _download(token, query_id, from_date, to_date)
 
     # Checked BEFORE archiving and before the stamp. The request is spent either
     # way, but a body that is not a statement must not become `activity-*.xml`,
@@ -1271,15 +1300,7 @@ def _fetch_locked(
     # Recorded after a successful download so a failed request does not start
     # a cooldown -- otherwise one transient error would lock out retries.
     _record_fetch(archive_dir, query_id, hashlib.sha256(raw).hexdigest(), path)
-
-    # Parse from the archived file: py_ibkr's public entry point takes a
-    # path, and this keeps fetch() and load() on the same code path.
-    return FetchResult(
-        response=parse_xml_file(str(path)),
-        raw_path=path,
-        raw_bytes=len(raw),
-        duplicate_of=duplicate_of,
-    )
+    return FetchResult(raw_path=path, raw_bytes=len(raw), duplicate_of=duplicate_of)
 
 
 def load(path: Path) -> FlexQueryResponse:

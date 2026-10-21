@@ -1697,11 +1697,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                            "set it from your real journal's Settings.",
             }
         token = str(self._body().get("token") or "").strip()
-        # Shape-checked only for length, and the reasoning is `write_token`'s:
-        # IBKR does not document the format, so a stricter rule here could refuse
-        # a token that works. Both limbs answer with `present: null` -- nothing
-        # was written, so the previous token is untouched and this endpoint has
-        # learned nothing about it.
+        # Shape-checked only for length and whitespace inside, and the reasoning
+        # is `write_token`'s: IBKR does not document the format, so a stricter
+        # rule here could refuse a token that works. Every limb answers with
+        # `present: null` -- nothing was written, so the previous token is
+        # untouched and this endpoint has learned nothing about it.
         if not token:
             return 400, {
                 "ok": False, "kind": "token", "present": None, "account": account,
@@ -1713,6 +1713,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "ok": False, "kind": "token", "present": None, "account": account,
                 "message": f"that is {len(token)} characters; IBKR's tokens are "
                            f"under {TOKEN_MAX_LEN}, so it is not one.",
+            }
+        if any(c.isspace() for c in token):
+            return 400, {
+                "ok": False, "kind": "token", "present": None, "account": account,
+                "message": "that has a space or line break inside it, which "
+                           "no request can carry: copy the token again from "
+                           "Client Portal → Settings → Flex Web Service.",
             }
 
         def store() -> tuple[str, str]:

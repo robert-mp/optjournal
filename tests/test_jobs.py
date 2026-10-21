@@ -1124,7 +1124,7 @@ def test_a_sync_that_raises_mid_ingest_leaves_nothing_half_written(
     statement = raw / STATEMENTS[0].name
     shutil.copy(STATEMENTS[0], statement)
     monkeypatch.setattr(sync, "fetch", lambda *_a, **_k: FetchResult(
-        response=None, raw_path=statement, raw_bytes=statement.stat().st_size))
+        raw_path=statement, raw_bytes=statement.stat().st_size))
 
     real_cash = ingest._ingest_cash
     failures = {"left": 1}
@@ -3011,6 +3011,25 @@ def test_a_sync_retries_the_same_day_only_after_a_failure_that_clears_by_itself(
         f"{raised}: the instant was {'kept' if gives_back else 'given back'}")
     assert conn.execute("SELECT consecutive_failures FROM job_state WHERE job = 'sync'"
                         ).fetchone()[0] == 1, "a failure that counts toward the backoff"
+
+
+def test_a_maintenance_page_from_ibkr_is_a_sync_retried_the_same_day(conn, ctx,
+                                                                     monkeypatch):
+    """IBKR down for maintenance answers with an HTML page. That clears by itself,
+    so the sync gives its instant back, the same as no network after a wake."""
+    from optjournal import flex
+    from optjournal import jobs as mod
+
+    class Maintenance(flex._TimeoutFlexClient):
+        def _get(self, url: str) -> bytes:
+            return b"<!DOCTYPE html><html><head><meta charset=utf-8></head></html>"
+
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory", Maintenance)
+    mod.run_job(conn, "sync", ctx=ctx, fired_for=1786310000)
+    row = conn.execute("SELECT status, fired_for, detail FROM job_runs").fetchone()
+    assert (row["status"], row["fired_for"]) == ("failed", None)
+    assert row["detail"].startswith("FlexUnreachable")
 
 
 def test_a_sync_in_a_dark_wake_asked_nothing_and_counts_no_failure(conn, ctx, monkeypatch):
