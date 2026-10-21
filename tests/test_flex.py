@@ -785,6 +785,25 @@ def test_a_statement_stating_no_base_currency_is_neither_archived_nor_stamped(
     assert len(list(tmp_path.glob("activity-*.xml"))) == 1
 
 
+def test_a_statement_with_a_foreign_row_and_no_rate_is_neither_archived_nor_stamped(
+    tmp_path, monkeypatch,
+):
+    """Ingest refuses a statement whose USD rows in an EUR account carry no
+    `fxRateToBase`, so the fetch refuses it first, before it spends the cooldown
+    or leaves a file no ingest can read."""
+    import re
+
+    whole = STATEMENTS_FIRST.read_bytes()
+    bare = re.sub(rb' fxRateToBase="[^"]*"', b"", whole)
+    assert bare != whole
+
+    _serve(monkeypatch, bare)
+    with pytest.raises(flex.StatementUnreadable, match="FX Rate To Base"):
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("activity-*.xml"))
+    assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+
+
 def test_a_statement_that_is_not_read_is_still_an_ordinary_flex_error(tmp_path,
                                                                        monkeypatch):
     """Every caller already handles `FlexError`; the new type must reach them."""

@@ -45,7 +45,7 @@ from py_ibkr.flex.parser import parse_xml_file
 from optjournal.clock import MARKET_TZ
 from optjournal.confirms import CONFIRM_QUERY_TYPE
 from optjournal.locks import LockTimeout, locked
-from optjournal.sections import stated_base_currency
+from optjournal.sections import stated_base_currency, unrated_sections
 
 __all__ = [
     "FETCH_COOLDOWN_S",
@@ -67,6 +67,7 @@ __all__ = [
     "TokenUnreadable",
     "TokenWriteRefused",
     "archive_digest",
+    "check_rates",
     "cooldown_remaining",
     "fetch",
     "fetch_confirms",
@@ -1064,13 +1065,29 @@ def _check_payload(raw: bytes, *, expect: str, source: str) -> None:
     # Before archiving, because ingest refuses such a statement: archived, it
     # spent a request, stamped the cooldown and left a file no ingest can read,
     # one more on every daily sync.
-    if expect == ACTIVITY_QUERY_TYPE and not stated_base_currency(
-            root.findall(".//FlexStatement")):
+    if expect != ACTIVITY_QUERY_TYPE:
+        return
+    blocks = root.findall(".//FlexStatement")
+    base = stated_base_currency(blocks)
+    if not base:
         raise StatementUnreadable(
             f"{source} does not state the account's base currency: it has no "
             f"AccountInformation section. Enable Account Information in the "
             f"Activity Flex query (Client Portal, Performance & Reports, Flex "
             f"Queries), then fetch again.")
+    check_rates(blocks, base, source)
+
+
+def check_rates(statements: list[ET.Element], base: str, source: str) -> None:
+    """Refuse a statement holding a row the ingest cannot translate into `base`."""
+    unrated = unrated_sections(statements, base)
+    if unrated:
+        raise StatementUnreadable(
+            f"{source} has rows in {', '.join(unrated)} in a currency other than "
+            f"the base {base}, with no fxRateToBase to convert them. Enable FX "
+            f"Rate To Base in those sections of the Activity Flex query (Client "
+            f"Portal, Performance & Reports, Flex Queries; Select All includes "
+            f"it), then fetch again.")
 
 
 def _payload_to_date(raw: bytes) -> str | None:

@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 __all__ = ["MODELLED_SECTIONS", "raw_sections", "stated_base_currency",
-           "statement_blocks"]
+           "statement_blocks", "unrated_sections"]
 
 #: Statement child elements py_ibkr turns into typed models.
 MODELLED_SECTIONS = frozenset({"Trades", "CashTransactions", "CashReport"})
@@ -53,6 +53,25 @@ def stated_base_currency(statements: list[ET.Element]) -> str | None:
                     if code:
                         return code
     return None
+
+
+#: The rows the ingest translates into the base currency, by section.
+_CONVERTED_ROWS = (("Trades", "Trade"), ("CashTransactions", "CashTransaction"),
+                   ("OpenPositions", "OpenPosition"))
+
+
+def unrated_sections(statements: list[ET.Element], base: str) -> list[str]:
+    """The sections holding a row in a currency other than `base` with no rate.
+
+    Read at a rate of 1, such a row books one currency's amounts as another's. A
+    row in `base` needs no rate. One rule for the ingest's reader and the fetch's
+    check, like `stated_base_currency`.
+    """
+    return [
+        section for section, tag in _CONVERTED_ROWS
+        if any((row.get("currency") or "") != base and not row.get("fxRateToBase")
+               for stmt in statements for row in stmt.iterfind(f"{section}/{tag}"))
+    ]
 
 
 def raw_sections(path: Path) -> dict[str, list[dict[str, str]]]:
