@@ -312,7 +312,6 @@ def _stand_in_clone(tmp_path, suite: str) -> Path:
 
 
 def _pids(clone: Path) -> tuple[int, int]:
-    """The blocking suite's pytest and server pids, once it has started."""
     deadline = time.monotonic() + 10
     while not (clone / "pids").exists():
         assert time.monotonic() < deadline, "the blocking suite never started"

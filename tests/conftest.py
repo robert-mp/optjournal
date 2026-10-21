@@ -55,7 +55,6 @@ LIVE_STATEMENTS = (
     if os.environ.get("OPTJOURNAL_LIVE") else []
 )
 
-#: Skip marker for those tests, saying how to opt in.
 needs_live = pytest.mark.skipif(
     not LIVE_STATEMENTS, reason="needs the live corpus: run with OPTJOURNAL_LIVE=1")
 

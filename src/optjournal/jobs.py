@@ -310,10 +310,6 @@ class Job:
     #: ISO weekdays (Monday=1). `sync` runs Tue-Sat because a US Friday session
     #: settles into a statement Saturday morning European time.
     weekdays: tuple[int, ...]
-    #: The job's own zone. `confirm` is Eastern because market hours ARE an
-    #: Eastern concept, so it follows US DST without being edited twice a year;
-    #: the rest are the reader's local zone, where "before breakfast" is the
-    #: actual requirement.
     zone: str
     catchup: Catchup
     window_s: int
@@ -981,12 +977,9 @@ def interrupted_runs(conn: sqlite3.Connection, *, archive_dir: Path) -> int:
 # named predicates rather than folded into one condition.
 # ---------------------------------------------------------------------------
 
-#: The US session, in `America/New_York`, as the hours a `WINDOW` job may poll in:
-#: the 09:30-16:00 cash session, plus `SESSION_TAIL_M` past the close.
 SESSION_OPEN_H = 9
 SESSION_OPEN_M = 30
 SESSION_CLOSE_H = 16
-#: Minutes past the close that a poll still runs.
 SESSION_TAIL_M = 10
 
 

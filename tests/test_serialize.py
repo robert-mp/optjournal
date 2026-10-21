@@ -374,7 +374,6 @@ def test_the_countdown_is_counted_from_the_et_day_not_the_utc_one(conn):
 
 
 def _fetched_on(conn, symbol: str, day: str, at: datetime) -> None:
-    """Stamp `symbol`'s stored bars for one ET session as fetched at `at`."""
     start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=MARKET_TZ).timestamp())
     conn.execute(
         "UPDATE price_bars SET fetched_at = ? WHERE symbol = ? AND ts >= ? AND ts < ?",
@@ -391,8 +390,9 @@ def test_a_daily_bar_is_a_close_once_it_was_fetched_after_its_settle(
     conn, fetched, read, through, last,
 ):
     """Adding a symbol mid-session, or running `bars` by hand, stores today's daily
-    bar while it still moves. Read at 17:00 that 11:00 price was the stored close
-    from today, with its change against Friday, until the next morning's job."""
+    bar while it still moves. Read at 17:00, that 11:00 price would be the stored
+    close from today, with its change against Friday, until the next morning's
+    job."""
     _seed_watched_symbol(conn, "NVDA", ["2026-08-06", "2026-08-07", "2026-08-10"],
                          [100.0, 101.0, 105.0], duplicated=False)
     _fetched_on(conn, "NVDA", "2026-08-10", datetime(2026, 8, 10, *fetched,
@@ -618,8 +618,9 @@ def test_scoring_counts_today_once_it_has_settled_as_the_calculator_does(conn):
 
 
 def test_an_index_bar_fetched_mid_session_is_not_that_sessions_close(conn):
-    """At 17:00 ET a 15:00 fetch of today's bar holds a 15:00 price. The calculator
-    planned tomorrow off it and scoring scored today's rails against it."""
+    """At 17:00 ET a 15:00 fetch of today's bar holds a 15:00 price. Taken as the
+    close, the calculator would plan tomorrow off it and today's rails would be
+    scored against it."""
     from optjournal.serialize import odte_context_data, odte_scoring_data
     for day, spx, vix in (("2026-10-13", 6600.0, 18.0), ("2026-10-14", 6650.0, 17.0)):
         _seed_index(conn, "^GSPC", day, spx)

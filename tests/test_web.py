@@ -5748,13 +5748,12 @@ def test_a_journal_that_never_scheduled_is_not_shown_as_a_failure():
     # version of this assertion could not have matched whatever the code said --
     # and the ablation proved it, passing with the pill tinted red.
     raw = _fn("collection")
-    for label in ("not running",):
-        element = re.search(rf"<b([^>]*)>{re.escape(label)}</b>", raw)
-        assert element, f"the {label!r} pill is gone from the strip"
-        assert "class" not in element.group(1), (
-            f"the {label!r} pill carries {element.group(1).strip()!r}, tinting it "
-            "as a failure -- it is the normal state of a CLI-driven journal"
-        )
+    element = re.search(r"<b([^>]*)>not running</b>", raw)
+    assert element, "the 'not running' pill is gone from the strip"
+    assert "class" not in element.group(1), (
+        f"the 'not running' pill carries {element.group(1).strip()!r}, tinting it "
+        "as a failure -- it is the normal state of a CLI-driven journal"
+    )
 
 
 def test_the_job_status_word_is_rendered_not_collapsed_to_a_colour():
@@ -9723,7 +9722,7 @@ def test_the_typed_readings_ride_in_the_hash_and_heal_back_out():
 
 def test_a_reading_in_the_hash_is_masked_as_its_own_field():
     """A level grouped in threes is that level, and a VIX of 18.250 stays 18.25:
-    read as 18250 it drew an expected move near 1100% with no warning."""
+    read as 18250 it would draw an expected move near 1100% with no warning."""
     out = _hash_harness([
         "location.hash='#tab=odte&spx=7,706&vix=18.250&call=7.780&put=7,600';",
         "applyHash();",
@@ -10652,9 +10651,9 @@ def test_the_earnings_refresh_asks_nasdaq_for_its_symbols_side_by_side(tmp_path,
     """Nasdaq takes 2 to 3 s a symbol, 15 s when it hangs, and the quotes wait on
     these dates: a pool's width of symbols is in flight at once, with the same
     answers and the same failures as one after another."""
-    import threading  # noqa: PLC0415 - local to this test
+    import threading
 
-    from optjournal import earnings  # noqa: PLC0415 - local to this test
+    from optjournal import earnings
 
     symbols = [f"S{n}" for n in range(web.QUOTE_WORKERS)]
     db = tmp_path / "j.db"

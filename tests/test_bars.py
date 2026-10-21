@@ -411,7 +411,6 @@ def test_underlying_granularity_follows_the_window_length(conn):
 
 def _round_trip(conn, *, conid, symbol, opened, closed, underlying="TSLA",
                 ucid="UT"):
-    """One short option opened and bought back: a closed episode."""
     for trade_id, day, open_close, quantity in (
         (f"{conid}-{opened}", opened, "O", -1), (f"{conid}-{closed}", closed, "C", 1),
     ):
@@ -444,10 +443,10 @@ def test_overlapping_windows_on_one_underlying_are_one_request(conn):
 
 def test_windows_years_apart_stay_apart_and_an_old_one_is_not_hourly(conn):
     """A 5-day put from an imported 2023 statement and one open today are two
-    windows, not one from 2023 to now. Their union asked hourly bars back to 2023,
-    which the source refuses past 730 days, so the open trade's hourly bars never
-    landed; inside 730 days it re-fetched a year of hourly bars every day. The old
-    window is asked daily only, which its replay falls back to.
+    windows, not one from 2023 to now. Their union would ask hourly bars back to
+    2023, which the source refuses past 730 days, so the open trade's hourly bars
+    would never land; inside 730 days it would re-fetch a year of hourly bars every
+    day. The old window is asked daily only, which its replay falls back to.
     """
     _round_trip(conn, conid="C0", symbol="TSLA  230113P00120000",
                 opened="2023-01-10", closed="2023-01-12")
@@ -892,10 +891,9 @@ def test_a_week_is_its_last_session_and_a_short_week_is_still_a_week(conn):
     """A week's close is where it ENDED, and a holiday-shortened week is one week.
 
     No gap filling and no holiday calendar: the sessions present in the data are
-    the definition. That is not an edge case
-    either -- measured over 755 fetched closes, 31 of 158 ISO weeks hold four
-    sessions and 2 hold three, so filling them to five would invent a third of a
-    year of closes the market never printed.
+    the definition. That is not an edge case either -- measured over 755 fetched
+    closes, 31 of 158 ISO weeks hold four sessions and 2 hold three, so filling
+    them to five would invent a third of a year of closes the market never printed.
 
     Seeded as two full weeks around one whose Wednesday is missing, which is the
     shape a real holiday leaves. The middle week must still appear, exactly once,
@@ -1112,8 +1110,8 @@ def _asked_per_run(conn, fetch, now):
 
 def test_a_finished_window_whose_first_bar_comes_late_is_asked_once(conn):
     """The TSLA 260904P270 put sold 2026-07-24 has its first stored bar 7 days and 4
-    hours after its padded start, past the week `_settled` allows, so it was asked
-    on every daily run 75 days after it ended.
+    hours after its padded start, past the week `_settled` allows, so on its stored
+    bars alone it would be asked on every daily run for good.
     """
     _round_trip(conn, conid="C1", symbol="TSLA  260904P00270000",
                 opened="2026-07-24", closed="2026-07-28")
@@ -1126,10 +1124,10 @@ def test_a_finished_window_whose_first_bar_comes_late_is_asked_once(conn):
 
 
 def test_an_expired_option_that_answers_404_is_asked_once(conn):
-    """144 expired contracts from an imported history answered 404 on every run,
-    about 40 s a day and growing with the history. Asked once, it is not asked
-    again -- until an older statement widens its window backwards, when the new
-    part is fetched.
+    """An expired contract answers 404, and an imported history holds 144 of them:
+    asked on every run, that is about 40 s a day, growing with the history. Asked
+    once, it is not asked again -- until an older statement widens its window
+    backwards, when the new part is fetched.
     """
     _round_trip(conn, conid="C1", symbol="TSLA  260109P00250000",
                 opened="2026-01-05", closed="2026-01-06")

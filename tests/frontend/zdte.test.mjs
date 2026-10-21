@@ -233,9 +233,7 @@ test("a decimal comma is a decimal point, and a thousands separator is dropped",
   for (const key of LEVELS) assert.equal(sanitizeLevel("1,234,567", key), "1234567", key);
   /* The finding's own reading: a VIX of 18,5 is a 1.16% move, not 11.56%. */
   assert.equal(expectedMove(SPX, sanitizeLevel("18,5", "vix")).pct.toFixed(2), "1.16");
-  /* A VIX of 18.250 is a 1.14% move, not 1140%. */
   assert.equal(expectedMove(SPX, sanitizeLevel("18.250", "vix")).pct.toFixed(2), "1.14");
-  /* A level pasted with its thousands grouped is the strike it names, not 10. */
   assert.equal(strikeNear(sanitizeLevel("7,780", "call"), "call"), 7780);
 });
 

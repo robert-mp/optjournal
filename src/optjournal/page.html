@@ -4458,8 +4458,8 @@ function annual(){
      aggregation. The total row is `annual_total`, computed independently of the
      years -- so if they ever stop accounting for everything the discrepancy is
      on screen. Not the Dashboard's all-time `stats`: that one follows the Trade
-     Types filter, which this tab does not show, and using it made the total
-     shrink below the sum of its own rows whenever the filter was on. */
+     Types filter, which this tab does not show, and using it would make the
+     total shrink below the sum of its own rows whenever the filter is on. */
   let best=yrs[0];
   yrs.forEach(s=>{if(s.net_pnl.base>best.net_pnl.base)best=s;});
   const row=(s,klass)=>statsRow(s,{

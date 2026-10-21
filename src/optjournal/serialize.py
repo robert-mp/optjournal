@@ -886,9 +886,6 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
     same-day seller wants beside the ladder. Filtered here rather than in the page
     so the two surfaces cannot disagree about which day "today" is.
     """
-    # The last close from a SETTLED session: a bar fetched after its own settle.
-    # After 16:15 ET today's is final, and it is the prior close for the next
-    # session -- excluding it all evening planned tomorrow off yesterday.
     spx = bars_close_series(conn, "^GSPC", bar_size="1d", settled=True)
     vix = bars_close_series(conn, "^VIX", bar_size="1d")
     if not spx or not vix:
@@ -1026,7 +1023,7 @@ def odte_scoring_data(conn: sqlite3.Connection) -> list[Row]:
     calculator's rule. Before that its close is still moving, and scoring a band
     against a price that has not settled would report a hit that the afternoon can
     take back. After it, the calculator plans off that close, and leaving it
-    unscored all evening put the two a session apart.
+    unscored all evening would put the two a session apart.
 
     SO IS A PAIR ACROSS A HOLE. The index series is fetched over a 60-day window,
     so a journal left unopened for longer stores June and then August, and the

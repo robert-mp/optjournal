@@ -667,9 +667,7 @@ def build_state(
         # RESOLVE ABANDONED RUNS FIRST, before anything reads `job_runs`.
         #
         # On page load rather than from a scheduled job: a watchdog that is itself
-        # scheduled stops when the scheduler does, and this project has already
-        # watched three cron jobs report health for two days while collecting
-        # nothing.
+        # scheduled stops when the scheduler does.
         #
         # The KERNEL answers it -- a `running` row whose per-job file lock can be
         # acquired has no live holder, because OS locks release on process death

@@ -132,7 +132,6 @@ def test_refuses_to_touch_real_data_wherever_it_sits(tmp_path):
         f'accountId="{DEMO_ACCOUNT}"'.encode(), b'accountId="U1234567"')
     assert real != tracked.read_bytes()
 
-    # Each at a path the old check had never heard of.
     statement = tmp_path / "somewhere-else" / tracked.name
     confirm = tmp_path / "confirms-only" / "confirm-20260227T150000Z.xml"
     for path in (statement, confirm):
@@ -141,7 +140,6 @@ def test_refuses_to_touch_real_data_wherever_it_sits(tmp_path):
         with pytest.raises(ValueError, match="real statement"):
             assert_not_real(path.parent)
 
-    # A database holding that statement, likewise.
     db_copy = tmp_path / "restored.db"
     conn = connect_migrated(db_copy)
     ingest_file(conn, statement)

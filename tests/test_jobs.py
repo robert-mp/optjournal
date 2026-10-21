@@ -275,7 +275,6 @@ def test_the_live_poll_is_a_window_and_the_rest_are_wall_clock():
         "session time, and is the last success stale' rather than claiming a "
         "wall-clock minute"
     )
-    # `history` has no instants at all, and runs ONCE by itself after the first sync.
     assert [j.name for j in JOBS if j.catchup is Catchup.ONCE] == ["history"]
 
 
@@ -1532,7 +1531,7 @@ def test_the_live_poll_is_due_inside_the_session_and_never_outside_it():
 
     Outside the window `confirm` must be NOT DUE rather than due-and-empty: a
     20:00 wake that fetches nothing and records `ok` is an empty poll recorded as
-    success, which is how three cron jobs reported health for two days.
+    success.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -1683,7 +1682,7 @@ def test_a_schedule_in_the_missing_spring_forward_hour_still_runs():
 
 
 def test_the_market_hours_poll_follows_us_dst_not_the_readers_clock():
-    """Which is why `confirm` is scheduled in Eastern.
+    """Which is why the session window is read in Eastern.
 
     In March the US springs forward two weeks before Europe does, so for a fortnight
     the offset between them is one hour smaller. A poll scheduled in the reader's

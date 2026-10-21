@@ -55,7 +55,6 @@ def stated_base_currency(statements: list[ET.Element]) -> str | None:
     return None
 
 
-#: The rows the ingest translates into the base currency, by section.
 _CONVERTED_ROWS = (("Trades", "Trade"), ("CashTransactions", "CashTransaction"),
                    ("OpenPositions", "OpenPosition"))
 
