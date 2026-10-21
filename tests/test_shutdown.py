@@ -479,10 +479,10 @@ web.serve(db_path=Path({db!r}), archive_dir=Path({archive!r}),
 def test_serve_exits_promptly_with_a_job_still_running(journal):
     """A BUSY SCHEDULER MUST NOT WEDGE THE STOP, and nothing asserted that.
 
-    All three tests above signal an IDLE server: the demo fixture has no perishable
-    bar windows and no confirm query, so the first tick finds nothing to do. The
-    interesting case is the one that only happens during a trading session -- a tick
-    mid-fetch when the signal arrives -- and this repo's CI had never once run inside
+    All three tests above signal an IDLE server: the demo fixture has no confirm
+    query, so the first tick finds nothing to do. The interesting case is the one
+    that only happens during a trading session -- a tick mid-fetch when the signal
+    arrives -- and this repo's CI had never once run inside
     US market hours, so it had never been exercised anywhere.
 
     That absence cost real debugging: when windows-latest started failing, "a job is

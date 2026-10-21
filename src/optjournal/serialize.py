@@ -29,13 +29,12 @@ from typing import Any
 from optjournal.ahead import SOURCE as AHEAD_SOURCE
 from optjournal.ahead import covered_weeks, week_of
 from optjournal.bars import (
-    audit_perishable,
+    close_series as bars_close_series,
+)
+from optjournal.bars import (
     upsert_bars,
     watch_closes,
     weekly_closes,
-)
-from optjournal.bars import (
-    close_series as bars_close_series,
 )
 from optjournal.campaigns import named as campaign_named
 from optjournal.clock import MARKET_TZ, et_day, parse_day
@@ -1542,80 +1541,6 @@ def collection_status(
         return say("behind", f"Statements end {through}. Bitácora keeps trying"
                              + (f"; the last attempt said: {failed[:160]}" if failed else "."))
     return say("ok", f"Up to date: statements through {through}.")
-
-
-def audit_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
-    """Did the last session's perishable option bars actually land?
-
-    Computed on EVERY page load rather than by a scheduled job, and that is the
-    point rather than a shortcut. The audit was a cron, which meant the watchdog
-    and the thing it watched could stop together -- and did. Measured at 2.95 ms
-    on the real journal (the plan predicted 0.76 ms; either way it is noise
-    against a payload that already issues ~142 statements), so there is no reason
-    to make it conditional.
-
-    Answers the one question no later run can fix: an option's intraday series
-    exists only while its own session runs.
-
-    `audit.ok` IS NOT ENOUGH, AND THE PAGE MUST NOT RENDER IT ALONE. `ok` is
-    `not market_traded or not missing` (bars.SessionAudit.ok), and `market_traded`
-    is answered by "does any UNDERLYING have hourly bars for that day" -- a
-    deliberately calendar-free holiday oracle. That oracle shares a failure mode
-    with the thing it certifies. Reproduced on three copies of the real journal:
-
-        healthy          traded=True  covered=5  missing=0  ok=True
-        option poll dead traded=True  covered=0  missing=5  ok=False   <- caught
-        TOTAL blackout   traded=False covered=0  missing=0  ok=True    <- MISSED
-
-    Delete every hourly bar, as a fully dead collector would, and `ok` goes GREEN
-    because "no bars for anyone" reads as a market holiday. That is the same
-    watchdog-and-watched-stop-together shape that moved this audit out of a cron in
-    the first place, one level down.
-
-    So two extra fields travel, and the page reads THEM rather than `ok`:
-
-    * `witnesses` -- how many contracts were actually checked. Falls to zero in a
-      blackout while `ok` is green, so a count is honest where a boolean is not.
-    * `blackout` -- no underlying traded across `last_traded_day`'s whole 10-day
-      lookback. Nine US market holidays a year do not fall in a ten-day row, so
-      this cannot be a quiet December: it means collection itself has stopped.
-    * `ever_collected` -- whether this journal holds ANY bar at all. Without it
-      `blackout` cannot tell "collection stopped" from "collection never started",
-      and those need opposite responses. MEASURED, not assumed: with `price_bars`
-      emptied out of a copy of the real journal and again on a fresh one, the two
-      payloads were byte-identical (`market_traded` False, `witnesses` 0,
-      `blackout` True, `ok` True). So the demo journal, and any journal before its
-      first `optjournal bars`, rendered a red collection alarm for the absence of
-      a thing that had never been there. Exactly the distinction the heartbeat
-      already draws with `ever_ran`, which is what makes its omission here an
-      oversight rather than a judgement.
-
-    `ok` is kept, unchanged, because `optjournal bars --audit` and the cron's
-    delivery policy both key on it and this is not the commit to move that.
-    """
-    audit = audit_perishable(conn, now=now)
-    # `day` is None only when last_traded_day found no session in ten days, which
-    # is the blackout: the audit could not even choose a day to examine.
-    blackout = not audit.market_traded and not audit.covered and not audit.missing
-    # LIMIT 1, not COUNT(*): the question is existence, and price_bars holds
-    # thousands of rows on a working journal.
-    ever = conn.execute("SELECT 1 FROM price_bars LIMIT 1").fetchone() is not None
-    return {
-        "day": audit.day,
-        "market_traded": audit.market_traded,
-        "covered": list(audit.covered),
-        "missing": list(audit.missing),
-        "ok": audit.ok,
-        #: What the check actually looked at. Zero means it proved nothing.
-        "witnesses": len(audit.covered) + len(audit.missing),
-        #: Nothing traded anywhere in the lookback -- not a holiday, a dead poll.
-        #: Read WITH `ever_collected`: a blackout on a journal that never collected
-        #: is not a fault, and the page must not tint it as one.
-        "blackout": blackout,
-        #: Whether any bar has ever been stored here. Distinguishes a stopped
-        #: collector from one that was never started.
-        "ever_collected": ever,
-    }
 
 
 def logbook_data(conn: sqlite3.Connection, *, today: date) -> Row:

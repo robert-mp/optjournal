@@ -40,8 +40,7 @@ def _sessions(count: int, *, ending: date = date(2026, 8, 7)) -> list[str]:
 
     Weekends are skipped so the series is a plausible run of sessions rather than
     a calendar. Nothing in `watch_closes` knows about holidays -- the sessions
-    present in the data are the definition, which is the same principle the
-    perishable audit's holiday oracle uses.
+    present in the data are the definition.
     """
     days: list[str] = []
     day = ending

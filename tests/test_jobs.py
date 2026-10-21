@@ -35,17 +35,17 @@ def test_a_run_records_both_the_row_and_the_anchor(conn):
     anchor is what a catch-up reconciler reads, so a missing update means the job
     looks like it never ran.
     """
-    run_id = record_run(conn, "bars_live", status="ok", detail="3 windows",
+    run_id = record_run(conn, "bars_daily", status="ok", detail="3 windows",
                         done=3, total=3)
     assert run_id > 0
 
     run = conn.execute("SELECT * FROM job_runs WHERE id = ?", (run_id,)).fetchone()
     assert (run["job"], run["status"], run["done"], run["total"]) == (
-        "bars_live", "ok", 3, 3)
+        "bars_daily", "ok", 3, 3)
     assert run["finished_at"], "a completed run must be stamped finished"
 
     state = conn.execute(
-        "SELECT * FROM job_state WHERE job = 'bars_live'").fetchone()
+        "SELECT * FROM job_state WHERE job = 'bars_daily'").fetchone()
     assert state["last_status"] == "ok"
     assert state["consecutive_failures"] == 0
 
@@ -58,11 +58,11 @@ def test_an_empty_run_is_nothing_not_ok(conn):
     for two days while `price_bars` gained nothing. The page can render `nothing`
     differently from `ok`; it cannot un-conflate them after the fact.
     """
-    record_run(conn, "bars_live", status="nothing", detail="0 bar(s), 4 empty")
+    record_run(conn, "confirm", status="nothing", detail="0 new, 0 updated")
     row = conn.execute("SELECT status FROM job_runs").fetchone()
     assert row["status"] == "nothing"
-    # And it is NOT counted as a failure: an empty poll outside the session is the
-    # normal state six times in seven, so counting it would cry wolf permanently.
+    # And it is NOT counted as a failure: most polls of a session find no new
+    # fill, so counting them would cry wolf permanently.
     assert conn.execute(
         "SELECT consecutive_failures FROM job_state").fetchone()[0] == 0
 
@@ -107,7 +107,7 @@ def test_an_unknown_job_name_is_refused(conn):
     that into an exception at the call site.
     """
     with pytest.raises(ValueError, match="unknown job"):
-        record_run(conn, "bars-live", status="ok")     # hyphen, not underscore
+        record_run(conn, "bars-daily", status="ok")    # hyphen, not underscore
     assert conn.execute("SELECT COUNT(*) FROM job_runs").fetchone()[0] == 0
 
 
@@ -185,16 +185,16 @@ def test_history_is_pruned_but_the_newest_scheduled_run_survives(conn):
     replay it or lose the schedule.
     """
     # One scheduled run, then enough manual runs to push it out of the window.
-    record_run(conn, "bars_live", status="ok", fired_for=1786310000)
+    record_run(conn, "confirm", status="ok", fired_for=1786310000)
     for _ in range(RUN_HISTORY + 20):
-        record_run(conn, "bars_live", status="nothing")
+        record_run(conn, "confirm", status="nothing")
 
     total = conn.execute(
-        "SELECT COUNT(*) FROM job_runs WHERE job = 'bars_live'").fetchone()[0]
+        "SELECT COUNT(*) FROM job_runs WHERE job = 'confirm'").fetchone()[0]
     assert total <= RUN_HISTORY + 1, f"history grew unbounded: {total} rows"
 
     survived = conn.execute(
-        "SELECT COUNT(*) FROM job_runs WHERE job = 'bars_live'"
+        "SELECT COUNT(*) FROM job_runs WHERE job = 'confirm'"
         " AND fired_for = 1786310000").fetchone()[0]
     assert survived == 1, "pruning deleted the newest scheduled run"
 
@@ -203,170 +203,13 @@ def test_pruning_one_job_leaves_another_alone(conn):
     """The prune is per job, so a chatty job cannot evict a quiet one's history."""
     record_run(conn, "sync", status="ok")
     for _ in range(RUN_HISTORY + 5):
-        record_run(conn, "bars_live", status="nothing")
+        record_run(conn, "confirm", status="nothing")
     assert conn.execute(
         "SELECT COUNT(*) FROM job_runs WHERE job = 'sync'").fetchone()[0] == 1
 
 
 def test_prune_is_safe_on_a_job_with_no_runs(conn):
     assert prune_runs(conn, "sync") == 0
-
-
-# ---------------------------------------------------------------------------
-# The audit payload, and the hole in `ok`.
-# ---------------------------------------------------------------------------
-
-
-def _bars_row(conn, *, conid, symbol, bar_size, ts, category="OPT"):
-    conn.execute(
-        "INSERT OR REPLACE INTO price_bars (conid, symbol, bar_size, ts, close,"
-        " source, fetched_at) VALUES (?,?,?,?,1.0,'yahoo','2026-08-09')",
-        (conid, symbol, bar_size, ts))
-    conn.execute(
-        "INSERT OR IGNORE INTO securities (broker, conid, symbol, asset_category)"
-        " VALUES ('ibkr', ?, ?, ?)", (conid, symbol, category))
-
-
-def test_a_total_blackout_is_not_reported_as_ok(conn):
-    """THE DEFECT this pair of fields exists for, and it is subtle.
-
-    `SessionAudit.ok` is `not market_traded or not missing`, and `market_traded` is
-    answered by "does any UNDERLYING have hourly bars for that day" -- a
-    calendar-free holiday oracle. But that oracle fails the SAME WAY as the thing
-    it certifies: delete every hourly bar, as a fully dead collector would, and
-    `ok` goes GREEN because "no bars for anyone" reads as a market holiday.
-
-    Reproduced on three copies of the real journal before this was written:
-
-        healthy           traded=True   covered=5  missing=0  ok=True
-        option poll dead  traded=True   covered=0  missing=5  ok=False  caught
-        TOTAL blackout    traded=False  covered=0  missing=0  ok=True   MISSED
-
-    Same watchdog-and-watched-stop-together shape that moved this audit out of a
-    cron. So the payload carries `witnesses` (how many contracts were actually
-    checked) and `blackout` (nothing traded in the whole lookback), and the page
-    reads those instead of `ok`.
-    """
-    from datetime import UTC, datetime
-
-    from optjournal.serialize import audit_data
-
-    # An empty journal IS a blackout: no underlying has bars for any recent day.
-    data = audit_data(conn, now=datetime(2026, 8, 10, 12, tzinfo=UTC))
-    assert data["ok"] is True, (
-        "premise: ok is green here, which is exactly the problem being fixed"
-    )
-    assert data["blackout"] is True, "a blackout must be distinguishable from fine"
-    assert data["witnesses"] == 0, "nothing was checked, so nothing was proved"
-
-
-def test_a_healthy_session_is_not_a_blackout(populated_db):
-    """The other direction, so `blackout` is not simply always true.
-
-    Uses the REAL archive rather than a hand-built row, and that is not laziness:
-    `market_traded_on` derives its underlying set from `underlying_conids`, which
-    reads TRADES, not `securities`. A fixture that inserts a bar and a security row
-    but no trade yields an empty conid set and `market_traded=False` -- which is how
-    the first version of this test failed, looking like a code bug when it was a
-    fixture gap. Building the whole trade-plus-security-plus-bar graph by hand would
-    be reimplementing the ingest to test three payload keys.
-    """
-    from datetime import UTC, datetime
-
-    from optjournal.bars import last_traded_day
-    from optjournal.db import connect
-    from optjournal.serialize import audit_data
-
-    conn = connect(populated_db)
-    # Bars come from `optjournal bars`, which the suite never runs, so seed one
-    # hourly underlying bar for a day the real book was open.
-    trade = conn.execute(
-        "SELECT underlying_conid, underlying_symbol FROM trades"
-        " WHERE underlying_conid IS NOT NULL LIMIT 1").fetchone()
-    if trade is None:
-        pytest.skip("the archive holds no option trade to hang an underlying off")
-    session = datetime(2026, 8, 7, 14, 30, tzinfo=UTC)      # 10:30 ET, mid-session
-    _bars_row(conn, conid=str(trade["underlying_conid"]),
-              symbol=str(trade["underlying_symbol"]), bar_size="1h",
-              ts=int(session.timestamp()), category="STK")
-    conn.commit()
-
-    # `last_traded_day` walks back from YESTERDAY, so ask on the following day.
-    now = session + timedelta(days=1)
-    assert last_traded_day(conn, now=now) == "2026-08-07", (
-        "the seeded underlying bar should make that day the last traded one"
-    )
-    data = audit_data(conn, now=now)
-    assert data["market_traded"] is True
-    assert data["blackout"] is False, (
-        "an underlying traded, so the collector is demonstrably alive"
-    )
-    conn.close()
-
-
-def test_witnesses_counts_what_was_examined_not_what_passed(conn):
-    """`witnesses` is covered PLUS missing, so it does not fall when coverage does.
-
-    That is the point: a count that dropped on failure would be as useless as the
-    boolean. It answers "did the audit look at anything", which is a different
-    question from "did it like what it saw".
-    """
-    from datetime import UTC, datetime
-
-    from optjournal.serialize import audit_data
-
-    data = audit_data(conn, now=datetime(2026, 8, 10, 12, tzinfo=UTC))
-    assert data["witnesses"] == len(data["covered"]) + len(data["missing"])
-
-
-def test_a_journal_that_never_collected_is_not_a_stopped_collector(conn, populated_db):
-    """The second hole in the blackout signal, and it made the page cry wolf.
-
-    `blackout` says "nothing traded in the whole ten-day lookback", which on a
-    working journal means the collector died. On a journal that has NEVER stored a
-    bar it means nothing at all -- and the two produce identical payloads. Measured
-    rather than reasoned about: `price_bars` emptied out of a copy of the real
-    journal, versus a fresh journal, gave byte-identical results.
-
-        collection STOPPED   market_traded=False  witnesses=0  blackout=True
-        NEVER collected      market_traded=False  witnesses=0  blackout=True
-
-    So the demo journal -- and any real journal before its first `optjournal bars`
-    -- rendered a red collection alarm for the absence of something that was never
-    there. `ever_collected` separates them, exactly as `Scheduler.ever_ran`
-    separates "the loop is dead" from "no loop has ever run here". That the
-    heartbeat already drew this distinction is what makes its absence here an
-    oversight rather than a decision.
-    """
-    from datetime import UTC, datetime
-
-    from optjournal.db import connect
-    from optjournal.serialize import audit_data
-
-    now = datetime(2026, 8, 10, 12, tzinfo=UTC)
-    fresh = audit_data(conn, now=now)
-    assert fresh["blackout"] is True, "premise: an empty journal reads as a blackout"
-    assert fresh["ever_collected"] is False, (
-        "a journal with no bars at all must not look like a stopped collector"
-    )
-
-    # The other direction, on the real archive: a stored bar flips it, and it stays
-    # flipped for a bar that is far too old to help the audit -- the field answers
-    # "has this ever worked", not "is it working now", which is what makes it safe
-    # to gate an alarm on.
-    other = connect(populated_db)
-    other.execute(
-        "INSERT OR REPLACE INTO price_bars (conid, symbol, bar_size, ts, close,"
-        " source, fetched_at) VALUES ('1','X','1h',946684800,1.0,'yahoo','2000-01-01')")
-    other.commit()
-    aged = audit_data(other, now=now)
-    assert aged["ever_collected"] is True, (
-        "a bar exists, so this journal has demonstrably collected before"
-    )
-    assert aged["blackout"] is True, (
-        "and the blackout still stands -- the two fields answer different questions"
-    )
-    other.close()
 
 
 # ---------------------------------------------------------------------------
@@ -412,22 +255,6 @@ def test_the_calendar_job_is_registered_here_because_it_never_was_anywhere_else(
     )
 
 
-def test_the_audit_is_not_a_job_any_more():
-    """It was `optjournal-bars-audit`; step 4 made it a field on every page load.
-
-    A watchdog that is itself scheduled stops when the thing it watches stops, and
-    did: bars-audit read `last_status: ok` for two days while nothing was
-    collected. Registering it again would undo that, so its absence is an
-    assertion rather than an omission.
-    """
-    from optjournal.jobs import JOBS
-
-    assert not [job for job in JOBS if "audit" in job.name], (
-        "the perishable audit is computed by serialize.audit_data on every page "
-        "load -- as a job it cannot notice the outage that stops it too"
-    )
-
-
 def test_only_the_sync_spends_a_broker_request():
     """The flag the reconciler reads before retrying anything.
 
@@ -448,22 +275,21 @@ def test_only_the_sync_spends_a_broker_request():
 
 
 def test_the_live_poll_is_a_window_and_the_rest_are_wall_clock():
-    """`bars_live` is the one job whose due-ness is not an instant.
+    """`confirm` is the one job whose due-ness is not an instant.
 
-    Seven cron slots collapse into one predicate -- inside the session AND the last
-    success over 55 minutes old -- and it is sound only because the intraday series
-    is CUMULATIVE within a session: a 13:00 poll returns every completed bar since
-    the open. `Catchup.LATEST` on it would be wrong in the dangerous direction,
-    firing outside the session and recording an empty fetch as a success.
+    A row of cron slots collapses into one predicate -- inside the session AND the
+    last success over 25 minutes old -- and it is sound only because a Trade
+    Confirmation is CUMULATIVE within a session: a 13:00 poll holds every fill
+    since the open. `Catchup.LATEST` on it would be wrong in the dangerous
+    direction, firing outside the session and recording an empty fetch as a
+    success.
     """
-    from optjournal.jobs import JOBS, Catchup, job_by_name
+    from optjournal.jobs import JOBS, Catchup
 
-    assert job_by_name("bars_live").catchup is Catchup.WINDOW
-    assert {j.name for j in JOBS if j.catchup is Catchup.WINDOW} == {
-        "bars_live", "confirm"}, (
-        "the window jobs are the two intraday ones: bars_live and the Trade "
-        "Confirmation poll. Both ask 'is it session time, and is the last success "
-        "stale' rather than claiming a wall-clock minute"
+    assert {j.name for j in JOBS if j.catchup is Catchup.WINDOW} == {"confirm"}, (
+        "the window job is the intraday Trade Confirmation poll. It asks 'is it "
+        "session time, and is the last success stale' rather than claiming a "
+        "wall-clock minute"
     )
     # And no job is NONE, which silently drops a missed instant; `history` has no
     # instants at all, and runs ONCE by itself after the first sync.
@@ -680,12 +506,11 @@ def test_the_market_hours_poll_is_scheduled_in_market_time():
 
     The others are the reader's own zone, where "before breakfast" is the actual
     requirement. Getting this backwards would put the live poll an hour off the
-    session for half the year -- which for perishable bars means a lost hour that
-    cannot be refetched.
+    session for half the year.
     """
     from optjournal.jobs import job_by_name
 
-    assert job_by_name("bars_live").zone == "America/New_York"
+    assert job_by_name("confirm").zone == "America/New_York"
     assert job_by_name("sync").zone == "Europe/Dublin"
 
 
@@ -713,7 +538,7 @@ def test_an_unknown_job_name_raises_its_own_type():
     from optjournal.jobs import UnknownJob, job_by_name
 
     with pytest.raises(UnknownJob):
-        job_by_name("bars-live")                   # hyphen, not underscore
+        job_by_name("bars-daily")                  # hyphen, not underscore
 
 
 # ---------------------------------------------------------------------------
@@ -1175,7 +1000,7 @@ def test_an_interrupted_run_is_resolved_by_the_kernel_not_by_a_timeout(conn, ctx
 
     conn.execute(
         "INSERT INTO job_runs (job, started_at, status)"
-        " VALUES ('bars_live', '2026-08-09T14:00:00+00:00', 'running')")
+        " VALUES ('bars_daily', '2026-08-09T14:00:00+00:00', 'running')")
     conn.commit()
 
     assert interrupted_runs(conn, archive_dir=ctx.archive_dir) == 1
@@ -1426,7 +1251,7 @@ def test_the_payload_says_which_jobs_spend_a_broker_request(conn):
 
 
 def test_a_job_that_left_the_registry_keeps_its_history_and_is_marked(conn):
-    """`bars_audit` is the real case: it WAS a cron and is now a page-load field.
+    """`bars_audit` is the real case: it WAS a cron, and is no job now.
 
     Its rows are still in this journal. Dropping them from the payload would make
     the panel that reports on collection health silently forget that the audit ever
@@ -1450,6 +1275,46 @@ def test_a_job_that_left_the_registry_keeps_its_history_and_is_marked(conn):
     # And a registered job never carries the flag, or every row would render as
     # unrunnable.
     assert "retired" not in rows["sync"]
+
+
+def test_a_ledger_holding_bars_live_rows_still_reads_and_schedules(conn, ctx, monkeypatch):
+    """A journal that ran the hourly option poll keeps its rows: runs, one still
+    `running` from a process long gone, and an anchor carrying failures. Every
+    reader of the ledger has to get past them without running the job, reviving
+    its backoff or letting it speak for the journal's collection state.
+    """
+    from datetime import UTC, date, datetime
+
+    from optjournal import jobs as mod
+    from optjournal.serialize import collection_status, jobs_data
+
+    conn.executemany(
+        "INSERT INTO job_runs (job, started_at, finished_at, status, detail)"
+        " VALUES ('bars_live', ?, ?, ?, ?)",
+        [("2026-10-15T14:05:00+00:00", "2026-10-15T14:05:09+00:00", "failed",
+          "URLError"),
+         ("2026-10-15T15:05:00+00:00", None, "running", None)])
+    conn.execute(
+        "INSERT INTO job_state (job, last_status, consecutive_failures, heartbeat_at)"
+        " VALUES ('bars_live', 'failed', 7, 1)")
+    conn.commit()
+
+    assert mod.interrupted_runs(conn, archive_dir=ctx.archive_dir) == 1
+    _registry(monkeypatch, *(job.name for job in mod.JOBS))
+    now = datetime(2026, 10, 21, 17, 0, tzinfo=UTC)               # 13:00 ET
+    started = mod.reconcile(conn, ctx=ctx, now=now)
+    assert started == ["confirm"], started
+    mod.heartbeat(conn, now=now)
+
+    scheduler = jobs_data(conn, now=now)
+    row = {r["job"]: r for r in scheduler["jobs"]}["bars_live"]
+    assert (row["retired"], row["backed_off"], row["spends_request"]) == (
+        True, False, False), row
+    state = collection_status(scheduler, configured=True, demo=False,
+                              newest=date(2026, 10, 20), today=date(2026, 10, 21))
+    assert state["state"] == "ok", state
+    with pytest.raises(ValueError, match="unknown job"):
+        record_run(conn, "bars_live", status="ok")
 
 
 # ---------------------------------------------------------------------------
@@ -1508,7 +1373,7 @@ def test_an_empty_ledger_means_unknown_not_overdue():
     from zoneinfo import ZoneInfo
 
     # A Wednesday, 22:00 Dublin = 17:00 ET: past sync (12:00), bars_daily (12:30)
-    # and market (11:00), and AFTER the US close so `bars_live` is out of the
+    # and market (11:00), and AFTER the US close so `confirm` is out of the
     # picture. 18:00 Dublin would be 13:00 ET -- mid-session -- and the first
     # version of this test used it and failed on a live poll that was correctly
     # due. See `test_the_live_poll_ignores_the_empty_ledger_rule` for why that is
@@ -1681,37 +1546,36 @@ def test_a_job_too_far_behind_is_not_caught_up():
 
 
 def test_the_live_poll_is_due_inside_the_session_and_never_outside_it():
-    """Both halves, and the second is the one that protects the audit's meaning.
+    """Both halves, and the second is the one that keeps `ok` meaning something.
 
-    Outside the window `bars_live` must be NOT DUE rather than due-and-empty: a
-    20:00 wake that fetches nothing and records `ok` is the exact inversion the
-    perishable audit exists to catch. An empty poll recorded as success is how three
-    cron jobs reported health for two days.
+    Outside the window `confirm` must be NOT DUE rather than due-and-empty: a
+    20:00 wake that fetches nothing and records `ok` is an empty poll recorded as
+    success, which is how three cron jobs reported health for two days.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     et = ZoneInfo(_ET)
     mid = datetime(2026, 8, 12, 13, 0, tzinfo=et)          # Wednesday, mid-session
-    assert "bars_live" in _names(_due(mid))
+    assert "confirm" in _names(_due(mid))
     for label, when in (
         ("pre-market", datetime(2026, 8, 12, 8, 0, tzinfo=et)),
         ("after the close", datetime(2026, 8, 12, 20, 0, tzinfo=et)),
         ("Saturday", datetime(2026, 8, 15, 13, 0, tzinfo=et)),
         ("Sunday", datetime(2026, 8, 16, 13, 0, tzinfo=et)),
     ):
-        assert "bars_live" not in _names(_due(when)), (
+        assert "confirm" not in _names(_due(when)), (
             f"the live poll is due {label}, so it would fetch nothing and record "
-            "a success -- which is what the audit exists to catch"
+            "a success"
         )
 
 
 def test_the_live_poll_waits_out_its_window_after_a_success():
-    """Cumulative within a session, so one poll an hour is enough.
+    """Cumulative within a session, so one poll a window is enough.
 
-    A 13:00 poll returns every completed bar since the open, which is what lets
-    seven cron slots collapse into one predicate -- and what makes polling again
-    four minutes later pure waste.
+    A 13:00 poll holds every fill since the open, which is what lets a row of cron
+    slots collapse into one predicate -- and what makes polling again four
+    minutes later pure waste.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -1720,13 +1584,13 @@ def test_the_live_poll_waits_out_its_window_after_a_success():
 
     et = ZoneInfo(_ET)
     now = datetime(2026, 8, 12, 13, 0, tzinfo=et)
-    window = job_by_name("bars_live").window_s
+    window = job_by_name("confirm").window_s
     fresh = int(now.timestamp()) - (window - 60)
     stale = int(now.timestamp()) - (window + 60)
-    assert "bars_live" not in _names(_due(now, last_poll={"bars_live": fresh})), (
+    assert "confirm" not in _names(_due(now, last_poll={"confirm": fresh})), (
         "the live poll fired again inside its own window"
     )
-    assert "bars_live" in _names(_due(now, last_poll={"bars_live": stale})), (
+    assert "confirm" in _names(_due(now, last_poll={"confirm": stale})), (
         "the live poll stopped firing once its window had elapsed"
     )
 
@@ -1745,14 +1609,14 @@ def test_the_live_poll_claims_no_instant():
     now = datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo(_ET))
     from optjournal.jobs import job_by_name
 
-    stale = int(now.timestamp()) - (job_by_name("bars_live").window_s + 60)
+    stale = int(now.timestamp()) - (job_by_name("confirm").window_s + 60)
     # BOTH branches of `_window_due`: no success recorded yet, and a success old
     # enough to have expired. An ablation that made only the second claim an
     # instant survived a version of this test that exercised the first alone.
     for label, ledger in (("no success yet", {}),
-                          ("an expired success", {"bars_live": stale})):
+                          ("an expired success", {"confirm": stale})):
         live = next(d for d in _due(now, last_poll=ledger)
-                    if d.job.name == "bars_live")
+                    if d.job.name == "confirm")
         assert live.fired_for is None, (
             f"with {label} the live poll claims a scheduled instant, so the unique "
             "index would let it run once per session instead of once per window"
@@ -1837,12 +1701,11 @@ def test_a_schedule_in_the_missing_spring_forward_hour_still_runs():
 
 
 def test_the_market_hours_poll_follows_us_dst_not_the_readers_clock():
-    """Which is why `bars_live` is scheduled in Eastern.
+    """Which is why `confirm` is scheduled in Eastern.
 
     In March the US springs forward two weeks before Europe does, so for a fortnight
     the offset between them is one hour smaller. A poll scheduled in the reader's
-    zone would sit an hour off the session for those two weeks -- and for perishable
-    bars an hour off is an hour lost.
+    zone would sit an hour off the session for those two weeks.
 
     Asserted at 09:45 ET on a day inside that fortnight: in-session in market time,
     while the same wall-clock hour in Dublin is before the open.
@@ -1852,7 +1715,7 @@ def test_the_market_hours_poll_follows_us_dst_not_the_readers_clock():
 
     # 2026-03-16 is a Monday between the US (Mar 8) and EU (Mar 29) transitions.
     inside = datetime(2026, 3, 16, 9, 45, tzinfo=ZoneInfo(_ET))
-    assert "bars_live" in _names(_due(inside)), (
+    assert "confirm" in _names(_due(inside)), (
         "the live poll is not due at 09:45 ET during the US/EU DST gap, so it "
         "would miss the first hour of the session for two weeks a year"
     )
@@ -1870,10 +1733,9 @@ def test_the_market_hours_poll_follows_us_dst_not_the_readers_clock():
         "premise: this instant is inside the US session and outside a same-clock "
         "window in the reader's zone"
     )
-    assert "bars_live" in _names(_due(late)), (
+    assert "confirm" in _names(_due(late)), (
         "the live poll is not due at 15:45 ET, so the session window is being read "
-        "in the wrong zone -- the last half hour of every session would be lost, "
-        "and those bars cannot be recollected at any price"
+        "in the wrong zone -- the last half hour of every session would be lost"
     )
 
 
@@ -1922,14 +1784,11 @@ def test_the_live_poll_ignores_the_empty_ledger_rule_and_that_is_correct():
     """A WINDOW job is exempt from "empty ledger means unknown", deliberately.
 
     The rule protects a RESTORE from catch-up: a rebuilt journal must not replay a
-    scheduled instant and spend an IBKR request unprompted. `bars_live` catches up
-    on nothing -- it asks "is the market open right now, and are my bars stale?" --
-    so there is no missed instant to replay, and the answer on a rebuilt journal at
-    13:00 ET is genuinely YES: that session's intraday bars are being lost while the
-    question is asked, and they cannot be recollected at any price.
-
-    It is also the cheapest job to be wrong about: a public chart endpoint, no IBKR
-    request, and an empty poll records `nothing` rather than a failure.
+    scheduled instant and spend an IBKR request unprompted. `confirm` catches up
+    on nothing -- it asks "is the market open right now, and is my last poll
+    stale?" -- so there is no missed instant to replay, and a rebuilt journal in
+    market hours should collect today's fills rather than wait. The statement
+    supersedes whatever it collects.
 
     Worth its own test because it looks like a hole in the rule. Two tests above had
     to change their clock because of it, which is precisely when an exemption should
@@ -1939,18 +1798,10 @@ def test_the_live_poll_ignores_the_empty_ledger_rule_and_that_is_correct():
     from zoneinfo import ZoneInfo
 
     mid = datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo(_ET))
-    assert "bars_live" in _names(_due(mid, ever_ran=set())), (
-        "the live poll waits for history on a rebuilt journal, so a restore during "
-        "market hours silently loses that session's perishable bars"
-    )
     # And the instant-claiming jobs at the SAME clock are still held back.
-    # Sorted by `_names`, so this is a SET claim rather than an execution order.
-    # The Trade Confirmation poll shares the exemption and the reasoning: a rebuilt
-    # journal in market hours should collect today's fills rather than wait, and the
-    # statement supersedes whatever it collects. Everything that claims a
-    # wall-clock instant is still held back.
-    assert _names(_due(mid, ever_ran=set())) == ["bars_live", "confirm"], (
-        "a job that catches up fired on an empty ledger"
+    assert _names(_due(mid, ever_ran=set())) == ["confirm"], (
+        "the live poll waits for history on a rebuilt journal, or a job that "
+        "catches up fired on an empty ledger"
     )
 
 
@@ -1969,7 +1820,7 @@ def test_a_claimed_instant_does_not_brake_the_live_poll():
     mid = datetime(2026, 8, 12, 13, 0, tzinfo=ZoneInfo(_ET))
     # A claim that could not have come from this job, plus a NULL-ish key: neither
     # may hide the poll.
-    assert "bars_live" in _names(_due(mid, claimed={"bars_live": {0}})), (
+    assert "confirm" in _names(_due(mid, claimed={"confirm": {0}})), (
         "the live poll is gated on claimed instants, which it never has -- it "
         "would poll once per session instead of once per window"
     )
@@ -2153,14 +2004,12 @@ def test_a_backed_off_daily_job_keeps_its_schedule_but_loses_its_retries(
 
 
 def test_a_backed_off_window_job_is_retried_once_per_window_not_never():
-    """H7 for `bars_live` and `confirm`: one attempt per window while backed off.
+    """H7 for `confirm`: one attempt per window while backed off.
 
-    Their failures do not brake, so they retry on every 60 s tick, and five
-    minutes offline was enough to reach the limit. Backed off, a failed attempt
-    now brakes like a poll: once per `window_s`, which is also the cadence a
-    healthy poll keeps. `confirm` brakes so from its first failure, because each
-    attempt spends an IBKR request: four more inside four minutes answered a
-    "too many requests" (1018) with more requests.
+    Backed off, a failed attempt brakes like a poll: once per `window_s`, which is
+    also the cadence a healthy poll keeps. `confirm` brakes so from its first
+    failure, because each attempt spends an IBKR request: four more inside four
+    minutes answered a "too many requests" (1018) with more requests.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -2169,20 +2018,15 @@ def test_a_backed_off_window_job_is_retried_once_per_window_not_never():
 
     now = datetime(2026, 9, 24, 13, 0, tzinfo=ZoneInfo(_ET))       # in session
     epoch = int(now.timestamp())
-    backed = {"bars_live": FAILURE_BACKOFF, "confirm": FAILURE_BACKOFF}
-    for name in ("bars_live", "confirm"):
-        window = job_by_name(name).window_s
-        just = _due(now, last_try={name: epoch - 60}, failures=backed)
-        assert name not in _names(just), f"a backed-off {name} retried after a tick"
-        late = _due(now, last_try={name: epoch - window}, failures=backed)
-        assert name in _names(late), f"a backed-off {name} is never retried"
-        # Below the limit a failure still retries on the next tick, unless the
-        # attempt spends an IBKR request.
-        fresh = _due(now, last_try={name: epoch - 60}, failures={name: 1})
-        if name == "bars_live":
-            assert name in _names(fresh), f"{name} lost its quick retry"
-        else:
-            assert name not in _names(fresh), f"{name} asked IBKR again after a tick"
+    name = "confirm"
+    backed = {name: FAILURE_BACKOFF}
+    window = job_by_name(name).window_s
+    just = _due(now, last_try={name: epoch - 60}, failures=backed)
+    assert name not in _names(just), f"a backed-off {name} retried after a tick"
+    late = _due(now, last_try={name: epoch - window}, failures=backed)
+    assert name in _names(late), f"a backed-off {name} is never retried"
+    fresh = _due(now, last_try={name: epoch - 60}, failures={name: 1})
+    assert name not in _names(fresh), f"{name} asked IBKR again after a tick"
 
 
 def test_the_payload_says_when_a_job_is_backed_off(conn):
@@ -2192,56 +2036,14 @@ def test_the_payload_says_when_a_job_is_backed_off(conn):
     from optjournal.jobs import FAILURE_BACKOFF
     from optjournal.serialize import jobs_data
 
-    for job, count in (("bars_live", FAILURE_BACKOFF), ("market", FAILURE_BACKOFF - 1)):
+    for job, count in (("confirm", FAILURE_BACKOFF), ("market", FAILURE_BACKOFF - 1)):
         conn.execute("INSERT INTO job_state (job, last_status, consecutive_failures)"
                      " VALUES (?, 'failed', ?)", (job, count))
     conn.commit()
     rows = {r["job"]: r for r in jobs_data(conn, now=datetime.now(UTC))["jobs"]}
-    assert rows["bars_live"]["backed_off"] is True
+    assert rows["confirm"]["backed_off"] is True
     assert rows["market"]["backed_off"] is False
     assert rows["sync"]["backed_off"] is False, "a job that never ran is not backed off"
-
-
-def test_five_minutes_offline_no_longer_parks_the_live_poll(conn, ctx, clock, monkeypatch):
-    """H7 end to end, as `evidence/jobs/v1_window_backoff.py` measured it.
-
-    DNS fails for the first five minutes of a session and then works. Before the
-    fix the live poll backed off at 09:44 and never ran again, which the real
-    ledger shows as runs 550-554 parking `bars_live` from 09-09 to 09-24.
-    """
-    from datetime import UTC, datetime, timedelta
-    from zoneinfo import ZoneInfo
-
-    from optjournal import jobs as mod
-
-    start = datetime(2026, 10, 1, 9, 40, tzinfo=ZoneInfo(_ET))    # Thursday
-    online = start + timedelta(minutes=5)
-
-    def poll(_c, _x):
-        if clock["t"] < online:
-            return mod.Outcome("failed", "URLError: nodename nor servname provided")
-        return mod.Outcome("ok", "3 bar(s), 0 empty", 3, 3)
-
-    _stub(monkeypatch, "bars_live", poll)
-    monkeypatch.setattr(mod, "JOBS", tuple(j for j in mod.JOBS if j.name == "bars_live"))
-    for minute in range(6 * 60):                                    # to 15:40 ET
-        clock["t"] = (start + timedelta(minutes=minute)).astimezone(UTC)
-        mod.reconcile(conn, ctx=ctx, now=clock["t"])
-
-    statuses = [r[0] for r in conn.execute("SELECT status FROM job_runs ORDER BY id")]
-    assert statuses[:mod.FAILURE_BACKOFF] == ["failed"] * mod.FAILURE_BACKOFF
-    assert "ok" in statuses, "the live poll never ran again after backing off"
-    first_ok = conn.execute(
-        "SELECT started_at FROM job_runs WHERE status = 'ok' ORDER BY id").fetchone()[0]
-    last_fail = start + timedelta(minutes=mod.FAILURE_BACKOFF - 1)
-    window = mod.job_by_name("bars_live").window_s
-    assert first_ok == (last_fail + timedelta(seconds=window)).astimezone(
-        UTC).isoformat(timespec="seconds"), "the backed-off retry is not one window on"
-    assert conn.execute(
-        "SELECT consecutive_failures FROM job_state WHERE job='bars_live'"
-    ).fetchone()[0] == 0, "the success did not clear the backoff"
-    # Healthy again, it polls once per window for the rest of the session.
-    assert statuses.count("ok") >= 5
 
 
 def test_the_heartbeat_is_written_by_the_loop_not_by_a_job(conn):
@@ -2701,8 +2503,8 @@ def test_a_bars_run_that_collected_most_of_the_book_is_not_a_failure(conn, monke
         failures = ["SPX 1d: HTTPError: HTTP Error 404: Not Found",
                     "SPX 1h: HTTPError: HTTP Error 404: Not Found"]
 
-    monkeypatch.setattr(jobs, "backfill_bars", lambda conn, perishable_only: _Result())
-    outcome = jobs._bars(conn, None, live=False)
+    monkeypatch.setattr(jobs, "backfill_bars", lambda conn: _Result())
+    outcome = jobs._bars(conn, None)
     assert outcome.status == "ok", (
         "a run that wrote 8,889 bars still reports failed, which backs the job off"
     )
@@ -2724,8 +2526,8 @@ def test_a_bars_run_that_collected_nothing_at_all_still_fails(conn, monkeypatch)
         written, skipped, requested = 0, 0, 3
         failures = ["TSLA 1d: URLError: nodename nor servname provided"]
 
-    monkeypatch.setattr(jobs, "backfill_bars", lambda conn, perishable_only: _Result())
-    outcome = jobs._bars(conn, None, live=False)
+    monkeypatch.setattr(jobs, "backfill_bars", lambda conn: _Result())
+    outcome = jobs._bars(conn, None)
     assert outcome.status == "failed"
     assert "TSLA 1d" in outcome.detail
 

@@ -189,8 +189,7 @@ def sync_journal(
     transaction that already holds its `running` claim.
 
     It ends with a snapshot, and the placement is deliberate: beside the write it
-    protects, so it cannot be the thing that silently stopped running. Same
-    argument that turned `bars-audit` from a cron into a page-load field.
+    protects, so it cannot be the thing that silently stopped running.
 
     WHAT IT IS FOR IS THE PERISHABLE HALF, and the split is lopsided enough after
     this change that "it backs up `price_bars`" would name the wrong thing.

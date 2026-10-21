@@ -73,8 +73,8 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-#: Runs kept per job. Enough to see a week of a job that fires seven times a
-#: session (bars_live) without the table growing forever. The newest row for a
+#: Runs kept per job. Enough to see a week of a job that fires every 25 minutes
+#: of a session (confirm) without the table growing forever. The newest row for a
 #: given `fired_for` is never pruned -- see `prune_runs`.
 RUN_HISTORY = 200
 
@@ -88,7 +88,7 @@ RUN_HISTORY = 200
 #: would write rows nothing reads and leave the real job looking as if it never ran
 #: -- the exact failure this ledger exists to make visible.
 KNOWN_JOBS = frozenset({
-    "sync", "confirm", "bars_live", "bars_daily", "market", "history",
+    "sync", "confirm", "bars_daily", "market", "history",
 })
 
 #: Statuses a run may end in. `running` is written BEFORE the work starts (step 5),
@@ -243,9 +243,6 @@ def prune_runs(conn: sqlite3.Connection, job: str, *, keep: int = RUN_HISTORY) -
 #     optjournal-bars-daily    30 12 * * 2-6     Europe/Dublin     600s
 #     optjournal-bars-audit    0 13 * * 2-6      Europe/Dublin     120s
 #
-# `bars-audit` is deliberately ABSENT from this registry: step 4 moved it from a
-# job to a field computed on every page load (`serialize.audit_data`), because a
-# watchdog that is itself a cron stops when the thing it watches stops -- and did.
 # `market` is present for the first time.
 # ---------------------------------------------------------------------------
 
@@ -265,7 +262,7 @@ class Catchup(enum.Enum):
     #: the same statement twice.
     LATEST = "latest"
     #: Not a wall-clock fire at all -- due while inside a window and the last
-    #: success is old enough. `bars_live` only, see its Job below.
+    #: success is old enough. `confirm` only, see its Job below.
     WINDOW = "window"
     #: A missed instant is simply missed. With no `weekdays` there is no instant
     #: to miss: the job runs only when asked.
@@ -327,7 +324,7 @@ class Job:
     #: ISO weekdays (Monday=1). `sync` runs Tue-Sat because a US Friday session
     #: settles into a statement Saturday morning European time.
     weekdays: tuple[int, ...]
-    #: The job's own zone. `bars_live` is Eastern because market hours ARE an
+    #: The job's own zone. `confirm` is Eastern because market hours ARE an
     #: Eastern concept, so it follows US DST without being edited twice a year;
     #: the rest are the reader's local zone, where "before breakfast" is the
     #: actual requirement.
@@ -399,17 +396,14 @@ class JobBusy(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _bars(conn: sqlite3.Connection, _ctx: Context, *, live: bool) -> Outcome:
-    """Fetch the manifest's windows. Shared by `bars_live` and `bars_daily`.
-
-    One function with a flag rather than two, because the two differ ONLY in what
-    they ask for.
+def _bars(conn: sqlite3.Connection, _ctx: Context) -> Outcome:
+    """Fetch the manifest's windows.
 
     Per-window failures are collected by `backfill_bars` rather than raised (one
     unreachable contract must not abandon the book), so the status is derived from
     the outcome rather than from an exception.
     """
-    outcome = backfill_bars(conn, perishable_only=live)
+    outcome = backfill_bars(conn)
     if outcome.failures and not outcome.written:
         return Outcome("failed", "; ".join(outcome.failures)[:400],
                        outcome.written, outcome.requested)
@@ -422,8 +416,7 @@ def _bars(conn: sqlite3.Connection, _ctx: Context, *, live: bool) -> Outcome:
         # collected over a symbol that was never going to work.
         #
         # Still not silently green: the failures are named in the detail the page
-        # shows and the backoff warning reads, and a perishable window that did not
-        # land is `audit_perishable`'s question rather than this status's.
+        # shows and the backoff warning reads.
         return Outcome(
             "ok" if outcome.written else "nothing",
             f"{got}; {len(outcome.failures)} window(s) failed: "
@@ -707,10 +700,10 @@ JOBS: tuple[Job, ...] = (
     Job(
         name="confirm",
         run=_confirm,
-        # SAME SHAPE AS `bars_live`, for the same reason: due-ness is "inside the
-        # session AND the last success is over 25 minutes old", so one predicate
-        # replaces a row of cron slots and a laptop that slept through two hours
-        # collects on its first tick awake rather than waiting for the next slot.
+        # NOT a wall-clock fire: due-ness is "inside the session AND the last
+        # success is over 25 minutes old", so one predicate replaces a row of cron
+        # slots and a laptop that slept through two hours collects on its first
+        # tick awake rather than waiting for the next slot.
         #
         # US market hours, because that is when a fill can happen on this account.
         # Outside them the payload cannot change, and polling it would spend
@@ -721,26 +714,13 @@ JOBS: tuple[Job, ...] = (
     ),
     Job(
         name="bars_daily",
-        run=lambda conn, ctx: _bars(conn, ctx, live=False),
+        run=_bars,
         # 12:30, thirty minutes behind the sync: a position opened yesterday is
         # only in the database once that sync has ingested it, and the manifest is
         # derived from positions. The gap clears the sync's worst case, the
         # 930s of `flex.FETCH_WORST_CASE_S`.
         minute=30, hour=12, weekdays=(2, 3, 4, 5, 6), zone="Europe/Dublin",
         catchup=Catchup.LATEST, window_s=CATCH_UP_S,   # re-fetchable by definition
-    ),
-    Job(
-        name="bars_live",
-        run=lambda conn, ctx: _bars(conn, ctx, live=True),
-        # NOT a wall-clock fire. The minute/hour are the session's own open in ET,
-        # kept so the schedule reads consistently, but `Catchup.WINDOW` means due-
-        # ness is "inside the session AND the last success is over 55 minutes old"
-        # -- one predicate replacing seven cron slots. Sound because the intraday
-        # series is CUMULATIVE within a session: a 13:00 poll returns every
-        # completed bar since the open, so one wake at 14:30 after sleeping since
-        # 10:00 collects the whole session.
-        minute=5, hour=10, weekdays=(1, 2, 3, 4, 5), zone="America/New_York",
-        catchup=Catchup.WINDOW, window_s=55 * 60,
     ),
     Job(
         name="market",
@@ -963,9 +943,8 @@ def interrupted_runs(conn: sqlite3.Connection, *, archive_dir: Path) -> int:
     is wrong, because this machine measured 44.6 hours of sleep excluded from
     `monotonic`.
 
-    Called on page load rather than by a scheduled job, for the same reason the
-    perishable audit moved out of a cron: a watchdog that is itself scheduled stops
-    when the scheduler does.
+    Called on page load rather than by a scheduled job, because a watchdog that is
+    itself scheduled stops when the scheduler does.
 
     Four sub-millisecond lock attempts. `LOCK_NB` never waits, so a job that IS
     running costs one failed syscall and keeps its row.
@@ -1012,21 +991,16 @@ def interrupted_runs(conn: sqlite3.Connection, *, archive_dir: Path) -> int:
 #
 # THE STAKES. Getting this wrong in the permissive direction spends real IBKR
 # requests against a hard lockout budget; getting it wrong in the other direction
-# silently converts "missed, unrecoverable" into nothing at all, because an
-# option's intraday series exists only while its own session runs. So the rules are
-# stated as separate named predicates rather than folded into one condition.
+# silently skips work nobody sees missing. So the rules are stated as separate
+# named predicates rather than folded into one condition.
 # ---------------------------------------------------------------------------
 
-#: The US session, in `America/New_York`, as the hours `bars_live` may poll in.
-#: 09:30-16:00 is the cash session; the poll runs from the first completed hourly
-#: bar (10:00) to one past the close (16:05 in the cron it replaces), so the window
-#: is expressed as hours-past-the-open rather than as a second set of clock times
-#: that could disagree with `clock.MARKET_TZ`.
+#: The US session, in `America/New_York`, as the hours a `WINDOW` job may poll in:
+#: the 09:30-16:00 cash session, plus `SESSION_TAIL_M` past the close.
 SESSION_OPEN_H = 9
 SESSION_OPEN_M = 30
 SESSION_CLOSE_H = 16
-#: Minutes past the close that a poll is still useful: the 16:00 bar is only on the
-#: grid once the hour has completed.
+#: Minutes past the close that a poll still runs.
 SESSION_TAIL_M = 10
 
 
@@ -1082,10 +1056,9 @@ def _in_session(now: datetime) -> bool:
 
     Weekday only, and deliberately calendar-free: a market holiday is not
     distinguishable here, and the cost of polling on one is a request that returns
-    no bars and records `nothing`. That is the correct outcome anyway -- an empty
-    poll on a holiday is not a failure, and inventing a holiday calendar to avoid
-    it would be a second source of truth about what the market did, which
-    `bars.market_traded_on` already answers FROM THE DATA.
+    nothing new and records `nothing`. That is the correct outcome anyway -- an
+    empty poll on a holiday is not a failure, and a holiday calendar would be a
+    date list to maintain forever.
     """
     local = now.astimezone(ZoneInfo("America/New_York"))
     if local.isoweekday() > 5:
@@ -1103,15 +1076,14 @@ def _window_due(
 ) -> Due | None:
     """`Catchup.WINDOW`: inside the session, and the last POLL is old enough.
 
-    SEVEN CRON SLOTS COLLAPSE INTO THIS ONE PREDICATE, and it is sound only because
-    the intraday series is CUMULATIVE within a session: a 13:00 poll returns every
-    completed bar since the open, so one wake at 14:30 after sleeping since 10:00
-    collects the whole session. That is launchd's coalescing expressed in the job
-    rather than begged from the substrate.
+    A ROW OF CRON SLOTS COLLAPSES INTO THIS ONE PREDICATE, and it is sound only
+    because what a poll fetches is CUMULATIVE within a session: a Trade
+    Confirmation grows with every fill, so one wake at 14:30 after sleeping since
+    10:00 collects the whole session. That is launchd's coalescing expressed in the
+    job rather than begged from the substrate.
 
     Outside the window it is NEVER due. A 20:00 wake must not fetch nothing and
-    record `ok` -- that is precisely the inversion the perishable audit exists to
-    catch, one layer down.
+    record `ok`.
 
     Claims NO `fired_for`, because there is no instant: the run is "this session, at
     whatever moment we woke". The partial unique index accepts repeats of NULL,
@@ -1349,7 +1321,7 @@ TICK_S = 60
 
 #: At this many consecutive failures a job is BACKED OFF: its fast retries stop,
 #: and it runs only at its own healthy cadence. A window job gets one attempt per
-#: window (55 minutes for `bars_live`, 25 for `confirm`) instead of one per tick,
+#: window (25 minutes for `confirm`) instead of one per tick,
 #: and a daily job one attempt per scheduled instant plus, when it spends no IBKR
 #: request, a single `RETRY_AFTER_S` retry of it: that attempt is often the first
 #: tick after a wake, and a network still coming up would otherwise take every

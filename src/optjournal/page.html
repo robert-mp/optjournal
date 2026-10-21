@@ -243,9 +243,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   supervising this server, and journals a previous download left (web.build_state)
  * @property {Array} history_plan -- HistoryChunk rows a history import would
  *   request now, newest first (sync.history_plan); empty when complete
- * @property {Audit} audit -- did the last session's perishable bars land
- *   (serialize.audit_data). Computed on EVERY load, because when this was a cron
- *   the watchdog and the thing it watched stopped together
  * @property {Logbook} logbook -- the header dateline (serialize.logbook_data).
  *   Whole-journal, so it moves with neither the month nor the trade-type filter
  * @property {Journal} journal -- what the reader wrote, plus the vocabulary the
@@ -814,29 +811,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {number} total
  * @property {string|null} note
  * @property {number} slept
- */
-
-/** @typedef {Object} Audit -- the perishable-bar check (serialize.audit_data)
- *
- *  The one question no later run can fix: an option's intraday series exists only
- *  while its own session runs, so a missed session is missed permanently.
- * @property {string} day -- the ET session examined
- * @property {boolean} market_traded -- false on a holiday, when no bars is correct
- * @property {Array} covered -- contracts asked for that HAVE hourly bars
- * @property {Array} missing -- contracts asked for that have none
- * @property {boolean} ok -- nothing for a human to do: no missing, or no session.
- *   DO NOT render this alone: it is green in a total collection blackout, because
- *   `market_traded` is answered by "does any underlying have bars", which fails the
- *   same way the thing it certifies does. Read `witnesses`/`blackout` instead
- * @property {number} witnesses -- contracts actually checked. Zero means the audit
- *   proved nothing, which a boolean cannot say
- * @property {boolean} blackout -- nothing traded anywhere in the 10-day lookback.
- *   Nine US holidays a year do not fall in a ten-day row, so this is a dead poll.
- *   Only an ALARM when `ever_collected` -- read the two together
- * @property {boolean} ever_collected -- any bar ever stored here. A blackout on a
- *   journal that never collected is not a fault, and measured identical without
- *   this: emptying price_bars out of the real journal and a fresh journal produced
- *   byte-identical payloads. Same distinction `Scheduler.ever_ran` draws
  */
 
 /** @typedef {Object} Logbook -- the header dateline (serialize.logbook_data)
@@ -1474,7 +1448,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @payload w:Watch wo:WatchOption wa:Watch wb:Watch
  * @payload mres:MarketFetch wres:WatchWrite qres:QuoteReply wq:Quote
  * @payload ivr:IvRank ir:IvRank
- * @payload sc:Scheduler j:JobRow run:JobRun au:Audit jres:JobReply
+ * @payload sc:Scheduler j:JobRow run:JobRun jres:JobReply
  * @payload lb:Logbook hc:HistoryChunk ins:Install upd:UpdateCheck ures:UpdateReply
  * @payload cn:Collection sres:SettingsWrite pl:Pulse
  * @payload je:JournalEntry jf:JField trg:Trigger jnres:JournalWrite lkres:LinkWrite
@@ -2503,8 +2477,8 @@ function dashboard(){
    and the history import. */
 const DEMO_NO_IBKR='The demo journal is synthetic data and never fetches from IBKR.';
 function collection(){
-  const sc=S.state.scheduler, au=S.state.audit;
-  if(!sc||!au) return '';
+  const sc=S.state.scheduler;
+  if(!sc) return '';
 
   /* THE HEARTBEAT PILL, and its three states are three different situations.
      `ever_ran:false` is NOT an alarm: no scheduler has ever written a heartbeat
@@ -2524,45 +2498,6 @@ function collection(){
         sc.stale_after_s}s, so the loop is not ticking. Jobs are NOT running, no
         matter what the rows below say about their last outcome."
         >scheduler <b class="neg">stale</b> · ${esc(ago(sc.heartbeat_age_s))}</span>`;
-
-  /* THE AUDIT PILL READS `witnesses` AND `blackout`, NEVER `ok`.
-     `ok` is `not market_traded or not missing`, and `market_traded` is answered
-     by "does any underlying have hourly bars for that day" -- an oracle that
-     fails the same way as the thing it certifies. Reproduced on three copies of
-     the real journal: delete every hourly bar, as a fully dead collector would,
-     and `ok` goes GREEN because "no bars for anyone" reads as a holiday. So the
-     page renders what was actually examined. */
-  const audit=!au.ever_collected
-    /* NOT AN ALARM, and this branch has to come first. A journal that has never
-       stored a bar produces a payload byte-identical to one whose collector died
-       -- measured on a copy of the real journal with `price_bars` emptied -- so
-       without `ever_collected` the demo journal, and every journal before its
-       first bars run, showed a red blackout for the absence of something that
-       was never there. Same distinction `ever_ran` draws for the heartbeat. */
-    ? `<span class="pill" title="No price bars have ever been stored in this
-        journal, so there is nothing to audit yet. They are collected by
-        themselves after the first sync. This is not a fault.">bars <b>none collected</b></span>`
-    : au.blackout
-    ? `<span class="pill" title="No underlying traded anywhere in the last ten
-        days, and this journal HAS collected bars before. Nine US market holidays a
-        year do not fall in a ten-day row, so this is not a quiet December -- bar
-        collection has stopped."
-        >bars <b class="neg">blackout</b></span>`
-    : au.witnesses===0
-    ? `<span class="pill" title="The audit examined no contracts, so it proved
-        nothing either way. Not a failure -- there is simply no open option whose
-        intraday series could have been checked."
-        >bars <b>nothing to check</b></span>`
-    : au.missing.length
-    ? `<span class="pill" title="${au.missing.length} of ${plural(au.witnesses,'open contract')}
-        have no hourly bars for ${esc(shortDay(au.day))}. An option's intraday
-        series exists only while its own session runs, so this cannot be
-        backfilled later."
-        >bars <b class="neg">${au.missing.length} missed</b> of ${au.witnesses}</span>`
-    : `<span class="pill" title="${au.witnesses===1?'The open contract has'
-        :`All ${au.witnesses} open contracts have`} hourly bars for ${
-        esc(shortDay(au.day))}, so the session was captured."
-        >bars <b class="pos">${au.witnesses}/${au.witnesses}</b> · ${esc(shortDay(au.day))}</span>`;
 
   /* One row per registered job. `last_status` is rendered as itself rather than
      collapsed to a colour: `nothing` (a legitimately empty run) and `ok` are both
@@ -2606,7 +2541,7 @@ function collection(){
       `What each background job did last. A green status means the last run
        SUCCEEDED, which is a different question from whether anything is running
        at all. The scheduler pill answers the second.`)}</h2>
-    <div class="pills">${beat}${audit}</div>
+    <div class="pills">${beat}</div>
     ${rows}`;
 }
 
