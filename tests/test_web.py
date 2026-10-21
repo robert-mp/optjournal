@@ -6507,26 +6507,21 @@ def test_nulls_sort_last_in_both_directions():
 
     A symbol holding no B-Xtrender has not stored enough sessions to have a
     reading, so it must never top an ascending sort, where it would read as the most
-    extreme value in the column. The null branch therefore returns its verdict
-    BEFORE the direction multiplier is applied -- that ordering is the whole rule,
-    and folding the nulls into the comparison is how they end up first in one
-    direction.
+    extreme value in the column. Ties, the nulls among them, break on the symbol
+    in both directions, so a block has a stable readable order rather than the
+    payload's arrival order.
     """
-    body = _fn("watchSort").replace(" ", "").replace("\n", "")
-    assert "if(va==null||vb==null){" in body, "the null case is no longer separate"
-    assert "returnva==null?1:-1" in body, (
-        "a missing value must sort after a measured one whichever way the column "
-        "is pointing"
-    )
-    nulls = body.index("returnva==null?1:-1")
-    direction = body.index("*(asc?1:-1)")
-    assert nulls < direction, (
-        "the direction multiplier now reaches the null verdict, which puts "
-        "unmeasured rows first in one of the two directions"
-    )
-    # Ties break on the symbol, so the block of nulls has a stable readable order
-    # rather than the payload's arrival order.
-    assert body.count("wa.symbol<wb.symbol?-1:1") == 2
+    rows = [{"symbol": s, "bx_daily": v}
+            for s, v in (("D", 12), ("C", None), ("F", 5), ("A", 5), ("E", None),
+                         ("B", -3))]
+    out = _node_run([
+        "const S={quotes:{}};",
+        *_page_fns("watchSort"),
+        f"const rows={json.dumps(rows)};",
+        "console.log(JSON.stringify(['asc','desc'].map(d=>{S.wsort='bxtrender:'+d;"
+        " return watchSort(rows).map(w=>w.symbol).join('');})));",
+    ])
+    assert out == ["BAFDCE", "DAFBCE"]
 
 
 def test_every_implied_vol_on_the_tab_is_attributed_to_whoever_measured_it():

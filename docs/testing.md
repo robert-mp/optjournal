@@ -4,7 +4,12 @@ The default suite is deterministic. It uses redacted Flex statements committed
 under `tests/fixtures/statements/`, temporary SQLite databases, seeded external
 events and local HTTP servers. A fresh checkout and CI therefore test the same
 data. Private statements under `raw/` are reserved for explicitly named
-acceptance checks and never decide whether the normal suite is green.
+acceptance checks and never decide whether the normal suite is green. Those
+checks read the archive only when asked to:
+
+```bash
+OPTJOURNAL_LIVE=1 uv run pytest -q
+```
 
 Run the quality gate with:
 
@@ -20,6 +25,9 @@ The suite covers four complementary layers:
 - payload-contract guards binding Python serializers to `page.html`;
 - pure frontend modules executed with Node's test runner;
 - rendered-page checks through a local headless browser.
+
+A rendered check skips on a machine with no working browser, and fails in CI
+(where `CI` is set), so a runner that loses its browser cannot go quiet.
 
 The source-text frontend guards are intentional. JavaScript commonly turns a
 misspelled payload key into `undefined` and then into a plausible blank cell;

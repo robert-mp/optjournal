@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 
 import pytest
-from conftest import LIVE_STATEMENTS, connect_migrated
+from conftest import LIVE_STATEMENTS, connect_migrated, needs_live
 
 from optjournal.confirms import (
     CONFIRM_QUERY_TYPE,
@@ -518,7 +518,7 @@ def test_closing_a_lot_from_before_the_records_opens_nothing():
     assert fifo_realized(fills, "3") == pytest.approx(98.0)
 
 
-@pytest.mark.skipif(not LIVE_STATEMENTS, reason="needs the optional live corpus")
+@needs_live
 def test_the_replay_reproduces_every_settled_close_of_the_real_account(tmp_path):
     """The standing check that the estimate follows IBKR's own rule.
 

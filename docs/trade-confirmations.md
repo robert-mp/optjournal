@@ -148,4 +148,5 @@ the last poll of the day is a superset of every earlier one.
 
 Every archive walker globs `activity-*.xml`, so confirms are invisible to the
 statements inventory, `archive.newest_statement` and the ingest -- which is why the
-prefix differs rather than the suffix.
+prefix differs rather than the suffix. The demo's guard is the exception: it reads
+every `*.xml`, because a real confirm is real data it must not write beside.

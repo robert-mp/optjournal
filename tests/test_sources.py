@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
-from conftest import LIVE_STATEMENTS, ROOT, STATEMENTS, connect_migrated
+from conftest import LIVE_STATEMENTS, ROOT, STATEMENTS, connect_migrated, needs_live
 
 from optjournal.db import DEFAULT_BROKER
 from optjournal.fills import NormalisedFill
@@ -88,6 +88,7 @@ def test_missing_execution_ids_do_not_collide(tmp_path, monkeypatch):
     assert all(row["ib_exec_id"] is None for row in rows)
 
 
+@needs_live
 def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
     """Every trade row through the seam equals what py_ibkr-direct ingest wrote.
 
@@ -118,8 +119,6 @@ def test_the_seam_ingests_byte_identically_to_the_direct_read(tmp_path):
     set. Popping each new column instead missed `pnl_estimated` (schema 18), and
     the test failed on live data from then on.
     """
-    if not LIVE_STATEMENTS:
-        pytest.skip("needs the optional live acceptance corpus")
     import hashlib
     import json
 

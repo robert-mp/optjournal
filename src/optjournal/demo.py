@@ -707,7 +707,7 @@ def _holds_real_statement(archive_dir: Path) -> Path | None:
     if not archive_dir.is_dir():
         return None
     needle = f'accountId="{DEMO_ACCOUNT}"'.encode()
-    for path in sorted(archive_dir.glob("activity-*.xml")):
+    for path in sorted(archive_dir.glob("*.xml")):
         try:
             head = path.read_bytes()[:4096]
         except OSError:  # pragma: no cover - unreadable file is not our business

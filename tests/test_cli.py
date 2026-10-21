@@ -226,8 +226,12 @@ def test_friction_scopes_to_the_categories_asked_for(tmp_path, capsys):
     assert (opt["totals"]["attributable"]["base"]
             < both["totals"]["attributable"]["base"])
     # And an unscoped run is the widest of the three.
+    everything = friction()
     assert (both["totals"]["attributable"]["base"]
-            <= friction()["totals"]["attributable"]["base"])
+            <= everything["totals"]["attributable"]["base"])
+    # The spellings `ingest`, `sync` and `serve` take for the same flag.
+    assert friction("OPT,STK") == both
+    assert friction("ALL") == everything
 
 
 @pytest.mark.skipif(not STATEMENTS, reason="needs an archived statement")

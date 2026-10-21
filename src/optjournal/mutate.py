@@ -101,6 +101,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from optjournal.config import DATA_NAMES
+
 __all__ = [
     "MUTANTS",
     "MUTATION_TIMEOUT_RETURN_CODE",
@@ -769,6 +771,10 @@ def _pytest(clone: Path, *args: str) -> subprocess.CompletedProcess[str]:
             stdout=(out or "") + f"\nTIMEOUT after {_SUITE_TIMEOUT_S}s",
             stderr=err or "",
         )
+    except BaseException:
+        # Ctrl-C reaches this process, not the suite in its own session.
+        _kill_process_tree(proc)
+        raise
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
@@ -780,7 +786,13 @@ def _prepare(source: Path, clone: Path) -> None:
     """
     if clone.exists():
         shutil.rmtree(clone)
-    shutil.copytree(source, clone, symlinks=True)
+    journal = shutil.ignore_patterns(*DATA_NAMES, "journal-*.db*")
+    shutil.copytree(
+        source, clone, symlinks=True,
+        # Top level only: that is where a journal sits beside the code, while a
+        # `demo` or `logs` deeper down belongs to a dependency.
+        ignore=lambda d, names: journal(d, names) if Path(d) == source else set(),
+    )
     for cache in clone.rglob("__pycache__"):
         if ".venv" not in cache.parts:
             shutil.rmtree(cache, ignore_errors=True)
@@ -809,59 +821,60 @@ def _imports_the_clone(clone: Path) -> bool:
 def run_mutant(mutant: Mutant, *, source: Path, workdir: Path) -> MutationOutcome:
     """Apply one defect in a fresh clone and report which tests failed."""
     clone = workdir / mutant.key
-    _prepare(source, clone)
+    try:
+        _prepare(source, clone)
 
-    if not _imports_the_clone(clone):
-        return MutationOutcome(mutant, "path-leak",
-                               detail="the clone imported the original tree")
+        if not _imports_the_clone(clone):
+            return MutationOutcome(mutant, "path-leak",
+                                   detail="the clone imported the original tree")
 
-    baseline = _pytest(clone)
-    if baseline.returncode != 0:
-        tail = (baseline.stdout or "").strip().splitlines()[-1:] or [""]
-        return MutationOutcome(mutant, "dirty-baseline", detail=tail[0])
+        baseline = _pytest(clone)
+        if baseline.returncode != 0:
+            tail = (baseline.stdout or "").strip().splitlines()[-1:] or [""]
+            return MutationOutcome(mutant, "dirty-baseline", detail=tail[0])
 
-    target = clone / "src" / "optjournal" / mutant.module
-    text = target.read_text(encoding="utf-8")
-    if mutant.find not in text:
-        return MutationOutcome(mutant, "stale-mutant",
-                               detail=f"pattern not found in {mutant.module}")
-    target.write_text(text.replace(mutant.find, mutant.replace, 1), encoding="utf-8")
+        target = clone / "src" / "optjournal" / mutant.module
+        text = target.read_text(encoding="utf-8")
+        if mutant.find not in text:
+            return MutationOutcome(mutant, "stale-mutant",
+                                   detail=f"pattern not found in {mutant.module}")
+        target.write_text(text.replace(mutant.find, mutant.replace, 1), encoding="utf-8")
 
-    result = _pytest(clone)
-    # A KILLED suite measured NOTHING. Without this, the timeout path in `_pytest`
-    # returns a result whose stdout carries no FAILED line, and the count below is
-    # a truthful zero for an untruthful reason -- reported as `UNCAUGHT`, which
-    # reads as "the suite has no sentinel here" when in fact the sentinel hung.
-    # Found exactly that way: `loopback` makes `serve()` bind instead of raise, the
-    # test then serves forever, and the survey called the security guard untested.
-    # A hang is a MEASUREMENT FAILURE, not a result, so it belongs with the other
-    # untrustworthy statuses that make `optjournal mutate` exit 1.
-    if result.returncode == MUTATION_TIMEOUT_RETURN_CODE:
+        result = _pytest(clone)
+        # A KILLED suite measured NOTHING. Without this, the timeout path in `_pytest`
+        # returns a result whose stdout carries no FAILED line, and the count below is
+        # a truthful zero for an untruthful reason -- reported as `UNCAUGHT`, which
+        # reads as "the suite has no sentinel here" when in fact the sentinel hung.
+        # Found exactly that way: `loopback` makes `serve()` bind instead of raise, the
+        # test then serves forever, and the survey called the security guard untested.
+        # A hang is a MEASUREMENT FAILURE, not a result, so it belongs with the other
+        # untrustworthy statuses that make `optjournal mutate` exit 1.
+        if result.returncode == MUTATION_TIMEOUT_RETURN_CODE:
+            return MutationOutcome(
+                mutant, "hung",
+                detail=f"the suite did not finish within {_SUITE_TIMEOUT_S}s; a test "
+                       f"blocks rather than fails under this defect",
+            )
+        # ERROR as well as FAILED. A defect that breaks a FIXTURE is reported by
+        # pytest as an error, not a failure -- and counting only FAILED reported such
+        # a mutant as caught by NOTHING while a test was in fact catching it, in the
+        # assertion that makes the fixture refuse to build. Found exactly that way:
+        # `broker-stamp` read as uncaught because the two-broker fixture asserts the
+        # second broker's trades landed, so the mutant errored 3 tests instead of
+        # failing them. Undercounting is the dangerous direction here, since the
+        # whole point of a zero is to send someone looking for a missing test.
+        failed = tuple(
+            name
+            for name in (
+                re.sub(r"\s.*$", "", line.split(" ", 1)[1])
+                for line in (result.stdout or "").splitlines()
+                if line.startswith(("FAILED ", "ERROR "))
+            )
+            if name not in _SELF_REFERENTIAL
+        )
+        return MutationOutcome(mutant, "measured", failed=len(failed), tests=failed)
+    finally:
         shutil.rmtree(clone, ignore_errors=True)
-        return MutationOutcome(
-            mutant, "hung",
-            detail=f"the suite did not finish within {_SUITE_TIMEOUT_S}s; a test "
-                   f"blocks rather than fails under this defect",
-        )
-    # ERROR as well as FAILED. A defect that breaks a FIXTURE is reported by
-    # pytest as an error, not a failure -- and counting only FAILED reported such
-    # a mutant as caught by NOTHING while a test was in fact catching it, in the
-    # assertion that makes the fixture refuse to build. Found exactly that way:
-    # `broker-stamp` read as uncaught because the two-broker fixture asserts the
-    # second broker's trades landed, so the mutant errored 3 tests instead of
-    # failing them. Undercounting is the dangerous direction here, since the
-    # whole point of a zero is to send someone looking for a missing test.
-    failed = tuple(
-        name
-        for name in (
-            re.sub(r"\s.*$", "", line.split(" ", 1)[1])
-            for line in (result.stdout or "").splitlines()
-            if line.startswith(("FAILED ", "ERROR "))
-        )
-        if name not in _SELF_REFERENTIAL
-    )
-    shutil.rmtree(clone, ignore_errors=True)
-    return MutationOutcome(mutant, "measured", failed=len(failed), tests=failed)
 
 
 def run_all(

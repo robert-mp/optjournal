@@ -27,6 +27,7 @@ import shutil
 import socket
 import sqlite3
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -45,11 +46,18 @@ STATEMENTS = sorted(RAW_DIR.glob("activity-*.xml"))
 #: The project root, for tests reaching source files rather than data.
 ROOT = Path(__file__).resolve().parent.parent
 
-#: Optional acceptance corpus from the developer's account. Tests that make
-#: claims about specific live rows opt into this explicitly; the normal suite
-#: never changes when another statement is fetched.
-LIVE_RAW_DIR = data_home() / "raw"
-LIVE_STATEMENTS = sorted(LIVE_RAW_DIR.glob("activity-*.xml"))
+#: Optional acceptance corpus from the developer's account, read only when
+#: `OPTJOURNAL_LIVE=1` asks for it. Tests that make claims about specific live
+#: rows opt into this explicitly; the normal suite never reads a private archive,
+#: so it never changes when another statement is fetched.
+LIVE_STATEMENTS = (
+    sorted((data_home() / "raw").glob("activity-*.xml"))
+    if os.environ.get("OPTJOURNAL_LIVE") else []
+)
+
+#: Skip marker for those tests, saying how to opt in.
+needs_live = pytest.mark.skipif(
+    not LIVE_STATEMENTS, reason="needs the live corpus: run with OPTJOURNAL_LIVE=1")
 
 
 def _is_copy() -> bool:
@@ -91,6 +99,18 @@ skip_if_copy = pytest.mark.skipif(
     reason="pins the original checkout's absolute paths; this tree is a copy "
            "(git worktree or mutation clone), where they cannot hold",
 )
+
+
+def no_browser(reason: str) -> NoReturn:
+    """Skip a rendered check where no browser works, except in CI.
+
+    A machine without Chrome is an environment, not a defect, so it skips. A CI
+    runner (GitHub sets `CI`) that lost its browser would turn every rendered
+    check into a skip behind a green build, so there it fails.
+    """
+    if os.environ.get("CI"):
+        pytest.fail(f"{reason}; CI must render the page", pytrace=False)
+    pytest.skip(reason)
 
 
 @pytest.fixture(autouse=True, scope="session")
