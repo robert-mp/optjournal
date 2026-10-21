@@ -222,7 +222,6 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  * @property {string} trade_type
  * @property {string} trade_type_label
  * @property {Stats} stats -- the selected period
- * @property {Stats} all_time
  * @property {Array} positions -- Position rows, newest snapshot
  * @property {Allocation} allocation -- the account by holding (serialize.allocation_data)
  * @property {Portfolio} portfolio -- net liquidation over time against the money put
@@ -252,7 +251,7 @@ import {SIGMA_LABEL, VIX_DIVISOR, expectedMove, ladderRows, parseNumber,
  *   form writes it in (serialize.journal_data)
  * @property {Array} annual -- Stats per year, ignores both filters
  * @property {Array} monthly -- Stats per month, ignores both filters
- * @property {Stats} annual_total -- whole-book total row, deliberately not all_time
+ * @property {Stats} annual_total -- whole-book total row, ignores both filters
  * @property {Object} replays -- Replay by key; rows resolve into it (replay.attach)
  * @property {OdteBlock} odte
  * @property {FxBlock} fx
@@ -4537,9 +4536,9 @@ function annual(){
      by the same summations over a year-wide period rather than a parallel
      aggregation. The total row is `annual_total`, computed independently of the
      years -- so if they ever stop accounting for everything the discrepancy is
-     on screen. Not `all_time`: that one follows the Trade Types filter, which
-     this tab does not show, and using it made the total shrink below the sum
-     of its own rows whenever the filter was on. */
+     on screen. Not the Dashboard's all-time `stats`: that one follows the Trade
+     Types filter, which this tab does not show, and using it made the total
+     shrink below the sum of its own rows whenever the filter was on. */
   let best=yrs[0];
   yrs.forEach(s=>{if(s.net_pnl.base>best.net_pnl.base)best=s;});
   const row=(s,klass)=>statsRow(s,{

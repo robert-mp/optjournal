@@ -770,10 +770,6 @@ def build_state(
                 month_stats(conn, selected, asset_category=view_category,
                             scope=scope, report=view_report)
             ),
-            "all_time": stats_data(
-                month_stats(conn, None, asset_category=view_category,
-                            scope=scope, report=view_report)
-            ),
             "positions": positions_data(conn),
             "allocation": allocation_data(conn),
             # Net liquidation over time against the money put in, for the
@@ -820,7 +816,7 @@ def build_state(
             # while three jobs reported `ok`. 2.95 ms measured on the real
             # journal, against a payload that already issues ~142 statements.
             "audit": audit_data(conn, now=datetime.now(UTC)),
-            # The header's dateline. Deliberately outside `stats`/`all_time`:
+            # The header's dateline. Deliberately outside `stats`:
             # how long the log has been kept is a fact about the JOURNAL, not
             # about a selected month or a trade-type scope, and a header figure
             # that moved with a filter the header does not display is the same
@@ -833,14 +829,11 @@ def build_state(
             "journal": journal_data(conn),
         }
         # How many POSITIONS the open contracts form, which needs the campaign
-        # grouping and so cannot be computed inside month_stats. Set on both
-        # blocks because they share the Stats shape, and it is period-invariant
-        # either way: the open book is the open book whatever month is selected.
-        open_positions = position_count(
+        # grouping and so cannot be computed inside month_stats. Period-invariant:
+        # the open book is the open book whatever month is selected.
+        state["stats"]["open_positions"] = position_count(
             view_campaigns, view_episodes, in_scope=scope.has_episode,
         )
-        for block in ("stats", "all_time"):
-            state[block]["open_positions"] = open_positions
         # The header's open book, over the HOME category's campaigns whatever the
         # trade type, because the dateline is a fact about the journal and shows on
         # tabs the trade type does not reach. Only Equities builds other ones.
@@ -851,14 +844,13 @@ def build_state(
         # The strategy ranking, for the same reason as open_positions: a close is
         # ranked under its card's opening shape, and the cards are built here
         # rather than inside month_stats. Unlike open_positions it IS
-        # period-bound, so each block ranks its own period, over the scope the
+        # period-bound, so it ranks the selected period, over the scope the
         # tiles beside it count.
         shapes = fill_shapes(state["lifecycles"], view_campaigns, view_episodes)
-        for block, period in (("stats", selected), ("all_time", None)):
-            ranking = strategy_ranking(conn, period, shapes=shapes,
-                                       asset_category=view_category, scope=scope)
-            state[block]["best_strategy"] = ranking["best"]
-            state[block]["worst_strategy"] = ranking["worst"]
+        ranking = strategy_ranking(conn, selected, shapes=shapes,
+                                   asset_category=view_category, scope=scope)
+        state["stats"]["best_strategy"] = ranking["best"]
+        state["stats"]["worst_strategy"] = ranking["worst"]
         # Over the same cards the Trades tab draws, so the review and the cards
         # are one reading of one scope.
         state["journal"]["review"] = journal_review(
@@ -881,8 +873,8 @@ def build_state(
                 report=report,
             )
         ]
-        # The Annual table's total row. Deliberately not `all_time`, which is the
-        # Dashboard's figure and therefore scoped: under an active filter the
+        # The Annual table's total row. Deliberately not `stats` at All time, which
+        # is the Dashboard's figure and therefore scoped: under an active filter the
         # year rows stayed whole while that total shrank, so the table stopped
         # adding up -- destroying the one reconciliation it exists to show.
         state["annual_total"] = stats_data(whole)

@@ -689,8 +689,6 @@ def test_the_scope_reaches_the_payload_end_to_end(demo, tmp_path):
     assert sum(y["total_trades"] for y in scoped["annual"]) == (
         scoped["annual_total"]["total_trades"]
     )
-    # all_time, by contrast, is the Dashboard's own figure and does narrow.
-    assert scoped["all_time"]["total_trades"] < everything["all_time"]["total_trades"]
 
 
 # ------------------------------------------------------------- per-fill P&L

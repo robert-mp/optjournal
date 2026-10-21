@@ -431,9 +431,10 @@ def _shape_samples(state: dict, widest: dict) -> dict[str, dict]:
     samples = {
         "State": state,
         "Stats": state["stats"],
-        # all_time rather than the selected month: a single month can hold no
-        # decided position and leave the shape null, which would exempt it.
-        "StrategyRank": state["all_time"]["best_strategy"],
+        # The fixture selects no month, so `stats` spans all time: a single month
+        # can hold no decided position and leave the shape null, which would
+        # exempt it.
+        "StrategyRank": state["stats"]["best_strategy"],
         # Anchors the nested money shape to a real figure, so the Money
         # typedef cannot drift from what the serializer actually sends.
         "Money": state["stats"]["commissions"],
@@ -935,7 +936,7 @@ def test_an_estimated_close_is_flagged_on_its_day_its_event_and_its_card(populat
     st = build_state(db_path=populated, archive_dir=RAW_DIR, query_id=None)
 
     day = str(fill["trade_date"]).replace("-", "")
-    assert [d["day"].replace("-", "") for d in st["all_time"]["days"]
+    assert [d["day"].replace("-", "") for d in st["stats"]["days"]
             if d["pnl_estimated"]] == [day]
 
     def holds(event) -> bool:
@@ -1054,7 +1055,7 @@ def test_options_commission_reconciles_with_the_fills(populated):
         for m in everything["month_range"]
     )
     assert monthly_sum == pytest.approx(billed)
-    assert everything["all_time"]["commissions"]["base"] == pytest.approx(billed)
+    assert everything["stats"]["commissions"]["base"] == pytest.approx(billed)
 
 
 def test_calendar_day_drilldown_is_wired():
@@ -1231,7 +1232,7 @@ def test_a_lifecycle_spans_open_and_close_and_matches_the_dashboard(populated):
     assert any(x["status"] == "open" and x["realized_pnl"] for x in st["lifecycles"]), (
         "precondition: an open card has booked P&L")
     assert sum(x["realized_pnl"]["base"] for x in st["lifecycles"]
-               if x["realized_pnl"]) == pytest.approx(st["all_time"]["net_pnl"]["base"])
+               if x["realized_pnl"]) == pytest.approx(st["stats"]["net_pnl"]["base"])
 
 
 def test_dashboard_headline_counts_closes_for_options():
@@ -3131,8 +3132,7 @@ def test_the_base_currency_is_the_one_the_statement_states(populated):
     assert state["fx"]["base"] == "USD"
     assert "USD" not in [q["code"] for q in state["fx"]["quotes"]]
     labels = {state[block]["base_currency"]
-              for block in ("stats", "all_time", "annual_total", "history",
-                            "broker_costs")}
+              for block in ("stats", "annual_total", "history", "broker_costs")}
     labels |= {row["base_currency"] for row in state["annual"] + state["monthly"]}
     assert labels == {"USD"}
 
@@ -9903,7 +9903,7 @@ def test_the_strategy_ranking_sums_the_same_money_as_the_scoreboard(state, popul
     sum to what Avg P&L per Trade implies, or the Best Strategy tile is ranking
     different money from the tiles beside it. Recomputed, not pinned.
     """
-    at = state["all_time"]
+    at = state["stats"]
     if not at["closes"]:
         pytest.skip("needs closes")
     conn = connect(populated)
@@ -9933,9 +9933,9 @@ def test_every_close_ranks_under_a_shape_and_each_block_ranks_its_own_period(
     """The strategy tiles rank the money the tiles beside them count.
 
     Every closing fill ranks under some card's opening shape, so ranked as one
-    shape a period's closes sum to its Net P&L. And `stats` ranks the selected
-    month while `all_time` ranks everything: a lifetime answer on a one-month
-    dashboard is the defect the first check would not see.
+    shape a period's closes sum to its Net P&L. And a month's `stats` ranks that
+    month, not everything: a lifetime answer on a one-month dashboard is the
+    defect the first check would not see.
     """
     from optjournal.stats import month_stats, strategy_ranking
     from optjournal.strategies import fill_shapes
@@ -9968,7 +9968,7 @@ def test_every_close_ranks_under_a_shape_and_each_block_ranks_its_own_period(
                          month=quiet)["stats"]
     ranked = [r for r in (picked["best_strategy"], picked["worst_strategy"]) if r]
     assert ranked and sum(r["decided"] for r in ranked) <= closes[quiet] \
-        < state["all_time"]["closes"]
+        < state["stats"]["closes"]
 
 
 def _at_rules(width: int, kind: str = "media") -> list[tuple[str, str]]:
