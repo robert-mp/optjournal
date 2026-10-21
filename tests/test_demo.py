@@ -14,15 +14,15 @@ generator surfaces here rather than quietly weakening every test that uses it.
 
 from __future__ import annotations
 
-import shutil
 import sys
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from conftest import LIVE_RAW_DIR, add_statement, connect_migrated
+from conftest import STATEMENTS, add_statement, connect_migrated
 
 from optjournal.demo import (
+    DEMO_ACCOUNT,
     FROM_DATE,
     TO_DATE,
     assert_not_real,
@@ -123,25 +123,28 @@ def test_refuses_to_touch_real_data_wherever_it_sits(tmp_path):
     location-dependent, so the suite failed when run from a copied tree because
     the "real" archive was no longer at the path it compared against.
 
-    Built from the real archive rather than a fixture, because the property under
-    test is "recognises real data", and only real data proves it.
+    Real means stated for any account but the demo's, so the tracked fixture
+    with its account changed is real as far as the guard can tell. A confirm is
+    real data too, under its own name.
     """
-    real_statements = sorted(LIVE_RAW_DIR.glob("activity-*.xml"))
-    if not real_statements:
-        pytest.skip("needs an archived statement")
+    tracked = STATEMENTS[0]
+    real = tracked.read_bytes().replace(
+        f'accountId="{DEMO_ACCOUNT}"'.encode(), b'accountId="U1234567"')
+    assert real != tracked.read_bytes()
 
-    # A COPY of a real statement, at a path the old check had never heard of.
-    elsewhere = tmp_path / "somewhere-else"
-    elsewhere.mkdir()
-    shutil.copy(real_statements[0], elsewhere)
-    with pytest.raises(ValueError, match="real statement"):
-        assert_not_real(elsewhere)
+    # Each at a path the old check had never heard of.
+    statement = tmp_path / "somewhere-else" / tracked.name
+    confirm = tmp_path / "confirms-only" / "confirm-20260227T150000Z.xml"
+    for path in (statement, confirm):
+        path.parent.mkdir()
+        path.write_bytes(real)
+        with pytest.raises(ValueError, match="real statement"):
+            assert_not_real(path.parent)
 
-    # A database holding that statement, likewise. Ingested from the copy rather
-    # than copied from the live journal, which no test may read.
+    # A database holding that statement, likewise.
     db_copy = tmp_path / "restored.db"
     conn = connect_migrated(db_copy)
-    ingest_file(conn, elsewhere / real_statements[0].name)
+    ingest_file(conn, statement)
     conn.close()
     with pytest.raises(ValueError, match="real account"):
         assert_not_real(tmp_path / "fresh", db_copy)
