@@ -308,10 +308,18 @@ def test_reingest_overrides_digest_dedupe(conn, tmp_path):
     assert result.duplicate_of is None
 
 
-@pytest.mark.skipif(len(STATEMENTS) < 2, reason="needs two distinct statements")
-def test_distinct_statements_are_not_treated_as_duplicates(conn):
-    """Guard against the dedupe being too eager and swallowing real data."""
-    for path in STATEMENTS[:2]:
+def test_distinct_statements_are_not_treated_as_duplicates(conn, tmp_path):
+    """Guard against the dedupe being too eager and swallowing real data.
+
+    The second is the same period generated an hour later, which is what a
+    second fetch is: different bytes, so a different statement.
+    """
+    original = STATEMENTS[0]
+    later = tmp_path / "activity-demo-20260227T070000Z.xml"
+    later.write_bytes(original.read_bytes().replace(
+        b'whenGenerated="20260227;060000"', b'whenGenerated="20260227;070000"'))
+    assert later.read_bytes() != original.read_bytes()
+    for path in (original, later):
         result = ingest_file(conn, path, assets=ASSET_FILTER_ALL)
         assert result.duplicate_of is None
     rows = conn.execute("SELECT COUNT(*) AS n FROM statements").fetchone()["n"]
