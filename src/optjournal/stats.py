@@ -800,8 +800,11 @@ def month_stats(
     # Premium is cash received or paid in the contract's own currency, so it
     # takes the same treatment as commission: exact when one currency accounts
     # for the whole figure, withheld when they are mixed.
+    # Proceeds are gross and IBKR's realised P&L is net of commission, so the
+    # commission comes off too, leaving the open lots' premium net of their own.
     stats.open_premium = Money.charged(
-        (e.proceeds_base - e.realized_pnl_base, e.proceeds - e.realized_pnl, e.currency)
+        (e.proceeds_base + e.commission_base - e.realized_pnl_base,
+         e.proceeds + e.commission - e.realized_pnl, e.currency)
         for e in report.open if scope.has_episode(e)
     )
     closes = list(closing.values())

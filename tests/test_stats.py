@@ -989,8 +989,22 @@ def test_a_partial_close_counts_on_its_card_its_event_and_its_day(conn):
         "2026-09-24": 0.0, "2026-09-28": 195.0, "2026-09-30": 90.0}
     assert _realised(september.net_pnl.payload()) == 285.0
     assert (september.closes, september.wins, september.losses) == (2, 2, 0)
-    assert _realised(september.open_premium.payload()) == 260.0, (
-        "the far contract's 350 of premium less the 90 already in net P&L")
+    assert _realised(september.open_premium.payload()) == 258.0, (
+        "the far contract's 350 of premium less its 2 of commission and the 90 "
+        "already in net P&L")
+
+
+def test_open_premium_is_the_open_put_net_of_its_own_commission(conn):
+    """Sell 2 puts at 2.50 and buy 1 back at 1.50, a dollar of commission a fill:
+    IBKR realises 98.50, which already holds the closing dollar and half the
+    opening one. The put still open was sold for 250, 249.50 after its half."""
+    _leg(conn, conid="1", order_id="1001", at="2026-09-02 10:00:00", qty=-2,
+         proceeds=500.0, pnl=None)
+    _leg(conn, conid="1", order_id="1002", at="2026-09-03 10:00:00", qty=1,
+         proceeds=-150.0, pnl=98.5)
+    s = month_stats(conn, "2026-09")
+    assert _realised(s.net_pnl.payload()) == 98.5, "the control"
+    assert s.open_premium.payload() == {"base": 249.5, "native": 249.5, "ccy": "USD"}
 
 
 def test_a_close_that_nets_zero_is_neither_a_win_nor_a_loss(conn):
