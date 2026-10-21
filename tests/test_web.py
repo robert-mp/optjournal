@@ -10487,12 +10487,10 @@ def test_a_refresh_asks_for_an_earnings_date_once_a_day(populated, monkeypatch):
         _, second = _get(base, "/api/quotes")
     assert asked_first == [], "the add just asked; a refresh must not ask again"
     assert (first["earnings_asked"], second["earnings_asked"]) == (0, 0)
-    assert first["earnings_failed"] == []
 
 
-def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, monkeypatch):
-    """A dead endpoint costs one request per symbol per day, not one per refresh,
-    and the page is told which symbols it could not refresh."""
+def test_a_failed_earnings_fetch_is_not_retried_all_day(populated, monkeypatch):
+    """A dead endpoint costs one request per symbol per day, not one per refresh."""
     from optjournal import earnings  # noqa: PLC0415 - local to this test
 
     calls: list[str] = []
@@ -10506,9 +10504,8 @@ def test_a_failed_earnings_fetch_is_reported_and_not_retried_all_day(populated, 
     with web.serve_ephemeral(db_path=populated, archive_dir=RAW_DIR) as base:
         _post(base, "/api/watchlist", {"symbol": "zzzq"})
         assert calls == ["ZZZQ"], "the add asked and the fetch failed"
-        _, reply = _get(base, "/api/quotes")
+        _get(base, "/api/quotes")
     assert calls == ["ZZZQ"], "a failure is stamped, so the day's budget is spent"
-    assert reply["earnings_failed"] == []
 
 
 def _watching(tmp_path, *symbols: str) -> Path:
@@ -10611,7 +10608,7 @@ def _offline_quotes(monkeypatch) -> None:
 def test_a_nasdaq_error_reply_keeps_the_stored_earnings_date(tmp_path, monkeypatch):
     """L8: a throttled Nasdaq reply (HTTP 200, `rCode` 429, no data) used to parse
     as "no earnings" and wipe the stored date for a day. It is a failure now, so
-    the refresh names the symbol and the date on screen stays."""
+    the date on screen stays."""
     from optjournal import earnings  # noqa: PLC0415 - local to this test
 
     db = tmp_path / "j.db"
@@ -10620,8 +10617,8 @@ def test_a_nasdaq_error_reply_keeps_the_stored_earnings_date(tmp_path, monkeypat
     monkeypatch.setattr(earnings, "fetch_earnings", lambda symbol, **_: (
         earnings.parse_earnings({"data": None, "status": {"rCode": 429}})))
     with web.serve_ephemeral(db_path=db, archive_dir=tmp_path / "raw") as base:
-        status, reply = _get(base, "/api/quotes")
-    assert (status, reply["earnings_failed"]) == (200, ["AMD"])
+        status, _ = _get(base, "/api/quotes")
+    assert status == 200
     with open_journal(db) as conn:
         row = conn.execute(
             "SELECT earnings_next, earnings_confirmed, earnings_timing"
@@ -10659,11 +10656,11 @@ def test_the_earnings_refresh_holds_no_write_lock_while_it_asks_nasdaq(tmp_path,
 
     monkeypatch.setattr(earnings, "fetch_earnings", fetch)
     with open_journal(db) as conn:
-        failed, asked = web._refresh_earnings(conn, ["AAA", "BBB", "CCC"])
+        asked = web._refresh_earnings(conn, ["AAA", "BBB", "CCC"])
         rows = {r["symbol"]: (r["earnings_next"], bool(r["earnings_checked_at"]))
                 for r in conn.execute("SELECT * FROM watchlist")}
     assert blocked == [], f"a fetch ran while the journal was write-locked: {blocked}"
-    assert (failed, asked) == (["BBB"], 3)
+    assert asked == 3
     assert rows == {"AAA": ("2026-10-28", True), "BBB": (None, True),
                     "CCC": ("2026-10-28", True)}
 
@@ -10671,7 +10668,7 @@ def test_the_earnings_refresh_holds_no_write_lock_while_it_asks_nasdaq(tmp_path,
 def test_the_earnings_refresh_asks_nasdaq_for_its_symbols_side_by_side(tmp_path, monkeypatch):
     """Nasdaq takes 2 to 3 s a symbol, 15 s when it hangs, and the quotes wait on
     these dates: a pool's width of symbols is in flight at once, with the same
-    answers and the same failures, in order, as one after another."""
+    answers and the same failures as one after another."""
     import threading  # noqa: PLC0415 - local to this test
 
     from optjournal import earnings  # noqa: PLC0415 - local to this test
@@ -10680,8 +10677,8 @@ def test_the_earnings_refresh_asks_nasdaq_for_its_symbols_side_by_side(tmp_path,
     db = tmp_path / "j.db"
     with open_journal(db) as conn:
         for symbol in symbols:
-            conn.execute("INSERT INTO watchlist (symbol, added_at)"
-                         " VALUES (?, '2026-01-01')", (symbol,))
+            conn.execute("INSERT INTO watchlist (symbol, added_at, earnings_next)"
+                         " VALUES (?, '2026-01-01', '2026-01-15')", (symbol,))
         conn.commit()
     together = threading.Barrier(len(symbols), timeout=2)
     alone: list[str] = []
@@ -10697,12 +10694,13 @@ def test_the_earnings_refresh_asks_nasdaq_for_its_symbols_side_by_side(tmp_path,
 
     monkeypatch.setattr(earnings, "fetch_earnings", fetch)
     with open_journal(db) as conn:
-        failed, asked = web._refresh_earnings(conn, symbols)
+        asked = web._refresh_earnings(conn, symbols)
         rows = {r["symbol"]: (r["earnings_next"], bool(r["earnings_checked_at"]))
                 for r in conn.execute("SELECT * FROM watchlist")}
     assert alone == [], "the symbols were asked one after another"
-    assert (failed, asked) == (["S2", "S5"], len(symbols))
-    assert rows == {s: (None if s in ("S2", "S5") else "2026-10-28", True) for s in symbols}
+    assert asked == len(symbols)
+    assert rows == {s: ("2026-01-15" if s in ("S2", "S5") else "2026-10-28", True)
+                    for s in symbols}
 
 
 def test_each_job_row_says_how_many_requests_one_run_spends():

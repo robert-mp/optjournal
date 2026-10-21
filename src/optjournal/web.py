@@ -314,15 +314,14 @@ EARNINGS_MAX_AGE_S = 20 * 3600
 
 
 def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
-                      force: bool = False) -> tuple[list[str], int]:
+                      force: bool = False) -> int:
     """Fetch the next earnings date for symbols whose stored one is stale.
 
-    Returns the symbols whose fetch FAILED, so the reply can say so, and how
-    many were asked, so the page knows whether its payload is now stale; a symbol
-    with no earnings (a fund) is an answer and is stored as none, while a failed
-    fetch keeps the stored date. Every asked symbol is stamped, success or not,
-    so a dead endpoint costs one request per symbol per day rather than one per
-    refresh.
+    Returns how many were asked, so the page knows whether its payload is now
+    stale. A symbol with no earnings (a fund) is an answer and is stored as
+    none, while a failed fetch keeps the stored date. Every asked symbol is
+    stamped, success or not, so a dead endpoint costs one request per symbol per
+    day rather than one per refresh.
 
     EVERY FETCH FIRST, THEN EVERY WRITE in one short transaction. A fetch can
     take up to `earnings._TIMEOUT_S`, and writing after each one held the
@@ -347,7 +346,6 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
             if age < EARNINGS_MAX_AGE_S:
                 continue
         due.append(symbol)
-    failed: list[str] = []
     found: dict[str, earnings_mod.Earnings | None] = {}
     # Side by side: Nasdaq takes seconds a symbol, and the quotes wait on these.
     with ThreadPoolExecutor(max_workers=QUOTE_WORKERS) as pool:
@@ -357,7 +355,6 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
             found[symbol] = asked[symbol].result()
         except earnings_mod.EarningsFetchError as exc:
             log.debug("earnings %s failed: %s", symbol, exc)
-            failed.append(symbol)
     for symbol in due:
         if symbol not in found:
             conn.execute("UPDATE watchlist SET earnings_checked_at = ? WHERE symbol = ?",
@@ -373,7 +370,7 @@ def _refresh_earnings(conn: sqlite3.Connection, symbols: list[str], *,
              stamp, symbol),
         )
     conn.commit()
-    return failed, len(due)
+    return len(due)
 
 
 def _inverted_alert(conn: sqlite3.Connection, symbol: str,
@@ -1434,7 +1431,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "SELECT symbol FROM watchlist ORDER BY symbol")]
             # Earnings ride along, but only for dates over a day old: one request
             # per symbol per day, whatever the quote cadence.
-            earnings_failed, earnings_asked = _refresh_earnings(conn, symbols)
+            earnings_asked = _refresh_earnings(conn, symbols)
         with ThreadPoolExecutor(max_workers=QUOTE_WORKERS) as pool:
             asked = {symbol: pool.submit(fetch_quote, symbol) for symbol in symbols}
             ranked = _iv_ranks(symbols, held=self.cfg.iv_ranks, pool=pool)
@@ -1465,9 +1462,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             "ok": True,
             "quotes": quotes,
             "failed": failed,
-            #: Symbols whose earnings date could not be refreshed; the stored one
-            #: stands and the page says so.
-            "earnings_failed": earnings_failed,
             #: How many earnings dates were re-asked; nonzero means the state
             #: payload's dates may have moved, so the page reloads it.
             "earnings_asked": earnings_asked,
