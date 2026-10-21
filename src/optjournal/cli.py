@@ -185,7 +185,7 @@ def cmd_fetch(args) -> int:
         # A command line waits its turn behind another fetch rather than giving up.
         lock_timeout_s=FETCH_LOCK_TIMEOUT_S,
     )
-    data = summary_data(result.response, result.raw_path)
+    data = summary_data(load(result.raw_path), result.raw_path)
     data["raw_path"] = str(result.raw_path)
     data["raw_bytes"] = result.raw_bytes
     header = f"{result.raw_bytes:,} bytes -> {result.raw_path}"

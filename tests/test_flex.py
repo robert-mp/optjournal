@@ -485,7 +485,7 @@ def test_the_real_client_is_the_one_with_the_timeout():
         f"the fetch path builds {flex._client_factory!r}, which is not the client "
         "that carries a socket timeout"
     )
-    body = inspect.getsource(flex._fetch_locked)
+    body = inspect.getsource(flex._download)
     assert "_client_factory(" in body, (
         "the fetch path no longer goes through the one stubbable seam, so a test "
         "that stubs the network can silently miss and make real requests"
@@ -748,14 +748,15 @@ def _serve(monkeypatch, body: bytes) -> None:
         "C", (), {"download": lambda self, *a, **k: body})())
 
 
-@pytest.mark.parametrize("body", [
-    b"<html><body>Scheduled maintenance</body></html>\n",
-    b"",
-    b'<FlexQueryResponse queryName="q" type="AF"><FlexStatements count="1">',
-    _NO_STATEMENTS,
+@pytest.mark.parametrize(("body", "raised"), [
+    (b"<html><body>Scheduled maintenance</body></html>\n", flex.StatementUnreadable),
+    (b"", flex.FlexUnreachable),
+    (b'<FlexQueryResponse queryName="q" type="AF"><FlexStatements count="1">',
+     flex.FlexUnreachable),
+    (_NO_STATEMENTS, flex.StatementUnreadable),
 ], ids=["html", "empty", "truncated", "no-statements"])
 def test_a_body_that_is_not_a_statement_is_neither_archived_nor_stamped(
-    tmp_path, monkeypatch, body,
+    tmp_path, monkeypatch, body, raised,
 ):
     """M6: an HTML maintenance page used to become `activity-*.xml`.
 
@@ -764,10 +765,55 @@ def test_a_body_that_is_not_a_statement_is_neither_archived_nor_stamped(
     request that had produced nothing.
     """
     _serve(monkeypatch, body)
-    with pytest.raises(flex.StatementUnreadable):
+    with pytest.raises(raised):
         flex.fetch("1591754", archive_dir=tmp_path, force=True)
     assert not list(tmp_path.glob("activity-*.xml"))
     assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+
+
+#: IBKR's page while the Flex service is down: HTML, and not well-formed XML.
+_MAINTENANCE = (b"<!DOCTYPE html><html><head><meta charset=utf-8><title>Maintenance"
+                b"</title></head><body>Scheduled maintenance</body></html>")
+
+
+class _MaintenanceClient(flex._TimeoutFlexClient):
+    """py_ibkr's own two-stage download, with IBKR answering every request with
+    the maintenance page."""
+
+    def _get(self, url: str) -> bytes:
+        return _MAINTENANCE
+
+
+@pytest.mark.parametrize("entry", [flex.fetch, flex.fetch_confirms],
+                         ids=["fetch", "fetch_confirms"])
+def test_a_maintenance_page_instead_of_a_flex_reply_is_unreachable_try_later(
+    tmp_path, monkeypatch, entry,
+):
+    """IBKR down for maintenance is IBKR failing on its side, which clears by
+    itself: the error every caller reads as "try again later", nothing archived
+    and no cooldown started."""
+    monkeypatch.setattr(flex, "read_token", lambda account=None: "tok")
+    monkeypatch.setattr(flex, "_client_factory", _MaintenanceClient)
+    with pytest.raises(flex.FlexUnreachable, match="not XML"):
+        entry("1591754", archive_dir=tmp_path, force=True)
+    assert not list(tmp_path.glob("*.xml"))
+    assert flex.cooldown_remaining(tmp_path, "1591754") == 0
+
+
+def test_a_statement_py_ibkr_cannot_parse_is_archived_and_named_unreadable(
+    tmp_path, monkeypatch,
+):
+    """The request is spent once the body is in, so the body is kept: a statement
+    the parser cannot read yet is re-read from disk once it can. Reading it is the
+    ingest's job, which names the file rather than raising the parser's error."""
+    whole = STATEMENTS_FIRST.read_bytes()
+    multi = whole.replace(b'dateTime="20250114;143005"', b'dateTime="MULTI"', 1)
+    assert multi != whole
+    _serve(monkeypatch, multi)
+    result = flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert result.raw_path.read_bytes() == multi
+    with pytest.raises(flex.StatementUnreadable, match="could not be parsed"):
+        flex.load(result.raw_path)
 
 
 def test_a_statement_stating_no_base_currency_is_neither_archived_nor_stamped(
