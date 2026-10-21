@@ -51,7 +51,6 @@ from optjournal.sync import import_history, newest_statement_end, sync_journal
 
 __all__ = [
     "JOBS",
-    "KNOWN_JOBS",
     "RUN_HISTORY",
     "Catchup",
     "Context",
@@ -77,19 +76,6 @@ log = logging.getLogger(__name__)
 #: of a session (confirm) without the table growing forever. The newest row for a
 #: given `fired_for` is never pruned -- see `prune_runs`.
 RUN_HISTORY = 200
-
-#: The job names the ledger accepts, matching the MeshClaw registrations they
-#: stand in for today, plus `market` -- which has NEVER been registered (verified:
-#: `grep -c optjournal-market ~/.meshclaw/crons.json` is 0), so 143 lines of
-#: tested calendar policy have never run on a schedule. Naming it here is the first
-#: step of "exists" and "registered" becoming one fact in step 5.
-#:
-#: A CHECKED SET rather than free text, because a typo'd job name is invisible: it
-#: would write rows nothing reads and leave the real job looking as if it never ran
-#: -- the exact failure this ledger exists to make visible.
-KNOWN_JOBS = frozenset({
-    "sync", "confirm", "bars_daily", "market", "history",
-})
 
 #: Statuses a run may end in. `running` is written BEFORE the work starts (step 5),
 #: so a killed process leaves evidence rather than an unclaimed slot.
@@ -127,8 +113,11 @@ def record_run(
     plus one UPSERT against a table with no foreign keys, and the heartbeat in
     `job_state` is what a reader checks to see whether anything is recording at all.
     """
-    if job not in KNOWN_JOBS:
-        raise ValueError(f"unknown job {job!r}; expected one of {sorted(KNOWN_JOBS)}")
+    # Checked rather than free text: a typo'd name would write rows nothing reads
+    # and leave the real job looking as if it never ran.
+    names = {spec.name for spec in JOBS}
+    if job not in names:
+        raise ValueError(f"unknown job {job!r}; expected one of {sorted(names)}")
     if status not in _STATUSES:
         raise ValueError(f"unknown status {status!r}; expected one of {sorted(_STATUSES)}")
 
@@ -264,9 +253,6 @@ class Catchup(enum.Enum):
     #: Not a wall-clock fire at all -- due while inside a window and the last
     #: success is old enough. `confirm` only, see its Job below.
     WINDOW = "window"
-    #: A missed instant is simply missed. With no `weekdays` there is no instant
-    #: to miss: the job runs only when asked.
-    NONE = "none"
     #: Not a schedule: due until one run completes, once the journal holds a
     #: statement, with `ONCE_RETRY_S` between attempts (`history`).
     ONCE = "once"
@@ -1265,8 +1251,6 @@ def due_jobs(
         if job.name not in ever_ran and (since is None or stamp < since):
             # See the docstring: a journal with no history is UNKNOWN, not behind,
             # so only an instant this process watched arrive may run.
-            continue
-        if job.catchup is Catchup.NONE:
             continue
         behind = int(now.timestamp()) - stamp
         if behind > job.window_s:

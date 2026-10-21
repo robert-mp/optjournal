@@ -20,7 +20,7 @@ from datetime import timedelta
 import pytest
 from conftest import connect_migrated
 
-from optjournal.jobs import KNOWN_JOBS, RUN_HISTORY, prune_runs, record_run
+from optjournal.jobs import RUN_HISTORY, prune_runs, record_run
 
 
 @pytest.fixture()
@@ -118,7 +118,7 @@ def test_an_unknown_status_is_refused(conn):
 
 
 def test_the_known_jobs_include_the_one_that_never_ran(conn):
-    """`market` is in the set even though MeshClaw never registered it.
+    """`market` is accepted even though MeshClaw never registered it.
 
     Verified: `grep -c optjournal-market ~/.meshclaw/crons.json` is 0, so 143 lines
     of tested, documented calendar policy have never run on a schedule -- and
@@ -126,7 +126,6 @@ def test_the_known_jobs_include_the_one_that_never_ran(conn):
     depends on. Naming it here is the first step of "exists" and "registered"
     becoming one fact.
     """
-    assert "market" in KNOWN_JOBS
     record_run(conn, "market", status="ok", detail="99 fetched, 99 stored")
     assert conn.execute(
         "SELECT job FROM job_state").fetchone()["job"] == "market"
@@ -223,21 +222,6 @@ def test_prune_is_safe_on_a_job_with_no_runs(conn):
 # ---------------------------------------------------------------------------
 
 
-def test_the_registry_holds_every_job_the_ledger_accepts():
-    """`KNOWN_JOBS` and `JOBS` must name the same four things.
-
-    Two containers for one registry is how "exists" and "registered" drift apart
-    again -- a name in the ledger's set with no Job is a status nothing can ever
-    write, and a Job whose name the ledger refuses raises at the end of a run that
-    already did its work.
-    """
-    from optjournal.jobs import JOBS
-
-    assert {job.name for job in JOBS} == set(KNOWN_JOBS), (
-        "the registry and the ledger's accepted set disagree"
-    )
-
-
 def test_the_calendar_job_is_registered_here_because_it_never_was_anywhere_else():
     """`market` exists in code for the first time.
 
@@ -291,9 +275,7 @@ def test_the_live_poll_is_a_window_and_the_rest_are_wall_clock():
         "session time, and is the last success stale' rather than claiming a "
         "wall-clock minute"
     )
-    # And no job is NONE, which silently drops a missed instant; `history` has no
-    # instants at all, and runs ONCE by itself after the first sync.
-    assert [j.name for j in JOBS if j.catchup is Catchup.NONE] == []
+    # `history` has no instants at all, and runs ONCE by itself after the first sync.
     assert [j.name for j in JOBS if j.catchup is Catchup.ONCE] == ["history"]
 
 

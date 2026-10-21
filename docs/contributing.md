@@ -124,11 +124,10 @@ It is 690 occurrences, so it waits for a real second broker — see PLAN.md's "t
 the commit-by-commit order.
 
 **A new scheduled job**: a `Job` in `jobs.JOBS` (its run function, its schedule
-and catch-up rule, and whether it spends an IBKR request), its name in
-`KNOWN_JOBS`, and cases in `tests/test_jobs.py`, which hold the two lists to each
-other. Keep the run function thin. The work belongs in a module the CLI already
-calls, and the job only turns its result or its typed exception into a ledger
-status.
+and catch-up rule, and whether it spends an IBKR request) and cases in
+`tests/test_jobs.py`. Keep the run function thin. The work belongs in a module the
+CLI already calls, and the job only turns its result or its typed exception into a
+ledger status.
 
 ## Data safety
 
