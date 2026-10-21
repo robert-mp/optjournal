@@ -50,7 +50,6 @@ from optjournal.events import (
     DEFAULT_IMPACTS,
     IMPACT_ORDER,
     SOURCE,
-    default_scope,
     upcoming,
 )
 from optjournal.history import (
@@ -292,14 +291,13 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     for cat, key in (("STK", "stock"), ("OPT", "options")):
         for r in conn.execute(
             "SELECT COALESCE(underlying_symbol, symbol) AS holding,"
-            " SUM(position_value * fx_rate_to_base) AS value, COUNT(*) AS n"
+            " SUM(position_value * fx_rate_to_base) AS value"
             f" FROM position_snapshots p{book_join_sql(cat)}"
             " WHERE asset_category = ? GROUP BY 1", (cat,),
         ):
             row = holdings.setdefault(r["holding"], {
-                "holding": r["holding"], "stock": 0.0, "options": 0.0, "lines": 0})
+                "holding": r["holding"], "stock": 0.0, "options": 0.0})
             row[key] += r["value"] or 0.0
-            row["lines"] += r["n"]
         day = book_date(conn, cat)
         if day:
             dates.append(day)
@@ -308,7 +306,7 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     # share of a total that includes them. Per account, like the holdings above,
     # so an account whose statements lag still counts.
     navs = conn.execute(
-        "SELECT total_base, cash_base, report_date FROM equity_summaries e"
+        "SELECT total_base, cash_base FROM equity_summaries e"
         " WHERE report_date = (SELECT MAX(report_date) FROM equity_summaries"
         "  WHERE broker = e.broker AND account_id = e.account_id)"
     ).fetchall()
@@ -328,7 +326,6 @@ def allocation_data(conn: sqlite3.Connection) -> Row:
     return {
         "as_of": as_of,
         "nav": total,
-        "nav_date": max(str(n["report_date"]) for n in navs) if navs else None,
         "cash": cash,
         "cash_share": share(cash),
         "rows": rows,
@@ -793,11 +790,6 @@ def market_data(
         "zone": str(MARKET_TZ),
         "countries": countries,
         "impacts": impacts,
-        #: What the DEFAULT view narrows to, in words, so the page can say it
-        #: rather than assembling the sentence from the two lists itself. From
-        #: `events.default_scope` so the CLI and the page cannot describe the
-        #: default differently -- the drift that shipped once already.
-        "default_scope": default_scope(),
         "total_events": len(events),
         #: How many rows the DEFAULT filter shows, so the page can report what
         #: resetting would cost without recomputing the server's own defaults.
@@ -983,7 +975,6 @@ def odte_context_data(conn: sqlite3.Connection, *, now: datetime) -> Row | None:
         "spx_date": et_day(spx_ts),
         "vix": vix_close,
         "vix_date": et_day(vix_ts),
-        "spx_fetched_at": spx_at.isoformat() if spx_at else None,
         "vix_fetched_at": vix_at.isoformat() if vix_at else None,
         "live": live,
         "fresh": not problems,
@@ -1377,7 +1368,7 @@ def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
     Reads only. Writing is the runner's job; this is what the page renders.
     """
     rows = [dict(r) for r in conn.execute(
-        "SELECT job, last_fired_for, last_status, consecutive_failures,"
+        "SELECT job, last_status, consecutive_failures,"
         " heartbeat_at FROM job_state ORDER BY job")]
 
     latest: dict[str, Row] = {}
@@ -1409,7 +1400,6 @@ def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
         jobs.append({
             "job": spec.name,
             "last_status": None if state is None else state["last_status"],
-            "last_fired_for": None if state is None else state["last_fired_for"],
             "consecutive_failures": (
                 0 if state is None else (state["consecutive_failures"] or 0)),
             #: Past `jobs.FAILURE_BACKOFF`: the reconciler has stopped the fast
@@ -1433,7 +1423,6 @@ def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
         jobs.append({
             "job": name,
             "last_status": state["last_status"],
-            "last_fired_for": state["last_fired_for"],
             "consecutive_failures": state["consecutive_failures"] or 0,
             #: Unregistered, so nothing schedules it either way.
             "backed_off": False,
@@ -1454,7 +1443,6 @@ def jobs_data(conn: sqlite3.Connection, *, now: datetime) -> Row:
     age = None if beat is None else int(now.timestamp()) - int(beat)
     return {
         "jobs": jobs,
-        "heartbeat_at": beat,
         "heartbeat_age_s": age,
         "running": age is not None and age <= HEARTBEAT_STALE_S,
         #: None when no scheduler has ever written a heartbeat. The page says

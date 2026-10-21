@@ -525,7 +525,7 @@ def test_a_replay_card_seeks_to_the_frame_that_reveals_its_fill(replayed, tmp_pa
         pytest.skip("no browser produced a DOM (environment, not the page)")
     markup = browser.markup(dom)
     page = sweep.Page(tab="trades", ccy=None, kind=None, calday=None, replay=key,
-                      dom=dom, markup=markup, text=browser.rendered_text(dom),
+                      markup=markup, text=browser.rendered_text(dom),
                       payload=payload)
     verdict = sweep.check_replay_renders_from_url(page)
     assert verdict.status == sweep.PASS, verdict.detail

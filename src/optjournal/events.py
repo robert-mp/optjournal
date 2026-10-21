@@ -100,10 +100,9 @@ DEFAULT_IMPACTS = ("High", "Medium")
 def default_scope() -> str:
     """The default filter in words, for whoever is about to label it.
 
-    Here rather than in each caller because the CLI and the web view both name
-    this slice, and the CLI's copy had already drifted -- it printed "USD
-    high-impact" while `DEFAULT_IMPACTS` held two grades. A label that narrates a
-    filter it does not apply is worse than no label, so there is one of these.
+    Here, beside the constants, because the CLI's own copy had drifted -- it
+    printed "USD high-impact" while `DEFAULT_IMPACTS` held two grades. A label
+    that narrates a filter it does not apply is worse than no label.
 
     Countries are comma-separated: space-separated, "USD All high-impact" reads as
     a currency called "USD All" rather than as two choices, and `All` really is a
