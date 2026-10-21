@@ -27,6 +27,7 @@ import shutil
 import socket
 import sqlite3
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -98,6 +99,18 @@ skip_if_copy = pytest.mark.skipif(
     reason="pins the original checkout's absolute paths; this tree is a copy "
            "(git worktree or mutation clone), where they cannot hold",
 )
+
+
+def no_browser(reason: str) -> NoReturn:
+    """Skip a rendered check where no browser works, except in CI.
+
+    A machine without Chrome is an environment, not a defect, so it skips. A CI
+    runner (GitHub sets `CI`) that lost its browser would turn every rendered
+    check into a skip behind a green build, so there it fails.
+    """
+    if os.environ.get("CI"):
+        pytest.fail(f"{reason}; CI must render the page", pytrace=False)
+    pytest.skip(reason)
 
 
 @pytest.fixture(autouse=True, scope="session")

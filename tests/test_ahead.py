@@ -22,7 +22,7 @@ import urllib.request
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from conftest import ROOT, connect_migrated
+from conftest import ROOT, connect_migrated, no_browser
 
 from optjournal import ahead, jobs
 from optjournal.ahead import MEASURED, SOURCE, Placing, parse_day, refresh_ahead
@@ -691,12 +691,12 @@ def _render(db, tmp_path, monkeypatch, fragment: str,
     from optjournal import browser, web
 
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     monkeypatch.setattr(web, "datetime", _frozen(now))
     with web.serve_ephemeral(db_path=db, archive_dir=tmp_path) as base:
         dom = browser.dump_dom(f"{base}/{fragment}", tmp_path / "chrome")
     if dom is None:
-        pytest.skip("no browser produced a DOM (environment, not the page)")
+        no_browser("no browser produced a DOM (environment, not the page)")
     return " ".join(browser.rendered_text(dom).split()), browser.markup(dom)
 
 

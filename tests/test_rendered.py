@@ -8,10 +8,10 @@ suite. One executed render with DOM assertions closes the class, at the cost
 of one browser launch.
 
 The skip/fail contract is deliberate: a missing browser or a launch the
-machine kills is an ENVIRONMENT problem and skips loudly, but a DOM that came
-back and fails an assertion is the PAGE being wrong and fails the suite. A
-skip here must never hide a rendering bug -- it may only hide the absence of
-Chrome.
+machine kills is an ENVIRONMENT problem and skips loudly (except in CI, where
+it fails: see `conftest.no_browser`), but a DOM that came back and fails an
+assertion is the PAGE being wrong and fails the suite. A skip here must never
+hide a rendering bug -- it may only hide the absence of Chrome.
 
 Browser discovery and the DOM dump live in ``optjournal.browser``: the
 hazards there (a Rosetta Chrome that hangs in every headless variant, the
@@ -28,7 +28,7 @@ import urllib.request
 from datetime import date
 
 import pytest
-from conftest import connect_migrated
+from conftest import connect_migrated, no_browser
 
 from optjournal import browser, sweep, web
 from optjournal.bars import upsert_bars
@@ -68,10 +68,10 @@ def _month_label(month: str) -> str:
 
 def test_the_dashboard_renders_from_the_payload(served, tmp_path):
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     dom = browser.dump_dom(served + "/", tmp_path / "profile")
     if dom is None:
-        pytest.skip("no browser produced a DOM (environment, not the page)")
+        no_browser("no browser produced a DOM (environment, not the page)")
     assert not browser.last_console_errors(), (
         "the page raised in the browser: " + "; ".join(browser.last_console_errors())
     )
@@ -178,7 +178,7 @@ def test_a_themed_url_repaints_the_whole_page(served, tmp_path):
     otherwise.
     """
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     for requested, expected, label in (
         ("admiralty", "admiralty", "Admiralty Edition"),
         ("ledger", "ledger", "Ledger Edition"),
@@ -187,7 +187,7 @@ def test_a_themed_url_repaints_the_whole_page(served, tmp_path):
         dom = browser.dump_dom(f"{served}/#theme={requested}",
                                tmp_path / f"profile-{requested}")
         if dom is None:
-            pytest.skip("no browser produced a DOM (environment, not the page)")
+            no_browser("no browser produced a DOM (environment, not the page)")
         assert f'data-theme="{expected}"' in dom, (
             f"#theme={requested} did not put data-theme={expected} on <html>"
         )
@@ -211,13 +211,13 @@ def test_every_drill_down_is_a_keyboard_stop(served, tmp_path):
     button role.
     """
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     found = {}
     for tab, attr in (("calendar&month=all", "data-calday"),
                       ("trades", "data-topen"), ("positions", "data-replay")):
         dom = browser.dump_dom(f"{served}/#tab={tab}", tmp_path / f"kbd-{tab[:5]}")
         if dom is None:
-            pytest.skip("no browser produced a DOM (environment, not the page)")
+            no_browser("no browser produced a DOM (environment, not the page)")
         tags = _opening_tags(browser.markup(dom), attr)
         found[tab] = len(tags)
         for tag in tags:
@@ -248,12 +248,12 @@ def test_the_rail_groups_the_holdings_under_portfolio_and_old_links_still_land(
     `#tab=positions` or `#tab=costs` written before the regrouping opens the
     same view, now under its new destination."""
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     seen = {}
     for leaf in ("trades", "positions", "portfolio", "costs", "review"):
         dom = browser.dump_dom(f"{served}/#tab={leaf}", tmp_path / f"rail-{leaf}")
         if dom is None:
-            pytest.skip("no browser produced a DOM (environment, not the page)")
+            no_browser("no browser produced a DOM (environment, not the page)")
         seen[leaf] = _rail(browser.markup(dom))
     rail = ["Dashboard", "Calendar", "Trades", "Portfolio", "Analysis", "0DTE",
             "Market", "Watchlist"]
@@ -278,14 +278,14 @@ def test_the_0dte_tab_works_on_typed_readings_before_any_index_bar(
     on `bars` does not reach it, and it is patched here.
     """
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     from optjournal import serialize  # noqa: PLC0415 - the server's own binding
     monkeypatch.setattr(serialize, "fetch_bars", lambda *a, **k: [])
     with urllib.request.urlopen(served + "/api/state") as res:
         assert json.load(res)["odte"]["context"] is None, "the fixture now has index bars"
     dom = browser.dump_dom(f"{served}/#tab=odte&spx=7000&vix=20", tmp_path / "odte")
     if dom is None:
-        pytest.skip("no browser produced a DOM (environment, not the page)")
+        no_browser("no browser produced a DOM (environment, not the page)")
     markup = browser.markup(dom)
     assert re.search(r'<input id="zspx"[^>]*value="7000"', markup), "no S&P field"
     assert re.search(r'<input id="zvix"[^>]*value="20"', markup), "no VIX field"
@@ -302,14 +302,14 @@ def test_the_header_keeps_the_months_net_pnl_and_the_body_does_not_repeat_it(
     the month), the chart corner and the pills go, and the comparison is on the
     0DTE tab."""
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     from optjournal import serialize  # noqa: PLC0415 - the server's own binding
     monkeypatch.setattr(serialize, "fetch_bars", lambda *a, **k: [])
     seen = {}
     for tab in ("dashboard", "calendar", "odte"):
         dom = browser.dump_dom(f"{served}/#tab={tab}", tmp_path / f"once-{tab}")
         if dom is None:
-            pytest.skip("no browser produced a DOM (environment, not the page)")
+            no_browser("no browser produced a DOM (environment, not the page)")
         seen[tab] = (browser.markup(dom), browser.rendered_text(dom))
     dash, dash_text = seen["dashboard"]
     assert 'class="pfig"' in dash, "the Dashboard header lost the month's Net P&L"
@@ -334,14 +334,14 @@ def test_every_tab_writes_dates_and_counts_the_way_a_reader_does(
     caption does not end on a separator either: the Costs line read "Options ·"
     whenever no currency note followed."""
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     from optjournal import serialize  # noqa: PLC0415 - the server's own binding
     monkeypatch.setattr(serialize, "fetch_bars", lambda *a, **k: [])
     leaks = {}
     for tab in sweep.TABS:
         dom = browser.dump_dom(f"{served}/#tab={tab}", tmp_path / f"dates-{tab}")
         if dom is None:
-            pytest.skip("no browser produced a DOM (environment, not the page)")
+            no_browser("no browser produced a DOM (environment, not the page)")
         # What is on screen and what a tooltip says; the footer's path aside.
         text = re.sub(r"\S+\.db\b", "", " ".join(
             [browser.rendered_text(dom),
@@ -362,7 +362,7 @@ def test_an_estimated_close_is_marked_where_its_pnl_shows(tmp_path):
     line showed it as final. Each now carries a "≈" whose tooltip says the
     statement replaces it, and a journal with no estimate shows none."""
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     conn = connect_migrated(tmp_path / "demo.db")
     ingest_file(conn, statement)
@@ -374,7 +374,7 @@ def test_an_estimated_close_is_marked_where_its_pnl_shows(tmp_path):
                             ("trades", f"tab=trades&replay={card['replay_key']}")):
             dom = browser.dump_dom(f"{base}/#{hash_}", tmp_path / f"{profile}-{name}")
             if dom is None:
-                pytest.skip("no browser produced a DOM (environment, not the page)")
+                no_browser("no browser produced a DOM (environment, not the page)")
             seen[name] = re.findall(r'<span class="approx" title="([^"]*)">≈</span>',
                                     browser.markup(dom))
         return seen
@@ -407,7 +407,7 @@ def test_one_tap_shows_in_the_journal_review(tmp_path):
     leads the review, with the positions not answered yet beside it, and the plan
     table waits for a plan answer."""
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     conn = connect_migrated(tmp_path / "demo.db")
     ingest_file(conn, statement)
@@ -425,7 +425,7 @@ def test_one_tap_shows_in_the_journal_review(tmp_path):
             assert json.load(res)["ok"]
         dom = browser.dump_dom(f"{base}/#tab=review", tmp_path / "review")
     if dom is None:
-        pytest.skip("no browser produced a DOM (environment, not the page)")
+        no_browser("no browser produced a DOM (environment, not the page)")
     text = re.sub(r"\s+", " ", browser.rendered_text(dom))
     assert "Why they came off" in text
     assert re.search(r"Time-based \(approaching expiry\) 1 ", text), text
@@ -445,13 +445,13 @@ def test_the_dashboard_renders_the_tiles_the_reader_stored(served, tmp_path):
     only an executed render shows it holds.
     """
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     from optjournal import settings  # noqa: PLC0415 - the session's settings home
 
     def rendered_tiles(profile: str) -> list[str]:
         dom = browser.dump_dom(served + "/", tmp_path / profile)
         if dom is None:
-            pytest.skip("no browser produced a DOM (environment, not the page)")
+            no_browser("no browser produced a DOM (environment, not the page)")
         assert not browser.last_console_errors(), (
             "the page raised: " + "; ".join(browser.last_console_errors())
         )
@@ -513,7 +513,7 @@ def test_a_replay_card_seeks_to_the_frame_that_reveals_its_fill(replayed, tmp_pa
     one axis.
     """
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     with urllib.request.urlopen(replayed + "/api/state") as res:
         payload = json.load(res)
     key = next(k for k in payload["replays"] if k.endswith("@2026-01-16"))
@@ -522,7 +522,7 @@ def test_a_replay_card_seeks_to_the_frame_that_reveals_its_fill(replayed, tmp_pa
         "the fixture no longer draws the 0DTE hourly, so this proves nothing")
     dom = browser.dump_dom(f"{replayed}/#tab=trades&replay={key}", tmp_path / "replay")
     if dom is None:
-        pytest.skip("no browser produced a DOM (environment, not the page)")
+        no_browser("no browser produced a DOM (environment, not the page)")
     markup = browser.markup(dom)
     page = sweep.Page(tab="trades", ccy=None, kind=None, calday=None, replay=key,
                       dom=dom, markup=markup, text=browser.rendered_text(dom),
@@ -556,7 +556,7 @@ def test_the_watchlist_draws_an_iv_rank_column_only_once_a_rank_is_in(
     -39.0 reads as a percentage change.
     """
     if not browser.browsers():
-        pytest.skip("no Chrome/Chromium on this machine")
+        no_browser("no Chrome/Chromium on this machine")
     from optjournal import iv  # noqa: PLC0415 - the server's own binding
     statement = write_demo_statement(tmp_path / "demo", tmp_path / "demo.db")
     conn = connect_migrated(tmp_path / "demo.db")
@@ -568,7 +568,7 @@ def test_the_watchlist_draws_an_iv_rank_column_only_once_a_rank_is_in(
     def headers(profile: str) -> list[str]:
         dom = browser.dump_dom(f"{base}/#tab=watchlist", tmp_path / profile)
         if dom is None:
-            pytest.skip("no browser produced a DOM (environment, not the page)")
+            no_browser("no browser produced a DOM (environment, not the page)")
         markup = browser.markup(dom)
         return [re.sub(r"<[^>]+>|[⇅↑↓]", "", cell).strip() for cell in
                 re.findall(r'<th[^>]*>(.*?)</th>', markup.split('class="wtab"')[1], re.S)]

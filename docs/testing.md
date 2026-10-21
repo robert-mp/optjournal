@@ -26,6 +26,9 @@ The suite covers four complementary layers:
 - pure frontend modules executed with Node's test runner;
 - rendered-page checks through a local headless browser.
 
+A rendered check skips on a machine with no working browser, and fails in CI
+(where `CI` is set), so a runner that loses its browser cannot go quiet.
+
 The source-text frontend guards are intentional. JavaScript commonly turns a
 misspelled payload key into `undefined` and then into a plausible blank cell;
 rendering alone does not reliably expose that class of defect.
