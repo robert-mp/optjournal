@@ -557,6 +557,17 @@ def test_write_token_refuses_an_empty_token_rather_than_storing_one(
     assert wrote == []
 
 
+@pytest.mark.parametrize("bad", ["123456789012 345678901234", "123456\t789012",
+                                 "123456\n789012"])
+def test_write_token_refuses_a_token_with_whitespace_inside(monkeypatch, bad):
+    """The token goes into the request URL as typed, so a space inside one makes
+    a URL no request can be sent with. Refused with what to do, nothing stored."""
+    wrote = _captured_keyring(monkeypatch)
+    with pytest.raises(ValueError, match="inside"):
+        flex.write_token(bad, "tester")
+    assert wrote == []
+
+
 def test_write_token_refuses_something_far_too_long_to_be_a_token(monkeypatch):
     """A length bound, not a format one, and the distinction is deliberate: IBKR
     does not document the token's shape, so a digits-only rule could refuse a
@@ -1410,6 +1421,22 @@ def test_only_a_failure_that_clears_by_itself_is_unreachable(monkeypatch, raised
     with pytest.raises(FlexError) as caught:
         _TimeoutFlexClient(user_agent="test", timeout_s=1)._get("https://x/")
     assert isinstance(caught.value, FlexUnreachable) is unreachable
+
+
+def test_a_token_with_a_space_inside_never_reaches_the_error_message(tmp_path,
+                                                                    monkeypatch):
+    """The token travels in the URL, and a failed request's message can quote the
+    URL. That message is what the run ledger, the Sync reply and the command line
+    show, every retry, so the token must not be in it."""
+    token = "123456789012 345678901234"
+    monkeypatch.setattr(flex, "read_token", lambda account=None: token)
+    monkeypatch.setattr(flex._TimeoutFlexClient, "BASE_URL",
+                        "http://127.0.0.1:9/FlexWebService")
+    with pytest.raises(flex.FlexUnreachable) as caught:
+        flex.fetch("1591754", archive_dir=tmp_path, force=True)
+    assert "SendRequest?t=***&q=1591754" in str(caught.value)
+    for part in token.split():
+        assert part not in str(caught.value)
 
 
 # --- a reply broken off mid-way is this module's typed error (L3) -------------

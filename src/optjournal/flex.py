@@ -262,6 +262,15 @@ FETCH_LOCK_TIMEOUT_S = FETCH_WORST_CASE_S + 60
 FETCH_LOCK_WAIT_S = 30
 
 
+#: The token in a Flex request URL. py_ibkr puts it there as typed, so an error
+#: that quotes the URL quotes the token.
+_URL_TOKEN = re.compile(r"([?&]t=)[^&]+")
+
+
+def _masked(message: str) -> str:
+    return _URL_TOKEN.sub(r"\1***", message)
+
+
 class _TimeoutFlexClient(FlexClient):
     """`FlexClient` with a socket timeout on every request.
 
@@ -290,9 +299,9 @@ class _TimeoutFlexClient(FlexClient):
             # A 5xx is IBKR's side failing, which clears by itself; a 4xx is this
             # request being wrong, which a retry would only repeat.
             error = FlexUnreachable if exc.code >= 500 else FlexError
-            raise error(f"HTTP Error {exc.code}: {exc.reason}") from exc
+            raise error(_masked(f"HTTP Error {exc.code}: {exc.reason}")) from exc
         except URLError as exc:
-            raise FlexUnreachable(f"URL Error: {exc.reason}") from exc
+            raise FlexUnreachable(_masked(f"URL Error: {exc.reason}")) from exc
         except TimeoutError as exc:
             # MEASURED, and my first version got it wrong: a socket timeout raises a
             # BARE `TimeoutError`, which is an `OSError` and NOT a `URLError`
@@ -301,14 +310,15 @@ class _TimeoutFlexClient(FlexClient):
             # every other transport failure does, so `sync_journal`'s callers would
             # have seen a raw traceback -- exactly the shape of the 2026-08-07
             # keychain failure this plan exists to stop.
-            raise FlexUnreachable(f"timed out after {self.timeout_s}s: {exc}") from exc
+            raise FlexUnreachable(
+                _masked(f"timed out after {self.timeout_s}s: {exc}")) from exc
         except (http.client.HTTPException, OSError) as exc:
             # The same gap one level over: a body cut short raises IncompleteRead,
             # an `http.client.HTTPException` and not an `OSError`, and a server
             # that hangs up raises RemoteDisconnected or ConnectionResetError. None
             # is a `URLError` once the response has started.
             raise FlexUnreachable(
-                f"connection failed: {type(exc).__name__}: {exc}") from exc
+                _masked(f"connection failed: {type(exc).__name__}: {exc}")) from exc
 
 
 class FlexUnreachable(FlexError):
@@ -674,11 +684,17 @@ def write_token(token: str, account: str | None = None) -> str:
     Whitespace-stripped because the value arrives PASTED -- from Client Portal,
     through a terminal prompt or a browser field, all three of which pick up a
     trailing newline or a leading space that IBKR then rejects as an invalid
-    token. Nothing here echoes, logs or returns the value.
+    token. Whitespace INSIDE is refused: the token goes into the request URL as
+    typed, where a space makes a URL no request can be sent with. Nothing here
+    echoes, logs or returns the value.
     """
     token = token.strip()
     if not token:
         raise ValueError("refusing to store an empty Flex token")
+    if any(c.isspace() for c in token):
+        raise ValueError(
+            "refusing to store a Flex token with a space or line break inside it: "
+            "copy it again from Client Portal (Settings → Flex Web Service)")
     if len(token) > TOKEN_MAX_LEN:
         raise ValueError(
             f"refusing to store a {len(token)}-character Flex token: "
