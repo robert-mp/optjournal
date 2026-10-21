@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import urllib.error
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from conftest import add_statement, connect_migrated
@@ -409,18 +409,54 @@ def test_underlying_granularity_follows_the_window_length(conn):
     assert HOURLY_LIMIT_DAYS > 0
 
 
-def test_windows_merge_per_conid_and_bar_size(conn):
-    """Two episodes on the same contract become one request covering both, so
-    an overlapping pair is not fetched twice.
+def _round_trip(conn, *, conid, symbol, opened, closed, underlying="TSLA",
+                ucid="UT"):
+    """One short option opened and bought back: a closed episode."""
+    for trade_id, day, open_close, quantity in (
+        (f"{conid}-o", opened, "O", -1), (f"{conid}-c", closed, "C", 1),
+    ):
+        _option_trade(conn, conid=conid, symbol=symbol, underlying=underlying,
+                      ucid=ucid, date=day, trade_id=trade_id,
+                      open_close=open_close, quantity=quantity)
+
+
+def _underlying(conn, *, now=_NOW) -> dict[str, list[tuple[int, int]]]:
+    """The underlying's windows per bar size, oldest first."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    for r in bars_manifest(conn, now=now):
+        if r.kind == "underlying":
+            out.setdefault(r.bar_size, []).append((r.start, r.end))
+    return {size: sorted(windows) for size, windows in out.items()}
+
+
+def test_overlapping_windows_on_one_underlying_are_one_request(conn):
+    """Two short holds a few days apart pad into one span, so they are fetched as
+    one window rather than twice over the same days.
     """
-    _option_trade(conn, conid="C1", symbol="AAA  260101P00100000",
-                  underlying="AAA", ucid="U1", date="2026-01-05",
-                  trade_id="t1")
-    _option_trade(conn, conid="C1", symbol="AAA  260101P00100000",
-                  underlying="AAA", ucid="U1", date="2026-01-09",
-                  trade_id="t2")
-    keys = [r.key for r in bars_manifest(conn)]
-    assert len(keys) == len(set(keys)), f"duplicate windows: {keys}"
+    _round_trip(conn, conid="C1", symbol="TSLA  260807P00300000",
+                opened="2026-07-20", closed="2026-07-22")
+    _round_trip(conn, conid="C2", symbol="TSLA  260814P00300000",
+                opened="2026-07-27", closed="2026-07-29")
+    windows = _underlying(conn)
+    assert windows == {"1h": [(_ts("2026-07-16"), _ts("2026-08-02"))],
+                       "1d": [(_ts("2026-07-16"), _ts("2026-08-02"))]}, windows
+
+
+def test_windows_years_apart_stay_apart_and_an_old_one_is_not_hourly(conn):
+    """A 5-day put from an imported 2023 statement and one open today are two
+    windows, not one from 2023 to now. Their union asked hourly bars back to 2023,
+    which the source refuses past 730 days, so the open trade's hourly bars never
+    landed; inside 730 days it re-fetched a year of hourly bars every day. The old
+    window is asked daily only, which its replay falls back to.
+    """
+    _round_trip(conn, conid="C0", symbol="TSLA  230113P00120000",
+                opened="2023-01-10", closed="2023-01-12")
+    _option_trade(conn, conid="C1", symbol="TSLA  260807P00300000",
+                  underlying="TSLA", ucid="UT", date="2026-08-03", trade_id="t1")
+    windows = _underlying(conn)
+    recent = (_ts("2026-07-30"), int((_NOW + timedelta(days=1)).timestamp()))
+    assert windows == {"1h": [recent],
+                       "1d": [(_ts("2023-01-06"), _ts("2023-01-16")), recent]}, windows
 
 
 def test_a_flat_book_asks_only_for_the_market_context(conn):

@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -80,6 +80,11 @@ SETTLED_DAYS = 7
 #: while a months-long position wants daily or the series becomes thousands of
 #: points for no added insight.
 HOURLY_LIMIT_DAYS = 40
+
+#: How far back the source serves hourly bars. It refuses an hourly range starting
+#: more than 730 days ago, so an older underlying window is asked daily only, and
+#: its replay falls back to the daily series.
+HOURLY_HISTORY_DAYS = 729
 
 #: Context either side of the trade window when CHARTING, as a FRACTION of the
 #: window itself. PAD_DAYS is what gets FETCHED (wide is free and already
@@ -321,17 +326,22 @@ def bars_manifest(
 ) -> list[BarRequest]:
     """Every (contract, granularity, window) the journal's own positions imply.
 
-    Windows for the same ``(conid, bar_size)`` are merged to their union, so an
-    overlapping pair becomes one request rather than two.
+    Windows for the same ``(conid, bar_size)`` that overlap or touch are merged
+    to their union, so an overlapping pair becomes one request rather than two.
+    Two holds years apart stay two requests: their union would fetch every bar
+    between them.
     """
     moment = now or datetime.now(UTC)
     ceiling = int((moment + timedelta(days=1)).timestamp())
+    hourly_floor = int((moment - timedelta(days=HOURLY_HISTORY_DAYS)).timestamp())
 
     underlyings = underlying_conids(conn)
-    merged: dict[tuple[str, str], BarRequest] = {}
+    windows: dict[tuple[str, str], list[BarRequest]] = {}
 
     def add(conid: str, symbol: str, start: int, end: int, kind: str) -> None:
         size = _bar_size_for(start, end, kind=kind)
+        if size == "1h" and start < hourly_floor:
+            size = "1d"
         _emit(conid, symbol, start, end, kind, size)
         # An hourly underlying window ALSO needs its daily series, because the
         # expected-move band solves implied vol by pairing an option's daily
@@ -350,16 +360,7 @@ def bars_manifest(
             conid=str(conid), symbol=str(symbol), bar_size=size,
             start=start, end=end, kind=kind,
         )
-        existing = merged.get(request.key)
-        if existing is None:
-            merged[request.key] = request
-            return
-        merged[request.key] = BarRequest(
-            conid=existing.conid, symbol=existing.symbol, bar_size=size,
-            start=min(existing.start, request.start),
-            end=max(existing.end, request.end),
-            kind=existing.kind,
-        )
+        windows.setdefault(request.key, []).append(request)
 
     report = build_history(conn, asset_category="OPT")
     for episode in report.episodes:
@@ -416,7 +417,18 @@ def bars_manifest(
             int((moment - timedelta(days=CONTEXT_LOOKBACK_DAYS)).timestamp()),
             ceiling, "context")
 
-    return sorted(merged.values(), key=lambda r: (r.kind, r.symbol, r.bar_size))
+    merged: list[BarRequest] = []
+    for group in windows.values():
+        group.sort(key=lambda r: r.start)
+        current = group[0]
+        for request in group[1:]:
+            if request.start <= current.end:
+                current = replace(current, end=max(current.end, request.end))
+            else:
+                merged.append(current)
+                current = request
+        merged.append(current)
+    return sorted(merged, key=lambda r: (r.kind, r.symbol, r.bar_size, r.start))
 
 
 def upsert_bars(
