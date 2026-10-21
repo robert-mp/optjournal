@@ -204,12 +204,20 @@ test("a decimal comma is a decimal point, and a thousands separator is dropped",
     ["1.234.567,89", "1234567.89"],
     ["1,234,567.89", "1234567.89"],
     ["7706.03.", "7706.03"],
+    ["7,780", "7780"],
+    ["7.780", "7780"],
+    ["7,706", "7706"],
+    ["1,234,567", "1234567"],
+    ["7,780.5", "7780.5"],
+    ["7780,5", "7780.5"],
   ]) {
     assert.equal(sanitizeLevel(text), level, `pasted ${text}`);
     assert.equal(typed(text), level, `typed ${text}`);
   }
   /* The finding's own reading: a VIX of 18,5 is a 1.16% move, not 11.56%. */
   assert.equal(expectedMove(SPX, sanitizeLevel("18,5")).pct.toFixed(2), "1.16");
+  /* A level pasted with its thousands grouped is the strike it names, not 10. */
+  assert.equal(strikeNear(sanitizeLevel("7,780"), "call"), 7780);
 });
 
 test("a level resolves to the listed strike nearest it", () => {
