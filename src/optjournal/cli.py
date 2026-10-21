@@ -494,7 +494,7 @@ def cmd_friction(args) -> int:
     Emits JSON through the same serializer the page reads, so `--json` here and
     the tab cannot disagree about a figure.
     """
-    scope = CostScope.of(args.assets)
+    scope = CostScope.of(_asset_filter(",".join(args.assets or ())))
     with open_journal(args.db) as conn:
         report = build_costs(conn, scope=scope, period=args.month)
     data = broker_costs_data(report)
@@ -1528,7 +1528,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("history", parents=[common, database],
                        help="closed-position P&L, one row per round trip")
-    p.add_argument("--assets", default="OPT", metavar="LIST",
+    p.add_argument("--assets", default="OPT", metavar="CAT",
                    help="asset category to report, or ALL (default: OPT)")
     p.set_defaults(func=cmd_history)
 
