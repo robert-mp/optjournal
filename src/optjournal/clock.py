@@ -33,12 +33,20 @@ from datetime import date, datetime
 from functools import cache
 from zoneinfo import ZoneInfo
 
-__all__ = ["MARKET_TZ", "epoch_et", "et_day", "expiry_epoch", "parse_day"]
+__all__ = [
+    "MARKET_TZ", "SETTLE_H", "SETTLE_M", "epoch_et", "et_day", "expiry_epoch",
+    "parse_day",
+]
 
 #: The clock every journal timestamp is stated in. See epoch_et for the
 #: evidence; it is also the zone the chart labels its x axis in, so fills and
 #: bars land on one timeline without conversion.
 MARKET_TZ = ZoneInfo("America/New_York")
+
+#: When a session's daily bar is final, in ET: the 16:00 close plus a margin for
+#: the source to publish the settled print. Before it, the day's bar is still
+#: moving; after it, that bar IS the prior close for the next session.
+SETTLE_H, SETTLE_M = 16, 15
 
 
 def epoch_et(stamp: str | None) -> int | None:

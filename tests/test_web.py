@@ -10318,7 +10318,8 @@ def test_a_failed_odte_refresh_says_so_and_the_reading_is_not_fresh(populated, m
                               source="yahoo",
                               bars=[Bar(ts=1790000000, open=level, high=level,
                                         low=level, close=level, volume=0)])
-    conn.execute("UPDATE price_bars SET fetched_at = '2026-01-01T00:00:00+00:00'")
+    # Fetched after that session's settle, and long before the last one.
+    conn.execute("UPDATE price_bars SET fetched_at = '2026-09-22T00:00:00+00:00'")
     conn.commit()
     conn.close()
     monkeypatch.setattr(serialize, "fetch_bars", offline)

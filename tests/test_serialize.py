@@ -373,17 +373,31 @@ def test_the_countdown_is_counted_from_the_et_day_not_the_utc_one(conn):
     assert watchlist_data(conn, now=evening)[0]["earnings_in_days"] == 14
 
 
-@pytest.mark.parametrize("hour, through, last", [
-    (11, "2026-08-07", 101.0),   # Monday mid-session: Friday is the newest close
-    (17, "2026-08-10", 105.0),   # after the settle, Monday's bar is final
+def _fetched_on(conn, symbol: str, day: str, at: datetime) -> None:
+    """Stamp `symbol`'s stored bars for one ET session as fetched at `at`."""
+    start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=MARKET_TZ).timestamp())
+    conn.execute(
+        "UPDATE price_bars SET fetched_at = ? WHERE symbol = ? AND ts >= ? AND ts < ?",
+        (at.astimezone(UTC).isoformat(timespec="seconds"), symbol, start, start + 86400))
+    conn.commit()
+
+
+@pytest.mark.parametrize("fetched, read, through, last", [
+    ((11, 0), (11, 0), "2026-08-07", 101.0),    # mid-session: Friday is the newest
+    ((11, 0), (17, 0), "2026-08-07", 101.0),    # an 11:00 price is not the close
+    ((16, 20), (17, 0), "2026-08-10", 105.0),   # fetched after the settle, it is
 ])
-def test_a_session_in_progress_is_not_yet_a_stored_close(conn, hour, through, last):
-    """Adding a symbol mid-session stores today's daily bar while it still moves,
-    and the row printed it as "stored close from" today, while the 0DTE calculator
-    leaves the same bar out until 16:15 ET."""
+def test_a_daily_bar_is_a_close_once_it_was_fetched_after_its_settle(
+    conn, fetched, read, through, last,
+):
+    """Adding a symbol mid-session, or running `bars` by hand, stores today's daily
+    bar while it still moves. Read at 17:00 that 11:00 price was the stored close
+    from today, with its change against Friday, until the next morning's job."""
     _seed_watched_symbol(conn, "NVDA", ["2026-08-06", "2026-08-07", "2026-08-10"],
                          [100.0, 101.0, 105.0], duplicated=False)
-    row = watchlist_data(conn, now=datetime(2026, 8, 10, hour, tzinfo=MARKET_TZ))[0]
+    _fetched_on(conn, "NVDA", "2026-08-10", datetime(2026, 8, 10, *fetched,
+                                                     tzinfo=MARKET_TZ))
+    row = watchlist_data(conn, now=datetime(2026, 8, 10, *read, tzinfo=MARKET_TZ))[0]
     assert (row["closes_through"], row["last"]) == (through, last)
 
 
@@ -513,6 +527,7 @@ def test_the_prior_close_is_the_last_settled_session_not_todays_moving_bar(conn)
     _seed_index(conn, "^VIX", "2026-08-28", 14.43)
     _seed_index(conn, "^VIX", "2026-08-31", 15.25)
     now = datetime(2026, 8, 31, 17, 0, tzinfo=UTC)      # Monday, mid-session ET
+    _fetched_on(conn, "^GSPC", "2026-08-31", now)
 
     ctx = odte_context_data(conn, now=now)
     assert ctx["spx_prev_close"] == 7711.76, "Monday's moving bar is not a close"
@@ -563,7 +578,7 @@ def test_scoring_pairs_each_settled_session_with_the_close_before_it(conn):
         _seed_index(conn, "^GSPC", day, spx)
         _seed_index(conn, "^VIX", day, vix)
 
-    rows = odte_scoring_data(conn, now=datetime(2026, 8, 31, 13, 0, tzinfo=UTC))
+    rows = odte_scoring_data(conn)
     assert rows == [
         {"date": "2026-08-27", "prev_close": 7600.0, "vix": 15.0, "close": 7650.0},
         {"date": "2026-08-28", "prev_close": 7650.0, "vix": 16.0, "close": 7711.76},
@@ -584,8 +599,9 @@ def test_scoring_excludes_today_because_its_close_is_still_moving(conn):
     _seed_index(conn, "^GSPC", "2026-08-31", 7686.14)   # today, in progress
     _seed_index(conn, "^VIX", "2026-08-31", 15.25)
     now = datetime(2026, 8, 31, 17, 0, tzinfo=UTC)      # Monday, mid-session ET
+    _fetched_on(conn, "^GSPC", "2026-08-31", now)
 
-    assert odte_scoring_data(conn, now=now) == [], "today is not a settled outcome"
+    assert odte_scoring_data(conn) == [], "today is not a settled outcome"
 
 
 def test_scoring_counts_today_once_it_has_settled_as_the_calculator_does(conn):
@@ -596,9 +612,23 @@ def test_scoring_counts_today_once_it_has_settled_as_the_calculator_does(conn):
         _seed_index(conn, "^GSPC", day, spx)
         _seed_index(conn, "^VIX", day, vix)
     now = datetime(2026, 10, 14, 17, 0, tzinfo=MARKET_TZ)
-    scored = odte_scoring_data(conn, now=now)
+    scored = odte_scoring_data(conn)
     assert [row["date"] for row in scored] == ["2026-10-14"]
     assert scored[-1]["date"] == odte_context_data(conn, now=now)["spx_date"]
+
+
+def test_an_index_bar_fetched_mid_session_is_not_that_sessions_close(conn):
+    """At 17:00 ET a 15:00 fetch of today's bar holds a 15:00 price. The calculator
+    planned tomorrow off it and scoring scored today's rails against it."""
+    from optjournal.serialize import odte_context_data, odte_scoring_data
+    for day, spx, vix in (("2026-10-13", 6600.0, 18.0), ("2026-10-14", 6650.0, 17.0)):
+        _seed_index(conn, "^GSPC", day, spx)
+        _seed_index(conn, "^VIX", day, vix)
+        _fetched_on(conn, "^GSPC", day, datetime(2026, 10, 14, 15, 0, tzinfo=MARKET_TZ))
+    now = datetime(2026, 10, 14, 17, 0, tzinfo=MARKET_TZ)
+    assert odte_scoring_data(conn) == [], "a 15:00 price was scored"
+    assert odte_context_data(conn, now=now)["spx_date"] == "2026-10-13", (
+        "the calculator planned off a 15:00 price")
 
 
 def test_scoring_skips_a_session_whose_vix_never_landed(conn):
@@ -614,7 +644,7 @@ def test_scoring_skips_a_session_whose_vix_never_landed(conn):
     _seed_index(conn, "^VIX", "2026-08-26", 15.0)
     # Nothing for the 27th, so the session it would have drawn the 28th's band from
     # is unusable.
-    rows = odte_scoring_data(conn, now=datetime(2026, 8, 31, 13, 0, tzinfo=UTC))
+    rows = odte_scoring_data(conn)
     assert [row["date"] for row in rows] == ["2026-08-27"]
 
 
@@ -634,7 +664,7 @@ def test_scoring_skips_a_pair_the_stored_series_has_a_hole_between(conn):
                      ("2026-09-04", 7700.0), ("2026-09-08", 7710.0)]:
         _seed_index(conn, "^GSPC", day, spx)
         _seed_index(conn, "^VIX", day, 16.0)
-    rows = odte_scoring_data(conn, now=datetime(2026, 9, 10, 13, 0, tzinfo=UTC))
+    rows = odte_scoring_data(conn)
     assert [row["date"] for row in rows] == ["2026-06-02", "2026-08-04", "2026-09-08"], (
         "the session after the hole was scored against a close from before it, or "
         "the holiday weekend was mistaken for a hole"
@@ -644,11 +674,10 @@ def test_scoring_skips_a_pair_the_stored_series_has_a_hole_between(conn):
 def test_scoring_is_empty_until_both_series_have_landed(conn):
     """One index without the other scores nothing, the same as it reads nothing."""
     from optjournal.serialize import odte_scoring_data
-    now = datetime(2026, 8, 31, 13, 0, tzinfo=UTC)
-    assert odte_scoring_data(conn, now=now) == []
+    assert odte_scoring_data(conn) == []
     _seed_index(conn, "^GSPC", "2026-08-27", 7650.0)
     _seed_index(conn, "^GSPC", "2026-08-28", 7711.76)
-    assert odte_scoring_data(conn, now=now) == [], "the S&P alone scores nothing"
+    assert odte_scoring_data(conn) == [], "the S&P alone scores nothing"
 
 
 # ------------------------------------------------------------------ allocation

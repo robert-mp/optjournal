@@ -42,7 +42,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from optjournal.clock import et_day
+from optjournal.clock import MARKET_TZ, SETTLE_H, SETTLE_M, et_day
 from optjournal.history import build_history
 from optjournal.marketdata import (
     BAR_SIZES,
@@ -565,6 +565,23 @@ def _settled(conn: sqlite3.Connection, request: BarRequest, cutoff: int) -> bool
     return first is not None and first <= request.start + slack
 
 
+def _is_settled_close(ts: int, fetched_at: str) -> bool:
+    """Whether a daily bar holds its session's close: fetched at or after that ET
+    day's settle.
+
+    A bar fetched mid-session holds the price of that moment and stays stored as
+    the session's row until a later fetch replaces it, so the clock alone cannot
+    say: read at 17:00, an 11:00 fetch is still an 11:00 price.
+    """
+    settle = datetime.fromtimestamp(ts, MARKET_TZ).replace(
+        hour=SETTLE_H, minute=SETTLE_M, second=0, microsecond=0)
+    try:
+        fetched = datetime.fromisoformat(fetched_at)
+    except ValueError:
+        return False
+    return (fetched if fetched.tzinfo else fetched.replace(tzinfo=UTC)) >= settle
+
+
 def close_series(
     conn: sqlite3.Connection,
     conid: str,
@@ -572,6 +589,7 @@ def close_series(
     bar_size: str,
     start: int | None = None,
     end: int | None = None,
+    settled: bool = False,
 ) -> list[tuple[int, float]]:
     """Timestamped closes for one conid at one granularity, oldest first.
 
@@ -588,7 +606,8 @@ def close_series(
 
     Null closes are dropped. A quiet strike genuinely has no print, and the
     window is clipped inclusively so a caller asking for a trade's span gets
-    exactly that span.
+    exactly that span. `settled` drops a daily bar that does not hold its
+    session's close yet (`_is_settled_close`).
     """
     clauses = ["bar_size = ?", "conid = ?", "close IS NOT NULL"]
     args: list[Any] = [bar_size, str(conid)]
@@ -599,10 +618,12 @@ def close_series(
         clauses.append("ts <= ?")
         args.append(int(end))
     rows = conn.execute(
-        f"SELECT ts, close FROM price_bars WHERE {' AND '.join(clauses)} ORDER BY ts",
+        f"SELECT ts, close, fetched_at FROM price_bars WHERE {' AND '.join(clauses)}"
+        " ORDER BY ts",
         args,
     ).fetchall()
-    return [(int(r["ts"]), float(r["close"])) for r in rows]
+    return [(int(r["ts"]), float(r["close"])) for r in rows
+            if not settled or _is_settled_close(int(r["ts"]), r["fetched_at"])]
 
 
 def watch_closes(
@@ -640,9 +661,10 @@ def watch_closes(
 
     A null close is dropped, for `close_series`' reason: a bar's close is nullable
     by design and a day with no print is not a session this can report a price for.
+    So is a bar that does not hold its session's close yet (`_is_settled_close`).
     """
     rows = conn.execute(
-        f"SELECT ts, close, ({_RANK_CASE}) AS rank FROM price_bars"
+        f"SELECT ts, close, fetched_at, ({_RANK_CASE}) AS rank FROM price_bars"
         " WHERE symbol = ? AND bar_size = '1d' AND close IS NOT NULL"
         " ORDER BY ts DESC",
         (str(symbol or "").strip().upper(),),
@@ -653,6 +675,8 @@ def watch_closes(
     best: dict[str, tuple[int, int, float]] = {}
     order: list[str] = []
     for row in rows:
+        if not _is_settled_close(int(row["ts"]), row["fetched_at"]):
+            continue
         day = et_day(int(row["ts"]))
         contender = (int(row["rank"]), int(row["ts"]), float(row["close"]))
         if day not in best:

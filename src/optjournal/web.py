@@ -906,7 +906,7 @@ def build_state(
             # the same rails the ladder uses -- no level is stored on either side.
             # Empty until two sessions of bars have landed, which the page renders
             # the same way it renders the absent planner.
-            "history": odte_scoring_data(conn, now=datetime.now(UTC)),
+            "history": odte_scoring_data(conn),
         }
         state["fx"] = {"base": report.base_currency,
                        "quotes": fx_quotes(conn, report.base_currency)}
