@@ -506,23 +506,45 @@ def backfill_bars(
             # or a provider outage and should still fail the job.
             if request.kind == "option" and request.end <= cutoff:
                 skipped += 1
+                _mark_asked(conn, request, cutoff, source)
                 continue
             failures.append(str(exc))
             continue
         except BarFetchError as exc:
             failures.append(str(exc))
             continue
-        if not bars:
+        if bars:
+            written += upsert_bars(
+                conn, conid=request.conid, symbol=request.symbol,
+                bar_size=request.bar_size, source=source, bars=bars,
+            )
+        else:
             skipped += 1
-            continue
-        written += upsert_bars(
-            conn, conid=request.conid, symbol=request.symbol,
-            bar_size=request.bar_size, source=source, bars=bars,
-        )
+        _mark_asked(conn, request, cutoff, source)
     return BackfillOutcome(
         requested=len(requests), written=written,
         skipped=skipped, failures=tuple(failures),
     )
+
+
+def _mark_asked(
+    conn: sqlite3.Connection, request: BarRequest, cutoff: int, source: str
+) -> None:
+    """Store an all-null bar at a finished window's start when nothing stored
+    reaches that start, so `_settled` stops asking for it.
+
+    The source has nothing there to give: an expired option answers 404 or an
+    empty series, and a contract that first traded days into its window starts
+    late. Without this each would be asked on every run for good. A null bar is
+    what the source itself sends for an interval with no print, and every reader
+    drops a null close or open. A window widened backwards later starts before
+    this bar, so it is asked again.
+    """
+    if request.end <= cutoff - SETTLED_DAYS * 86400 and not _settled(
+            conn, request, cutoff):
+        upsert_bars(conn, conid=request.conid, symbol=request.symbol,
+                    bar_size=request.bar_size, source=source,
+                    bars=[Bar(request.start, None, None, None, None, None)])
 
 
 def _settled(conn: sqlite3.Connection, request: BarRequest, cutoff: int) -> bool:

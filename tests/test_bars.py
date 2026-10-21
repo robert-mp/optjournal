@@ -413,7 +413,7 @@ def _round_trip(conn, *, conid, symbol, opened, closed, underlying="TSLA",
                 ucid="UT"):
     """One short option opened and bought back: a closed episode."""
     for trade_id, day, open_close, quantity in (
-        (f"{conid}-o", opened, "O", -1), (f"{conid}-c", closed, "C", 1),
+        (f"{conid}-{opened}", opened, "O", -1), (f"{conid}-{closed}", closed, "C", 1),
     ):
         _option_trade(conn, conid=conid, symbol=symbol, underlying=underlying,
                       ucid=ucid, date=day, trade_id=trade_id,
@@ -1092,6 +1092,62 @@ def test_a_window_long_closed_and_already_stored_is_not_asked_again(conn):
                       underlying="AAA", ucid="U1", date=day, trade_id=trade_id,
                       open_close=open_close, quantity=quantity)
     assert run() == context | {("AAA  251107P00100000", "1d"), ("AAA", "1h"), ("AAA", "1d")}
+
+
+def _asked_per_run(conn, fetch, now):
+    """A `run()` that backfills at `now` and returns the (symbol, size) it asked."""
+    asked: list[tuple[str, str]] = []
+
+    def recording(symbol, *, bar_size, start, end, source):
+        asked.append((symbol, bar_size))
+        return fetch(symbol, bar_size=bar_size, start=start, end=end, source=source)
+
+    def run() -> set[tuple[str, str]]:
+        asked.clear()
+        backfill_bars(conn, fetch=recording, now=now)
+        return set(asked)
+
+    return run
+
+
+def test_a_finished_window_whose_first_bar_comes_late_is_asked_once(conn):
+    """The TSLA 260904P270 put sold 2026-07-24 has its first stored bar 7 days and 4
+    hours after its padded start, past the week `_settled` allows, so it was asked
+    on every daily run 75 days after it ended.
+    """
+    _round_trip(conn, conid="C1", symbol="TSLA  260904P00270000",
+                opened="2026-07-24", closed="2026-07-28")
+    run = _asked_per_run(
+        conn, lambda symbol, *, bar_size, start, end, source:
+        [_bar(start + 7 * DAY + 4 * 3600)], now=datetime(2026, 10, 11, tzinfo=UTC))
+    option = ("TSLA  260904P00270000", "1d")
+    assert option in run()
+    assert option not in run(), "a finished window with a late first bar is asked again"
+
+
+def test_an_expired_option_that_answers_404_is_asked_once(conn):
+    """144 expired contracts from an imported history answered 404 on every run,
+    about 40 s a day and growing with the history. Asked once, it is not asked
+    again -- until an older statement widens its window backwards, when the new
+    part is fetched.
+    """
+    _round_trip(conn, conid="C1", symbol="TSLA  260109P00250000",
+                opened="2026-01-05", closed="2026-01-06")
+
+    def fetch(symbol, *, bar_size, start, end, source):
+        if symbol.startswith("TSLA "):
+            raise BarNotFound(f"{symbol} {bar_size}: HTTP Error 404")
+        return [_bar(start + DAY)]
+
+    run = _asked_per_run(conn, fetch, now=datetime(2026, 2, 1, tzinfo=UTC))
+    option = ("TSLA  260109P00250000", "1d")
+    assert option in run()
+    assert option not in run(), "an expired option's 404 is asked on every run"
+
+    # An older round trip on the same contract, close enough to widen the window.
+    _round_trip(conn, conid="C1", symbol="TSLA  260109P00250000",
+                opened="2025-12-26", closed="2025-12-29")
+    assert option in run(), "a window widened backwards was not asked again"
 
 
 def test_backfill_keeps_a_current_option_404_loud(conn):
